@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="referrer" content="origin" />
+    <meta name="theme-color" content="#fff" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    
+    <link id="pwa-manifest-placeholder" rel="manifest" href="" />
+    <script>
+      
+      window.RETOOL_FRONTEND_FAKE_BACKEND_MODE = false;
+      
+
+      // On-prem override for the workflow loop iteration timeout cap. The sentinel is replaced at
+      // container startup by frontend/k8s/update_files.sh from WORKFLOW_MAX_LOOP_ITERATION_TIMEOUT_MS.
+      window.RETOOL_WORKFLOW_MAX_LOOP_ITERATION_TIMEOUT_MS = ''
+
+      // #PageVisibility
+      // Here we detect if user has suspended the browser page / tab since loading
+      // See https://developer.mozilla.org/en-US/docs/Web/API/Page_Visibility_API
+      window.RETOOL_PAGE_SUSPEND_DETECTED = document.visibilityState === 'hidden'
+      function _detectVisibilityChange() {
+        if (document.visibilityState === 'hidden') {
+          window.RETOOL_PAGE_SUSPEND_DETECTED = true
+          // Remove listener because we only detect it once
+          document.removeEventListener('visibilitychange', _detectVisibilityChange)
+        }
+      }
+      // Only listen for change if page is not already hidden
+      if (document.visibilityState === 'visible') {
+        document.addEventListener('visibilitychange', _detectVisibilityChange)
+      }
+    </script>
+    <script>
+      // https://stackoverflow.com/a/24103596
+      function _getCookie(name) {
+        var nameEq = (name += '=')
+        var ca = document.cookie.split(';')
+        for (var i = 0; i < ca.length; i++) {
+          var c = ca[i]
+          while (c.charAt(0) === ' ') c = c.substring(1, c.length)
+          if (c.indexOf(nameEq) === 0) return c.substring(nameEq.length, c.length)
+        }
+      }
+
+      // Prefer the __Host- prefixed xsrf cookie, fall back to the legacy name.
+      // Mirrors the cascade in frontend/src/networking/cookieNames.ts — strict
+      // `!== undefined` so a present-but-empty __Host- cookie is trusted rather
+      // than falling through to the subdomain-injectable legacy name.
+      function _getXsrfTokenCookie() {
+        var v = _getCookie('__Host-xsrfToken')
+        return v !== undefined ? v : _getCookie('xsrfToken')
+      }
+
+      // Here we do an eager fetch of user data as a performance optimization. By doing the
+      // fetch here, in an inline script, we can fire it asap while the initial webpack
+      // bundle loads and evals. This is strictly for performance optimization and non-essential,
+      // if this fails to run or has errors then the normal application flow will handle the
+      // fetch for user data.
+
+      if (
+        !RETOOL_FRONTEND_FAKE_BACKEND_MODE &&
+        _getXsrfTokenCookie() && // presence of xsrf token means user is already authed
+        window.fetch !== undefined && // make sure fetch api is available
+        !new URL(location.origin).host.startsWith('login.') // avoid special login domain
+      ) {
+        window.RETOOL_USER_FETCH = fetch('/api/user', {
+          credentials: 'same-origin',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'Relax-Login-Subdomain-Restrictions': false,
+            'X-Xsrf-Token': _getXsrfTokenCookie(),
+            'X-Retool-Client-Version': '4.84.0-8ec403c (Build 409410)',
+          },
+        })
+          .then((r) => {
+            if (r.ok) {
+              return r.json()
+            }
+            return
+          })
+          .catch(() => {
+            // Noop to prevent unnecessary Sentry spam; this fetch races page unload (usually the
+            // service worker's reload on a deploy). Callers fall back to the normal /api/user fetch.
+          })
+      }
+    </script>
+    <script>
+      function parseAsBool(envValue, defaultValue) {
+        if (envValue === 'true') {
+          return true
+        } else if (envValue === 'false') {
+          return false
+        } else {
+          return defaultValue
+        }
+      }
+
+      // Webpack uses slightly unconventional EJS templating which is why we need to duplicate this
+      // snippet. ViteJS does it the "right way" and will be the what we keep once migration to
+      // Vite is done, so lets just keep this duplicated for now.
+      
+      SANDBOX_DOMAIN = "https://retool-edge.com"
+      ALLOW_SAME_ORIGIN_OPTION = parseAsBool("true", false)
+      MAIN_DOMAIN = "retool.com"
+      SAML_ENABLED = parseAsBool("false", false)
+      CLIENT_ID = "716367306867-d861tjqj92gjb0uphcjt8gu2nvtf6e9t.apps.googleusercontent.com"
+      RESTRICTED_DOMAIN = ""
+      DISABLE_USER_PASS_LOGIN = parseAsBool("false", false)
+      INCLUDE_COOKIES_IN_API_CALLS = ""
+      VERSION_CONTROL_LOCKED = parseAsBool("false", false)
+      IS_ADMIN = parseAsBool("false", false)
+      WEBPACK_SHARED_BUILD_VERSION = "409410_8ec403c"
+      STATSD_HOST = "__STATSD_HOST__"
+      RETOOL_APP_VARIANT = 'vite'
+      const retoolVersionForServiceWorker = '4.84.0-8ec403c (Build 409410)'
+      console.log('Running ViteJS Retool app variant')
+      // To get replaced during vite prod build with hash filename
+      VITE_RUNTIME_HTML = 'runtime.Njc4ZmE4.html'
+      
+
+      // Eager fetch of global experiments. Since global experiments can affect rendering they
+      // should be loaded before initial render. Because of that it is best to start fetching
+      // as early as possible to avoid blocking the initial render.
+      window.RETOOL_EXPERIMENTS_ID_COOKIE_NAME = 'experimentsId'
+      const credentials = INCLUDE_COOKIES_IN_API_CALLS || 'same-origin'
+      if (_getCookie(window.RETOOL_EXPERIMENTS_ID_COOKIE_NAME) !== undefined) {
+        // Only make the request if the experiments id idempotency cookie in order to get
+        // deterministic values on each call
+        window.RETOOL_GLOBAL_EXPERIMENTS_FETCH = fetch('/api/experiments', {
+          credentials,
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'X-Retool-Client-Version': '4.84.0-8ec403c (Build 409410)',
+          },
+        })
+      }
+
+      window.htmlLoadedAt = performance.now()
+    </script>
+    
+    
+    <link rel="modulepreload" crossorigin href="https://retool-edge.com/assets_vjs/routeAssumptions-DSu9wL8k.js">
+    <link rel="modulepreload" crossorigin href="https://retool-edge.com/assets_vjs/main-mti2rlpj.js">
+    <link rel="stylesheet" crossorigin href="https://retool-edge.com/assets_vjs/main-CYEVdsHA.css">
+  </head>
+  <body>
+    <script>var entrypointChunk = 'https://retool-edge.com/assets_vjs/src-index-DVIhUstC.js'</script>
+
+    <div id="root" style="height: 100%"></div>
+    <div
+      id="translationToolDetectionId"
+      style="position: absolute; left: -9999px; top: -9999px; visibility: hidden; z-index: -100"
+    >
+      This is some invisible text to see if a translation tool is being used
+    </div>
+    <script>
+      
+    </script>
+     
+    <script>
+      function errorHandler() {
+        var url = this._url
+        var retryCount
+        var storedRetryCount = localStorage.getItem('entrypoint-chunk-retry-count')
+        if (storedRetryCount !== null) {
+          retryCount = parseInt(storedRetryCount)
+        } else {
+          retryCount = 0
+        }
+        if (retryCount < 5) {
+          localStorage.setItem('entrypoint-chunk-retry-count', retryCount + 1)
+          window.location.reload()
+        }
+      }
+      function createScriptElement(url) {
+        var scriptTag = document.createElement('script')
+        scriptTag.onerror = errorHandler
+        // A later deploy's failures get a fresh retry budget
+        scriptTag.onload = function () {
+          localStorage.removeItem('entrypoint-chunk-retry-count')
+        }
+        scriptTag.type = 'module'
+        scriptTag.crossorigin = 'crossorigin'
+        scriptTag._url = url
+        scriptTag.src = url
+        scriptTag.setAttribute('data-marker', 'entrypoint-chunk')
+        return scriptTag
+      }
+      if (entrypointChunk !== undefined) {
+        document.body.appendChild(createScriptElement(entrypointChunk))
+      }
+    </script>
+    
+  <script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a514fd1a9fe4bc8a',t:'MTc5MzEzODU4NA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>

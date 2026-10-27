@@ -1,0 +1,15 @@
+{
+  "base": "https://vovasahren.retool.com",
+  "page_uuid": "7ea408b2-d252-11f1-af7f-4bc3c3d1e61f",
+  "thread_id": "c233ef98-d15c-48de-9271-2b1edaa41828",
+  "cookie": "experimentsId=-1201135262; in_retool_canary_group=never; nav-badge-assignment=control.51e35182-5ac4-42ff-8004-4459302262c2; nav-contact-sales-assignment=variant.51e35182-5ac4-42ff-8004-4459302262c2; stable-id=331eb91c-1770-432c-89ba-747a4f655a27; nav-app-gallery-assignment=off.51e35182-5ac4-42ff-8004-4459302262c2; x-geo=NL-NH; ajs_anonymous_id=1babb352-d234-4f40-acdc-292eb91ee9bf; _cfuvid=CtVqJxNCmN5a1IKd91ESzbbD50chaUQ_TBATwQAtkwg-1793133055.3454611-1.0.1.1-qKO8Ws1i5xCQgTLJ6Hf3d4QKVI1MNE3ULNeEDl8VEBM; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ4c3JmVG9rZW4iOiI3NGZlYmFiOS05OWUxLTQ5NmYtYWM3YS04YjZhODNiMjI0ZTYiLCJ2ZXJzaW9uIjoiMS4yIiwiaWF0IjoxNzkzMTMzMDk5fQ._qQbzpJPF1eZYpMvdP61Yu5jJSCuMUrgwFvF36IxkoI; xsrfToken=74febab9-99e1-496f-ac7a-8b6a83b224e6; xsrfTokenSameSite=74febab9-99e1-496f-ac7a-8b6a83b224e6; subdomain=vovasahren.retool.com; cf_clearance=D7.XPjveTCmq9O96hyzFdWIVbhU5GNm97dz0nkFKnck-1793137633-1.2.1.1-wJ0FgQEr0fhYL4tpdeHekWlSa8AtIx8jiYOq1Rq3H5lThu3_5c0mk79_zStezM3eIX1CY6TwTCIoibOFHAIqwapb1uGJN6HW64sqk8ZqC0tH_Gb5uoBpU0XO9b4CHnX1Rel0V.5B_IaSSpl2gsnB7XHyf4okca_xxvrZ8qVXBOVH6AkKfiB30iz9udDbArEshUEAuypgEnTTAdZjWYC5F_q2eT3krgoUPHB2n3TzYtZkcBz.LBKkzRC3uoftFv3WCeu3pjQK1liE8tqGZ6GfHLer_UEFePBJOiRw9tvLkwa4Jxi_roodQQPzLD3qOdehAbgpBqjzOHxktUeFgGfpz.BoG.fTsIHCWuSLSq0fpo4",
+  "xsrf": "74febab9-99e1-496f-ac7a-8b6a83b224e6",
+  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+  "model": "claude-opus-5-5",
+  "provider_resource_name": "ffd4d570-7c6b-414f-b95a-1a695676d0a8",
+  "openai_provider_resource_name": "1b7f4c97-241f-4117-a710-18c7cbfa74b1",
+  "reasoning_effort": "high",
+  "local_exec": true,
+  "project_context": true,
+  "workspace_root": "C:\\specialinay_papka"
+}
