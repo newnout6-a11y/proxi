@@ -89,7 +89,8 @@ def make_handler(runtime: Runtime):
         def _cors(self):
             self.send_header("access-control-allow-origin", "*")
             self.send_header("access-control-allow-headers",
-                             "authorization, x-api-key, anthropic-version, content-type, x-request-id")
+                             "authorization, x-api-key, anthropic-version, anthropic-beta, content-type, "
+                             "x-request-id, x-session-affinity, x-session-id, x-opencode-session")
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
             self.send_header("access-control-expose-headers", "x-request-id, retry-after")
 
@@ -214,7 +215,8 @@ def make_handler(runtime: Runtime):
                 "label": model["label"],
                 "context_window": model["context"],
                 "capabilities": {"reasoning": model["reasoning"], "tools": model["tools"],
-                                 "vision": model["vision"]},
+                                 "vision": False,
+                                 "reasoning_effort_levels": model.get("reasoning_effort_levels", [])},
             } for model in model_catalog.catalog()
                 if self._model_routable(model)]
             self._json(200, {"object": "list", "data": data})
@@ -284,7 +286,7 @@ def make_handler(runtime: Runtime):
                 raise apierr.too_many_requests("relay rate limit reached", wait)
 
             events = queue.Queue()
-            holder = {"reason": "stop", "session": None}
+            holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
             fut = asyncio.run_coroutine_threadsafe(runtime.runner.run(parsed, events, holder), runtime.loop)
 
             prompt_text = parsed.system + "\n" + parsed.prompt
@@ -315,10 +317,7 @@ def make_handler(runtime: Runtime):
                 except queue.Empty:
                     # Non-stream turns can be abandoned as well: cancel upstream on disconnect.
                     if sse.client_gone(self):
-                        session = holder_session.get("session")
-                        if session is not None:
-                            session.cancel()
-                        fut.cancel()
+                        self._cancel_turn(fut, holder_session)
                         return "cancelled"
                     if fut.done() and events.empty():
                         break
@@ -332,7 +331,19 @@ def make_handler(runtime: Runtime):
                     reason = event.get("reason", "stop")
                     continue
                 adapter.feed(event)
+                if sse.client_gone(self):
+                    self._cancel_turn(fut, holder_session)
+                    return "cancelled"
             return reason
+
+        def _cancel_turn(self, fut, holder):
+            event = holder.get("cancel_event")
+            if event is not None:
+                event.set()
+            session = holder.get("session")
+            if session is not None:
+                session.cancel()
+            fut.cancel()
 
         def _pump(self, fut, events, adapter, holder, writer):
             """Stream events to the client, sending heartbeats and honouring disconnects."""
@@ -347,9 +358,7 @@ def make_handler(runtime: Runtime):
                         writer.comment()
                         last_write = now
                     if sse.client_gone(self):
-                        session = holder.get("session")
-                        if session is not None:
-                            session.cancel()
+                        self._cancel_turn(fut, holder)
                         return "cancelled"
                     if fut.done() and events.empty():
                         break
@@ -365,9 +374,7 @@ def make_handler(runtime: Runtime):
                 last_write = time.time()
                 # Check for a disconnect on every event, not only when the stream idles.
                 if sse.client_gone(self):
-                    session = holder.get("session")
-                    if session is not None:
-                        session.cancel()
+                    self._cancel_turn(fut, holder)
                     return "cancelled"
             return holder.get("reason", reason)
 

@@ -169,46 +169,31 @@ class RelaySession:
         self._loop = None
         self.sandbox_id = None
 
+    def begin_request(self):
+        """Reset cancellation only when the pool grants a new request lease."""
+        self._cancelled = False
+
     def cancel(self):
-        """May be called from a worker thread, so never assume a running loop."""
+        """Thread-safe cancellation: close the old socket to isolate its frames."""
         self._cancelled = True
         self._needs_drain = True
-        # Keep reading (and discarding) the aborted turn so its frames cannot
-        # bleed into the next one; the next turn awaits this drain first.
-        if self.ws is None or self._drain_task is not None:
-            return
         loop = self._loop
-        if loop is None or loop.is_closed():
-            return
-        self._drain_task = asyncio.run_coroutine_threadsafe(self._drain_until_done(), loop)
-
-    async def _drain_until_done(self):
-        deadline = time.time() + 45
-        try:
-            while self.ws is not None and time.time() < deadline:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
-                await self._maybe_pong(raw)
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") == "agent_loop_done":
-                    break
-        except Exception:
-            pass
-        finally:
-            self._drain_task = None
+        if self.ws is not None and self._drain_task is None and loop is not None and not loop.is_closed():
+            self._drain_task = asyncio.run_coroutine_threadsafe(self.aclose(), loop)
 
     async def open(self):
         if self.ws is not None:
             return
+        rejected_cookie = self.cfg.get("cookie")
         try:
             started = await self.backend.start_run(self.thread_id)
             self.ws = await self.backend.connect(started.url)
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             if status in (401, 403) or "401" in str(exc):
-                if not self.backend.refresher.refresh():
+                refresh_options = {"rejected_cookie": rejected_cookie} if rejected_cookie is not None else {}
+                refreshed = await asyncio.to_thread(self.backend.refresher.refresh, **refresh_options)
+                if not refreshed:
                     raise apierr.upstream_auth_failed(self.backend.refresher.last_error or str(exc))
                 started = await self.backend.start_run(self.thread_id)
                 self.ws = await self.backend.connect(started.url)
@@ -239,33 +224,57 @@ class RelaySession:
                 pass
 
     async def aclose(self):
-        if self.ws is not None:
+        ws, self.ws = self.ws, None
+        if ws is not None:
             try:
-                await self.ws.close()
+                await ws.close()
             except Exception:
                 pass
-            self.ws = None
 
     async def stream(self, prompt, model_provider, tool_names=None):
-        """Yield normalised events. Raises ApiError on failure."""
-        # A session outlives one turn in shared mode: clear the flag and any
-        # frames left over from a cancelled turn before starting a new one.
+        """Keep one request's cancellation sticky across all local tool turns."""
+        self._loop = asyncio.get_running_loop()
         if self._drain_task is not None:
             try:
                 await asyncio.shield(asyncio.wrap_future(self._drain_task))
             except Exception:
                 pass
-        self._loop = asyncio.get_running_loop()
-        self._cancelled = False
-        if self.ws is not None and self._needs_drain:
-            await self._drain()
+            self._drain_task = None
+        if self._needs_drain:
+            await self.aclose()
             self._needs_drain = False
+        if self._cancelled:
+            yield {"type": "end", "reason": "cancelled"}
+            return
+        completed = False
+        self._output_started = False
+        turn = self._stream_turn(prompt, model_provider, tool_names)
+        try:
+            async for event in turn:
+                if event.get("type") in ("text", "thinking", "tool_call"):
+                    self._output_started = True
+                if event.get("type") == "end" and event.get("reason") == "stop":
+                    completed = True
+                yield event
+        finally:
+            await turn.aclose()
+            if not completed:
+                # A timed-out, abandoned or failed turn cannot be read again by
+                # the next request sharing this Retool thread.
+                self._needs_drain = True
+                await self.aclose()
+
+    async def _stream_turn(self, prompt, model_provider, tool_names=None):
+        """Yield normalised provider events, cleaning its poller on every exit."""
         try:
             await self.open()
         except Exception as exc:
             raise exc if isinstance(exc, apierr.ApiError) else apierr.upstream_error(str(exc))
-        try:
-            await self.ws.send(json.dumps({
+        if self._cancelled:
+            yield {"type": "end", "reason": "cancelled"}
+            return
+        turn_start = time.time()
+        frame = json.dumps({
                 "type": "user_prompt",
                 "prompt": prompt,
                 "modelProvider": model_provider,
@@ -278,15 +287,18 @@ class RelaySession:
                 "agentMode": int(self.cfg.get("agent_mode", 2)),
                 "testingEnabled": False,
                 "requestOrigin": "Browser",
-            }, ensure_ascii=True))
+            }, ensure_ascii=True)
+        try:
+            await self.ws.send(frame)
         except Exception as exc:
             raise apierr.upstream_error(f"websocket send failed: {exc}")
 
-        turn_start = time.time()
         deadline = turn_start + self.cfg["turn_timeout"]
-        think_q = asyncio.Queue() if self.cfg.get("show_thinking") else None
-        poller = (asyncio.ensure_future(self._poll_thinking(turn_start, think_q, tool_names or ()))
-                  if think_q else None)
+        tool_names = set(tool_names or ())
+        state = {"thinking": "", "tools": {}, "signatures": set()}
+        think_q = asyncio.Queue() if (self.cfg.get("show_thinking") or tool_names) else None
+        poller = (asyncio.ensure_future(self._poll_thinking(turn_start, think_q, tool_names, state))
+                  if think_q is not None else None)
         last_text = ""
         full_text = ""
         block_id = None
@@ -295,172 +307,226 @@ class RelaySession:
         last_thinking = ""
         restart_hint = False
         reconnects = 0
-        tool_buffers = {}
-        while True:
-            while think_q is not None and not think_q.empty():
-                pending = think_q.get_nowait()
-                if isinstance(pending, dict):
-                    yield pending
-                else:
-                    yield {"type": "thinking", "delta": pending}
-            if self._cancelled:
-                self.cancel()
-                if poller is not None:
-                    poller.cancel()
-                yield {"type": "end", "reason": "cancelled"}
-                return
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                if poller is not None:
-                    poller.cancel()
-                yield {"type": "end", "reason": "timeout"}
-                return
-            try:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=min(remaining, self.cfg["recv_timeout"]))
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                if poller is not None:
-                    poller.cancel()
-                raise
-            except Exception as exc:
-                if reconnects >= 1:
-                    raise apierr.upstream_error(f"websocket closed: {exc}")
-                reconnects += 1
-                await self.aclose()
-                try:
-                    await self.open()
-                except Exception as inner:
+        tool_buffers = state["tools"]
+        try:
+            while True:
+                while think_q is not None and not think_q.empty():
+                    pending = think_q.get_nowait()
+                    if isinstance(pending, dict):
+                        yield pending
+                    else:
+                        yield {"type": "thinking", "delta": pending}
+                if self._cancelled:
+                    self.cancel()
                     if poller is not None:
                         poller.cancel()
-                    raise apierr.upstream_error(f"websocket reconnect failed: {inner}")
-                continue
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    if poller is not None:
+                        poller.cancel()
+                    yield {"type": "end", "reason": "timeout"}
+                    return
+                try:
+                    # A history poll can complete while the socket is quiet.
+                    # Revisit its queue promptly rather than waiting up to the
+                    # entire receive timeout before showing real thinking.
+                    receive_wait = min(remaining, self.cfg["recv_timeout"], 0.25 if think_q is not None else remaining)
+                    raw = await asyncio.wait_for(self.ws.recv(), timeout=receive_wait)
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    if poller is not None:
+                        poller.cancel()
+                    raise
+                except Exception as exc:
+                    if self._cancelled:
+                        yield {"type": "end", "reason": "cancelled"}
+                        return
+                    if reconnects >= 1 or self._output_started:
+                        raise apierr.upstream_error(f"websocket closed: {exc}")
+                    reconnects += 1
+                    await self.aclose()
+                    try:
+                        await self.open()
+                        if self._cancelled:
+                            yield {"type": "end", "reason": "cancelled"}
+                            return
+                        await self.ws.send(frame)
+                    except Exception as inner:
+                        if poller is not None:
+                            poller.cancel()
+                        raise apierr.upstream_error(f"websocket reconnect failed: {inner}")
+                    continue
 
-            await self._maybe_pong(raw)
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            kind = event.get("type")
+                if self._cancelled:
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                await self._maybe_pong(raw)
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                kind = event.get("type")
 
-            if kind == "text":
-                content = event.get("content") or ""
-                # Text frames are cumulative *per messageId*; a new id starts a new block.
-                if event.get("messageId") != block_id:
-                    # A new id may restart the same text (overlap) or open a new block.
-                    if block_id is not None and last_text and content.startswith(last_text):
+                if kind == "text":
+                    content = event.get("content") or ""
+                    # Text frames are cumulative *per messageId*; a new id starts a new block.
+                    if event.get("messageId") != block_id:
+                        # A new id may restart the same text (overlap) or open a new block.
+                        if block_id is not None and last_text and content.startswith(last_text):
+                            block_id = event.get("messageId")
+                            delta = content[len(last_text):]
+                            last_text = content
+                            full_text += delta
+                            if delta:
+                                yield {"type": "text", "delta": delta}
+                            continue
+                        if full_text.strip():
+                            full_text = full_text.rstrip("\n") + "\n"
                         block_id = event.get("messageId")
+                        last_text = ""
+                    if content.startswith(last_text):
                         delta = content[len(last_text):]
-                        last_text = content
-                        full_text += delta
-                        if delta:
-                            yield {"type": "text", "delta": delta}
-                        continue
-                    if full_text.strip():
-                        full_text = full_text.rstrip("\n") + "\n"
-                    block_id = event.get("messageId")
-                    last_text = ""
-                if content.startswith(last_text):
-                    delta = content[len(last_text):]
-                elif restart_hint or len(content) < len(last_text):
-                    # Buffer restarted: the frame carries the text from scratch.
-                    delta = content
-                else:
-                    delta = content[len(last_text):]
-                restart_hint = False
-                last_text = content
-                full_text += delta
-                if delta:
-                    yield {"type": "text", "delta": delta}
-            elif kind == "thinking":
-                content = event.get("content") or ""
-                if event.get("messageId") != thinking_id:
-                    if thinking_text.strip():
-                        thinking_text += "\n"
-                    thinking_id = event.get("messageId")
-                    last_thinking = ""
-                if content.startswith(last_thinking):
-                    delta = content[len(last_thinking):]
-                elif len(content) >= len(last_thinking):
-                    delta = content[len(last_thinking):]
-                else:
-                    delta = content
-                last_thinking = content
-                thinking_text += delta
-                if delta:
-                    yield {"type": "thinking", "delta": delta}
-            elif kind == "clear_streaming":
-                # UI signal (usually before a tool call): the next frame may restart
-                # the same text, so we only mark that the buffer may be replaced.
-                restart_hint = True
-            elif kind == "run_credits_persisted":
-                value = event.get("creditsUsed")
-                if isinstance(value, (int, float)):
-                    yield {"type": "credits", "value": float(value)}
-            elif kind == "hitl":
-                yield {"type": "hitl", "question": _hitl_text(event)}
-            elif kind == "tool_call":
-                call = _tool_call_from_event(event)
-                if call is not None:
-                    merged = _merge_tool_call(call, tool_buffers)
-                    if merged is not None:
-                        yield {"type": "tool_call", **merged}
-            elif kind == "agent_loop_done":
-                if poller is not None:
-                    poller.cancel()
-                    await asyncio.sleep(0)
-                    while think_q is not None and not think_q.empty():
-                        pending = think_q.get_nowait()
-                        if isinstance(pending, dict):
-                            yield pending
-                        else:
-                            yield {"type": "thinking", "delta": pending}
-                for trail in await self._trailing():
-                    yield trail
-                yield {"type": "final_text", "text": full_text}
-                yield {"type": "end", "reason": "stop"}
-                return
-            elif kind == "error":
-                if poller is not None:
-                    poller.cancel()
-                raise apierr.upstream_error(str(event)[:300])
-            elif os.environ.get("DEBUG_EVENTS"):
-                print("dbg-unknown:", json.dumps(event, ensure_ascii=False)[:400], flush=True)
+                    elif restart_hint or len(content) < len(last_text):
+                        # Buffer restarted: the frame carries the text from scratch.
+                        delta = content
+                    else:
+                        delta = content[len(last_text):]
+                    restart_hint = False
+                    last_text = content
+                    full_text += delta
+                    if delta:
+                        yield {"type": "text", "delta": delta}
+                elif kind == "thinking":
+                    content = event.get("content") or ""
+                    if event.get("messageId") != thinking_id:
+                        if thinking_text.strip():
+                            thinking_text += "\n"
+                        thinking_id = event.get("messageId")
+                        last_thinking = ""
+                    if content.startswith(last_thinking):
+                        delta = content[len(last_thinking):]
+                    elif len(content) >= len(last_thinking):
+                        delta = content[len(last_thinking):]
+                    else:
+                        delta = content
+                    last_thinking = content
+                    thinking_text += delta
+                    sent = state["thinking"]
+                    if thinking_text.startswith(sent):
+                        delta = thinking_text[len(sent):]
+                        state["thinking"] = thinking_text
+                    elif sent.startswith(thinking_text):
+                        delta = ""
+                    else:
+                        state["thinking"] += delta
+                    if delta:
+                        yield {"type": "thinking", "delta": delta}
+                    signature = event.get("signature")
+                    if signature and signature not in state["signatures"]:
+                        state["signatures"].add(signature)
+                        yield {"type": "thinking_signature", "signature": signature}
+                elif kind == "thinking_signature":
+                    signature = event.get("signature")
+                    if signature and signature not in state["signatures"]:
+                        state["signatures"].add(signature)
+                        yield {"type": "thinking_signature", "signature": signature}
+                elif kind == "clear_streaming":
+                    # UI signal (usually before a tool call): the next frame may restart
+                    # the same text, so we only mark that the buffer may be replaced.
+                    restart_hint = True
+                elif kind == "run_credits_persisted":
+                    value = event.get("creditsUsed")
+                    if isinstance(value, (int, float)):
+                        yield {"type": "credits", "value": float(value)}
+                elif kind == "hitl":
+                    yield {"type": "hitl", "question": _hitl_text(event)}
+                elif kind == "tool_call":
+                    call = _tool_call_from_event(event)
+                    if call is not None and call["name"] in tool_names:
+                        merged = _merge_tool_call(call, tool_buffers)
+                        if merged is not None:
+                            yield {"type": "tool_call", **merged}
+                elif kind == "agent_loop_done":
+                    if poller is not None:
+                        poller.cancel()
+                        await asyncio.gather(poller, return_exceptions=True)
+                        # Fast turns may finish before the first polling tick.
+                        # Fetch the final persisted reasoning while it still
+                        # belongs to this turn; this never invents reasoning.
+                        try:
+                            await asyncio.wait_for(self._queue_history(turn_start, think_q, tool_names, state), timeout=3)
+                        except Exception:
+                            pass
+                        while think_q is not None and not think_q.empty():
+                            pending = think_q.get_nowait()
+                            if isinstance(pending, dict):
+                                yield pending
+                            else:
+                                yield {"type": "thinking", "delta": pending}
+                    for trail in await self._trailing():
+                        yield trail
+                    yield {"type": "final_text", "text": full_text}
+                    yield {"type": "end", "reason": "stop"}
+                    return
+                elif kind == "error":
+                    if poller is not None:
+                        poller.cancel()
+                    raise apierr.upstream_error(str(event)[:300])
+                elif os.environ.get("DEBUG_EVENTS"):
+                    print("dbg-unknown:", json.dumps(event, ensure_ascii=False)[:400], flush=True)
+        finally:
+            if poller is not None:
+                poller.cancel()
+                await asyncio.gather(poller, return_exceptions=True)
 
-    async def _poll_thinking(self, turn_start: float, queue_: "asyncio.Queue", tool_names=()):
-        """Poll persisted thinking/tool messages without crossing turn boundaries."""
-        sent = ""
-        tool_buffers = {}
+    async def _queue_history(self, turn_start, queue_, tool_names, state):
+        data = await self.backend.get_messages(self.thread_id)
+        parts = []
+        signatures = []
+        for message in reversed(data.get("messages", [])):
+            created = message.get("createdAt")
+            if not created or _created_timestamp(created) < turn_start:
+                continue
+            content = message.get("content") or {}
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") == "tool_call":
+                call = _tool_call_from_event(content)
+                if call and call["name"] in tool_names:
+                    merged = _merge_tool_call(call, state["tools"])
+                    if merged is not None:
+                        queue_.put_nowait({"type": "tool_call", **merged})
+                continue
+            if content.get("type") != "thinking" or not self.cfg.get("show_thinking"):
+                continue
+            parts.append(content.get("thinking") or "")
+            signature = content.get("signature")
+            if signature and signature not in state["signatures"]:
+                state["signatures"].add(signature)
+                signatures.append(signature)
+        text = "\n".join(p for p in parts if p)
+        sent = state["thinking"]
+        if text.startswith(sent) and len(text) > len(sent):
+            queue_.put_nowait({"type": "thinking", "delta": text[len(sent):]})
+            state["thinking"] = text
+        for signature in signatures:
+            queue_.put_nowait({"type": "thinking_signature", "signature": signature})
+
+    async def _poll_thinking(self, turn_start, queue_, tool_names=(), state=None):
+        """Poll only actual provider messages correlated to this turn."""
+        if state is None:
+            state = {"thinking": "", "tools": {}, "signatures": set()}
         while True:
             try:
                 await asyncio.sleep(2.0)
-                data = await self.backend.get_messages(self.thread_id)
+                await self._queue_history(turn_start, queue_, tool_names, state)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 continue
-            parts = []
-            for message in reversed(data.get("messages", [])):
-                created = message.get("createdAt")
-                # A message without a timestamp cannot be correlated safely
-                # to this turn, so never merge it into the current thinking.
-                if not created or _created_timestamp(created) < turn_start - 0.25:
-                    continue
-                content = message.get("content") or {}
-                if content.get("type") == "tool_call":
-                    call = _tool_call_from_event(content)
-                    if call:
-                        merged = _merge_tool_call(call, tool_buffers)
-                        if merged is not None:
-                            queue_.put_nowait({"type": "tool_call", **merged})
-                    continue
-                if content.get("type") != "thinking":
-                    continue
-                parts.append(content.get("thinking") or "")
-            text = "\n".join(p for p in parts if p)
-            if text.startswith(sent) and len(text) > len(sent):
-                queue_.put_nowait(text[len(sent):])
-                sent = text
 
     async def _trailing(self):
         """Collect a trailing credits frame, but never block the turn for long."""
@@ -470,6 +536,8 @@ class RelaySession:
             try:
                 raw = await asyncio.wait_for(self.ws.recv(), timeout=0.25)
             except asyncio.TimeoutError:
+                break
+            except Exception:
                 break
             await self._maybe_pong(raw)
             try:
@@ -493,13 +561,30 @@ def _hitl_text(event) -> str:
     return hitl.get("message") or f"[hitl: {hitl.get('hitlType', 'askUser')}]"
 
 
-class SessionPool:
-    """Provides sessions per request, per client conversation, or globally.
+class SessionLease:
+    """A unique request handle, even when the underlying socket is reused."""
 
-    ``per_conversation`` is the mode used by OpenCode: its affinity header is
-    the key, so tool-result follow-ups reuse the same Retool thread while
-    unrelated chats stay isolated.
-    """
+    def __init__(self, session):
+        self.session = session
+        self.released = False
+
+    def __getattr__(self, name):
+        return getattr(self.session, name)
+
+    def cancel(self):
+        if not self.released:
+            self.session.cancel()
+
+    async def stream(self, prompt, model_provider, tool_names=None):
+        if self.released:
+            yield {"type": "end", "reason": "cancelled"}
+            return
+        async for event in self.session.stream(prompt, model_provider, tool_names):
+            yield event
+
+
+class SessionPool:
+    """Bounded persistent conversations with one exclusive lease per request."""
 
     def __init__(self, backend: Backend):
         self.backend = backend
@@ -508,97 +593,106 @@ class SessionPool:
         self._lock = asyncio.Lock()
         self._conversations = {}
         self._conversation_locks = {}
+        self._conversation_refs = {}
+        self._last_used = {}
         self._slots = asyncio.BoundedSemaphore(max(1, self.cfg["max_workers"]))
-        self._active = set()
-        self._starts = 0
-        self._started_at = time.time()
+        self._active = {}
 
     @property
     def mode(self):
         return self.cfg["session_mode"]
 
-    async def acquire(self, conversation_key=None) -> RelaySession:
-        """Take a session slot. Caller must always release() it (once)."""
+    async def _evict_idle(self, make_room=False):
+        now = time.monotonic()
+        ttl = self.cfg.get("conversation_idle_timeout", 900)
+        capacity = max(1, self.cfg.get("max_conversations", 128))
+        idle = sorted((key for key in self._conversation_locks
+                       if not self._conversation_refs.get(key)), key=lambda key: self._last_used.get(key, 0))
+        closing = []
+        for key in idle:
+            expired = ttl > 0 and now - self._last_used.get(key, now) >= ttl
+            full = make_room and len(self._conversation_locks) >= capacity
+            if not expired and not full:
+                continue
+            session = self._conversations.pop(key, None)
+            self._conversation_locks.pop(key, None)
+            self._conversation_refs.pop(key, None)
+            self._last_used.pop(key, None)
+            if session is not None:
+                closing.append(session)
+        for session in closing:
+            await session.aclose()
+
+    async def acquire(self, conversation_key=None) -> SessionLease:
+        """Take one slot and return an independently releasable request handle."""
         await self._slots.acquire()
-        if self.mode == "shared":
-            locked = False
-            try:
-                await self._lock.acquire()
+        lock = None
+        locked = False
+        key = None
+        referenced = False
+        keep = False
+        try:
+            if self.mode == "shared":
+                lock = self._lock
+                await lock.acquire()
                 locked = True
                 if self._shared is None:
                     self._shared = RelaySession(self.backend, self.cfg["thread_id"])
-                self._active.add(self._shared)
-                return self._shared
-            except BaseException:
-                if locked:
-                    self._lock.release()
-                self._slots.release()
-                raise
-        if self.mode == "per_conversation":
-            key = conversation_key or "anonymous"
-            lock = self._conversation_locks.setdefault(key, asyncio.Lock())
-            locked = False
-            try:
+                session = self._shared
+                keep = True
+            elif self.mode == "per_conversation" and conversation_key:
+                key = conversation_key
+                await self._evict_idle(make_room=key not in self._conversation_locks)
+                capacity = max(1, self.cfg.get("max_conversations", 128))
+                if key not in self._conversation_locks and len(self._conversation_locks) >= capacity:
+                    raise apierr.service_unavailable("conversation pool is full; retry after an active conversation finishes")
+                lock = self._conversation_locks.setdefault(key, asyncio.Lock())
+                self._conversation_refs[key] = self._conversation_refs.get(key, 0) + 1
+                referenced = True
                 await lock.acquire()
                 locked = True
                 session = self._conversations.get(key)
                 if session is None:
                     session = RelaySession(self.backend, await self.backend.create_thread())
                     self._conversations[key] = session
-                self._active.add((key, session))
-                return session
-            except BaseException:
-                if locked:
-                    lock.release()
-                self._slots.release()
-                raise
-        try:
-            thread_id = await self.backend.create_thread()
+                keep = True
+            else:
+                # No explicit affinity means a fresh thread, never a shared
+                # content-derived "anonymous" conversation.
+                session = RelaySession(self.backend, await self.backend.create_thread())
+            session.begin_request()
+            lease = SessionLease(session)
+            self._active[lease] = (session, key, lock, keep)
+            return lease
         except BaseException:
-            # CancelledError is a BaseException: the slot must still come back.
+            if locked:
+                lock.release()
+            if referenced:
+                self._conversation_refs[key] -= 1
+                if not self._conversation_refs[key] and key not in self._conversations:
+                    self._conversation_refs.pop(key, None)
+                    self._conversation_locks.pop(key, None)
             self._slots.release()
             raise
-        session = RelaySession(self.backend, thread_id)
-        self._active.add(session)
-        return session
 
-    async def release(self, session: RelaySession) -> None:
-        """Release a session exactly once; extra releases are ignored."""
-        key = None
-        if self.mode == "per_conversation":
-            for candidate, active in tuple(self._active):
-                if active is session:
-                    key = candidate
-                    self._active.discard((candidate, active))
-                    break
-            if key is None:
-                return
-        elif self.mode != "shared" and session not in self._active:
+    async def release(self, lease: SessionLease) -> None:
+        """Stale or duplicate release/cancel cannot affect a subsequent lease."""
+        record = self._active.pop(lease, None)
+        if record is None:
             return
-        if self.mode != "per_conversation":
-            self._active.discard(session)
+        lease.released = True
+        session, key, lock, keep = record
         try:
-            if self.mode != "shared":
-                if self.mode == "per_conversation":
-                    # Keep the WebSocket and Retool thread for the next
-                    # message in this conversation.
-                    pass
-                else:
-                    await session.aclose()
+            if not keep or session._needs_drain:
+                await session.aclose()
         finally:
-            if self.mode == "shared":
-                try:
-                    self._lock.release()
-                except RuntimeError:
-                    pass
-            elif self.mode == "per_conversation":
-                lock = self._conversation_locks.get(key)
-                if lock is not None and lock.locked():
-                    lock.release()
-            try:
-                self._slots.release()
-            except ValueError:
-                pass
+            if key is not None:
+                self._conversation_refs[key] -= 1
+                self._last_used[key] = time.monotonic()
+            if lock is not None:
+                lock.release()
+            self._slots.release()
+        await self._evict_idle()
 
     async def __aenter__(self):
         self._lease = await self.acquire()
@@ -607,5 +701,3 @@ class SessionPool:
     async def __aexit__(self, *exc):
         await self.release(self._lease)
         return False
-
-

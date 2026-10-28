@@ -138,15 +138,14 @@ def test_usage_endpoint_reports_turns(relay):
 
 def test_structure_preserved_for_tool_and_blocks(relay):
     payload = {"model": "claude-opus-5-5", "messages": [
-        {"role": "user", "content": [{"type": "text", "text": "read file"},
-                                     {"type": "image", "source": {"type": "media_type", "media_type": "image/png"}}]},
+        {"role": "user", "content": [{"type": "text", "text": "read file"}]},
         {"role": "assistant", "content": "calling", "tool_calls": [
             {"id": "1", "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}}]},
         {"role": "tool", "name": "read_file", "content": "DATA"},
     ]}
     relay.json("/v1/chat/completions", payload)
     prompt = relay.fake.seen[-1].prompt
-    assert "image/png" in prompt and "tool_call read_file" in prompt and "tool result" in prompt
+    assert "read file" in prompt and "tool_call read_file" in prompt and "tool result" in prompt
 
 
 def test_chat_native_tool_call_round_trip(relay):

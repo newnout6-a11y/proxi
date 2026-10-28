@@ -32,10 +32,10 @@ def make(frames):
     return session
 
 
-def collect(session):
+def collect(session, tool_names=None):
     async def drain():
         out = []
-        async for event in session.stream("p", {"model": "m"}):
+        async for event in session.stream("p", {"model": "m"}, tool_names=tool_names):
             out.append(event)
         return out
     return asyncio.run(drain())
@@ -83,6 +83,6 @@ def test_tool_call_fragments_are_reassembled():
         {"type": "tool_call", "toolCallId": "call_1", "toolName": "bash",
          "partialInputs": '"command":"dir"}'},
         {"type": "agent_loop_done"},
-    ]))
+    ]), tool_names=["bash"])
     calls = [e for e in events if e["type"] == "tool_call"]
     assert calls[-1]["arguments"] == '{"command":"dir"}'

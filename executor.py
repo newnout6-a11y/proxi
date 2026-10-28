@@ -19,12 +19,12 @@ CMD_LETS = "|".join((
     "get-content|get-childitem|get-item|get-itemproperty|get-location|get-date|get-command",
     "get-process|get-service|select-string|select-object|sort-object|where-object|foreach-object",
     "measure-object|resolve-path|test-path|write-output|write-host|split-path|join-path",
-    "dir|type|more|findstr|where|tasklist|ping|start-sleep|cls|echo|copy|move|mkdir|remove-item",
+    "dir|type|more|findstr|where|tasklist|ping|start-sleep|cls|echo",
 ))
 CMD_LETS_RE = re.compile("^(" + CMD_LETS + r")\b", re.IGNORECASE)
 
 
-def split_segments(cmd: str):
+def split_segments(cmd: str, powershell=False):
     """Split a command line on shell separators, ignoring ones inside quotes."""
     segments, buf = [], []
     quote = ""
@@ -38,7 +38,7 @@ def split_segments(cmd: str):
             buf.append(ch)
             i += 1
             continue
-        if ch in "\"'":
+        if ch == '"' or (powershell and ch == "'"):
             quote = ch
             buf.append(ch)
             i += 1
@@ -65,17 +65,17 @@ def _shell_body(segment: str):
     parts = segment.split(None, 1)
     if len(parts) < 2:
         return None
-    rest = parts[1]
-    lowered = rest.lower()
-    for flag in SHELL_FLAGS:
-        idx = lowered.find(flag)
-        if idx == -1:
-            continue
-        body = rest[idx + len(flag):].strip()
-        if body[:1] in ('"', "'") and body[-1:] == body[:1]:
-            body = body[1:-1]
-        return body.strip() or None
-    return None
+    shell = parts[0].strip('"').lower().removesuffix(".exe")
+    options = r"(?:(?:-noprofile|-noninteractive|-nologo)\s+)*(?:-command|-c)\s+(.+)"
+    if shell == "cmd":
+        options = r"(?:(?:/d|/s)\s+)*/c\s+(.+)"
+    match = re.fullmatch(options, parts[1], re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return None
+    body = match.group(1).strip()
+    if body[:1] in ('"', "'") and body[-1:] == body[:1]:
+        body = body[1:-1]
+    return body.strip() or None
 
 # Variables kept from the parent environment; everything else is dropped.
 ENV_KEEP = ("PATH", "PATHEXT", "SystemRoot", "SystemDrive", "ComSpec", "TEMP", "TMP",
@@ -145,35 +145,46 @@ def command_tool_call(text: str, tool_names):
     if not command:
         return None
     names = set(tool_names or ())
-    name = next((candidate for candidate in ("bash", "shell", "exec_command", "run_command")
-                 if candidate in names), None)
+    name = next((actual for candidate in ("bash", "shell", "exec_command", "run_command")
+                 for actual in names if actual.lower() == candidate), None)
     if name is None:
         return None
-    field = "command" if name in ("bash", "shell") else "cmd"
+    field = "command" if name.lower() in ("bash", "shell") else "cmd"
     return {"id": "call_" + uuid.uuid4().hex[:20], "name": name,
             "arguments": json.dumps({field: command}, ensure_ascii=False, separators=(",", ":"))}
 
 
 def _check_segments(segments, patterns, depth=0) -> None:
     for segment in segments:
-        head = segment.split(" ")[0].strip('"')
-        if head.startswith("$env:") or head.lower() == "set":
-            continue
+        head = segment.split()[0].strip('"')
+        if head.lower().removesuffix(".exe") == "git" and re.search(
+                r"(?:^|\s)(?:-c|-C|--config-env|--exec-path)(?:\s|=)|\b(?:config|alias|credential|submodule)\b",
+                segment, re.IGNORECASE):
+            raise PolicyError("git command/config overrides require allow_all")
         shell = head.lower().removesuffix(".exe") in SHELLS
-        if not shell and not any(pattern.search(segment) for pattern in patterns):
+        if not any(pattern.search(segment) for pattern in patterns):
             raise PolicyError(
                 "command not allowlisted: '" + head + "' "
                 "(exec_policy=allowlist; add a pattern to exec_allowlist)")
         body = _shell_body(segment) if shell else None
-        if body and depth < 3:
+        if shell and (not body or depth >= 3):
+            raise PolicyError("only explicit -Command/-c or cmd /c bodies are supported by allowlist")
+        if body:
             # The shell body must satisfy the policy on its own.
-            inner = [s for s in split_segments(body) if s.strip()]
-            _check_segments(inner, [CMD_LETS_RE] + patterns, depth + 1)
+            ps = head.lower().removesuffix(".exe") != "cmd"
+            if ps and re.search(r"[{}()\x60]|(?:^|[;\r\n])\s*\$", body):
+                raise PolicyError("PowerShell script blocks, expansion and assignments require allow_all")
+            inner = split_segments(body, powershell=ps)
+            _check_segments(inner, [CMD_LETS_RE] if ps else patterns, depth + 1)
 
 
 def check_policy(cmd: str, policy: str, allowlist) -> None:
     if policy == "allow_all":
         return
+    if policy != "allowlist":
+        raise PolicyError("local command execution is disabled")
+    if not cmd or re.search(r"[%!^]", cmd):
+        raise PolicyError("cmd expansion/escaping is not supported by allowlist")
     patterns = [re.compile(p, re.IGNORECASE) for p in (allowlist or [])]
     _check_segments(split_segments(cmd), patterns)
 
@@ -202,7 +213,9 @@ def _kill_tree(pid: int) -> None:
 
 
 def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
-                policy: str = "allowlist", allowlist=None, audit_path=None):
+                policy: str = "allowlist", allowlist=None, audit_path=None, cancel_event=None):
+    if cancel_event is not None and cancel_event.is_set():
+        return -1, "[cancelled before execution]"
     check_policy(cmd, policy, allowlist)
     started = time.time()
     env = clean_env(cwd)
@@ -231,10 +244,22 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
         thread.start()
 
     timed_out = False
+    cancelled = False
     try:
-        proc.wait(timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                proc.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                pass
     except subprocess.TimeoutExpired:
-        timed_out = True
+        timed_out = not cancelled
         _kill_tree(proc.pid)
         try:
             proc.wait(timeout=5)
@@ -250,6 +275,8 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
         combined += ("\nSTDERR:\n" if combined else "") + err
     if timed_out:
         combined += "\n[timed out after " + str(timeout) + "s, process tree killed]"
+    if cancelled:
+        combined += "\n[cancelled, process tree killed]"
     if not combined:
         combined = "(no output)"
 
@@ -258,7 +285,7 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
         truncated_len = len(combined) - limit
         combined = combined[:limit] + "\n... [truncated " + str(truncated_len) + " chars]"
 
-    code = -1 if timed_out else proc.returncode
+    code = -1 if timed_out or cancelled else proc.returncode
     _audit(audit_path, cmd, code, time.time() - started, len(combined))
     return code, combined
 

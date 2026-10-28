@@ -1,4 +1,5 @@
 import argparse, json, sys, time, urllib.request, urllib.error
+from auth import client_headers
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -11,16 +12,18 @@ def main():
     parser.add_argument("--balance", action="store_true", help="Check credits balance")
     parser.add_argument("--models", action="store_true", help="List available models")
     parser.add_argument("--url", default="http://127.0.0.1:8787", help="Base URL of proxy")
+    parser.add_argument("--key", help="Relay key (otherwise RELAY_API_KEY or relay_key.txt)")
     args = parser.parse_args()
+    headers = client_headers(args.key)
 
     if args.balance:
-        with urllib.request.urlopen(f"{args.url}/v1/balance") as resp:
+        with urllib.request.urlopen(urllib.request.Request(f"{args.url}/v1/balance", headers=headers)) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             print(json.dumps(data, indent=2, ensure_ascii=False))
         return
 
     if args.models:
-        with urllib.request.urlopen(f"{args.url}/v1/models") as resp:
+        with urllib.request.urlopen(urllib.request.Request(f"{args.url}/v1/models", headers=headers)) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             print("Models:")
             for m in data.get("data", []):
@@ -38,7 +41,7 @@ def main():
     req = urllib.request.Request(
         f"{args.url}/v1/chat/completions",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"content-type": "application/json"}
+        headers=headers
     )
 
     print(f"\n[Sending prompt to {args.model} | stream={not args.no_stream}]")
@@ -50,18 +53,36 @@ def main():
             if args.no_stream:
                 res = json.loads(resp.read().decode("utf-8"))
                 text = res["choices"][0]["message"]["content"]
+                thinking = res["choices"][0]["message"].get("reasoning_content")
+                if thinking:
+                    print("\n[Thinking]\n" + thinking + "\n[Answer]")
                 print(text)
                 usage = res.get("usage", {})
                 print(f"\n[Usage]: Credits used={usage.get('credits_used')} | Remaining={usage.get('credits_available')}")
             else:
+                channel = None
                 for line in resp:
                     s = line.decode("utf-8", "replace").strip()
                     if not s or s == "data: [DONE]":
                         continue
                     if s.startswith("data: "):
                         chunk = json.loads(s[6:])
-                        delta = chunk["choices"][0]["delta"].get("content", "")
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        piece = choices[0].get("delta", {})
+                        thinking = piece.get("reasoning_content")
+                        if thinking:
+                            if channel != "thinking":
+                                print("\n[Thinking]", flush=True)
+                            sys.stdout.write(thinking)
+                            sys.stdout.flush()
+                            channel = "thinking"
+                        delta = piece.get("content", "")
                         if delta:
+                            if channel == "thinking":
+                                print("\n[Answer]", flush=True)
+                            channel = "text"
                             sys.stdout.write(delta)
                             sys.stdout.flush()
                 print(f"\n\n[Done in {time.time()-t0:.2f}s]")

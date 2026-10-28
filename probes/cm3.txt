@@ -1,9 +1,0 @@
-feat(models+limits): current October-2026 line-up, per-model caps, looser relay limits
-
-- catalog regenerated: gpt-6-astra/sol/luna, gpt-6.1-sol(-ultrafast) added, gpt-4.1 dropped,
-  Claude context raised to 1M input / 128k output per public model cards (tavily)
-- max_tokens validated per model instead of a flat 200k cap (MAX_TOKENS_CAP now 1M fallback)
-- command_output_limit 4k -> 64k, max_prompt_bytes 24k -> 128k, context_max_bytes 2.5k -> 120k,
-  max_workers 16 -> 32, max_exec_seconds removed (steps unlimited, summary turn on exhaustion)
-- websocket max_size now really applied from max_frame_bytes (was hardcoded None)
-- live check: gpt-6-sol and claude-opus-5-5 both answer 200, /v1/models has no gpt-4.1

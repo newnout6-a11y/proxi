@@ -47,10 +47,11 @@ def test_cancel_does_not_poison_following_turns():
         async for event in session.stream("p", {}):
             first.append(event)
             session.cancel()
-        # the aborted turn is drained in the background before the next one
+        # An aborted socket is closed before the next logical request.
         if session._drain_task is not None:
             await asyncio.wrap_future(session._drain_task)
-        assert session.ws is not None, "shared sessions keep the socket"
+        assert session.ws is None
+        session.begin_request()
         session.ws = FakeWS([{"type": "text", "messageId": "b", "content": "second"},
                              {"type": "agent_loop_done"}])
         session._needs_drain = False

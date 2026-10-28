@@ -1,6 +1,6 @@
 """Strict request parsing for every supported dialect."""
-import hashlib
 import json
+import math
 
 from apierr import bad_request, unprocessable
 import models as model_catalog
@@ -32,7 +32,9 @@ def load_json(raw: bytes):
     if not raw:
         raise bad_request("empty request body")
     try:
-        data = json.loads(raw.decode("utf-8", "replace"))
+        data = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise bad_request("request body must use valid UTF-8")
     except json.JSONDecodeError as exc:
         raise bad_request(f"invalid JSON body: {exc.msg} at line {exc.lineno}")
     if not isinstance(data, dict):
@@ -46,6 +48,13 @@ def _opt_str(data, key, default=None):
         return None
     if not isinstance(value, str):
         raise unprocessable(f"'{key}' must be a string", param=key)
+    return value
+
+
+def _opt_bool(data, key, default=False):
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise unprocessable(f"'{key}' must be a boolean", param=key)
     return value
 
 
@@ -69,7 +78,7 @@ def _opt_float(data, key):
     if key not in data or data[key] is None:
         return None
     value = data[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise unprocessable(f"'{key}' must be a number", param=key)
     return float(value)
 
@@ -100,22 +109,16 @@ def _blocks_to_text(content, index, role):
                 raise unprocessable(f"{where}.text must be a string", param=where + ".text")
             chunks.append(text)
         elif btype in ("image", "image_url", "input_image"):
-            source = block.get("source") if isinstance(block.get("source"), dict) else None
-            if source:
-                url = source.get("url") or source.get("data") or ""
-            else:
-                image = block.get("image_url")
-                url = image.get("url") if isinstance(image, dict) else image
-            label = "image"
-            if isinstance(source, dict) and source.get("media_type"):
-                label = str(source["media_type"])
-            chunks.append(f"[{label}: {str(url)[:120] or 'inline'}]")
+            raise unprocessable("image attachments are not supported by this relay", param=where)
         elif btype in ("tool_use", "tool_call"):
             name = block.get("name") or "tool"
-            args = block.get("input") or block.get("arguments") or {}
-            chunks.append(f"[tool_call {name}: {json.dumps(args, ensure_ascii=False)[:400]}]")
+            args = block.get("input", block.get("arguments", {}))
+            call_id = block.get("id") or block.get("tool_call_id") or "call"
+            chunks.append(f"[tool_call {name} id={call_id}: {json.dumps(args, ensure_ascii=False)}]")
         elif btype in ("tool_result",):
-            chunks.append(f"[tool_result: {str(block.get('content'))[:400]}]")
+            call_id = block.get("tool_use_id") or block.get("tool_call_id") or "call"
+            result = _blocks_to_text(block.get("content"), index, "tool")
+            chunks.append(f"[tool_result id={call_id}: {result}]")
         elif btype in ("thinking", "redacted_thinking"):
             continue
         else:
@@ -153,7 +156,7 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
                     name = fn.get("name") or call.get("name") or "tool"
                     args = fn.get("arguments") or call.get("arguments") or ""
                     call_id = call.get("id") or call.get("tool_call_id") or "call"
-                    convo.append(f"Assistant: {text}\n[tool_call {name} id={call_id}: {str(args)[:400]}]".strip())
+                    convo.append(f"Assistant: {text}\n[tool_call {name} id={call_id}: {str(args)}]".strip())
                     text = ""
             if text:
                 convo.append(f"Assistant: {text}")
@@ -167,15 +170,20 @@ def _responses_item(item):
     if not isinstance(item, dict):
         return item
     kind = item.get("type")
-    if kind in ("function_call_output", "tool_result") and "role" not in item:
+    if kind in ("function_call_output", "custom_tool_call_output", "tool_result") and "role" not in item:
         return {"role": "tool", "name": item.get("name") or item.get("call_id") or "tool",
                 "tool_call_id": item.get("call_id") or item.get("tool_call_id"),
                 "content": item.get("output") if item.get("output") is not None else item.get("content")}
-    if kind == "function_call" and "role" not in item:
+    if kind in ("function_call", "custom_tool_call") and "role" not in item:
+        arguments = (json.dumps({"input": item.get("input", "")}, ensure_ascii=False)
+                     if kind == "custom_tool_call" else item.get("arguments") or "")
         return {"role": "assistant", "content": "",
-                "tool_calls": [{"function": {"name": item.get("name") or "tool",
-                                             "arguments": item.get("arguments") or ""}}]}
-    if kind in ("reasoning", "item_reference") and "role" not in item:
+                "tool_calls": [{"id": item.get("call_id") or item.get("id") or "call",
+                                "function": {"name": item.get("name") or "tool",
+                                             "arguments": arguments}}]}
+    if kind == "item_reference":
+        raise unprocessable("item_reference is not supported; send the full conversation items", param="input")
+    if kind == "reasoning" and "role" not in item:
         return {"role": "assistant", "content": item.get("summary") or ""}
     return item
 
@@ -198,10 +206,17 @@ def _finish(data, parsed):
     if declared:
         parsed.declared_ignored = declared
     stream_options = data.get("stream_options")
-    if isinstance(stream_options, dict) and stream_options.get("include_usage"):
-        parsed.wants_usage = True
+    if stream_options is not None:
+        if not isinstance(stream_options, dict):
+            raise unprocessable("'stream_options' must be an object", param="stream_options")
+        parsed.wants_usage = _opt_bool(stream_options, "include_usage")
     parsed.tools = _tools(data)
     parsed.tool_choice = _tool_choice(data.get("tool_choice"))
+    names = [tool["function"]["name"] for tool in parsed.tools]
+    if parsed.tool_choice == "required" and not names:
+        raise unprocessable("tool_choice requires at least one tool", param="tool_choice")
+    if isinstance(parsed.tool_choice, dict) and parsed.tool_choice["function"]["name"] not in names:
+        raise unprocessable("tool_choice must name a declared tool", param="tool_choice")
     return parsed
 
 
@@ -217,14 +232,19 @@ def _tools(data):
         where = f"tools[{index}]"
         if not isinstance(tool, dict):
             raise unprocessable(f"{where} must be an object", param=where)
-        if tool.get("type", "function") != "function":
-            raise unprocessable(f"{where}.type must be 'function'", param=where + ".type")
+        kind = tool.get("type", "function")
+        if kind not in ("function", "custom"):
+            raise unprocessable(f"{where}.type must be 'function' or 'custom'", param=where + ".type")
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
         name = fn.get("name")
         if not isinstance(name, str) or not name.strip():
             raise unprocessable(f"{where}.function.name must be a non-empty string",
                                 param=where + ".function.name")
+        if any(item["function"]["name"] == name for item in result):
+            raise unprocessable(f"duplicate tool name '{name}'", param=where + ".name")
         parameters = fn.get("parameters", fn.get("input_schema", {}))
+        if kind == "custom":
+            parameters = {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}
         if not isinstance(parameters, dict):
             raise unprocessable(f"{where}.function.parameters must be an object",
                                 param=where + ".function.parameters")
@@ -236,6 +256,14 @@ def _tools(data):
                 "parameters": parameters,
             },
         })
+        if kind == "custom":
+            result[-1]["function"]["x-client-type"] = "custom"
+            if tool.get("format") is not None:
+                if not isinstance(tool["format"], dict):
+                    raise unprocessable("custom tool format must be an object", param=where + ".format")
+                result[-1]["function"]["x-format"] = tool["format"]
+        if fn.get("strict") is not None:
+            result[-1]["function"]["strict"] = _opt_bool(fn, "strict")
     return result
 
 
@@ -255,7 +283,7 @@ def _tool_choice(value):
             return "none"
         if choice_type == "any":
             return "required"
-        if value.get("type") == "tool" and isinstance(value.get("name"), str):
+        if choice_type in ("tool", "custom") and isinstance(value.get("name"), str):
             return {"type": "function", "function": {"name": value["name"]}}
         if choice_type == "function" and fn is None and isinstance(value.get("name"), str):
             return {"type": "function", "function": {"name": value["name"]}}
@@ -268,40 +296,16 @@ def _tool_choice(value):
 def conversation_key(data, header_value=None):
     """Return a stable affinity key for one client dialogue.
 
-    OpenCode supplies a session header.  The body fallback keeps ordinary
-    OpenAI clients usable without making every request a new Retool thread.
+    Without an explicit client identity, full request history is sufficient
+    and a fresh upstream thread prevents unrelated clients sharing history.
     """
     if isinstance(header_value, str) and header_value.strip():
-        return "header:" + header_value.strip()[:256]
+        return "header:" + header_value.strip()
     for key in ("conversation", "conversation_id", "session_id"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
-            return key + ":" + value.strip()[:256]
-    messages = data.get("messages")
-    if messages is None:
-        raw = data.get("input") or data.get("prompt") or ""
-        if isinstance(raw, list):
-            stable = []
-            for item in raw[:4]:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") in ("message", "input_text") or item.get("role") in ("system", "developer", "user"):
-                    stable.append({"role": item.get("role"), "type": item.get("type"),
-                                   "content": item.get("content") or item.get("input_text")})
-            raw = stable
-        seed = {"input": raw, "instructions": data.get("instructions"), "model": data.get("model")}
-    else:
-        stable = []
-        for message in messages[:4] if isinstance(messages, list) else []:
-            if not isinstance(message, dict):
-                continue
-            role = message.get("role")
-            if role in ("system", "developer", "user"):
-                stable.append({"role": role, "content": message.get("content")})
-        seed = {"messages": stable, "model": data.get("model")}
-    digest = hashlib.sha256(json.dumps(seed, ensure_ascii=False, sort_keys=True,
-                                      separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
-    return "body:" + digest
+            return key + ":" + value.strip()
+    return None
 
 
 def parse_chat(data, cfg):
@@ -312,11 +316,11 @@ def parse_chat(data, cfg):
     messages = _messages(data)
     system, prompt = _render_messages(messages)
     parsed.system, parsed.prompt = system, prompt
-    parsed.stream = bool(data.get("stream"))
+    parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
                          or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
     parsed.temperature = _opt_float(data, "temperature")
-    parsed.show_thinking = bool(cfg.get("show_thinking", True))
+    parsed.show_thinking = _show_thinking(data, cfg)
     return _finish(data, parsed)
 
 
@@ -339,10 +343,10 @@ def parse_responses(data, cfg):
     instructions = _opt_str(data, "instructions") or ""
     parsed.system = "\n\n".join(x for x in (instructions, system) if x)
     parsed.prompt = prompt
-    parsed.stream = bool(data.get("stream"))
+    parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
-    parsed.show_thinking = bool(cfg.get("show_thinking", True))
+    parsed.show_thinking = _show_thinking(data, cfg)
     return _finish(data, parsed)
 
 
@@ -358,7 +362,7 @@ def parse_anthropic(data, cfg):
     if declared_system:
         parsed.system = _blocks_to_text(declared_system, 0, "system")
     parsed.prompt = prompt
-    parsed.stream = bool(data.get("stream"))
+    parsed.stream = _opt_bool(data, "stream")
     if data.get("max_tokens") is None:
         raise bad_request("'max_tokens' is required for the Anthropic dialect", param="max_tokens")
     parsed.max_tokens = _opt_int(data, "max_tokens", high=_cap(entry))
@@ -366,35 +370,54 @@ def parse_anthropic(data, cfg):
     stop = data.get("stop_sequences")
     if stop is not None and not isinstance(stop, list):
         raise unprocessable("'stop_sequences' must be an array", param="stop_sequences")
-    parsed.show_thinking = bool(cfg.get("show_thinking", True))
+    parsed.show_thinking = _show_thinking(data, cfg)
     return _finish(data, parsed)
 
 
 def _effort(data):
-    """Accept reasoning_effort, reasoning.effort and thinking.budget_tokens."""
+    """Translate client controls to the actual Retool modelProvider effort field."""
+    selected = []
     if data.get("reasoning_effort") is not None:
-        return _opt_str(data, "reasoning_effort")
+        selected.append(_opt_str(data, "reasoning_effort"))
     reasoning = data.get("reasoning")
-    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
-        return _opt_str(reasoning, "effort")
     if reasoning is not None and not isinstance(reasoning, dict):
         raise unprocessable("'reasoning' must be an object", param="reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        selected.append(_opt_str(reasoning, "effort"))
+    output = data.get("output_config")
+    if output is not None and not isinstance(output, dict):
+        raise unprocessable("'output_config' must be an object", param="output_config")
+    if isinstance(output, dict) and output.get("effort") is not None:
+        selected.append(_opt_str(output, "effort"))
     thinking = data.get("thinking")
     if thinking is not None and not isinstance(thinking, dict):
         raise unprocessable("'thinking' must be an object", param="thinking")
     if isinstance(thinking, dict):
         kind = thinking.get("type")
         if kind is not None:
-            if not isinstance(kind, str) or kind.lower() not in ("enabled", "disabled", "auto"):
-                raise unprocessable("thinking.type must be 'enabled', 'disabled' or 'auto'",
+            if not isinstance(kind, str) or kind.lower() not in ("enabled", "disabled", "auto", "adaptive"):
+                raise unprocessable("thinking.type must be 'enabled', 'disabled', 'adaptive' or 'auto'",
                                     param="thinking.type")
             if kind.lower() == "disabled":
-                return None
+                selected.append("none")
         if thinking.get("effort") is not None:
-            return _opt_str(thinking, "effort")
+            selected.append(_opt_str(thinking, "effort"))
         if thinking.get("budget_tokens") is not None:
-            budget = thinking["budget_tokens"]
-            if isinstance(budget, str) and budget.strip().isdigit():
-                budget = int(budget)
-            return model_catalog.effort_from_budget(budget)
-    return None
+            if isinstance(kind, str) and kind.lower() in ("disabled", "adaptive"):
+                raise unprocessable("budget_tokens requires enabled thinking", param="thinking.budget_tokens")
+            selected.append(model_catalog.effort_from_budget(thinking["budget_tokens"]))
+    selected = [value.lower() for value in selected]
+    if len(set(selected)) > 1:
+        raise unprocessable("conflicting reasoning effort controls", param="reasoning_effort")
+    return selected[0] if selected else None
+
+
+def _show_thinking(data, cfg):
+    show = bool(cfg.get("show_thinking", True))
+    thinking = data.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("display") is not None:
+        display = thinking["display"]
+        if display not in ("summarized", "omitted"):
+            raise unprocessable("thinking.display must be 'summarized' or 'omitted'", param="thinking.display")
+        show = show and display != "omitted"
+    return show

@@ -109,7 +109,9 @@ def test_conversation_pool_reuses_one_thread_per_affinity_key():
         return a1, b, a2
 
     a1, b, a2 = asyncio.run(scenario())
-    assert a1 is a2
+    assert a1 is not a2
+    assert a1.session is a2.session
+    assert a1.thread_id == a2.thread_id
     assert a1.thread_id != b.thread_id
     assert backend.created == ["thread-1", "thread-2"]
 

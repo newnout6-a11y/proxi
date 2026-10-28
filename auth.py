@@ -7,8 +7,26 @@ from apierr import unauthorized
 CLIENT_VERSION = "4.84.0-16f3123 (Build 409813)"
 
 
+def client_headers(key=None):
+    """Load the local relay credential without requiring upstream config."""
+    if key is None:
+        key = os.environ.get("RELAY_API_KEY")
+        if not key:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay_key.txt")
+            try:
+                with open(path, encoding="utf-8") as source:
+                    key = source.read().strip()
+            except FileNotFoundError:
+                key = None
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("missing relay API key: set RELAY_API_KEY or create relay_key.txt")
+    return {"content-type": "application/json",
+            "authorization": "Bearer " + key.strip().encode("utf-8").decode("latin-1")}
+
+
 def extract_key(headers) -> str:
     """Pull a relay key from Authorization, x-api-key or ?key= (handled by caller)."""
+    headers = {key.lower(): value for key, value in headers.items()}
     auth = headers.get("authorization") or ""
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
@@ -20,12 +38,15 @@ def extract_key(headers) -> str:
 
 def verify(headers, query_key, expected: str) -> None:
     """Constant-time check of the relay key. Raises 401."""
-    presented = extract_key(headers) or (query_key or "").strip()
+    presented = extract_key(headers)
+    from_header = bool(presented)
+    presented = presented or (query_key or "").strip()
     if not presented:
         raise unauthorized()
     # compare_digest refuses non-ASCII str; headers arrive latin-1 decoded, so
     # round-trip back to the original bytes and compare those.
-    if not hmac.compare_digest(presented.encode("latin-1", "replace"), expected.encode("utf-8")):
+    encoded = presented.encode("latin-1", "replace") if from_header else presented.encode("utf-8")
+    if not hmac.compare_digest(encoded, expected.encode("utf-8")):
         raise unauthorized("invalid relay API key")
 
 

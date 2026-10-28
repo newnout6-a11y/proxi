@@ -1,7 +1,10 @@
 """Dialect adapters: OpenAI Chat, OpenAI Responses, Anthropic Messages."""
 import json
+import re
 import time
 import uuid
+
+import apierr
 
 
 def approx_tokens(text: str) -> int:
@@ -20,14 +23,25 @@ class _Base:
         self.credits = 0.0
         self.exec_lines = 0
         self.tool_calls = []
+        self._custom_tools = {
+            tool.get("function", {}).get("name")
+            for tool in getattr(parsed, "tools", [])
+            if tool.get("x-client-type") == "custom"
+            or tool.get("function", {}).get("x-client-type") == "custom"
+        }
 
     def feed(self, event):
         kind = event.get("type")
         if kind == "thinking":
-            self.thinking += event["delta"]
             if not self.parsed.show_thinking:
                 return
+            self.thinking += event["delta"]
             self._think(event["delta"])
+            if event.get("signature"):
+                self._signature(event["signature"])
+        elif kind == "thinking_signature":
+            if self.parsed.show_thinking:
+                self._signature(event.get("signature", ""))
         elif kind == "text":
             self.text += event["delta"]
             self._text(event["delta"])
@@ -59,6 +73,9 @@ class _Base:
     def _think(self, delta):
         pass
 
+    def _signature(self, signature):
+        pass
+
     def _feed_tool_call(self, event):
         call_id = str(event.get("id") or "call_0")
         name = str(event.get("name") or "tool")
@@ -69,13 +86,15 @@ class _Base:
         is_new = current is None
         if current is None:
             current = {"id": call_id, "name": name, "arguments": ""}
+            if event.get("tool_type") == "custom" or name in self._custom_tools:
+                current["tool_type"] = "custom"
             self.tool_calls.append(current)
         if arguments.startswith(current["arguments"]):
             delta = arguments[len(current["arguments"]):]
         else:
             delta = arguments
         current["arguments"] = arguments
-        self._tool_call(len(self.tool_calls) - 1, current, delta, new=is_new)
+        self._tool_call(self.tool_calls.index(current), current, delta, new=is_new)
 
     def _tool_call(self, index, call, delta, new=False):
         pass
@@ -144,7 +163,7 @@ class ChatAdapter(_Base):
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
                 "choices": [{"index": 0, "message": {"role": "assistant",
-                                                     "content": None if self.tool_calls else self.text,
+                                                     "content": self.text or (None if self.tool_calls else ""),
                                                      **({"reasoning_content": self.thinking} if self.thinking else {}),
                                                      **({"tool_calls": [{"id": call["id"], "type": "function",
                                                                           "function": {"name": call["name"],
@@ -165,6 +184,9 @@ class ResponsesAdapter(_Base):
         self.seq = 0
         self.item_id = "msg_" + uuid.uuid4().hex[:20]
         self.reasoning_id = "rs_" + uuid.uuid4().hex[:20]
+        self._items = []
+        self._indices = {}
+        self._custom_inputs = {}
 
     def _emit(self, name, payload):
         if not self.writer:
@@ -176,70 +198,126 @@ class ResponsesAdapter(_Base):
     def begin(self):
         self._emit("response.created", {"response": {"id": self.id, "object": "response",
                                                      "created_at": self.created, "model": self.parsed.model,
-                                                     "status": "in_progress"}})
-        self._emit("response.output_item.added", {"output_index": 0,
-                                                  "item": {"id": self.item_id, "type": "message",
-                                                           "role": "assistant", "content": []}})
-        self._emit("response.content_part.added", {"item_id": self.item_id, "output_index": 0,
-                                                   "content_index": 0,
-                                                   "part": {"type": "output_text", "text": ""}})
+                                                     "status": "in_progress", "output": []}})
+
+    def _ensure_item(self, kind, item_id, call=None):
+        if item_id in self._indices:
+            return self._indices[item_id]
+        index = len(self._items)
+        self._indices[item_id] = index
+        self._items.append((kind, item_id, call))
+        self._emit("response.output_item.added", {"output_index": index,
+                                                  "item": self._item(index, started=True)})
+        if kind == "message":
+            self._emit("response.content_part.added", {"item_id": item_id, "output_index": index,
+                                                       "content_index": 0,
+                                                       "part": {"type": "output_text", "text": "", "annotations": []}})
+        elif kind == "reasoning":
+            self._emit("response.reasoning_summary_part.added", {
+                "item_id": item_id, "output_index": index, "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            })
+        return index
+
+    @staticmethod
+    def _custom_input(call):
+        arguments = call["arguments"]
+        try:
+            value = json.loads(arguments)
+        except (ValueError, TypeError):
+            # Normalized envelopes can arrive in several fragments. Do not send
+            # the partially escaped JSON wrapper as the actual custom-tool input.
+            return None if re.match(r'^\s*\{\s*"input"\s*:', arguments) else arguments
+        if isinstance(value, dict) and isinstance(value.get("input"), str):
+            return value["input"]
+        return arguments
+
+    def _item(self, index, *, started=False, status="completed"):
+        kind, item_id, call = self._items[index]
+        status = "in_progress" if started else status
+        if kind == "reasoning":
+            return {"id": item_id, "type": kind, "status": status,
+                    "summary": [] if started else [{"type": "summary_text", "text": self.thinking}]}
+        if kind == "message":
+            return {"id": item_id, "type": kind, "role": "assistant", "status": status,
+                    "content": [] if started else [{"type": "output_text", "text": self.text, "annotations": []}]}
+        item = {"id": item_id, "type": kind, "call_id": call["id"], "name": call["name"], "status": status}
+        if kind == "custom_tool_call":
+            value = "" if started else self._custom_input(call)
+            if value is None:
+                raise apierr.upstream_error("Retool returned incomplete custom tool input")
+            item["input"] = value
+        else:
+            item["arguments"] = "" if started else call["arguments"]
+        return item
 
     def _text(self, delta):
-        self._emit("response.output_text.delta", {"item_id": self.item_id, "output_index": 0,
+        index = self._ensure_item("message", self.item_id)
+        self._emit("response.output_text.delta", {"item_id": self.item_id, "output_index": index,
                                                   "content_index": 0, "delta": delta})
 
     def _think(self, delta):
+        index = self._ensure_item("reasoning", self.reasoning_id)
         self._emit("response.reasoning_summary_text.delta", {"item_id": self.reasoning_id,
-                                                             "output_index": 0,
+                                                             "output_index": index,
                                                              "summary_index": 0, "delta": delta})
 
     def _tool_call(self, index, call, delta, new=False):
-        output_index = index + 1
-        if new:
-            self._emit("response.output_item.added", {
-                "output_index": output_index,
-                "item": {"id": call["id"], "type": "function_call", "call_id": call["id"],
-                         "name": call["name"], "arguments": ""},
-            })
+        custom = call.get("tool_type") == "custom"
+        kind = "custom_tool_call" if custom else "function_call"
+        output_index = self._ensure_item(kind, call["id"], call)
+        if custom:
+            current = self._custom_input(call)
+            if current is None:
+                return
+            previous = self._custom_inputs.get(call["id"], "")
+            delta = current[len(previous):] if current.startswith(previous) else current
+            self._custom_inputs[call["id"]] = current
         if delta:
-            self._emit("response.function_call_arguments.delta", {
+            self._emit("response.custom_tool_call_input.delta" if custom else "response.function_call_arguments.delta", {
                 "item_id": call["id"], "output_index": output_index, "delta": delta,
             })
 
     def end(self, reason, prompt_text=""):
-        prompt, completion = self.usage(prompt_text)
-        self._emit("response.output_text.done", {"item_id": self.item_id, "output_index": 0,
-                                                 "content_index": 0, "text": self.text})
-        for index, call in enumerate(self.tool_calls):
-            output_index = index + 1
-            self._emit("response.function_call_arguments.done", {
-                "item_id": call["id"], "output_index": output_index, "arguments": call["arguments"]
-            })
+        if not self._items:
+            self._ensure_item("message", self.item_id)
+        status = "incomplete" if reason == "timeout" else "completed"
+        for index, (kind, item_id, call) in enumerate(self._items):
+            fields = {"item_id": item_id, "output_index": index}
+            if kind == "message":
+                fields["content_index"] = 0
+                self._emit("response.output_text.done", {**fields, "text": self.text})
+                self._emit("response.content_part.done", {
+                    **fields, "part": {"type": "output_text", "text": self.text, "annotations": []},
+                })
+            elif kind == "reasoning":
+                fields["summary_index"] = 0
+                self._emit("response.reasoning_summary_text.done", {**fields, "text": self.thinking})
+                self._emit("response.reasoning_summary_part.done", {
+                    **fields, "part": {"type": "summary_text", "text": self.thinking},
+                })
+            elif kind == "custom_tool_call":
+                self._emit("response.custom_tool_call_input.done", {**fields, "input": self._item(index)["input"]})
+            else:
+                self._emit("response.function_call_arguments.done", {**fields, "arguments": call["arguments"]})
             self._emit("response.output_item.done", {
-                "output_index": output_index,
-                "item": {"id": call["id"], "type": "function_call", "call_id": call["id"],
-                         "name": call["name"], "arguments": call["arguments"], "status": "completed"},
+                "output_index": index, "item": self._item(index, status=status),
             })
         final = self.payload(reason, prompt_text)
-        self._emit("response.completed", {"response": final})
+        self._emit("response.incomplete" if reason == "timeout" else "response.completed", {"response": final})
         if self.writer:
             self.writer.done()
         return final
 
     def payload(self, reason, prompt_text=""):
         prompt, completion = self.usage(prompt_text)
+        if not self._items:
+            self._ensure_item("message", self.item_id)
+        status = "incomplete" if reason == "timeout" else "completed"
         return {"id": self.id, "object": "response", "created_at": self.created,
                 "model": self.parsed.model,
-                "status": "incomplete" if reason == "timeout" else "completed",
-                "output": ([{"id": self.reasoning_id, "type": "reasoning",
-                             "summary": [{"type": "summary_text", "text": self.thinking}]}]
-                           if self.thinking else [])
-                + [{"id": call["id"], "type": "function_call", "call_id": call["id"],
-                   "name": call["name"], "arguments": call["arguments"], "status": "completed"}
-                   for call in self.tool_calls]
-                + [{"id": self.item_id, "type": "message", "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": self.text}]}],
+                "status": status,
+                "output": [self._item(index, status=status) for index in range(len(self._items))],
                 "output_text": self.text,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "total_tokens": prompt + completion,
@@ -252,6 +330,9 @@ class AnthropicAdapter(_Base):
         self.id = "msg_" + uuid.uuid4().hex[:20]
         self.open_kind = None
         self.index = 0
+        self._blocks = []
+        self._open_indices = set()
+        self._tool_indices = {}
 
     def _emit(self, name, payload):
         if self.writer:
@@ -264,38 +345,66 @@ class AnthropicAdapter(_Base):
             "usage": {"input_tokens": self.usage()[0], "output_tokens": 0}}})
         self._emit("ping", {"type": "ping"})
 
+    def _close_blocks(self):
+        for index in sorted(self._open_indices):
+            self._emit("content_block_stop", {"type": "content_block_stop", "index": index})
+        self._open_indices.clear()
+        self.open_kind = None
+
     def _open(self, kind):
-        if self.open_kind == kind:
-            return
-        if self.open_kind is not None:
-            self._emit("content_block_stop", {"type": "content_block_stop", "index": self.index})
-            self.index += 1
+        if self.open_kind == kind and kind != "tool":
+            return self._blocks[self.index]
+        self._close_blocks()
         self.open_kind = kind
-        block = {"type": "thinking", "thinking": ""} if kind == "thinking" else {"type": "text", "text": ""}
+        # Retool does not normally provide an Anthropic signature. An empty
+        # schema field is not a fabricated cryptographic signature; genuine
+        # signature events, when available, are relayed unchanged below.
+        block = ({"type": "thinking", "thinking": "", "signature": ""}
+                 if kind == "thinking" else {"type": "text", "text": ""})
+        self.index = len(self._blocks)
+        self._blocks.append(block)
+        self._open_indices.add(self.index)
         self._emit("content_block_start", {"type": "content_block_start", "index": self.index,
-                                           "content_block": block})
+                                           "content_block": dict(block)})
+        return block
 
     def _think(self, delta):
-        self._open("thinking")
+        block = self._open("thinking")
+        block["thinking"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                            "delta": {"type": "thinking_delta", "thinking": delta}})
 
+    def _signature(self, signature):
+        if signature and self.open_kind == "thinking":
+            self._blocks[self.index]["signature"] += signature
+            self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
+                                               "delta": {"type": "signature_delta", "signature": signature}})
+
     def _text(self, delta):
-        self._open("text")
+        block = self._open("text")
+        block["text"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                            "delta": {"type": "text_delta", "text": delta}})
 
     def _tool_call(self, index, call, delta, new=False):
         if new:
-            if self.open_kind is not None:
-                self._emit("content_block_stop", {"type": "content_block_stop", "index": self.index})
-                self.index += 1
+            if self.open_kind != "tool":
+                self._close_blocks()
             self.open_kind = "tool"
+            self.index = len(self._blocks)
+            self._blocks.append({"type": "tool_use", "id": call["id"], "name": call["name"], "input": {}})
+            self._tool_indices[call["id"]] = self.index
+            self._open_indices.add(self.index)
             self._emit("content_block_start", {"type": "content_block_start", "index": self.index,
                                                "content_block": {"type": "tool_use", "id": call["id"],
                                                                  "name": call["name"], "input": {}}})
+        block_index = self._tool_indices[call["id"]]
+        try:
+            self._blocks[block_index]["input"] = json.loads(call["arguments"] or "{}")
+        except ValueError:
+            pass  # streamed JSON fragments are finalized by a subsequent delta
         if delta:
-            self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
+            self._emit("content_block_delta", {"type": "content_block_delta", "index": block_index,
                                                "delta": {"type": "input_json_delta", "partial_json": delta}})
 
     def _stop_reason(self, reason):
@@ -307,9 +416,9 @@ class AnthropicAdapter(_Base):
 
     def end(self, reason, prompt_text=""):
         usage = {"input_tokens": self.usage(prompt_text)[0], "output_tokens": self.usage(prompt_text)[1]}
-        if self.open_kind is None:
+        if not self._blocks:
             self._open("text")
-        self._emit("content_block_stop", {"type": "content_block_stop", "index": self.index})
+        self._close_blocks()
         self._emit("message_delta", {"type": "message_delta",
                                      "delta": {"stop_reason": self._stop_reason(reason), "stop_sequence": None},
                                      "usage": usage})
@@ -321,11 +430,7 @@ class AnthropicAdapter(_Base):
     def payload(self, reason, prompt_text=""):
         prompt, completion = self.usage(prompt_text)
         return {"id": self.id, "type": "message", "role": "assistant", "model": self.parsed.model,
-                "content": ([{"type": "thinking", "thinking": self.thinking}] if self.thinking else [])
-                + [{"type": "tool_use", "id": call["id"], "name": call["name"],
-                    "input": json.loads(call["arguments"] or "{}")}
-                   for call in self.tool_calls]
-                + [{"type": "text", "text": self.text}],
+                "content": [dict(block) for block in self._blocks] or [{"type": "text", "text": ""}],
                 "stop_reason": self._stop_reason(reason), "stop_sequence": None,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "credits_used": round(self.credits, 5), "estimated": True}}

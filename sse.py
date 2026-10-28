@@ -19,6 +19,9 @@ class StreamWriter:
         self.handler.send_header("x-accel-buffering", "no")
         for key, value in (headers or {}).items():
             self.handler.send_header(key, value)
+        cors = getattr(self.handler, "_cors", None)
+        if cors is not None:
+            cors()
         self.handler.end_headers()
 
     def raw(self, text: str):

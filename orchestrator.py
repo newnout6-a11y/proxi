@@ -2,6 +2,7 @@
 import asyncio
 import json
 import queue
+import threading
 import uuid
 
 import apierr
@@ -30,7 +31,6 @@ class TurnRunner:
         self.cfg = cfg
         self.credits = credits
         self.pool = pool
-        self._recent = []
 
     def _can_exec(self, steps: int) -> bool:
         """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
@@ -39,18 +39,24 @@ class TurnRunner:
         max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
         return max_steps <= 0 or steps < max_steps
 
-    def _looks_looping(self, command: str) -> bool:
+    def _looks_looping(self, command: str, history) -> bool:
         """True when this command already ran three times in the recent window."""
         key = " ".join(command.strip().lower().split())
-        recent = [" ".join(c.strip().lower().split()) for c, _ in self._recent]
+        recent = [" ".join(c.strip().lower().split()) for c, _ in history]
         return recent.count(key) >= 3
 
-    def _remember(self, command: str) -> None:
-        self._recent.append((command, 0))
-        if len(self._recent) > 8:
-            del self._recent[0]
+    def _remember(self, command: str, history) -> None:
+        history.append((command, 0))
+        if len(history) > 8:
+            del history[0]
 
-    def _instructions(self):
+    def _instructions(self, native_tools=False):
+        if native_tools:
+            return ("[ROLE]\nYou are a coding assistant using the client's tools. "
+                    "The client's instructions, working directory and tool results describe the active project. "
+                    "Use those tools to inspect, edit and test that project. "
+                    "Do not claim to have read, changed or tested files without tool evidence. "
+                    "Reply in the user's language. Do not use relay-local <exec_command> tags.")
         return build_system_instructions(
             self.cfg["workspace_root"],
             enable_context=self.cfg["project_context"],
@@ -104,24 +110,34 @@ class TurnRunner:
         turn_id = str(uuid.uuid4())
         holder["turn_id"] = turn_id
         # Loop detection is per client turn, never shared by concurrent chats.
-        self._recent = []
+        recent = []
+        cancelled = holder.setdefault("cancel_event", threading.Event())
         exec_steps = 0
         empty_retries = 0
         final_summary = False
         try:
-            instructions = self._instructions()
             native_tools = getattr(parsed, "tools", None) or []
-            tool_names = [item["function"]["name"] for item in native_tools]
+            tool_definitions = {item["function"]["name"]: item["function"] for item in native_tools}
+            choice = getattr(parsed, "tool_choice", "auto")
+            tool_names = list(tool_definitions) if choice != "none" else []
+            if isinstance(choice, dict):
+                tool_names = [choice["function"]["name"]]
+            instructions = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._instructions(native_tools=bool(native_tools)))
+            if cancelled.is_set():
+                raise asyncio.CancelledError()
             reminder = ""
             if native_tools and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif self.cfg["exec_policy"] != "off":
+            elif not native_tools and self.cfg["exec_policy"] != "off":
                 reminder = (
                     "\n\n[LOCAL EXEC REMINDER]\n"
                     "To run anything on the user's machine you MUST output "
                     "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
                     "Do not answer that you cannot run commands."
                 )
+            if parsed.system:
+                instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
             prompt = (instructions + "\n\n" + parsed.prompt) if instructions else parsed.prompt
             prompt += reminder
             task_block = ""
@@ -130,8 +146,11 @@ class TurnRunner:
                 "model": parsed.model,
                 "providerResourceName": model_catalog.provider_resource(self.cfg, parsed.entry),
             }
-            if parsed.effort:
-                model_provider["reasoningEffort"] = parsed.effort
+            effort = parsed.effort
+            if effort is None and parsed.entry.get("reasoning") and self.cfg.get("reasoning_effort"):
+                _, effort = model_catalog.resolve(parsed.model, self.cfg["reasoning_effort"])
+            if effort is not None:
+                model_provider["reasoningEffort"] = effort
 
             base_prompt = prompt
             session = None
@@ -140,6 +159,9 @@ class TurnRunner:
                 session = await self.pool.acquire(key) if key else await self.pool.acquire()
                 holder["session"] = session
                 while True:
+                    if cancelled.is_set():
+                        session.cancel()
+                        raise asyncio.CancelledError()
                     final_text = ""
                     streamed_tool_call = False
                     stream = (session.stream(prompt, model_provider, tool_names=tool_names)
@@ -155,9 +177,12 @@ class TurnRunner:
                         elif event["type"] == "final_text":
                             if event.get("text"):
                                 final_text = event["text"]
-                        elif event["type"] == "tool_call":
-                            streamed_tool_call = True
+                        elif event["type"] in ("thinking", "thinking_signature"):
                             out.put(event)
+                        elif event["type"] == "tool_call" and event.get("name") in tool_names:
+                            streamed_tool_call = True
+                            definition = tool_definitions[event["name"]]
+                            out.put({**event, "tool_type": definition.get("x-client-type", "function")})
                         elif event["type"] == "credits":
                             self.credits.record_turn(turn_id, event["value"])
                             out.put(event)
@@ -171,12 +196,14 @@ class TurnRunner:
                                 return
                     holder.setdefault("reason", "stop")
 
-                    native_call = executor.extract_tool_call(final_text, tool_names) if native_tools else None
-                    if native_call is None and native_tools:
+                    native_call = executor.extract_tool_call(final_text, tool_names) if tool_names else None
+                    if native_call is None and tool_names:
                         native_call = executor.command_tool_call(final_text, tool_names)
                     if native_call is not None:
                         if not streamed_tool_call:
-                            out.put({"type": "tool_call", **native_call})
+                            definition = tool_definitions[native_call["name"]]
+                            out.put({"type": "tool_call", **native_call,
+                                     "tool_type": definition.get("x-client-type", "function")})
                         holder["reason"] = "tool_calls"
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
@@ -184,6 +211,8 @@ class TurnRunner:
                         holder["reason"] = "tool_calls"
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
+                    if tool_names and (choice == "required" or isinstance(choice, dict)):
+                        raise apierr.upstream_error("upstream did not honor the required client tool choice")
                     if native_tools and not streamed_tool_call and final_text.strip():
                         # A tool-enabled request may still be answered directly.
                         out.put({"type": "text", "delta": final_text})
@@ -200,7 +229,7 @@ class TurnRunner:
                         continue
 
                     # Loop guard: the same command keeps coming back (any period).
-                    if command and not final_summary and self._looks_looping(command):
+                    if command and not final_summary and self._looks_looping(command, recent):
                         final_summary = True
                         prompt = prompt + "\n\n[ИТОГ] Команда '" + command + "' повторяется. " \
                                           "Команды больше не выполняй, дай итоговый ответ."
@@ -241,10 +270,14 @@ class TurnRunner:
                                 policy=self.cfg["exec_policy"],
                                 allowlist=self.cfg["exec_allowlist"],
                                 audit_path=self.cfg.get("command_log"),
+                                cancel_event=cancelled,
                             ),
                         )
                     except executor.PolicyError as exc:
                         code, output = 126, str(exc)
+                    if cancelled.is_set():
+                        session.cancel()
+                        raise asyncio.CancelledError()
                     output = redact(output, cookie_values=self.cfg.get("cookie_values", ()))
                     exec_steps += 1
 
@@ -259,7 +292,7 @@ class TurnRunner:
                         for c, e in previous_steps[-4:]
                     ) or "(none yet)"
                     previous_steps.append((command, code))
-                    self._remember(command)
+                    self._remember(command, recent)
 
                     limit = int(self.cfg.get("max_prompt_bytes", 128000))
                     header = task_block + "\n\nPrevious steps: " + trail

@@ -9,7 +9,7 @@ IGNORED_DIRS = {
     ".system_generated", ".gemini", "chunks", "probes", "experiments", ".idea",
     ".vscode", ".pytest_cache", ".mypy_cache",
 }
-DOC_FILES = ("README.md", "PROTOCOL.md")
+DOC_FILES = ("AGENTS.md", "README.md", "PROTOCOL.md")
 MAX_FILES = 60
 
 
@@ -26,7 +26,8 @@ def inside_workspace(path: str, workspace_root: str) -> bool:
     root = _safe_workspace(workspace_root)
     if not root:
         return False
-    target = os.path.realpath(path)
+    target = os.path.normcase(os.path.realpath(path))
+    root = os.path.normcase(root)
     return target == root or target.startswith(root + os.sep)
 
 
@@ -87,6 +88,9 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
         if budget <= 0:
             break
         path = os.path.join(workspace_root, doc)
+        if not inside_workspace(path, workspace_root):
+            warnings.append(doc + " points outside workspace; contents not loaded")
+            continue
         if not os.path.isfile(path):
             continue
         try:
@@ -105,7 +109,7 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
 
     lines.append("[END OF PROJECT CONTEXT]")
     text = "\n".join(lines)
-    return text[:limit]
+    return text.encode("utf-8")[:max(0, limit)].decode("utf-8", "ignore")
 
 
 def build_system_instructions(workspace_root: str, enable_context=True, enable_local_exec=True,

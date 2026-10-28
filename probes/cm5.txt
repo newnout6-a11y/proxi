@@ -1,8 +1,0 @@
-feat(relay): expose agent thinking as a separate stream
-
-- thinking frames are surfaced as deltas; adapters render them where the dialect allows:
-  chat delta.reasoning_content, anthropic thinking content block, responses reasoning events
-- upstream often sends thinking frames with empty content, so persisted thinking messages are
-  polled during the turn and streamed too
-- show_thinking config switch (default on); thinking still used as fallback when text is empty
-- tests: chat/anthropic/responses rendering, hidden switch, poller

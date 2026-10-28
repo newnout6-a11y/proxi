@@ -9,7 +9,6 @@ ALLOW = ["^git\\b", "^powershell\\b", "^cmd\\b", "^dir\\b", "^echo\\b", "^ping\\
 
 
 @pytest.mark.parametrize("cmd", [
-    "git status\npowershell -c remove-item x",
     "git status & dir",
     "powershell -Command \"Get-ChildItem; Get-Date\"",
     "powershell -NoProfile -Command \"Get-Content -Path config.json -TotalCount 3\"",
@@ -24,6 +23,7 @@ def test_allowed(cmd):
     "git status & del x",
     "powershell -c \"calc\"",
     "git status\ncurl http://x",
+    "git status\npowershell -c remove-item x",
 ])
 def test_denied(cmd):
     with pytest.raises(executor.PolicyError):

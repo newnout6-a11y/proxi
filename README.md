@@ -29,8 +29,13 @@ Anthropic-клиентов (Codex, opencode, Aider, Continue, Claude Code, curl)
 
     python -m pip install -r requirements.txt
     copy config.example.json config.json     # заполнить base/page_uuid/cookie/xsrf/workspace_root
-    $env:RELAY_API_KEY = "<длинный случайный ключ>"
-    python proxy.py
+    python proxy.py                          # ключ сам появится в relay_key.txt
+
+Фоновый запуск, переживающий закрытие терминала и перезапускающийся при падении:
+
+    Start-Process pwsh -ArgumentList '-NoProfile','-File','scripts\run_relay.ps1' -WindowStyle Hidden -PassThru |
+        ForEach-Object { $_.Id | Out-File relay.pid }
+    taskkill /PID (Get-Content relay.pid) /T /F     # остановить (супервизор перезапустит — убивать с /T)
 
 Если RELAY_API_KEY и relay_api_key не заданы, ключ генерируется в relay_key.txt
 и печатается в баннере маскированно.

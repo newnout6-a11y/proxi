@@ -17,6 +17,8 @@
 
   "max_body_bytes": 33554432,
   "max_workers": 32,
+  "max_conversations": 128,
+  "conversation_idle_timeout": 900,
   "rate_limit_rps": 32,
   "rate_limit_burst": 64,
   "turn_timeout": 300,
@@ -31,7 +33,7 @@
 
   "exec_policy": "allowlist",
   "exec_policy_note": "allowlist режет команду по \\n и \\u0026\\u0026 || | ; \\u0026 вне кавычек; тело powershell/cmd после -Command/-c проверяется рекурсивно",
-  "exec_allowlist": ["^powershell\\b", "^pwsh\\b", "^cmd\\b", "^git\\b", "^dir\\b", "^type\\b", "^findstr\\b", "^python\\b", "^npm\\b"],
+  "exec_allowlist": ["^powershell\\b", "^pwsh\\b", "^cmd\\b", "^git\\b", "^dir\\b", "^type\\b", "^findstr\\b"],
   "max_exec_turns": 0,
   "command_timeout": 40,
   "command_output_limit": 64000,

@@ -22,6 +22,8 @@ DEFAULTS = {
     "max_body_bytes": 32 * 1024 * 1024,
     "max_frame_bytes": 16 * 1024 * 1024,
     "max_workers": 32,
+    "max_conversations": 128,
+    "conversation_idle_timeout": 900,
     "rate_limit_rps": 32.0,
     "rate_limit_burst": 64.0,
     "turn_timeout": 300,
@@ -33,10 +35,9 @@ DEFAULTS = {
     "max_exec_turns": 0,          # 0 = без ограничения
     "exec_policy": "allowlist",
     "exec_allowlist": [
-        r"^powershell\b", r"^pwsh\b", r"^cmd\b", r"^git\b", r"^ping\b", r"^more\b", r"^dir\b", r"^type\b", r"^findstr\b", r"^where\b", r"^python\b",
-        r"^pytest\b", r"^npm\b", r"^node\b", r"^pip\b", r"^dotnet\b", r"^cargo\b",
+        r"^powershell\b", r"^pwsh\b", r"^cmd\b", r"^git\b", r"^ping\b", r"^more\b", r"^dir\b", r"^type\b", r"^findstr\b", r"^where\b",
         r"^rg\b", r"^Get-ChildItem\b", r"^Get-Content\b", r"^Select-String\b",
-        r"^curl\b", r"^echo\b", r"^cls\b", r"^mkdir\b",
+        r"^echo\b", r"^cls\b",
     ],
     "project_context": True,
     "context_max_bytes": 120000,
@@ -151,7 +152,7 @@ def load(path=CONFIG_PATH):
 
     for num_key in ("port", "agent_mode", "max_body_bytes", "max_frame_bytes", "max_workers",
                     "turn_timeout", "recv_timeout", "upstream_timeout",
-                    "session_refresh_interval",
+                    "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
                     "max_prompt_bytes"):
         try:
@@ -161,6 +162,8 @@ def load(path=CONFIG_PATH):
 
     if cfg["session_refresh_interval"] < 0:
         raise service_unavailable("session_refresh_interval must be non-negative (0 disables keepalive)")
+    if cfg["max_conversations"] < 1 or cfg["conversation_idle_timeout"] < 1:
+        raise service_unavailable("max_conversations and conversation_idle_timeout must be positive")
 
     for float_key in ("rate_limit_rps", "rate_limit_burst"):
         try:

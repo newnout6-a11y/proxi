@@ -1,6 +1,6 @@
-"""Model catalog mirrored from the Retool copilot bundle (probes/gen_models.py).
+"""Model metadata mirrored from the Retool copilot bundle.
 
-Regenerate with: python probes/gen_models.py && python probes/gen_models_py.py
+Effort capabilities describe the Retool route rather than the provider-wide union.
 """
 from apierr import bad_request, not_found, service_unavailable
 
@@ -9,6 +9,19 @@ EFFORTS_BY_PROVIDER = {
     "openai": ("minimal", "low", "medium", "high", "xhigh", "max", "none"),
     "anthropic": ("low", "medium", "high", "max"),
     "google": ("low", "medium", "high"),
+}
+
+# Per-model route capabilities from the Retool bundle. Provider-wide unions
+# advertise levels that individual models reject (for example GPT-5.5 xhigh).
+_BASE_EFFORTS = ("low", "medium", "high")
+_EFFORTS_BY_MODEL = {
+    "gpt-5": _BASE_EFFORTS + ("minimal",),
+    "gpt-5.1": ("none",) + _BASE_EFFORTS,
+    "gpt-5.2": ("none",) + _BASE_EFFORTS,
+    "gpt-6-astra": _BASE_EFFORTS + ("xhigh", "max"),
+    "gpt-6.1-sol": _BASE_EFFORTS + ("xhigh", "max"),
+    "gpt-6-sol": ("none",) + _BASE_EFFORTS + ("xhigh", "max"),
+    "gpt-6-luna": ("none",) + _BASE_EFFORTS + ("xhigh", "max"),
 }
 
 # Which config key holds the providerResourceName for each provider.
@@ -66,6 +79,13 @@ CATALOG = [
 
 _BY_ID = {m['id']: m for m in CATALOG}
 
+for _model in CATALOG:
+    _default_efforts = (_BASE_EFFORTS if _model['provider'] == 'openai'
+                        else EFFORTS_BY_PROVIDER.get(_model['provider'], ()))
+    _model['reasoning_effort_levels'] = list(_EFFORTS_BY_MODEL.get(_model['id'], _default_efforts))
+    if not _model.get('reasoning'):
+        _model['reasoning_effort_levels'] = []
+
 _BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))
 
 def catalog():
@@ -87,10 +107,10 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
             raise not_found(f"unknown model '{name}'; see GET /v1/models")
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name, 'context': 200000}
     if effort is not None:
-        allowed = EFFORTS_BY_PROVIDER.get(entry['provider'], ())
+        allowed = entry.get('reasoning_effort_levels', EFFORTS_BY_PROVIDER.get(entry['provider'], ()))
         if not isinstance(effort, str) or effort.lower() not in allowed:
             raise bad_request(
-                f"reasoning effort for {entry['provider']} must be one of {', '.join(allowed) or 'none'}",
+                f"reasoning effort for {name} must be one of {', '.join(allowed) or 'no supported levels'}",
                 param='reasoning_effort')
         effort = effort.lower()
         if not entry.get('reasoning', True):
@@ -110,9 +130,9 @@ def provider_resource(cfg, entry):
 
 
 def effort_from_budget(budget):
-    try:
+    if isinstance(budget, str) and budget.strip().isdigit():
         budget = int(budget)
-    except (TypeError, ValueError):
+    if isinstance(budget, bool) or not isinstance(budget, int):
         raise bad_request('thinking.budget_tokens must be an integer', param='thinking.budget_tokens')
     if budget < 1024:
         raise bad_request('thinking.budget_tokens must be >= 1024', param='thinking.budget_tokens')
