@@ -356,12 +356,16 @@ class SessionPool:
         """Take a session slot. Caller must always release() it."""
         await self._slots.acquire()
         if self.mode == "shared":
+            locked = False
             try:
                 await self._lock.acquire()
+                locked = True
                 if self._shared is None:
                     self._shared = RelaySession(self.backend, self.cfg["thread_id"])
                 return self._shared
-            except Exception:
+            except BaseException:
+                if locked:
+                    self._lock.release()
                 self._slots.release()
                 raise
         try:

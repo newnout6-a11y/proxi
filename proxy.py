@@ -273,7 +273,7 @@ def make_handler(runtime: Runtime):
             prompt_text = parsed.system + "\n" + parsed.prompt
             if not parsed.stream:
                 adapter = adapters.for_dialect(dialect, parsed)
-                reason = self._collect(fut, events, adapter, prompt_text)
+                reason = self._collect(fut, events, adapter, prompt_text, holder)
                 payload = adapter.end(reason, prompt_text)
                 self._json(200, payload)
                 return
@@ -289,12 +289,20 @@ def make_handler(runtime: Runtime):
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
 
-        def _collect(self, fut, events, adapter, prompt_text):
+        def _collect(self, fut, events, adapter, prompt_text, holder_session=None):
+            holder_session = holder_session or {}
             reason = "stop"
             while True:
                 try:
                     event = events.get(timeout=0.1)
                 except queue.Empty:
+                    # Non-stream turns can be abandoned as well: cancel upstream on disconnect.
+                    if sse.client_gone(self):
+                        session = holder_session.get("session")
+                        if session is not None:
+                            session.cancel()
+                        fut.cancel()
+                        return "cancelled"
                     if fut.done() and events.empty():
                         break
                     continue

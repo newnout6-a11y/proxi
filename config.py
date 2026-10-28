@@ -35,6 +35,7 @@ DEFAULTS = {
     ],
     "project_context": True,
     "context_max_bytes": 2500,
+    "max_prompt_bytes": 24000,
     "show_exec_output": True,
     "enable_anthropic": True,
     "enable_chat": True,
@@ -100,7 +101,8 @@ def load(path=CONFIG_PATH):
 
     for num_key in ("port", "agent_mode", "max_body_bytes", "max_frame_bytes", "max_workers",
                     "turn_timeout", "recv_timeout", "upstream_timeout",
-                    "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes"):
+                    "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
+                    "max_prompt_bytes"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):

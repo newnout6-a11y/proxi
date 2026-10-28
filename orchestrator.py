@@ -65,7 +65,8 @@ class TurnRunner:
                 )
             prompt = (instructions + "\n\n" + parsed.prompt) if instructions else parsed.prompt
             prompt += reminder
-            history_note = ""
+            task_block = ""
+            previous_steps = []
             model_provider = {
                 "model": parsed.model,
                 "providerResourceName": model_catalog.provider_resource(self.cfg, parsed.entry),
@@ -147,9 +148,16 @@ class TurnRunner:
                     if self.cfg["show_exec_output"]:
                         out.put({"type": "exec_result", "cmd": command, "output": output, "exit": code})
 
-                    history_note = (history_note + "\n\n" if history_note else "") + \
-                        "USER TASK:\n" + parsed.prompt
-                    followup = executor.format_command_followup(command, code, output, history_note)
+                    # Keep the task text once; earlier steps go in as a compact trail.
+                    if not task_block:
+                        task_block = "USER TASK:\n" + parsed.prompt
+                    trail = "; ".join(c + " -> exit " + str(e) for c, e in previous_steps) or "(none yet)"
+                    previous_steps.append((command, code))
+
+                    budget = int(self.cfg.get("max_prompt_bytes", 24000)) - len(instructions) - len(task_block) - 400
+                    trimmed = output[: max(600, budget)]
+                    header = task_block + "\n\nPrevious steps: " + trail
+                    followup = executor.format_command_followup(command, code, trimmed, header)
                     prompt = (instructions + "\n\n" + followup) if instructions else followup
             finally:
                 await self.pool.release(session)
