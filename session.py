@@ -11,9 +11,15 @@ import websockets
 
 import apierr
 from auth import upstream_headers
+
+ISO_FMT = "%Y-%m-%dT%H:%M:%S"
 from upstream_refresh import Refresher
 
 MAX_FRAME_DEFAULT = 16 * 1024 * 1024
+
+
+def _iso(ts: float) -> str:
+    return time.strftime(ISO_FMT, time.gmtime(ts))
 
 
 class StartResult:
@@ -232,6 +238,8 @@ class RelaySession:
             raise apierr.upstream_error(f"websocket send failed: {exc}")
 
         deadline = time.time() + self.cfg["turn_timeout"]
+        think_q = asyncio.Queue() if self.cfg.get("show_thinking") else None
+        poller = asyncio.ensure_future(self._poll_thinking(time.time(), think_q)) if think_q else None
         last_text = ""
         full_text = ""
         block_id = None
@@ -241,6 +249,8 @@ class RelaySession:
         restart_hint = False
         reconnects = 0
         while True:
+            while think_q is not None and not think_q.empty():
+                yield {"type": "thinking", "delta": think_q.get_nowait()}
             if self._cancelled:
                 if self.ws is not None and self._drain_task is None:
                     self._drain_task = asyncio.create_task(self._drain_until_done())
@@ -311,12 +321,15 @@ class RelaySession:
                     thinking_id = event.get("messageId")
                     last_thinking = ""
                 if content.startswith(last_thinking):
-                    thinking_text += content[len(last_thinking):]
+                    delta = content[len(last_thinking):]
                 elif len(content) >= len(last_thinking):
-                    thinking_text += content[len(last_thinking):]
+                    delta = content[len(last_thinking):]
                 else:
-                    thinking_text += content
+                    delta = content
                 last_thinking = content
+                thinking_text += delta
+                if delta:
+                    yield {"type": "thinking", "delta": delta}
             elif kind == "clear_streaming":
                 # UI signal (usually before a tool call): the next frame may restart
                 # the same text, so we only mark that the buffer may be replaced.
@@ -328,6 +341,11 @@ class RelaySession:
             elif kind == "hitl":
                 yield {"type": "hitl", "question": _hitl_text(event)}
             elif kind == "agent_loop_done":
+                if poller is not None:
+                    poller.cancel()
+                    await asyncio.sleep(0)
+                    while think_q is not None and not think_q.empty():
+                        yield {"type": "thinking", "delta": think_q.get_nowait()}
                 for trail in await self._trailing():
                     yield trail
                 final = full_text
@@ -342,6 +360,31 @@ class RelaySession:
                 raise apierr.upstream_error(str(event)[:300])
             elif os.environ.get("DEBUG_EVENTS"):
                 print("dbg-unknown:", json.dumps(event, ensure_ascii=False)[:400], flush=True)
+
+    async def _poll_thinking(self, turn_start: float, queue_: "asyncio.Queue"):
+        """Thinking is persisted, not streamed: poll the thread and emit new text."""
+        sent = ""
+        while True:
+            try:
+                await asyncio.sleep(2.0)
+                data = await self.backend.get_messages(self.thread_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+            parts = []
+            for message in reversed(data.get("messages", [])):
+                content = message.get("content") or {}
+                if content.get("type") != "thinking":
+                    continue
+                created = message.get("createdAt") or ""
+                if created and created < _iso(turn_start):
+                    continue
+                parts.append(content.get("thinking") or "")
+            text = "\n".join(p for p in parts if p)
+            if text.startswith(sent) and len(text) > len(sent):
+                queue_.put_nowait(text[len(sent):])
+                sent = text
 
     async def _trailing(self):
         """Collect a trailing credits frame, but never block the turn for long."""

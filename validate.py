@@ -21,6 +21,7 @@ class Parsed:
         self.system = ""
         self.declared_ignored = []
         self.wants_usage = False
+        self.show_thinking = True
 
 
 def load_json(raw: bytes):
@@ -207,6 +208,7 @@ def parse_chat(data, cfg):
     parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
                          or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
     parsed.temperature = _opt_float(data, "temperature")
+    parsed.show_thinking = bool(cfg.get("show_thinking", True))
     return _finish(data, parsed)
 
 
@@ -232,6 +234,7 @@ def parse_responses(data, cfg):
     parsed.stream = bool(data.get("stream"))
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
+    parsed.show_thinking = bool(cfg.get("show_thinking", True))
     return _finish(data, parsed)
 
 
@@ -255,6 +258,7 @@ def parse_anthropic(data, cfg):
     stop = data.get("stop_sequences")
     if stop is not None and not isinstance(stop, list):
         raise unprocessable("'stop_sequences' must be an array", param="stop_sequences")
+    parsed.show_thinking = bool(cfg.get("show_thinking", True))
     return _finish(data, parsed)
 
 

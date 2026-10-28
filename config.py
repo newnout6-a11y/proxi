@@ -40,6 +40,7 @@ DEFAULTS = {
     "show_exec_output": True,
     "enable_anthropic": True,
     "enable_chat": True,
+    "show_thinking": True,
     "enable_responses": True,
     "reasoning_effort": "high",
     "agent_mode": 2,

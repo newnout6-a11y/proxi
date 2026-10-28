@@ -16,12 +16,18 @@ class _Base:
         self.parsed = parsed
         self.writer = writer
         self.text = ""
+        self.thinking = ""
         self.credits = 0.0
         self.exec_lines = 0
 
     def feed(self, event):
         kind = event.get("type")
-        if kind == "text":
+        if kind == "thinking":
+            self.thinking += event["delta"]
+            if not self.parsed.show_thinking:
+                return
+            self._think(event["delta"])
+        elif kind == "text":
             self.text += event["delta"]
             self._text(event["delta"])
         elif kind == "credits":
@@ -46,6 +52,9 @@ class _Base:
 
     def _text(self, delta):
         raise NotImplementedError
+
+    def _think(self, delta):
+        pass
 
     def payload(self, reason, prompt_text=""):
         raise NotImplementedError
@@ -76,6 +85,10 @@ class ChatAdapter(_Base):
         if self.writer:
             self.writer.data(self._chunk({"content": delta}))
 
+    def _think(self, delta):
+        if self.writer:
+            self.writer.data(self._chunk({"reasoning_content": delta}))
+
     def end(self, reason, prompt_text=""):
         finish = FINISH_MAP.get(reason, "stop")
         if self.writer:
@@ -95,7 +108,8 @@ class ChatAdapter(_Base):
         prompt, completion = self.usage(prompt_text)
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": self.text},
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": self.text,
+                                                     **({"reasoning_content": self.thinking} if self.thinking else {})},
                              "finish_reason": FINISH_MAP.get(reason, "stop")}],
                 "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
                           "total_tokens": prompt + completion,
@@ -109,6 +123,7 @@ class ResponsesAdapter(_Base):
         self.created = int(time.time())
         self.seq = 0
         self.item_id = "msg_" + uuid.uuid4().hex[:20]
+        self.reasoning_id = "rs_" + uuid.uuid4().hex[:20]
 
     def _emit(self, name, payload):
         if not self.writer:
@@ -132,6 +147,11 @@ class ResponsesAdapter(_Base):
         self._emit("response.output_text.delta", {"item_id": self.item_id, "output_index": 0,
                                                   "content_index": 0, "delta": delta})
 
+    def _think(self, delta):
+        self._emit("response.reasoning_summary_text.delta", {"item_id": self.reasoning_id,
+                                                             "output_index": 0,
+                                                             "summary_index": 0, "delta": delta})
+
     def end(self, reason, prompt_text=""):
         prompt, completion = self.usage(prompt_text)
         self._emit("response.output_text.done", {"item_id": self.item_id, "output_index": 0,
@@ -147,9 +167,12 @@ class ResponsesAdapter(_Base):
         return {"id": self.id, "object": "response", "created_at": self.created,
                 "model": self.parsed.model,
                 "status": "incomplete" if reason == "timeout" else "completed",
-                "output": [{"id": self.item_id, "type": "message", "role": "assistant",
-                            "status": "completed",
-                            "content": [{"type": "output_text", "text": self.text}]}],
+                "output": ([{"id": self.reasoning_id, "type": "reasoning",
+                             "summary": [{"type": "summary_text", "text": self.thinking}]}]
+                           if self.thinking else [])
+                + [{"id": self.item_id, "type": "message", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": self.text}]}],
                 "output_text": self.text,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "total_tokens": prompt + completion,
@@ -160,6 +183,8 @@ class AnthropicAdapter(_Base):
     def __init__(self, parsed, writer=None):
         super().__init__(parsed, writer)
         self.id = "msg_" + uuid.uuid4().hex[:20]
+        self.open_kind = None
+        self.index = 0
 
     def _emit(self, name, payload):
         if self.writer:
@@ -170,12 +195,27 @@ class AnthropicAdapter(_Base):
             "id": self.id, "type": "message", "role": "assistant", "model": self.parsed.model,
             "content": [], "stop_reason": None, "stop_sequence": None,
             "usage": {"input_tokens": self.usage()[0], "output_tokens": 0}}})
-        self._emit("content_block_start", {"type": "content_block_start", "index": 0,
-                                           "content_block": {"type": "text", "text": ""}})
         self._emit("ping", {"type": "ping"})
 
+    def _open(self, kind):
+        if self.open_kind == kind:
+            return
+        if self.open_kind is not None:
+            self._emit("content_block_stop", {"type": "content_block_stop", "index": self.index})
+            self.index += 1
+        self.open_kind = kind
+        block = {"type": "thinking", "thinking": ""} if kind == "thinking" else {"type": "text", "text": ""}
+        self._emit("content_block_start", {"type": "content_block_start", "index": self.index,
+                                           "content_block": block})
+
+    def _think(self, delta):
+        self._open("thinking")
+        self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
+                                           "delta": {"type": "thinking_delta", "thinking": delta}})
+
     def _text(self, delta):
-        self._emit("content_block_delta", {"type": "content_block_delta", "index": 0,
+        self._open("text")
+        self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                            "delta": {"type": "text_delta", "text": delta}})
 
     def _stop_reason(self, reason):
@@ -183,7 +223,9 @@ class AnthropicAdapter(_Base):
 
     def end(self, reason, prompt_text=""):
         usage = {"input_tokens": self.usage(prompt_text)[0], "output_tokens": self.usage(prompt_text)[1]}
-        self._emit("content_block_stop", {"type": "content_block_stop", "index": 0})
+        if self.open_kind is None:
+            self._open("text")
+        self._emit("content_block_stop", {"type": "content_block_stop", "index": self.index})
         self._emit("message_delta", {"type": "message_delta",
                                      "delta": {"stop_reason": self._stop_reason(reason), "stop_sequence": None},
                                      "usage": usage})
@@ -195,7 +237,8 @@ class AnthropicAdapter(_Base):
     def payload(self, reason, prompt_text=""):
         prompt, completion = self.usage(prompt_text)
         return {"id": self.id, "type": "message", "role": "assistant", "model": self.parsed.model,
-                "content": [{"type": "text", "text": self.text}],
+                "content": ([{"type": "thinking", "thinking": self.thinking}] if self.thinking else [])
+                + [{"type": "text", "text": self.text}],
                 "stop_reason": self._stop_reason(reason), "stop_sequence": None,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "credits_used": round(self.credits, 5), "estimated": True}}
