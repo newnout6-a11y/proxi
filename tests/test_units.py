@@ -10,6 +10,11 @@ from credits import CreditsManager
 FENCE = chr(96) * 3
 
 
+def test_extract_command_prefers_last_tag():
+    text = "echo " + chr(60) + "exec_command>old</exec_command> and " + chr(60) + "exec_command>new</exec_command>"
+    assert executor.extract_command(text) == "new"
+
+
 def test_extract_command_strips_fences():
     assert executor.extract_command("<exec_command>" + FENCE + "bash\ngit status\n" + FENCE + "</exec_command>") == "git status"
     assert executor.extract_command("no command") is None
@@ -75,8 +80,8 @@ def test_inside_workspace(tmp_path):
 
 
 def test_effort_from_budget():
-    assert models.effort_from_budget(1024) == "minimal"
-    assert models.effort_from_budget(2048) == "low"
+    assert models.effort_from_budget(1024) == "low"
+    assert models.effort_from_budget(8192) == "medium"
     with pytest.raises(apierr.ApiError):
         models.effort_from_budget(10)
 

@@ -36,6 +36,23 @@ POST /api/pages/{pageUuid}/sandpack/threads/{threadId}/messages
    body {"messages":[{"role":"user","type":"text","text":"..."}]}
 (POST only persists; the run is started via start+WS.)
 
+## Сообщения треда (REST)
+
+- `GET .../threads/{id}/messages` отдаёт массив **от новых к старым** (index 0 — самое свежее).
+- Ошибки прогона приходят не кадром WS, а сохранённым сообщением:
+  `{"senderRole":"sandpack","content":{"type":"error","error":"...","statusCode":...}}`.
+  Пример: `You've used all AI credits included in your plan.` Текст хода при этом пустой.
+- Прочие типы контента: `text`, `thinking`, `tool_call`, `turn_commit`.
+- Кадр `clear_streaming` приходит перед tool-call и обнуляет накопитель текста;
+  считать текст хода надо по последнему полному `content`, а не по склейке дельт.
+
+## Режим агента
+
+`agentMode: 2` — рабочий режим (правит файлы приложения в песочнице, событие `files_changed`).
+При длинном системном контексте модель склонна «строить приложение» и не использовать
+внешние команды, поэтому инструкцию про `<exec_command>` нужно держать в начале промпта,
+а контекст проекта — после неё и в хвосте промпта.
+
 ## Сессия и её срок жизни
 
 - accessToken - JWT без exp, но сессия всё равно инвалидируется на практике через часы.

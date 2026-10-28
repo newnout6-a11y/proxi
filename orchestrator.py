@@ -5,7 +5,9 @@ import uuid
 
 import apierr
 import executor
+import models as model_catalog
 from context import build_system_instructions
+from redact import redact
 
 
 class TurnRunner:
@@ -24,19 +26,49 @@ class TurnRunner:
             exec_policy=self.cfg["exec_policy"],
         )
 
+    async def _explain_empty(self, holder):
+        """Silent turns are usually a persisted upstream error (e.g. out of credits)."""
+        session = holder.get("session")
+        if session is None:
+            return None
+        try:
+            data = await self.pool.backend.get_messages(session.thread_id)
+        except Exception as exc:
+            print("[explain] fetch failed:", exc, flush=True)
+            return None
+        # Retool returns messages newest-first.
+        for message in data.get("messages", []):
+            content = message.get("content") or {}
+            if message.get("senderRole") == "sandpack" and content.get("type") == "error":
+                text = str(content.get("error") or "").strip()
+                if "credit" in text.lower():
+                    return apierr.ApiError(429, "insufficient_credits", text or "Retool credits exhausted")
+                return apierr.upstream_error(text or "upstream returned an error message")
+            if message.get("senderRole") == "sandpack" and content.get("type") in ("text", "tool_call"):
+                return None
+        return None
+
     async def run(self, parsed, out: queue.Queue, holder: dict):
         turn_id = str(uuid.uuid4())
         holder["turn_id"] = turn_id
         exec_steps = 0
+        empty_retries = 0
         try:
             instructions = self._instructions()
+            reminder = ""
+            if self.cfg["exec_policy"] != "off":
+                reminder = (
+                    "\n\n[LOCAL EXEC REMINDER]\n"
+                    "To run anything on the user's machine you MUST output "
+                    "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
+                    "Do not answer that you cannot run commands."
+                )
             prompt = (instructions + "\n\n" + parsed.prompt) if instructions else parsed.prompt
+            prompt += reminder
             history_note = ""
             model_provider = {
                 "model": parsed.model,
-                "providerResourceName": self.cfg["provider_resource_name"]
-                if parsed.entry.get("provider") != "openai"
-                else self.cfg["openai_provider_resource_name"],
+                "providerResourceName": model_catalog.provider_resource(self.cfg, parsed.entry),
             }
             if parsed.effort:
                 model_provider["reasoningEffort"] = parsed.effort
@@ -50,6 +82,9 @@ class TurnRunner:
                         if event["type"] == "text":
                             final_text += event["delta"]
                             out.put(event)
+                        elif event["type"] == "final_text":
+                            if event.get("text"):
+                                final_text = event["text"]
                         elif event["type"] == "credits":
                             self.credits.record_turn(turn_id, event["value"])
                             out.put(event)
@@ -67,7 +102,19 @@ class TurnRunner:
 
                 can_exec = (self.cfg["exec_policy"] != "off") and exec_steps < self.cfg["max_exec_turns"]
                 command = executor.extract_command(final_text) if can_exec else None
-                if not can_exec:
+                if not command and not final_text.strip():
+                    explained = await self._explain_empty(holder)
+                    if explained is not None:
+                        out.put({"type": "error", "error": explained})
+                        return
+
+                if not command and not final_text.strip() and empty_retries < 2:
+                    # Turn produced no text (model used a native tool or went quiet): ask again.
+                    empty_retries += 1
+                    prompt = parsed.prompt + "\n\n(Ответь текстом. Если нужна команда — выведи <exec_command>...</exec_command>.)"
+                    continue
+
+                if not can_exec or not command:
                     out.put({"type": "end", "reason": holder.get("reason", "stop")})
                     return
 
@@ -88,6 +135,7 @@ class TurnRunner:
                     )
                 except executor.PolicyError as exc:
                     code, output = 126, str(exc)
+                output = redact(output, cookie_values=self.cfg.get("cookie_values", ()))
                 exec_steps += 1
 
                 if self.cfg["show_exec_output"]:

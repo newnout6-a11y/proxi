@@ -24,10 +24,11 @@ class PolicyError(Exception):
 def extract_command(text: str):
     if not text:
         return None
-    match = EXEC_REGEX.search(text)
-    if not match:
+    matches = list(EXEC_REGEX.finditer(text))
+    if not matches:
         return None
-    cmd = match.group(1).strip()
+    # The model sometimes echoes the tag in prose; the last one is the real command.
+    cmd = matches[-1].group(1).strip()
     cmd = re.sub(r"^" + FENCE + r"[a-zA-Z]*\n?", "", cmd)
     cmd = re.sub(r"\n?" + FENCE + "$", "", cmd)
     return cmd.strip() or None

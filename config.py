@@ -33,12 +33,15 @@ DEFAULTS = {
         r"^curl\b", r"^echo\b", r"^cls\b", r"^mkdir\b",
     ],
     "project_context": True,
-    "context_max_bytes": 6000,
+    "context_max_bytes": 2500,
     "show_exec_output": True,
     "enable_anthropic": True,
     "enable_responses": True,
     "reasoning_effort": "high",
+    "agent_mode": 2,
     "model": "claude-opus-5-5",
+    "google_provider_resource_name": "",
+    "retool_fast_provider_resource_name": "",
 }
 
 REQUIRED = ("base", "page_uuid", "ua")
@@ -90,7 +93,7 @@ def load(path=CONFIG_PATH):
         if value:
             cfg[key] = value
 
-    for num_key in ("port", "max_body_bytes", "max_frame_bytes", "max_workers",
+    for num_key in ("port", "agent_mode", "max_body_bytes", "max_frame_bytes", "max_workers",
                     "turn_timeout", "recv_timeout", "upstream_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes"):
         try:

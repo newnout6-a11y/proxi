@@ -92,7 +92,7 @@ def test_responses_stream_events(relay):
 
 def test_effort_and_budget_are_forwarded(relay):
     relay.json("/v1/messages", dict(ANTH, thinking={"type": "enabled", "budget_tokens": 2048}))
-    assert relay.fake.seen[-1].effort == "low"
+    assert relay.fake.seen[-1].effort == "medium"
 
 
 def test_models_lists_capabilities(relay):

@@ -14,6 +14,7 @@ from urllib.parse import urlparse, parse_qs
 import adapters
 import apierr
 import auth
+from redact import redact
 import config as config_module
 import models as model_catalog
 import sse
@@ -93,6 +94,7 @@ def make_handler(runtime: Runtime):
             self.send_header("access-control-expose-headers", "x-request-id, retry-after")
 
         def _json(self, status, payload, extra=None):
+            self._status = status
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("content-type", "application/json; charset=utf-8")
@@ -134,14 +136,23 @@ def make_handler(runtime: Runtime):
         def do_PUT(self):
             self._dispatch()
 
+        def _log(self, note=""):
+            status = getattr(self, "_status", 0) or getattr(self, "_stream_status", 0)
+            took = (time.time() - self._started) * 1000
+            model = getattr(self, "_model", "-")
+            print("relay %s %s %s %s %s %.0fms %s" % (
+                self.request_id, self.command, redact(self.path), status, model, took, note), flush=True)
+
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
+            self._started = time.time()
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
             route = ROUTES.get((self.command, path))
             dialect = "anthropic" if route == "anthropic" else "chat"
             try:
+                self._log_route = route
                 if route is None:
                     if any(method_path[1] == path for method_path in ROUTES):
                         raise apierr.method_not_allowed()
@@ -179,6 +190,7 @@ def make_handler(runtime: Runtime):
                 else:
                     self._error_response(err, dialect)
             except Exception as exc:  # never leak a bare traceback
+                print("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]), flush=True)
                 err = apierr.internal(str(exc) or exc.__class__.__name__)
                 if getattr(self, "_streaming", False):
                     writer = self._writer
@@ -186,6 +198,8 @@ def make_handler(runtime: Runtime):
                     writer.done()
                 else:
                     self._error_response(err, dialect)
+            finally:
+                self._log()
 
         def _error_response(self, err, dialect):
             body = adapters.error_payload(dialect, err)
@@ -197,6 +211,7 @@ def make_handler(runtime: Runtime):
                 "id": model["id"],
                 "object": "model",
                 "owned_by": model["provider"],
+                "label": model["label"],
                 "context_window": model["context"],
                 "capabilities": {"reasoning": model["reasoning"], "tools": model["tools"],
                                  "vision": model["vision"]},
@@ -267,6 +282,8 @@ def make_handler(runtime: Runtime):
             self._writer = writer
             self._streaming = True
             writer.start({"x-request-id": self.request_id})
+            self._model = parsed.model
+            self._stream_status = 200
             adapter = adapters.for_dialect(dialect, parsed, writer)
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)

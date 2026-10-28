@@ -4,7 +4,7 @@ import os
 
 from apierr import unauthorized
 
-CLIENT_VERSION = "4.84.0-8ec403c (Build 409410)"
+CLIENT_VERSION = "4.84.0-16f3123 (Build 409813)"
 
 
 def extract_key(headers) -> str:

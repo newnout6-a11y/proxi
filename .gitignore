@@ -11,3 +11,4 @@ cookies.txt
 relay_key.txt
 commands.log
 .pytest_cache/
+probes/chunks/

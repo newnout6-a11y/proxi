@@ -1,6 +1,7 @@
 """Upstream Retool transport: thread creation, WebSocket turns, retries, cancellation."""
 import asyncio
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -71,6 +72,17 @@ class Backend:
         raise last
 
     # -- API ----------------------------------------------------------------
+    async def get_messages(self, thread_id):
+        """Fetch persisted messages (used to explain silent turns)."""
+        path = f"/api/pages/{self.cfg['page_uuid']}/sandpack/threads/{thread_id}/messages"
+
+        def call():
+            req = urllib.request.Request(self.cfg["base"] + path, headers=upstream_headers(self.cfg), method="GET")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+
+        return await asyncio.get_running_loop().run_in_executor(None, call)
+
     async def create_thread(self) -> str:
         data = await self._call(f"/api/pages/{self.cfg['page_uuid']}/sandpack/threads", {})
         thread_id = data.get("id") if isinstance(data, dict) else None
@@ -175,7 +187,7 @@ class RelaySession:
                 "r2OnboardingTemplateId": None,
                 "messageId": str(uuid.uuid4()),
                 "expectedThreadId": self.thread_id,
-                "agentMode": 2,
+                "agentMode": int(self.cfg.get("agent_mode", 2)),
                 "testingEnabled": False,
                 "requestOrigin": "Browser",
             }, ensure_ascii=True))
@@ -184,6 +196,7 @@ class RelaySession:
 
         deadline = time.time() + self.cfg["turn_timeout"]
         last_text = ""
+        full_text = ""
         reconnects = 0
         while True:
             if self._cancelled:
@@ -219,13 +232,26 @@ class RelaySession:
 
             if kind == "text":
                 content = event.get("content") or ""
-                if len(content) >= len(last_text):
+                if content.startswith(last_text):
+                    # Cumulative frame: the new tail is the delta.
                     delta = content[len(last_text):]
+                    full_text = content
+                elif len(content) >= len(last_text):
+                    delta = content[len(last_text):]
+                    full_text = content
                 else:
+                    # Buffer restarted (clear_streaming or a new block): treat as fresh text.
                     delta = content
+                    full_text = content
                 last_text = content
                 if delta:
                     yield {"type": "text", "delta": delta}
+            elif kind == "clear_streaming":
+                # The UI clears the streaming block (usually before a tool call);
+                # subsequent text frames start a fresh cumulative buffer.
+                last_text = ""
+                if full_text.strip():
+                    full_text += "\n"
             elif kind == "run_credits_persisted":
                 value = event.get("creditsUsed")
                 if isinstance(value, (int, float)):
@@ -235,10 +261,13 @@ class RelaySession:
             elif kind == "agent_loop_done":
                 for trail in await self._trailing():
                     yield trail
+                yield {"type": "final_text", "text": full_text}
                 yield {"type": "end", "reason": "stop"}
                 return
             elif kind == "error":
                 raise apierr.upstream_error(str(event)[:300])
+            elif os.environ.get("DEBUG_EVENTS"):
+                print("dbg-unknown:", json.dumps(event, ensure_ascii=False)[:400], flush=True)
 
     async def _trailing(self):
         """Collect a trailing credits frame, but never block the turn for long."""

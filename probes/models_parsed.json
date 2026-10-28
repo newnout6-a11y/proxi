@@ -1,0 +1,212 @@
+[
+ {
+  "id": "gpt-5",
+  "provider": "openai",
+  "label": "GPT 5",
+  "context": 272000.0
+ },
+ {
+  "id": "gpt-5-mini",
+  "provider": "openai",
+  "label": "GPT 5 Mini",
+  "context": 272000.0
+ },
+ {
+  "id": "gpt-5-nano",
+  "provider": "openai",
+  "label": "GPT 5 Nano",
+  "context": 272000.0
+ },
+ {
+  "id": "gpt-5.1",
+  "provider": "openai",
+  "label": "GPT 5.1",
+  "context": 272000.0
+ },
+ {
+  "id": "gpt-5.2",
+  "provider": "openai",
+  "label": "GPT 5.2",
+  "context": 272000.0
+ },
+ {
+  "id": "gpt-5.3-codex",
+  "provider": "openai",
+  "label": "GPT 5.3 Codex",
+  "context": 272000.0
+ },
+ {
+  "id": "gpt-5.4",
+  "provider": "openai",
+  "label": "GPT 5.4",
+  "context": 922000.0
+ },
+ {
+  "id": "gpt-5.5",
+  "provider": "openai",
+  "label": "GPT 5.5",
+  "context": 922000.0
+ },
+ {
+  "id": "gpt-5.6-sol",
+  "provider": "openai",
+  "label": "GPT 5.6 Sol",
+  "context": 922000.0
+ },
+ {
+  "id": "gpt-5.6-terra",
+  "provider": "openai",
+  "label": "GPT 5.6 Terra",
+  "context": 922000.0
+ },
+ {
+  "id": "gpt-5.6-luna",
+  "provider": "openai",
+  "label": "GPT 5.6 Luna",
+  "context": 922000.0
+ },
+ {
+  "id": "gpt-4.1",
+  "provider": "openai",
+  "label": "GPT 4.1",
+  "context": 1014808
+ },
+ {
+  "id": "gpt-4.1-nano",
+  "provider": "openai",
+  "label": "GPT 4.1 Nano",
+  "context": 1014808
+ },
+ {
+  "id": "claude-opus-5-5",
+  "provider": "anthropic",
+  "label": "Claude Opus 5.5",
+  "context": 872000.0
+ },
+ {
+  "id": "claude-opus-5",
+  "provider": "anthropic",
+  "label": "Claude Opus 5",
+  "context": 872000.0
+ },
+ {
+  "id": "claude-opus-4-8",
+  "provider": "anthropic",
+  "label": "Claude Opus 4.8",
+  "context": 872000.0
+ },
+ {
+  "id": "claude-opus-4-7",
+  "provider": "anthropic",
+  "label": "Claude Opus 4.7",
+  "context": 872000.0
+ },
+ {
+  "id": "claude-opus-4-20250514",
+  "provider": "anthropic",
+  "label": "Claude Opus 4",
+  "context": 191808
+ },
+ {
+  "id": "claude-opus-4-1-20250805",
+  "provider": "anthropic",
+  "label": "Claude Opus 4.1",
+  "context": 191808
+ },
+ {
+  "id": "claude-opus-4-5-20251101",
+  "provider": "anthropic",
+  "label": "Claude Opus 4.5",
+  "context": 191808
+ },
+ {
+  "id": "claude-opus-4-6",
+  "provider": "anthropic",
+  "label": "Claude Opus 4.6",
+  "context": 872000.0
+ },
+ {
+  "id": "claude-fable-5",
+  "provider": "anthropic",
+  "label": "Claude Fable 5",
+  "context": 872000.0
+ },
+ {
+  "id": "claude-sonnet-5",
+  "provider": "anthropic",
+  "label": "Claude Sonnet 5",
+  "context": 872000.0
+ },
+ {
+  "id": "claude-sonnet-4-20250514",
+  "provider": "anthropic",
+  "label": "Claude Sonnet 4",
+  "context": 191808
+ },
+ {
+  "id": "claude-sonnet-4-5-20250929",
+  "provider": "anthropic",
+  "label": "Claude Sonnet 4.5",
+  "context": 191808
+ },
+ {
+  "id": "claude-sonnet-4-6",
+  "provider": "anthropic",
+  "label": "Claude Sonnet 4.6",
+  "context": 936000.0
+ },
+ {
+  "id": "claude-haiku-4-5-20251001",
+  "provider": "anthropic",
+  "label": "Claude Haiku 4.5",
+  "context": 191808
+ },
+ {
+  "id": "gemini-3.1-pro-preview",
+  "provider": "google",
+  "label": "Gemini 3.1 Pro (Preview)",
+  "context": 983040
+ },
+ {
+  "id": "gemini-3-flash-preview",
+  "provider": "google",
+  "label": "Gemini 3 Flash (Preview)",
+  "context": 983040
+ },
+ {
+  "id": "gemini-3.5-flash",
+  "provider": "google",
+  "label": "Gemini 3.5 Flash",
+  "context": 983040
+ },
+ {
+  "id": "gemini-3.1-flash-lite-preview",
+  "provider": "google",
+  "label": "Gemini 3.1 Flash-Lite (Preview)",
+  "context": 983040
+ },
+ {
+  "id": "gemini-2.5-pro",
+  "provider": "google",
+  "label": "Gemini 2.5 Pro",
+  "context": 983040
+ },
+ {
+  "id": "gemini-2.5-flash",
+  "provider": "google",
+  "label": "Gemini 2.5 Flash",
+  "context": 983040
+ },
+ {
+  "id": "zai-org/GLM-5.3",
+  "provider": "retool-fast",
+  "label": "Retool Power",
+  "context": 984576
+ },
+ {
+  "id": "zai-org/GLM-5.3-Flash",
+  "provider": "retool-fast",
+  "label": "Retool Mini",
+  "context": 984576
+ }
+]

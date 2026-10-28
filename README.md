@@ -62,13 +62,27 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 | exec_allowlist | regex-список разрешённых первых слов команд |
 | strict_models | true — неизвестная модель даёт 404 вместо тихой маршрутизации |
 | max_body_bytes, max_workers, rate_limit_rps | лимиты входа и параллелизма |
+| agent_mode | 2 — рабочий режим агента (1 — более «разговорный», 3 — не проверялся) |
+| google_provider_resource_name, retool_fast_provider_resource_name | ресурсы для gemini-* и zai-org/*; без них эти модели дают 503 |
+
+## Каталог моделей
+
+35 моделей сняты из бандла приложения Retool (там же, где их показывает пикер):
+Claude Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / 4.5 / 4.1 / 4, Claude Sonnet 5 / 4.6 / 4.5 / 4,
+Claude Fable 5, Claude Haiku 4.5, GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.4, GPT-5.3 Codex,
+GPT-5.2 / 5.1 / 5 / mini / nano, GPT-4.1, Gemini 3.x, Retool Power/Mini.
+Размеры контекста взяты оттуда же. Пересобрать после обновления Retool:
+
+    python probes/gen_models.py && python probes/gen_models_py.py
+
+Маршрутизация в провайдера — по префиксу модели: claude-* → ресурс Anthropic, gpt-* → ресурс OpenAI.
 
 ## Коды ответов
 
 400 битый JSON/заголовки, 401 нет или неверный relay-ключ, 404 неизвестный маршрут или модель,
 405 неверный метод, 413 слишком большое тело, 415 не JSON, 422 неверные типы полей,
-429 локальный rate limit или лимит Retool, 502 отказ upstream/сессии, 503 upstream недоступен,
-504 таймаут хода.
+429 локальный rate limit, лимит Retool или исчерпанные кредиты плана
+(`insufficient_credits`), 502 отказ upstream/сессии, 503 upstream недоступен, 504 таймаут хода.
 
 ## Ограничения (важно)
 
@@ -81,6 +95,17 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 - Промпт собирается из всей истории запроса; авт-обрезки по контексту нет.
 - Retool не даёт удалять треды: в режиме per_request треды копятся.
 - Состав моделей статичен; доступность конкретной модели проверяет upstream.
+
+## Что проверено вживую (Retool, свежая сессия)
+
+- все три диалекта в streaming и non-streaming возвращают реальный ответ модели;
+- маршрутизация провайдеров: `claude-opus-4-8` → Anthropic, `gpt-5.5` → OpenAI;
+- два параллельных запроса создают два треда и не видят историю друг друга;
+- allowlisted-команда (`dir`) исполняется локально, неразрешённая (`whoami`) даёт код 126
+  и текст политики, аудит пишется в `commands.log`;
+- пустые ходы диагностируются: исчерпание кредитов отдаётся как `429 insufficient_credits`,
+  а не пустой `200`;
+- upstream 401 при мёртвой сессии отдаётся как `502 upstream_auth_error` после попытки refresh.
 
 ## Тесты
 
