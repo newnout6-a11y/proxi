@@ -10,7 +10,7 @@ def get(path, key):
     except urllib.error.HTTPError as e:
         return e.code, e.read()[:80].decode()
 print("models with ?key:", get("/v1/models?key=live-test-key", None)[0])
-print("non-ascii key:", get("/v1/models", "ключ-测试"))
+print("non-ascii key:", get("/v1/models", "ключ-测试".encode("utf-8").decode("latin-1")))
 payload = json.dumps({"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "Скажи одно слово: работаю"}]}).encode()
 req = urllib.request.Request(BASE + "/v1/chat/completions", data=payload, method="POST",
                              headers={"content-type": "application/json", "authorization": "Bearer live-test-key"})
