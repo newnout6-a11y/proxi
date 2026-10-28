@@ -91,14 +91,12 @@ class Backend:
         for attempt in range(attempts):
             try:
                 return await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: self._http_post(path, payload, timeout))
+                    None, lambda: self.refresher.call(lambda: self._http_post(path, payload, timeout)))
             except urllib.error.HTTPError as exc:
                 body = exc.read()[:300].decode("utf-8", "replace") if exc.fp else ""
                 if exc.code in (401, 403):
                     detail = body or (self.refresher.last_error or "")
                     last = apierr.upstream_auth_failed(detail)
-                    if attempt < attempts - 1 and self.refresher.refresh():
-                        continue
                     raise last
                 if exc.code == 429:
                     retry_after = exc.headers.get("retry-after") if exc.headers else None
@@ -128,7 +126,7 @@ class Backend:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8", "replace"))
 
-        return await asyncio.get_running_loop().run_in_executor(None, call)
+        return await asyncio.get_running_loop().run_in_executor(None, lambda: self.refresher.call(call))
 
     async def create_thread(self) -> str:
         data = await self._call(f"/api/pages/{self.cfg['page_uuid']}/sandpack/threads", {})

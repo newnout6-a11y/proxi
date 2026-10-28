@@ -57,7 +57,7 @@ class Runtime:
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.backend = Backend(cfg)
         self.pool = SessionPool(self.backend)
-        self.credits = CreditsManager(cfg["base"], lambda: auth.upstream_headers(cfg))
+        self.credits = CreditsManager(cfg["base"], lambda: auth.upstream_headers(cfg), self.backend.refresher)
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
@@ -232,7 +232,7 @@ def make_handler(runtime: Runtime):
 
         def _health(self):
             balance = runtime.credits.get_balance(force_refresh=True)
-            ok = balance.get("available") is not None
+            ok = balance.get("available") is not None and not balance.get("stale")
             payload = {
                 "ok": ok,
                 "uptime_seconds": round(time.time() - runtime.started, 1),
@@ -240,6 +240,7 @@ def make_handler(runtime: Runtime):
                 "models": len(model_catalog.catalog()),
                 "upstream": "ok" if ok else "degraded",
                 "error": balance.get("error") or balance.get("stale_error"),
+                "session": runtime.backend.refresher.status(),
             }
             self._json(200 if ok else 503, payload)
 
@@ -404,6 +405,7 @@ def main():
     slots = threading.BoundedSemaphore(cfg["max_workers"])
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
 
+    runtime.backend.refresher.start()
     balance = runtime.credits.get_balance(force_refresh=True)
     print("=" * 64)
     print(" Retool AI relay")
@@ -432,6 +434,7 @@ def main():
         server.serve_forever()
     finally:
         try:
+            runtime.backend.refresher.stop()
             runtime.loop.call_soon_threadsafe(runtime.loop.stop)
         finally:
             server.server_close()

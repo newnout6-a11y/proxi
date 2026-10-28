@@ -9,9 +9,10 @@ HISTORY_MAX = 200
 
 
 class CreditsManager:
-    def __init__(self, base_url, headers_fn):
+    def __init__(self, base_url, headers_fn, refresher=None):
         self.base_url = base_url
         self.headers_fn = headers_fn
+        self.refresher = refresher
         self._lock = threading.RLock()
         self._balance = None
         self._cached_at = 0.0
@@ -24,12 +25,16 @@ class CreditsManager:
         now = time.time()
         with self._lock:
             if not force_refresh and self._balance and now - self._cached_at < CACHE_TTL:
-                return dict(self._balance, stale=False)
-        try:
+                return dict(self._balance, stale=bool(self.last_error),
+                            **({"stale_error": self.last_error} if self.last_error else {}))
+        def fetch():
             req = urllib.request.Request(self.base_url + "/api/credits/balance",
                                          headers=self.headers_fn(), method="GET")
             with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
+                return json.loads(resp.read().decode("utf-8", "replace"))
+
+        try:
+            data = self.refresher.call(fetch) if self.refresher is not None else fetch()
         except Exception as exc:
             with self._lock:
                 self.last_error = str(exc)

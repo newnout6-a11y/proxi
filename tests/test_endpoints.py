@@ -6,6 +6,16 @@ CHAT = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi
 ANTH = {"model": "claude-opus-5-5", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
 
 
+def test_health_rejects_stale_balance(relay):
+    relay.credits.balance.update(stale=True, stale_error="HTTP Error 401: Unauthorized")
+    status, body = relay.json_any("/health", key=None)
+    assert status == 503
+    assert body["ok"] is False
+    assert body["upstream"] == "degraded"
+    assert "401" in body["error"]
+    assert body["session"]["keepalive"] is False
+
+
 def test_chat_non_stream_shape(relay):
     status, body = relay.json("/v1/chat/completions", CHAT)
     assert status == 200

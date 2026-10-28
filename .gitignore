@@ -10,5 +10,6 @@ config.json
 cookies.txt
 relay_key.txt
 commands.log
+.session-*.tmp
 .pytest_cache/
 probes/chunks/

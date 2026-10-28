@@ -3,6 +3,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 
 from apierr import service_unavailable
 
@@ -26,6 +27,7 @@ DEFAULTS = {
     "turn_timeout": 300,
     "recv_timeout": 120,
     "upstream_timeout": 120,
+    "session_refresh_interval": 900,
     "command_timeout": 40,
     "command_output_limit": 64000,
     "max_exec_turns": 0,          # 0 = без ограничения
@@ -82,10 +84,54 @@ def _ensure_relay_key(cfg):
     return key
 
 
+def persist_auth(cfg):
+    """Atomically save rotated credentials without writing runtime defaults/secrets."""
+    path = cfg.get("_config_path")
+    if not path or not cfg.get("_persist_auth", False):
+        return
+    saved = _read_file(path)
+    if saved.get("base", "").rstrip("/") != cfg["base"].rstrip("/"):
+        raise ValueError("session configuration origin changed")
+    disk_auth = (saved.get("cookie"), saved.get("xsrf"))
+    if disk_auth != cfg.get("_disk_auth", disk_auth):
+        raise ValueError("session configuration changed during renewal")
+    saved.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                         prefix=".session-", suffix=".tmp", delete=False) as fh:
+            temporary = fh.name
+            json.dump(saved, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+        cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def reload_auth(cfg):
+    """Adopt a newer local session, including an externally completed sign-in."""
+    if not cfg.get("_config_path") or not cfg.get("_persist_auth", False):
+        return False
+    saved = _read_file(cfg["_config_path"])
+    if (saved.get("base", "").rstrip("/") != cfg["base"].rstrip("/")
+            or not saved.get("cookie") or not saved.get("xsrf")
+            or (saved["cookie"], saved["xsrf"]) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"]))):
+        return False
+    cfg.update(cookie=saved["cookie"], xsrf=saved["xsrf"], _disk_auth=(saved["cookie"], saved["xsrf"]),
+               cookie_values=[p.strip().split("=", 1)[1] for p in saved["cookie"].split(";") if "=" in p])
+    return True
+
+
 def load(path=CONFIG_PATH):
     """Load config, apply env overrides, fill defaults, validate."""
     cfg = dict(DEFAULTS)
     cfg.update(_read_file(path))
+    cfg["_config_path"] = os.path.abspath(path)
+    cfg["_persist_auth"] = not (os.environ.get("RETOOL_COOKIE") or os.environ.get("RETOOL_XSRF"))
 
     # Secrets may live outside the repo: env wins over file.
     env_map = {
@@ -105,12 +151,16 @@ def load(path=CONFIG_PATH):
 
     for num_key in ("port", "agent_mode", "max_body_bytes", "max_frame_bytes", "max_workers",
                     "turn_timeout", "recv_timeout", "upstream_timeout",
+                    "session_refresh_interval",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
                     "max_prompt_bytes"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
             raise service_unavailable(f"config value '{num_key}' must be an integer")
+
+    if cfg["session_refresh_interval"] < 0:
+        raise service_unavailable("session_refresh_interval must be non-negative (0 disables keepalive)")
 
     for float_key in ("rate_limit_rps", "rate_limit_burst"):
         try:
@@ -145,4 +195,5 @@ def load(path=CONFIG_PATH):
         for seg in cfg["cookie"].split("; ")
         if "=" in seg and not HOSTNAME.fullmatch(seg.split("=", 1)[1])
     ]
+    cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
     return cfg

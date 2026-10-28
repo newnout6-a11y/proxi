@@ -31,6 +31,7 @@ def verify(headers, query_key, expected: str) -> None:
 
 def upstream_headers(cfg) -> dict:
     """Retool session headers. Cookie/xsrf stay the source of upstream auth."""
+    cfg = dict(cfg)  # read cookie and xsrf from the same credential snapshot
     return {
         "accept": "application/json",
         "content-type": "application/json",
@@ -49,12 +50,13 @@ def merge_set_cookie(cfg, headers) -> bool:
     Returns True when the access token (or xsrf token) changed.
     """
     jar = {}
-    for segment in cfg["cookie"].split("; "):
+    for segment in cfg["cookie"].split(";"):
         if "=" in segment:
-            key, value = segment.split("=", 1)
+            key, value = segment.strip().split("=", 1)
             jar[key] = value
     changed = False
     dirty = False
+    xsrf = cfg["xsrf"]
     for raw in headers or []:
         pair = raw.split(";")[0]
         if "=" not in pair:
@@ -70,11 +72,12 @@ def merge_set_cookie(cfg, headers) -> bool:
             changed = True
             dirty = True
         if key in ("xsrfToken", "__Host-xsrfToken"):
-            cfg["xsrf"] = value
-            changed = True
+            dirty = dirty or xsrf != value
+            changed = changed or xsrf != value
+            xsrf = value
     if dirty:
-        cfg["cookie"] = "; ".join(key + "=" + value for key, value in jar.items())
-        cfg["cookie_values"] = list(jar.values())
+        cfg.update(cookie="; ".join(key + "=" + value for key, value in jar.items()),
+                   cookie_values=list(jar.values()), xsrf=xsrf)
     return changed
 
 
