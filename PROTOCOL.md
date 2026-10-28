@@ -5,8 +5,12 @@ Host: https://vovasahren.retool.com — auth by cookies + x-xsrf-token (header m
 ## 1. Start run
 POST /api/ai/retool-next-agent/start
 body: {"threadId":"<uuid>","pageUuid":"<uuid>","environmentName":"production"}
--> {"type":"websocket_url","url":"wss://sandbox-<id>.retool.app/sandbox/sandbox-<id>/agent-ws?sandboxToken=<jwt>",
+-> {"type":"websocket_url","url":"wss://sandbox-<id>.retool.app/sandbox/sandbox-<id>/agent-ws",
     "sandboxId":"...","sandboxToken":"<jwt exp +10800s>","sandboxReused":bool,"uploadToken":"..."}
+
+ВАЖНО: в поле url параметра sandboxToken НЕТ - токен из соседнего поля приложение
+дописывает само. Клиент должен клеить "?sandboxToken=<jwt>" и не дублировать параметр,
+если он уже есть. Пустой или просроченный токен даёт HTTP 401 на рукопожатии.
 
 ## 2. Stream
 WS connect, Origin: https://vovasahren.retool.com (token already in URL query).
@@ -31,6 +35,15 @@ GET  /api/pages/{pageUuid}/sandpack/threads/{threadId}/messages
 POST /api/pages/{pageUuid}/sandpack/threads/{threadId}/messages
    body {"messages":[{"role":"user","type":"text","text":"..."}]}
 (POST only persists; the run is started via start+WS.)
+
+## Сессия и её срок жизни
+
+- accessToken - JWT без exp, но сессия всё равно инвалидируется на практике через часы.
+- При 401 на любом /api/* имеет смысл POST /api/refreshtoken с пустым телом.
+  Успех возвращает Set-Cookie с новыми accessToken/xsrfToken; при мёртвой сессии -
+  {"success":false,"message":"Authentication failure. Session has expired."} и Set-Cookie
+  с Expires в 1970 (удаление).
+- cf_clearance привязан к IP и User-Agent: менять UA между запросами нельзя.
 
 ## Rate limit
 x-ratelimit-limit: 120 / 60s
