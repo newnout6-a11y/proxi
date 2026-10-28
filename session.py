@@ -49,10 +49,11 @@ class Backend:
             except urllib.error.HTTPError as exc:
                 body = exc.read()[:300].decode("utf-8", "replace") if exc.fp else ""
                 if exc.code in (401, 403):
-                    if attempt < attempts and self.refresher.refresh():
-                        continue
                     detail = body or (self.refresher.last_error or "")
-                    raise apierr.upstream_auth_failed(detail)
+                    last = apierr.upstream_auth_failed(detail)
+                    if attempt < attempts - 1 and self.refresher.refresh():
+                        continue
+                    raise last
                 if exc.code == 429:
                     retry_after = exc.headers.get("retry-after") if exc.headers else None
                     last = apierr.too_many_requests("Retool rate limit", float(retry_after or 2))
@@ -69,7 +70,7 @@ class Backend:
             except urllib.error.URLError as exc:
                 last = apierr.upstream_error(f"Retool unreachable: {exc.reason}")
                 await asyncio.sleep(0.4 * (attempt + 1))
-        raise last
+        raise last if last is not None else apierr.upstream_error("upstream call failed")
 
     # -- API ----------------------------------------------------------------
     async def get_messages(self, thread_id):
@@ -197,6 +198,11 @@ class RelaySession:
         deadline = time.time() + self.cfg["turn_timeout"]
         last_text = ""
         full_text = ""
+        block_id = None
+        thinking_text = ""
+        thinking_id = None
+        last_thinking = ""
+        restart_hint = False
         reconnects = 0
         while True:
             if self._cancelled:
@@ -232,26 +238,51 @@ class RelaySession:
 
             if kind == "text":
                 content = event.get("content") or ""
+                # Text frames are cumulative *per messageId*; a new id starts a new block.
+                if event.get("messageId") != block_id:
+                    # A new id may restart the same text (overlap) or open a new block.
+                    if block_id is not None and last_text and content.startswith(last_text):
+                        block_id = event.get("messageId")
+                        delta = content[len(last_text):]
+                        last_text = content
+                        full_text += delta
+                        if delta:
+                            yield {"type": "text", "delta": delta}
+                        continue
+                    if full_text.strip():
+                        full_text = full_text.rstrip("\n") + "\n"
+                    block_id = event.get("messageId")
+                    last_text = ""
                 if content.startswith(last_text):
-                    # Cumulative frame: the new tail is the delta.
                     delta = content[len(last_text):]
-                    full_text = content
-                elif len(content) >= len(last_text):
-                    delta = content[len(last_text):]
-                    full_text = content
-                else:
-                    # Buffer restarted (clear_streaming or a new block): treat as fresh text.
+                elif restart_hint or len(content) < len(last_text):
+                    # Buffer restarted: the frame carries the text from scratch.
                     delta = content
-                    full_text = content
+                else:
+                    delta = content[len(last_text):]
+                restart_hint = False
                 last_text = content
+                full_text += delta
                 if delta:
                     yield {"type": "text", "delta": delta}
+            elif kind == "thinking":
+                content = event.get("content") or ""
+                if event.get("messageId") != thinking_id:
+                    if thinking_text.strip():
+                        thinking_text += "\n"
+                    thinking_id = event.get("messageId")
+                    last_thinking = ""
+                if content.startswith(last_thinking):
+                    thinking_text += content[len(last_thinking):]
+                elif len(content) >= len(last_thinking):
+                    thinking_text += content[len(last_thinking):]
+                else:
+                    thinking_text += content
+                last_thinking = content
             elif kind == "clear_streaming":
-                # The UI clears the streaming block (usually before a tool call);
-                # subsequent text frames start a fresh cumulative buffer.
-                last_text = ""
-                if full_text.strip():
-                    full_text += "\n"
+                # UI signal (usually before a tool call): the next frame may restart
+                # the same text, so we only mark that the buffer may be replaced.
+                restart_hint = True
             elif kind == "run_credits_persisted":
                 value = event.get("creditsUsed")
                 if isinstance(value, (int, float)):
@@ -261,7 +292,12 @@ class RelaySession:
             elif kind == "agent_loop_done":
                 for trail in await self._trailing():
                     yield trail
-                yield {"type": "final_text", "text": full_text}
+                final = full_text
+                if not final.strip() and thinking_text.strip():
+                    # The model answered only in its thinking channel: surface it.
+                    final = thinking_text.strip()
+                    yield {"type": "text", "delta": final}
+                yield {"type": "final_text", "text": final}
                 yield {"type": "end", "reason": "stop"}
                 return
             elif kind == "error":

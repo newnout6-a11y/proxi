@@ -23,7 +23,9 @@ def verify(headers, query_key, expected: str) -> None:
     presented = extract_key(headers) or (query_key or "").strip()
     if not presented:
         raise unauthorized()
-    if not hmac.compare_digest(presented, expected):
+    # compare_digest refuses non-ASCII str; headers arrive latin-1 decoded, so
+    # round-trip back to the original bytes and compare those.
+    if not hmac.compare_digest(presented.encode("latin-1", "replace"), expected.encode("utf-8")):
         raise unauthorized("invalid relay API key")
 
 

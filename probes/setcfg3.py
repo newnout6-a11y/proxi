@@ -1,0 +1,8 @@
+import json, pathlib
+p = pathlib.Path("config.json"); c = json.loads(p.read_text(encoding="utf-8"))
+c["base"] = "https://vovasaharov0880.retool.com"
+c["cookie"] = "experimentsId=-1201135262; nav-badge-assignment=control.51e35182-5ac4-42ff-8004-4459302262c2; nav-contact-sales-assignment=variant.51e35182-5ac4-42ff-8004-4459302262c2; stable-id=331eb91c-1770-432c-89ba-747a4f655a27; onboardingUrl=guided-tour; nav-app-gallery-assignment=off.51e35182-5ac4-42ff-8004-4459302262c2; ajs_anonymous_id=1babb352-d234-4f40-acdc-292eb91ee9bf; x-geo=NO-07; _cfuvid=5.HNjdrKDY1VvSZ2HDuP0D8VL8j4AXAWR8qD93kHx8k-1793200256.6141365-1.0.1.1-EGujp728wcQbw0kZfq5FGX9y.ZB2SFUZJUAg4v9WYM4; cf_clearance=EaCZCC59DBiVG6RHU4YwXIV._Bzh0J_cM.oFGE5Rgog-1793200257-1.2.1.1-GeDoZoNaPxKdI_5N.OIoaIQ0HQko4EkO75MlOIApbVSymRkPztvpkJQazVlaLDMI.Tu5GrBFsnDmADUuOewFPSU079R9KdMHFTrHtFsnEG0dU7xJWWmH8RHjV7QfcyfX3Qp5AwdN5LczQ.XkSJodNCA43vT3c6xNBhcnYOK.NPDh4I_0OqHhNs9K5bNHB_j5.cW_g2wVmUu0dhbiNO7hBqy8BnnLx6AdWz0jquyOOJXCs0iCG6T.7Kt7L5Yj3sBZyGaASR__aOZJbXlZKd1sO74o6hxon7tca00FL6EVgZU0ZZ.VMLJWFOfXvYeg00ZiytlaEx48vXuO3nZ.ptqVu4qzIlJS6WGTtXSXACek8Hc; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ4c3JmVG9rZW4iOiI0MzBhOTQ2Mi1lMDY0LTQyOGUtYWQwNC01MTdhMjMwNmY5NzUiLCJ2ZXJzaW9uIjoiMS4yIiwiaWF0IjoxNzkzMjAwMjY2fQ.crhAwR3gTTLBA8eZSySNZ0dPc_e129VP49C9615eAbM; xsrfToken=430a9462-e064-428e-ad04-517a2306f975; xsrfTokenSameSite=430a9462-e064-428e-ad04-517a2306f975; in_retool_canary_group=never; subdomain=vovasaharov0880.retool.com"
+c["xsrf"] = "430a9462-e064-428e-ad04-517a2306f975"
+c["page_uuid"] = "0a82fc2e-d2e1-11f1-b3fc-df5de4d956e8"
+c["thread_id"] = "90cf0995-1410-4481-80c2-d4794929b391"
+p.write_text(json.dumps(c, indent=2), encoding="utf-8"); print("updated", c["base"])

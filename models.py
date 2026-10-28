@@ -86,11 +86,11 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name, 'context': 200000}
     if effort is not None:
         allowed = EFFORTS_BY_PROVIDER.get(entry['provider'], ())
-        if not isinstance(effort, str) or effort.lower() not in allowed:
+        if allowed and (not isinstance(effort, str) or effort.lower() not in allowed):
             raise bad_request(
-                f"reasoning effort for {entry['provider']} must be one of {', '.join(allowed) or 'none'}",
+                f"reasoning effort for {entry['provider']} must be one of {', '.join(allowed)}",
                 param='reasoning_effort')
-        effort = effort.lower()
+        effort = effort.lower() if isinstance(effort, str) else effort
         if not entry.get('reasoning', True):
             effort = None
     return entry, effort

@@ -161,8 +161,8 @@ def make_handler(runtime: Runtime):
                     query = parse_qs(parsed_url.query)
                     auth.verify(self.headers, (query.get("key") or [""])[0], cfg["relay_api_key"])
                 if route == "chat":
-                    if not cfg.get("_chat", True):
-                        raise apierr.not_found()
+                    if not cfg["enable_chat"]:
+                        raise apierr.not_found("chat API disabled")
                     self._completion("chat")
                 elif route == "responses":
                     if not cfg["enable_responses"]:
@@ -338,6 +338,12 @@ def make_handler(runtime: Runtime):
                     continue
                 adapter.feed(event)
                 last_write = time.time()
+                # Check for a disconnect on every event, not only when the stream idles.
+                if sse.client_gone(self):
+                    session = holder.get("session")
+                    if session is not None:
+                        session.cancel()
+                    return "cancelled"
             return holder.get("reason", reason)
 
     return Handler

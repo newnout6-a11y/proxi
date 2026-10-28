@@ -11,6 +11,8 @@ _PATTERNS = [
     (re.compile(r"cf_clearance=[^;\s\"']+"), "cf_clearance=" + MASK),
     (re.compile(r"accessToken=[^;\s\"']+"), "accessToken=" + MASK),
     (re.compile(r"xsrfToken=[^;\s\"']+"), "xsrfToken=" + MASK),
+    # Relay key in a query string (?key=...)
+    (re.compile(r"([?&]key=)([^&\s\"']+)"), None),
     # Common key shapes
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), MASK),
     (re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"), MASK),

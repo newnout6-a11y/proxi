@@ -1,0 +1,12 @@
+fix(relay): close verifier blockers D1-D8, D10
+
+- _call: auth failure always raises ApiError even after successful refresh (was TypeError/500)
+- relay key compared as raw bytes (non-ASCII no longer 500) and ?key= masked in logs
+- command policy now splits on newlines and &&, ||, |, ;, & outside quotes and checks
+  powershell/pwsh/cmd bodies recursively against a cmdlet allowlist
+- disconnect detected on every streamed event, not only while idle
+- retry stays in the same Retool thread and keeps the full system prompt; exec follow-up
+  also re-sends instructions
+- thinking.type/disabled validated, string budget coerced, GLM accepts any effort
+- enable_chat config key instead of the dead _chat flag
+- docs: policy semantics, timeouts (60/30/40), verifier report

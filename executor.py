@@ -7,7 +7,72 @@ import threading
 import time
 
 EXEC_REGEX = re.compile(r"<exec_command>(.*?)</exec_command>", re.DOTALL | re.IGNORECASE)
-SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||\||;)\s*")
+SEPARATORS = ("&&", "||", "|", ";", "&", "\n", "\r")
+SHELLS = ("powershell", "pwsh", "cmd")
+SHELL_FLAGS = ("-command", "-c", "/c", "-encodedcommand", "-e")
+
+# cmdlets allowed inside a powershell/cmd body (head of the inner segment).
+CMD_LETS = "|".join((
+    "get-content|get-childitem|get-item|get-itemproperty|get-location|get-date|get-command",
+    "get-process|get-service|select-string|select-object|sort-object|where-object|foreach-object",
+    "measure-object|resolve-path|test-path|write-output|write-host|split-path|join-path",
+    "dir|type|more|findstr|where|tasklist|ping|start-sleep|cls|echo|copy|move|mkdir|remove-item",
+))
+CMD_LETS_RE = re.compile("^(" + CMD_LETS + r")\b", re.IGNORECASE)
+
+
+def split_segments(cmd: str):
+    """Split a command line on shell separators, ignoring ones inside quotes."""
+    segments, buf = [], []
+    quote = ""
+    chars = list(cmd or "")
+    i = 0
+    while i < len(chars):
+        ch = chars[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        two = cmd[i:i + 2]
+        if two in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in "|;&\n\r":
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [s.strip() for s in segments if s.strip()]
+
+
+def _shell_body(segment: str):
+    """Return the command body of a powershell/cmd segment, if it has one."""
+    parts = segment.split(None, 1)
+    if len(parts) < 2:
+        return None
+    rest = parts[1]
+    lowered = rest.lower()
+    for flag in SHELL_FLAGS:
+        idx = lowered.find(flag)
+        if idx == -1:
+            continue
+        body = rest[idx + len(flag):].strip()
+        if body[:1] in ('"', "'") and body[-1:] == body[:1]:
+            body = body[1:-1]
+        return body.strip() or None
+    return None
 
 # Variables kept from the parent environment; everything else is dropped.
 ENV_KEEP = ("PATH", "PATHEXT", "SystemRoot", "SystemDrive", "ComSpec", "TEMP", "TMP",
@@ -34,21 +99,28 @@ def extract_command(text: str):
     return cmd.strip() or None
 
 
+def _check_segments(segments, patterns, depth=0) -> None:
+    for segment in segments:
+        head = segment.split(" ")[0].strip('"')
+        if head.startswith("$env:") or head.lower() == "set":
+            continue
+        shell = head.lower().removesuffix(".exe") in SHELLS
+        if not shell and not any(pattern.search(segment) for pattern in patterns):
+            raise PolicyError(
+                "command not allowlisted: '" + head + "' "
+                "(exec_policy=allowlist; add a pattern to exec_allowlist)")
+        body = _shell_body(segment) if shell else None
+        if body and depth < 3:
+            # The shell body must satisfy the policy on its own.
+            inner = [s for s in split_segments(body) if s.strip()]
+            _check_segments(inner, [CMD_LETS_RE] + patterns, depth + 1)
+
+
 def check_policy(cmd: str, policy: str, allowlist) -> None:
     if policy == "allow_all":
         return
     patterns = [re.compile(p, re.IGNORECASE) for p in (allowlist or [])]
-    for segment in SEGMENT_SPLIT.split(cmd):
-        segment = segment.strip()
-        if not segment:
-            continue
-        head = segment.split(" ")[0]
-        if head.startswith("$env:") or head.startswith("set"):
-            continue
-        if not any(pattern.search(segment) for pattern in patterns):
-            raise PolicyError(
-                "command not allowlisted: '" + head + "' "
-                "(exec_policy=allowlist; add a pattern to exec_allowlist)")
+    _check_segments(split_segments(cmd), patterns)
 
 
 def clean_env(workspace: str) -> dict:

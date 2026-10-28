@@ -1,6 +1,7 @@
 """Configuration loading, environment overrides and validation."""
 import json
 import os
+import re
 import secrets
 
 from apierr import service_unavailable
@@ -19,15 +20,15 @@ DEFAULTS = {
     "max_workers": 16,
     "rate_limit_rps": 8.0,
     "rate_limit_burst": 16.0,
-    "turn_timeout": 180,
-    "recv_timeout": 60,
+    "turn_timeout": 60,
+    "recv_timeout": 30,
     "upstream_timeout": 120,
     "command_timeout": 40,
     "command_output_limit": 4000,
     "max_exec_turns": 5,
     "exec_policy": "allowlist",
     "exec_allowlist": [
-        r"^git\b", r"^dir\b", r"^type\b", r"^findstr\b", r"^where\b", r"^python\b",
+        r"^powershell\b", r"^pwsh\b", r"^cmd\b", r"^git\b", r"^ping\b", r"^more\b", r"^dir\b", r"^type\b", r"^findstr\b", r"^where\b", r"^python\b",
         r"^pytest\b", r"^npm\b", r"^node\b", r"^pip\b", r"^dotnet\b", r"^cargo\b",
         r"^rg\b", r"^Get-ChildItem\b", r"^Get-Content\b", r"^Select-String\b",
         r"^curl\b", r"^echo\b", r"^cls\b", r"^mkdir\b",
@@ -36,6 +37,7 @@ DEFAULTS = {
     "context_max_bytes": 2500,
     "show_exec_output": True,
     "enable_anthropic": True,
+    "enable_chat": True,
     "enable_responses": True,
     "reasoning_effort": "high",
     "agent_mode": 2,
@@ -45,6 +47,9 @@ DEFAULTS = {
 }
 
 REQUIRED = ("base", "page_uuid", "ua")
+
+# Cookie values that are just host names are not secrets.
+HOSTNAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
 
 
 def _read_file(path):
@@ -128,5 +133,10 @@ def load(path=CONFIG_PATH):
         raise service_unavailable(f"workspace_root is not a directory: {cfg['workspace_root']}")
 
     cfg["relay_api_key"] = _ensure_relay_key(cfg)
-    cfg["cookie_values"] = [seg.split("=", 1)[1] for seg in cfg["cookie"].split("; ") if "=" in seg]
+    # Mask cookie secrets, but not plain host names (else the subdomain gets hidden).
+    cfg["cookie_values"] = [
+        seg.split("=", 1)[1]
+        for seg in cfg["cookie"].split("; ")
+        if "=" in seg and not HOSTNAME.fullmatch(seg.split("=", 1)[1])
+    ]
     return cfg

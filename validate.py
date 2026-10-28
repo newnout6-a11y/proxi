@@ -120,6 +120,8 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
         if not isinstance(message, dict):
             raise unprocessable(f"messages[{index}] must be an object", param=f"messages[{index}]")
         role = message.get(role_key) or message.get("role")
+        if role is None and message.get("tool_calls"):
+            role = "assistant"
         if not isinstance(role, str):
             raise unprocessable(f"messages[{index}].{role_key} must be a string", param=f"messages[{index}].{role_key}")
         text = _blocks_to_text(message.get("content"), index, role)
@@ -146,6 +148,23 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
             continue
         convo.append(f"{role.capitalize()}: {text}")
     return "\n\n".join(system_parts), "\n\n".join(convo)
+
+
+def _responses_item(item):
+    """Responses input items are richer than chat messages; normalise the shapes."""
+    if not isinstance(item, dict):
+        return item
+    kind = item.get("type")
+    if kind in ("function_call_output", "tool_result") and "role" not in item:
+        return {"role": "tool", "name": item.get("call_id") or "tool",
+                "content": item.get("output") if item.get("output") is not None else item.get("content")}
+    if kind == "function_call" and "role" not in item:
+        return {"role": "assistant", "content": "",
+                "tool_calls": [{"function": {"name": item.get("name") or "tool",
+                                             "arguments": item.get("arguments") or ""}}]}
+    if kind in ("reasoning", "item_reference") and "role" not in item:
+        return {"role": "assistant", "content": item.get("summary") or ""}
+    return item
 
 
 def _messages(data, *, min_items=1):
@@ -195,7 +214,7 @@ def parse_responses(data, cfg):
     if isinstance(raw_input, str):
         messages = [{"role": "user", "content": raw_input}]
     elif isinstance(raw_input, list):
-        messages = raw_input
+        messages = [_responses_item(item) for item in raw_input]
     elif raw_input is None:
         raise bad_request("'input' is required", param="input")
     else:
@@ -246,8 +265,18 @@ def _effort(data):
     if thinking is not None and not isinstance(thinking, dict):
         raise unprocessable("'thinking' must be an object", param="thinking")
     if isinstance(thinking, dict):
+        kind = thinking.get("type")
+        if kind is not None:
+            if not isinstance(kind, str) or kind.lower() not in ("enabled", "disabled", "auto"):
+                raise unprocessable("thinking.type must be 'enabled', 'disabled' or 'auto'",
+                                    param="thinking.type")
+            if kind.lower() == "disabled":
+                return None
         if thinking.get("effort") is not None:
             return _opt_str(thinking, "effort")
         if thinking.get("budget_tokens") is not None:
-            return model_catalog.effort_from_budget(thinking["budget_tokens"])
+            budget = thinking["budget_tokens"]
+            if isinstance(budget, str) and budget.strip().isdigit():
+                budget = int(budget)
+            return model_catalog.effort_from_budget(budget)
     return None

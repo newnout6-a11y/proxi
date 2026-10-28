@@ -31,12 +31,26 @@ class FakeSession:
 class FakePool:
     def __init__(self, session):
         self.session = session
+        self.acquires = 0
 
     async def acquire(self):
+        self.acquires += 1
         return self.session
 
     async def release(self, session):
         return None
+
+
+class EmptyThenText(FakeSession):
+    async def stream(self, prompt, model_provider):
+        self.prompts.append(prompt)
+        self.calls += 1
+        if self.calls == 1:
+            yield {"type": "final_text", "text": ""}
+        else:
+            yield {"type": "text", "delta": "готово"}
+            yield {"type": "final_text", "text": "готово"}
+        yield {"type": "end", "reason": "stop"}
 
 
 def parsed(prompt="покажи папку"):
@@ -65,6 +79,23 @@ def test_exec_output_is_redacted(tmp_path, monkeypatch):
     assert "[redacted]" in session.prompts[1]
     assert COOKIE_VALUE not in session.prompts[1]
     assert any(e and e.get("type") == "exec_result" for e in events)
+
+
+def test_retry_keeps_instructions_and_session(tmp_path):
+    session = EmptyThenText()
+    pool = FakePool(session)
+    cfg = {"workspace_root": str(tmp_path), "project_context": False, "exec_policy": "allowlist",
+           "exec_allowlist": ["^dir\\b"], "max_exec_turns": 2, "command_timeout": 5,
+           "command_output_limit": 500, "show_exec_output": True, "cookie_values": [],
+           "context_max_bytes": 500, "provider_resource_name": "anth", "openai_provider_resource_name": "oai"}
+    runner = TurnRunner(cfg, type("C", (), {"record_turn": lambda *a: None})(), pool)
+    out = queue.Queue()
+    asyncio.run(runner.run(parsed(), out, {}))
+
+    assert pool.acquires == 1, "retry must reuse the same session/thread"
+    assert len(session.prompts) == 2
+    assert session.prompts[1].startswith(session.prompts[0])
+    assert "[RETRY]" in session.prompts[1]
 
 
 def test_context_hides_cookie_value(tmp_path):

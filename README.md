@@ -59,11 +59,23 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 | --- | --- |
 | session_mode | per_request (изоляция, по умолчанию) или shared (один тред) |
 | exec_policy | allowlist (по умолчанию), allow_all, off |
-| exec_allowlist | regex-список разрешённых первых слов команд |
+| exec_allowlist | regex-список разрешённых первых слов команд (см. ниже) |
 | strict_models | true — неизвестная модель даёт 404 вместо тихой маршрутизации |
 | max_body_bytes, max_workers, rate_limit_rps | лимиты входа и параллелизма |
 | agent_mode | 2 — рабочий режим агента (1 — более «разговорный», 3 — не проверялся) |
 | google_provider_resource_name, retool_fast_provider_resource_name | ресурсы для gemini-* и zai-org/*; без них эти модели дают 503 |
+
+### Как читается политика команд
+
+Команда режется на сегменты по переводам строк и разделителям `&& || | ; &` **вне кавычек**.
+Для каждого сегмента проверяется первое слово. Для `powershell`, `pwsh` и `cmd` тело после
+`-Command` / `-c` / `/c` проверяется рекурсивно по списку разрешённых cmdlet-ов
+(`Get-Content`, `Get-ChildItem`, `Select-String`, `dir`, `type`, `findstr`, `ping` и т. п.).
+Поэтому `powershell -Command "Get-ChildItem; Get-Date"` проходит, а `powershell -c "calc"` — нет.
+`allowlist` ограничивает **список программ**, а не файловую систему: `type C:\Windows\win.ini`
+или `type %USERPROFILE%\.ssh\id_rsa` пройдут. Для изоляции ФС нужен отдельный контейнер.
+
+Таймауты: ход — 60 с (`turn_timeout`), ожидание кадра — 30 с (`recv_timeout`), команда — 40 с.
 
 ## Каталог моделей
 
