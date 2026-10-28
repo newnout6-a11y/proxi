@@ -215,8 +215,20 @@ def make_handler(runtime: Runtime):
                 "context_window": model["context"],
                 "capabilities": {"reasoning": model["reasoning"], "tools": model["tools"],
                                  "vision": model["vision"]},
-            } for model in model_catalog.catalog()]
+            } for model in model_catalog.catalog()
+                if self._model_routable(model)]
             self._json(200, {"object": "list", "data": data})
+
+        def _model_routable(self, model) -> bool:
+            """Hide models whose provider resource is not configured."""
+            if cfg.get("show_unrouted_models"):
+                return True
+            if not any(cfg.get(k) for k in model_catalog.PROVIDER_RESOURCE_KEY.values()):
+                return True  # nothing configured yet: list everything, calls fail with a clear 503
+            if model["id"] == cfg.get("model"):
+                return True  # the configured default stays visible
+            key = model_catalog.PROVIDER_RESOURCE_KEY.get(model["provider"])
+            return bool(key and cfg.get(key))
 
         def _health(self):
             balance = runtime.credits.get_balance(force_refresh=True)

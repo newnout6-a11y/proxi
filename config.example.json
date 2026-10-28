@@ -17,10 +17,10 @@
 
   "max_body_bytes": 33554432,
   "max_workers": 32,
-  "rate_limit_rps": 8,
-  "rate_limit_burst": 16,
-  "turn_timeout": 60,
-  "recv_timeout": 30,
+  "rate_limit_rps": 32,
+  "rate_limit_burst": 64,
+  "turn_timeout": 300,
+  "recv_timeout": 120,
   "upstream_timeout": 120,
 
   "model": "claude-opus-5-5",
@@ -31,7 +31,7 @@
   "exec_policy": "allowlist",
   "exec_policy_note": "allowlist режет команду по \\n и \\u0026\\u0026 || | ; \\u0026 вне кавычек; тело powershell/cmd после -Command/-c проверяется рекурсивно",
   "exec_allowlist": ["^powershell\\b", "^pwsh\\b", "^cmd\\b", "^git\\b", "^dir\\b", "^type\\b", "^findstr\\b", "^python\\b", "^npm\\b"],
-  "max_exec_turns": 5,
+  "max_exec_turns": 0,
   "command_timeout": 40,
   "command_output_limit": 64000,
   "show_exec_output": true,

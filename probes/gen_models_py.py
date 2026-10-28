@@ -33,7 +33,7 @@ lines = ['"""Model catalog mirrored from the Retool copilot bundle (probes/gen_m
          "CATALOG = ["]
 DROP = ("gpt-4.1",)  # к октябрю 2026 выведены из обихода
 NEW_OPENAI = [("gpt-6-astra", 400000), ("gpt-6-sol", 400000), ("gpt-6-luna", 400000),
-              ("gpt-6.1-sol", 400000), ("gpt-6.1-sol-ultrafast", 400000)]
+              ("gpt-6.1-sol", 400000)]  # ultrafast пока отдаёт 502 на стороне OpenAI
 
 
 def max_out(provider, mid):

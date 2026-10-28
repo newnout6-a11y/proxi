@@ -15,13 +15,14 @@ DEFAULTS = {
     "port": 8787,
     "session_mode": "per_request",
     "strict_models": True,
+    "show_unrouted_models": False,
     "max_body_bytes": 32 * 1024 * 1024,
     "max_frame_bytes": 16 * 1024 * 1024,
     "max_workers": 32,
-    "rate_limit_rps": 8.0,
-    "rate_limit_burst": 16.0,
-    "turn_timeout": 60,
-    "recv_timeout": 30,
+    "rate_limit_rps": 32.0,
+    "rate_limit_burst": 64.0,
+    "turn_timeout": 300,
+    "recv_timeout": 120,
     "upstream_timeout": 120,
     "command_timeout": 40,
     "command_output_limit": 64000,
@@ -125,8 +126,8 @@ def load(path=CONFIG_PATH):
         raise service_unavailable("session_mode must be 'per_request' or 'shared'")
     if cfg["session_mode"] == "shared" and not cfg.get("thread_id"):
         raise service_unavailable("session_mode 'shared' requires 'thread_id'")
-    if cfg["exec_policy"] not in ("allow_all", "allowlist"):
-        raise service_unavailable("exec_policy must be 'allow_all' or 'allowlist'")
+    if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
+        raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
 
     workspace = cfg.get("workspace_root") or os.getcwd()
     # Resolve symlinks/junctions so escapes are visible.

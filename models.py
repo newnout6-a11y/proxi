@@ -25,7 +25,6 @@ ALIASES = {"claude-opus": "claude-opus-5-5", "claude-sonnet": "claude-sonnet-5",
            "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol"}
 
 CATALOG = [
-    {"id": "gpt-6.1-sol-ultrafast", "label": "GPT 6.1-sol-ultrafast", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gpt-6.1-sol", "label": "GPT 6.1-sol", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gpt-6-luna", "label": "GPT 6-luna", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gpt-6-sol", "label": "GPT 6-sol", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},

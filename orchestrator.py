@@ -10,11 +10,26 @@ from context import build_system_instructions
 from redact import redact
 
 
+def _b(text: str) -> int:
+    """Limit in bytes, not characters (Cyrillic is 2 bytes each in UTF-8)."""
+    return len((text or "").encode("utf-8"))
+
+
+def _trim(text: str, budget: int) -> str:
+    if budget <= 0 or not text:
+        return ""
+    raw = text.encode("utf-8")
+    if len(raw) <= budget:
+        return text
+    return raw[:budget].decode("utf-8", "ignore")
+
+
 class TurnRunner:
     def __init__(self, cfg, credits, pool):
         self.cfg = cfg
         self.credits = credits
         self.pool = pool
+        self._recent = []
 
     def _can_exec(self, steps: int) -> bool:
         """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
@@ -22,6 +37,17 @@ class TurnRunner:
             return False
         max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
         return max_steps <= 0 or steps < max_steps
+
+    def _looks_looping(self, command: str) -> bool:
+        """True when this command already ran three times in the recent window."""
+        key = " ".join(command.strip().lower().split())
+        recent = [" ".join(c.strip().lower().split()) for c, _ in self._recent]
+        return recent.count(key) >= 3
+
+    def _remember(self, command: str) -> None:
+        self._recent.append((command, 0))
+        if len(self._recent) > 8:
+            del self._recent[0]
 
     def _instructions(self):
         return build_system_instructions(
@@ -109,14 +135,22 @@ class TurnRunner:
                                 return
                     holder.setdefault("reason", "stop")
 
-                    can_exec = self._can_exec(exec_steps)
+                    # Once the summary turn is requested, nothing is executed any more.
+                    can_exec = self._can_exec(exec_steps) and not final_summary
                     command = executor.extract_command(final_text) if can_exec else None
 
-                    if not can_exec and not final_summary:
-                        # Out of budget/time: one last turn with the commands disabled.
+                    if not final_summary and exec_steps and not self._can_exec(exec_steps):
+                        # Explicit step cap reached (max_exec_turns > 0 only).
                         final_summary = True
-                        prompt = (base_prompt + "\n\n[ИТОГ] Команды больше не выполняй. "
-                                  "Дай итоговый ответ по уже собранной информации, на русском.")
+                        prompt = prompt + "\n\n[ИТОГ] Команды больше не выполняй. " \
+                                          "Дай итоговый ответ по уже собранной информации, на русском."
+                        continue
+
+                    # Loop guard: the same command keeps coming back (any period).
+                    if command and not final_summary and self._looks_looping(command):
+                        final_summary = True
+                        prompt = prompt + "\n\n[ИТОГ] Команда '" + command + "' повторяется. " \
+                                          "Команды больше не выполняй, дай итоговый ответ."
                         continue
 
                     if not command and not final_text.strip():
@@ -172,12 +206,13 @@ class TurnRunner:
                         for c, e in previous_steps[-4:]
                     ) or "(none yet)"
                     previous_steps.append((command, code))
+                    self._remember(command)
 
                     limit = int(self.cfg.get("max_prompt_bytes", 128000))
                     header = task_block + "\n\nPrevious steps: " + trail
-                    wrapper = len(executor.format_command_followup(command, code, "", header))
-                    budget = limit - len(instructions) - len(reminder) - wrapper - 100
-                    trimmed = output[: max(200, budget)]
+                    wrapper = _b(executor.format_command_followup(command, code, "", header))
+                    budget = limit - _b(instructions) - _b(reminder) - wrapper - 100
+                    trimmed = _trim(output, max(0, budget))
                     followup = executor.format_command_followup(command, code, trimmed, header)
                     if reminder:
                         followup += reminder
