@@ -245,7 +245,7 @@ def make_handler(runtime: Runtime):
             return bool(key and cfg.get(key))
 
         def _health(self):
-            balance = runtime.credits.get_balance(force_refresh=True)
+            balance = runtime.credits.get_balance()
             ok = balance.get("available") is not None and not balance.get("stale")
             payload = {
                 "ok": ok,

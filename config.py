@@ -166,7 +166,8 @@ def load(path=CONFIG_PATH):
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit"):
         if cfg[key] < 0:
             raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
-    for key in ("turn_timeout", "recv_timeout", "upstream_timeout", "command_timeout", "max_workers"):
+    for key in ("turn_timeout", "recv_timeout", "upstream_timeout", "command_timeout", "max_workers",
+                "max_body_bytes", "max_frame_bytes"):
         if cfg[key] < 1:
             raise service_unavailable(f"{key} must be positive")
     if cfg["max_conversations"] < 1 or cfg["conversation_idle_timeout"] < 1:

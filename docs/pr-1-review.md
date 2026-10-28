@@ -5,8 +5,8 @@ Qodo сверены с исходниками, исправления покры
 Нумерация ниже совпадает с номерами замечаний в PR. Данные авторизации и
 содержимое непрозрачных блоков провайдера в отчёт не включены.
 
-Итоговый интеграционный прогон после исправлений и аудита лимитов:
-`python -m pytest -o addopts= -q` — **374 passed in 38.93s**.
+Полный локальный прогон после исправлений повторного ревью:
+`python -m pytest -o addopts= -q` — **464 passed in 49.48s**.
 Компиляция рабочих Python-модулей, разбор `config.example.json` и
 `git diff --check` завершились с exit 0.
 
@@ -37,6 +37,42 @@ Qodo сверены с исходниками, исправления покры
 | 21 | Невалидный UTF-8 тихо заменялся на U+FFFD | Невалидная кодировка отклоняется вместо изменения пользовательских данных. |
 | 22 | Строка `"false"` включала streaming | `stream` принимает только boolean во всех трёх dialects. |
 | 23 | Scratch verification output попадал в поставку | `.verify*`, одноразовые `probes` и `r.txt` исключены из текущего Git-дерева. Регрессии находятся в `tests/`. |
+
+## Повторное ревью Qodo
+
+Пять дополнительных замечаний к `c77030b` проверены и исправлены.
+Нумерация этой таблицы относится к повторному ревью.
+
+| № | Проверенный дефект | Результат исправления |
+| --- | --- | --- |
+| 1 | Каждый анонимный `/health` принудительно запрашивал upstream | Health использует 30-секундный кеш баланса; параллельные промахи объединяются в один запрос. Ошибки HTTP/auth, timeout и некорректного ответа тоже кешируются. При недоступном или stale-балансе сохраняется HTTP 503; авторизованный запрос баланса может явно обновить данные. |
+| 2 | System учитывался дважды, а Anthropic start не учитывал prompt | Все адаптеры сохраняют полный нормализованный prompt и считают его один раз. Начальный и конечный input usage Anthropic совпадают; оценки по-прежнему помечены `estimated`. |
+| 3 | Нулевые/отрицательные body/frame limits проходили startup | `max_body_bytes` и `max_frame_bytes` проверяются как строго положительные при загрузке конфигурации. |
+| 4 | JSON scalar/array в WebSocket приводил к AttributeError | Неподдерживаемые JSON-значения игнорируются в heartbeat, основном stream и trailing-обработке; последующие text/ping/credits продолжают обрабатываться. |
+| 5 | Allowlisted shell-команды могли перенаправлять ввод/вывод | Неэкранированные кавычками `<`/`>` отклоняются во внешнем cmd и вложенных cmd/PowerShell bodies, включая append и descriptor redirection. Quoted literals, обычные pipelines и явный `allow_all` сохранены. |
+
+Добавлены 90 регрессионных случаев в `tests/test_health_cache.py`,
+`tests/test_usage_consistency.py`, `tests/test_review_validation.py` и
+`tests/test_redirection_policy.py`. Эти проверки используют локальный HTTP
+harness и подменённый upstream; новый живой модельный прогон для этих пяти
+исправлений не выполнялся.
+
+После перезапуска локального relay живой `/health` вернул HTTP 200,
+`ok: true`, `upstream: ok`, 37 моделей. Это проверка доступности баланса
+и сервиса, а не новый тест генерации каждой модели.
+
+Итоговые проверки:
+
+```text
+python -m pytest -o addopts= -q
+464 passed in 49.48s
+
+python -m py_compile adapters.py config.py credits.py executor.py proxy.py session.py tests/test_health_cache.py tests/test_redirection_policy.py tests/test_review_validation.py tests/test_usage_consistency.py
+exit 0
+
+git -c core.safecrlf=false diff --check
+exit 0
+```
 
 ## Thinking и уровни мышления
 

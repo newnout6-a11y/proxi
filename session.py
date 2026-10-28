@@ -210,7 +210,7 @@ class RelaySession:
             event = json.loads(raw)
         except json.JSONDecodeError:
             return
-        if event.get("type") == "ping":
+        if isinstance(event, dict) and event.get("type") == "ping":
             try:
                 await self.ws.send('{"type":"pong"}')
             except Exception:
@@ -367,6 +367,8 @@ class RelaySession:
                 try:
                     event = json.loads(raw)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
                     continue
                 kind = event.get("type")
 
@@ -569,6 +571,8 @@ class RelaySession:
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
                 continue
             if event.get("type") == "run_credits_persisted":
                 value = event.get("creditsUsed")

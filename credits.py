@@ -1,5 +1,6 @@
 """Thread-safe credits tracking and usage history."""
 import json
+import math
 import threading
 import time
 import urllib.request
@@ -14,19 +15,27 @@ class CreditsManager:
         self.headers_fn = headers_fn
         self.refresher = refresher
         self._lock = threading.RLock()
+        self._fetch_lock = threading.Lock()
         self._balance = None
-        self._cached_at = 0.0
+        self._cached_at = float("-inf")
         self.session_used = 0.0
         self._history = []
         self._seen_turns = set()
         self.last_error = None
 
     def get_balance(self, force_refresh=False):
-        now = time.time()
+        # Coalesce simultaneous cache misses, including a failed auth refresh.
+        with self._fetch_lock:
+            return self._get_balance(force_refresh)
+
+    def _get_balance(self, force_refresh):
+        now = time.monotonic()
         with self._lock:
-            if not force_refresh and self._balance and now - self._cached_at < CACHE_TTL:
-                return dict(self._balance, stale=bool(self.last_error),
-                            **({"stale_error": self.last_error} if self.last_error else {}))
+            if not force_refresh and now - self._cached_at < CACHE_TTL:
+                if self._balance:
+                    return dict(self._balance, stale=bool(self.last_error),
+                                **({"stale_error": self.last_error} if self.last_error else {}))
+                return {"available": None, "error": self.last_error, "session_used": self.session_used}
         def fetch():
             req = urllib.request.Request(self.base_url + "/api/credits/balance",
                                          headers=self.headers_fn(), method="GET")
@@ -35,27 +44,34 @@ class CreditsManager:
 
         try:
             data = self.refresher.call(fetch) if self.refresher is not None else fetch()
+            if not isinstance(data, dict) or not isinstance(data.get("org"), dict):
+                raise ValueError("invalid upstream balance object")
+            org = data["org"]
+            available = org.get("balance")
+            allocation = org.get("monthlyAllocation", 0.0)
+            if isinstance(available, bool) or isinstance(allocation, bool):
+                raise ValueError("invalid upstream balance amount")
+            available, allocation = float(available), float(allocation)
+            if not math.isfinite(available) or not math.isfinite(allocation):
+                raise ValueError("invalid upstream balance amount")
+            info = {
+                "available": round(available, 4),
+                "monthly_allocation": allocation,
+                "used_month": round(max(0.0, allocation - available), 4) if allocation else 0.0,
+                "reset_date": org.get("resetDate"),
+                "is_low": org.get("isLow", False),
+                "session_used": round(self.session_used, 4),
+            }
         except Exception as exc:
             with self._lock:
-                self.last_error = str(exc)
+                self.last_error = str(exc) or type(exc).__name__
+                self._cached_at = time.monotonic()
                 if self._balance:
-                    return dict(self._balance, stale=True, stale_error=str(exc))
-                return {"available": None, "error": str(exc), "session_used": self.session_used}
-
-        org = data.get("org") or {}
-        available = org.get("balance", 0.0)
-        allocation = org.get("monthlyAllocation", 0.0)
-        info = {
-            "available": round(float(available), 4),
-            "monthly_allocation": allocation,
-            "used_month": round(max(0.0, float(allocation) - float(available)), 4) if allocation else 0.0,
-            "reset_date": org.get("resetDate"),
-            "is_low": org.get("isLow", False),
-            "session_used": round(self.session_used, 4),
-        }
+                    return dict(self._balance, stale=True, stale_error=self.last_error)
+                return {"available": None, "error": self.last_error, "session_used": self.session_used}
         with self._lock:
             self._balance = dict(info)
-            self._cached_at = now
+            self._cached_at = time.monotonic()
             self.last_error = None
         return dict(info, stale=False)
 

@@ -18,6 +18,8 @@ class _Base:
     def __init__(self, parsed, writer=None):
         self.parsed = parsed
         self.writer = writer
+        # Initial and final usage must estimate the same complete request.
+        self._prompt_text = getattr(parsed, "system", "") + "\n" + getattr(parsed, "prompt", "")
         self.text = ""
         self.thinking = ""
         self.credits = 0.0
@@ -62,8 +64,8 @@ class _Base:
             self.text += block
             self._text(block)
 
-    def usage(self, prompt_text=""):
-        prompt = approx_tokens(prompt_text) + approx_tokens(self.parsed.system)
+    def usage(self, prompt_text=None):
+        prompt = approx_tokens(self._prompt_text if prompt_text is None else prompt_text)
         completion = approx_tokens(self.text)
         return prompt, completion
 
@@ -99,13 +101,13 @@ class _Base:
     def _tool_call(self, index, call, delta, new=False):
         pass
 
-    def payload(self, reason, prompt_text=""):
+    def payload(self, reason, prompt_text=None):
         raise NotImplementedError
 
     def begin(self):
         raise NotImplementedError
 
-    def end(self, reason, prompt_text=""):
+    def end(self, reason, prompt_text=None):
         raise NotImplementedError
 
 
@@ -143,7 +145,7 @@ class ChatAdapter(_Base):
             item["function"]["name"] = call["name"]
         self.writer.data(self._chunk({"tool_calls": [item]}))
 
-    def end(self, reason, prompt_text=""):
+    def end(self, reason, prompt_text=None):
         finish = FINISH_MAP.get(reason, "stop")
         if self.writer:
             self.writer.data(self._chunk({}, finish))
@@ -158,7 +160,7 @@ class ChatAdapter(_Base):
             self.writer.done()
         return self.payload(reason, prompt_text)
 
-    def payload(self, reason, prompt_text=""):
+    def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
@@ -286,7 +288,7 @@ class ResponsesAdapter(_Base):
                 "item_id": call["id"], "output_index": output_index, "delta": delta,
             })
 
-    def end(self, reason, prompt_text=""):
+    def end(self, reason, prompt_text=None):
         if not self._items:
             self._ensure_item("message", self.item_id)
         status = "incomplete" if reason == "timeout" else "completed"
@@ -317,7 +319,7 @@ class ResponsesAdapter(_Base):
             self.writer.done()
         return final
 
-    def payload(self, reason, prompt_text=""):
+    def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
         if not self._items:
             self._ensure_item("message", self.item_id)
@@ -422,7 +424,7 @@ class AnthropicAdapter(_Base):
             return "tool_use"
         return "end_turn"
 
-    def end(self, reason, prompt_text=""):
+    def end(self, reason, prompt_text=None):
         usage = {"input_tokens": self.usage(prompt_text)[0], "output_tokens": self.usage(prompt_text)[1]}
         if not self._blocks:
             self._open("text")
@@ -435,7 +437,7 @@ class AnthropicAdapter(_Base):
             self.writer.done()
         return self.payload(reason, prompt_text)
 
-    def payload(self, reason, prompt_text=""):
+    def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
         return {"id": self.id, "type": "message", "role": "assistant", "model": self.parsed.model,
                 "content": [dict(block) for block in self._blocks] or [{"type": "text", "text": ""}],

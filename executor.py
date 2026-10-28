@@ -24,7 +24,7 @@ CMD_LETS = "|".join((
 CMD_LETS_RE = re.compile("^(" + CMD_LETS + r")\b", re.IGNORECASE)
 
 
-def split_segments(cmd: str, powershell=False):
+def split_segments(cmd: str, powershell=False, reject_redirection=False):
     """Split a command line on shell separators, ignoring ones inside quotes."""
     segments, buf = [], []
     quote = ""
@@ -43,6 +43,8 @@ def split_segments(cmd: str, powershell=False):
             buf.append(ch)
             i += 1
             continue
+        if reject_redirection and ch in "<>":
+            raise PolicyError("redirection requires allow_all")
         two = cmd[i:i + 2]
         if two in ("&&", "||"):
             segments.append("".join(buf))
@@ -195,7 +197,7 @@ def _check_segments(segments, patterns, depth=0) -> None:
             ps = head.lower().removesuffix(".exe") != "cmd"
             if ps and re.search(r"[{}()\x60]|(?:^|[;\r\n])\s*\$", body):
                 raise PolicyError("PowerShell script blocks, expansion and assignments require allow_all")
-            inner = split_segments(body, powershell=ps)
+            inner = split_segments(body, powershell=ps, reject_redirection=True)
             _check_segments(inner, [CMD_LETS_RE] if ps else patterns, depth + 1)
 
 
@@ -207,7 +209,7 @@ def check_policy(cmd: str, policy: str, allowlist) -> None:
     if not cmd or re.search(r"[%!^]", cmd):
         raise PolicyError("cmd expansion/escaping is not supported by allowlist")
     patterns = [re.compile(p, re.IGNORECASE) for p in (allowlist or [])]
-    _check_segments(split_segments(cmd), patterns)
+    _check_segments(split_segments(cmd, reject_redirection=True), patterns)
 
 
 def clean_env(workspace: str) -> dict:
