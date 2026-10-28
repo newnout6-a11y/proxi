@@ -221,3 +221,36 @@ def test_responses_does_not_replace_truncated_custom_input_with_an_empty_patch()
     with pytest.raises(apierr.ApiError) as error:
         adapter.end("tool_calls")
     assert error.value.status == 502
+
+
+def test_responses_namespaced_tool_restores_client_dispatch_name_in_every_item():
+    tools = [{"type": "function", "function": {
+        "name": "multi_agent_v1.spawn_agent", "x-namespace": "multi_agent_v1",
+        "x-client-name": "spawn_agent", "parameters": {"type": "object"},
+    }}]
+    writer = Writer()
+    adapter = adapters.ResponsesAdapter(parsed(tools=tools), writer)
+    adapter.begin()
+    adapter.feed({"type": "tool_call", "id": "spawn-1", "name": "multi_agent_v1.spawn_agent",
+                  "arguments": '{"task":"inspect"}'})
+    final = adapter.end("tool_calls")
+    items = [p["item"] for kind, p in writer.events
+             if kind in ("response.output_item.added", "response.output_item.done")]
+    items += final["output"]
+    assert len(items) == 3
+    assert all(item["namespace"] == "multi_agent_v1" for item in items)
+    assert all(item["name"] == "spawn_agent" for item in items)
+    assert all(item["call_id"] == "spawn-1" for item in items)
+
+
+def test_responses_namespaces_disambiguate_identical_tool_leaf_names():
+    tools = [{"type": "function", "function": {
+        "name": space + ".inspect", "x-namespace": space, "x-client-name": "inspect",
+    }} for space in ["files", "agents"]]
+    adapter = adapters.ResponsesAdapter(parsed(tools=tools))
+    for space in ["files", "agents"]:
+        adapter.feed({"type": "tool_call", "id": space + "-1", "name": space + ".inspect",
+                      "arguments": "{}"})
+    output = adapter.end("tool_calls")["output"]
+    assert [(item["namespace"], item["name"]) for item in output] == [
+        ("files", "inspect"), ("agents", "inspect")]

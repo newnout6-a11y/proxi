@@ -65,15 +65,47 @@ RETOOL_PAGE_UUID, RETOOL_THREAD_ID, RELAY_API_KEY. Для OpenCode affinity пр
 
 Codex (~/.codex/config.toml):
 
-    model = "claude-opus-5-5"
+    model = "gpt-6-sol"
     model_provider = "retool"
+    model_reasoning_effort = "high"
+    model_reasoning_summary = "detailed"
     [model_providers.retool]
     name = "Retool relay"
     base_url = "http://127.0.0.1:8787/v1"
-    wire_api = "chat"
+    wire_api = "responses"
     env_key = "RELAY_API_KEY"
+    supports_websockets = false
+    model_catalog_url = "http://127.0.0.1:8787/codex/models"
 
-Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<relay key>.
+Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` и
+`ANTHROPIC_API_KEY=<тот же relay key>` (или `ANTHROPIC_AUTH_TOKEN`).
+В bare-режиме Claude Code использует `ANTHROPIC_API_KEY`.
+
+### Thinking и работа с проектом
+
+Relay передаёт полученный от провайдера thinking отдельно от ответа:
+Chat — `reasoning_content`, Responses — reasoning summary item/events,
+Anthropic — thinking content blocks. Это только данные, которые Retool
+раскрывает: скрытую цепочку рассуждений relay не восстанавливает и не выдумывает.
+Если провайдер вернул пустой thinking, блок текста останется пустым.
+В Claude Code блоки по умолчанию свёрнуты: `Ctrl+O` раскрывает их;
+`showThinkingSummaries: true` включает отображение кратких сводок.
+
+Уровень меняется настоящим полем Retool `modelProvider.reasoningEffort`:
+`reasoning_effort` в Chat, `reasoning.effort` в Responses,
+`thinking.type=adaptive` + `output_config.effort` в Anthropic.
+Допустимые уровни конкретной модели перечислены в
+`/v1/models → capabilities.reasoning_effort_levels`. Неподдерживаемый уровень
+возвращает ошибку. Legacy `thinking.budget_tokens` переводится в уровень;
+точный бюджет токенов Retool этим интерфейсом не предоставляет.
+
+Если клиент передал инструменты, модель получает его system/developer instructions,
+историю и полные результаты инструментов. Файлы, изменения и тесты выполняются
+инструментами клиента: workspace клиента имеет приоритет над папкой relay.
+Поддержаны обычные function tools и Responses custom tools (`apply_patch`).
+Без инструментов клиента relay добавляет список файлов, Git-состояние и выдержки
+AGENTS/README/PROTOCOL настроенного workspace; дополнительные чтения доступны
+через локальный exec-протокол. Это не загрузка всего репозитория в prompt.
 
 ## Конфигурация
 
@@ -82,6 +114,7 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 | ключ | смысл |
 | --- | --- |
 | session_mode | per_conversation (по умолчанию), per_request (новый тред на каждый запрос) или shared (один тред) |
+| max_conversations, conversation_idle_timeout | максимум 128 persistent-диалогов, неактивные вытесняются через 900 с |
 | exec_policy | allowlist (по умолчанию), allow_all, off |
 | exec_allowlist | regex-список разрешённых первых слов команд (см. ниже) |
 | strict_models | true — неизвестная модель даёт 404 вместо тихой маршрутизации |
@@ -99,7 +132,11 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 (`Get-Content`, `Get-ChildItem`, `Select-String`, `dir`, `type`, `findstr`, `ping` и т. п.).
 Поэтому `powershell -Command "Get-ChildItem; Get-Date"` проходит, а `powershell -c "calc"` — нет.
 `allowlist` ограничивает **список программ**, а не файловую систему: `type C:\Windows\win.ini`
-или `type %USERPROFILE%\.ssh\id_rsa` пройдут. Для изоляции ФС нужен отдельный контейнер.
+или чтение другого абсолютного пути возможны. Allowlist не является песочницей
+файловой системы. Подстановки cmd, PowerShell script blocks/вложенные выражения,
+неявные и encoded shell-команды блокируются; Python/Node/npm/curl не разрешены
+по умолчанию. Полноценные правки и тесты используйте через инструменты клиента
+с его разрешениями. `allow_all` остаётся явным выбором владельца relay.
 
 Таймауты: ход — 300 с (`turn_timeout`), ожидание кадра — 120 с (`recv_timeout`), команда — 40 с.
 Количество шагов исполнения не ограничено (`max_exec_turns: 0`). Ограничение шагов можно
@@ -111,13 +148,12 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 
 ## Каталог моделей
 
-35 моделей сняты из бандла приложения Retool (там же, где их показывает пикер):
+Каталог и доступные уровни мышления сверены с picker/schema приложения Retool:
 Claude Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / 4.5 / 4.1 / 4, Claude Sonnet 5 / 4.6 / 4.5 / 4,
 Claude Fable 5, Claude Haiku 4.5, GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.4, GPT-5.3 Codex,
-GPT-5.2 / 5.1 / 5 / mini / nano, GPT-4.1, Gemini 3.x, Retool Power/Mini.
-Размеры контекста взяты оттуда же. Пересобрать после обновления Retool:
-
-    python probes/gen_models.py && python probes/gen_models_py.py
+GPT-5.2 / 5.1 / 5 / mini / nano, GPT-6 Astra/Sol/Luna, GPT-6.1 Sol,
+Gemini 3.x, Retool Power/Mini. Список статический: обновляется в `models.py`
+после проверки схемы Retool; наличие в каталоге не гарантирует доступ в организации.
 
 Маршрутизация в провайдера — по префиксу модели: claude-* → ресурс Anthropic, gpt-* → ресурс OpenAI.
 
@@ -133,10 +169,13 @@ GPT-5.2 / 5.1 / 5 / mini / nano, GPT-4.1, Gemini 3.x, Retool Power/Mini.
 - Retool WebSocket не принимает поле `tools` нативно. Relay делает совместимый
   bridge: схемы инструментов добавляются в prompt, `<tool_call>...</tool_call>`
   преобразуется в OpenAI Chat `tool_calls` или Responses `function_call`, а
-  следующий `role=tool`/`function_call_output` ход возвращается в тот же тред.
+  следующий `role=tool`/`function_call_output` ход передаёт полный результат модели.
   Это полноценный клиентский tool protocol, но не нативный tool API Retool.
 - temperature, top_p, stop, n, seed, response_format, logprobs принимаются, но upstream
   их не применяет; список игнорируемых полей пишется в лог.
+- max_tokens/max_output_tokens проверяются по модели, но Retool не принимает
+  точный лимит генерации через этот WebSocket; relay не обещает его соблюдение.
+- Изображения не передаются: image input явно отклоняется с 422, vision=false.
 - usage по токенам приблизительный (len/4, флаг estimated), достоверны только кредиты.
 - HITL-вопрос агента отдаётся как текст; отдельного API ответа на HITL нет.
 - Промпт собирается из всей истории запроса; авт-обрезки по контексту нет.
@@ -157,7 +196,8 @@ GPT-5.2 / 5.1 / 5 / mini / nano, GPT-4.1, Gemini 3.x, Retool Power/Mini.
 ## Тесты
 
     python -m pytest -q          # offline, без сети
-    python probes/dbg_ws6.py     # ручной прогон против реального Retool
+    python test_client.py --models
+    python test_client.py "Проверь проект" --effort high
 
 ## Архитектура
 
@@ -165,4 +205,6 @@ proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая сх�
 (контекст, exec-цикл) -> session.py (тред + WS, ретраи, отмена) -> adapters.py
 (три диалекта) + sse.py. Вспомогательное: auth.py, upstream_refresh.py, credits.py,
 executor.py, context.py, redact.py, apierr.py, models.py.
-Реверс-инжиниринг протокола — PROTOCOL.md, черновики — probes/.
+Реверс-инжиниринг протокола — PROTOCOL.md. Локальные capture/probe-артефакты
+исключены из Git: они могут содержать credentials. Удаление файлов из текущей
+ветки не удаляет ранее опубликованные секреты из истории; их следует отозвать.

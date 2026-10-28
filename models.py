@@ -92,6 +92,50 @@ def catalog():
     return CATALOG
 
 
+def codex_catalog(entries=None):
+    """Codex-native ModelsResponse with direct client tools for this gateway.
+
+    The OpenAI-compatible list is insufficient for Codex to discover a custom
+    model's tool mode. Keep this separate so SDK model-list clients are unchanged.
+    """
+    instructions = (
+        "You are a coding assistant working in the user's project. Follow the "
+        "user's instructions and project guidance. Use the tools provided by "
+        "the client to inspect files, make requested changes, and run relevant "
+        "checks. Base reports on observed tool results and state any limitations."
+    )
+    result = []
+    for index, entry in enumerate(CATALOG if entries is None else entries):
+        efforts = entry.get('reasoning_effort_levels', [])
+        default = 'medium' if 'medium' in efforts else (efforts[0] if efforts else None)
+        result.append({
+            'slug': entry['id'], 'display_name': entry.get('label', entry['id']),
+            'description': 'Retool relay: ' + entry.get('label', entry['id']),
+            'default_reasoning_level': default,
+            'supported_reasoning_levels': [{'effort': effort, 'description': effort.title() + ' reasoning effort'}
+                                           for effort in efforts],
+            'shell_type': 'unified_exec', 'visibility': 'list', 'supported_in_api': True,
+            'priority': index, 'additional_speed_tiers': [], 'service_tiers': [],
+            'default_service_tier': None, 'availability_nux': None, 'upgrade': None,
+            'base_instructions': instructions,
+            'model_messages': {'instructions_template': instructions, 'persistent_instructions': ''},
+            'include_skills_usage_instructions': False, 'include_plugin_usage_instructions': False,
+            'include_apps_usage_instructions': False,
+            'supports_reasoning_summary_parameter': bool(entry.get('reasoning')),
+            'default_reasoning_summary': 'detailed' if entry.get('reasoning') else 'none',
+            'support_verbosity': False, 'default_verbosity': None,
+            'apply_patch_tool_type': 'freeform',
+            'truncation_policy': {'mode': 'tokens', 'limit': 10000},
+            'context_window': entry.get('context', 128000),
+            'effective_context_window_percent': 95,
+            'experimental_supported_tools': [], 'input_modalities': ['text'],
+            'supports_search_tool': False, 'supports_experimental_context': False,
+            'use_responses_lite': False, 'supports_reasoning_effort_updates': False,
+            'node_repl_disabled': True, 'tool_mode': 'direct',
+        })
+    return {'models': result}
+
+
 def _canonical(name):
     name = (name or '').strip()
     return ALIASES.get(name, name)

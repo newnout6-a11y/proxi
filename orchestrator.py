@@ -3,6 +3,8 @@ import asyncio
 import json
 import queue
 import threading
+import time
+from datetime import datetime
 import uuid
 
 import apierr
@@ -96,6 +98,13 @@ class TurnRunner:
             return None
         # Retool returns messages newest-first.
         for message in data.get("messages", []):
+            try:
+                created = datetime.fromisoformat(str(message.get("createdAt", "")).replace("Z", "+00:00")).timestamp()
+                if created < holder.get("upstream_started_at", 0):
+                    continue
+            except (ValueError, TypeError):
+                if holder.get("upstream_started_at"):
+                    continue
             content = message.get("content") or {}
             if message.get("senderRole") == "sandpack" and content.get("type") == "error":
                 text = str(content.get("error") or "").strip()
@@ -163,6 +172,7 @@ class TurnRunner:
                         session.cancel()
                         raise asyncio.CancelledError()
                     final_text = ""
+                    holder["upstream_started_at"] = time.time()
                     streamed_tool_call = False
                     stream = (session.stream(prompt, model_provider, tool_names=tool_names)
                               if native_tools else session.stream(prompt, model_provider))
@@ -195,6 +205,9 @@ class TurnRunner:
                                 out.put({"type": "end", "reason": "cancelled"})
                                 return
                     holder.setdefault("reason", "stop")
+                    if holder.get("reason") == "timeout":
+                        out.put({"type": "end", "reason": "timeout"})
+                        return
 
                     native_call = executor.extract_tool_call(final_text, tool_names) if tool_names else None
                     if native_call is None and tool_names:

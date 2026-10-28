@@ -308,6 +308,7 @@ class RelaySession:
         restart_hint = False
         reconnects = 0
         tool_buffers = state["tools"]
+        receive_task = None
         try:
             while True:
                 while think_q is not None and not think_q.empty():
@@ -329,11 +330,16 @@ class RelaySession:
                     yield {"type": "end", "reason": "timeout"}
                     return
                 try:
-                    # A history poll can complete while the socket is quiet.
-                    # Revisit its queue promptly rather than waiting up to the
-                    # entire receive timeout before showing real thinking.
+                    # Revisit persisted thinking promptly without cancelling an
+                    # in-flight socket read each time the history queue ticks.
                     receive_wait = min(remaining, self.cfg["recv_timeout"], 0.25 if think_q is not None else remaining)
-                    raw = await asyncio.wait_for(self.ws.recv(), timeout=receive_wait)
+                    if receive_task is None:
+                        receive_task = asyncio.create_task(self.ws.recv())
+                    done, _ = await asyncio.wait({receive_task}, timeout=receive_wait)
+                    if not done:
+                        continue
+                    ready, receive_task = receive_task, None
+                    raw = ready.result()
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
@@ -478,6 +484,9 @@ class RelaySession:
                 elif os.environ.get("DEBUG_EVENTS"):
                     print("dbg-unknown:", json.dumps(event, ensure_ascii=False)[:400], flush=True)
         finally:
+            if receive_task is not None:
+                receive_task.cancel()
+                await asyncio.gather(receive_task, return_exceptions=True)
             if poller is not None:
                 poller.cancel()
                 await asyncio.gather(poller, return_exceptions=True)

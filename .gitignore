@@ -21,3 +21,4 @@ probes/chunks/
 .verify*/
 /probes/
 /r.txt
+/logs/

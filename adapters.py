@@ -187,6 +187,10 @@ class ResponsesAdapter(_Base):
         self._items = []
         self._indices = {}
         self._custom_inputs = {}
+        self._tool_definitions = {
+            tool.get("function", {}).get("name"): tool.get("function", {})
+            for tool in getattr(parsed, "tools", [])
+        }
 
     def _emit(self, name, payload):
         if not self.writer:
@@ -242,6 +246,10 @@ class ResponsesAdapter(_Base):
             return {"id": item_id, "type": kind, "role": "assistant", "status": status,
                     "content": [] if started else [{"type": "output_text", "text": self.text, "annotations": []}]}
         item = {"id": item_id, "type": kind, "call_id": call["id"], "name": call["name"], "status": status}
+        definition = self._tool_definitions.get(call["name"], {})
+        if definition.get("x-namespace"):
+            item["namespace"] = definition["x-namespace"]
+            item["name"] = definition.get("x-client-name") or call["name"]
         if kind == "custom_tool_call":
             value = "" if started else self._custom_input(call)
             if value is None:

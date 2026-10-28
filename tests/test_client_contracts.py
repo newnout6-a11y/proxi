@@ -141,6 +141,33 @@ def test_supported_efforts_are_real_per_model_capabilities():
     assert entry["reasoning_effort_levels"] == ["low", "medium", "high"]
 
 
+def test_codex_catalog_advertises_direct_client_tools_and_actual_route_capabilities():
+    entry, _ = models.resolve("gpt-6-sol")
+    catalog = models.codex_catalog([entry])
+    assert list(catalog) == ["models"]
+    native = catalog["models"][0]
+    assert native["slug"] == "gpt-6-sol"
+    assert native["tool_mode"] == "direct"
+    assert native["shell_type"] == "unified_exec"
+    assert native["apply_patch_tool_type"] == "freeform"
+    assert native["input_modalities"] == ["text"]
+    assert native["supports_reasoning_summary_parameter"] is True
+    assert native["default_reasoning_summary"] == "detailed"
+    assert [value["effort"] for value in native["supported_reasoning_levels"]] == entry["reasoning_effort_levels"]
+    assert native["default_reasoning_level"] in entry["reasoning_effort_levels"]
+    assert native["model_messages"]["instructions_template"] == native["base_instructions"]
+    assert native["use_responses_lite"] is False
+
+
+def test_codex_catalog_does_not_invent_reasoning_for_non_reasoning_model():
+    entry, _ = models.resolve("zai-org/GLM-5.3")
+    native = models.codex_catalog([entry])["models"][0]
+    assert native["supported_reasoning_levels"] == []
+    assert native["default_reasoning_level"] is None
+    assert native["supports_reasoning_summary_parameter"] is False
+    assert models.codex_catalog([]) == {"models": []}
+
+
 def test_disabling_thinking_never_silently_falls_back_to_high():
     parsed = validate.parse_responses(_body("responses", thinking={"type": "disabled"}), CFG)
     assert parsed.effort == "none"
@@ -198,6 +225,23 @@ def test_codex_custom_tools_keep_grammar_input_call_id_and_result():
     assert parsed.prompt.count("id=call_patch") == 2
     assert "*** End Patch" in parsed.prompt
     assert "Updated app.py" in parsed.prompt
+
+
+def test_codex_namespace_tools_keep_the_client_namespace_and_call_identity():
+    parsed = validate.parse_responses(_body("responses", tools=[{
+        "type": "namespace", "name": "multi_agent_v1", "tools": [
+            {"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}]}],
+        tool_choice={"type": "function", "namespace": "multi_agent_v1", "name": "spawn_agent"}, input=[
+            {"type": "function_call", "namespace": "multi_agent_v1", "name": "spawn_agent",
+             "call_id": "call_agent", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_agent", "output": "agent-id"},
+        ]), CFG)
+    definition = parsed.tools[0]["function"]
+    assert definition["name"] == "multi_agent_v1.spawn_agent"
+    assert definition["x-client-name"] == "spawn_agent"
+    assert definition["x-namespace"] == "multi_agent_v1"
+    assert parsed.tool_choice["function"]["name"] == definition["name"]
+    assert "tool_call multi_agent_v1.spawn_agent id=call_agent" in parsed.prompt
 
 
 def test_image_input_is_rejected_rather_than_replaced_with_a_text_placeholder():

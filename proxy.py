@@ -69,6 +69,7 @@ ROUTES = {
     ("POST", "/v1/messages"): "anthropic",
     ("GET", "/v1/models"): "models",
     ("GET", "/v1/models/"): "models",
+    ("GET", "/codex/models"): "codex_models",
     ("GET", "/v1/balance"): "balance",
     ("GET", "/v1/usage"): "usage",
     ("GET", "/health"): "health",
@@ -175,6 +176,9 @@ def make_handler(runtime: Runtime):
                     self._completion("anthropic")
                 elif route == "models":
                     self._models()
+                elif route == "codex_models":
+                    self._json(200, model_catalog.codex_catalog(
+                        [entry for entry in model_catalog.catalog() if self._model_routable(entry)]))
                 elif route == "balance":
                     balance = runtime.credits.get_balance(force_refresh=True)
                     status = 200 if balance.get("available") is not None or balance.get("stale") else 503

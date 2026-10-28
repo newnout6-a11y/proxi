@@ -177,9 +177,12 @@ def _responses_item(item):
     if kind in ("function_call", "custom_tool_call") and "role" not in item:
         arguments = (json.dumps({"input": item.get("input", "")}, ensure_ascii=False)
                      if kind == "custom_tool_call" else item.get("arguments") or "")
+        name = item.get("name") or "tool"
+        if item.get("namespace"):
+            name = str(item["namespace"]) + "." + name
         return {"role": "assistant", "content": "",
                 "tool_calls": [{"id": item.get("call_id") or item.get("id") or "call",
-                                "function": {"name": item.get("name") or "tool",
+                                "function": {"name": name,
                                              "arguments": arguments}}]}
     if kind == "item_reference":
         raise unprocessable("item_reference is not supported; send the full conversation items", param="input")
@@ -233,6 +236,20 @@ def _tools(data):
         if not isinstance(tool, dict):
             raise unprocessable(f"{where} must be an object", param=where)
         kind = tool.get("type", "function")
+        if kind == "namespace":
+            namespace = tool.get("name")
+            if not isinstance(namespace, str) or not namespace.strip() or not isinstance(tool.get("tools"), list):
+                raise unprocessable("namespace tools require a name and tools array", param=where)
+            for nested in _tools({"tools": tool["tools"]}):
+                fn = nested["function"]
+                client_name = fn["name"]
+                fn["x-namespace"] = namespace
+                fn["x-client-name"] = client_name
+                fn["name"] = namespace + "." + client_name
+                if any(item["function"]["name"] == fn["name"] for item in result):
+                    raise unprocessable(f"duplicate tool name '{fn['name']}'", param=where + ".name")
+                result.append(nested)
+            continue
         if kind not in ("function", "custom"):
             raise unprocessable(f"{where}.type must be 'function' or 'custom'", param=where + ".type")
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
@@ -284,9 +301,15 @@ def _tool_choice(value):
         if choice_type == "any":
             return "required"
         if choice_type in ("tool", "custom") and isinstance(value.get("name"), str):
-            return {"type": "function", "function": {"name": value["name"]}}
+            name = value["name"]
+            if value.get("namespace"):
+                name = str(value["namespace"]) + "." + name
+            return {"type": "function", "function": {"name": name}}
         if choice_type == "function" and fn is None and isinstance(value.get("name"), str):
-            return {"type": "function", "function": {"name": value["name"]}}
+            name = value["name"]
+            if value.get("namespace"):
+                name = str(value["namespace"]) + "." + name
+            return {"type": "function", "function": {"name": name}}
         if value.get("type") != "function" or not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
             raise unprocessable("'tool_choice' function form is invalid", param="tool_choice")
         return {"type": "function", "function": {"name": fn["name"]}}
