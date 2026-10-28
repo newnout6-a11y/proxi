@@ -1,7 +1,0 @@
-test(relay): cover exec output redaction, context trust markers and tree kill
-
-- orchestrator test proves command output is redacted before it reaches upstream
-- context tests prove cookie values never leak into the injected instructions and that
-  the block is marked as reference data
-- probes/check_kill_tree.py proves a timed-out command is killed together with its child
-- orchestrator tolerates a config without command_log
