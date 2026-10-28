@@ -61,7 +61,9 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 | exec_policy | allowlist (по умолчанию), allow_all, off |
 | exec_allowlist | regex-список разрешённых первых слов команд (см. ниже) |
 | strict_models | true — неизвестная модель даёт 404 вместо тихой маршрутизации |
-| max_body_bytes, max_workers, rate_limit_rps | лимиты входа и параллелизма |
+| max_body_bytes, max_workers, rate_limit_rps | лимиты входа и параллелизма (воркеров 32) |
+| command_output_limit, max_prompt_bytes | 64 000 и 128 000 символов на вывод команды и промпт |
+| context_max_bytes | 120 000 — сколько контекста проекта подмешивается |
 | agent_mode | 2 — рабочий режим агента (1 — более «разговорный», 3 — не проверялся) |
 | google_provider_resource_name, retool_fast_provider_resource_name | ресурсы для gemini-* и zai-org/*; без них эти модели дают 503 |
 
@@ -76,6 +78,10 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 или `type %USERPROFILE%\.ssh\id_rsa` пройдут. Для изоляции ФС нужен отдельный контейнер.
 
 Таймауты: ход — 60 с (`turn_timeout`), ожидание кадра — 30 с (`recv_timeout`), команда — 40 с.
+Количество шагов исполнения не ограничено (`max_exec_turns: 0`); при исчерпании шагов
+агент получает финальный ход без команд и обязан дать сводку.
+`max_tokens` валидируется по модели: у Claude 5.5 — 128 000, у GPT-6 — 128 000, у Gemini — 65 536,
+у GLM — 32 768; контексты моделей — от 400 000 до 1 000 000.
 
 ## Каталог моделей
 

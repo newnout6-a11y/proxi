@@ -26,15 +26,48 @@ lines = ['"""Model catalog mirrored from the Retool copilot bundle (probes/gen_m
          "}",
          "",
          'ALIASES = {"claude-opus": "claude-opus-5-5", "claude-sonnet": "claude-sonnet-5",',
-         '           "claude-haiku": "claude-haiku-4-5-20251001", "gpt-5.6": "gpt-5.6-sol"}',
+         '           "claude-haiku": "claude-haiku-4-5-20251001", "gpt-5.6": "gpt-5.6-sol",',
+         '           "claude-opus-5.5": "claude-opus-5-5", "claude-opus-4.8": "claude-opus-4-8",',
+         '           "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol"}',
          "",
          "CATALOG = ["]
+DROP = ("gpt-4.1",)  # к октябрю 2026 выведены из обихода
+NEW_OPENAI = [("gpt-6-astra", 400000), ("gpt-6-sol", 400000), ("gpt-6-luna", 400000),
+              ("gpt-6.1-sol", 400000), ("gpt-6.1-sol-ultrafast", 400000)]
+
+
+def max_out(provider, mid):
+    """Completion caps: 128k у топовых, ниже у мелких; из публичных карточек моделей."""
+    if provider == "anthropic":
+        return 128000
+    if mid.startswith(("gpt-6", "gpt-5.4", "gpt-5.5", "gpt-5.6")):
+        return 128000
+    if mid.startswith("gpt-5"):
+        return 128000
+    if provider == "google":
+        return 65536
+    return 32768
+
+
+def context_for(provider, mid, default):
+    if provider == "anthropic":
+        return 1000000          # Opus 5.5: 1M вход
+    if mid.startswith("gpt-6") or mid.startswith(("gpt-5.4", "gpt-5.5", "gpt-5.6")):
+        return 400000
+    return int(default)
+
+
+rows = [r for r in rows if not r["id"].startswith(DROP)]
+for mid, ctx in NEW_OPENAI:
+    rows.insert(0, {"id": mid, "provider": "openai", "label": mid.replace("gpt-", "GPT "), "context": ctx})
+
 for row in rows:
     reasoning = "True" if row["provider"] in ("anthropic", "openai", "google") else "False"
     lines.append('    {{"id": "{id}", "label": "{label}", "provider": "{provider}", "context": {ctx}, '
-                 '"reasoning": {r}, "tools": True, "vision": True}},'.format(
+                 '"max_output": {mo}, "reasoning": {r}, "tools": True, "vision": True}},'.format(
                      id=row["id"], label=row["label"].replace('"', "'"), provider=row["provider"],
-                     ctx=int(row["context"]), r=reasoning))
+                     ctx=context_for(row["provider"], row["id"], row["context"]),
+                     mo=max_out(row["provider"], row["id"]), r=reasoning))
 lines += ["]", "", "_BY_ID = {m['id']: m for m in CATALOG}", "",
           "_BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))", ""]
 lines += [

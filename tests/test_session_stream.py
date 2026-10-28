@@ -13,6 +13,8 @@ class FakeWS:
     async def recv(self):
         if self.frames:
             return self.frames.pop(0)
+        # Real sockets idle before timing out; the drain phase relies on that.
+        await asyncio.sleep(0.45)
         raise asyncio.TimeoutError
 
     async def send(self, payload):

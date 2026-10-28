@@ -21,45 +21,48 @@ PROVIDER_RESOURCE_KEY = {
 
 ALIASES = {"claude-opus": "claude-opus-5-5", "claude-sonnet": "claude-sonnet-5",
            "claude-haiku": "claude-haiku-4-5-20251001", "gpt-5.6": "gpt-5.6-sol",
-           "claude-opus-5.5": "claude-opus-5-5", "claude-sonnet-4.6": "claude-sonnet-4-6",
-           "claude-opus-4.8": "claude-opus-4-8"}
+           "claude-opus-5.5": "claude-opus-5-5", "claude-opus-4.8": "claude-opus-4-8",
+           "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol"}
 
 CATALOG = [
-    {"id": "gpt-5", "label": "GPT 5", "provider": "openai", "context": 272000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5-mini", "label": "GPT 5 Mini", "provider": "openai", "context": 272000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5-nano", "label": "GPT 5 Nano", "provider": "openai", "context": 272000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.1", "label": "GPT 5.1", "provider": "openai", "context": 272000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.2", "label": "GPT 5.2", "provider": "openai", "context": 272000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.3-codex", "label": "GPT 5.3 Codex", "provider": "openai", "context": 272000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.4", "label": "GPT 5.4", "provider": "openai", "context": 922000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.5", "label": "GPT 5.5", "provider": "openai", "context": 922000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.6-sol", "label": "GPT 5.6 Sol", "provider": "openai", "context": 922000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.6-terra", "label": "GPT 5.6 Terra", "provider": "openai", "context": 922000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.6-luna", "label": "GPT 5.6 Luna", "provider": "openai", "context": 922000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-4.1", "label": "GPT 4.1", "provider": "openai", "context": 1014808, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-4.1-nano", "label": "GPT 4.1 Nano", "provider": "openai", "context": 1014808, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "anthropic", "context": 872000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-5", "label": "Claude Opus 5", "provider": "anthropic", "context": 872000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-8", "label": "Claude Opus 4.8", "provider": "anthropic", "context": 872000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-7", "label": "Claude Opus 4.7", "provider": "anthropic", "context": 872000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-20250514", "label": "Claude Opus 4", "provider": "anthropic", "context": 191808, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-1-20250805", "label": "Claude Opus 4.1", "provider": "anthropic", "context": 191808, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-5-20251101", "label": "Claude Opus 4.5", "provider": "anthropic", "context": 191808, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-6", "label": "Claude Opus 4.6", "provider": "anthropic", "context": 872000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-fable-5", "label": "Claude Fable 5", "provider": "anthropic", "context": 872000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "provider": "anthropic", "context": 872000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet 4", "provider": "anthropic", "context": 191808, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5", "provider": "anthropic", "context": 191808, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "provider": "anthropic", "context": 936000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5", "provider": "anthropic", "context": 191808, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro (Preview)", "provider": "google", "context": 983040, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash (Preview)", "provider": "google", "context": 983040, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash", "provider": "google", "context": 983040, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gemini-3.1-flash-lite-preview", "label": "Gemini 3.1 Flash-Lite (Preview)", "provider": "google", "context": 983040, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro", "provider": "google", "context": 983040, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash", "provider": "google", "context": 983040, "reasoning": True, "tools": True, "vision": True},
-    {"id": "zai-org/GLM-5.3", "label": "Retool Power", "provider": "retool-fast", "context": 984576, "reasoning": False, "tools": True, "vision": True},
-    {"id": "zai-org/GLM-5.3-Flash", "label": "Retool Mini", "provider": "retool-fast", "context": 984576, "reasoning": False, "tools": True, "vision": True},
+    {"id": "gpt-6.1-sol-ultrafast", "label": "GPT 6.1-sol-ultrafast", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6.1-sol", "label": "GPT 6.1-sol", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6-luna", "label": "GPT 6-luna", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6-sol", "label": "GPT 6-sol", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6-astra", "label": "GPT 6-astra", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5", "label": "GPT 5", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5-mini", "label": "GPT 5 Mini", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5-nano", "label": "GPT 5 Nano", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.1", "label": "GPT 5.1", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.2", "label": "GPT 5.2", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.3-codex", "label": "GPT 5.3 Codex", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.4", "label": "GPT 5.4", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.5", "label": "GPT 5.5", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.6-sol", "label": "GPT 5.6 Sol", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.6-terra", "label": "GPT 5.6 Terra", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.6-luna", "label": "GPT 5.6 Luna", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-5", "label": "Claude Opus 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-8", "label": "Claude Opus 4.8", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-7", "label": "Claude Opus 4.7", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-20250514", "label": "Claude Opus 4", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-1-20250805", "label": "Claude Opus 4.1", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-5-20251101", "label": "Claude Opus 4.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-6", "label": "Claude Opus 4.6", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-fable-5", "label": "Claude Fable 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet 4", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gemini-3.1-flash-lite-preview", "label": "Gemini 3.1 Flash-Lite (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
+    {"id": "zai-org/GLM-5.3", "label": "Retool Power", "provider": "retool-fast", "context": 984576, "max_output": 32768, "reasoning": False, "tools": True, "vision": True},
+    {"id": "zai-org/GLM-5.3-Flash", "label": "Retool Mini", "provider": "retool-fast", "context": 984576, "max_output": 32768, "reasoning": False, "tools": True, "vision": True},
 ]
 
 _BY_ID = {m['id']: m for m in CATALOG}
@@ -86,11 +89,11 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name, 'context': 200000}
     if effort is not None:
         allowed = EFFORTS_BY_PROVIDER.get(entry['provider'], ())
-        if allowed and (not isinstance(effort, str) or effort.lower() not in allowed):
+        if not isinstance(effort, str) or effort.lower() not in allowed:
             raise bad_request(
-                f"reasoning effort for {entry['provider']} must be one of {', '.join(allowed)}",
+                f"reasoning effort for {entry['provider']} must be one of {', '.join(allowed) or 'none'}",
                 param='reasoning_effort')
-        effort = effort.lower() if isinstance(effort, str) else effort
+        effort = effort.lower()
         if not entry.get('reasoning', True):
             effort = None
     return entry, effort

@@ -16,7 +16,7 @@
   "enable_anthropic": true,
 
   "max_body_bytes": 33554432,
-  "max_workers": 16,
+  "max_workers": 32,
   "rate_limit_rps": 8,
   "rate_limit_burst": 16,
   "turn_timeout": 60,
@@ -33,11 +33,11 @@
   "exec_allowlist": ["^powershell\\b", "^pwsh\\b", "^cmd\\b", "^git\\b", "^dir\\b", "^type\\b", "^findstr\\b", "^python\\b", "^npm\\b"],
   "max_exec_turns": 5,
   "command_timeout": 40,
-  "command_output_limit": 4000,
+  "command_output_limit": 64000,
   "show_exec_output": true,
 
   "project_context": true,
-  "context_max_bytes": 2500,
-  "max_prompt_bytes": 24000,
+  "context_max_bytes": 120000,
+  "max_prompt_bytes": 128000,
   "workspace_root": "C:\\your\\project\\path"
 }

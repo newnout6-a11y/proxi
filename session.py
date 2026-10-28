@@ -106,7 +106,8 @@ class Backend:
         return StartResult(url, data.get("sandboxId"))
 
     async def connect(self, url):
-        return await self._ws_connect(url, origin=self.cfg["base"], max_size=None,
+        return await self._ws_connect(url, origin=self.cfg["base"],
+                                      max_size=self.cfg.get("max_frame_bytes") or MAX_FRAME_DEFAULT,
                                       ping_interval=None, open_timeout=self.cfg["upstream_timeout"])
 
 
@@ -119,10 +120,34 @@ class RelaySession:
         self.thread_id = thread_id
         self.ws = None
         self._cancelled = False
+        self._needs_drain = False
+        self._drain_task = None
         self.sandbox_id = None
 
     def cancel(self):
         self._cancelled = True
+        self._needs_drain = True
+        # Keep reading (and discarding) the aborted turn so its frames cannot
+        # bleed into the next one; the next turn awaits this drain first.
+        if self.ws is not None and self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain_until_done())
+
+    async def _drain_until_done(self):
+        deadline = time.time() + 45
+        try:
+            while self.ws is not None and time.time() < deadline:
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
+                await self._maybe_pong(raw)
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "agent_loop_done":
+                    break
+        except Exception:
+            pass
+        finally:
+            self._drain_task = None
 
     async def open(self):
         if self.ws is not None:
@@ -173,6 +198,17 @@ class RelaySession:
 
     async def stream(self, prompt, model_provider):
         """Yield normalised events. Raises ApiError on failure."""
+        # A session outlives one turn in shared mode: clear the flag and any
+        # frames left over from a cancelled turn before starting a new one.
+        if self._drain_task is not None:
+            try:
+                await asyncio.shield(self._drain_task)
+            except Exception:
+                pass
+        self._cancelled = False
+        if self.ws is not None and self._needs_drain:
+            await self._drain()
+            self._needs_drain = False
         try:
             await self.open()
         except Exception as exc:
@@ -206,6 +242,8 @@ class RelaySession:
         reconnects = 0
         while True:
             if self._cancelled:
+                if self.ws is not None and self._drain_task is None:
+                    self._drain_task = asyncio.create_task(self._drain_until_done())
                 yield {"type": "end", "reason": "cancelled"}
                 return
             remaining = deadline - time.time()
@@ -344,7 +382,8 @@ class SessionPool:
         self.cfg = backend.cfg
         self._shared = None
         self._lock = asyncio.Lock()
-        self._slots = asyncio.Semaphore(max(1, self.cfg["max_workers"]))
+        self._slots = asyncio.BoundedSemaphore(max(1, self.cfg["max_workers"]))
+        self._active = set()
         self._starts = 0
         self._started_at = time.time()
 
@@ -353,7 +392,7 @@ class SessionPool:
         return self.cfg["session_mode"]
 
     async def acquire(self) -> RelaySession:
-        """Take a session slot. Caller must always release() it."""
+        """Take a session slot. Caller must always release() it (once)."""
         await self._slots.acquire()
         if self.mode == "shared":
             locked = False
@@ -362,6 +401,7 @@ class SessionPool:
                 locked = True
                 if self._shared is None:
                     self._shared = RelaySession(self.backend, self.cfg["thread_id"])
+                self._active.add(self._shared)
                 return self._shared
             except BaseException:
                 if locked:
@@ -370,12 +410,19 @@ class SessionPool:
                 raise
         try:
             thread_id = await self.backend.create_thread()
-        except Exception:
+        except BaseException:
+            # CancelledError is a BaseException: the slot must still come back.
             self._slots.release()
             raise
-        return RelaySession(self.backend, thread_id)
+        session = RelaySession(self.backend, thread_id)
+        self._active.add(session)
+        return session
 
     async def release(self, session: RelaySession) -> None:
+        """Release a session exactly once; extra releases are ignored."""
+        if self.mode != "shared" and session not in self._active:
+            return
+        self._active.discard(session)
         try:
             if self.mode != "shared":
                 await session.aclose()
@@ -385,7 +432,10 @@ class SessionPool:
                     self._lock.release()
                 except RuntimeError:
                     pass
-            self._slots.release()
+            try:
+                self._slots.release()
+            except ValueError:
+                pass
 
     async def __aenter__(self):
         self._lease = await self.acquire()
@@ -396,30 +446,3 @@ class SessionPool:
         return False
 
 
-class _SharedLease:
-    def __init__(self, pool):
-        self.pool = pool
-        self.session = pool._shared
-        self._guard = pool._lock
-
-    async def __aenter__(self):
-        await self._guard.acquire()
-        return self.session
-
-    async def __aexit__(self, *exc):
-        self._guard.release()
-        await self.pool._release(self)
-        return False
-
-
-class _LeasedSession:
-    def __init__(self, pool, session):
-        self.pool = pool
-        self.session = session
-
-    async def __aenter__(self):
-        return self.session
-
-    async def __aexit__(self, *exc):
-        await self.pool._release(self)
-        return False

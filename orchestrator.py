@@ -16,6 +16,13 @@ class TurnRunner:
         self.credits = credits
         self.pool = pool
 
+    def _can_exec(self, steps: int) -> bool:
+        """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
+        if self.cfg["exec_policy"] == "off":
+            return False
+        max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
+        return max_steps <= 0 or steps < max_steps
+
     def _instructions(self):
         return build_system_instructions(
             self.cfg["workspace_root"],
@@ -53,6 +60,7 @@ class TurnRunner:
         holder["turn_id"] = turn_id
         exec_steps = 0
         empty_retries = 0
+        final_summary = False
         try:
             instructions = self._instructions()
             reminder = ""
@@ -75,10 +83,11 @@ class TurnRunner:
                 model_provider["reasoningEffort"] = parsed.effort
 
             base_prompt = prompt
-            session = await self.pool.acquire()
-            holder["session"] = session
+            session = None
             try:
-              while True:
+                session = await self.pool.acquire()
+                holder["session"] = session
+                while True:
                     final_text = ""
                     async for event in session.stream(prompt, model_provider):
                         if event["type"] == "text":
@@ -100,8 +109,15 @@ class TurnRunner:
                                 return
                     holder.setdefault("reason", "stop")
 
-                    can_exec = (self.cfg["exec_policy"] != "off") and exec_steps < self.cfg["max_exec_turns"]
+                    can_exec = self._can_exec(exec_steps)
                     command = executor.extract_command(final_text) if can_exec else None
+
+                    if not can_exec and not final_summary:
+                        # Out of budget/time: one last turn with the commands disabled.
+                        final_summary = True
+                        prompt = (base_prompt + "\n\n[ИТОГ] Команды больше не выполняй. "
+                                  "Дай итоговый ответ по уже собранной информации, на русском.")
+                        continue
 
                     if not command and not final_text.strip():
                         explained = await self._explain_empty(holder)
@@ -148,19 +164,27 @@ class TurnRunner:
                     if self.cfg["show_exec_output"]:
                         out.put({"type": "exec_result", "cmd": command, "output": output, "exit": code})
 
-                    # Keep the task text once; earlier steps go in as a compact trail.
+                    # Keep the task text once; earlier steps go in as a short trail.
                     if not task_block:
                         task_block = "USER TASK:\n" + parsed.prompt
-                    trail = "; ".join(c + " -> exit " + str(e) for c, e in previous_steps) or "(none yet)"
+                    trail = "; ".join(
+                        (c[:60] + "…" if len(c) > 60 else c) + " -> exit " + str(e)
+                        for c, e in previous_steps[-4:]
+                    ) or "(none yet)"
                     previous_steps.append((command, code))
 
-                    budget = int(self.cfg.get("max_prompt_bytes", 24000)) - len(instructions) - len(task_block) - 400
-                    trimmed = output[: max(600, budget)]
+                    limit = int(self.cfg.get("max_prompt_bytes", 128000))
                     header = task_block + "\n\nPrevious steps: " + trail
+                    wrapper = len(executor.format_command_followup(command, code, "", header))
+                    budget = limit - len(instructions) - len(reminder) - wrapper - 100
+                    trimmed = output[: max(200, budget)]
                     followup = executor.format_command_followup(command, code, trimmed, header)
+                    if reminder:
+                        followup += reminder
                     prompt = (instructions + "\n\n" + followup) if instructions else followup
             finally:
-                await self.pool.release(session)
+                if session is not None:
+                    await self.pool.release(session)
         except apierr.ApiError as err:
             out.put({"type": "error", "error": err})
         except asyncio.CancelledError:

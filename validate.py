@@ -4,7 +4,7 @@ import json
 from apierr import bad_request, unprocessable
 import models as model_catalog
 
-MAX_TOKENS_CAP = 200000
+MAX_TOKENS_CAP = 1_000_000  # absolute ceiling when a model has no catalog value
 
 
 class Parsed:
@@ -51,8 +51,13 @@ def _opt_int(data, key, low=1, high=MAX_TOKENS_CAP):
     if isinstance(value, bool) or not isinstance(value, int):
         raise unprocessable(f"'{key}' must be an integer", param=key)
     if not low <= value <= high:
-        raise unprocessable(f"'{key}' must be between {low} and {high}", param=key)
+        raise unprocessable(f"'{key}' must be between {low} and {high} (model output cap)", param=key)
     return value
+
+
+def _cap(entry) -> int:
+    """Per-model completion ceiling from the catalog."""
+    return int(entry.get("max_output") or MAX_TOKENS_CAP)
 
 
 def _opt_float(data, key):
@@ -199,7 +204,8 @@ def parse_chat(data, cfg):
     system, prompt = _render_messages(messages)
     parsed.system, parsed.prompt = system, prompt
     parsed.stream = bool(data.get("stream"))
-    parsed.max_tokens = _opt_int(data, "max_tokens") or _opt_int(data, "max_completion_tokens")
+    parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
+                         or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
     parsed.temperature = _opt_float(data, "temperature")
     return _finish(data, parsed)
 
@@ -224,7 +230,7 @@ def parse_responses(data, cfg):
     parsed.system = "\n\n".join(x for x in (instructions, system) if x)
     parsed.prompt = prompt
     parsed.stream = bool(data.get("stream"))
-    parsed.max_tokens = _opt_int(data, "max_output_tokens")
+    parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
     return _finish(data, parsed)
 
@@ -244,7 +250,7 @@ def parse_anthropic(data, cfg):
     parsed.stream = bool(data.get("stream"))
     if data.get("max_tokens") is None:
         raise bad_request("'max_tokens' is required for the Anthropic dialect", param="max_tokens")
-    parsed.max_tokens = _opt_int(data, "max_tokens")
+    parsed.max_tokens = _opt_int(data, "max_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
     stop = data.get("stop_sequences")
     if stop is not None and not isinstance(stop, list):
