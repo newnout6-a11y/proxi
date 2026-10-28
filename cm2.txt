@@ -1,7 +1,0 @@
-fix(relay): bound exec prompts, cancel non-stream turns, un-leak shared lock
-
-- orchestrator: user task is embedded once, later steps add only a compact "cmd -> exit" trail and
-  the command output is trimmed to max_prompt_bytes (new config key)
-- _collect cancels the upstream turn and the future when a non-stream client disconnects
-- SessionPool.acquire releases the shared lock if it fails between acquire and return
-- tests: pool shared serialisation/reuse, per_request thread per acquire
