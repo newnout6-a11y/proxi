@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import signal
+import socket
 import sys
 import threading
 import time
@@ -36,12 +37,14 @@ class RateLimiter:
         self.rate = rate
         self.burst = burst
         self.tokens = burst
-        self.stamp = time.time()
+        self.stamp = time.monotonic()
         self.lock = threading.Lock()
 
     def take(self):
+        if self.rate <= 0:
+            return 0.0
         with self.lock:
-            now = time.time()
+            now = time.monotonic()
             self.tokens = min(self.burst, self.tokens + (now - self.stamp) * self.rate)
             self.stamp = now
             if self.tokens < 1.0:
@@ -218,9 +221,14 @@ def make_handler(runtime: Runtime):
                 "owned_by": model["provider"],
                 "label": model["label"],
                 "context_window": model["context"],
+                "max_output_tokens": model.get("max_output"),
+                **{key: model[key] for key in ("metadata_checked_at", "metadata_source", "metadata_status", "metadata_notes")
+                   if key in model},
                 "capabilities": {"reasoning": model["reasoning"], "tools": model["tools"],
                                  "vision": False,
-                                 "reasoning_effort_levels": model.get("reasoning_effort_levels", [])},
+                                 "reasoning_effort_levels": model.get("reasoning_effort_levels", []),
+                                 "default_reasoning_effort": model.get("default_reasoning_effort"),
+                                 "reasoning_effort_control": model.get("reasoning_effort_control", "selectable")},
             } for model in model_catalog.catalog()
                 if self._model_routable(model)]
             self._json(200, {"object": "list", "data": data})
@@ -373,6 +381,7 @@ def make_handler(runtime: Runtime):
                     raise event["error"]
                 if event.get("type") == "end":
                     reason = event.get("reason", "stop")
+                    holder["reason"] = reason
                     continue
                 adapter.feed(event)
                 last_write = time.time()
@@ -387,7 +396,14 @@ def make_handler(runtime: Runtime):
 
 class BoundedServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows SO_REUSEADDR permits two relay processes to own the same port,
+    # making clients randomly hit old code after a restart.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def __init__(self, address, handler, slots):
         super().__init__(address, handler)

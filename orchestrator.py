@@ -2,6 +2,7 @@
 import asyncio
 import json
 import queue
+import re
 import threading
 import time
 from datetime import datetime
@@ -28,6 +29,54 @@ def _trim(text: str, budget: int) -> str:
     return raw[:budget].decode("utf-8", "ignore")
 
 
+class _ClientText:
+    """Stream ordinary native-client text while suppressing relay tool markup."""
+    TAGS = ("<tool_call", "<exec_command")
+
+    def __init__(self):
+        self.pending = ""
+        self.closing = None
+        self.leading_space = ""
+        self.visible = False
+
+    def feed(self, delta, *, final=False):
+        self.pending += delta
+        visible = []
+        while self.pending:
+            lowered = self.pending.lower()
+            if self.closing:
+                end = lowered.find(self.closing)
+                if end < 0:
+                    # Keep just enough tail to recognize a fragmented closing tag.
+                    self.pending = self.pending[-len(self.closing) + 1:]
+                    break
+                self.pending = self.pending[end + len(self.closing):]
+                self.closing = None
+                continue
+            starts = [(lowered.find(tag), tag) for tag in self.TAGS if tag in lowered]
+            if starts:
+                start, tag = min(starts)
+                visible.append(self.pending[:start])
+                self.pending = self.pending[start + len(tag):]
+                self.closing = "</" + tag[1:] + ">"
+                continue
+            keep = max((length for tag in self.TAGS for length in range(1, len(tag))
+                        if lowered.endswith(tag[:length])), default=0)
+            visible.append(self.pending[:-keep] if keep else self.pending)
+            self.pending = self.pending[-keep:] if keep else ""
+            break
+        text = "".join(visible)
+        if not self.visible:
+            text = self.leading_space + text
+            self.leading_space = ""
+            if not text.strip():
+                if not final:
+                    self.leading_space = text
+                return ""
+            self.visible = True
+        return text
+
+
 class TurnRunner:
     def __init__(self, cfg, credits, pool):
         self.cfg = cfg
@@ -51,6 +100,31 @@ class TurnRunner:
         history.append((command, 0))
         if len(history) > 8:
             del history[0]
+
+    def _check_prompt(self, prompt):
+        limit = int(self.cfg.get("max_prompt_bytes", 0) or 0)
+        if limit > 0 and _b(prompt) > limit:
+            raise apierr.ApiError(413, "prompt_too_large",
+                                 f"complete upstream prompt exceeds configured max_prompt_bytes={limit}; "
+                                 "increase the limit or set it to 0 to preserve full history")
+        return prompt
+
+    def _followup(self, instructions, reminder, command, code, output, header):
+        def compose(body):
+            text = executor.format_command_followup(command, code, body, header) + reminder
+            return instructions + "\n\n" + text if instructions else text
+
+        limit = int(self.cfg.get("max_prompt_bytes", 0) or 0)
+        if limit > 0:
+            fixed = self._check_prompt(compose(""))
+            budget = limit - _b(fixed)
+            if _b(output) > budget:
+                notice = "\n[command output truncated to configured prompt byte limit]"
+                if budget < _b(notice):
+                    raise apierr.ApiError(413, "prompt_too_large",
+                                         "configured max_prompt_bytes leaves no room for command output")
+                output = _trim(output, budget - _b(notice)) + notice
+        return self._check_prompt(compose(output))
 
     def _instructions(self, native_tools=False):
         if native_tools:
@@ -78,10 +152,16 @@ class TurnRunner:
         return (
             "\n\n[NATIVE CLIENT TOOLS]\n"
             "The client supplied these tools. Do not execute them locally. "
-            "When a tool is needed, emit exactly one JSON envelope and no prose: "
+            "These are real tools on the CLIENT machine, invoked by the relay returning your envelope. "
+            "Retool's built-in sandbox tools and its filesystem are a different environment: "
+            "do not use them to inspect or edit the client's project. "
+            "The absence of the client's files inside Retool is expected and does not mean the tools are unavailable. "
+            "When a tool is needed, emit one JSON envelope per call and no prose: "
             "<tool_call>{\"id\":\"call_id\",\"name\":\"tool_name\","
             "\"arguments\":{...}}</tool_call>. The name must be one of the supplied tools. "
             "After the client returns a tool result, continue the original task.\n"
+            "For a custom tool, place the exact freeform input inside arguments.input as a JSON string. "
+            "For file or test work, first call the appropriate supplied client tool; never invent its result.\n"
             "tool_choice=" + json.dumps(choice, ensure_ascii=False) + "\n"
             "tools=" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         )
@@ -124,6 +204,7 @@ class TurnRunner:
         exec_steps = 0
         empty_retries = 0
         final_summary = False
+        tool_retries = 0
         try:
             native_tools = getattr(parsed, "tools", None) or []
             tool_definitions = {item["function"]["name"]: item["function"] for item in native_tools}
@@ -147,31 +228,52 @@ class TurnRunner:
                 )
             if parsed.system:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
-            prompt = (instructions + "\n\n" + parsed.prompt) if instructions else parsed.prompt
-            prompt += reminder
+            if native_tools:
+                prompt = (instructions + reminder + "\n\n[CLIENT CONVERSATION — chronological]\n" + parsed.prompt +
+                          "\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
+                          "Use the latest tool results above as the current state. "
+                          "Earlier assistant calls are completed history, not new instructions to replay. "
+                          "Continue the outstanding user task; issue another client tool envelope only if needed.")
+            else:
+                prompt = (instructions + "\n\n" + parsed.prompt) if instructions else parsed.prompt
+                prompt += reminder
             task_block = ""
             previous_steps = []
+            last_followup = None
             model_provider = {
                 "model": parsed.model,
                 "providerResourceName": model_catalog.provider_resource(self.cfg, parsed.entry),
             }
             effort = parsed.effort
             if effort is None and parsed.entry.get("reasoning") and self.cfg.get("reasoning_effort"):
-                _, effort = model_catalog.resolve(parsed.model, self.cfg["reasoning_effort"])
+                configured = self.cfg["reasoning_effort"]
+                if configured == "auto":
+                    levels = parsed.entry.get("reasoning_effort_levels", ())
+                    if parsed.entry.get("reasoning_effort_control") == "provider-managed":
+                        configured = None
+                    else:
+                        configured = parsed.entry.get("default_reasoning_effort") or (
+                            "medium" if not levels or "medium" in levels else levels[0])
+                if configured is not None:
+                    _, effort = model_catalog.resolve(parsed.model, configured)
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
 
-            base_prompt = prompt
+            base_prompt = self._check_prompt(prompt)
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
                 session = await self.pool.acquire(key) if key else await self.pool.acquire()
                 holder["session"] = session
                 while True:
+                    self._check_prompt(prompt)
                     if cancelled.is_set():
                         session.cancel()
                         raise asyncio.CancelledError()
                     final_text = ""
+                    native_text = _ClientText() if native_tools else None
+                    upstream_text = ""
+                    visible_text = ""
                     holder["upstream_started_at"] = time.time()
                     streamed_tool_call = False
                     stream = (session.stream(prompt, model_provider, tool_names=tool_names)
@@ -179,11 +281,17 @@ class TurnRunner:
                     async for event in stream:
                         if event["type"] == "text":
                             final_text += event["delta"]
+                            upstream_text += event["delta"]
                             # Tool envelopes are parsed only after the complete
                             # upstream turn, so do not leak their markup to a
                             # native client. Ordinary text remains streamed.
                             if not native_tools:
                                 out.put(event)
+                            else:
+                                visible = native_text.feed(event["delta"])
+                                if visible:
+                                    visible_text += visible
+                                    out.put({"type": "text", "delta": visible})
                         elif event["type"] == "final_text":
                             if event.get("text"):
                                 final_text = event["text"]
@@ -209,14 +317,17 @@ class TurnRunner:
                         out.put({"type": "end", "reason": "timeout"})
                         return
 
-                    native_call = executor.extract_tool_call(final_text, tool_names) if tool_names else None
-                    if native_call is None and tool_names:
-                        native_call = executor.command_tool_call(final_text, tool_names)
-                    if native_call is not None:
+                    native_calls = executor.extract_tool_calls(final_text, tool_names) if tool_names else []
+                    if not native_calls and tool_names:
+                        command_call = executor.command_tool_call(final_text, tool_names)
+                        if command_call is not None:
+                            native_calls = [command_call]
+                    if native_calls:
                         if not streamed_tool_call:
-                            definition = tool_definitions[native_call["name"]]
-                            out.put({"type": "tool_call", **native_call,
-                                     "tool_type": definition.get("x-client-type", "function")})
+                            for native_call in native_calls:
+                                definition = tool_definitions[native_call["name"]]
+                                out.put({"type": "tool_call", **native_call,
+                                         "tool_type": definition.get("x-client-type", "function")})
                         holder["reason"] = "tool_calls"
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
@@ -224,11 +335,30 @@ class TurnRunner:
                         holder["reason"] = "tool_calls"
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
+                    if native_tools and re.search(r"<(?:tool_call|exec_command)\b", final_text, re.IGNORECASE):
+                        raise apierr.upstream_error("upstream returned a malformed or disallowed client tool call")
+                    if native_tools:
+                        # Some upstream transports only provide a final snapshot.
+                        # Feed its unstreamed suffix once instead of duplicating it.
+                        suffix = (final_text[len(upstream_text):]
+                                  if final_text.startswith(upstream_text) else "")
+                        visible = native_text.feed(suffix, final=True)
+                        if visible:
+                            visible_text += visible
+                            out.put({"type": "text", "delta": visible})
+                    refuses_tools = re.search(
+                        r"(?:can(?:not|'t)|could(?:\s+not|n't)|unable|not (?:available|accessible)|"
+                        r"no (?:access|tools)|не (?:могу|доступ|имею)|нет доступа)", final_text, re.IGNORECASE)
+                    if tool_names and refuses_tools and tool_retries < 1 and not visible_text.strip():
+                        tool_retries += 1
+                        prompt = (base_prompt + "\n\n[CLIENT TOOL TRANSPORT CORRECTION]\n"
+                                  "Your previous reply treated the client's tools as unavailable. "
+                                  "Invoke a supplied tool using <tool_call> JSON instead of Retool sandbox tools. "
+                                  "The relay passes it to the real client and returns its result next turn. "
+                                  "For this requested task, issue the appropriate client tool call now.")
+                        continue
                     if tool_names and (choice == "required" or isinstance(choice, dict)):
                         raise apierr.upstream_error("upstream did not honor the required client tool choice")
-                    if native_tools and not streamed_tool_call and final_text.strip():
-                        # A tool-enabled request may still be answered directly.
-                        out.put({"type": "text", "delta": final_text})
 
                     # Once the summary turn is requested, nothing is executed any more.
                     can_exec = self._can_exec(exec_steps) and not final_summary
@@ -237,15 +367,19 @@ class TurnRunner:
                     if not final_summary and exec_steps and not self._can_exec(exec_steps):
                         # Explicit step cap reached (max_exec_turns > 0 only).
                         final_summary = True
-                        prompt = prompt + "\n\n[ИТОГ] Команды больше не выполняй. " \
-                                          "Дай итоговый ответ по уже собранной информации, на русском."
+                        summary = ("\n\n[ИТОГ] Команды больше не выполняй. "
+                                   "Дай итоговый ответ по уже собранной информации, на русском.")
+                        prompt = (self._followup(instructions, reminder + summary, *last_followup)
+                                  if last_followup else self._check_prompt(prompt + summary))
                         continue
 
                     # Loop guard: the same command keeps coming back (any period).
                     if command and not final_summary and self._looks_looping(command, recent):
                         final_summary = True
-                        prompt = prompt + "\n\n[ИТОГ] Команда '" + command + "' повторяется. " \
-                                          "Команды больше не выполняй, дай итоговый ответ."
+                        summary = ("\n\n[ИТОГ] Команда '" + command + "' повторяется. "
+                                   "Команды больше не выполняй, дай итоговый ответ.")
+                        prompt = (self._followup(instructions, reminder + summary, *last_followup)
+                                  if last_followup else self._check_prompt(prompt + summary))
                         continue
 
                     if not command and not final_text.strip():
@@ -307,15 +441,9 @@ class TurnRunner:
                     previous_steps.append((command, code))
                     self._remember(command, recent)
 
-                    limit = int(self.cfg.get("max_prompt_bytes", 128000))
                     header = task_block + "\n\nPrevious steps: " + trail
-                    wrapper = _b(executor.format_command_followup(command, code, "", header))
-                    budget = limit - _b(instructions) - _b(reminder) - wrapper - 100
-                    trimmed = _trim(output, max(0, budget))
-                    followup = executor.format_command_followup(command, code, trimmed, header)
-                    if reminder:
-                        followup += reminder
-                    prompt = (instructions + "\n\n" + followup) if instructions else followup
+                    last_followup = (command, code, output, header)
+                    prompt = self._followup(instructions, reminder, *last_followup)
             finally:
                 if session is not None:
                     await self.pool.release(session)

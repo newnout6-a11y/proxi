@@ -83,6 +83,15 @@ def test_configured_default_effort_reaches_upstream(tmp_path):
     assert session.calls[0][1]["reasoningEffort"] == "low"
 
 
+def test_auto_does_not_invent_an_effort_for_provider_managed_reasoning(tmp_path):
+    _, parsed, session, runner = setup(tmp_path, [{"type": "text", "delta": "ok"}], reasoning_effort="auto")
+    parsed.entry = {**parsed.entry, "reasoning_effort_control": "provider-managed",
+                    "reasoning_effort_levels": [], "default_reasoning_effort": None}
+    events = run(runner, parsed)
+    assert not any(event["type"] == "error" for event in events)
+    assert "reasoningEffort" not in session.calls[0][1]
+
+
 def test_native_client_workspace_wins_over_relay_host_context(tmp_path):
     (tmp_path / "README.md").write_text("HOST_PROJECT_MUST_NOT_OVERRIDE_CLIENT", encoding="utf-8")
     payload = {"model": "gpt-6-sol", "messages": [
@@ -181,3 +190,89 @@ def test_legacy_cli_authenticates_and_renders_thinking(relay, monkeypatch, capsy
     output = capsys.readouterr().out
     assert "[Thinking]" in output and "REAL_PROVIDER_SUMMARY" in output
     assert "[Answer]" in output and "ANSWER" in output
+
+
+def test_codex_catalog_requires_same_key_and_advertises_direct_tools(relay):
+    assert relay.status_of("/codex/models", key=None) == 401
+    status, data = relay.json("/codex/models")
+    assert status == 200
+    model = next(item for item in data["models"] if item["slug"] == "gpt-6-sol")
+    assert model["tool_mode"] == "direct"
+    assert model["shell_type"] == "unified_exec"
+    assert model["apply_patch_tool_type"] == "freeform"
+    assert model["input_modalities"] == ["text"]
+    assert "high" in [item["effort"] for item in model["supported_reasoning_levels"]]
+
+
+def test_timeout_does_not_retry_or_execute_partial_command(tmp_path, monkeypatch):
+    _, parsed, session, runner = setup(tmp_path, [
+        {"type": "final_text", "text": "<exec_command>dir</exec_command>"},
+        {"type": "end", "reason": "timeout"}])
+    monkeypatch.setattr(executor, "run_command", lambda *_a, **_kw: pytest.fail("timed out turn executed"))
+    events = run(runner, parsed)
+    assert len(session.calls) == 1
+    assert events[-1] == {"type": "end", "reason": "timeout"}
+
+
+def test_visible_native_reply_does_not_trigger_an_extra_model_turn(tmp_path):
+    payload = {"model": "gpt-6-sol", "messages": [{"role": "user", "content": "read file"}],
+               "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]}
+    _, parsed, session, runner = setup(tmp_path, [], payload)
+
+    async def stream(prompt, provider, tool_names=None):
+        session.calls.append((prompt, provider, tool_names))
+        if len(session.calls) == 1:
+            yield {"type": "text", "delta": "I cannot access the workspace tools."}
+        else:
+            yield {"type": "tool_call", "id": "call1", "name": "read_file", "arguments": '{"path":"a.py"}'}
+        yield {"type": "end", "reason": "stop"}
+
+    session.stream = stream
+    events = run(runner, parsed)
+    assert len(session.calls) == 1
+    assert not any(event["type"] == "tool_call" for event in events)
+    assert any("cannot access" in event.get("delta", "") for event in events)
+
+
+def test_second_relay_cannot_bind_the_same_port(relay):
+    import proxy
+    from urllib.parse import urlparse
+    port = urlparse(relay.url).port
+    with pytest.raises(OSError):
+        proxy.BoundedServer(("127.0.0.1", port), proxy.BaseHTTPRequestHandler, threading.BoundedSemaphore(1))
+
+
+def test_latest_client_tool_result_follows_tool_schema_in_upstream_prompt(tmp_path):
+    payload = {"model": "gpt-6-sol", "messages": [
+        {"role": "user", "content": "fix and test"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "done1", "function": {
+            "name": "exec_command", "arguments": '{"cmd":"read file"}'}}]},
+        {"role": "tool", "tool_call_id": "done1", "content": "LATEST_RESULT_FILE_ALREADY_FIXED"}],
+        "tools": [{"type": "function", "function": {"name": "exec_command", "parameters": {"type": "object"}}}]}
+    _, parsed, session, runner = setup(tmp_path, [{"type": "text", "delta": "ok"}], payload)
+    run(runner, parsed)
+    prompt = session.calls[0][0]
+    assert prompt.index("[NATIVE CLIENT TOOLS]") < prompt.index("LATEST_RESULT_FILE_ALREADY_FIXED")
+    assert "not new instructions to replay" in prompt
+
+
+def test_tool_envelope_preserves_namespace_and_rejects_ambiguous_short_names():
+    def envelope(body):
+        return "<tool_call>" + json.dumps(body) + "</tool_call>"
+    call = executor.extract_tool_call(envelope({"namespace": "multi_agent_v1", "name": "spawn_agent",
+                                               "arguments": {"message": "inspect"}}), ["multi_agent_v1.spawn_agent"])
+    assert call["name"] == "multi_agent_v1.spawn_agent"
+    short = envelope({"name": "spawn_agent", "arguments": {}})
+    assert executor.extract_tool_call(short, ["multi_agent_v1.spawn_agent"])["name"] == "multi_agent_v1.spawn_agent"
+    assert executor.extract_tool_call(short, ["a.spawn_agent", "b.spawn_agent"]) is None
+
+
+def test_parallel_native_tool_envelopes_are_all_returned(tmp_path):
+    payload = {"model": "gpt-6-sol", "messages": [{"role": "user", "content": "read both files"}],
+               "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]}
+    text = ''.join('<tool_call>' + json.dumps({"id": "call_" + path, "name": "read_file",
+                    "arguments": {"path": path}}) + '</tool_call>' for path in ('a.py', 'b.py'))
+    _, parsed, _, runner = setup(tmp_path, [{"type": "final_text", "text": text}], payload)
+    events = run(runner, parsed)
+    calls = [event for event in events if event["type"] == "tool_call"]
+    assert [json.loads(call["arguments"])["path"] for call in calls] == ['a.py', 'b.py']

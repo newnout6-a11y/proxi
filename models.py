@@ -1,4 +1,4 @@
-"""Model metadata mirrored from the Retool copilot bundle.
+"""Audited model metadata; see docs/model-catalog-audit.md for provenance.
 
 Effort capabilities describe the Retool route rather than the provider-wide union.
 """
@@ -38,46 +38,58 @@ ALIASES = {"claude-opus": "claude-opus-5-5", "claude-sonnet": "claude-sonnet-5",
            "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol"}
 
 CATALOG = [
-    {"id": "gpt-6.1-sol", "label": "GPT 6.1-sol", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-6-luna", "label": "GPT 6-luna", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-6-sol", "label": "GPT 6-sol", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-6-astra", "label": "GPT 6-astra", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5", "label": "GPT 5", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5-mini", "label": "GPT 5 Mini", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5-nano", "label": "GPT 5 Nano", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.1", "label": "GPT 5.1", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.2", "label": "GPT 5.2", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.3-codex", "label": "GPT 5.3 Codex", "provider": "openai", "context": 272000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.4", "label": "GPT 5.4", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.5", "label": "GPT 5.5", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.6-sol", "label": "GPT 5.6 Sol", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.6-terra", "label": "GPT 5.6 Terra", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gpt-5.6-luna", "label": "GPT 5.6 Luna", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6.1-sol", "label": "GPT 6.1-sol", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6-luna", "label": "GPT 6-luna", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6-sol", "label": "GPT 6-sol", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6-astra", "label": "GPT 6-astra", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5", "label": "GPT 5", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5-mini", "label": "GPT 5 Mini", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5-nano", "label": "GPT 5 Nano", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.1", "label": "GPT 5.1", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.2", "label": "GPT 5.2", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.3-codex", "label": "GPT 5.3 Codex", "provider": "openai", "context": 400000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.4", "label": "GPT 5.4", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.5", "label": "GPT 5.5", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.6-sol", "label": "GPT 5.6 Sol", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.6-terra", "label": "GPT 5.6 Terra", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-5.6-luna", "label": "GPT 5.6 Luna", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-opus-5", "label": "Claude Opus 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-opus-4-8", "label": "Claude Opus 4.8", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-opus-4-7", "label": "Claude Opus 4.7", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-20250514", "label": "Claude Opus 4", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-1-20250805", "label": "Claude Opus 4.1", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-opus-4-5-20251101", "label": "Claude Opus 4.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-20250514", "label": "Claude Opus 4", "provider": "anthropic", "context": 200000, "max_output": 32000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-1-20250805", "label": "Claude Opus 4.1", "provider": "anthropic", "context": 200000, "max_output": 32000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-opus-4-5-20251101", "label": "Claude Opus 4.5", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-opus-4-6", "label": "Claude Opus 4.6", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-fable-5", "label": "Claude Fable 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet 4", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet 4", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
-    {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash", "provider": "google", "context": 1000000, "max_output": 65000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-3.1-flash-lite-preview", "label": "Gemini 3.1 Flash-Lite (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
-    {"id": "zai-org/GLM-5.3", "label": "Retool Power", "provider": "retool-fast", "context": 984576, "max_output": 32768, "reasoning": False, "tools": True, "vision": True},
+    {"id": "zai-org/GLM-5.3", "label": "Retool Power", "provider": "retool-fast", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": False},
     {"id": "zai-org/GLM-5.3-Flash", "label": "Retool Mini", "provider": "retool-fast", "context": 984576, "max_output": 32768, "reasoning": False, "tools": True, "vision": True},
 ]
 
 _BY_ID = {m['id']: m for m in CATALOG}
+
+# Capabilities are dated independently of local resource availability. Values
+# marked provisional must not be presented as a verified upstream contract.
+_AUDIT_DATE = '2026-10-29'
+_RETOOL_SOURCE = 'https://retool-edge.com/assets_vjs/main-CnZ2mbHm.js'
+_CLAUDE_DOCS = 'https://platform.claude.com/docs/en/models/'
+_LEGACY_CLAUDE = {'claude-opus-4-20250514', 'claude-opus-4-1-20250805',
+                  'claude-sonnet-4-20250514'}
+_LOW_DEFAULTS = {'gpt-5-mini', 'gpt-5-nano', 'claude-haiku-4-5-20251001',
+                 'gemini-3-flash-preview', 'gemini-3.5-flash',
+                 'gemini-3.1-flash-lite-preview', 'gemini-2.5-flash'}
+_HIGH_DEFAULTS = {'gpt-6-astra', 'claude-fable-5'}
 
 for _model in CATALOG:
     _default_efforts = (_BASE_EFFORTS if _model['provider'] == 'openai'
@@ -85,6 +97,40 @@ for _model in CATALOG:
     _model['reasoning_effort_levels'] = list(_EFFORTS_BY_MODEL.get(_model['id'], _default_efforts))
     if not _model.get('reasoning'):
         _model['reasoning_effort_levels'] = []
+    _levels = _model['reasoning_effort_levels']
+    _model['default_reasoning_effort'] = (
+        ('low' if _model['id'] in _LOW_DEFAULTS else
+         'high' if _model['id'] in _HIGH_DEFAULTS else 'medium') if _levels else None)
+    _model['reasoning_effort_control'] = 'selectable' if _levels else 'provider-managed'
+    _model['metadata_checked_at'] = _AUDIT_DATE
+    _model['metadata_source'] = [_RETOOL_SOURCE]
+    _model['metadata_status'] = 'verified'
+    if _model['provider'] == 'openai':
+        # Mini/nano inherit the family levels; their registry entries omit an
+        # explicit list. Do not claim those controls were individually tested.
+        if _model['id'] in {'gpt-5-mini', 'gpt-5-nano'}:
+            _model['metadata_status'] = 'partial'
+            _model['metadata_notes'] = 'Effort levels inherit the Retool GPT family; not individually verified.'
+    elif _model['provider'] == 'anthropic':
+        if _model['id'] in _LEGACY_CLAUDE:
+            _model['metadata_status'] = 'provisional'
+            _model['metadata_source'].append('https://platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy')
+            _model['metadata_notes'] = 'Legacy 200K context; conservative 32K Opus/64K Sonnet output pending route verification.'
+        else:
+            _slug = _model['id'].removeprefix('claude-')
+            _slug = _slug.rsplit('-', 1)[0] if _slug[-8:].isdigit() else _slug
+            _model['metadata_source'].append(_CLAUDE_DOCS + _slug + '/overview')
+    elif _model['id'] == 'gemini-3.5-flash':
+        _model['metadata_source'].append('https://ai.google.dev/gemini-api/docs/whats-new-gemini-3.5')
+        _model['metadata_status'] = 'partial'
+        _model['metadata_notes'] = '1M input window and 65K output documented; relay route not configured or live-verified.'
+    elif _model['id'] == 'zai-org/GLM-5.3':
+        _model['metadata_source'].append('https://docs.z.ai/guides/llm/glm-5.3')
+        _model['metadata_status'] = 'partial'
+        _model['metadata_notes'] = 'Model thinking is always enabled; relay effort forwarding and route not verified.'
+    else:
+        _model['metadata_status'] = 'provisional'
+        _model['metadata_notes'] = 'Context is the Retool input reservation; full model limits and relay capabilities not independently verified.'
 
 _BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))
 
@@ -107,7 +153,9 @@ def codex_catalog(entries=None):
     result = []
     for index, entry in enumerate(CATALOG if entries is None else entries):
         efforts = entry.get('reasoning_effort_levels', [])
-        default = 'medium' if 'medium' in efforts else (efforts[0] if efforts else None)
+        default = entry.get('default_reasoning_effort')
+        if default not in efforts:
+            default = 'medium' if 'medium' in efforts else (efforts[0] if efforts else None)
         result.append({
             'slug': entry['id'], 'display_name': entry.get('label', entry['id']),
             'description': 'Retool relay: ' + entry.get('label', entry['id']),

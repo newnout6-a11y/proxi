@@ -160,7 +160,7 @@ def test_codex_catalog_advertises_direct_client_tools_and_actual_route_capabilit
 
 
 def test_codex_catalog_does_not_invent_reasoning_for_non_reasoning_model():
-    entry, _ = models.resolve("zai-org/GLM-5.3")
+    entry = {"id": "plain-text-model", "reasoning": False, "reasoning_effort_levels": []}
     native = models.codex_catalog([entry])["models"][0]
     assert native["supported_reasoning_levels"] == []
     assert native["default_reasoning_level"] is None

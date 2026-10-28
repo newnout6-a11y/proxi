@@ -1,6 +1,7 @@
 """Project context and system-instruction builder (untrusted-data aware)."""
 import os
 import subprocess
+import threading
 
 from redact import redact, is_sensitive_path
 
@@ -11,11 +12,46 @@ IGNORED_DIRS = {
 }
 DOC_FILES = ("AGENTS.md", "README.md", "PROTOCOL.md")
 MAX_FILES = 60
+_COMMIT_CACHE = {}
+_COMMIT_LOCK = threading.Lock()
 
 
 def _git(workspace, *args):
     return subprocess.run(["git", *args], cwd=workspace, capture_output=True,
                           text=True, timeout=5).stdout.strip()
+
+
+def _last_commit(workspace):
+    """Cache immutable commit metadata; status is still read fresh each time."""
+    git_dir = os.path.join(workspace, ".git")
+    if os.path.isfile(git_dir):
+        with open(git_dir, encoding="utf-8") as handle:
+            pointer = handle.readline().strip()
+        if pointer.startswith("gitdir:"):
+            git_dir = os.path.realpath(os.path.join(workspace, pointer[7:].strip()))
+    head = os.path.join(git_dir, "HEAD")
+    with open(head, encoding="utf-8") as handle:
+        target = handle.read(1024).strip()
+    common_dir = git_dir
+    common_pointer = os.path.join(git_dir, "commondir")
+    if os.path.isfile(common_pointer):
+        with open(common_pointer, encoding="utf-8") as handle:
+            common_dir = os.path.realpath(os.path.join(git_dir, handle.readline().strip()))
+    paths = [head, os.path.join(common_dir, "packed-refs")]
+    if target.startswith("ref:"):
+        paths.append(os.path.join(common_dir, target[4:].strip()))
+    stamps = tuple((path, os.stat(path).st_mtime_ns, os.stat(path).st_size)
+                   for path in paths if os.path.isfile(path))
+    signature = (target, stamps)
+    with _COMMIT_LOCK:
+        cached = _COMMIT_CACHE.get(workspace)
+        if cached and cached[0] == signature:
+            return cached[1]
+        commit = _git(workspace, "log", "-1", "--oneline")
+        if len(_COMMIT_CACHE) >= 32:
+            _COMMIT_CACHE.pop(next(iter(_COMMIT_CACHE)))
+        _COMMIT_CACHE[workspace] = (signature, commit)
+        return commit
 
 
 def _safe_workspace(workspace_root: str) -> str:
@@ -43,9 +79,11 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
 
     if os.path.exists(os.path.join(workspace_root, ".git")):
         try:
-            branch = _git(workspace_root, "rev-parse", "--abbrev-ref", "HEAD")
-            commit = _git(workspace_root, "log", "-1", "--oneline")
-            status = _git(workspace_root, "status", "--short")
+            snapshot = _git(workspace_root, "status", "--short", "--branch").splitlines()
+            branch = (snapshot[0][3:].split("...", 1)[0]
+                      if snapshot and snapshot[0].startswith("## ") else "")
+            status = "\n".join(snapshot[1:] if branch else snapshot)
+            commit = _last_commit(workspace_root)
             if branch:
                 lines.append("Git branch: " + branch)
             if commit:
@@ -83,7 +121,7 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
             listing += " | sensitive (contents not loaded): " + ", ".join(flagged[:10])
         lines.append("Files (" + str(len(files)) + " shown): " + listing)
 
-    budget = max(500, limit - len("\n".join(lines)))
+    budget = max(0, limit - len("\n".join(lines).encode("utf-8")))
     for doc in DOC_FILES:
         if budget <= 0:
             break
@@ -95,14 +133,14 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
             continue
         try:
             with open(path, encoding="utf-8", errors="replace") as handle:
-                snippet = handle.read(min(1500, budget))
+                snippet = handle.read(budget)
         except OSError as exc:
             warnings.append(doc + " unreadable: " + str(exc))
             continue
         snippet = redact(snippet, cookie_values=cookie_values).strip()
         if snippet:
             lines.append("--- " + doc + " (excerpt) ---\n" + snippet)
-            budget -= len(snippet)
+            budget -= len(snippet.encode("utf-8"))
 
     if warnings:
         lines.append("Context warnings: " + "; ".join(warnings))

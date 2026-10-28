@@ -1,6 +1,6 @@
 # Retool agent API (reverse-engineered)
 
-Host: https://vovasahren.retool.com — auth by cookies + x-xsrf-token (header must equal xsrfToken cookie).
+Host: https://<tenant>.retool.com — auth by cookies + x-xsrf-token (header must equal xsrfToken cookie).
 
 ## 1. Start run
 POST /api/ai/retool-next-agent/start
@@ -13,7 +13,7 @@ body: {"threadId":"<uuid>","pageUuid":"<uuid>","environmentName":"production"}
 если он уже есть. Пустой или просроченный токен даёт HTTP 401 на рукопожатии.
 
 ## 2. Stream
-WS connect, Origin: https://vovasahren.retool.com (token already in URL query).
+WS connect, Origin: https://<tenant>.retool.com (token already in URL query).
 Send:
 {"type":"user_prompt","prompt":"...","modelProvider":{"model":"claude-opus-5-5","providerResourceName":"ffd4d570-7c6b-414f-b95a-1a695676d0a8"},
  "attachments":[],"taggedResourceNames":[],"taggedResourceIds":[],"r2OnboardingTemplateId":null,
@@ -63,4 +63,7 @@ POST /api/pages/{pageUuid}/sandpack/threads/{threadId}/messages
 - cf_clearance привязан к IP и User-Agent: менять UA между запросами нельзя.
 
 ## Rate limit
-x-ratelimit-limit: 120 / 60s
+Исторически наблюдался `x-ratelimit-limit: 120 / 60s`. Это не подтверждение
+текущей общей квоты: в проверке `GET /api/credits/balance` 2026-10-29 эти
+заголовки отсутствовали. Relay обрабатывает реальные 429/Retry-After, не
+добавляя фиксированный интервал между успешными запросами.

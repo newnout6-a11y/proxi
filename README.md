@@ -69,6 +69,7 @@ Codex (~/.codex/config.toml):
     model_provider = "retool"
     model_reasoning_effort = "high"
     model_reasoning_summary = "detailed"
+    web_search = "disabled"
     [model_providers.retool]
     name = "Retool relay"
     base_url = "http://127.0.0.1:8787/v1"
@@ -77,9 +78,19 @@ Codex (~/.codex/config.toml):
     supports_websockets = false
     model_catalog_url = "http://127.0.0.1:8787/codex/models"
 
+`/codex/models` предоставляет Codex-совместимые описания уровней мышления и
+инструментов (`exec_command`, freeform `apply_patch`, namespaces субагентов).
+Встроенный server-side `web_search` Responses не реализован; клиентские
+инструменты поиска, объявленные как function tools, проходят обычный bridge.
+
 Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` и
 `ANTHROPIC_API_KEY=<тот же relay key>` (или `ANTHROPIC_AUTH_TOKEN`).
 В bare-режиме Claude Code использует `ANTHROPIC_API_KEY`.
+
+Для DeepSeek Harness используйте провайдера `retool` через OpenAI Chat:
+`baseURL: http://127.0.0.1:8787/v1`, `thinkingFormat: deepseek`.
+Схемы настроек трёх клиентов и границы IDE-команд — в
+[docs/client-setup.md](docs/client-setup.md).
 
 ### Thinking и работа с проектом
 
@@ -118,9 +129,12 @@ AGENTS/README/PROTOCOL настроенного workspace; дополнител�
 | exec_policy | allowlist (по умолчанию), allow_all, off |
 | exec_allowlist | regex-список разрешённых первых слов команд (см. ниже) |
 | strict_models | true — неизвестная модель даёт 404 вместо тихой маршрутизации |
-| max_body_bytes, max_workers, rate_limit_rps | лимиты входа и параллелизма (воркеров 32) |
-| command_output_limit, max_prompt_bytes | 64 000 и 128 000 символов на вывод команды и промпт |
+| max_body_bytes, max_frame_bytes, max_workers | границы памяти/параллелизма: 32 МиБ запроса, 16 МиБ WS-кадра, 32 воркера |
+| rate_limit_rps | 0 — дополнительная локальная квота выключена; можно включить явно |
+| command_output_limit | 64 000 символов; 0 — весь вывод команды |
+| max_prompt_bytes | 0 — relay не обрезает prompt; положительный лимит проверяет весь UTF-8 prompt и возвращает 413 при переполнении |
 | context_max_bytes | 120 000 — сколько контекста проекта подмешивается |
+| reasoning_effort | auto — рекомендация выбранной модели; явный уровень из клиента имеет приоритет |
 | agent_mode | 2 — рабочий режим агента (1 — более «разговорный», 3 — не проверялся) |
 | google_provider_resource_name, retool_fast_provider_resource_name | ресурсы для gemini-* и zai-org/*; без них эти модели дают 503 |
 
@@ -138,13 +152,15 @@ AGENTS/README/PROTOCOL настроенного workspace; дополнител�
 по умолчанию. Полноценные правки и тесты используйте через инструменты клиента
 с его разрешениями. `allow_all` остаётся явным выбором владельца relay.
 
-Таймауты: ход — 300 с (`turn_timeout`), ожидание кадра — 120 с (`recv_timeout`), команда — 40 с.
+Таймауты: ход — 900 с (`turn_timeout`), чтение кадра — 120 с (`recv_timeout`), команда — 300 с.
+Таймаут чтения кадра сам по себе не завершает генерацию. Эти значения ограничивают
+максимальное ожидание; успешный ответ отправляется сразу после готовности.
 Количество шагов исполнения не ограничено (`max_exec_turns: 0`). Ограничение шагов можно
 включить вручную: тогда на исчерпании агент получает финальный ход без команд. Отдельно
 стоит предохранитель от цикла: если одна и та же команда повторяется, исполнение
 останавливается и агент обязан дать сводку.
-`max_tokens` валидируется по модели: у Claude 5.5 — 128 000, у GPT-6 — 128 000, у Gemini — 65 536,
-у GLM — 32 768; контексты моделей — от 400 000 до 1 000 000.
+`max_tokens` валидируется по модели. Контексты, output caps, рекомендуемые уровни
+и границы подтверждения сведены в [аудите каталога](docs/model-catalog-audit.md).
 
 ## Каталог моделей
 

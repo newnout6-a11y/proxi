@@ -101,19 +101,23 @@ class Backend:
                 if exc.code == 429:
                     retry_after = exc.headers.get("retry-after") if exc.headers else None
                     last = apierr.too_many_requests("Retool rate limit", float(retry_after or 2))
-                    await asyncio.sleep(min(float(retry_after or 2), 5) * (attempt + 1))
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(min(float(retry_after or 2), 5) * (attempt + 1))
                     continue
                 if 500 <= exc.code < 600:
                     last = apierr.upstream_error(f"Retool HTTP {exc.code}{(': ' + body) if body else ''}")
-                    await asyncio.sleep(0.4 * (attempt + 1))
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(0.4 * (attempt + 1))
                     continue
                 raise apierr.upstream_error(f"Retool HTTP {exc.code}{(': ' + body) if body else ''}")
             except TimeoutError:
                 last = apierr.upstream_timeout(f"Retool did not answer within {timeout}s")
-                await asyncio.sleep(0.4 * (attempt + 1))
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.4 * (attempt + 1))
             except urllib.error.URLError as exc:
                 last = apierr.upstream_error(f"Retool unreachable: {exc.reason}")
-                await asyncio.sleep(0.4 * (attempt + 1))
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.4 * (attempt + 1))
         raise last if last is not None else apierr.upstream_error("upstream call failed")
 
     # -- API ----------------------------------------------------------------
@@ -200,17 +204,6 @@ class RelaySession:
             else:
                 raise
         self.sandbox_id = started.sandbox_id
-        await self._drain()
-
-    async def _drain(self):
-        while True:
-            try:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=0.4)
-            except asyncio.TimeoutError:
-                return
-            except Exception:
-                return
-            await self._maybe_pong(raw)
 
     async def _maybe_pong(self, raw):
         try:
@@ -295,7 +288,7 @@ class RelaySession:
 
         deadline = turn_start + self.cfg["turn_timeout"]
         tool_names = set(tool_names or ())
-        state = {"thinking": "", "tools": {}, "signatures": set()}
+        state = {"thinking": "", "tools": {}, "signatures": set(), "activity": asyncio.Event()}
         think_q = asyncio.Queue() if (self.cfg.get("show_thinking") or tool_names) else None
         poller = (asyncio.ensure_future(self._poll_thinking(turn_start, think_q, tool_names, state))
                   if think_q is not None else None)
@@ -309,6 +302,7 @@ class RelaySession:
         reconnects = 0
         tool_buffers = state["tools"]
         receive_task = None
+        credits_received = False
         try:
             while True:
                 while think_q is not None and not think_q.empty():
@@ -387,6 +381,7 @@ class RelaySession:
                             last_text = content
                             full_text += delta
                             if delta:
+                                state["activity"].set()
                                 yield {"type": "text", "delta": delta}
                             continue
                         if full_text.strip():
@@ -404,6 +399,7 @@ class RelaySession:
                     last_text = content
                     full_text += delta
                     if delta:
+                        state["activity"].set()
                         yield {"type": "text", "delta": delta}
                 elif kind == "thinking":
                     content = event.get("content") or ""
@@ -429,14 +425,17 @@ class RelaySession:
                     else:
                         state["thinking"] += delta
                     if delta:
+                        state["activity"].set()
                         yield {"type": "thinking", "delta": delta}
                     signature = event.get("signature")
                     if signature and signature not in state["signatures"]:
+                        state["activity"].set()
                         state["signatures"].add(signature)
                         yield {"type": "thinking_signature", "signature": signature}
                 elif kind == "thinking_signature":
                     signature = event.get("signature")
                     if signature and signature not in state["signatures"]:
+                        state["activity"].set()
                         state["signatures"].add(signature)
                         yield {"type": "thinking_signature", "signature": signature}
                 elif kind == "clear_streaming":
@@ -446,12 +445,14 @@ class RelaySession:
                 elif kind == "run_credits_persisted":
                     value = event.get("creditsUsed")
                     if isinstance(value, (int, float)):
+                        credits_received = True
                         yield {"type": "credits", "value": float(value)}
                 elif kind == "hitl":
                     yield {"type": "hitl", "question": _hitl_text(event)}
                 elif kind == "tool_call":
                     call = _tool_call_from_event(event)
                     if call is not None and call["name"] in tool_names:
+                        state["activity"].set()
                         merged = _merge_tool_call(call, tool_buffers)
                         if merged is not None:
                             yield {"type": "tool_call", **merged}
@@ -472,8 +473,9 @@ class RelaySession:
                                 yield pending
                             else:
                                 yield {"type": "thinking", "delta": pending}
-                    for trail in await self._trailing():
-                        yield trail
+                    if not credits_received:
+                        for trail in await self._trailing():
+                            yield trail
                     yield {"type": "final_text", "text": full_text}
                     yield {"type": "end", "reason": "stop"}
                     return
@@ -493,6 +495,7 @@ class RelaySession:
 
     async def _queue_history(self, turn_start, queue_, tool_names, state):
         data = await self.backend.get_messages(self.thread_id)
+        before = queue_.qsize()
         parts = []
         signatures = []
         for message in reversed(data.get("messages", [])):
@@ -523,18 +526,32 @@ class RelaySession:
             state["thinking"] = text
         for signature in signatures:
             queue_.put_nowait({"type": "thinking_signature", "signature": signature})
+        return queue_.qsize() > before
 
     async def _poll_thinking(self, turn_start, queue_, tool_names=(), state=None):
         """Poll only actual provider messages correlated to this turn."""
         if state is None:
             state = {"thinking": "", "tools": {}, "signatures": set()}
+        activity = state.setdefault("activity", asyncio.Event())
+        interval = 2.0
         while True:
             try:
-                await asyncio.sleep(2.0)
-                await self._queue_history(turn_start, queue_, tool_names, state)
+                try:
+                    await asyncio.wait_for(activity.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    # WS activity already supplies new content. Resume the
+                    # normal cadence without adding a redundant history GET.
+                    activity.clear()
+                    interval = 2.0
+                    continue
+                changed = await self._queue_history(turn_start, queue_, tool_names, state)
+                interval = 2.0 if changed else min(interval * 2, 15.0)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                interval = min(interval * 2, 15.0)
                 continue
 
     async def _trailing(self):

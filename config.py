@@ -1,5 +1,6 @@
 """Configuration loading, environment overrides and validation."""
 import json
+import math
 import os
 import re
 import secrets
@@ -24,13 +25,13 @@ DEFAULTS = {
     "max_workers": 32,
     "max_conversations": 128,
     "conversation_idle_timeout": 900,
-    "rate_limit_rps": 32.0,
+    "rate_limit_rps": 0.0,       # optional local quota; upstream limits still apply
     "rate_limit_burst": 64.0,
-    "turn_timeout": 300,
+    "turn_timeout": 900,
     "recv_timeout": 120,
     "upstream_timeout": 120,
     "session_refresh_interval": 900,
-    "command_timeout": 40,
+    "command_timeout": 300,
     "command_output_limit": 64000,
     "max_exec_turns": 0,          # 0 = без ограничения
     "exec_policy": "allowlist",
@@ -41,13 +42,13 @@ DEFAULTS = {
     ],
     "project_context": True,
     "context_max_bytes": 120000,
-    "max_prompt_bytes": 128000,
+    "max_prompt_bytes": 0,       # no relay-imposed prompt cap
     "show_exec_output": True,
     "enable_anthropic": True,
     "enable_chat": True,
     "show_thinking": True,
     "enable_responses": True,
-    "reasoning_effort": "high",
+    "reasoning_effort": "auto",
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -162,6 +163,12 @@ def load(path=CONFIG_PATH):
 
     if cfg["session_refresh_interval"] < 0:
         raise service_unavailable("session_refresh_interval must be non-negative (0 disables keepalive)")
+    for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit"):
+        if cfg[key] < 0:
+            raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
+    for key in ("turn_timeout", "recv_timeout", "upstream_timeout", "command_timeout", "max_workers"):
+        if cfg[key] < 1:
+            raise service_unavailable(f"{key} must be positive")
     if cfg["max_conversations"] < 1 or cfg["conversation_idle_timeout"] < 1:
         raise service_unavailable("max_conversations and conversation_idle_timeout must be positive")
 
@@ -170,6 +177,10 @@ def load(path=CONFIG_PATH):
             cfg[float_key] = float(cfg[float_key])
         except (TypeError, ValueError):
             raise service_unavailable(f"config value '{float_key}' must be a number")
+        if not math.isfinite(cfg[float_key]):
+            raise service_unavailable(f"config value '{float_key}' must be finite")
+    if cfg["rate_limit_rps"] < 0 or cfg["rate_limit_burst"] <= 0:
+        raise service_unavailable("rate_limit_rps must be non-negative and rate_limit_burst must be positive")
 
     missing = [k for k in REQUIRED if not cfg.get(k)]
     if missing:

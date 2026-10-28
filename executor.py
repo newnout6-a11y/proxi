@@ -121,6 +121,15 @@ def extract_tool_call(text: str, allowed=None):
     if not isinstance(name, str) or not name.strip():
         return None
     name = name.strip()
+    if (isinstance(value.get("namespace"), str) and value["namespace"]
+            and not name.startswith(value["namespace"] + ".")):
+        name = value["namespace"] + "." + name
+    if allowed and name not in allowed:
+        # Models may use the short function name from a namespace schema.
+        # Restore the namespace only when it is unambiguous.
+        matches = [candidate for candidate in allowed if candidate.endswith("." + name)]
+        if len(matches) == 1:
+            name = matches[0]
     if allowed and name not in allowed:
         return None
     arguments = value.get("arguments", value.get("input", value.get("parameters", {})))
@@ -137,6 +146,18 @@ def extract_tool_call(text: str, allowed=None):
             return None
     return {"id": str(value.get("id") or value.get("tool_call_id") or "call_" + uuid.uuid4().hex[:20]),
             "name": name, "arguments": encoded}
+
+
+def extract_tool_calls(text: str, allowed=None):
+    """Preserve a parallel client-tool batch instead of dropping all but its last call."""
+    calls = []
+    for match in TOOL_REGEX.finditer(text or ""):
+        call = extract_tool_call(match.group(0), allowed)
+        if call is not None:
+            if any(previous["id"] == call["id"] for previous in calls):
+                call["id"] = "call_" + uuid.uuid4().hex[:20]
+            calls.append(call)
+    return calls
 
 
 def command_tool_call(text: str, tool_names):
@@ -200,16 +221,22 @@ def _decode(raw: bytes) -> str:
     for encoding in ("utf-8", "cp866", "cp1251"):
         try:
             return raw.decode(encoding)
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as exc:
+            if encoding == "utf-8" and exc.reason == "unexpected end of data" and exc.end == len(raw):
+                # A bounded capture can stop halfway through the final UTF-8
+                # character. Preserve the valid prefix instead of decoding all
+                # UTF-8 output as a legacy Windows code page.
+                return raw[:exc.start].decode("utf-8")
             continue
     return raw.decode("utf-8", "replace")
 
 
-def _kill_tree(pid: int) -> None:
+def _kill_tree(pid: int) -> bool:
     try:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10)
+        result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10)
+        return result.returncode == 0
     except Exception:
-        pass
+        return False
 
 
 def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
@@ -234,7 +261,9 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
             data = stream.read(2048)
             if not data:
                 break
-            if collected["size"] < limit * 2:
+            # Output limits are characters; UTF-8 can require four bytes each.
+            # Keep one extra character so truncation can be reported accurately.
+            if limit <= 0 or collected["size"] < (limit + 1) * 4:
                 collected[key].append(data)
                 collected["size"] += len(data)
 
@@ -245,6 +274,7 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
 
     timed_out = False
     cancelled = False
+    tree_killed = False
     try:
         deadline = time.monotonic() + timeout
         while proc.poll() is None:
@@ -260,7 +290,9 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
                 pass
     except subprocess.TimeoutExpired:
         timed_out = not cancelled
-        _kill_tree(proc.pid)
+        tree_killed = _kill_tree(proc.pid)
+        if not tree_killed and proc.poll() is None:
+            proc.kill()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -274,14 +306,15 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
     if err:
         combined += ("\nSTDERR:\n" if combined else "") + err
     if timed_out:
-        combined += "\n[timed out after " + str(timeout) + "s, process tree killed]"
+        combined += "\n[timed out after " + str(timeout) + "s; " + (
+            "process tree killed]" if tree_killed else "process termination requested]")
     if cancelled:
-        combined += "\n[cancelled, process tree killed]"
+        combined += "\n[cancelled; " + ("process tree killed]" if tree_killed else "process termination requested]")
     if not combined:
         combined = "(no output)"
 
     truncated_len = 0
-    if len(combined) > limit:
+    if limit > 0 and len(combined) > limit:
         truncated_len = len(combined) - limit
         combined = combined[:limit] + "\n... [truncated " + str(truncated_len) + " chars]"
 

@@ -136,5 +136,5 @@ def test_deep_exec_chain_respects_prompt_limit(tmp_path, monkeypatch):
     asyncio.run(runner.run(parsed, queue.Queue(), {}))
 
     assert len(prompts) == 5
-    assert prompts[0].count("USER TASK") == 0 or True
-    assert all(len(p) <= limit for p in prompts), [len(p) for p in prompts]
+    assert all("задача" in prompt for prompt in prompts)
+    assert all(len(p.encode("utf-8")) <= limit for p in prompts), [len(p.encode("utf-8")) for p in prompts]
