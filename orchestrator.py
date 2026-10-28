@@ -130,7 +130,7 @@ class TurnRunner:
                             limit=self.cfg["command_output_limit"],
                             policy=self.cfg["exec_policy"],
                             allowlist=self.cfg["exec_allowlist"],
-                            audit_path=self.cfg["command_log"],
+                            audit_path=self.cfg.get("command_log"),
                         ),
                     )
                 except executor.PolicyError as exc:
