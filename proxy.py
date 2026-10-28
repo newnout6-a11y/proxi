@@ -430,8 +430,19 @@ def main():
         except (ValueError, OSError):
             pass
 
+    def _thread_crash(args):
+        print("thread crash:", args.exc_type.__name__, args.exc_value, flush=True)
+
+    threading.excepthook = _thread_crash
+
     try:
-        server.serve_forever()
+        while True:
+            try:
+                server.serve_forever()
+                break
+            except Exception as exc:  # never lose the listener on a stray error
+                print("serve_forever crashed:", exc, flush=True)
+                time.sleep(0.5)
     finally:
         try:
             runtime.backend.refresher.stop()

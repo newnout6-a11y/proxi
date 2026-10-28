@@ -1,0 +1,7 @@
+fix(session+proxy): thread-safe cancel, survive listener errors
+
+- RelaySession.cancel() may be called from a worker thread: use run_coroutine_threadsafe
+  on the stored loop instead of asyncio.create_task (fixes 'no running event loop')
+- drain future awaited via asyncio.wrap_future
+- threading.excepthook logs thread crashes; serve_forever restarts instead of dying
+- opencode config: capability flags so the provider appears in the model picker
