@@ -13,7 +13,9 @@ KEY_PATH = os.path.join(HERE, "relay_key.txt")
 DEFAULTS = {
     "host": "127.0.0.1",
     "port": 8787,
-    "session_mode": "per_request",
+    # Keep one upstream thread for one client conversation.  OpenCode sends
+    # x-session-affinity/X-Session-Id, which SessionPool uses as the key.
+    "session_mode": "per_conversation",
     "strict_models": True,
     "show_unrouted_models": False,
     "max_body_bytes": 32 * 1024 * 1024,
@@ -123,8 +125,8 @@ def load(path=CONFIG_PATH):
         raise service_unavailable("config is missing 'cookie' (or RETOOL_COOKIE)")
     if not cfg.get("xsrf"):
         raise service_unavailable("config is missing 'xsrf' (or RETOOL_XSRF)")
-    if cfg["session_mode"] not in ("per_request", "shared"):
-        raise service_unavailable("session_mode must be 'per_request' or 'shared'")
+    if cfg["session_mode"] not in ("per_request", "per_conversation", "shared"):
+        raise service_unavailable("session_mode must be 'per_request', 'per_conversation' or 'shared'")
     if cfg["session_mode"] == "shared" and not cfg.get("thread_id"):
         raise service_unavailable("session_mode 'shared' requires 'thread_id'")
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):

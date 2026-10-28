@@ -10,7 +10,7 @@
   "port": 8787,
   "relay_api_key": "<optional; иначе env RELAY_API_KEY или сгенерированный relay_key.txt>",
 
-  "session_mode": "per_request",
+  "session_mode": "per_conversation",
   "strict_models": true,
   "enable_responses": true,
   "enable_anthropic": true,

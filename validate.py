@@ -1,4 +1,5 @@
 """Strict request parsing for every supported dialect."""
+import hashlib
 import json
 
 from apierr import bad_request, unprocessable
@@ -22,6 +23,9 @@ class Parsed:
         self.declared_ignored = []
         self.wants_usage = False
         self.show_thinking = True
+        self.tools = []
+        self.tool_choice = "auto"
+        self.conversation_key = None
 
 
 def load_json(raw: bytes):
@@ -136,7 +140,8 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
             continue
         if role in ("tool", "function"):
             name = message.get("name") or message.get("tool_call_id") or "tool"
-            convo.append(f"[tool result {name}]: {text}")
+            call_id = message.get("tool_call_id") or message.get("call_id") or name
+            convo.append(f"[tool result {name} id={call_id}]: {text}")
             continue
         if role == "assistant":
             calls = message.get("tool_calls") or []
@@ -147,7 +152,8 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
                     fn = call.get("function") or {}
                     name = fn.get("name") or call.get("name") or "tool"
                     args = fn.get("arguments") or call.get("arguments") or ""
-                    convo.append(f"Assistant: {text}\n[tool_call {name}: {str(args)[:400]}]".strip())
+                    call_id = call.get("id") or call.get("tool_call_id") or "call"
+                    convo.append(f"Assistant: {text}\n[tool_call {name} id={call_id}: {str(args)[:400]}]".strip())
                     text = ""
             if text:
                 convo.append(f"Assistant: {text}")
@@ -162,7 +168,8 @@ def _responses_item(item):
         return item
     kind = item.get("type")
     if kind in ("function_call_output", "tool_result") and "role" not in item:
-        return {"role": "tool", "name": item.get("call_id") or "tool",
+        return {"role": "tool", "name": item.get("name") or item.get("call_id") or "tool",
+                "tool_call_id": item.get("call_id") or item.get("tool_call_id"),
                 "content": item.get("output") if item.get("output") is not None else item.get("content")}
     if kind == "function_call" and "role" not in item:
         return {"role": "assistant", "content": "",
@@ -193,7 +200,108 @@ def _finish(data, parsed):
     stream_options = data.get("stream_options")
     if isinstance(stream_options, dict) and stream_options.get("include_usage"):
         parsed.wants_usage = True
+    parsed.tools = _tools(data)
+    parsed.tool_choice = _tool_choice(data.get("tool_choice"))
     return parsed
+
+
+def _tools(data):
+    """Validate and retain OpenAI/Anthropic-compatible function definitions."""
+    tools = data.get("tools")
+    if tools is None:
+        return []
+    if not isinstance(tools, list):
+        raise unprocessable("'tools' must be an array", param="tools")
+    result = []
+    for index, tool in enumerate(tools):
+        where = f"tools[{index}]"
+        if not isinstance(tool, dict):
+            raise unprocessable(f"{where} must be an object", param=where)
+        if tool.get("type", "function") != "function":
+            raise unprocessable(f"{where}.type must be 'function'", param=where + ".type")
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise unprocessable(f"{where}.function.name must be a non-empty string",
+                                param=where + ".function.name")
+        parameters = fn.get("parameters", fn.get("input_schema", {}))
+        if not isinstance(parameters, dict):
+            raise unprocessable(f"{where}.function.parameters must be an object",
+                                param=where + ".function.parameters")
+        result.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": str(fn.get("description") or ""),
+                "parameters": parameters,
+            },
+        })
+    return result
+
+
+def _tool_choice(value):
+    if value is None:
+        return "auto"
+    if isinstance(value, str):
+        if value not in ("none", "auto", "required"):
+            raise unprocessable("'tool_choice' must be 'none', 'auto' or 'required'", param="tool_choice")
+        return value
+    if isinstance(value, dict):
+        fn = value.get("function")
+        choice_type = value.get("type")
+        if choice_type == "auto":
+            return "auto"
+        if choice_type == "none":
+            return "none"
+        if choice_type == "any":
+            return "required"
+        if value.get("type") == "tool" and isinstance(value.get("name"), str):
+            return {"type": "function", "function": {"name": value["name"]}}
+        if choice_type == "function" and fn is None and isinstance(value.get("name"), str):
+            return {"type": "function", "function": {"name": value["name"]}}
+        if value.get("type") != "function" or not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+            raise unprocessable("'tool_choice' function form is invalid", param="tool_choice")
+        return {"type": "function", "function": {"name": fn["name"]}}
+    raise unprocessable("'tool_choice' must be a string or function object", param="tool_choice")
+
+
+def conversation_key(data, header_value=None):
+    """Return a stable affinity key for one client dialogue.
+
+    OpenCode supplies a session header.  The body fallback keeps ordinary
+    OpenAI clients usable without making every request a new Retool thread.
+    """
+    if isinstance(header_value, str) and header_value.strip():
+        return "header:" + header_value.strip()[:256]
+    for key in ("conversation", "conversation_id", "session_id"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return key + ":" + value.strip()[:256]
+    messages = data.get("messages")
+    if messages is None:
+        raw = data.get("input") or data.get("prompt") or ""
+        if isinstance(raw, list):
+            stable = []
+            for item in raw[:4]:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") in ("message", "input_text") or item.get("role") in ("system", "developer", "user"):
+                    stable.append({"role": item.get("role"), "type": item.get("type"),
+                                   "content": item.get("content") or item.get("input_text")})
+            raw = stable
+        seed = {"input": raw, "instructions": data.get("instructions"), "model": data.get("model")}
+    else:
+        stable = []
+        for message in messages[:4] if isinstance(messages, list) else []:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role in ("system", "developer", "user"):
+                stable.append({"role": role, "content": message.get("content")})
+        seed = {"messages": stable, "model": data.get("model")}
+    digest = hashlib.sha256(json.dumps(seed, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
+    return "body:" + digest
 
 
 def parse_chat(data, cfg):

@@ -137,3 +137,16 @@ def test_structure_preserved_for_tool_and_blocks(relay):
     relay.json("/v1/chat/completions", payload)
     prompt = relay.fake.seen[-1].prompt
     assert "image/png" in prompt and "tool_call read_file" in prompt and "tool result" in prompt
+
+
+def test_chat_native_tool_call_round_trip(relay):
+    relay.fake.script = [{"type": "tool_call", "id": "call_1", "name": "bash",
+                          "arguments": '{"command":"dir"}'},
+                         {"type": "end", "reason": "tool_calls"}]
+    payload = dict(CHAT, tools=[{"type": "function", "function": {
+        "name": "bash", "parameters": {"type": "object"}}}], stream=False)
+    status, body = relay.json("/v1/chat/completions", payload)
+    assert status == 200
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    call = body["choices"][0]["message"]["tool_calls"][0]
+    assert call["id"] == "call_1" and body["choices"][0]["message"]["content"] is None

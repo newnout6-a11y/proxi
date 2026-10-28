@@ -5,8 +5,11 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 
 EXEC_REGEX = re.compile(r"<exec_command>(.*?)</exec_command>", re.DOTALL | re.IGNORECASE)
+TOOL_REGEX = re.compile(r"<tool_call(?:\s+name=[\"']([^\"']+)[\"'])?>(.*?)</tool_call>",
+                        re.DOTALL | re.IGNORECASE)
 SEPARATORS = ("&&", "||", "|", ";", "&", "\n", "\r")
 SHELLS = ("powershell", "pwsh", "cmd")
 SHELL_FLAGS = ("-command", "-c", "/c", "-encodedcommand", "-e")
@@ -97,6 +100,58 @@ def extract_command(text: str):
     cmd = re.sub(r"^" + FENCE + r"[a-zA-Z]*\n?", "", cmd)
     cmd = re.sub(r"\n?" + FENCE + "$", "", cmd)
     return cmd.strip() or None
+
+
+def extract_tool_call(text: str, allowed=None):
+    """Extract the prompt-bridge envelope used for client native tools."""
+    if not text:
+        return None
+    matches = list(TOOL_REGEX.finditer(text))
+    if not matches:
+        return None
+    match = matches[-1]
+    raw = match.group(2).strip()
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    name = match.group(1) or value.get("name") or value.get("tool") or value.get("toolName")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    name = name.strip()
+    if allowed and name not in allowed:
+        return None
+    arguments = value.get("arguments", value.get("input", value.get("parameters", {})))
+    if isinstance(arguments, str):
+        try:
+            json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+        encoded = arguments
+    else:
+        try:
+            encoded = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+    return {"id": str(value.get("id") or value.get("tool_call_id") or "call_" + uuid.uuid4().hex[:20]),
+            "name": name, "arguments": encoded}
+
+
+def command_tool_call(text: str, tool_names):
+    """Map the legacy command envelope to a client shell-like tool."""
+    command = extract_command(text)
+    if not command:
+        return None
+    names = set(tool_names or ())
+    name = next((candidate for candidate in ("bash", "shell", "exec_command", "run_command")
+                 if candidate in names), None)
+    if name is None:
+        return None
+    field = "command" if name in ("bash", "shell") else "cmd"
+    return {"id": "call_" + uuid.uuid4().hex[:20], "name": name,
+            "arguments": json.dumps({field: command}, ensure_ascii=False, separators=(",", ":"))}
 
 
 def _check_segments(segments, patterns, depth=0) -> None:

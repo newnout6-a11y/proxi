@@ -273,6 +273,10 @@ def make_handler(runtime: Runtime):
                 parsed = validate.parse_responses(data, cfg)
             else:
                 parsed = validate.parse_chat(data, cfg)
+            affinity = (self.headers.get("x-session-affinity") or
+                        self.headers.get("x-session-id") or
+                        self.headers.get("x-opencode-session"))
+            parsed.conversation_key = validate.conversation_key(data, affinity)
 
             wait = runtime.limiter.take()
             if wait:

@@ -49,7 +49,7 @@ def test_cancel_does_not_poison_following_turns():
             session.cancel()
         # the aborted turn is drained in the background before the next one
         if session._drain_task is not None:
-            await session._drain_task
+            await asyncio.wrap_future(session._drain_task)
         assert session.ws is not None, "shared sessions keep the socket"
         session.ws = FakeWS([{"type": "text", "messageId": "b", "content": "second"},
                              {"type": "agent_loop_done"}])

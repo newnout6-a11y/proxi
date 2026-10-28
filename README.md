@@ -15,7 +15,9 @@ Anthropic-клиентов (Codex, opencode, Aider, Continue, Claude Code, curl)
 - GET /v1/models — каталог моделей с capabilities и размером контекста.
 - GET /v1/balance, GET /v1/usage, GET /health (503, когда upstream недоступен).
 - Обязательный локальный ключ relay: Authorization: Bearer, x-api-key или ?key=.
-- Изоляция: отдельный Retool-тред и отдельный WebSocket на каждый запрос.
+- Изоляция: один Retool-тред и WebSocket на один диалог; OpenCode affinity
+  (`x-session-affinity`/`X-Session-Id`) разделяет диалоги, а tool-result ходы
+  остаются в том же треде.
 - Локальное выполнение команд (<exec_command>) с allowlist, чистым окружением
   и убийством дерева процессов по таймауту.
 - Инжект контекста проекта с redaction секретов.
@@ -33,7 +35,8 @@ Anthropic-клиентов (Codex, opencode, Aider, Continue, Claude Code, curl)
 и печатается в баннере маскированно.
 
 Секреты можно держать вне файла: RETOOL_COOKIE, RETOOL_XSRF, RETOOL_BASE,
-RETOOL_PAGE_UUID, RETOOL_THREAD_ID, RELAY_API_KEY. config.json и cookies.txt в .gitignore.
+RETOOL_PAGE_UUID, RETOOL_THREAD_ID, RELAY_API_KEY. Для OpenCode affinity приходит
+в `x-session-affinity`/`X-Session-Id`; config.json и cookies.txt в .gitignore.
 
 ## Использование
 
@@ -57,7 +60,7 @@ Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 и ANTHROPIC_AUTH_TOKEN=<r
 
 | ключ | смысл |
 | --- | --- |
-| session_mode | per_request (изоляция, по умолчанию) или shared (один тред) |
+| session_mode | per_conversation (по умолчанию), per_request (новый тред на каждый запрос) или shared (один тред) |
 | exec_policy | allowlist (по умолчанию), allow_all, off |
 | exec_allowlist | regex-список разрешённых первых слов команд (см. ниже) |
 | strict_models | true — неизвестная модель даёт 404 вместо тихой маршрутизации |
@@ -106,14 +109,17 @@ GPT-5.2 / 5.1 / 5 / mini / nano, GPT-4.1, Gemini 3.x, Retool Power/Mini.
 
 ## Ограничения (важно)
 
-- Модель отвечает одним текстовым потоком: tools/tool_choice клиента не транслируются
-  в нативные tool-calls, локальные команды приходят текстом.
+- Retool WebSocket не принимает поле `tools` нативно. Relay делает совместимый
+  bridge: схемы инструментов добавляются в prompt, `<tool_call>...</tool_call>`
+  преобразуется в OpenAI Chat `tool_calls` или Responses `function_call`, а
+  следующий `role=tool`/`function_call_output` ход возвращается в тот же тред.
+  Это полноценный клиентский tool protocol, но не нативный tool API Retool.
 - temperature, top_p, stop, n, seed, response_format, logprobs принимаются, но upstream
   их не применяет; список игнорируемых полей пишется в лог.
 - usage по токенам приблизительный (len/4, флаг estimated), достоверны только кредиты.
 - HITL-вопрос агента отдаётся как текст; отдельного API ответа на HITL нет.
 - Промпт собирается из всей истории запроса; авт-обрезки по контексту нет.
-- Retool не даёт удалять треды: в режиме per_request треды копятся.
+- Retool не даёт удалять треды: созданные диалоговые треды копятся.
 - Состав моделей статичен; доступность конкретной модели проверяет upstream.
 
 ## Что проверено вживую (Retool, свежая сессия)

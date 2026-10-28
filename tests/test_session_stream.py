@@ -48,10 +48,10 @@ def test_thinking_only_is_surfaced():
         {"type": "agent_loop_done", "outcome": "success"},
     ]
     events = collect(make(frames))
-    texts = [e["delta"] for e in events if e["type"] == "text"]
     final = [e for e in events if e["type"] == "final_text"][0]["text"]
-    assert final == "Проверю файл"
-    assert "".join(texts) == final
+    thinking = [e["delta"] for e in events if e["type"] == "thinking"]
+    assert final == ""
+    assert "".join(thinking) == "Проверю файл"
 
 
 def test_new_message_id_starts_new_block_without_duplication():
@@ -75,3 +75,14 @@ def test_text_wins_over_thinking():
     events = collect(make(frames))
     final = [e for e in events if e["type"] == "final_text"][0]["text"]
     assert final == "ответ"
+
+
+def test_tool_call_fragments_are_reassembled():
+    events = collect(make([
+        {"type": "tool_call", "toolCallId": "call_1", "toolName": "bash", "partialInputs": "{"},
+        {"type": "tool_call", "toolCallId": "call_1", "toolName": "bash",
+         "partialInputs": '"command":"dir"}'},
+        {"type": "agent_loop_done"},
+    ]))
+    calls = [e for e in events if e["type"] == "tool_call"]
+    assert calls[-1]["arguments"] == '{"command":"dir"}'

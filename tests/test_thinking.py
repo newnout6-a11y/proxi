@@ -69,3 +69,30 @@ def test_responses_emits_reasoning_events():
     adapter.begin()
     adapter.feed({"type": "thinking", "delta": "хм"})
     assert any(k == "response.reasoning_summary_text.delta" for k, _ in writer.events)
+
+
+def test_chat_tool_call_has_native_shape_and_finish_reason():
+    writer = Writer()
+    adapter = adapters.for_dialect("chat", parsed(), writer)
+    adapter.begin()
+    adapter.feed({"type": "tool_call", "id": "call_1", "name": "bash",
+                  "arguments": '{"command":"dir"}'})
+    final = adapter.end("tool_calls")
+    chunks = [p for kind, p in writer.events if kind == "data"]
+    assert chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "bash"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    call = final["choices"][0]["message"]["tool_calls"][0]
+    assert call["id"] == "call_1" and final["choices"][0]["message"]["content"] is None
+
+
+def test_responses_tool_call_emits_function_call_events():
+    writer = Writer()
+    adapter = adapters.for_dialect("responses", parsed("gpt-6-sol"), writer)
+    adapter.begin()
+    adapter.feed({"type": "tool_call", "id": "call_1", "name": "bash",
+                  "arguments": '{"command":"dir"}'})
+    final = adapter.end("tool_calls")
+    kinds = [kind for kind, _ in writer.events]
+    assert "response.output_item.added" in kinds
+    assert "response.function_call_arguments.delta" in kinds
+    assert final["output"][0]["type"] == "function_call"

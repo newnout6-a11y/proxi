@@ -1,5 +1,6 @@
 """Upstream Retool transport: thread creation, WebSocket turns, retries, cancellation."""
 import asyncio
+import datetime as _datetime
 import json
 import os
 import time
@@ -19,7 +20,46 @@ MAX_FRAME_DEFAULT = 16 * 1024 * 1024
 
 
 def _iso(ts: float) -> str:
-    return time.strftime(ISO_FMT, time.gmtime(ts))
+    return _datetime.datetime.fromtimestamp(ts, _datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _created_timestamp(value):
+    if not value:
+        return 0.0
+    try:
+        return _datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _tool_call_from_event(event):
+    """Normalise Retool WS/history tool-call shapes to relay events."""
+    content = event.get("content") if isinstance(event.get("content"), dict) else event
+    name = content.get("toolName") or content.get("name")
+    call_id = content.get("toolCallId") or content.get("call_id") or content.get("id")
+    arguments = content.get("toolInput", content.get("input", content.get("arguments")))
+    if arguments is None:
+        arguments = content.get("partialInputs")
+    if not name or not call_id or arguments is None:
+        return None
+    if isinstance(arguments, str):
+        encoded = arguments
+    else:
+        encoded = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    return {"id": str(call_id), "name": str(name), "arguments": encoded}
+
+
+def _merge_tool_call(call, buffers):
+    previous = buffers.get(call["id"])
+    current = call["arguments"]
+    if previous is None:
+        buffers[call["id"]] = current
+        return call
+    merged = current if current.startswith(previous) else previous + current
+    if merged == previous:
+        return None
+    buffers[call["id"]] = merged
+    return {**call, "arguments": merged}
 
 
 class StartResult:
@@ -128,15 +168,21 @@ class RelaySession:
         self._cancelled = False
         self._needs_drain = False
         self._drain_task = None
+        self._loop = None
         self.sandbox_id = None
 
     def cancel(self):
+        """May be called from a worker thread, so never assume a running loop."""
         self._cancelled = True
         self._needs_drain = True
         # Keep reading (and discarding) the aborted turn so its frames cannot
         # bleed into the next one; the next turn awaits this drain first.
-        if self.ws is not None and self._drain_task is None:
-            self._drain_task = asyncio.create_task(self._drain_until_done())
+        if self.ws is None or self._drain_task is not None:
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        self._drain_task = asyncio.run_coroutine_threadsafe(self._drain_until_done(), loop)
 
     async def _drain_until_done(self):
         deadline = time.time() + 45
@@ -202,15 +248,16 @@ class RelaySession:
                 pass
             self.ws = None
 
-    async def stream(self, prompt, model_provider):
+    async def stream(self, prompt, model_provider, tool_names=None):
         """Yield normalised events. Raises ApiError on failure."""
         # A session outlives one turn in shared mode: clear the flag and any
         # frames left over from a cancelled turn before starting a new one.
         if self._drain_task is not None:
             try:
-                await asyncio.shield(self._drain_task)
+                await asyncio.shield(asyncio.wrap_future(self._drain_task))
             except Exception:
                 pass
+        self._loop = asyncio.get_running_loop()
         self._cancelled = False
         if self.ws is not None and self._needs_drain:
             await self._drain()
@@ -237,9 +284,11 @@ class RelaySession:
         except Exception as exc:
             raise apierr.upstream_error(f"websocket send failed: {exc}")
 
-        deadline = time.time() + self.cfg["turn_timeout"]
+        turn_start = time.time()
+        deadline = turn_start + self.cfg["turn_timeout"]
         think_q = asyncio.Queue() if self.cfg.get("show_thinking") else None
-        poller = asyncio.ensure_future(self._poll_thinking(time.time(), think_q)) if think_q else None
+        poller = (asyncio.ensure_future(self._poll_thinking(turn_start, think_q, tool_names or ()))
+                  if think_q else None)
         last_text = ""
         full_text = ""
         block_id = None
@@ -248,16 +297,24 @@ class RelaySession:
         last_thinking = ""
         restart_hint = False
         reconnects = 0
+        tool_buffers = {}
         while True:
             while think_q is not None and not think_q.empty():
-                yield {"type": "thinking", "delta": think_q.get_nowait()}
+                pending = think_q.get_nowait()
+                if isinstance(pending, dict):
+                    yield pending
+                else:
+                    yield {"type": "thinking", "delta": pending}
             if self._cancelled:
-                if self.ws is not None and self._drain_task is None:
-                    self._drain_task = asyncio.create_task(self._drain_until_done())
+                self.cancel()
+                if poller is not None:
+                    poller.cancel()
                 yield {"type": "end", "reason": "cancelled"}
                 return
             remaining = deadline - time.time()
             if remaining <= 0:
+                if poller is not None:
+                    poller.cancel()
                 yield {"type": "end", "reason": "timeout"}
                 return
             try:
@@ -265,6 +322,8 @@ class RelaySession:
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
+                if poller is not None:
+                    poller.cancel()
                 raise
             except Exception as exc:
                 if reconnects >= 1:
@@ -274,6 +333,8 @@ class RelaySession:
                 try:
                     await self.open()
                 except Exception as inner:
+                    if poller is not None:
+                        poller.cancel()
                     raise apierr.upstream_error(f"websocket reconnect failed: {inner}")
                 continue
 
@@ -340,30 +401,38 @@ class RelaySession:
                     yield {"type": "credits", "value": float(value)}
             elif kind == "hitl":
                 yield {"type": "hitl", "question": _hitl_text(event)}
+            elif kind == "tool_call":
+                call = _tool_call_from_event(event)
+                if call is not None:
+                    merged = _merge_tool_call(call, tool_buffers)
+                    if merged is not None:
+                        yield {"type": "tool_call", **merged}
             elif kind == "agent_loop_done":
                 if poller is not None:
                     poller.cancel()
                     await asyncio.sleep(0)
                     while think_q is not None and not think_q.empty():
-                        yield {"type": "thinking", "delta": think_q.get_nowait()}
+                        pending = think_q.get_nowait()
+                        if isinstance(pending, dict):
+                            yield pending
+                        else:
+                            yield {"type": "thinking", "delta": pending}
                 for trail in await self._trailing():
                     yield trail
-                final = full_text
-                if not final.strip() and thinking_text.strip():
-                    # The model answered only in its thinking channel: surface it.
-                    final = thinking_text.strip()
-                    yield {"type": "text", "delta": final}
-                yield {"type": "final_text", "text": final}
+                yield {"type": "final_text", "text": full_text}
                 yield {"type": "end", "reason": "stop"}
                 return
             elif kind == "error":
+                if poller is not None:
+                    poller.cancel()
                 raise apierr.upstream_error(str(event)[:300])
             elif os.environ.get("DEBUG_EVENTS"):
                 print("dbg-unknown:", json.dumps(event, ensure_ascii=False)[:400], flush=True)
 
-    async def _poll_thinking(self, turn_start: float, queue_: "asyncio.Queue"):
-        """Thinking is persisted, not streamed: poll the thread and emit new text."""
+    async def _poll_thinking(self, turn_start: float, queue_: "asyncio.Queue", tool_names=()):
+        """Poll persisted thinking/tool messages without crossing turn boundaries."""
         sent = ""
+        tool_buffers = {}
         while True:
             try:
                 await asyncio.sleep(2.0)
@@ -374,11 +443,20 @@ class RelaySession:
                 continue
             parts = []
             for message in reversed(data.get("messages", [])):
-                content = message.get("content") or {}
-                if content.get("type") != "thinking":
+                created = message.get("createdAt")
+                # A message without a timestamp cannot be correlated safely
+                # to this turn, so never merge it into the current thinking.
+                if not created or _created_timestamp(created) < turn_start - 0.25:
                     continue
-                created = message.get("createdAt") or ""
-                if created and created < _iso(turn_start):
+                content = message.get("content") or {}
+                if content.get("type") == "tool_call":
+                    call = _tool_call_from_event(content)
+                    if call:
+                        merged = _merge_tool_call(call, tool_buffers)
+                        if merged is not None:
+                            queue_.put_nowait({"type": "tool_call", **merged})
+                    continue
+                if content.get("type") != "thinking":
                     continue
                 parts.append(content.get("thinking") or "")
             text = "\n".join(p for p in parts if p)
@@ -418,13 +496,20 @@ def _hitl_text(event) -> str:
 
 
 class SessionPool:
-    """Provides a RelaySession per request (isolated) or one shared session."""
+    """Provides sessions per request, per client conversation, or globally.
+
+    ``per_conversation`` is the mode used by OpenCode: its affinity header is
+    the key, so tool-result follow-ups reuse the same Retool thread while
+    unrelated chats stay isolated.
+    """
 
     def __init__(self, backend: Backend):
         self.backend = backend
         self.cfg = backend.cfg
         self._shared = None
         self._lock = asyncio.Lock()
+        self._conversations = {}
+        self._conversation_locks = {}
         self._slots = asyncio.BoundedSemaphore(max(1, self.cfg["max_workers"]))
         self._active = set()
         self._starts = 0
@@ -434,7 +519,7 @@ class SessionPool:
     def mode(self):
         return self.cfg["session_mode"]
 
-    async def acquire(self) -> RelaySession:
+    async def acquire(self, conversation_key=None) -> RelaySession:
         """Take a session slot. Caller must always release() it (once)."""
         await self._slots.acquire()
         if self.mode == "shared":
@@ -451,6 +536,24 @@ class SessionPool:
                     self._lock.release()
                 self._slots.release()
                 raise
+        if self.mode == "per_conversation":
+            key = conversation_key or "anonymous"
+            lock = self._conversation_locks.setdefault(key, asyncio.Lock())
+            locked = False
+            try:
+                await lock.acquire()
+                locked = True
+                session = self._conversations.get(key)
+                if session is None:
+                    session = RelaySession(self.backend, await self.backend.create_thread())
+                    self._conversations[key] = session
+                self._active.add((key, session))
+                return session
+            except BaseException:
+                if locked:
+                    lock.release()
+                self._slots.release()
+                raise
         try:
             thread_id = await self.backend.create_thread()
         except BaseException:
@@ -463,18 +566,37 @@ class SessionPool:
 
     async def release(self, session: RelaySession) -> None:
         """Release a session exactly once; extra releases are ignored."""
-        if self.mode != "shared" and session not in self._active:
+        key = None
+        if self.mode == "per_conversation":
+            for candidate, active in tuple(self._active):
+                if active is session:
+                    key = candidate
+                    self._active.discard((candidate, active))
+                    break
+            if key is None:
+                return
+        elif self.mode != "shared" and session not in self._active:
             return
-        self._active.discard(session)
+        if self.mode != "per_conversation":
+            self._active.discard(session)
         try:
             if self.mode != "shared":
-                await session.aclose()
+                if self.mode == "per_conversation":
+                    # Keep the WebSocket and Retool thread for the next
+                    # message in this conversation.
+                    pass
+                else:
+                    await session.aclose()
         finally:
             if self.mode == "shared":
                 try:
                     self._lock.release()
                 except RuntimeError:
                     pass
+            elif self.mode == "per_conversation":
+                lock = self._conversation_locks.get(key)
+                if lock is not None and lock.locked():
+                    lock.release()
             try:
                 self._slots.release()
             except ValueError:
