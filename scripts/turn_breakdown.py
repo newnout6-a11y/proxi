@@ -1,6 +1,6 @@
 """Split relay turns from journal.jsonl into context, thinking, tool arguments and text.
 
-Usage: python scripts/turn_breakdown.py [journal.jsonl|export.jsonl] [--last N]
+Usage: python scripts/turn_breakdown.py [journal.jsonl|export.jsonl] [--last N] [--since-restart]
 Needs the upstream.thinking_* / tool_start / text_start events (relay after 3b347e6).
 """
 import collections
@@ -69,7 +69,15 @@ def main():
     if "--last" in args:
         last = int(args[args.index("--last") + 1])
         del args[args.index("--last"):args.index("--last") + 2]
-    rows = turns(load(args[0] if args else "journal.jsonl"))
+    since_restart = "--since-restart" in args
+    if since_restart:
+        args.remove("--since-restart")
+    events = load(args[0] if args else "journal.jsonl")
+    if since_restart:
+        starts = [event["ts"] for event in events if event["kind"] == "relay.start"]
+        if starts:
+            events = [event for event in events if event["ts"] >= starts[-1]]
+    rows = turns(events)
     if last:
         rows = rows[-last:]
     if not rows:

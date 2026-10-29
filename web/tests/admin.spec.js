@@ -220,6 +220,20 @@ test('turn traces aggregate journal events into a timeline', async ({ page }) =>
   await expect(trace.locator('.timeline-dot')).toHaveCount(5);
 });
 
+test('turn traces show hidden thinking and tool argument time', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Ходы');
+  state.stream.push(
+    ev(20, 'turn.begin', 'Ход', 'info', { turn_id: 'turn-beta-2', data: { model: 'claude-opus-5-5', effort: 'high' } }),
+    ev(21, 'upstream.thinking_end', 'Мышление заняло 6400 мс', 'info', { turn_id: 'turn-beta-2', data: { thinking_ms: 6400 } }),
+    ev(22, 'tool.call', 'Инструмент клиента: Write', 'info', { turn_id: 'turn-beta-2', data: { name: 'Write', args_ms: 7100 } }),
+  );
+  const trace = page.locator('.trace', { hasText: 'effort high' }).first();
+  await expect(trace.locator('[title="Скрытое мышление"]')).toContainText('6,40 с', { timeout: 10000 });
+  await expect(trace.locator('[title="Генерация аргументов инструментов"]')).toContainText('7,10 с');
+});
+
 test('models can be searched and filtered by route', async ({ page }) => {
   await mockAdmin(page);
   await login(page);

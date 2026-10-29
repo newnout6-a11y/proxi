@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Route, Wrench, Terminal, Coins, Timer, Database, TriangleAlert } from 'lucide-react';
+import { Brain, Route, Wrench, Terminal, Coins, Timer, Database, TriangleAlert } from 'lucide-react';
 import { Page, Reveal, spring } from '../motion.jsx';
 import { Badge, Empty } from '../ui.jsx';
 import { LEVELS, TURN_STATUS, category } from '../catalog.js';
@@ -17,7 +17,7 @@ function buildTraces(events) {
     if (!trace) {
       trace = { id: event.turn_id, started: event.ts, ended: null, status: 'running', model: null, effort: null,
         transport: null, dialect: null, ttft: null, duration: null, credits: 0, cacheRead: 0, cacheWrite: 0,
-        tools: 0, commands: 0, errors: 0, events: [] };
+        tools: 0, commands: 0, errors: 0, thinking: 0, args: 0, events: [] };
       map.set(event.turn_id, trace);
     }
     const data = event.data || {};
@@ -30,7 +30,11 @@ function buildTraces(events) {
       trace.cacheRead += Number(data.cache_read) || 0;
       trace.cacheWrite += Number(data.cache_write) || 0;
     }
-    if (event.kind === 'tool.call') trace.tools += 1;
+    if (event.kind === 'upstream.thinking_end') trace.thinking += Number(data.thinking_ms) || 0;
+    if (event.kind === 'tool.call') {
+      trace.tools += 1;
+      trace.args += Number(data.args_ms) || 0;
+    }
     if (event.kind === 'exec.result') trace.commands += 1;
     if (event.level === 'error') trace.errors += 1;
   }
@@ -104,6 +108,8 @@ export default function Turns({ journal }) {
                   <span className="trace-metrics">
                     <span title="Время до первого токена"><Timer size={13} />{fmtMs(trace.ttft)}</span>
                     <span title="Длительность хода"><Route size={13} />{fmtMs(trace.duration)}</span>
+                    {trace.thinking > 0 && <span title="Скрытое мышление"><Brain size={13} />{fmtMs(trace.thinking)}</span>}
+                    {trace.args > 0 && <span title="Генерация аргументов инструментов"><Wrench size={13} />{fmtMs(trace.args)}</span>}
                     <span title="Кэш: прочитано"><Database size={13} />{fmtTokens(trace.cacheRead)}{hit !== null && <em>{Math.round(hit * 100)}%</em>}</span>
                     <span title="Кредиты"><Coins size={13} />{fmtNum(trace.credits, 4)}</span>
                     {trace.tools > 0 && <span title="Вызовы инструментов"><Wrench size={13} />{trace.tools}</span>}
