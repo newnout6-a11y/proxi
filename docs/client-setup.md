@@ -95,6 +95,14 @@ or explicit request fields `conversation`, `conversation_id`, and `session_id`.
 Parent agents and subagents must use different identities. A single static
 provider-wide header would mix their conversations and must not be used.
 
+Some in-process Claude Code subagents may share the runtime session ID:
+installed 2.1.310 does not include its internal agent ID in the normal metadata
+identity. Recognizing that metadata fixes the main conversation; it does not
+prove separate warm channels for every in-process child. Changed client
+histories still rotate their upstream context, and distinct supplied session
+IDs are isolated. Stateless direct inference would avoid this conversation-ID
+dependency; it is not enabled by the current agent transport fixes.
+
 Claude Code 2.1.310 supplies its current `session_id` inside the JSON string
 `metadata.user_id`. The relay recognizes that explicit session identity too;
 device/account IDs, opaque user IDs and `parent_session_id` are not substituted
