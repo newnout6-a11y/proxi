@@ -394,7 +394,11 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
             continue
         kind = event.get("event")
         if kind == "content_block_start":
-            if event.get("type") == "tool_call":
+            if event.get("type") == "thinking":
+                # Opus 5.5 streams no thinking text, only this early start and a final
+                # signature; surfacing the start replaces silence with "thinking".
+                yield {"type": "thinking_start"}
+            elif event.get("type") == "tool_call":
                 current = event.get("toolCallId") or "call_%d" % len(calls)
                 calls[current] = {"id": event.get("toolCallId"), "name": event.get("toolName"), "args": []}
                 stack.append(current)

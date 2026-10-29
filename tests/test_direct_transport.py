@@ -171,3 +171,67 @@ def test_stringly_typed_numbers_and_booleans_are_repaired():
 def test_coercion_keeps_unparsable_arguments_verbatim():
     assert direct.coerce_arguments("not json", {"a": {"type": "number"}}) == "not json"
     assert direct.coerce_arguments("", {}) == "{}"
+
+
+def test_drain_surfaces_silent_thinking_start():
+    import asyncio as _asyncio
+
+    class _S:
+        _cancelled = False
+
+    async def collect():
+        q = _asyncio.Queue()
+        for line in ('{"event":"content_block_start","type":"thinking"}',
+                     '{"event":"content_block_delta","type":"thinking","partialThinking":""}',
+                     '{"event":"content_block_delta","type":"signature","partialSignature":"sig"}',
+                     '{"event":"content_block_end"}',
+                     '{"event":"content_block_start","type":"text"}',
+                     '{"event":"content_block_delta","type":"text","partialText":"42"}'):
+            q.put_nowait(line)
+        q.put_nowait(None)
+        return [e async for e in direct._drain({}, _S(), q, [], [])]
+
+    kinds = [e["type"] for e in _asyncio.run(collect())]
+    assert kinds == ["thinking_start", "thinking_signature", "text"]
+
+
+def test_anthropic_adapter_opens_thinking_block_before_text():
+    import adapters
+
+    class W:
+        def __init__(self):
+            self.events = []
+
+        def event(self, name, payload):
+            self.events.append((name, payload))
+
+    parsed = type("P", (), {"show_thinking": True, "model": "claude-opus-5-5", "system": "", "prompt": "x",
+                            "tools": []})()
+    writer = W()
+    adapter = adapters.AnthropicAdapter(parsed, writer)
+    adapter.feed({"type": "thinking_start"})
+    adapter.feed({"type": "thinking_signature", "signature": "sig"})
+    adapter.feed({"type": "text", "delta": "42"})
+    starts = [p["content_block"]["type"] for n, p in writer.events if n == "content_block_start"]
+    assert starts == ["thinking", "text"]
+    sig = [p for n, p in writer.events if n == "content_block_delta" and p["delta"]["type"] == "signature_delta"]
+    assert sig and sig[0]["index"] == 0
+    assert writer.events[0][0] == "content_block_start"
+
+
+def test_thinking_start_is_hidden_when_thinking_disabled():
+    import adapters
+
+    class W:
+        def __init__(self):
+            self.events = []
+
+        def event(self, name, payload):
+            self.events.append((name, payload))
+
+    parsed = type("P", (), {"show_thinking": False, "model": "m", "system": "", "prompt": "x", "tools": []})()
+    writer = W()
+    adapter = adapters.AnthropicAdapter(parsed, writer)
+    adapter.feed({"type": "thinking_start"})
+    adapter.feed({"type": "text", "delta": "ok"})
+    assert [p["content_block"]["type"] for n, p in writer.events if n == "content_block_start"] == ["text"]

@@ -41,6 +41,9 @@ class _Base:
             self._think(event["delta"])
             if event.get("signature"):
                 self._signature(event["signature"])
+        elif kind == "thinking_start":
+            if self.parsed.show_thinking:
+                self._think_start()
         elif kind == "thinking_signature":
             if self.parsed.show_thinking:
                 self._signature(event.get("signature", ""))
@@ -74,6 +77,9 @@ class _Base:
         raise NotImplementedError
 
     def _think(self, delta):
+        pass
+
+    def _think_start(self):
         pass
 
     def _signature(self, signature):
@@ -378,6 +384,11 @@ class AnthropicAdapter(_Base):
         self._emit("content_block_start", {"type": "content_block_start", "index": self.index,
                                            "content_block": dict(block)})
         return block
+
+    def _think_start(self):
+        # An open thinking block lets the client show "thinking" while the
+        # provider reasons silently; the later signature attaches to it.
+        self._open("thinking")
 
     def _think(self, delta):
         block = self._open("thinking")

@@ -470,6 +470,7 @@ class TurnRunner:
                         "debug", transport="direct" if direct_mode else "agent",
                         prompt_chars=len(stream_prompt or ""), attempt=empty_retries + tool_retries + exec_steps + 1)
                     first_token = False
+                    think_started = None
                     try:
                         async for event in stream:
                             if not first_token and event["type"] in ("text", "thinking", "tool_call"):
@@ -493,7 +494,18 @@ class TurnRunner:
                             elif event["type"] == "final_text":
                                 if event.get("text"):
                                     final_text = event["text"]
+                            elif event["type"] == "thinking_start":
+                                think_started = time.time()
+                                ms = round((think_started - holder["upstream_started_at"]) * 1000)
+                                log("upstream.thinking_start", "Модель начала думать через %d мс" % ms, "info",
+                                    ms=ms)
+                                out.put(event)
                             elif event["type"] in ("thinking", "thinking_signature"):
+                                if event["type"] == "thinking_signature" and think_started:
+                                    span = round((time.time() - think_started) * 1000)
+                                    log("upstream.thinking_end", "Мышление заняло %d мс" % span, "info",
+                                        thinking_ms=span)
+                                    think_started = None
                                 out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 streamed_tool_call = True
