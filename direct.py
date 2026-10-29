@@ -7,11 +7,13 @@ context is billed once and reused, keeping time-to-first-token flat.
 import asyncio, hashlib, json, time, urllib.error, urllib.request
 
 import apierr
+import journal
+import models as model_catalog
 
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
-_ASSIST_ONLY = set()  # models proven to live only on the Assist list
-_CACHE_MIN_CHARS = 3000
+_ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
+_CACHE_MIN_CHARS = 0
 
 
 def loop_now():
@@ -69,17 +71,23 @@ def _param_schema(schema, required):
 
 
 def tools_to_retool(tools):
-    """Translate client function tools to the Retool tool declaration shape."""
+    """Translate client function tools to the Retool tool declaration shape with canonical ordering."""
     converted = []
-    for tool in tools or []:
+    sorted_tools = sorted(
+        tools or [],
+        key=lambda item: (item.get("function", {}).get("name") if isinstance(item, dict) and isinstance(item.get("function"), dict)
+                          else (item.get("name") if isinstance(item, dict) else "")) or ""
+    )
+    for tool in sorted_tools:
         function = tool.get("function") if isinstance(tool, dict) else None
         if not isinstance(function, dict) or not function.get("name"):
             continue
         params = {}
         schema = function.get("parameters") or {}
-        required = schema.get("required") or []
-        for name, sub in (schema.get("properties") or {}).items():
-            params[name] = _param_schema(sub, name in required)
+        required = set(schema.get("required") or [])
+        properties = schema.get("properties") or {}
+        for name in sorted(properties.keys()):
+            params[name] = _param_schema(properties[name], name in required)
         converted.append({"name": function["name"],
                           "description": (function.get("description") or "")[:1000],
                           "params": params, "strict": True})
@@ -132,16 +140,28 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         if cache:
             block["cache"] = True
         messages.append({"role": "system", "content": [block]})
-    history = [str(part) for part in (chunks or []) if part]
+    history = [part for part in (chunks or []) if part]
     if not history:
         if prompt:
             messages.append({"role": "user", "content": prompt})
     else:
         for index, part in enumerate(history):
-            block = {"type": "text", "text": part}
-            if cfg.get("direct_cache", True) and index == len(history) - 1:
-                block["cache"] = True
-            messages.append({"role": "user", "content": [block]})
+            if isinstance(part, list):
+                blocks = [dict(b) if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in part]
+                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                    target = next((b for b in reversed(blocks) if b.get("type") == "text"), blocks[-1])
+                    target["cache"] = True
+                messages.append({"role": "user", "content": blocks})
+            elif isinstance(part, dict):
+                block = dict(part)
+                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                    block["cache"] = True
+                messages.append({"role": "user", "content": [block]})
+            else:
+                block = {"type": "text", "text": str(part)}
+                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                    block["cache"] = True
+                messages.append({"role": "user", "content": [block]})
     body = {"model": model_provider.get("model"),
             "messages": messages,
             "rit": make_rit(messages, tools),
@@ -159,7 +179,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             (tool_choice or {}).get("function", {}).get("name") if isinstance(tool_choice, dict) else None)
         if choice and choice != "auto":
             body["toolChoice"] = choice
-    if cache:
+    if cache and head:
         body["openAICacheKey"] = cache_key_for(head)
     return body
 
@@ -183,7 +203,13 @@ def _ping(session, body):
     """Cheap request that re-reads the cached prefix so its TTL does not lapse."""
     payload = dict(body)
     payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
-    payload["reasoningEffort"] = "low"
+    model_name = payload.get("model")
+    entry = model_catalog._BY_ID.get(model_name)
+    levels = entry.get("reasoning_effort_levels") or () if entry else ()
+    if levels:
+        payload["reasoningEffort"] = "low" if "low" in levels else levels[0]
+    else:
+        payload["reasoningEffort"] = "low"
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                      data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
                                      headers=session.backend.headers(), method="POST")
@@ -202,17 +228,22 @@ async def _keepwarm(session, cfg):
         return
     idle = float(cfg.get("cache_keepwarm_idle", 1800) or 1800)
     while True:
-        await asyncio.sleep(interval)
-        body = getattr(session, "_warm_body", None)
-        if not body or getattr(session, "_busy", False):
-            continue
-        if time.time() - getattr(session, "_warm_at", 0) > idle:
-            return
         try:
+            await asyncio.sleep(interval)
+            last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
+            if time.time() - last_req > idle:
+                return
+            body = getattr(session, "_warm_body", None)
+            if not body or getattr(session, "_busy", False):
+                continue
             await asyncio.to_thread(_ping, session, body)
             session._warm_at = time.time()
+            journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
+                         thread=journal.tag(getattr(session, "thread_id", None)))
             if cfg.get("direct_debug"):
                 print("[warm] prefix refreshed", flush=True)
+        except asyncio.CancelledError:
+            return
         except Exception:
             return
 
@@ -239,6 +270,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 _ASSIST_ONLY.clear()
             _ASSIST_ONLY.add(model_provider.get("model"))
             print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
+            journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
+                         model=model_provider.get("model"))
             body = {key: value for key, value in body.items() if key != "metadata"}
             async for event in _stream_body(cfg, session, body, param_types):
                 yield event
@@ -247,6 +280,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         if body.get("openAICacheKey"):
             session._warm_body = body
             session._warm_at = time.time()
+            session._last_request_at = time.time()
             task = getattr(session, "_warm_task", None)
             if task is None or task.done():
                 session._warm_task = asyncio.create_task(_keepwarm(session, cfg))
@@ -398,7 +432,11 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
                     usage.get("inputTokens"), usage.get("promptTokensReadFromCache"),
                     usage.get("promptTokensWrittenToCache"), usage.get("creditsUsed")), flush=True)
             if usage.get("creditsUsed") is not None:
-                yield {"type": "credits", "value": float(usage["creditsUsed"])}
+                yield {"type": "credits", "value": float(usage["creditsUsed"]),
+                       "usage": {"input_tokens": usage.get("inputTokens"),
+                                 "output_tokens": usage.get("outputTokens"),
+                                 "cache_read": usage.get("promptTokensReadFromCache"),
+                                 "cache_write": usage.get("promptTokensWrittenToCache")}}
         elif kind == "error":
             raise _error_from_event(event)
 

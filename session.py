@@ -14,6 +14,7 @@ import direct
 import websockets
 
 import apierr
+import journal
 from auth import upstream_headers
 
 ISO_FMT = "%Y-%m-%dT%H:%M:%S"
@@ -275,15 +276,43 @@ class RelaySession:
         self._loop = None
         self.sandbox_id = None
         self._direct = None
+        self._registered_tools = {}
+        self._cached_head = None
+        self._warm_body = None
+        self._warm_at = 0
+        self._warm_task = None
+        self._last_request_at = time.time()
 
     def set_direct(self, head, tools, tool_choice, max_tokens, chunks=None):
         """Direct transport: cacheable head, chunked history and native client tools."""
+        if head:
+            self._cached_head = head
+        if tools:
+            for t in tools:
+                if isinstance(t, dict) and t.get("name"):
+                    self._registered_tools[t["name"]] = t
         self._direct = {"head": head or "", "tools": tools, "tool_choice": tool_choice,
                         "max_tokens": max_tokens, "chunks": chunks}
+
+    def register_tools(self, tools):
+        """Register tools into the session's canonical tool schema."""
+        if not tools:
+            return
+        for t in tools:
+            if isinstance(t, dict) and t.get("name"):
+                self._registered_tools[t["name"]] = t
+
+    def get_canonical_tools(self):
+        """Return the normalized canonical tools registered in this session."""
+        return [self._registered_tools[name] for name in sorted(self._registered_tools)]
+
+    def has_tools(self):
+        return bool(self._registered_tools)
 
     def begin_request(self):
         """Reset cancellation only when the pool grants a new request lease."""
         self._cancelled = False
+        self._last_request_at = time.time()
 
     def cancel(self):
         """Thread-safe cancellation: close the old socket to isolate its frames."""
@@ -338,6 +367,9 @@ class RelaySession:
         await _answer_control(self.ws, raw)
 
     async def aclose(self):
+        task, self._warm_task = getattr(self, "_warm_task", None), None
+        if task is not None and not task.done():
+            task.cancel()
         ws, self.ws = self.ws, None
         reader, self._reader = self._reader, None
         if reader is not None:
@@ -783,6 +815,8 @@ class SessionPool:
             self._last_used.pop(key, None)
             if session is not None:
                 closing.append(session)
+            journal.emit("session.evict", "Диалог вытеснен (%s)" % ("простой" if expired else "нет места"),
+                         "debug", conversation=journal.tag(key), reason="idle" if expired else "capacity")
         for session in closing:
             await session.aclose()
 
@@ -823,11 +857,29 @@ class SessionPool:
                 if session is None:
                     session = RelaySession(self.backend, await self._new_thread_id())
                     self._conversations[key] = session
+                    journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
+                                 conversation=journal.tag(key), thread=journal.tag(session.thread_id),
+                                 pool=len(self._conversations))
                 keep = True
             else:
                 # No explicit affinity means a fresh thread, never a shared
                 # content-derived "anonymous" conversation.
                 session = RelaySession(self.backend, await self._new_thread_id())
+                if conversation_key and conversation_key in self._conversations:
+                    parent = self._conversations[conversation_key]
+                    if getattr(parent, "_cached_head", None):
+                        session._cached_head = parent._cached_head
+                    if getattr(parent, "_registered_tools", None):
+                        session._registered_tools = dict(parent._registered_tools)
+                    if getattr(parent, "_direct", None):
+                        session._direct = dict(parent._direct)
+                elif self._shared is not None:
+                    if getattr(self._shared, "_cached_head", None):
+                        session._cached_head = self._shared._cached_head
+                    if getattr(self._shared, "_registered_tools", None):
+                        session._registered_tools = dict(self._shared._registered_tools)
+                    if getattr(self._shared, "_direct", None):
+                        session._direct = dict(self._shared._direct)
             session.begin_request()
             lease = SessionLease(session)
             self._active[lease] = (session, key, lock, keep)

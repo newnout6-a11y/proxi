@@ -7,6 +7,7 @@ import urllib.request
 
 from auth import merge_set_cookie, upstream_headers
 from config import persist_auth, reload_auth
+import journal
 from redact import redact
 
 MIN_INTERVAL = 20.0
@@ -63,13 +64,19 @@ class Refresher:
                 self.last_error = f"session renewal failed: HTTP {exc.code}"
                 self._last_result = False
                 exc.close()
+                journal.emit("auth.refresh", "Продление сессии Retool не удалось: HTTP %s" % exc.code, "error",
+                             ok=False, status=exc.code, forced=force)
                 return False
             except Exception as exc:
                 self.last_error = redact(str(exc), cookie_values=self.cfg.get("cookie_values", []))
                 self._last_result = False
+                journal.emit("auth.refresh", "Продление сессии Retool не удалось", "error",
+                             ok=False, error=self.last_error, forced=force)
                 return False
             merge_set_cookie(self.cfg, headers)
             self._persist()
+            journal.emit("auth.refresh", "Сессия Retool продлена", "success", ok=True, forced=force,
+                         rotated=bool(headers), persistence_error=self.persistence_error)
             self.last_error = None
             self.last_success_at = time.time()
             self._last_result = True

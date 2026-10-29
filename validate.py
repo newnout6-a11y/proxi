@@ -86,16 +86,61 @@ def _opt_float(data, key):
     return float(value)
 
 
-def _blocks_to_text(content, index, role):
-    """Render content blocks without silently dropping information."""
+def _extract_image_data(block, where):
+    """Extract Retool-compatible image dict {'type': 'image', 'imageData': str, 'mimeType': str}."""
+    btype = block.get("type")
+    mime_type = "image/png"
+    data_b64 = None
+    if btype == "image":
+        source = block.get("source")
+        if isinstance(source, dict):
+            mime_type = source.get("media_type") or "image/png"
+            data_b64 = source.get("data")
+        elif "imageData" in block:
+            mime_type = block.get("mimeType") or "image/png"
+            data_b64 = block.get("imageData")
+    elif btype in ("image_url", "input_image"):
+        iu = block.get("image_url")
+        url = iu.get("url") if isinstance(iu, dict) else (iu if isinstance(iu, str) else block.get("url"))
+        if isinstance(url, str):
+            if url.startswith("data:"):
+                hdr, sep, rest = url.partition(",")
+                if sep and ";base64" in hdr:
+                    mime = hdr[5:].split(";")[0].strip()
+                    if mime:
+                        mime_type = mime
+                    data_b64 = rest.strip()
+            elif url.startswith("http://") or url.startswith("https://"):
+                import urllib.request, base64
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        ct = r.headers.get("content-type", "").split(";")[0].strip()
+                        if ct:
+                            mime_type = ct
+                        data_b64 = base64.b64encode(r.read()).decode("ascii")
+                except Exception as exc:
+                    raise unprocessable(f"failed to fetch image attachments from {url}: {exc}", param=where)
+    elif "imageData" in block:
+        mime_type = block.get("mimeType") or "image/png"
+        data_b64 = block.get("imageData")
+
+    if not data_b64:
+        raise unprocessable(f"{where}: missing image attachments data", param=where)
+    return {"type": "image", "imageData": data_b64, "mimeType": mime_type}
+
+
+def _parse_content(content, index, role):
+    """Render content blocks to text and extract any native image blocks."""
     if content is None:
-        return ""
+        return "", []
     if isinstance(content, str):
-        return content
+        return content, []
     if not isinstance(content, list):
         raise unprocessable(f"messages[{index}].content must be a string or an array of blocks",
                             param=f"messages[{index}].content")
     chunks = []
+    images = []
     for pos, block in enumerate(content):
         where = f"messages[{index}].content[{pos}]"
         if isinstance(block, str):
@@ -111,22 +156,30 @@ def _blocks_to_text(content, index, role):
             if not isinstance(text, str):
                 raise unprocessable(f"{where}.text must be a string", param=where + ".text")
             chunks.append(text)
-        elif btype in ("image", "image_url", "input_image"):
-            raise unprocessable("image attachments are not supported by this relay", param=where)
+        elif btype in ("image", "image_url", "input_image") or "imageData" in block:
+            img = _extract_image_data(block, where)
+            images.append(img)
+        elif btype == "tool_result":
+            call_id = block.get("tool_use_id") or block.get("tool_call_id") or "call"
+            sub_text, sub_images = _parse_content(block.get("content"), index, "tool")
+            chunks.append(f"[tool_result id={call_id}: {sub_text}]")
+            images.extend(sub_images)
         elif btype in ("tool_use", "tool_call"):
             name = block.get("name") or "tool"
             args = block.get("input", block.get("arguments", {}))
             call_id = block.get("id") or block.get("tool_call_id") or "call"
             chunks.append(f"[tool_call {name} id={call_id}: {json.dumps(args, ensure_ascii=False)}]")
-        elif btype in ("tool_result",):
-            call_id = block.get("tool_use_id") or block.get("tool_call_id") or "call"
-            result = _blocks_to_text(block.get("content"), index, "tool")
-            chunks.append(f"[tool_result id={call_id}: {result}]")
         elif btype in ("thinking", "redacted_thinking"):
             continue
         else:
             chunks.append(f"[{btype or 'block'}: {json.dumps(block, ensure_ascii=False)[:200]}]")
-    return "\n".join(c for c in chunks if c)
+    return "\n".join(c for c in chunks if c), images
+
+
+def _blocks_to_text(content, index, role):
+    """Render content blocks without silently dropping information."""
+    text, _ = _parse_content(content, index, role)
+    return text
 
 
 def _render_chunks(messages, role_key="role", *, allow_system=True):
@@ -144,18 +197,26 @@ def _render_chunks(messages, role_key="role", *, allow_system=True):
             role = "assistant"
         if not isinstance(role, str):
             raise unprocessable(f"messages[{index}].{role_key} must be a string", param=f"messages[{index}].{role_key}")
-        text = _blocks_to_text(message.get("content"), index, role)
+        text, images = _parse_content(message.get("content"), index, role)
         if role in ("system", "developer") and allow_system:
             system_parts.append(text)
             continue
         if role in ("tool", "function"):
             name = message.get("name") or message.get("tool_call_id") or "tool"
             call_id = message.get("tool_call_id") or message.get("call_id") or name
-            convo.append(f"[tool result {name} id={call_id}]: {text}")
+            convo_text = f"[tool result {name} id={call_id}]: {text}".strip()
+            if images:
+                blocks = []
+                if text:
+                    blocks.append({"type": "text", "text": convo_text})
+                blocks.extend(images)
+                convo.append(blocks)
+            else:
+                convo.append(convo_text)
             continue
         if role == "assistant":
             calls = message.get("tool_calls") or []
-            if isinstance(calls, list):
+            if isinstance(calls, list) and calls:
                 for call in calls:
                     if not isinstance(call, dict):
                         continue
@@ -163,19 +224,58 @@ def _render_chunks(messages, role_key="role", *, allow_system=True):
                     name = fn.get("name") or call.get("name") or "tool"
                     args = fn.get("arguments") or call.get("arguments") or ""
                     call_id = call.get("id") or call.get("tool_call_id") or "call"
-                    convo.append(f"Assistant: {text}\n[tool_call {name} id={call_id}: {str(args)}]".strip())
+                    asst_text = f"Assistant: {text}\n[tool_call {name} id={call_id}: {str(args)}]".strip()
+                    if images:
+                        blocks = []
+                        if asst_text:
+                            blocks.append({"type": "text", "text": asst_text})
+                        blocks.extend(images)
+                        convo.append(blocks)
+                        images = []
+                    else:
+                        convo.append(asst_text)
                     text = ""
             if text:
-                convo.append(f"Assistant: {text}")
+                asst_text = f"Assistant: {text}".strip()
+                if images:
+                    convo.append([{"type": "text", "text": asst_text}] + images)
+                else:
+                    convo.append(asst_text)
+            elif images:
+                convo.append(images)
             continue
-        convo.append(f"{role.capitalize()}: {text}")
+        user_text = f"{role.capitalize()}: {text}".strip()
+        if images:
+            blocks = []
+            if text:
+                blocks.append({"type": "text", "text": user_text})
+            blocks.extend(images)
+            convo.append(blocks)
+        else:
+            convo.append(user_text)
     return "\n\n".join(system_parts), convo
 
 
 def _render_messages(messages, role_key="role", *, allow_system=True):
     """Return (system_text, prompt_text)."""
     system, convo = _render_chunks(messages, role_key, allow_system=allow_system)
-    return system, "\n\n".join(convo)
+    text_chunks = []
+    for c in convo:
+        if isinstance(c, str):
+            text_chunks.append(c)
+        elif isinstance(c, list):
+            parts = []
+            for b in c:
+                if isinstance(b, dict):
+                    if b.get("type") == "text":
+                        parts.append(b.get("text", ""))
+                    elif b.get("type") == "image":
+                        img_hash = hashlib.sha256((b.get("imageData") or "").encode("ascii", errors="ignore")).hexdigest()[:16]
+                        parts.append(f"[image:{b.get('mimeType', 'unknown')}:{img_hash}]")
+            text_chunks.append("\n".join(parts))
+        else:
+            text_chunks.append(str(c))
+    return system, "\n\n".join(text_chunks)
 
 
 def _message_fingerprints(messages):
@@ -336,11 +436,13 @@ def _tool_choice(value):
     raise unprocessable("'tool_choice' must be a string or function object", param="tool_choice")
 
 
-def conversation_key(data, header_value=None):
+def conversation_key(data, header_value=None, allow_content_fallback=False):
     """Return a stable affinity key for one client dialogue.
 
-    Without an explicit client identity, full request history is sufficient
-    and a fresh upstream thread prevents unrelated clients sharing history.
+    Checks explicit client headers, data fields, metadata session identifiers.
+    If allow_content_fallback is True (used by the HTTP proxy for unidentified clients),
+    provides a deterministic content-hash fallback for standard OpenAI/Anthropic
+    clients (e.g. OpenCode) across turns.
     """
     if isinstance(header_value, str) and header_value.strip():
         return "header:" + header_value.strip()
@@ -349,15 +451,30 @@ def conversation_key(data, header_value=None):
         if isinstance(value, str) and value.strip():
             return key + ":" + value.strip()
     metadata = data.get("metadata")
-    user_id = metadata.get("user_id") if isinstance(metadata, dict) else None
-    if isinstance(user_id, str):
-        try:
-            identity = json.loads(user_id)
-        except (ValueError, RecursionError):
-            identity = None
-        session_id = identity.get("session_id") if isinstance(identity, dict) else None
-        if isinstance(session_id, str) and session_id.strip():
-            return "claude-metadata:" + session_id.strip()
+    if isinstance(metadata, dict):
+        user_id = metadata.get("user_id")
+        if isinstance(user_id, str):
+            try:
+                identity = json.loads(user_id)
+            except (ValueError, RecursionError):
+                identity = None
+            session_id = identity.get("session_id") if isinstance(identity, dict) else None
+            if isinstance(session_id, str) and session_id.strip():
+                return "claude-metadata:" + session_id.strip()
+    if allow_content_fallback:
+        messages = data.get("messages")
+        if isinstance(messages, list) and messages:
+            root_msg = None
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    root_msg = msg
+                    break
+            if root_msg is None and isinstance(messages[0], dict):
+                root_msg = messages[0]
+            if root_msg is not None:
+                raw = json.dumps(root_msg, sort_keys=True, ensure_ascii=False)
+                h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+                return f"content:{h}"
     return None
 
 
@@ -368,7 +485,8 @@ def parse_chat(data, cfg):
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     messages = _messages(data)
     system, chunks = _render_chunks(messages)
-    parsed.system, parsed.prompt, parsed.message_chunks = system, "\n\n".join(chunks), chunks
+    text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
+    parsed.system, parsed.prompt, parsed.message_chunks = system, "\n\n".join(text_chunks), chunks
     parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
@@ -396,7 +514,8 @@ def parse_responses(data, cfg):
     system, chunks = _render_chunks(messages)
     instructions = _opt_str(data, "instructions") or ""
     parsed.system = "\n\n".join(x for x in (instructions, system) if x)
-    parsed.prompt, parsed.message_chunks = "\n\n".join(chunks), chunks
+    text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
+    parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
@@ -413,7 +532,8 @@ def parse_anthropic(data, cfg):
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     messages = _messages(data)
     system, chunks = _render_chunks(messages, allow_system=False)
-    parsed.prompt, parsed.message_chunks = "\n\n".join(chunks), chunks
+    text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
+    parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     declared_system = data.get("system")
     if declared_system:
         parsed.system = _blocks_to_text(declared_system, 0, "system")

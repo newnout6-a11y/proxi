@@ -213,8 +213,11 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
     except ApiError as error:
         entry, _ = resolve(model, None, strict=strict, default_model=default_model)
         levels = entry.get("reasoning_effort_levels") or []
-        if error.status != 400 or not levels or not entry.get("reasoning", True):
+        if error.status != 400:
             raise
+        if not levels or not entry.get("reasoning", True):
+            print("[effort] %s -> None (reasoning not supported) for %s" % (effort, entry["id"]), flush=True)
+            return entry, None
         clamped = nearest_effort(levels, effort)
         print("[effort] %s -> %s for %s" % (effort, clamped, entry["id"]), flush=True)
         return entry, clamped

@@ -13,6 +13,7 @@ import uuid
 
 import apierr
 import executor
+import journal
 import models as model_catalog
 from context import build_system_instructions
 from redact import redact
@@ -30,6 +31,14 @@ _NATIVE_CONTINUE = ("\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
 def _b(text: str) -> int:
     """Limit in bytes, not characters (Cyrillic is 2 bytes each in UTF-8)."""
     return len((text or "").encode("utf-8"))
+
+
+def _preview(value, limit=600):
+    """Compact, bounded rendering of tool arguments for the journal."""
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _trim(text: str, budget: int) -> str:
@@ -288,6 +297,14 @@ class TurnRunner:
         empty_retries = 0
         final_summary = False
         tool_retries = 0
+        turn_started = time.time()
+        outcome = {"reason": None, "error": None, "first": False}
+        trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None),
+                 "conversation": journal.tag(getattr(parsed, "conversation_key", None))}
+
+        def log(kind, message, level="info", **fields):
+            journal.emit(kind, message, level, **trace, **fields)
+
         try:
             native_tools = getattr(parsed, "tools", None) or []
             tool_definitions = {item["function"]["name"]: item["function"] for item in native_tools}
@@ -295,14 +312,17 @@ class TurnRunner:
             tool_names = list(tool_definitions) if choice != "none" else []
             if isinstance(choice, dict):
                 tool_names = [choice["function"]["name"]]
+            direct_mode = self.cfg.get("transport") == "direct"
+            conv_key = getattr(parsed, "conversation_key", None)
+            is_native = bool(native_tools) or bool(conv_key) or bool(parsed.system)
             instructions = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._instructions(native_tools=bool(native_tools)))
+                None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
                 raise asyncio.CancelledError()
             reminder = ""
             if native_tools and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif not native_tools and self.cfg["exec_policy"] != "off":
+            elif not native_tools and self.cfg["exec_policy"] != "off" and not is_native:
                 reminder = (
                     "\n\n[LOCAL EXEC REMINDER]\n"
                     "To run anything on the user's machine you MUST output "
@@ -311,7 +331,6 @@ class TurnRunner:
                 )
             if parsed.system:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
-            direct_mode = self.cfg.get("transport") == "direct"
             if direct_mode and native_tools:
                 reminder = self._tool_prompt_native(parsed)
             if direct_mode:
@@ -346,9 +365,18 @@ class TurnRunner:
                         configured = parsed.entry.get("default_reasoning_effort") or (
                             "medium" if not levels or "medium" in levels else levels[0])
                 if configured is not None:
-                    _, effort = model_catalog.resolve(parsed.model, configured)
+                    _, effort = model_catalog.resolve_tolerant(
+                        parsed.model, configured, strict=self.cfg.get("strict_models", True),
+                        default_model=self.cfg.get("model"))
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
+            log("turn.begin", "Ход %s · effort %s · %s" % (parsed.model, effort or "—",
+                                                          "direct" if direct_mode else "agent"),
+                model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
+                dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
+                tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
+                prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
+                messages=len(getattr(parsed, "message_chunks", None) or []))
 
             base_prompt = self._check_prompt(prompt)
             session = None
@@ -361,6 +389,11 @@ class TurnRunner:
                 else:
                     session = await self.pool.acquire(key) if key else await self.pool.acquire()
                 holder["session"] = session
+                acquired = session.session if isinstance(session, SessionLease) else session
+                log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
+                    "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
+                    isolated=bool(key and not native_tools), mode=self.cfg.get("session_mode"),
+                    wait_ms=round((time.time() - turn_started) * 1000))
                 native_target, native_context = None, None
                 if native_tools:
                     prompt, native_target, native_context = await self._native_prompt(
@@ -403,15 +436,47 @@ class TurnRunner:
                         chunks = list(getattr(parsed, "message_chunks", None) or [])
                         if chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
+
+                        tools_converted = direct.tools_to_retool(parsed.tools) if native_tools else []
+                        if tools_converted and hasattr(direct_target, "register_tools"):
+                            direct_target.register_tools(tools_converted)
+
+                        if native_tools:
+                            final_tools = direct_target.get_canonical_tools() if (
+                                hasattr(direct_target, "has_tools") and direct_target.has_tools()) else tools_converted
+                            final_choice = getattr(parsed, "tool_choice", "auto")
+                            final_head = instructions
+                        else:
+                            # Tool-less requests (such as title generation, /compact, /goal Stop hook)
+                            # Align head with the cached prefix so it does not invalidate openAICacheKey
+                            cached_head = getattr(direct_target, "_cached_head", None)
+                            final_head = cached_head if cached_head else instructions
+                            if hasattr(direct_target, "has_tools") and direct_target.has_tools():
+                                final_tools = direct_target.get_canonical_tools()
+                                final_choice = "none"
+                            else:
+                                final_tools = None
+                                final_choice = "none"
+
                         direct_target.set_direct(
-                            instructions,
-                            direct.tools_to_retool(parsed.tools) if tool_names else None,
-                            getattr(parsed, "tool_choice", "auto"), getattr(parsed, "max_tokens", None),
+                            final_head,
+                            final_tools,
+                            final_choice,
+                            getattr(parsed, "max_tokens", None),
                             chunks)
                     stream = (session.stream(stream_prompt, model_provider, tool_names=tool_names)
                               if native_tools else session.stream(stream_prompt, model_provider))
+                    log("upstream.request", "Запрос к upstream (%s)" % ("direct" if direct_mode else "agent"),
+                        "debug", transport="direct" if direct_mode else "agent",
+                        prompt_chars=len(stream_prompt or ""), attempt=empty_retries + tool_retries + exec_steps + 1)
+                    first_token = False
                     try:
                         async for event in stream:
+                            if not first_token and event["type"] in ("text", "thinking", "tool_call"):
+                                first_token = True
+                                ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                log("upstream.first_token", "Первый токен через %d мс" % ttft,
+                                    "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
                             if event["type"] == "text":
                                 final_text += event["delta"]
                                 upstream_text += event["delta"]
@@ -433,10 +498,17 @@ class TurnRunner:
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 streamed_tool_call = True
                                 definition = tool_definitions[event["name"]]
+                                log("tool.call", "Инструмент клиента: %s" % event["name"], "info",
+                                    name=event["name"], call_id=event.get("id"),
+                                    arguments=_preview(event.get("arguments")), streamed=True)
                                 out.put({**event, "tool_type": definition.get("x-client-type", "function")})
                             elif event["type"] == "credits":
                                 self.credits.record_turn(turn_id, event["value"])
-                                out.put(event)
+                                usage = event.get("usage") or {}
+                                log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s" % (
+                                    event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—")),
+                                    "info", credits=event["value"], **usage)
+                                out.put({key: value for key, value in event.items() if key != "usage"})
                             elif event["type"] == "hitl":
                                 out.put(event)
                                 final_text += "\n" + event["question"]
@@ -448,6 +520,8 @@ class TurnRunner:
                                 and _DIRECT_UNSUPPORTED.search(exc.message or "")):
                             raise
                         # The model exists but not on this path: retry over the agent socket.
+                        log("upstream.fallback", "Прямой путь не принял модель — переход на WebSocket", "warn",
+                            reason=(exc.message or "")[:200])
                         direct_mode = False
                         prompt = instructions + "\n\n" + prompt
                         continue
@@ -468,6 +542,9 @@ class TurnRunner:
                         if not streamed_tool_call:
                             for native_call in native_calls:
                                 definition = tool_definitions[native_call["name"]]
+                                log("tool.call", "Инструмент клиента: %s" % native_call["name"], "info",
+                                    name=native_call["name"], call_id=native_call.get("id"),
+                                    arguments=_preview(native_call.get("arguments")), streamed=False)
                                 out.put({"type": "tool_call", **native_call,
                                          "tool_type": definition.get("x-client-type", "function")})
                         holder["reason"] = "tool_calls"
@@ -495,6 +572,8 @@ class TurnRunner:
                         r"no (?:access|tools)|не (?:могу|доступ|имею)|нет доступа)", final_text, re.IGNORECASE)
                     if tool_names and refuses_tools and tool_retries < 1 and not visible_text.strip():
                         tool_retries += 1
+                        log("turn.retry", "Модель отказалась от инструментов — повтор с коррекцией", "warn",
+                            reason="tool_refusal")
                         native_context = None  # Retry prompts are not part of the client history.
                         prompt = (base_prompt + "\n\n[CLIENT TOOL TRANSPORT CORRECTION]\n"
                                   "Your previous reply treated the client's tools as unavailable. "
@@ -521,6 +600,8 @@ class TurnRunner:
                     # Loop guard: the same command keeps coming back (any period).
                     if command and not final_summary and self._looks_looping(command, recent):
                         final_summary = True
+                        log("exec.loop_guard", "Команда повторяется — исполнение остановлено", "warn",
+                            command=command[:300])
                         summary = ("\n\n[ИТОГ] Команда '" + command + "' повторяется. "
                                    "Команды больше не выполняй, дай итоговый ответ.")
                         prompt = (self._followup(instructions, reminder + summary, *last_followup)
@@ -536,6 +617,7 @@ class TurnRunner:
                     if not command and not final_text.strip() and empty_retries < 1:
                         # Silent turn: insist once, keeping the full system prompt.
                         empty_retries += 1
+                        log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
                         native_context = None  # Retry prompts are not part of the client history.
                         prompt = (base_prompt + "\n\n[RETRY] Предыдущий ход вернул пустой ответ. "
                                   "Ответь сейчас: нужна команда — выведи <exec_command>...</exec_command>, "
@@ -553,6 +635,9 @@ class TurnRunner:
 
                     if self.cfg["show_exec_output"]:
                         out.put({"type": "exec_start", "cmd": command})
+                    log("exec.start", "Локальная команда: %s" % command[:160], "info",
+                        command=command[:2000], policy=self.cfg["exec_policy"], step=exec_steps + 1)
+                    exec_started = time.time()
 
                     try:
                         code, output = await asyncio.get_running_loop().run_in_executor(
@@ -574,6 +659,11 @@ class TurnRunner:
                         raise asyncio.CancelledError()
                     output = redact(output, cookie_values=self.cfg.get("cookie_values", ()))
                     exec_steps += 1
+                    log("exec.result", "Команда завершилась с кодом %s" % code,
+                        "success" if code == 0 else "warn" if code == 126 else "error",
+                        command=command[:2000], exit=code, output=(output or "")[:1500],
+                        output_chars=len(output or ""), duration_ms=round((time.time() - exec_started) * 1000),
+                        blocked=code == 126)
 
                     if self.cfg["show_exec_output"]:
                         out.put({"type": "exec_result", "cmd": command, "output": output, "exit": code})
@@ -595,11 +685,26 @@ class TurnRunner:
                 if session is not None:
                     await self.pool.release(session)
         except apierr.ApiError as err:
+            outcome["error"] = err
             out.put({"type": "error", "error": err})
         except asyncio.CancelledError:
+            outcome["reason"] = "cancelled"
             out.put({"type": "end", "reason": "cancelled"})
             raise
         except Exception as exc:  # defensive: never mask a crash as success
-            out.put({"type": "error", "error": apierr.internal(str(exc))})
+            outcome["error"] = apierr.internal(str(exc))
+            out.put({"type": "error", "error": outcome["error"]})
         finally:
+            duration = round((time.time() - turn_started) * 1000)
+            err = outcome["error"]
+            if err is not None:
+                log("turn.error", "%s: %s" % (err.code, (err.message or "")[:300]), "error",
+                    status=err.status, code=err.code)
+                reason = "error"
+            else:
+                reason = outcome["reason"] or holder.get("reason") or "stop"
+            log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
+                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout") else "success",
+                reason=reason, duration_ms=duration, exec_steps=exec_steps,
+                retries=empty_retries + tool_retries)
             out.put(None)

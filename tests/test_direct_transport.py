@@ -69,8 +69,14 @@ def test_head_becomes_a_cached_system_block_with_a_stable_key():
     assert body["maxCompletionTokens"] == 32
 
 
-def test_short_head_is_not_cached_but_still_a_system_message():
+def test_short_head_is_cached_with_stable_key():
     body = direct.build_body({"direct_cache": True}, {"model": "m"}, "short", "tail", None, "auto", None)
+    assert body["messages"][0] == {"role": "system", "content": [{"type": "text", "text": "short", "cache": True}]}
+    assert body["openAICacheKey"] == direct.cache_key_for("short")
+
+
+def test_cache_disabled_omits_cache_markers_and_key():
+    body = direct.build_body({"direct_cache": False}, {"model": "m"}, "short", "tail", None, "auto", None)
     assert body["messages"][0] == {"role": "system", "content": [{"type": "text", "text": "short"}]}
     assert "openAICacheKey" not in body
 
