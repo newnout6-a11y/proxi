@@ -1,5 +1,6 @@
 """Upstream Retool transport: thread creation, WebSocket turns, retries, cancellation."""
 import asyncio
+from collections import deque
 import datetime as _datetime
 import json
 import os
@@ -17,6 +18,7 @@ ISO_FMT = "%Y-%m-%dT%H:%M:%S"
 from upstream_refresh import Refresher
 
 MAX_FRAME_DEFAULT = 16 * 1024 * 1024
+MAX_PENDING_FRAMES = 256
 
 
 def _iso(ts: float) -> str:
@@ -159,6 +161,93 @@ class Backend:
                                       ping_interval=None, open_timeout=self.cfg["upstream_timeout"])
 
 
+async def _answer_control(ws, raw):
+    try:
+        event = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(event, dict):
+        return False
+    if event.get("type") == "ping":
+        await ws.send('{"type":"pong"}')
+        return True
+    ack = event.get("ack")
+    if isinstance(ack, dict) and ack.get("id"):
+        await ws.send(json.dumps({"type": "client_ack", "replyTo": ack["id"]}))
+    return False
+
+
+class _SocketReader:
+    """One receiver; backlog <= 256 frames and one configured max-frame byte budget."""
+
+    def __init__(self, ws, byte_limit):
+        self.ws = ws
+        self.frames = deque()
+        self.bytes = 0
+        self.byte_limit = byte_limit
+        self.ready = asyncio.Event()
+        self.error = None
+        self.task = asyncio.create_task(self._read())
+
+    async def _read(self):
+        try:
+            while True:
+                try:
+                    raw = await self.ws.recv()
+                except asyncio.TimeoutError:
+                    # Injectable transports may expose an idle read timeout.
+                    await asyncio.sleep(0)
+                    continue
+                if await _answer_control(self.ws, raw):
+                    continue
+                size = len(raw.encode("utf-8")) if isinstance(raw, str) else len(raw)
+                if len(self.frames) >= MAX_PENDING_FRAMES or self.bytes + size > self.byte_limit:
+                    raise apierr.upstream_error("websocket application buffer overflow; connection closed")
+                self.frames.append((raw, size))
+                self.bytes += size
+                self.ready.set()
+                # Let the active consumer run when recv() has buffered frames.
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.error = exc
+        finally:
+            if self.error is None:
+                self.error = RuntimeError("websocket reader closed")
+            self.ready.set()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+
+    async def recv(self):
+        while True:
+            # Overflow cannot turn into a successful, silently truncated turn.
+            if isinstance(self.error, apierr.ApiError):
+                raise self.error
+            if self.frames:
+                raw, size = self.frames.popleft()
+                self.bytes -= size
+                return raw
+            if self.error is not None:
+                raise self.error
+            self.ready.clear()
+            await self.ready.wait()
+
+    async def close(self):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+        self.frames.clear()
+        self.bytes = 0
+        self.error = RuntimeError("websocket reader closed")
+        self.ready.set()
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
+
 class RelaySession:
     """One WebSocket turn stream bound to a single Retool thread."""
 
@@ -167,6 +256,7 @@ class RelaySession:
         self.cfg = backend.cfg
         self.thread_id = thread_id
         self.ws = None
+        self._reader = None
         self._cancelled = False
         self._needs_drain = False
         self._drain_task = None
@@ -186,8 +276,15 @@ class RelaySession:
             self._drain_task = asyncio.run_coroutine_threadsafe(self.aclose(), loop)
 
     async def open(self):
+        self._loop = asyncio.get_running_loop()
         if self.ws is not None:
-            return
+            reader = await self._ensure_reader()
+            if reader.error is None and not reader.task.done():
+                return
+            error = reader.error
+            await self.aclose()
+            if isinstance(error, apierr.ApiError):
+                raise error
         rejected_cookie = self.cfg.get("cookie")
         try:
             started = await self.backend.start_run(self.thread_id)
@@ -204,21 +301,30 @@ class RelaySession:
             else:
                 raise
         self.sandbox_id = started.sandbox_id
+        await self._ensure_reader()
+
+    async def _ensure_reader(self):
+        if self._reader is not None and self._reader.ws is not self.ws:
+            reader, self._reader = self._reader, None
+            await reader.close()
+        if self._reader is None:
+            if self.ws is None:
+                raise RuntimeError("websocket is not connected")
+            self._reader = _SocketReader(self.ws, self.cfg.get("max_frame_bytes") or MAX_FRAME_DEFAULT)
+        return self._reader
+
+    async def _recv(self):
+        return await (await self._ensure_reader()).recv()
 
     async def _maybe_pong(self, raw):
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-        if isinstance(event, dict) and event.get("type") == "ping":
-            try:
-                await self.ws.send('{"type":"pong"}')
-            except Exception:
-                pass
+        await _answer_control(self.ws, raw)
 
     async def aclose(self):
         ws, self.ws = self.ws, None
-        if ws is not None:
+        reader, self._reader = self._reader, None
+        if reader is not None:
+            await reader.close()
+        if ws is not None and (reader is None or reader.ws is not ws):
             try:
                 await ws.close()
             except Exception:
@@ -328,7 +434,7 @@ class RelaySession:
                     # in-flight socket read each time the history queue ticks.
                     receive_wait = min(remaining, self.cfg["recv_timeout"], 0.25 if think_q is not None else remaining)
                     if receive_task is None:
-                        receive_task = asyncio.create_task(self.ws.recv())
+                        receive_task = asyncio.create_task(self._recv())
                     done, _ = await asyncio.wait({receive_task}, timeout=receive_wait)
                     if not done:
                         continue
@@ -339,6 +445,8 @@ class RelaySession:
                 except asyncio.CancelledError:
                     if poller is not None:
                         poller.cancel()
+                    raise
+                except apierr.ApiError:
                     raise
                 except Exception as exc:
                     if self._cancelled:
@@ -363,7 +471,6 @@ class RelaySession:
                 if self._cancelled:
                     yield {"type": "end", "reason": "cancelled"}
                     return
-                await self._maybe_pong(raw)
                 try:
                     event = json.loads(raw)
                 except json.JSONDecodeError:
@@ -562,12 +669,13 @@ class RelaySession:
         out = []
         while time.time() < end:
             try:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=0.25)
+                raw = await asyncio.wait_for(self._recv(), timeout=0.25)
             except asyncio.TimeoutError:
                 break
+            except apierr.ApiError:
+                raise
             except Exception:
                 break
-            await self._maybe_pong(raw)
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:

@@ -129,11 +129,15 @@ def test_already_received_credits_do_not_wait_for_another_trailing_frame():
                      {"type": "agent_loop_done"}])
     relay = make_session(socket)
 
+    async def unexpected_trailing():
+        pytest.fail("already received credits must not start a trailing wait")
+
+    relay._trailing = unexpected_trailing
+
     async def scenario():
         started = time.monotonic()
         events = [event async for event in relay.stream("prompt", {})]
         assert time.monotonic() - started < 0.1
-        assert socket.reads == 2  # no redundant 250 ms wait for credits
         assert [event for event in events if event["type"] == "credits"] == [
             {"type": "credits", "value": 0.5}]
         assert events[-1] == {"type": "end", "reason": "stop"}

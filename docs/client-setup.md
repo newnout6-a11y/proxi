@@ -30,6 +30,7 @@ llm-pi-ai:
         thinkingFormat: deepseek
         supportsReasoningEffort: true
         supportsUsageInStreaming: true
+        sendSessionAffinityHeaders: true
       retryPolicy:
         mode: normal
         maxRetries: 1
@@ -85,6 +86,56 @@ The installed adapter also passed a real Retool request: Claude Opus 5.5 returne
 `get_goal`, arguments `{}`, finish `tool-calls`, in 26.37 seconds. This verified
 the tool transport without changing the user's real goal. That low-effort
 upstream response supplied no visible thinking text.
+
+### Keep the upstream conversation warm
+
+The relay needs the client's stable dialogue identity to reuse a thread and
+WebSocket. It accepts `x-session-affinity`, `x-session-id`, `x-opencode-session`,
+or explicit request fields `conversation`, `conversation_id`, and `session_id`.
+Parent agents and subagents must use different identities. A single static
+provider-wide header would mix their conversations and must not be used.
+
+Harness supplies its unique session ID to pi-ai, but stock 0.1.5-rc.2 withholds
+the `sendSessionAffinityHeaders` compatibility setting. This setup includes a
+host-adapter fix exposing that existing SDK boolean, enabled only on the Retool
+route above. A YAML change alone does not enable it in the unpatched adapter.
+Keep the SDK cache retention at its default or `short`: `none` also suppresses
+session affinity. Restart the Harness host after updating its adapter bundle;
+settings-file watching alone cannot replace already loaded JavaScript.
+
+The relay keeps receiving control frames while a persistent socket is idle,
+answers upstream ping and acknowledgement requests, and uses one ordered
+receiver. Its application buffer is bounded by `max_frame_bytes` in total and
+256 frames; overflow is an explicit upstream error. A dead idle socket is
+reconnected before the next prompt. This does not implement the native web's
+proactive sandbox-token refresh; disconnected sockets still reconnect normally.
+
+For native client tools, a successful conversation caches the exact normalized
+client history and instruction/tool fingerprint in its upstream session. A
+strict append sends the new history suffix. Edited or compacted history and
+changed instructions/tools start a fresh upstream thread with the complete
+current context. Anonymous requests retain independent full-context threads.
+
+A bounded live Opus 5.5 `max` comparison on 2026-10-29 used two short plain
+prompts on the same thread/socket. Cold setup took 0.589s to create the thread,
+4.799s to start and 1.791s to connect; the first text arrived 9.100s after send.
+The warm request needed no start/connect and produced its first text after
+2.996s, finishing in 5.096s. Raw-to-normalized forwarding took 0.117ms/0.084ms.
+An independent native-web short follow-up became visible after 2.823s including
+browser automation overhead. These are short-prompt observations, not a
+one-second guarantee for IDE requests with a large project context.
+
+The final installed-Harness-adapter check used two real native-tool-enabled
+requests through an isolated relay at unchanged Opus 5.5 `max`. First text took
+19.329s cold and 1.406s warm; completion took 20.148s/2.182s. There was exactly
+one thread creation, start and connection for both requests. The transmitted
+prompt shrank from 1790 to 392 characters. This test declared a read-only tool
+but explicitly requested plain answers; it did not execute project tools.
+
+Validation on the prospective relay commit, excluding the separately paused
+admin work: `python -m pytest -o addopts= -q` — 534 passed in 49.77s.
+The Harness adapter change separately passed 167 scoped source tests,
+typecheck/build and seven localhost-only installed-bundle wire checks.
 
 ## Codex
 

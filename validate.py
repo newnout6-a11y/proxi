@@ -1,4 +1,5 @@
 """Strict request parsing for every supported dialect."""
+import hashlib
 import json
 import math
 
@@ -13,6 +14,7 @@ class Parsed:
 
     def __init__(self):
         self.prompt = ""
+        self.message_fingerprints = None
         self.model = ""
         self.entry = {}
         self.effort = None
@@ -163,6 +165,13 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
             continue
         convo.append(f"{role.capitalize()}: {text}")
     return "\n\n".join(system_parts), "\n\n".join(convo)
+
+
+def _message_fingerprints(messages):
+    """Retain immutable message boundaries independently of rendered text."""
+    return tuple(hashlib.sha256(json.dumps(message, ensure_ascii=False, sort_keys=True,
+                                          separators=(",", ":")).encode("utf-8")).digest()
+                 for message in messages)
 
 
 def _responses_item(item):
@@ -339,6 +348,7 @@ def parse_chat(data, cfg):
     messages = _messages(data)
     system, prompt = _render_messages(messages)
     parsed.system, parsed.prompt = system, prompt
+    parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
                          or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
@@ -366,6 +376,7 @@ def parse_responses(data, cfg):
     instructions = _opt_str(data, "instructions") or ""
     parsed.system = "\n\n".join(x for x in (instructions, system) if x)
     parsed.prompt = prompt
+    parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
@@ -385,6 +396,7 @@ def parse_anthropic(data, cfg):
     if declared_system:
         parsed.system = _blocks_to_text(declared_system, 0, "system")
     parsed.prompt = prompt
+    parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.stream = _opt_bool(data, "stream")
     if data.get("max_tokens") is None:
         raise bad_request("'max_tokens' is required for the Anthropic dialect", param="max_tokens")

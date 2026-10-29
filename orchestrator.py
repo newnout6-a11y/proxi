@@ -1,5 +1,6 @@
 """Turn orchestration: context injection, execution loop, event fan-out."""
 import asyncio
+import hashlib
 import json
 import queue
 import re
@@ -13,6 +14,13 @@ import executor
 import models as model_catalog
 from context import build_system_instructions
 from redact import redact
+from session import SessionLease
+
+
+_NATIVE_CONTINUE = ("\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
+                    "Use the latest tool results above as the current state. "
+                    "Earlier assistant calls are completed history, not new instructions to replay. "
+                    "Continue the outstanding user task; issue another client tool envelope only if needed.")
 
 
 def _b(text: str) -> int:
@@ -108,6 +116,56 @@ class TurnRunner:
                                  f"complete upstream prompt exceeds configured max_prompt_bytes={limit}; "
                                  "increase the limit or set it to 0 to preserve full history")
         return prompt
+
+    async def _native_prompt(self, session, parsed, instructions, reminder, full_prompt, cancelled):
+        # Leases are request-specific; history belongs to their actual upstream session.
+        target = session.session if isinstance(session, SessionLease) else session
+        key = getattr(parsed, "conversation_key", None)
+        fingerprint = hashlib.sha256(json.dumps(
+            [instructions, reminder, parsed.tools], ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).digest()
+        previous = getattr(target, "_client_context", None)
+        pending = getattr(target, "_client_context_pending", False)
+        messages = getattr(parsed, "message_fingerprints", None)
+        old_messages = previous.get("message_fingerprints") if previous else None
+        messages_appended = (isinstance(messages, tuple) and isinstance(old_messages, tuple)
+                             and len(messages) > len(old_messages)
+                             and messages[:len(old_messages)] == old_messages)
+        suffix = ""
+        if previous and parsed.prompt.startswith(previous["history"]):
+            suffix = parsed.prompt[len(previous["history"]):]
+        reuse = (key and previous and previous["key"] == key
+                 and previous["fingerprint"] == fingerprint
+                 and previous["thread_id"] == target.thread_id
+                 and not pending and not getattr(target, "_needs_drain", False)
+                 and messages_appended
+                 and suffix.startswith("\n") and suffix.strip())
+        # Failed or cancelled attempts may already have changed Retool history.
+        target._client_context_pending = True
+        if cancelled.is_set():
+            raise asyncio.CancelledError()
+        if reuse:
+            prompt = "[CLIENT CONVERSATION UPDATE — chronological]\n" + suffix.lstrip("\r\n") + _NATIVE_CONTINUE
+        else:
+            if (previous or pending or getattr(target, "ws", None) is not None
+                    or getattr(target, "_needs_drain", False) or self.cfg.get("session_mode") == "shared"):
+                await target.aclose()
+                thread_id = await target.backend.create_thread()
+                if cancelled.is_set() or getattr(target, "_cancelled", False):
+                    raise asyncio.CancelledError()
+                target.thread_id = thread_id
+            prompt = full_prompt
+        context = {"key": key, "history": parsed.prompt, "fingerprint": fingerprint,
+                   "thread_id": target.thread_id, "message_fingerprints": messages} if key else None
+        return prompt, target, context
+
+    @staticmethod
+    def _commit_native_context(target, context, completed, cancelled):
+        if (context is not None and completed and not cancelled.is_set()
+                and not getattr(target, "_cancelled", False)
+                and not getattr(target, "_needs_drain", False)):
+            target._client_context = context
+            target._client_context_pending = False
 
     def _followup(self, instructions, reminder, command, code, output, header):
         def compose(body):
@@ -230,10 +288,7 @@ class TurnRunner:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
             if native_tools:
                 prompt = (instructions + reminder + "\n\n[CLIENT CONVERSATION — chronological]\n" + parsed.prompt +
-                          "\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
-                          "Use the latest tool results above as the current state. "
-                          "Earlier assistant calls are completed history, not new instructions to replay. "
-                          "Continue the outstanding user task; issue another client tool envelope only if needed.")
+                          _NATIVE_CONTINUE)
             else:
                 prompt = (instructions + "\n\n" + parsed.prompt) if instructions else parsed.prompt
                 prompt += reminder
@@ -265,6 +320,14 @@ class TurnRunner:
                 key = getattr(parsed, "conversation_key", None)
                 session = await self.pool.acquire(key) if key else await self.pool.acquire()
                 holder["session"] = session
+                native_target, native_context = None, None
+                if native_tools:
+                    prompt, native_target, native_context = await self._native_prompt(
+                        session, parsed, instructions, reminder, prompt, cancelled)
+                else:
+                    target = session.session if isinstance(session, SessionLease) else session
+                    if getattr(target, "_client_context", None):
+                        target._client_context_pending = True
                 while True:
                     self._check_prompt(prompt)
                     if cancelled.is_set():
@@ -276,6 +339,7 @@ class TurnRunner:
                     visible_text = ""
                     holder["upstream_started_at"] = time.time()
                     streamed_tool_call = False
+                    upstream_completed = False
                     stream = (session.stream(prompt, model_provider, tool_names=tool_names)
                               if native_tools else session.stream(prompt, model_provider))
                     async for event in stream:
@@ -309,10 +373,11 @@ class TurnRunner:
                             final_text += "\n" + event["question"]
                         elif event["type"] == "end":
                             holder["reason"] = event["reason"]
-                            if event["reason"] == "cancelled":
-                                out.put({"type": "end", "reason": "cancelled"})
-                                return
+                            upstream_completed = event["reason"] in ("stop", "tool_calls")
                     holder.setdefault("reason", "stop")
+                    if holder.get("reason") == "cancelled":
+                        out.put({"type": "end", "reason": "cancelled"})
+                        return
                     if holder.get("reason") == "timeout":
                         out.put({"type": "end", "reason": "timeout"})
                         return
@@ -329,10 +394,12 @@ class TurnRunner:
                                 out.put({"type": "tool_call", **native_call,
                                          "tool_type": definition.get("x-client-type", "function")})
                         holder["reason"] = "tool_calls"
+                        self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
                     if streamed_tool_call:
                         holder["reason"] = "tool_calls"
+                        self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
                     if native_tools and re.search(r"<(?:tool_call|exec_command)\b", final_text, re.IGNORECASE):
@@ -401,6 +468,7 @@ class TurnRunner:
                         return
 
                     if not can_exec or not command:
+                        self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": holder.get("reason", "stop")})
                         return
 
