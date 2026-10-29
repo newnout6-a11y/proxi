@@ -122,6 +122,152 @@ def coerce_arguments(raw, params):
     return json.dumps(data, ensure_ascii=False) if changed else text
 
 
+def _coerce_value(value, spec):
+    """Coerce one string scalar like coerce_arguments; None when it stays a string."""
+    kind = spec.get("type") if isinstance(spec, dict) else None
+    if kind == "number":
+        try:
+            number = float(value) if "." in value else int(value)
+        except ValueError:
+            return None
+        return number if number == number and number not in (float("inf"), float("-inf")) else None
+    if kind == "boolean" and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    return None
+
+
+class ArgStream:
+    """Stream tool-call JSON as it arrives while keeping coerce_arguments' repairs.
+
+    Only a top-level string value of a number/boolean parameter is held until it
+    closes, then emitted coerced. Everything else (long string bodies, nested
+    values) passes through at once, so the emitted text is always a prefix of
+    the final arguments and clients can render the call while it is generated.
+    Anything unexpected switches to verbatim pass-through.
+    """
+
+    def __init__(self, params):
+        self.params = params or {}
+        self.state = "pre"
+        self.depth = 0
+        self.in_string = False
+        self.escape = False
+        self.key = []
+        self.held = None
+
+    def _coercible(self, raw_key):
+        try:
+            name = json.loads('"' + raw_key + '"')
+        except ValueError:
+            return False
+        spec = self.params.get(name)
+        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean")
+
+    def feed(self, chunk):
+        out = []
+        for char in chunk or "":
+            state = self.state
+            if state == "pass":
+                out.append(char)
+            elif state == "pre":
+                out.append(char)
+                if char == "{":
+                    self.depth, self.state = 1, "key"
+                elif not char.isspace():
+                    self.state = "pass"
+            elif state == "hold":
+                self.held.append(char)
+                if self.escape:
+                    self.escape = False
+                elif char == "\\":
+                    self.escape = True
+                elif char == '"':
+                    raw = "".join(self.held)
+                    self.held = None
+                    try:
+                        value = json.loads(raw)
+                    except ValueError:
+                        value = None
+                    coerced = _coerce_value(value, self.params.get(self.key_name)) if isinstance(value, str) else None
+                    out.append(raw if coerced is None else json.dumps(coerced))
+                    self.state = "after"
+            elif state == "keystr":
+                out.append(char)
+                if self.escape:
+                    self.escape = False
+                    self.key.append(char)
+                elif char == "\\":
+                    self.escape = True
+                    self.key.append(char)
+                elif char == '"':
+                    self.state = "colon"
+                else:
+                    self.key.append(char)
+            elif state == "key":
+                out.append(char)
+                if char == '"':
+                    self.key, self.state = [], "keystr"
+                elif char == "}":
+                    self.state = "done"
+                elif not char.isspace() and char != ",":
+                    self.state = "pass"
+            elif state == "colon":
+                out.append(char)
+                if char == ":":
+                    self.state = "value"
+                elif not char.isspace():
+                    self.state = "pass"
+            elif state == "value":
+                if char.isspace():
+                    out.append(char)
+                elif char == '"' and self._coercible("".join(self.key)):
+                    self.key_name = json.loads('"' + "".join(self.key) + '"')
+                    self.held, self.escape, self.state = ['"'], False, "hold"
+                else:
+                    out.append(char)
+                    self.state = "inval"
+                    self._track(char)
+            elif state == "inval":
+                out.append(char)
+                if not self.in_string and self.depth == 1 and char in ",}":
+                    self.state = "key" if char == "," else "done"
+                else:
+                    self._track(char)
+            elif state == "after":
+                out.append(char)
+                if char == ",":
+                    self.state = "key"
+                elif char == "}":
+                    self.state = "done"
+                elif not char.isspace():
+                    self.state = "pass"
+            else:  # done: trailing characters are relayed verbatim
+                out.append(char)
+        return "".join(out)
+
+    def _track(self, char):
+        if self.in_string:
+            if self.escape:
+                self.escape = False
+            elif char == "\\":
+                self.escape = True
+            elif char == '"':
+                self.in_string = False
+        elif char == '"':
+            self.in_string = True
+        elif char in "{[":
+            self.depth += 1
+        elif char in "}]":
+            self.depth -= 1
+
+    def finish(self):
+        """Flush a value left open by a truncated stream verbatim."""
+        if self.held is not None:
+            raw, self.held = "".join(self.held), None
+            return raw
+        return ""
+
+
 def cache_key_for(head):
     return hashlib.sha256(head.encode("utf-8")).hexdigest()[:24]
 
@@ -400,8 +546,12 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
                 yield {"type": "thinking_start"}
             elif event.get("type") == "tool_call":
                 current = event.get("toolCallId") or "call_%d" % len(calls)
-                calls[current] = {"id": event.get("toolCallId"), "name": event.get("toolName"), "args": []}
+                calls[current] = {"id": event.get("toolCallId"), "name": event.get("toolName"), "args": [],
+                                  "out": "", "stream": ArgStream((param_types or {}).get(event.get("toolName")))}
                 stack.append(current)
+                # Announce the call immediately so clients render it while arguments generate.
+                yield {"type": "tool_call", "id": event.get("toolCallId"), "name": event.get("toolName"),
+                       "arguments": "", "partial": True}
         elif kind == "content_block_delta":
             block = event.get("type")
             if block == "text":
@@ -420,14 +570,27 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
                 if event.get("partialSignature"):
                     yield {"type": "thinking_signature", "signature": event["partialSignature"]}
             elif block == "tool_call" and current in calls:
-                calls[current]["args"].append(event.get("partialInputs") or "")
+                call = calls[current]
+                piece = event.get("partialInputs") or ""
+                call["args"].append(piece)
+                emitted = call["stream"].feed(piece)
+                if emitted:
+                    call["out"] += emitted
+                    yield {"type": "tool_call", "id": call["id"], "name": call["name"],
+                           "arguments": call["out"], "partial": True}
         elif kind == "content_block_end":
             key = stack.pop() if stack else current
             call = calls.pop(key, None) if key is not None else None
             if call is not None:
-                yield {"type": "tool_call", "id": call["id"], "name": call["name"],
-                       "arguments": coerce_arguments(
-                           "".join(call["args"]), (param_types or {}).get(call["name"]))}
+                streamed = call["out"] + call["stream"].finish()
+                raw = "".join(call["args"])
+                # The streamed text is already coerced; fall back for non-JSON or empty input.
+                try:
+                    json.loads(streamed)
+                    final = streamed
+                except ValueError:
+                    final = coerce_arguments(raw, (param_types or {}).get(call["name"]))
+                yield {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": final}
             current = stack[-1] if stack else None
         elif kind == "metadata":
             usage = event.get("usage") or {}

@@ -471,6 +471,7 @@ class TurnRunner:
                         prompt_chars=len(stream_prompt or ""), attempt=empty_retries + tool_retries + exec_steps + 1)
                     first_token = False
                     think_started = None
+                    tool_started = {}
                     try:
                         async for event in stream:
                             if not first_token and event["type"] in ("text", "thinking", "tool_call"):
@@ -479,6 +480,10 @@ class TurnRunner:
                                 log("upstream.first_token", "Первый токен через %d мс" % ttft,
                                     "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
                             if event["type"] == "text":
+                                if not upstream_text:
+                                    ms = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                    log("upstream.text_start", "Модель начала писать текст через %d мс" % ms,
+                                        "debug", ms=ms)
                                 final_text += event["delta"]
                                 upstream_text += event["delta"]
                                 # Tool envelopes are parsed only after the complete
@@ -510,10 +515,20 @@ class TurnRunner:
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 streamed_tool_call = True
                                 definition = tool_definitions[event["name"]]
-                                log("tool.call", "Инструмент клиента: %s" % event["name"], "info",
-                                    name=event["name"], call_id=event.get("id"),
-                                    arguments=_preview(event.get("arguments")), streamed=True)
-                                out.put({**event, "tool_type": definition.get("x-client-type", "function")})
+                                call_key = event.get("id") or event["name"]
+                                if call_key not in tool_started:
+                                    tool_started[call_key] = time.time()
+                                    ms = round((tool_started[call_key] - holder["upstream_started_at"]) * 1000)
+                                    log("upstream.tool_start", "Модель начала вызов %s через %d мс" % (event["name"], ms),
+                                        "debug", name=event["name"], call_id=event.get("id"), ms=ms)
+                                if not event.get("partial"):
+                                    args_ms = round((time.time() - tool_started[call_key]) * 1000)
+                                    log("tool.call", "Инструмент клиента: %s (аргументы %d мс)" % (event["name"], args_ms),
+                                        "info", name=event["name"], call_id=event.get("id"),
+                                        arguments=_preview(event.get("arguments")), streamed=True,
+                                        args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
+                                out.put({key: value for key, value in event.items() if key != "partial"}
+                                        | {"tool_type": definition.get("x-client-type", "function")})
                             elif event["type"] == "credits":
                                 self.credits.record_turn(turn_id, event["value"])
                                 usage = event.get("usage") or {}
