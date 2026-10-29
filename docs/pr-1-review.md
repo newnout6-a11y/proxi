@@ -5,8 +5,8 @@ Qodo сверены с исходниками, исправления покры
 Нумерация ниже совпадает с номерами замечаний в PR. Данные авторизации и
 содержимое непрозрачных блоков провайдера в отчёт не включены.
 
-Текущий полный локальный прогон после исправления прогрева сессий:
-`python -m pytest -o addopts= -q` — **534 passed in 49.77s**.
+Текущий полный локальный прогон после исправления auxiliary/Claude affinity:
+`python -m pytest -o addopts= -q` — **585 passed in 50.60s**.
 Компиляция рабочих Python-модулей, разбор `config.example.json` и
 `git diff --check` завершились с exit 0.
 
@@ -331,3 +331,52 @@ Relay получил постоянный ограниченный WS reader д�
 админки: `python -m pytest -o addopts= -q` — **534 passed in 49.77s**.
 `python -m py_compile orchestrator.py validate.py session.py tests/test_idle_transport.py tests/test_native_context_reuse.py tests/test_transport_performance.py`
 и `git -c core.safecrlf=false diff --check` — exit 0.
+
+## Реальный цикл Harness и Claude Code
+
+Проверка двух маленьких запросов выше не покрывала полный цикл IDE.
+В реальном Harness с 73064 символами system и Opus 5.5 `max` сохранённые
+запросы заняли 35,836 и 27,952 с, до первого текста — 32,460 и 25,466 с.
+Между ними Harness запускал генерацию заголовка с тем же session ID, но без
+инструментов. Этот запрос попадал в основной thread и помечал его контекст
+негодным; следующий основной ход создавал новый thread. System и tools двух
+основных запросов совпадали. Причина подтверждена точным SHA256 system title-job
+в сохранённом Harness запросе и в соответствующем Retool сообщении.
+
+Исправления:
+
+- Tool-less запросы отделены от native-tools диалога по клиентскому ID и
+  system fingerprint. В shared mode они получают изолированный lease.
+- Claude Code session ID извлекается из JSON-строки `metadata.user_id`;
+  account/device/parent IDs не используются вместо собственного ID разговора.
+- Fingerprints сравнивают model-visible содержимое с сохранением границ
+  сообщений; перемещение SDK cache markers не создаёт ложного редактирования.
+  Правки настоящего текста, tool IDs/results и параметров по-прежнему сбрасывают
+  контекст. Новых догадок по User-Agent или тексту задания нет.
+
+Реплей сохранённых запросов через установленный Harness adapter с параллельным
+title-job, без исполнения project tools и с прежним Opus 5.5 `max`:
+
+| Показатель | Первый основной запрос | Следующий основной запрос |
+| --- | --- | --- |
+| До первого текста | 28,519 с | 4,906 с |
+| Завершение | 30,450 с | 7,107 с |
+| WS prompt | 80960 символов | 902 символа |
+
+На три запроса пришлись два thread/start/connect: один для основного диалога,
+один для title-job. Это изолированный реплей реальных client payloads с
+сохранённым предыдущим assistant message, а не полная автоматизация GUI.
+Локальные execution/project injection для диагностического сервера были
+выключены; исходный клиентский system сохранён. Время первой холодной операции
+остаётся значительным, постоянные 1,4/2,2 с для IDE не заявляются.
+
+`python -m pytest -o addopts= -q` на изолированной копии будущего commit —
+**585 passed in 50.60s**.
+`python -m py_compile orchestrator.py session.py validate.py tests/test_affinity_scopes.py tests/test_claude_affinity.py`
+и scoped/staged `git diff --check` — exit 0.
+
+Прямой inference endpoint также исследован отдельно:
+[direct-inference-audit.md](direct-inference-audit.md). Нативный Sonnet tool call
+проверен без sandbox; обычный managed Assist запрос Opus получил 422/BYOK.
+Этот commit не меняет модель/ключ и не выдаёт App Builder admission за
+универсальный доступ к прямому API.

@@ -318,13 +318,21 @@ class TurnRunner:
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
-                session = await self.pool.acquire(key) if key else await self.pool.acquire()
+                pool_key = key
+                if key and not native_tools:
+                    pool_key = ("text", key, hashlib.sha256(parsed.system.encode("utf-8")).digest())
+                if key and not native_tools and self.cfg.get("session_mode") == "shared":
+                    session = await self.pool.acquire(pool_key, isolated=True)
+                else:
+                    session = await self.pool.acquire(pool_key) if pool_key else await self.pool.acquire()
                 holder["session"] = session
                 native_target, native_context = None, None
                 if native_tools:
                     prompt, native_target, native_context = await self._native_prompt(
                         session, parsed, instructions, reminder, prompt, cancelled)
-                else:
+                elif not key:
+                    # Preserve legacy anonymous shared-mode invalidation. Explicit
+                    # text scopes never acquire or mutate the native session.
                     target = session.session if isinstance(session, SessionLease) else session
                     if getattr(target, "_client_context", None):
                         target._client_context_pending = True

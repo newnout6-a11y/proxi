@@ -761,7 +761,7 @@ class SessionPool:
         for session in closing:
             await session.aclose()
 
-    async def acquire(self, conversation_key=None) -> SessionLease:
+    async def acquire(self, conversation_key=None, *, isolated=False) -> SessionLease:
         """Take one slot and return an independently releasable request handle."""
         await self._slots.acquire()
         lock = None
@@ -770,7 +770,7 @@ class SessionPool:
         referenced = False
         keep = False
         try:
-            if self.mode == "shared":
+            if not isolated and self.mode == "shared":
                 lock = self._lock
                 await lock.acquire()
                 locked = True
@@ -778,7 +778,7 @@ class SessionPool:
                     self._shared = RelaySession(self.backend, self.cfg["thread_id"])
                 session = self._shared
                 keep = True
-            elif self.mode == "per_conversation" and conversation_key:
+            elif not isolated and self.mode == "per_conversation" and conversation_key:
                 key = conversation_key
                 await self._evict_idle(make_room=key not in self._conversation_locks)
                 capacity = max(1, self.cfg.get("max_conversations", 128))

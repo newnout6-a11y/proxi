@@ -168,8 +168,8 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
 
 
 def _message_fingerprints(messages):
-    """Retain immutable message boundaries independently of rendered text."""
-    return tuple(hashlib.sha256(json.dumps(message, ensure_ascii=False, sort_keys=True,
+    """Hash each bridge-visible message, preserving boundaries but not cache markers."""
+    return tuple(hashlib.sha256(json.dumps(_render_messages([message]), ensure_ascii=False, sort_keys=True,
                                           separators=(",", ":")).encode("utf-8")).digest()
                  for message in messages)
 
@@ -337,6 +337,16 @@ def conversation_key(data, header_value=None):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
             return key + ":" + value.strip()
+    metadata = data.get("metadata")
+    user_id = metadata.get("user_id") if isinstance(metadata, dict) else None
+    if isinstance(user_id, str):
+        try:
+            identity = json.loads(user_id)
+        except (ValueError, RecursionError):
+            identity = None
+        session_id = identity.get("session_id") if isinstance(identity, dict) else None
+        if isinstance(session_id, str) and session_id.strip():
+            return "claude-metadata:" + session_id.strip()
     return None
 
 

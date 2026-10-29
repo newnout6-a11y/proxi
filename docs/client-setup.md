@@ -95,6 +95,18 @@ or explicit request fields `conversation`, `conversation_id`, and `session_id`.
 Parent agents and subagents must use different identities. A single static
 provider-wide header would mix their conversations and must not be used.
 
+Claude Code 2.1.310 supplies its current `session_id` inside the JSON string
+`metadata.user_id`. The relay recognizes that explicit session identity too;
+device/account IDs, opaque user IDs and `parent_session_id` are not substituted
+for the current dialogue ID. Explicit headers/top-level IDs take precedence.
+
+Requests declaring native tools and tool-less requests have separate upstream
+scopes. Tool-less scopes also include the system-instruction fingerprint. This
+prevents a title-generation or side-query request with the same client ID from
+entering the main agent's thread, waiting on its conversation lock, or
+invalidating its cached history. Shared mode uses an isolated lease for such
+explicitly identified tool-less requests.
+
 Harness supplies its unique session ID to pi-ai, but stock 0.1.5-rc.2 withholds
 the `sendSessionAffinityHeaders` compatibility setting. This setup includes a
 host-adapter fix exposing that existing SDK boolean, enabled only on the Retool
@@ -115,6 +127,9 @@ client history and instruction/tool fingerprint in its upstream session. A
 strict append sends the new history suffix. Edited or compacted history and
 changed instructions/tools start a fresh upstream thread with the complete
 current context. Anonymous requests retain independent full-context threads.
+Message fingerprints use the same model-visible rendering as the bridge:
+moving SDK `cache_control` markers is not a content edit. Actual changes to
+text, tool calls/results and identifiers still invalidate the cached prefix.
 
 A bounded live Opus 5.5 `max` comparison on 2026-10-29 used two short plain
 prompts on the same thread/socket. Cold setup took 0.589s to create the thread,
@@ -136,6 +151,26 @@ Validation on the prospective relay commit, excluding the separately paused
 admin work: `python -m pytest -o addopts= -q` — 534 passed in 49.77s.
 The Harness adapter change separately passed 167 scoped source tests,
 typecheck/build and seven localhost-only installed-bundle wire checks.
+
+Those small-request measurements did not exercise the full Harness title-job
+lifecycle. A real project run subsequently showed 35.836s/27.952s total and
+32.460s/25.466s to first text. Its identical 73064-character system prompt was
+not the cache-breaking change: a concurrent tool-less title request entered the
+same thread and invalidated the native cache. Separate scopes fix that case.
+
+The saved full request sequence was replayed through the installed Harness
+adapter with the title running concurrently, using an isolated relay and the
+same Opus 5.5 `max` setting. First text took 28.519s cold and 4.906s on the next
+native request; completion took 30.450s/7.107s. Exactly two thread/start/connect
+operations served three requests (one main scope and one title scope); native
+prompts were 80960 then 902 characters. The replay retained the saved assistant
+message and executed no project tools. Relay-local execution/project injection
+were disabled for the diagnostic; client project instructions were preserved.
+These are captured-request replay observations, not a live GUI latency promise.
+
+Direct model API findings and access limitations are recorded in
+[direct-inference-audit.md](direct-inference-audit.md). This follow-up does not
+silently switch the client's model, credential or inference context.
 
 ## Codex
 
