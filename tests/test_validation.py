@@ -36,9 +36,11 @@ def test_unknown_model_is_404(relay):
                            {"model": "no-such-model", "messages": [{"role": "user", "content": "x"}]}) == 404
 
 
-def test_bad_effort_is_400(relay):
+def test_bad_effort_is_clamped_not_rejected(relay):
     payload = dict(GOOD, reasoning_effort="turbo")
-    assert relay.status_of("/v1/chat/completions", payload) == 400
+    status, body = relay.json("/v1/chat/completions", payload)
+    assert status == 200
+    assert body["choices"][0]["message"]
 
 
 def test_thinking_must_be_object(relay):

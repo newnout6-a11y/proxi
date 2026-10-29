@@ -41,7 +41,8 @@ DEFAULTS = {
         r"^echo\b", r"^cls\b",
     ],
     "project_context": True,
-    "context_max_bytes": 120000,
+    # Sent every turn, so it is capped tighter than a one-off prompt would be.
+    "context_max_bytes": 40000,
     "max_prompt_bytes": 0,       # no relay-imposed prompt cap
     "show_exec_output": True,
     "enable_anthropic": True,
@@ -49,6 +50,12 @@ DEFAULTS = {
     "show_thinking": True,
     "enable_responses": True,
     "reasoning_effort": "auto",
+    # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
+    "transport": "direct",
+    "direct_cache": True,
+    # Provider caches expire in minutes; re-read the prefix to hold it open.
+    "cache_keepwarm_seconds": 240,
+    "cache_keepwarm_idle": 1800,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -145,6 +152,7 @@ def load(path=CONFIG_PATH):
         "host": "RELAY_HOST",
         "port": "RELAY_PORT",
         "session_mode": "RELAY_SESSION_MODE",
+        "transport": "RELAY_TRANSPORT",
     }
     for key, env_name in env_map.items():
         value = os.environ.get(env_name)
@@ -155,7 +163,7 @@ def load(path=CONFIG_PATH):
                     "turn_timeout", "recv_timeout", "upstream_timeout",
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
-                    "max_prompt_bytes"):
+                    "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -194,6 +202,8 @@ def load(path=CONFIG_PATH):
         raise service_unavailable("session_mode must be 'per_request', 'per_conversation' or 'shared'")
     if cfg["session_mode"] == "shared" and not cfg.get("thread_id"):
         raise service_unavailable("session_mode 'shared' requires 'thread_id'")
+    if cfg.get("transport") not in ("direct", "agent"):
+        raise service_unavailable("transport must be 'direct' or 'agent'")
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
         raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
 

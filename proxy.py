@@ -70,6 +70,7 @@ ROUTES = {
     ("POST", "/v1/chat/completions"): "chat",
     ("POST", "/v1/responses"): "responses",
     ("POST", "/v1/messages"): "anthropic",
+    ("POST", "/v1/messages/count_tokens"): "count_tokens",
     ("GET", "/v1/models"): "models",
     ("GET", "/v1/models/"): "models",
     ("GET", "/codex/models"): "codex_models",
@@ -151,6 +152,10 @@ def make_handler(runtime: Runtime):
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
             self._started = time.time()
+            # Keep-alive reuses the handler: a stale status from the previous
+            # request (e.g. a 404 probe) must not leak into this log line.
+            self._status = 0
+            self._stream_status = 0
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -177,6 +182,10 @@ def make_handler(runtime: Runtime):
                     if not cfg["enable_anthropic"]:
                         raise apierr.not_found("anthropic API disabled")
                     self._completion("anthropic")
+                elif route == "count_tokens":
+                    if not cfg["enable_anthropic"]:
+                        raise apierr.not_found("anthropic API disabled")
+                    self._count_tokens()
                 elif route == "models":
                     self._models()
                 elif route == "codex_models":
@@ -191,6 +200,8 @@ def make_handler(runtime: Runtime):
                 elif route == "health":
                     self._health()
             except apierr.ApiError as err:
+                if err.status >= 400:
+                    print("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]), flush=True)
                 if getattr(self, "_streaming", False):
                     writer = self._writer
                     writer.event("error", adapters.error_payload(dialect, err))
@@ -213,6 +224,15 @@ def make_handler(runtime: Runtime):
             body = adapters.error_payload(dialect, err)
             extra = {"retry-after": err.retry_after} if err.retry_after else None
             self._json(err.status, body, extra)
+
+        def _count_tokens(self):
+            """Claude Code asks for a token estimate before sending a turn."""
+            data = validate.load_json(self._read_body())
+            # The real count_tokens endpoint does not require max_tokens.
+            data.setdefault("max_tokens", 1)
+            parsed = validate.parse_anthropic(data, cfg)
+            text = parsed.system + "\n" + parsed.prompt
+            self._json(200, {"input_tokens": adapters.approx_tokens(text)})
 
         def _models(self):
             data = [{

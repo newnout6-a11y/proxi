@@ -9,6 +9,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+import direct
+
 import websockets
 
 import apierr
@@ -80,6 +82,16 @@ class Backend:
         self.refresher = refresher if refresher is not None else Refresher(cfg)
 
     # -- HTTP ---------------------------------------------------------------
+    def headers(self):
+        """Current upstream credential headers (rebuilt after a refresh)."""
+        return upstream_headers(self.cfg)
+
+    async def new_thread_id(self) -> str:
+        """Direct transport needs no Retool thread; keep the cheap local id."""
+        if self.cfg.get("transport") == "direct":
+            return "direct-" + uuid.uuid4().hex
+        return await self.create_thread()
+
     def _default_post(self, path, payload, timeout):
         data = json.dumps(payload, ensure_ascii=True).encode("ascii")
         req = urllib.request.Request(self.cfg["base"] + path, data=data,
@@ -262,6 +274,12 @@ class RelaySession:
         self._drain_task = None
         self._loop = None
         self.sandbox_id = None
+        self._direct = None
+
+    def set_direct(self, head, tools, tool_choice, max_tokens, chunks=None):
+        """Direct transport: cacheable head, chunked history and native client tools."""
+        self._direct = {"head": head or "", "tools": tools, "tool_choice": tool_choice,
+                        "max_tokens": max_tokens, "chunks": chunks}
 
     def begin_request(self):
         """Reset cancellation only when the pool grants a new request lease."""
@@ -365,6 +383,13 @@ class RelaySession:
 
     async def _stream_turn(self, prompt, model_provider, tool_names=None):
         """Yield normalised provider events, cleaning its poller on every exit."""
+        if self.cfg.get("transport") == "direct":
+            args = self._direct or {}
+            async for event in direct.iter_events(
+                    self.cfg, self, model_provider, prompt, args.get("head"), args.get("tools"),
+                    args.get("tool_choice"), args.get("max_tokens"), args.get("chunks")):
+                yield event
+            return
         try:
             await self.open()
         except Exception as exc:
@@ -761,6 +786,11 @@ class SessionPool:
         for session in closing:
             await session.aclose()
 
+    async def _new_thread_id(self) -> str:
+        """Test backends may only implement create_thread()."""
+        maker = getattr(self.backend, "new_thread_id", None)
+        return await maker() if maker is not None else await self.backend.create_thread()
+
     async def acquire(self, conversation_key=None, *, isolated=False) -> SessionLease:
         """Take one slot and return an independently releasable request handle."""
         await self._slots.acquire()
@@ -791,13 +821,13 @@ class SessionPool:
                 locked = True
                 session = self._conversations.get(key)
                 if session is None:
-                    session = RelaySession(self.backend, await self.backend.create_thread())
+                    session = RelaySession(self.backend, await self._new_thread_id())
                     self._conversations[key] = session
                 keep = True
             else:
                 # No explicit affinity means a fresh thread, never a shared
                 # content-derived "anonymous" conversation.
-                session = RelaySession(self.backend, await self.backend.create_thread())
+                session = RelaySession(self.backend, await self._new_thread_id())
             session.begin_request()
             lease = SessionLease(session)
             self._active[lease] = (session, key, lock, keep)

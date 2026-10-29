@@ -63,9 +63,9 @@ def test_glm_reasoning_capability_does_not_invent_selectable_route_effort():
 
 def test_catalog_recommendations_are_valid_and_dated_without_removing_legacy_ids():
     entries = models.catalog()
-    assert len(entries) == len({entry['id'] for entry in entries}) == 37
+    assert len(entries) == len({entry['id'] for entry in entries}) == 38
     assert sum(entry['provider'] == 'openai' for entry in entries) == 15
-    assert sum(entry['provider'] == 'anthropic' for entry in entries) == 14
+    assert sum(entry['provider'] == 'anthropic' for entry in entries) == 15
     for entry in entries:
         levels = entry['reasoning_effort_levels']
         assert entry['default_reasoning_effort'] in levels if levels else entry['default_reasoning_effort'] is None

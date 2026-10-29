@@ -2,7 +2,7 @@
 
 Effort capabilities describe the Retool route rather than the provider-wide union.
 """
-from apierr import bad_request, not_found, service_unavailable
+from apierr import ApiError, bad_request, not_found, service_unavailable
 
 # Accepted reasoning effort values per provider (from the same bundle).
 EFFORTS_BY_PROVIDER = {
@@ -33,6 +33,7 @@ PROVIDER_RESOURCE_KEY = {
 }
 
 ALIASES = {"claude-opus": "claude-opus-5-5", "claude-sonnet": "claude-sonnet-5",
+           "claude-sonnet-5.5": "claude-sonnet-5-5",
            "claude-haiku": "claude-haiku-4-5-20251001", "gpt-5.6": "gpt-5.6-sol",
            "claude-opus-5.5": "claude-opus-5-5", "claude-opus-4.8": "claude-opus-4-8",
            "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol"}
@@ -62,6 +63,7 @@ CATALOG = [
     {"id": "claude-opus-4-5-20251101", "label": "Claude Opus 4.5", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-opus-4-6", "label": "Claude Opus 4.6", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-fable-5", "label": "Claude Fable 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet 4", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
@@ -189,6 +191,35 @@ def _canonical(name):
     return ALIASES.get(name, name)
 
 
+EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_EFFORT_RANK = {name: index for index, name in enumerate(EFFORT_ORDER)}
+
+
+def nearest_effort(levels, requested):
+    """Closest level the route accepts; ties resolve downwards."""
+    wanted = _EFFORT_RANK.get(str(requested or "").lower(), _EFFORT_RANK["medium"])
+    return min(levels, key=lambda level: (abs(_EFFORT_RANK.get(level, wanted) - wanted),
+                                          _EFFORT_RANK.get(level, wanted)))
+
+
+def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
+    """Like resolve(), but an unsupported effort is clamped instead of rejected.
+
+    Clients copy one effort across models, so e.g. xhigh legitimately reaches
+    Haiku, which only understands low/medium/high/max.
+    """
+    try:
+        return resolve(model, effort, strict=strict, default_model=default_model)
+    except ApiError as error:
+        entry, _ = resolve(model, None, strict=strict, default_model=default_model)
+        levels = entry.get("reasoning_effort_levels") or []
+        if error.status != 400 or not levels or not entry.get("reasoning", True):
+            raise
+        clamped = nearest_effort(levels, effort)
+        print("[effort] %s -> %s for %s" % (effort, clamped, entry["id"]), flush=True)
+        return entry, clamped
+
+
 def resolve(model, effort=None, *, strict=True, default_model=None):
     name = _canonical(model or default_model or '')
     if not name:
@@ -196,6 +227,7 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
     entry = _BY_ID.get(name)
     if entry is None:
         if strict:
+            print("[unknown-model]", repr(model), '->', repr(name), flush=True)
             raise not_found(f"unknown model '{name}'; see GET /v1/models")
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name, 'context': 200000}
     if effort is not None:

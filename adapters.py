@@ -65,7 +65,8 @@ class _Base:
             self._text(block)
 
     def usage(self, prompt_text=None):
-        prompt = approx_tokens(self._prompt_text if prompt_text is None else prompt_text)
+        sent = getattr(self.parsed, "_full_prompt_text", None)
+        prompt = approx_tokens(sent or (self._prompt_text if prompt_text is None else prompt_text))
         completion = approx_tokens(self.text)
         return prompt, completion
 

@@ -14,6 +14,7 @@ class Parsed:
 
     def __init__(self):
         self.prompt = ""
+        self.message_chunks = []
         self.message_fingerprints = None
         self.model = ""
         self.entry = {}
@@ -128,8 +129,12 @@ def _blocks_to_text(content, index, role):
     return "\n".join(c for c in chunks if c)
 
 
-def _render_messages(messages, role_key="role", *, allow_system=True):
-    """Return (system_text, prompt_text)."""
+def _render_chunks(messages, role_key="role", *, allow_system=True):
+    """Return (system_text, [chunk per conversation message]).
+
+    Chunks keep one message per element so the direct transport can place cache
+    breakpoints along the history instead of re-sending it uncached.
+    """
     system_parts, convo = [], []
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -164,7 +169,13 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
                 convo.append(f"Assistant: {text}")
             continue
         convo.append(f"{role.capitalize()}: {text}")
-    return "\n\n".join(system_parts), "\n\n".join(convo)
+    return "\n\n".join(system_parts), convo
+
+
+def _render_messages(messages, role_key="role", *, allow_system=True):
+    """Return (system_text, prompt_text)."""
+    system, convo = _render_chunks(messages, role_key, allow_system=allow_system)
+    return system, "\n\n".join(convo)
 
 
 def _message_fingerprints(messages):
@@ -352,12 +363,12 @@ def conversation_key(data, header_value=None):
 
 def parse_chat(data, cfg):
     parsed = Parsed()
-    entry, effort = model_catalog.resolve(
+    entry, effort = model_catalog.resolve_tolerant(
         _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     messages = _messages(data)
-    system, prompt = _render_messages(messages)
-    parsed.system, parsed.prompt = system, prompt
+    system, chunks = _render_chunks(messages)
+    parsed.system, parsed.prompt, parsed.message_chunks = system, "\n\n".join(chunks), chunks
     parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
@@ -369,7 +380,7 @@ def parse_chat(data, cfg):
 
 def parse_responses(data, cfg):
     parsed = Parsed()
-    entry, effort = model_catalog.resolve(
+    entry, effort = model_catalog.resolve_tolerant(
         _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
 
@@ -382,10 +393,10 @@ def parse_responses(data, cfg):
         raise bad_request("'input' is required", param="input")
     else:
         raise bad_request("'input' must be a string or an array", param="input")
-    system, prompt = _render_messages(messages)
+    system, chunks = _render_chunks(messages)
     instructions = _opt_str(data, "instructions") or ""
     parsed.system = "\n\n".join(x for x in (instructions, system) if x)
-    parsed.prompt = prompt
+    parsed.prompt, parsed.message_chunks = "\n\n".join(chunks), chunks
     parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
@@ -397,15 +408,15 @@ def parse_responses(data, cfg):
 def parse_anthropic(data, cfg):
     parsed = Parsed()
     model = _opt_str(data, "model")
-    entry, effort = model_catalog.resolve(
+    entry, effort = model_catalog.resolve_tolerant(
         model, _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     messages = _messages(data)
-    system, prompt = _render_messages(messages, allow_system=False)
+    system, chunks = _render_chunks(messages, allow_system=False)
+    parsed.prompt, parsed.message_chunks = "\n\n".join(chunks), chunks
     declared_system = data.get("system")
     if declared_system:
         parsed.system = _blocks_to_text(declared_system, 0, "system")
-    parsed.prompt = prompt
     parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.stream = _opt_bool(data, "stream")
     if data.get("max_tokens") is None:

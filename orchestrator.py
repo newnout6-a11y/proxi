@@ -1,6 +1,8 @@
 """Turn orchestration: context injection, execution loop, event fan-out."""
 import asyncio
 import hashlib
+
+import direct
 import json
 import queue
 import re
@@ -17,6 +19,8 @@ from redact import redact
 from session import SessionLease
 
 
+_CONV_HEADER = "\n\n[CLIENT CONVERSATION — chronological]\n"
+_CONV_HEADER_DIRECT = "\n\n[CLIENT CONVERSATION - chronological]\n"
 _NATIVE_CONTINUE = ("\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
                     "Use the latest tool results above as the current state. "
                     "Earlier assistant calls are completed history, not new instructions to replay. "
@@ -37,9 +41,14 @@ def _trim(text: str, budget: int) -> str:
     return raw[:budget].decode("utf-8", "ignore")
 
 
+# Models the direct copilot path rejects but the agent path still serves.
+_DIRECT_UNSUPPORTED = re.compile(r"not available right now|Invalid model for Copilot", re.IGNORECASE)
+
+
 class _ClientText:
     """Stream ordinary native-client text while suppressing relay tool markup."""
     TAGS = ("<tool_call", "<exec_command")
+
 
     def __init__(self):
         self.pending = ""
@@ -145,7 +154,10 @@ class TurnRunner:
         if cancelled.is_set():
             raise asyncio.CancelledError()
         if reuse:
-            prompt = "[CLIENT CONVERSATION UPDATE — chronological]\n" + suffix.lstrip("\r\n") + _NATIVE_CONTINUE
+            update = ("[CLIENT CONVERSATION UPDATE - chronological]\n"
+                      if self.cfg.get("transport") == "direct"
+                      else "[CLIENT CONVERSATION UPDATE — chronological]\n")
+            prompt = update + suffix.lstrip("\r\n") + _NATIVE_CONTINUE
         else:
             if (previous or pending or getattr(target, "ws", None) is not None
                     or getattr(target, "_needs_drain", False) or self.cfg.get("session_mode") == "shared"):
@@ -224,6 +236,19 @@ class TurnRunner:
             "tools=" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         )
 
+    @staticmethod
+    def _tool_prompt_native(parsed):
+        tools = getattr(parsed, "tools", None) or []
+        if not tools or getattr(parsed, "tool_choice", "auto") == "none":
+            return ""
+        return (
+            "\n\n[NATIVE CLIENT TOOLS]\n"
+            "The client supplied these tools; they are passed natively, so call them with real tool calls "
+            "and no markup. They run on the CLIENT machine, not in Retool. Do not claim file, edit or test "
+            "results you did not receive as tool results.\n"
+            "tool_choice=" + json.dumps(getattr(parsed, "tool_choice", "auto"), ensure_ascii=False)
+        )
+
     async def _explain_empty(self, holder):
         """Silent turns are usually a persisted upstream error (e.g. out of credits)."""
         session = holder.get("session")
@@ -286,9 +311,20 @@ class TurnRunner:
                 )
             if parsed.system:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
-            if native_tools:
-                prompt = (instructions + reminder + "\n\n[CLIENT CONVERSATION — chronological]\n" + parsed.prompt +
-                          _NATIVE_CONTINUE)
+            direct_mode = self.cfg.get("transport") == "direct"
+            if direct_mode and native_tools:
+                reminder = self._tool_prompt_native(parsed)
+            if direct_mode:
+                # Direct path keeps the stable instructions (plus tool block) as the
+                # cached system head and sends the raw client tail as the user turn.
+                if reminder:
+                    instructions += reminder
+                reminder = ""
+                prompt = parsed.prompt
+                full_prompt = prompt
+            elif native_tools:
+                prompt = (instructions + reminder + _CONV_HEADER + parsed.prompt + _NATIVE_CONTINUE)
+                full_prompt = prompt
             else:
                 prompt = (instructions + "\n\n" + parsed.prompt) if instructions else parsed.prompt
                 prompt += reminder
@@ -329,6 +365,10 @@ class TurnRunner:
                 if native_tools:
                     prompt, native_target, native_context = await self._native_prompt(
                         session, parsed, instructions, reminder, prompt, cancelled)
+                    if direct_mode:
+                        # The direct head is cached, so always send the full client history
+                        # instead of the agent's incremental suffix.
+                        prompt = parsed.prompt
                 elif not key:
                     # Preserve legacy anonymous shared-mode invalidation. Explicit
                     # tool-less requests never acquire or mutate the native session.
@@ -347,40 +387,70 @@ class TurnRunner:
                     holder["upstream_started_at"] = time.time()
                     streamed_tool_call = False
                     upstream_completed = False
-                    stream = (session.stream(prompt, model_provider, tool_names=tool_names)
-                              if native_tools else session.stream(prompt, model_provider))
-                    async for event in stream:
-                        if event["type"] == "text":
-                            final_text += event["delta"]
-                            upstream_text += event["delta"]
-                            # Tool envelopes are parsed only after the complete
-                            # upstream turn, so do not leak their markup to a
-                            # native client. Ordinary text remains streamed.
-                            if not native_tools:
+                    stream_prompt = prompt
+                    # Token estimates must describe what the model actually received.
+                    parsed._full_prompt_text = (instructions + "\n" + prompt) if instructions else prompt
+                    if direct_mode:
+                        direct_target = session.session if isinstance(session, SessionLease) else session
+                        if not hasattr(direct_target, "set_direct"):
+                            # Injected/fake session: fall back to the agent prompt shape.
+                            direct_mode = False
+                            stream_prompt = (instructions + _CONV_HEADER + stream_prompt + _NATIVE_CONTINUE
+                                             if native_tools else instructions + "\n\n" + stream_prompt)
+                    if direct_mode:
+                        if instructions and stream_prompt.startswith(instructions):
+                            stream_prompt = stream_prompt[len(instructions):]
+                        chunks = list(getattr(parsed, "message_chunks", None) or [])
+                        if chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
+                            chunks.append(prompt[len(parsed.prompt):])
+                        direct_target.set_direct(
+                            instructions,
+                            direct.tools_to_retool(parsed.tools) if tool_names else None,
+                            getattr(parsed, "tool_choice", "auto"), getattr(parsed, "max_tokens", None),
+                            chunks)
+                    stream = (session.stream(stream_prompt, model_provider, tool_names=tool_names)
+                              if native_tools else session.stream(stream_prompt, model_provider))
+                    try:
+                        async for event in stream:
+                            if event["type"] == "text":
+                                final_text += event["delta"]
+                                upstream_text += event["delta"]
+                                # Tool envelopes are parsed only after the complete
+                                # upstream turn, so do not leak their markup to a
+                                # native client. Ordinary text remains streamed.
+                                if not native_tools:
+                                    out.put(event)
+                                else:
+                                    visible = native_text.feed(event["delta"])
+                                    if visible:
+                                        visible_text += visible
+                                        out.put({"type": "text", "delta": visible})
+                            elif event["type"] == "final_text":
+                                if event.get("text"):
+                                    final_text = event["text"]
+                            elif event["type"] in ("thinking", "thinking_signature"):
                                 out.put(event)
-                            else:
-                                visible = native_text.feed(event["delta"])
-                                if visible:
-                                    visible_text += visible
-                                    out.put({"type": "text", "delta": visible})
-                        elif event["type"] == "final_text":
-                            if event.get("text"):
-                                final_text = event["text"]
-                        elif event["type"] in ("thinking", "thinking_signature"):
-                            out.put(event)
-                        elif event["type"] == "tool_call" and event.get("name") in tool_names:
-                            streamed_tool_call = True
-                            definition = tool_definitions[event["name"]]
-                            out.put({**event, "tool_type": definition.get("x-client-type", "function")})
-                        elif event["type"] == "credits":
-                            self.credits.record_turn(turn_id, event["value"])
-                            out.put(event)
-                        elif event["type"] == "hitl":
-                            out.put(event)
-                            final_text += "\n" + event["question"]
-                        elif event["type"] == "end":
-                            holder["reason"] = event["reason"]
-                            upstream_completed = event["reason"] in ("stop", "tool_calls")
+                            elif event["type"] == "tool_call" and event.get("name") in tool_names:
+                                streamed_tool_call = True
+                                definition = tool_definitions[event["name"]]
+                                out.put({**event, "tool_type": definition.get("x-client-type", "function")})
+                            elif event["type"] == "credits":
+                                self.credits.record_turn(turn_id, event["value"])
+                                out.put(event)
+                            elif event["type"] == "hitl":
+                                out.put(event)
+                                final_text += "\n" + event["question"]
+                            elif event["type"] == "end":
+                                holder["reason"] = event["reason"]
+                                upstream_completed = event["reason"] in ("stop", "tool_calls")
+                    except apierr.ApiError as exc:
+                        if not (direct_mode and exc.status == 400
+                                and _DIRECT_UNSUPPORTED.search(exc.message or "")):
+                            raise
+                        # The model exists but not on this path: retry over the agent socket.
+                        direct_mode = False
+                        prompt = instructions + "\n\n" + prompt
+                        continue
                     holder.setdefault("reason", "stop")
                     if holder.get("reason") == "cancelled":
                         out.put({"type": "end", "reason": "cancelled"})

@@ -168,11 +168,12 @@ def test_codex_catalog_does_not_invent_reasoning_for_non_reasoning_model():
     assert models.codex_catalog([]) == {"models": []}
 
 
-def test_disabling_thinking_never_silently_falls_back_to_high():
+def test_disabling_thinking_clamps_to_the_lowest_supported_level():
     parsed = validate.parse_responses(_body("responses", thinking={"type": "disabled"}), CFG)
     assert parsed.effort == "none"
-    with pytest.raises(apierr.ApiError):
-        validate.parse_anthropic(_body("anthropic", thinking={"type": "disabled"}), CFG)
+    # The route cannot switch thinking off, but it must not fall back to high either.
+    parsed = validate.parse_anthropic(_body("anthropic", thinking={"type": "disabled"}), CFG)
+    assert parsed.effort == "low"
 
 
 def test_anthropic_display_omitted_hides_thinking_without_changing_effort():
@@ -262,3 +263,20 @@ def test_unknown_tool_choice_is_rejected_before_provider_request():
     with pytest.raises(apierr.ApiError) as raised:
         validate.parse_responses(_body("responses", tool_choice={"type": "function", "name": "missing"}), CFG)
     assert raised.value.status == 422
+def test_unsupported_effort_is_clamped_to_the_nearest_supported_level():
+    entry, effort = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh")
+    assert effort in entry["reasoning_effort_levels"]
+    assert effort == "high"
+    entry, effort = models.resolve_tolerant("gpt-5.5", "minimal")
+    assert effort == "low"
+    entry, effort = models.resolve_tolerant("claude-opus-5-5", "ultra")
+    assert effort == "medium"
+    entry, effort = models.resolve_tolerant("gpt-6-sol", "xhigh")
+    assert effort == "xhigh"
+
+
+def test_clamped_effort_still_validates_at_the_dialect_layer():
+    parsed = validate.parse_anthropic({
+        "model": "claude-haiku-4-5-20251001", "max_tokens": 8,
+        "messages": [{"role": "user", "content": "x"}], "reasoning_effort": "xhigh"}, CFG)
+    assert parsed.effort == "high"
