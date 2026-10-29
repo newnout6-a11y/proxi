@@ -115,8 +115,9 @@ def test_real_pool_keeps_claude_parent_child_and_auxiliary_scopes_separate(tmp_p
         await send(body("child", followup=True, parent="main"))
 
     asyncio.run(scenario())
-    assert len(pool._conversations) == 4
+    assert set(pool._conversations) == {"claude-metadata:main", "claude-metadata:child"}
     assert [item[0] for item in backend.sent] == ["thread-1", "thread-2", "thread-3", "thread-4", "thread-1", "thread-3"]
+    assert backend.sent[1][2].closed and backend.sent[3][2].closed
     assert backend.starts == backend.connects == 4
     for index, identity in enumerate(("main", "child")):
         prompt = backend.sent[-2 + index][1]

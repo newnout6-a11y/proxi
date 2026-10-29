@@ -318,13 +318,12 @@ class TurnRunner:
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
-                pool_key = key
                 if key and not native_tools:
-                    pool_key = ("text", key, hashlib.sha256(parsed.system.encode("utf-8")).digest())
-                if key and not native_tools and self.cfg.get("session_mode") == "shared":
-                    session = await self.pool.acquire(pool_key, isolated=True)
+                    # Tool-less calls supply their complete history. Affinity alone
+                    # must not add prior standalone jobs to that client context.
+                    session = await self.pool.acquire(key, isolated=True)
                 else:
-                    session = await self.pool.acquire(pool_key) if pool_key else await self.pool.acquire()
+                    session = await self.pool.acquire(key) if key else await self.pool.acquire()
                 holder["session"] = session
                 native_target, native_context = None, None
                 if native_tools:
@@ -332,7 +331,7 @@ class TurnRunner:
                         session, parsed, instructions, reminder, prompt, cancelled)
                 elif not key:
                     # Preserve legacy anonymous shared-mode invalidation. Explicit
-                    # text scopes never acquire or mutate the native session.
+                    # tool-less requests never acquire or mutate the native session.
                     target = session.session if isinstance(session, SessionLease) else session
                     if getattr(target, "_client_context", None):
                         target._client_context_pending = True
@@ -426,6 +425,7 @@ class TurnRunner:
                         r"no (?:access|tools)|не (?:могу|доступ|имею)|нет доступа)", final_text, re.IGNORECASE)
                     if tool_names and refuses_tools and tool_retries < 1 and not visible_text.strip():
                         tool_retries += 1
+                        native_context = None  # Retry prompts are not part of the client history.
                         prompt = (base_prompt + "\n\n[CLIENT TOOL TRANSPORT CORRECTION]\n"
                                   "Your previous reply treated the client's tools as unavailable. "
                                   "Invoke a supplied tool using <tool_call> JSON instead of Retool sandbox tools. "
@@ -466,6 +466,7 @@ class TurnRunner:
                     if not command and not final_text.strip() and empty_retries < 1:
                         # Silent turn: insist once, keeping the full system prompt.
                         empty_retries += 1
+                        native_context = None  # Retry prompts are not part of the client history.
                         prompt = (base_prompt + "\n\n[RETRY] Предыдущий ход вернул пустой ответ. "
                                   "Ответь сейчас: нужна команда — выведи <exec_command>...</exec_command>, "
                                   "иначе дай короткий текстовый ответ.")

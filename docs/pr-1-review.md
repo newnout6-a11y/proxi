@@ -345,8 +345,9 @@ Relay получил постоянный ограниченный WS reader д�
 
 Исправления:
 
-- Tool-less запросы отделены от native-tools диалога по клиентскому ID и
-  system fingerprint. В shared mode они получают изолированный lease.
+- Tool-less запросы с клиентским ID отделены от native-tools диалога. Каждый
+  такой запрос получает свежий изолированный lease во всех session modes, поэтому
+  повторная генерация заголовка не наследует предыдущие задания.
 - Claude Code session ID извлекается из JSON-строки `metadata.user_id`;
   account/device/parent IDs не используются вместо собственного ID разговора.
 - Fingerprints сравнивают model-visible содержимое с сохранением границ
@@ -386,3 +387,22 @@ title-job, без исполнения project tools и с прежним Opus 5
 не входит в обычный metadata.user_id; дети могут разделять runtime SID.
 Разные предоставленные SID изолируются, изменившаяся история ротируется,
 но постоянная параллельная warm-изоляция таких детей отдельно не проверена.
+
+## Дополнительные замечания Qodo о контексте
+
+Повторные самостоятельные tool-less задания больше не сохраняют общий thread
+по совпадению client ID и system. Они освобождают собственный lease после
+завершения; основной native-tools диалог продолжает использовать свой thread.
+
+Если native-ход потребовал внутреннего повтора после пустого ответа или отказа
+использовать tools, его upstream-история содержит служебную correction, которой
+нет в клиентской истории. Такой ход больше не делает session пригодной для
+incremental reuse: следующий клиентский запрос начинает свежий thread с полным
+контекстом. Обычный успешный ход сохраняет прежнее переиспользование.
+
+Проверка итогового follow-up в основном checkout:
+`python -m pytest -o addopts= -q` — **637 passed in 51.08s**.
+`python -m py_compile orchestrator.py tests/test_affinity_scopes.py tests/test_claude_affinity.py tests/test_native_retry_context.py`
+и scoped `git -c core.safecrlf=false diff --check` — exit 0.
+Отдельный независимый прогон lifecycle/cancel/native regressions —
+**146 passed in 4.05s**. Новых живых модельных замеров этот follow-up не добавляет.

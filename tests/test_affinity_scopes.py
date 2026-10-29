@@ -1,9 +1,11 @@
 """Auxiliary requests cannot replace or block the native client's warm session."""
 import asyncio
 import json
+import threading
 
 import pytest
 
+import validate
 from test_native_context_reuse import FIRST, request, run, setup
 
 
@@ -55,15 +57,17 @@ def test_service_requests_preserve_native_socket_and_incremental_tool_results(tm
         assert target.ws is socket and target._client_context_pending is False
 
     asyncio.run(scenario())
-    assert backend.created == ["thread-1", "thread-2"]
-    assert backend.starts == backend.connects == 2
+    assert backend.created == ["thread-" + str(index) for index in range(1, service_count + 2)]
+    assert backend.starts == backend.connects == service_count + 1
     assert backend.sent[0][0] == backend.sent[-1][0] == "thread-1"
-    assert all(item[0] == "thread-2" for item in backend.sent[1:-1])
+    assert [item[0] for item in backend.sent[1:-1]] == backend.created[1:]
+    assert all(item[2].closed for item in backend.sent[1:-1])
+    assert list(pool._conversations) == [first.conversation_key]
     assert "NEW_NATIVE_TOOL_RESULT" in backend.sent[-1][1]
     assert "ORIGINAL_TASK" not in backend.sent[-1][1] and 'tools=[' not in backend.sent[-1][1]
 
 
-def test_auxiliary_systems_and_native_conversations_have_distinct_typed_scopes(tmp_path):
+def test_auxiliary_jobs_never_cache_history_across_systems_or_into_native_conversations(tmp_path):
     backend, pool, runner = scenario_setup(tmp_path)
     first, following = main_requests()
 
@@ -75,12 +79,9 @@ def test_auxiliary_systems_and_native_conversations_have_distinct_typed_scopes(t
         await run(runner, following)
 
     asyncio.run(scenario())
-    assert [item[0] for item in backend.sent] == ["thread-1", "thread-2", "thread-3", "thread-2", "thread-1"]
-    assert first.conversation_key in pool._conversations
-    auxiliary_keys = [key for key in pool._conversations if isinstance(key, tuple)]
-    assert len(auxiliary_keys) == 2
-    assert all(key[:2] == ("text", first.conversation_key) for key in auxiliary_keys)
-    assert all(isinstance(key[2], bytes) and len(key[2]) == 32 for key in auxiliary_keys)
+    assert [item[0] for item in backend.sent] == ["thread-1", "thread-2", "thread-3", "thread-4", "thread-1"]
+    assert list(pool._conversations) == [first.conversation_key]
+    assert all(item[2].closed for item in backend.sent[1:-1])
     assert "SUMMARY_PRIVATE_SYSTEM" not in backend.sent[1][1]
     assert "TITLE_PRIVATE_SYSTEM" not in backend.sent[2][1]
 
@@ -99,7 +100,7 @@ def test_parent_and_subagent_keep_their_native_and_service_scopes_separate(tmp_p
 
     asyncio.run(scenario())
     assert [item[0] for item in backend.sent] == ["thread-1", "thread-2", "thread-3", "thread-4", "thread-1", "thread-2"]
-    assert len(pool._conversations) == 4
+    assert set(pool._conversations) == set(keys)
     for index, (_, prompt, _) in enumerate(backend.sent[-2:]):
         assert "PRIVATE_TOOL_RESULT_" + str(index) in prompt
         assert "PRIVATE_TOOL_RESULT_" + str(1 - index) not in prompt
@@ -185,3 +186,101 @@ def test_isolated_lease_bypasses_both_reuse_modes_and_releases_its_own_slot(tmp_
         assert not pool._active and pool._slots._value == 2
 
     asyncio.run(scenario())
+
+
+def identified_service(source, content, *, model="claude-opus-5-5"):
+    data = {"model": model, "messages": [
+        {"role": "system", "content": "STANDALONE_SYSTEM"},
+        {"role": "user", "content": content},
+    ]}
+    header = "standalone-client" if source == "header" else None
+    if source == "metadata":
+        data["metadata"] = {"user_id": json.dumps({"session_id": "standalone-client"})}
+    elif source != "header":
+        data[source] = "standalone-client"
+    parsed = validate.parse_chat(data, {"strict_models": True, "model": model})
+    parsed.conversation_key = validate.conversation_key(data, header)
+    return parsed
+
+
+@pytest.mark.parametrize("mode", ["per_conversation", "shared", "per_request"])
+@pytest.mark.parametrize("source", ["header", "conversation", "conversation_id", "session_id", "metadata"])
+@pytest.mark.parametrize("second_model", ["claude-opus-5-5", "claude-sonnet-5"])
+def test_toolless_jobs_never_reuse_implicit_history(tmp_path, mode, source, second_model):
+    backend, pool, runner = scenario_setup(tmp_path, session_mode=mode, max_workers=1)
+    first = identified_service(source, "FIRST_STANDALONE_INPUT")
+    second = identified_service(source, "SECOND_STANDALONE_INPUT", model=second_model)
+
+    async def scenario():
+        for parsed in (first, second, first):
+            events = await run(runner, parsed)
+            assert events[-1] == {"type": "end", "reason": "stop"}
+            assert not pool._active and pool._slots._value == 1
+
+    asyncio.run(scenario())
+    assert first.conversation_key == second.conversation_key
+    assert backend.created == ["thread-1", "thread-2", "thread-3"]
+    assert [item[0] for item in backend.sent] == backend.created
+    assert all(item[2].closed for item in backend.sent)
+    assert not pool._conversations and not pool._conversation_locks and pool._shared is None
+    assert "FIRST_STANDALONE_INPUT" not in backend.sent[1][1]
+    assert "SECOND_STANDALONE_INPUT" not in backend.sent[2][1]
+
+
+def test_complete_plain_conversation_history_is_preserved_without_implicit_upstream_history(tmp_path):
+    backend, pool, runner = scenario_setup(tmp_path)
+    first = service_request(key="conversation_id:plain", content="PLAIN_FIRST_USER")
+    following = request([
+        {"role": "user", "content": "PLAIN_FIRST_USER"},
+        {"role": "assistant", "content": "PLAIN_FIRST_ANSWER"},
+        {"role": "user", "content": "PLAIN_SECOND_USER"},
+    ], key=first.conversation_key, system=first.system, tools=[])
+
+    async def scenario():
+        await run(runner, first)
+        events = await run(runner, following)
+        assert events[-1] == {"type": "end", "reason": "stop"}
+
+    asyncio.run(scenario())
+    assert backend.created == ["thread-1", "thread-2"]
+    assert all(text in backend.sent[-1][1] for text in (
+        "PLAIN_FIRST_USER", "PLAIN_FIRST_ANSWER", "PLAIN_SECOND_USER"))
+    assert following.prompt in backend.sent[-1][1]
+    assert not pool._conversations
+
+
+@pytest.mark.parametrize("mode", ["per_conversation", "shared"])
+@pytest.mark.parametrize("failure", ["error", "cancelled"])
+def test_failed_service_releases_its_slot_without_changing_native_context(tmp_path, mode, failure):
+    backend, pool, runner = scenario_setup(tmp_path, session_mode=mode, max_workers=1)
+    first, following = main_requests()
+
+    async def scenario():
+        await run(runner, first)
+        target = pool._shared if mode == "shared" else pool._conversations[first.conversation_key]
+        socket, context = target.ws, target._client_context
+        holder = {"cancel_event": threading.Event()}
+        if failure == "error":
+            backend.scripts.append([{"type": "error", "error": "standalone failure"}])
+        else:
+            def cancel():
+                holder["cancel_event"].set()
+                holder["session"].cancel()
+            backend.on_send = cancel
+        events = await run(runner, service_request(), holder)
+        backend.on_send = None
+        if failure == "error":
+            assert any(event["type"] == "error" for event in events)
+        else:
+            assert events[-1] == {"type": "end", "reason": "cancelled"}
+        assert backend.sent[-1][2].closed
+        assert not pool._active and pool._slots._value == 1
+        assert target.ws is socket and not socket.closed
+        assert target._client_context is context and not target._client_context_pending
+        events = await run(runner, following)
+        assert events[-1] == {"type": "end", "reason": "stop"}
+        assert target.ws is socket and not target._client_context_pending
+
+    asyncio.run(scenario())
+    assert [item[0] for item in backend.sent] == ["thread-1", "thread-2", "thread-1"]
+    assert "NEW_NATIVE_TOOL_RESULT" in backend.sent[-1][1]

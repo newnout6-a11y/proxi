@@ -230,3 +230,8 @@ those schemas, IDs, complete arguments and results, including namespace tools;
 it does not create a second, incompatible goal engine. Subagent lifecycle,
 permissions and persistence are likewise owned by the IDE. The relay carries
 independent requests and isolates their upstream sessions.
+
+Claude Code's in-process subagents may share the parent's runtime session ID:
+the installed CLI does not include its internal agent ID in ordinary metadata.
+Distinct supplied session IDs are isolated; independent warm conversations for
+every in-process Claude child have not been verified.
