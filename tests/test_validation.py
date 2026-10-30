@@ -90,3 +90,17 @@ def test_top_level_reasoning_effort_camel_case_is_accepted(relay):
     status, body = relay.json("/v1/chat/completions", payload)
     assert status == 200
     assert body["choices"][0]["message"]
+
+def test_nested_settings_reasoning_effort_is_accepted(relay):
+    payload = dict(GOOD, settings={"reasoningEffort": "max"})
+    status, body = relay.json("/v1/chat/completions", payload)
+    assert status == 200
+    assert body["choices"][0]["message"]
+
+
+def test_model_hash_variant_and_provider_prefix_accepted(relay):
+    payload = dict(GOOD, model="retool-relay/claude-opus-5-5#max")
+    status, body = relay.json("/v1/chat/completions", payload)
+    assert status == 200
+    assert body["choices"][0]["message"]
+

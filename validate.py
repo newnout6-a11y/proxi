@@ -561,6 +561,17 @@ def _effort(data):
         selected.append(_opt_str(data, "reasoningEffort"))
     if data.get("effort") is not None:
         selected.append(_opt_str(data, "effort"))
+    for container in (data.get("settings"), data.get("options"), data.get("body"),
+                      data.get("extra_body"), (data.get("providerOptions") or {}).get("openai")):
+        if isinstance(container, dict):
+            if container.get("reasoning_effort") is not None:
+                selected.append(_opt_str(container, "reasoning_effort"))
+            if container.get("reasoningEffort") is not None:
+                selected.append(_opt_str(container, "reasoningEffort"))
+            if container.get("effort") is not None:
+                selected.append(_opt_str(container, "effort"))
+            if isinstance(container.get("reasoning"), dict) and container["reasoning"].get("effort") is not None:
+                selected.append(_opt_str(container["reasoning"], "effort"))
     reasoning = data.get("reasoning")
     if reasoning is not None and not isinstance(reasoning, dict):
         raise unprocessable("'reasoning' must be an object", param="reasoning")
