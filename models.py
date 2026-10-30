@@ -36,7 +36,8 @@ ALIASES = {"claude-opus": "claude-opus-5-5", "claude-sonnet": "claude-sonnet-5",
            "claude-sonnet-5.5": "claude-sonnet-5-5",
            "claude-haiku": "claude-haiku-4-5-20251001", "gpt-5.6": "gpt-5.6-sol",
            "claude-opus-5.5": "claude-opus-5-5", "claude-opus-4.8": "claude-opus-4-8",
-           "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol"}
+           "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol",
+           "gpt-6.1": "gpt-6.1-sol"}
 
 CATALOG = [
     {"id": "gpt-6.1-sol", "label": "GPT 6.1-sol", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
