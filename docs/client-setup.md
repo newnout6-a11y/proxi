@@ -1,5 +1,68 @@
 # Coding clients
 
+## OpenCode
+
+OpenCode Desktop and CLI configure custom providers via `~/.config/opencode/opencode.jsonc` (or project-level `opencode.json`).
+
+The relay runs at `http://127.0.0.1:8787/v1` under `@ai-sdk/openai-compatible`.
+
+Example provider configuration with custom reasoning effort variants:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "retool-relay": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Retool relay",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "relay-..."
+      },
+      "models": {
+        "claude-opus-5-5": {
+          "name": "Claude Opus 5.5",
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "tool_call": true,
+          "attachment": true,
+          "reasoning": true,
+          "variants": {
+            "low": { "name": "Low", "settings": { "reasoningEffort": "low" } },
+            "medium": { "name": "Medium", "settings": { "reasoningEffort": "medium" } },
+            "high": { "name": "High", "settings": { "reasoningEffort": "high" } },
+            "max": { "name": "Max", "settings": { "reasoningEffort": "max" } }
+          }
+        },
+        "gpt-6.1": {
+          "name": "GPT 6.1",
+          "limit": {
+            "context": 1050000,
+            "output": 128000
+          },
+          "tool_call": true,
+          "attachment": true,
+          "reasoning": true,
+          "variants": {
+            "low": { "name": "Low", "settings": { "reasoningEffort": "low" } },
+            "medium": { "name": "Medium", "settings": { "reasoningEffort": "medium" } },
+            "high": { "name": "High", "settings": { "reasoningEffort": "high" } },
+            "xhigh": { "name": "Extra High", "settings": { "reasoningEffort": "xhigh" } },
+            "max": { "name": "Max", "settings": { "reasoningEffort": "max" } }
+          }
+        }
+      }
+    }
+  },
+  "model": "retool-relay/claude-opus-5-5"
+}
+```
+
+> [!NOTE]
+> OpenCode requires the `variants` field to be a dictionary/object mapping variant IDs to their configuration (`{ "id": { ... } }`). Passing an array (`[ ... ]`) causes schema validation failure and skips loading the provider.
+
 ## DeepSeek Harness
 
 The Desktop shortcut `DeepSeek Harness.lnk` launches the installed
