@@ -6,10 +6,13 @@ import socket
 HEARTBEAT_EVERY = 15.0
 
 
+import time
+
 class StreamWriter:
     def __init__(self, handler):
         self.handler = handler
         self.broken = False
+        self.last_write = time.time()
 
     def start(self, headers=None):
         self.handler.send_response(200)
@@ -30,6 +33,7 @@ class StreamWriter:
         try:
             self.handler.wfile.write(text.encode("utf-8"))
             self.handler.wfile.flush()
+            self.last_write = time.time()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             self.broken = True
 

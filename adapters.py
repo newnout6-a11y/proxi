@@ -61,13 +61,13 @@ class _Base:
             self.credits += event.get("value", 0.0)
             usage = event.get("usage") or {}
             if usage.get("cache_read") is not None:
-                self.cache_read = int(usage["cache_read"])
+                self.cache_read = (self.cache_read or 0) + int(usage["cache_read"])
             if usage.get("cache_write") is not None:
-                self.cache_write = int(usage["cache_write"])
+                self.cache_write = (self.cache_write or 0) + int(usage["cache_write"])
             if usage.get("input_tokens") is not None:
-                self.input_tokens = int(usage["input_tokens"])
+                self.input_tokens = (self.input_tokens or 0) + int(usage["input_tokens"])
             if usage.get("output_tokens") is not None:
-                self.output_tokens = int(usage["output_tokens"])
+                self.output_tokens = (self.output_tokens or 0) + int(usage["output_tokens"])
             output_tokens = self.output_tokens
             if self.thinking:
                 self.reasoning_tokens = approx_tokens(self.thinking)
@@ -426,6 +426,8 @@ class ResponsesAdapter(_Base):
                           "total_tokens": prompt + completion,
                           "input_token_details": {"cached_tokens": self.cache_read},
                           "output_token_details": {"reasoning_tokens": reasoning},
+                          "input_tokens_details": {"cached_tokens": self.cache_read},
+                          "output_tokens_details": {"reasoning_tokens": reasoning},
                           "credits_used": round(self.credits, 5), "estimated": True}}
 
 
@@ -525,7 +527,9 @@ class AnthropicAdapter(_Base):
         return "end_turn"
 
     def end(self, reason, prompt_text=None):
-        usage = {"input_tokens": self.usage(prompt_text)[0], "output_tokens": self.usage(prompt_text)[1],
+        raw_prompt, completion = self.usage(prompt_text)
+        non_cached = self.input_tokens if self.input_tokens is not None else max(0, raw_prompt - (self.cache_read or 0) - (self.cache_write or 0))
+        usage = {"input_tokens": non_cached, "output_tokens": completion,
                  "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_write}
         if not self._blocks:
             self._open("text")
@@ -539,11 +543,12 @@ class AnthropicAdapter(_Base):
         return self.payload(reason, prompt_text)
 
     def payload(self, reason, prompt_text=None):
-        prompt, completion = self.usage(prompt_text)
+        raw_prompt, completion = self.usage(prompt_text)
+        non_cached = self.input_tokens if self.input_tokens is not None else max(0, raw_prompt - (self.cache_read or 0) - (self.cache_write or 0))
         return {"id": self.id, "type": "message", "role": "assistant", "model": self.parsed.model,
                 "content": [dict(block) for block in self._blocks] or [{"type": "text", "text": ""}],
                 "stop_reason": self._stop_reason(reason), "stop_sequence": None,
-                "usage": {"input_tokens": prompt, "output_tokens": completion,
+                "usage": {"input_tokens": non_cached, "output_tokens": completion,
                           "cache_read_input_tokens": self.cache_read,
                           "cache_creation_input_tokens": self.cache_write,
                           "credits_used": round(self.credits, 5), "estimated": True}}

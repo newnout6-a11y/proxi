@@ -3,7 +3,7 @@ import hashlib
 import json
 import math
 
-from apierr import bad_request, unprocessable
+from apierr import bad_request, unprocessable, ApiError
 import models as model_catalog
 
 MAX_TOKENS_CAP = 1_000_000  # absolute ceiling when a model has no catalog value
@@ -135,7 +135,7 @@ def _extract_image_data(block, where):
                         if len(buf) > max_bytes:
                             raise unprocessable("failed to fetch image attachments: image exceeds maximum allowed size (10MB)", param=where)
                         data_b64 = base64.b64encode(buf).decode("ascii")
-                except apierr.ApiError:
+                except ApiError:
                     raise
                 except Exception:
                     raise unprocessable(f"failed to fetch image attachments from {url}", param=where)

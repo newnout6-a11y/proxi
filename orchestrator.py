@@ -446,9 +446,9 @@ class TurnRunner:
                         chunks = list(getattr(parsed, "message_chunks", None) or ([parsed.prompt] if getattr(parsed, "prompt", None) else []))
                         if exec_chunks:
                             chunks.extend(exec_chunks)
-                        elif last_followup:
+                        if last_followup and (not exec_chunks or not exec_chunks[-1].endswith(stream_prompt.strip())):
                             chunks.append(stream_prompt.strip())
-                        elif chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
+                        elif not exec_chunks and chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
 
                         tools_converted = direct.tools_to_retool(parsed.tools) if native_tools else []

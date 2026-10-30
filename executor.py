@@ -145,7 +145,12 @@ def extract_tool_call(text: str, allowed=None):
         arguments = value["input"]
     elif "parameters" in value:
         arguments = value["parameters"]
-    elif attr_name_match or ("name" in value and len(value) > 1):
+    elif attr_name_match:
+        if value.get("name") == name or value.get("tool") == name or value.get("toolName") == name:
+            arguments = {k: v for k, v in value.items() if k not in ("name", "id", "tool", "toolName", "namespace", "tool_call_id")}
+        else:
+            arguments = {k: v for k, v in value.items() if k not in ("id", "tool_call_id")}
+    elif "name" in value:
         arguments = {k: v for k, v in value.items() if k not in ("name", "id", "tool", "toolName", "namespace", "tool_call_id")}
     else:
         arguments = value

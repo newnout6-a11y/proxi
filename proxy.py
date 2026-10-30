@@ -305,6 +305,10 @@ def make_handler(runtime: Runtime):
         def _health(self):
             balance = runtime.credits.get_balance()
             ok = balance.get("available") is not None and not balance.get("stale")
+            for b in getattr(runtime.pool, "backends", []):
+                ref = getattr(b, "refresher", None)
+                if ref and ref.status().get("stale"):
+                    ok = False
             payload = {
                 "ok": ok,
                 "uptime_seconds": round(time.time() - runtime.started, 1),
@@ -445,7 +449,8 @@ def make_handler(runtime: Runtime):
                     event = events.get(timeout=0.25)
                 except queue.Empty:
                     now = time.time()
-                    if now - last_write >= sse.HEARTBEAT_EVERY:
+                    writer_last = getattr(writer, "last_write", last_write)
+                    if now - writer_last >= sse.HEARTBEAT_EVERY:
                         writer.comment()
                         last_write = now
                     if sse.client_gone(self):
@@ -515,7 +520,9 @@ def main():
     slots = threading.BoundedSemaphore(cfg["max_workers"])
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
 
-    runtime.backend.refresher.start()
+    for b in getattr(runtime.pool, "backends", [runtime.backend]):
+        if hasattr(b, "refresher") and b.refresher:
+            b.refresher.start()
     balance = runtime.credits.get_balance(force_refresh=True)
     print("=" * 64)
     print(" Retool AI relay")
@@ -555,7 +562,9 @@ def main():
                 time.sleep(0.5)
     finally:
         try:
-            runtime.backend.refresher.stop()
+            for b in getattr(runtime.pool, "backends", [runtime.backend]):
+                if hasattr(b, "refresher") and b.refresher:
+                    b.refresher.stop()
             async def _cancel_all():
                 tasks = [t for t in asyncio.all_tasks(runtime.loop) if t is not asyncio.current_task()]
                 for t in tasks:
