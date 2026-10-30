@@ -784,6 +784,19 @@ class SessionPool:
     def __init__(self, backend: Backend):
         self.backend = backend
         self.cfg = backend.cfg
+        self.backends = [backend]
+        if isinstance(self.cfg.get("accounts"), list) and self.cfg["accounts"]:
+            self.backends = []
+            for acc in self.cfg["accounts"]:
+                acc_cfg = dict(self.cfg)
+                acc_cfg.update(acc)
+                acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
+                acc_cfg["_account_ref"] = acc
+                acc_backend = Backend(acc_cfg, http_post=getattr(backend, "_http_post", None),
+                                      ws_connect=getattr(backend, "_ws_connect", None))
+                self.backends.append(acc_backend)
+            if self.backends:
+                self.backend = self.backends[0]
         self._shared = None
         self._lock = asyncio.Lock()
         self._conversations = {}
@@ -792,6 +805,20 @@ class SessionPool:
         self._last_used = {}
         self._slots = asyncio.BoundedSemaphore(max(1, self.cfg["max_workers"]))
         self._active = {}
+
+    def _next_backend(self) -> Backend:
+        if len(self.backends) <= 1:
+            return self.backend
+        counts = {b: 0 for b in self.backends}
+        for s in self._conversations.values():
+            if getattr(s, "backend", None) in counts:
+                counts[s.backend] += 1
+        for session, _, _, _ in self._active.values():
+            if getattr(session, "backend", None) in counts:
+                counts[session.backend] += 2
+        idx = getattr(self, "_rr_index", 0)
+        self._rr_index = (idx + 1) % len(self.backends)
+        return min(self.backends, key=lambda b: (counts[b], (self.backends.index(b) - idx) % len(self.backends)))
 
     @property
     def mode(self):
@@ -820,10 +847,11 @@ class SessionPool:
         for session in closing:
             await session.aclose()
 
-    async def _new_thread_id(self) -> str:
+    async def _new_thread_id(self, backend=None) -> str:
         """Test backends may only implement create_thread()."""
-        maker = getattr(self.backend, "new_thread_id", None)
-        return await maker() if maker is not None else await self.backend.create_thread()
+        b = backend or self.backend
+        maker = getattr(b, "new_thread_id", None)
+        return await maker() if maker is not None else await b.create_thread()
 
     async def acquire(self, conversation_key=None, *, isolated=False) -> SessionLease:
         """Take one slot and return an independently releasable request handle."""
@@ -851,20 +879,39 @@ class SessionPool:
                 lock = self._conversation_locks.setdefault(key, asyncio.Lock())
                 self._conversation_refs[key] = self._conversation_refs.get(key, 0) + 1
                 referenced = True
-                await lock.acquire()
-                locked = True
-                session = self._conversations.get(key)
-                if session is None:
-                    session = RelaySession(self.backend, await self._new_thread_id())
-                    self._conversations[key] = session
-                    journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
-                                 conversation=journal.tag(key), thread=journal.tag(session.thread_id),
-                                 pool=len(self._conversations))
-                keep = True
+                if lock.locked() and (getattr(self._conversations.get(key), "_direct", None)
+                                      or getattr(self._conversations.get(key), "_cached_head", None)
+                                      or self.cfg.get("transport") == "direct"
+                                      or len(self.backends) > 1):
+                    parent = self._conversations.get(key)
+                    backend = self._next_backend()
+                    session = RelaySession(backend, await self._new_thread_id(backend))
+                    if parent is not None:
+                        if getattr(parent, "_cached_head", None):
+                            session._cached_head = parent._cached_head
+                        if getattr(parent, "_registered_tools", None):
+                            session._registered_tools = dict(parent._registered_tools)
+                        if getattr(parent, "_direct", None):
+                            session._direct = dict(parent._direct)
+                    keep = False
+                    lock = None
+                else:
+                    await lock.acquire()
+                    locked = True
+                    session = self._conversations.get(key)
+                    if session is None:
+                        backend = self._next_backend()
+                        session = RelaySession(backend, await self._new_thread_id(backend))
+                        self._conversations[key] = session
+                        journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
+                                     conversation=journal.tag(key), thread=journal.tag(session.thread_id),
+                                     pool=len(self._conversations))
+                    keep = True
             else:
                 # No explicit affinity means a fresh thread, never a shared
                 # content-derived "anonymous" conversation.
-                session = RelaySession(self.backend, await self._new_thread_id())
+                backend = self._next_backend()
+                session = RelaySession(backend, await self._new_thread_id(backend))
                 if conversation_key and conversation_key in self._conversations:
                     parent = self._conversations[conversation_key]
                     if getattr(parent, "_cached_head", None):
@@ -903,6 +950,11 @@ class SessionPool:
         lease.released = True
         session, key, lock, keep = record
         try:
+            if not keep:
+                if key and key in self._conversations:
+                    parent = self._conversations[key]
+                    if parent is not None and getattr(session, "_registered_tools", None):
+                        parent._registered_tools.update(session._registered_tools)
             if not keep or session._needs_drain:
                 await session.aclose()
         finally:

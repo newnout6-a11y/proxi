@@ -74,6 +74,15 @@ class Refresher:
                              ok=False, error=self.last_error, forced=force)
                 return False
             merge_set_cookie(self.cfg, headers)
+            if "_account_ref" in self.cfg and isinstance(self.cfg["_account_ref"], dict):
+                self.cfg["_account_ref"]["cookie"] = self.cfg["cookie"]
+                self.cfg["_account_ref"]["xsrf"] = self.cfg["xsrf"]
+            if isinstance(self.cfg.get("accounts"), list):
+                for acc in self.cfg["accounts"]:
+                    if isinstance(acc, dict) and acc.get("page_uuid") == self.cfg.get("page_uuid"):
+                        acc["cookie"] = self.cfg["cookie"]
+                        acc["xsrf"] = self.cfg["xsrf"]
+                        break
             self._persist()
             journal.emit("auth.refresh", "Сессия Retool продлена", "success", ok=True, forced=force,
                          rotated=bool(headers), persistence_error=self.persistence_error)

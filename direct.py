@@ -517,6 +517,7 @@ async def _stream_body(cfg, session, body, param_types=None):
 
 async def _drain(cfg, session, queue, text, thinking, param_types=None):
     started = loop_now()
+    think_started = None
     """Consume one attempt's NDJSON lines, yielding normalised events.
 
     Calls are keyed by id: a provider may interleave several tool calls in one
@@ -525,11 +526,22 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
     stack = []  # open calls, newest last; deltas belong to the newest open block
     calls = {}
     current = None
+    req_id = getattr(session, "thread_id", None) or "req"
     while True:
         if session._cancelled:
             yield {"type": "end", "reason": "cancelled"}
             return
-        item = await queue.get()
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            if think_started is not None and not text:
+                elapsed = loop_now() - think_started
+                print(f"[{req_id}] Model is actively reasoning... ({round(elapsed)}s elapsed)", flush=True)
+                journal.emit("upstream.thinking_heartbeat",
+                             f"Модель активно думает ({round(elapsed)} с)",
+                             "debug", elapsed=round(elapsed, 1), thread=journal.tag(req_id))
+                yield {"type": "thinking_heartbeat", "elapsed": round(elapsed, 1)}
+            continue
         if item is None:
             return
         if isinstance(item, BaseException):
@@ -545,6 +557,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
             if event.get("type") == "thinking":
                 # Opus 5.5 streams no thinking text, only this early start and a final
                 # signature; surfacing the start replaces silence with "thinking".
+                think_started = loop_now()
                 yield {"type": "thinking_start"}
             elif event.get("type") == "tool_call":
                 current = event.get("toolCallId") or "call_%d" % len(calls)
@@ -564,6 +577,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
                     text.append(piece)
                     yield {"type": "text", "delta": piece}
             elif block == "thinking":
+                if think_started is None:
+                    think_started = loop_now()
                 piece = event.get("partialThinking") or ""
                 if piece:
                     thinking.append(piece)

@@ -331,10 +331,15 @@ def _finish(data, parsed):
     if declared:
         parsed.declared_ignored = declared
     stream_options = data.get("stream_options")
+    if stream_options is None:
+        stream_options = data.get("streamOptions")
     if stream_options is not None:
         if not isinstance(stream_options, dict):
             raise unprocessable("'stream_options' must be an object", param="stream_options")
-        parsed.wants_usage = _opt_bool(stream_options, "include_usage")
+        inc = _opt_bool(stream_options, "include_usage")
+        if inc is None or not inc:
+            inc = _opt_bool(stream_options, "includeUsage")
+        parsed.wants_usage = bool(inc)
     parsed.tools = _tools(data)
     parsed.tool_choice = _tool_choice(data.get("tool_choice"))
     names = [tool["function"]["name"] for tool in parsed.tools]
@@ -465,6 +470,14 @@ def conversation_key(data, header_value=None, allow_content_fallback=False):
                 return "claude-metadata:" + session_id.strip()
     if allow_content_fallback:
         messages = data.get("messages")
+        if not messages and "input" in data:
+            raw_input = data.get("input")
+            if isinstance(raw_input, str):
+                messages = [{"role": "user", "content": raw_input}]
+            elif isinstance(raw_input, list):
+                messages = raw_input
+            elif isinstance(raw_input, dict):
+                messages = [raw_input]
         if isinstance(messages, list) and messages:
             root_msg = None
             for msg in messages:
@@ -473,6 +486,8 @@ def conversation_key(data, header_value=None, allow_content_fallback=False):
                     break
             if root_msg is None and isinstance(messages[0], dict):
                 root_msg = messages[0]
+            elif root_msg is None and messages and isinstance(messages[0], str):
+                root_msg = {"role": "user", "content": messages[0]}
             if root_msg is not None:
                 raw = json.dumps(root_msg, sort_keys=True, ensure_ascii=False)
                 h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]

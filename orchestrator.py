@@ -390,8 +390,9 @@ class TurnRunner:
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
-                if key and not native_tools:
-                    # Tool-less calls supply their complete history. Affinity alone
+                can_exec = self._can_exec(0) and not native_tools
+                if not direct_mode and key and not native_tools and not can_exec:
+                    # Tool-less calls in agent mode supply their complete history. Affinity alone
                     # must not add prior standalone jobs to that client context.
                     session = await self.pool.acquire(key, isolated=True)
                 else:
@@ -414,8 +415,9 @@ class TurnRunner:
                     # Preserve legacy anonymous shared-mode invalidation. Explicit
                     # tool-less requests never acquire or mutate the native session.
                     target = session.session if isinstance(session, SessionLease) else session
-                    if getattr(target, "_client_context", None):
+                    if not direct_mode and getattr(target, "_client_context", None):
                         target._client_context_pending = True
+                exec_chunks = []
                 while True:
                     self._check_prompt(prompt)
                     if cancelled.is_set():
@@ -441,8 +443,12 @@ class TurnRunner:
                     if direct_mode:
                         if instructions and stream_prompt.startswith(instructions):
                             stream_prompt = stream_prompt[len(instructions):]
-                        chunks = list(getattr(parsed, "message_chunks", None) or [])
-                        if chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
+                        chunks = list(getattr(parsed, "message_chunks", None) or ([parsed.prompt] if getattr(parsed, "prompt", None) else []))
+                        if exec_chunks:
+                            chunks.extend(exec_chunks)
+                        elif last_followup:
+                            chunks.append(stream_prompt.strip())
+                        elif chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
 
                         tools_converted = direct.tools_to_retool(parsed.tools) if native_tools else []
@@ -521,6 +527,8 @@ class TurnRunner:
                                         thinking_ms=span)
                                     think_started = None
                                 out.put(event)
+                            elif event["type"] == "thinking_heartbeat":
+                                out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 streamed_tool_call = True
                                 definition = tool_definitions[event["name"]]
@@ -544,7 +552,7 @@ class TurnRunner:
                                 log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s" % (
                                     event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—")),
                                     "info", credits=event["value"], **usage)
-                                out.put({key: value for key, value in event.items() if key != "usage"})
+                                out.put(event)
                             elif event["type"] == "hitl":
                                 out.put(event)
                                 final_text += "\n" + event["question"]
@@ -602,7 +610,8 @@ class TurnRunner:
                         tool_retries += 1
                         log("turn.retry", "Модель отказалась от инструментов — повтор с коррекцией", "warn",
                             reason="tool_refusal")
-                        native_context = None  # Retry prompts are not part of the client history.
+                        if not direct_mode:
+                            native_context = None  # Retry prompts are not part of the client history in agent mode.
                         prompt = (base_prompt + "\n\n[CLIENT TOOL TRANSPORT CORRECTION]\n"
                                   "Your previous reply treated the client's tools as unavailable. "
                                   "Invoke a supplied tool using <tool_call> JSON instead of Retool sandbox tools. "
@@ -646,7 +655,8 @@ class TurnRunner:
                         # Silent turn: insist once, keeping the full system prompt.
                         empty_retries += 1
                         log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
-                        native_context = None  # Retry prompts are not part of the client history.
+                        if not direct_mode:
+                            native_context = None  # Retry prompts are not part of the client history in agent mode.
                         prompt = (base_prompt + "\n\n[RETRY] Предыдущий ход вернул пустой ответ. "
                                   "Ответь сейчас: нужна команда — выведи <exec_command>...</exec_command>, "
                                   "иначе дай короткий текстовый ответ.")
@@ -658,6 +668,8 @@ class TurnRunner:
 
                     if not can_exec or not command:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
+                        if direct_mode and native_target is not None and upstream_completed and not cancelled.is_set():
+                            native_target._client_context_pending = False
                         out.put({"type": "end", "reason": holder.get("reason", "stop")})
                         return
 
@@ -708,6 +720,8 @@ class TurnRunner:
 
                     header = task_block + "\n\nPrevious steps: " + trail
                     last_followup = (command, code, output, header)
+                    followup_text = executor.format_command_followup(command, code, output, header)
+                    exec_chunks.append(followup_text)
                     prompt = self._followup(instructions, reminder, *last_followup)
             finally:
                 if session is not None:
