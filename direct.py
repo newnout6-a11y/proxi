@@ -435,8 +435,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 async def _stream_body(cfg, session, body, param_types=None):
     payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
     if cfg.get("direct_debug"):
-        print("[body]", json.dumps({k: v for k, v in body.items() if k != "messages"}, ensure_ascii=False), flush=True)
-        print("[msgs]", json.dumps(body["messages"], ensure_ascii=False)[:1500], flush=True)
+        body_summary = {k: v for k, v in body.items() if k not in ("messages", "tools")}
+        if "tools" in body:
+            body_summary["tools_count"] = len(body["tools"])
+        print("[body]", json.dumps(body_summary, ensure_ascii=False), flush=True)
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
     headers["accept"] = "application/json"
@@ -532,7 +534,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
             return
         if isinstance(item, BaseException):
             raise item
-        if cfg.get("direct_debug"):
+        if cfg.get("direct_raw"):
             print("[raw]", str(item)[:200], flush=True)
         try:
             event = json.loads(item)
@@ -594,7 +596,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
             current = stack[-1] if stack else None
         elif kind == "metadata":
             usage = event.get("usage") or {}
-            if cfg.get("direct_debug"):
+            if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 print("[cache] in=%s read=%s write=%s credits=%s" % (
                     usage.get("inputTokens"), usage.get("promptTokensReadFromCache"),
                     usage.get("promptTokensWrittenToCache"), usage.get("creditsUsed")), flush=True)

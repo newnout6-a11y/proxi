@@ -21,6 +21,7 @@ from redact import redact
 import config as config_module
 import models as model_catalog
 import sse
+import models
 import validate
 from credits import CreditsManager
 from orchestrator import TurnRunner
@@ -157,8 +158,10 @@ def make_handler(runtime: Runtime):
             status = getattr(self, "_status", 0) or getattr(self, "_stream_status", 0)
             took = (time.time() - self._started) * 1000
             model = getattr(self, "_model", "-")
-            print("relay %s %s %s %s %s %.0fms %s" % (
-                self.request_id, self.command, redact(self.path), status, model, took, note), flush=True)
+            effort = getattr(self, "_effort_str", "")
+            effort_tag = f" [{effort}]" if effort and model != "-" else ""
+            print("relay %s %s %s %s %s%s %.0fms %s" % (
+                self.request_id, self.command, redact(self.path), status, model, effort_tag, took, note), flush=True)
             route = getattr(self, "_log_route", None)
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
@@ -180,6 +183,7 @@ def make_handler(runtime: Runtime):
             self._stream_status = 0
             self._streaming = False
             self._model = "-"
+            self._effort_str = ""
             self._error_code = None
             parsed_url = urlparse(self.path)
             path = parsed_url.path
@@ -353,6 +357,18 @@ def make_handler(runtime: Runtime):
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
+
+            effective_effort = parsed.effort
+            if effective_effort is None and parsed.entry.get("reasoning") and cfg.get("reasoning_effort"):
+                conf = cfg["reasoning_effort"]
+                if conf == "auto":
+                    conf = parsed.entry.get("default_reasoning_effort") or "medium"
+                _, effective_effort = models.resolve_tolerant(parsed.model, conf, strict=False)
+            self._effort_str = effective_effort or "none"
+
+            tools_count = len(getattr(parsed, "tools", None) or [])
+            note = " [title/auxiliary]" if tools_count == 0 and len(parsed.prompt or "") < 200 else ""
+            print(f"[{self.request_id}] {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()}{note}", flush=True)
 
             wait = runtime.limiter.take()
             if wait:
