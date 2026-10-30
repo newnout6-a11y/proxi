@@ -908,8 +908,6 @@ class SessionPool:
                                      pool=len(self._conversations))
                     keep = True
             else:
-                # No explicit affinity means a fresh thread, never a shared
-                # content-derived "anonymous" conversation.
                 backend = self._next_backend()
                 session = RelaySession(backend, await self._new_thread_id(backend))
                 if conversation_key and conversation_key in self._conversations:

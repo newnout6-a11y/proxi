@@ -52,7 +52,10 @@ export function useJournal(key, onUnauthorized) {
       try {
         const first = await api(key, 'events?limit=800', { signal });
         setEvents(first.data);
-        lastSeq.current = first.last_seq;
+        const maxSeq = Array.isArray(first.data) && first.data.length
+          ? Math.max(...first.data.map(e => e.seq || 0))
+          : (first.last_seq || 0);
+        lastSeq.current = maxSeq;
       } catch (error) {
         if (error.status === 401) { unauthorized.current?.(); return; }
       }

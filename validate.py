@@ -113,16 +113,32 @@ def _extract_image_data(block, where):
                         mime_type = mime
                     data_b64 = rest.strip()
             elif url.startswith("http://") or url.startswith("https://"):
-                import urllib.request, base64
+                import urllib.request, urllib.parse, socket, ipaddress, base64
+                parsed_url = urllib.parse.urlparse(url)
+                hostname = parsed_url.hostname or ""
+                try:
+                    ip = socket.gethostbyname(hostname)
+                    ip_obj = ipaddress.ip_address(ip)
+                    if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
+                        raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
+                except (socket.gaierror, ValueError):
+                    raise unprocessable("failed to fetch image attachments: invalid destination host", param=where)
+
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                max_bytes = 10 * 1024 * 1024
                 try:
                     with urllib.request.urlopen(req, timeout=10) as r:
                         ct = r.headers.get("content-type", "").split(";")[0].strip()
                         if ct:
                             mime_type = ct
-                        data_b64 = base64.b64encode(r.read()).decode("ascii")
-                except Exception as exc:
-                    raise unprocessable(f"failed to fetch image attachments from {url}: {exc}", param=where)
+                        buf = r.read(max_bytes + 1)
+                        if len(buf) > max_bytes:
+                            raise unprocessable("failed to fetch image attachments: image exceeds maximum allowed size (10MB)", param=where)
+                        data_b64 = base64.b64encode(buf).decode("ascii")
+                except apierr.ApiError:
+                    raise
+                except Exception:
+                    raise unprocessable(f"failed to fetch image attachments from {url}", param=where)
     elif "imageData" in block:
         mime_type = block.get("mimeType") or "image/png"
         data_b64 = block.get("imageData")
@@ -576,8 +592,10 @@ def _effort(data):
         selected.append(_opt_str(data, "reasoningEffort"))
     if data.get("effort") is not None:
         selected.append(_opt_str(data, "effort"))
+    provider_opts = data.get("providerOptions")
+    openai_opts = provider_opts.get("openai") if isinstance(provider_opts, dict) else None
     for container in (data.get("settings"), data.get("options"), data.get("body"),
-                      data.get("extra_body"), (data.get("providerOptions") or {}).get("openai")):
+                      data.get("extra_body"), openai_opts):
         if isinstance(container, dict):
             if container.get("reasoning_effort") is not None:
                 selected.append(_opt_str(container, "reasoning_effort"))

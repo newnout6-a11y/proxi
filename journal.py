@@ -76,6 +76,15 @@ class Journal:
             self._events.clear()
             self._seq = 0
             self._cond.notify_all()
+        with self._file_lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+            if self._path:
+                try:
+                    open(self._path, "w", encoding="utf-8").close()
+                except OSError:
+                    pass
 
     # -- redaction ---------------------------------------------------------
     def _secrets(self):
@@ -154,10 +163,29 @@ class Journal:
         with self._cond:
             return list(self._events)
 
-    def query(self, since=0, limit=300, levels=None, categories=None, text=None, turn=None, before=None):
+    def query(self, since=0, limit=300, levels=None, categories=None, text=None, turn=None, before=None, order="desc"):
         items = []
         needle = (text or "").lower()
-        for event in reversed(self._snapshot()):
+        events = self._snapshot()
+        if order == "asc":
+            for event in events:
+                if event["seq"] <= since:
+                    continue
+                if before is not None and event["seq"] >= before:
+                    break
+                if levels and event["level"] not in levels:
+                    continue
+                if categories and event["category"] not in categories:
+                    continue
+                if turn and event.get("turn_id") != turn:
+                    continue
+                if needle and needle not in json.dumps(event, ensure_ascii=False).lower():
+                    continue
+                items.append(event)
+                if len(items) >= limit:
+                    break
+            return items
+        for event in reversed(events):
             if event["seq"] <= since:
                 break
             if before is not None and event["seq"] >= before:
@@ -237,10 +265,10 @@ class Journal:
         levels = collections.Counter()
         latency_all, ttft_all = [], []
         for event in self._snapshot():
-            categories[event["category"]] += 1
-            levels[event["level"]] += 1
             if event["ts"] < start:
                 continue
+            categories[event["category"]] += 1
+            levels[event["level"]] += 1
             slot = buckets[min(count - 1, int((event["ts"] - start) // bucket))]
             data = event.get("data") or {}
             kind = event["kind"]

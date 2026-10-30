@@ -26,6 +26,7 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 ```json
 {
   "model": "claude-opus-5-5",
+  "rit": "99a368f5194fc7ea",
   "providerResourceName": "ffd4d570-7c6b-414f-b95a-1a695676d0a8",
   "messages": [
     {

@@ -30,10 +30,10 @@ Example provider configuration with custom reasoning effort variants:
           "attachment": true,
           "reasoning": true,
           "variants": {
-            "low": { "name": "Low", "settings": { "reasoningEffort": "low" } },
-            "medium": { "name": "Medium", "settings": { "reasoningEffort": "medium" } },
-            "high": { "name": "High", "settings": { "reasoningEffort": "high" } },
-            "max": { "name": "Max", "settings": { "reasoningEffort": "max" } }
+            "low": { "name": "Low", "reasoningEffort": "low", "settings": { "reasoningEffort": "low" } },
+            "medium": { "name": "Medium", "reasoningEffort": "medium", "settings": { "reasoningEffort": "medium" } },
+            "high": { "name": "High", "reasoningEffort": "high", "settings": { "reasoningEffort": "high" } },
+            "max": { "name": "Max", "reasoningEffort": "max", "settings": { "reasoningEffort": "max" } }
           }
         },
         "gpt-6.1": {
@@ -46,11 +46,11 @@ Example provider configuration with custom reasoning effort variants:
           "attachment": true,
           "reasoning": true,
           "variants": {
-            "low": { "name": "Low", "settings": { "reasoningEffort": "low" } },
-            "medium": { "name": "Medium", "settings": { "reasoningEffort": "medium" } },
-            "high": { "name": "High", "settings": { "reasoningEffort": "high" } },
-            "xhigh": { "name": "Extra High", "settings": { "reasoningEffort": "xhigh" } },
-            "max": { "name": "Max", "settings": { "reasoningEffort": "max" } }
+            "low": { "name": "Low", "reasoningEffort": "low", "settings": { "reasoningEffort": "low" } },
+            "medium": { "name": "Medium", "reasoningEffort": "medium", "settings": { "reasoningEffort": "medium" } },
+            "high": { "name": "High", "reasoningEffort": "high", "settings": { "reasoningEffort": "high" } },
+            "xhigh": { "name": "Extra High", "reasoningEffort": "xhigh", "settings": { "reasoningEffort": "xhigh" } },
+            "max": { "name": "Max", "reasoningEffort": "max", "settings": { "reasoningEffort": "max" } }
           }
         }
       }
@@ -142,7 +142,7 @@ Validation used the installed Harness 0.1.5-rc.2 adapter against local mock SSE:
 the same relay key authenticated, a reasoning delta became a Harness reasoning
 block, and `get_goal` became a normal tool-call block. These mock summaries
 verify transport behavior; they are not evidence that the upstream always emits
-thinking. Multimodal image inputs are supported and forwarded for vision-capable models (e.g. Claude Opus 5.5, Sonnet 5, GPT-5.5).
+thinking. Multimodal image inputs are supported and forwarded for vision-capable models (e.g. Claude Opus 5.5, Sonnet 5, GPT-5.5) on the direct transport.
 
 The installed adapter also passed a real Retool request: Claude Opus 5.5 returned
 `get_goal`, arguments `{}`, finish `tool-calls`, in 26.37 seconds. This verified

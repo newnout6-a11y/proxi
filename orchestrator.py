@@ -322,7 +322,7 @@ class TurnRunner:
                 tool_names = [choice["function"]["name"]]
             direct_mode = self.cfg.get("transport") == "direct"
             conv_key = getattr(parsed, "conversation_key", None)
-            is_native = bool(native_tools) or bool(conv_key) or bool(parsed.system)
+            is_native = bool(native_tools)
             instructions = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
@@ -330,7 +330,7 @@ class TurnRunner:
             reminder = ""
             if native_tools and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif not native_tools and self.cfg["exec_policy"] != "off" and not is_native:
+            elif not native_tools and self.cfg["exec_policy"] != "off":
                 reminder = (
                     "\n\n[LOCAL EXEC REMINDER]\n"
                     "To run anything on the user's machine you MUST output "
@@ -452,7 +452,7 @@ class TurnRunner:
                             chunks.append(prompt[len(parsed.prompt):])
 
                         tools_converted = direct.tools_to_retool(parsed.tools) if native_tools else []
-                        if tools_converted and hasattr(direct_target, "register_tools"):
+                        if hasattr(direct_target, "register_tools"):
                             direct_target.register_tools(tools_converted)
 
                         if native_tools:
@@ -462,7 +462,7 @@ class TurnRunner:
                             final_head = instructions
                         else:
                             # Tool-less requests (such as title generation, /compact, /goal Stop hook)
-                            # Align head with the cached prefix so it does not invalidate openAICacheKey
+                            # Align head and tools with the cached prefix so it does not invalidate openAICacheKey
                             cached_head = getattr(direct_target, "_cached_head", None)
                             final_head = cached_head if cached_head else instructions
                             if hasattr(direct_target, "has_tools") and direct_target.has_tools():
@@ -530,7 +530,8 @@ class TurnRunner:
                             elif event["type"] == "thinking_heartbeat":
                                 out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
-                                streamed_tool_call = True
+                                if not event.get("partial"):
+                                    streamed_tool_call = True
                                 definition = tool_definitions[event["name"]]
                                 call_key = event.get("id") or event["name"]
                                 if call_key not in tool_started:
@@ -569,8 +570,8 @@ class TurnRunner:
                         out.put({"type": "end", "reason": "timeout"})
                         return
 
-                    native_calls = executor.extract_tool_calls(final_text, tool_names) if tool_names else []
-                    if not native_calls and tool_names:
+                    native_calls = (executor.extract_tool_calls(final_text, tool_names) if tool_names else []) if not direct_mode else []
+                    if not direct_mode and not native_calls and tool_names:
                         command_call = executor.command_tool_call(final_text, tool_names)
                         if command_call is not None:
                             native_calls = [command_call]

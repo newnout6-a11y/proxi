@@ -226,15 +226,15 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
 
 def resolve(model, effort=None, *, strict=True, default_model=None):
     raw_name = (model or default_model or '').strip()
-    if effort is None:
-        for sep in ('#', ':'):
-            if sep in raw_name:
-                parts = raw_name.split(sep, 1)
-                cand = parts[1].strip().lower()
-                if cand in EFFORT_ORDER:
+    for sep in ('#', ':'):
+        if sep in raw_name:
+            parts = raw_name.split(sep, 1)
+            cand = parts[1].strip().lower()
+            if cand in EFFORT_ORDER:
+                if effort is None:
                     effort = cand
-                    raw_name = parts[0].strip()
-                break
+                raw_name = parts[0].strip()
+            break
     name = _canonical(raw_name)
     if not name:
         raise bad_request("'model' is required", param='model')

@@ -91,7 +91,8 @@ export default function Turns({ journal }) {
         <AnimatePresence initial={false}>
           {traces.slice(0, 120).map((trace) => {
             const isOpen = open === trace.id;
-            const hit = trace.cacheRead + trace.cacheWrite ? trace.cacheRead / (trace.cacheRead + trace.cacheWrite) : null;
+            const totalIn = (trace.inputTokens || 0) + (trace.cacheRead || 0) + (trace.cacheWrite || 0);
+            const hit = totalIn > 0 && trace.cacheRead ? trace.cacheRead / totalIn : null;
             return (
               <motion.article key={trace.id} layout className={`trace status-${trace.status} ${isOpen ? 'open' : ''}`}
                 initial={{ opacity: 0, y: -16, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0 }} transition={spring}>

@@ -300,14 +300,15 @@ class Admin:
             handler.wfile.write(body)
 
     def _events(self, query):
-        return {"data": self.runtime.journal.query(
-                    since=_int_param(query, "since", 0, 0, 2 ** 62),
-                    limit=_int_param(query, "limit", 300, 1, 2000),
-                    levels=_list_param(query, "level"), categories=_list_param(query, "category"),
-                    text=(query.get("q") or [""])[0][:200] or None,
-                    turn=(query.get("turn") or [""])[0] or None,
-                    before=_int_param(query, "before", 0, 0, 2 ** 62) or None),
-                "last_seq": self.runtime.journal.last_seq}
+        data = self.runtime.journal.query(
+            since=_int_param(query, "since", 0, 0, 2 ** 62),
+            limit=_int_param(query, "limit", 300, 1, 2000),
+            levels=_list_param(query, "level"), categories=_list_param(query, "category"),
+            text=(query.get("q") or [""])[0][:200] or None,
+            turn=(query.get("turn") or [""])[0] or None,
+            before=_int_param(query, "before", 0, 0, 2 ** 62) or None)
+        last_seq = data[-1]["seq"] if data else self.runtime.journal.last_seq
+        return {"data": data, "last_seq": last_seq}
 
     def _stream(self, handler, query):
         """Server-sent journal events; the key travels in headers via fetch streaming."""
@@ -332,7 +333,7 @@ class Admin:
                 writer.event("reset", {"last_seq": events.last_seq})
                 since = 0
             if events.wait(since, 1.0):
-                batch = events.query(since=since, limit=500)
+                batch = events.query(since=since, limit=500, order="asc")
                 for event in batch:
                     writer.event("journal", event)
                 if batch:
