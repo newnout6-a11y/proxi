@@ -79,8 +79,7 @@ Validation used the installed Harness 0.1.5-rc.2 adapter against local mock SSE:
 the same relay key authenticated, a reasoning delta became a Harness reasoning
 block, and `get_goal` became a normal tool-call block. These mock summaries
 verify transport behavior; they are not evidence that the upstream always emits
-thinking. Text-only input is advertised because this relay does not forward
-image attachments.
+thinking. Multimodal image inputs are supported and forwarded for vision-capable models (e.g. Claude Opus 5.5, Sonnet 5, GPT-5.5).
 
 The installed adapter also passed a real Retool request: Claude Opus 5.5 returned
 `get_goal`, arguments `{}`, finish `tool-calls`, in 26.37 seconds. This verified

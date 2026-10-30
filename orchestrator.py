@@ -50,9 +50,6 @@ def _trim(text: str, budget: int) -> str:
     return raw[:budget].decode("utf-8", "ignore")
 
 
-# Models the direct copilot path rejects but the agent path still serves.
-_DIRECT_UNSUPPORTED = re.compile(r"not available right now|Invalid model for Copilot", re.IGNORECASE)
-
 
 class _ClientText:
     """Stream ordinary native-client text while suppressing relay tool markup."""
@@ -62,6 +59,7 @@ class _ClientText:
     def __init__(self):
         self.pending = ""
         self.closing = None
+        self.suppressed = ""
         self.leading_space = ""
         self.visible = False
 
@@ -73,24 +71,33 @@ class _ClientText:
             if self.closing:
                 end = lowered.find(self.closing)
                 if end < 0:
-                    # Keep just enough tail to recognize a fragmented closing tag.
-                    self.pending = self.pending[-len(self.closing) + 1:]
+                    keep = len(self.closing) - 1
+                    if len(self.pending) > keep:
+                        self.suppressed += self.pending[:-keep]
+                        self.pending = self.pending[-keep:]
                     break
                 self.pending = self.pending[end + len(self.closing):]
                 self.closing = None
+                self.suppressed = ""
                 continue
             starts = [(lowered.find(tag), tag) for tag in self.TAGS if tag in lowered]
             if starts:
                 start, tag = min(starts)
                 visible.append(self.pending[:start])
-                self.pending = self.pending[start + len(tag):]
                 self.closing = "</" + tag[1:] + ">"
+                self.suppressed = self.pending[start:start + len(tag)]
+                self.pending = self.pending[start + len(tag):]
                 continue
             keep = max((length for tag in self.TAGS for length in range(1, len(tag))
                         if lowered.endswith(tag[:length])), default=0)
             visible.append(self.pending[:-keep] if keep else self.pending)
             self.pending = self.pending[-keep:] if keep else ""
             break
+        if final and self.closing:
+            visible.append(self.suppressed + self.pending)
+            self.pending = ""
+            self.closing = None
+            self.suppressed = ""
         text = "".join(visible)
         if not self.visible:
             text = self.leading_space + text
@@ -168,13 +175,14 @@ class TurnRunner:
                       else "[CLIENT CONVERSATION UPDATE — chronological]\n")
             prompt = update + suffix.lstrip("\r\n") + _NATIVE_CONTINUE
         else:
-            if (previous or pending or getattr(target, "ws", None) is not None
-                    or getattr(target, "_needs_drain", False) or self.cfg.get("session_mode") == "shared"):
-                await target.aclose()
-                thread_id = await target.backend.create_thread()
-                if cancelled.is_set() or getattr(target, "_cancelled", False):
-                    raise asyncio.CancelledError()
-                target.thread_id = thread_id
+            if self.cfg.get("transport") != "direct":
+                if (previous or pending or getattr(target, "ws", None) is not None
+                        or getattr(target, "_needs_drain", False) or self.cfg.get("session_mode") == "shared"):
+                    await target.aclose()
+                    thread_id = await target.backend.create_thread()
+                    if cancelled.is_set() or getattr(target, "_cancelled", False):
+                        raise asyncio.CancelledError()
+                    target.thread_id = thread_id
             prompt = full_prompt
         context = {"key": key, "history": parsed.prompt, "fingerprint": fingerprint,
                    "thread_id": target.thread_id, "message_fingerprints": messages} if key else None
@@ -211,7 +219,7 @@ class TurnRunner:
                     "The client's instructions, working directory and tool results describe the active project. "
                     "Use those tools to inspect, edit and test that project. "
                     "Do not claim to have read, changed or tested files without tool evidence. "
-                    "Reply in the user's language. Do not use relay-local <exec_command> tags.")
+                    "Reply in the user's language.")
         return build_system_instructions(
             self.cfg["workspace_root"],
             enable_context=self.cfg["project_context"],
@@ -489,8 +497,9 @@ class TurnRunner:
                                 # Tool envelopes are parsed only after the complete
                                 # upstream turn, so do not leak their markup to a
                                 # native client. Ordinary text remains streamed.
-                                if not native_tools:
+                                if direct_mode or not native_tools:
                                     out.put(event)
+                                    visible_text += event["delta"]
                                 else:
                                     visible = native_text.feed(event["delta"])
                                     if visible:
@@ -543,15 +552,7 @@ class TurnRunner:
                                 holder["reason"] = event["reason"]
                                 upstream_completed = event["reason"] in ("stop", "tool_calls")
                     except apierr.ApiError as exc:
-                        if not (direct_mode and exc.status == 400
-                                and _DIRECT_UNSUPPORTED.search(exc.message or "")):
-                            raise
-                        # The model exists but not on this path: retry over the agent socket.
-                        log("upstream.fallback", "Прямой путь не принял модель — переход на WebSocket", "warn",
-                            reason=(exc.message or "")[:200])
-                        direct_mode = False
-                        prompt = instructions + "\n\n" + prompt
-                        continue
+                        raise
                     holder.setdefault("reason", "stop")
                     if holder.get("reason") == "cancelled":
                         out.put({"type": "end", "reason": "cancelled"})
@@ -583,9 +584,9 @@ class TurnRunner:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
-                    if native_tools and re.search(r"<(?:tool_call|exec_command)\b", final_text, re.IGNORECASE):
+                    if not direct_mode and native_tools and not visible_text.strip() and re.search(r"<tool_call\b", final_text, re.IGNORECASE):
                         raise apierr.upstream_error("upstream returned a malformed or disallowed client tool call")
-                    if native_tools:
+                    if native_tools and not direct_mode:
                         # Some upstream transports only provide a final snapshot.
                         # Feed its unstreamed suffix once instead of duplicating it.
                         suffix = (final_text[len(upstream_text):]

@@ -235,3 +235,28 @@ def test_thinking_start_is_hidden_when_thinking_disabled():
     adapter.feed({"type": "thinking_start"})
     adapter.feed({"type": "text", "delta": "ok"})
     assert [p["content_block"]["type"] for n, p in writer.events if n == "content_block_start"] == ["text"]
+
+
+def test_direct_session_stream_tool_calls_marks_completed():
+    import session as session_mod
+
+    class FakeBackend:
+        cfg = {"transport": "direct", "session_mode": "per_conversation", "thread_id": "t1"}
+
+    sess = session_mod.RelaySession(FakeBackend(), "thread-1")
+
+    async def fake_iter(*args, **kwargs):
+        yield {"type": "tool_call", "id": "call_1", "name": "test", "arguments": "{}"}
+        yield {"type": "end", "reason": "tool_calls"}
+
+    sess._stream_turn = fake_iter
+
+    async def run():
+        events = []
+        async for e in sess.stream("prompt", {"model": "claude-opus-5-5"}):
+            events.append(e)
+        return events
+
+    evs = asyncio.run(run())
+    assert len(evs) == 2
+    assert not sess._needs_drain

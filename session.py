@@ -402,12 +402,12 @@ class RelaySession:
             async for event in turn:
                 if event.get("type") in ("text", "thinking", "tool_call"):
                     self._output_started = True
-                if event.get("type") == "end" and event.get("reason") == "stop":
+                if event.get("type") == "end" and event.get("reason") in ("stop", "tool_calls"):
                     completed = True
                 yield event
         finally:
             await turn.aclose()
-            if not completed:
+            if not completed and self.cfg.get("transport") != "direct":
                 # A timed-out, abandoned or failed turn cannot be read again by
                 # the next request sharing this Retool thread.
                 self._needs_drain = True

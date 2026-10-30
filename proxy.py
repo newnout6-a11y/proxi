@@ -279,7 +279,7 @@ def make_handler(runtime: Runtime):
                 **{key: model[key] for key in ("metadata_checked_at", "metadata_source", "metadata_status", "metadata_notes")
                    if key in model},
                 "capabilities": {"reasoning": model["reasoning"], "tools": model["tools"],
-                                 "vision": False,
+                                 "vision": bool(model.get("vision", False)),
                                  "reasoning_effort_levels": model.get("reasoning_effort_levels", []),
                                  "default_reasoning_effort": model.get("default_reasoning_effort"),
                                  "reasoning_effort_control": model.get("reasoning_effort_control", "selectable")},

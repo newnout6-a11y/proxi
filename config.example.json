@@ -11,7 +11,7 @@
   "relay_api_key": "<optional; иначе env RELAY_API_KEY или сгенерированный relay_key.txt>",
 
   "transport": "direct",
-  "transport_note": "direct = POST /api/gpt/copilotStreamGPT с кэшируемым system-блоком (быстро, ~2 с); agent = сандбокс через WebSocket (медленнее, ~20 с). Модель, отклонённая быстрым путём, автоматически уходит на agent.",
+  "transport_note": "direct = POST /api/gpt/copilotStreamGPT с кэшируемым system-блоком и нативными инструментами (быстро, ~2 с).",
   "direct_cache": true,
   "cache_keepwarm_seconds": 240,
   "cache_keepwarm_note": "провайдерский кэш живёт минуты; relay перечитывает префикс, чтобы он не истёк. 0 выключает",

@@ -67,8 +67,10 @@ def _opt_int(data, key, low=1, high=MAX_TOKENS_CAP):
     value = data[key]
     if isinstance(value, bool) or not isinstance(value, int):
         raise unprocessable(f"'{key}' must be an integer", param=key)
-    if not low <= value <= high:
-        raise unprocessable(f"'{key}' must be between {low} and {high} (model output cap)", param=key)
+    if value < low:
+        raise unprocessable(f"'{key}' must be at least {low}", param=key)
+    if value > high:
+        return high
     return value
 
 
@@ -555,6 +557,10 @@ def _effort(data):
     selected = []
     if data.get("reasoning_effort") is not None:
         selected.append(_opt_str(data, "reasoning_effort"))
+    if data.get("reasoningEffort") is not None:
+        selected.append(_opt_str(data, "reasoningEffort"))
+    if data.get("effort") is not None:
+        selected.append(_opt_str(data, "effort"))
     reasoning = data.get("reasoning")
     if reasoning is not None and not isinstance(reasoning, dict):
         raise unprocessable("'reasoning' must be an object", param="reasoning")

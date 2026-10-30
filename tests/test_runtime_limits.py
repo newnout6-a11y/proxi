@@ -304,3 +304,31 @@ def test_truncated_utf8_capture_does_not_switch_the_valid_prefix_to_cp866(tmp_pa
     assert code == 0
     assert text.startswith("€" * 1000)
     assert "truncated" in text
+
+
+def test_prose_mentioning_exec_command_does_not_fail(tmp_path):
+    class Session:
+        async def stream(self, *args, **kwargs):
+            yield {"type": "text", "delta": "Here is the code. Note: `<exec_command>` should not be used directly."}
+            yield {"type": "end", "reason": "stop"}
+
+    out = queue.Queue()
+    asyncio.run(runner(tmp_path, Session()).run(parsed(tools=TOOL), out, {}))
+    items = list(out.queue)
+    assert not any(e and e.get("type") == "error" for e in items)
+    deltas = [e["delta"] for e in items if e and e.get("type") == "text"]
+    assert "`<exec_command>`" in "".join(deltas)
+
+
+def test_prose_mentioning_tool_call_does_not_fail(tmp_path):
+    class Session:
+        async def stream(self, *args, **kwargs):
+            yield {"type": "text", "delta": "Here is an example: `<tool_call>` should have valid JSON."}
+            yield {"type": "end", "reason": "stop"}
+
+    out = queue.Queue()
+    asyncio.run(runner(tmp_path, Session()).run(parsed(tools=TOOL), out, {}))
+    items = list(out.queue)
+    assert not any(e and e.get("type") == "error" for e in items)
+    deltas = [e["delta"] for e in items if e and e.get("type") == "text"]
+    assert "`<tool_call>`" in "".join(deltas)
