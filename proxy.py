@@ -63,7 +63,11 @@ class Runtime:
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.backend = Backend(cfg)
         self.pool = SessionPool(self.backend)
-        self.credits = CreditsManager(cfg["base"], lambda: auth.upstream_headers(cfg), self.backend.refresher)
+        if getattr(self.pool, "backends", None):
+            self.backend = self.pool.backend
+        self.credits = CreditsManager(self.backend.cfg.get("base", cfg.get("base")),
+                                      lambda: auth.upstream_headers(self.backend.cfg),
+                                      self.backend.refresher)
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
@@ -520,8 +524,9 @@ def main():
     slots = threading.BoundedSemaphore(cfg["max_workers"])
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
 
-    all_refreshers = [runtime.backend.refresher] + [b.refresher for b in getattr(runtime.pool, "backends", []) if hasattr(b, "refresher") and b.refresher]
-    for r in {id(ref): ref for ref in all_refreshers}.values():
+    backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
+    refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
+    for r in refreshers:
         r.start()
     balance = runtime.credits.get_balance(force_refresh=True)
     print("=" * 64)
@@ -562,8 +567,9 @@ def main():
                 time.sleep(0.5)
     finally:
         try:
-            all_refreshers = [runtime.backend.refresher] + [b.refresher for b in getattr(runtime.pool, "backends", []) if hasattr(b, "refresher") and b.refresher]
-            for r in {id(ref): ref for ref in all_refreshers}.values():
+            backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
+            refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
+            for r in refreshers:
                 r.stop()
             async def _cancel_all():
                 tasks = [t for t in asyncio.all_tasks(runtime.loop) if t is not asyncio.current_task()]
