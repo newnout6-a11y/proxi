@@ -350,6 +350,7 @@ def make_handler(runtime: Runtime):
                         self.headers.get("conversation-id"))
             parsed.conversation_key = validate.conversation_key(data, affinity, allow_content_fallback=True)
             parsed.request_id = self.request_id
+            parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
 

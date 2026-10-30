@@ -106,6 +106,13 @@ Anthropic — thinking content blocks. Это только данные, кот�
 В Claude Code блоки по умолчанию свёрнуты: `Ctrl+O` раскрывает их;
 `showThinkingSummaries: true` включает отображение кратких сводок.
 
+Opus 5.5 через Retool думает молча: приходит только начало блока и подпись.
+Клиенты на OpenAI-совместимом API (OpenCode, Cline и другие на AI SDK) показывают
+мышление лишь при непустом `reasoning_content`, поэтому в форматах Chat и Responses
+relay в начале мышления отправляет метку `thinking_placeholder` (по умолчанию
+«Модель думает…»). Метка служит только для отображения и в историю не попадает.
+Пустая строка её отключает. В формате Anthropic открывается пустой блок thinking.
+
 Уровень меняется настоящим полем Retool `modelProvider.reasoningEffort`:
 `reasoning_effort` в Chat, `reasoning.effort` в Responses,
 `thinking.type=adaptive` + `output_config.effort` в Anthropic.

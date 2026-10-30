@@ -141,6 +141,12 @@ class ChatAdapter(_Base):
         if self.writer:
             self.writer.data(self._chunk({"reasoning_content": delta}))
 
+    def _think_start(self):
+        # Display-only label: it is streamed but never stored in self.thinking.
+        label = getattr(self.parsed, "thinking_placeholder", "")
+        if label and self.writer:
+            self.writer.data(self._chunk({"reasoning_content": label}))
+
     def _tool_call(self, index, call, delta, new=False):
         if not self.writer:
             return
@@ -278,6 +284,11 @@ class ResponsesAdapter(_Base):
         self._emit("response.reasoning_summary_text.delta", {"item_id": self.reasoning_id,
                                                              "output_index": index,
                                                              "summary_index": 0, "delta": delta})
+
+    def _think_start(self):
+        label = getattr(self.parsed, "thinking_placeholder", "")
+        if label and self.writer:
+            self._think(label)
 
     def _tool_call(self, index, call, delta, new=False):
         custom = call.get("tool_type") == "custom"
