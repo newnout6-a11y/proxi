@@ -30,3 +30,6 @@ probes/chunks/
 /web/src/tokens.css
 /web/test-results/
 /web/playwright-report/
+
+# agent scratch work
+.agents/
