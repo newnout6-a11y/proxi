@@ -520,9 +520,9 @@ def main():
     slots = threading.BoundedSemaphore(cfg["max_workers"])
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
 
-    for b in getattr(runtime.pool, "backends", [runtime.backend]):
-        if hasattr(b, "refresher") and b.refresher:
-            b.refresher.start()
+    all_refreshers = [runtime.backend.refresher] + [b.refresher for b in getattr(runtime.pool, "backends", []) if hasattr(b, "refresher") and b.refresher]
+    for r in {id(ref): ref for ref in all_refreshers}.values():
+        r.start()
     balance = runtime.credits.get_balance(force_refresh=True)
     print("=" * 64)
     print(" Retool AI relay")
@@ -562,9 +562,9 @@ def main():
                 time.sleep(0.5)
     finally:
         try:
-            for b in getattr(runtime.pool, "backends", [runtime.backend]):
-                if hasattr(b, "refresher") and b.refresher:
-                    b.refresher.stop()
+            all_refreshers = [runtime.backend.refresher] + [b.refresher for b in getattr(runtime.pool, "backends", []) if hasattr(b, "refresher") and b.refresher]
+            for r in {id(ref): ref for ref in all_refreshers}.values():
+                r.stop()
             async def _cancel_all():
                 tasks = [t for t in asyncio.all_tasks(runtime.loop) if t is not asyncio.current_task()]
                 for t in tasks:

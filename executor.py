@@ -146,7 +146,8 @@ def extract_tool_call(text: str, allowed=None):
     elif "parameters" in value:
         arguments = value["parameters"]
     elif attr_name_match:
-        if value.get("name") == name or value.get("tool") == name or value.get("toolName") == name:
+        json_name = value.get("name") or value.get("tool") or value.get("toolName")
+        if json_name and (name == json_name or name.endswith("." + json_name)):
             arguments = {k: v for k, v in value.items() if k not in ("name", "id", "tool", "toolName", "namespace", "tool_call_id")}
         else:
             arguments = {k: v for k, v in value.items() if k not in ("id", "tool_call_id")}
