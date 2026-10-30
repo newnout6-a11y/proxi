@@ -534,7 +534,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
         try:
             item = await asyncio.wait_for(queue.get(), timeout=5.0)
         except asyncio.TimeoutError:
-            if think_started is not None and not text:
+            if think_started is not None and not text and not stack and not calls:
                 elapsed = loop_now() - think_started
                 print(f"[{req_id}] Model is actively reasoning... ({round(elapsed)}s elapsed)", flush=True)
                 journal.emit("upstream.thinking_heartbeat",
@@ -560,6 +560,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
                 think_started = loop_now()
                 yield {"type": "thinking_start"}
             elif event.get("type") == "tool_call":
+                think_started = None
                 current = event.get("toolCallId") or "call_%d" % len(calls)
                 calls[current] = {"id": event.get("toolCallId"), "name": event.get("toolName"), "args": [],
                                   "out": "", "stream": ArgStream((param_types or {}).get(event.get("toolName")))}
@@ -584,6 +585,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
                     thinking.append(piece)
                     yield {"type": "thinking", "delta": piece}
             elif block == "signature":
+                think_started = None
                 if event.get("partialSignature"):
                     yield {"type": "thinking_signature", "signature": event["partialSignature"]}
             elif block == "tool_call" and current in calls:

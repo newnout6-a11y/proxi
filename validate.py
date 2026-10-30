@@ -356,6 +356,8 @@ def _finish(data, parsed):
         if inc is None or not inc:
             inc = _opt_bool(stream_options, "includeUsage")
         parsed.wants_usage = bool(inc)
+    else:
+        parsed.wants_usage = True
     parsed.tools = _tools(data)
     parsed.tool_choice = _tool_choice(data.get("tool_choice"))
     names = [tool["function"]["name"] for tool in parsed.tools]

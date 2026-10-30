@@ -72,7 +72,8 @@ class _Base:
             if self.thinking:
                 self.reasoning_tokens = approx_tokens(self.thinking)
             elif output_tokens is not None:
-                self.reasoning_tokens = max(0, int(output_tokens) - approx_tokens(self.text))
+                tool_text = "".join(c.get("name", "") + c.get("arguments", "") for c in self.tool_calls)
+                self.reasoning_tokens = max(0, int(output_tokens) - approx_tokens(self.text) - approx_tokens(tool_text))
         elif kind == "hitl":
             block = ("\n\n" if self.text else "") + event["question"]
             self.text += block
@@ -96,7 +97,7 @@ class _Base:
         base_completion = approx_tokens(self.text) + approx_tokens(tool_text)
         reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
         if self.output_tokens is not None:
-            completion = max(int(self.output_tokens), base_completion + reasoning)
+            completion = int(self.output_tokens)
         else:
             completion = base_completion + reasoning
         return prompt, completion
@@ -196,6 +197,9 @@ class ChatAdapter(_Base):
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
                 "total_tokens": prompt + completion,
+                "cached_tokens": self.cache_read or 0,
+                "cache_read_input_tokens": self.cache_read or 0,
+                "cache_creation_input_tokens": self.cache_write or 0,
                 "prompt_tokens_details": {
                     "cached_tokens": self.cache_read or 0,
                     "cache_read_tokens": self.cache_read or 0,
@@ -241,6 +245,9 @@ class ChatAdapter(_Base):
                              "finish_reason": FINISH_MAP.get(reason, "tool_calls" if self.tool_calls else "stop")}],
                 "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
                           "total_tokens": prompt + completion,
+                          "cached_tokens": self.cache_read or 0,
+                          "cache_read_input_tokens": self.cache_read or 0,
+                          "cache_creation_input_tokens": self.cache_write or 0,
                           "prompt_tokens_details": {
                               "cached_tokens": self.cache_read or 0,
                               "cache_read_tokens": self.cache_read or 0,

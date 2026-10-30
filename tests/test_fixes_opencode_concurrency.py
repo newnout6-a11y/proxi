@@ -474,6 +474,14 @@ def test_validate_stream_options_camel_case_support():
     parsed2 = validate.parse_chat(data2, cfg)
     assert parsed2.wants_usage is True
 
+    # When stream_options is omitted, wants_usage defaults to True for coding clients (OpenCode, Cursor, Aider)
+    data3 = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+    assert validate.parse_chat(data3, cfg).wants_usage is True
+
+    # Explicit opt-out is respected
+    data4 = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}], "stream": True, "stream_options": {"include_usage": False}}
+    assert validate.parse_chat(data4, cfg).wants_usage is False
+
 
 def test_chat_adapter_streaming_full_cache_read_write_details():
     class Writer:
@@ -512,6 +520,9 @@ def test_chat_adapter_streaming_full_cache_read_write_details():
     # Check streaming chunk
     usage_chunk = next(e for e in writer.events if "usage" in e)
     usage = usage_chunk["usage"]
+    assert usage["cached_tokens"] == 15000
+    assert usage["cache_read_input_tokens"] == 15000
+    assert usage["cache_creation_input_tokens"] == 2500
     assert usage["prompt_tokens_details"]["cached_tokens"] == 15000
     assert usage["prompt_tokens_details"]["cache_write_tokens"] == 2500
     assert usage["prompt_tokens_details"]["cache_read_tokens"] == 15000

@@ -556,11 +556,15 @@ def main():
     finally:
         try:
             runtime.backend.refresher.stop()
-            def _cleanup():
-                for t in asyncio.all_tasks(runtime.loop):
+            async def _cancel_all():
+                tasks = [t for t in asyncio.all_tasks(runtime.loop) if t is not asyncio.current_task()]
+                for t in tasks:
                     t.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 runtime.loop.stop()
-            runtime.loop.call_soon_threadsafe(_cleanup)
+
+            runtime.loop.call_soon_threadsafe(lambda: asyncio.create_task(_cancel_all()))
         finally:
             server.server_close()
 

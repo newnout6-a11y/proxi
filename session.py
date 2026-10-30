@@ -787,13 +787,19 @@ class SessionPool:
         self.backends = [backend]
         if isinstance(self.cfg.get("accounts"), list) and self.cfg["accounts"]:
             self.backends = []
+            custom_post = getattr(backend, "_http_post", None)
+            if custom_post == getattr(backend, "_default_post", None):
+                custom_post = None
+            custom_ws = getattr(backend, "_ws_connect", None)
+            if custom_ws == getattr(websockets, "connect", None):
+                custom_ws = None
             for acc in self.cfg["accounts"]:
                 acc_cfg = dict(self.cfg)
                 acc_cfg.update(acc)
                 acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
                 acc_cfg["_account_ref"] = acc
-                acc_backend = Backend(acc_cfg, http_post=getattr(backend, "_http_post", None),
-                                      ws_connect=getattr(backend, "_ws_connect", None))
+                acc_cfg["_disk_auth"] = (acc.get("cookie"), acc.get("xsrf"))
+                acc_backend = Backend(acc_cfg, http_post=custom_post, ws_connect=custom_ws)
                 self.backends.append(acc_backend)
             if self.backends:
                 self.backend = self.backends[0]

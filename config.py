@@ -102,17 +102,23 @@ def persist_auth(cfg):
     if not path or not cfg.get("_persist_auth", False):
         return
     saved = _read_file(path)
-    if saved.get("base", "").rstrip("/") != cfg["base"].rstrip("/"):
-        raise ValueError("session configuration origin changed")
-    disk_auth = (saved.get("cookie"), saved.get("xsrf"))
+    acc_match = None
     if isinstance(saved.get("accounts"), list):
         for acc in saved["accounts"]:
-            if isinstance(acc, dict) and acc.get("page_uuid") == cfg.get("page_uuid"):
-                disk_auth = (acc.get("cookie"), acc.get("xsrf"))
-                break
+            if isinstance(acc, dict):
+                if cfg.get("page_uuid") and acc.get("page_uuid") == cfg.get("page_uuid"):
+                    acc_match = acc
+                    break
+                elif not cfg.get("page_uuid") and acc.get("base", "").rstrip("/") == cfg["base"].rstrip("/"):
+                    acc_match = acc
+                    break
+    expected_base = (acc_match.get("base") if acc_match and acc_match.get("base") else saved.get("base", "")).rstrip("/")
+    if expected_base != cfg["base"].rstrip("/"):
+        raise ValueError("session configuration origin changed")
+    disk_auth = (acc_match.get("cookie"), acc_match.get("xsrf")) if acc_match else (saved.get("cookie"), saved.get("xsrf"))
     if disk_auth != cfg.get("_disk_auth", disk_auth):
         raise ValueError("session configuration changed during renewal")
-    if not saved.get("accounts") or cfg.get("page_uuid") == saved.get("page_uuid"):
+    if not saved.get("accounts") or (not acc_match and cfg.get("page_uuid") == saved.get("page_uuid")):
         saved.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
     if isinstance(saved.get("accounts"), list):
         for acc in saved["accounts"]:
@@ -146,12 +152,26 @@ def reload_auth(cfg):
     if not cfg.get("_config_path") or not cfg.get("_persist_auth", False):
         return False
     saved = _read_file(cfg["_config_path"])
-    if (saved.get("base", "").rstrip("/") != cfg["base"].rstrip("/")
-            or not saved.get("cookie") or not saved.get("xsrf")
-            or (saved["cookie"], saved["xsrf"]) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"]))):
+    acc_match = None
+    if isinstance(saved.get("accounts"), list):
+        for acc in saved["accounts"]:
+            if isinstance(acc, dict):
+                if cfg.get("page_uuid") and acc.get("page_uuid") == cfg.get("page_uuid"):
+                    acc_match = acc
+                    break
+                elif not cfg.get("page_uuid") and acc.get("base", "").rstrip("/") == cfg["base"].rstrip("/"):
+                    acc_match = acc
+                    break
+    target = acc_match if acc_match is not None else saved
+    base = target.get("base") or saved.get("base", "")
+    cookie = target.get("cookie")
+    xsrf = target.get("xsrf")
+    if (base.rstrip("/") != cfg["base"].rstrip("/")
+            or not cookie or not xsrf
+            or (cookie, xsrf) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"]))):
         return False
-    cfg.update(cookie=saved["cookie"], xsrf=saved["xsrf"], _disk_auth=(saved["cookie"], saved["xsrf"]),
-               cookie_values=[p.strip().split("=", 1)[1] for p in saved["cookie"].split(";") if "=" in p])
+    cfg.update(cookie=cookie, xsrf=xsrf, _disk_auth=(cookie, xsrf),
+               cookie_values=[p.strip().split("=", 1)[1] for p in cookie.split(";") if "=" in p])
     return True
 
 
