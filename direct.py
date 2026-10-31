@@ -676,10 +676,23 @@ async def _keepwarm(session, cfg):
             est_credits = prefix_tokens * credits.RATE_CACHE_READ
             session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0)
                                            + (actual if actual is not None else est_credits), 4)
-            journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
-                         thread=journal.tag(getattr(session, "thread_id", None)),
-                         prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
-                         actual_credits=actual, credits_total=session._keepwarm_cost)
+            if during:
+                # The user asked to SEE the mid-turn TTL refresh: console always,
+                # journal at info level (idle pings stay debug).
+                turn_age = round(time.time() - turn_started)
+                paid = actual if actual is not None else round(est_credits, 2)
+                print(f"[warm] TTL продлён во время хода: +{turn_age}s от начала, "
+                      f"кэш-чтение {paid} credits, всего {session._keepwarm_cost}", flush=True)
+                journal.emit("cache.keepwarm", "Прогрев кэша во время хода: TTL продлён", "info",
+                             model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
+                             during_turn=True, turn_age_seconds=turn_age,
+                             prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
+                             actual_credits=actual, credits_total=session._keepwarm_cost)
+            else:
+                journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
+                             thread=journal.tag(getattr(session, "thread_id", None)),
+                             prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
+                             actual_credits=actual, credits_total=session._keepwarm_cost)
             if cfg.get("direct_debug"):
                 print("[warm] prefix refreshed", flush=True)
         except asyncio.CancelledError:
