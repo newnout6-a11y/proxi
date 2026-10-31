@@ -389,7 +389,10 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             known_boundaries = sorted(set(session_ends) | turn_boundaries)
             # Anthropic enforces a strict maximum of 4 blocks with cache_control across the request.
             # If head is cached, that leaves at most 3 blocks for history. Otherwise at most 4.
-            max_history_cache = 3 if (head and cache) else 4
+            # The upstream backend adds its own cache_control breakpoint on the tool
+            # definitions, so with tools present one block stays reserved for it.
+            budget = 4 - (1 if tools else 0)
+            max_history_cache = budget - 1 if (head and cache) else budget
 
             chosen = set()
             chosen.add(0)
@@ -428,16 +431,18 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
                     block["cache"] = True
                 messages.append({"role": "user", "content": [block]})
 
-    # Hard safety check: ensure total blocks with cache: True NEVER exceeds 4 (Anthropic limit)
+    # Hard safety check: ensure total blocks with cache: True NEVER exceeds the Anthropic
+    # limit. With tools present one block is reserved for the upstream tool breakpoint.
+    max_cache_blocks = 3 if tools else 4
     cached_blocks = [
         b
         for m in messages
         for b in m.get("content", [])
         if isinstance(b, dict) and b.get("cache")
     ]
-    if len(cached_blocks) > 4:
+    if len(cached_blocks) > max_cache_blocks:
         for b in cached_blocks[1:-1]:
-            if len(cached_blocks) <= 4:
+            if len(cached_blocks) <= max_cache_blocks:
                 break
             b.pop("cache", None)
             cached_blocks = [

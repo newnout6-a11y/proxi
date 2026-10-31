@@ -65,6 +65,36 @@ def test_direct_prompt_cache_persistence_across_turns():
     assert len(cached4) == 4
 
 
+def test_direct_tools_cache_budget_reserves_upstream_breakpoint_slot():
+    """With client tools the upstream backend adds its own cache_control breakpoint
+    on the tool definitions, so relay markers must stay within 3 — otherwise
+    Anthropic rejects with "A maximum of 4 blocks with cache_control may be
+    provided. Found 5." (regression: multi-turn request with 13-18 tools)."""
+    cfg = {"direct_cache": True}
+    model = {"model": "claude-opus-5-5"}
+    head = "You are a helpful assistant."
+    tools = [
+        {"name": f"tool_{i}", "description": "t", "parameters": {"type": "object", "properties": {}}}
+        for i in range(13)
+    ]
+    chunks = ["User: hi", "[tool result id=1] ok", "User: go on", "[tool result id=2] ok", "User: continue"]
+
+    body = direct.build_body(cfg, model, head, "", tools, "auto", 100, chunks=chunks,
+                             session=SimpleNamespace(_cached_turn_ends=[]))
+    cached = [b for m in body["messages"] for b in m.get("content", []) if isinstance(b, dict) and b.get("cache")]
+    # 3 relay markers + 1 upstream tool breakpoint = 4 (never 5)
+    assert len(cached) <= 3
+    assert body["messages"][0]["content"][0]["cache"] is True
+    assert body["messages"][-1]["content"][-1].get("cache") is True
+
+    # Without tools the previous budget of 4 relay markers still holds
+    body_no_tools = direct.build_body(cfg, model, head, "", None, "auto", 100, chunks=chunks,
+                                      session=SimpleNamespace(_cached_turn_ends=[]))
+    cached_no_tools = [b for m in body_no_tools["messages"] for b in m.get("content", [])
+                       if isinstance(b, dict) and b.get("cache")]
+    assert len(cached_no_tools) == 4
+
+
 def test_client_text_suppresses_incomplete_tool_envelopes():
     """Verify _ClientText suppresses incomplete tool envelopes on final flush
     while preserving ordinary markdown backtick markup."""
