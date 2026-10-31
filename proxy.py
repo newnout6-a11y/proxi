@@ -360,7 +360,7 @@ def make_handler(runtime: Runtime):
                         self.headers.get("x-conversation-id") or
                         self.headers.get("session-id") or
                         self.headers.get("conversation-id"))
-            parsed.conversation_key = validate.conversation_key(data, affinity, allow_content_fallback=True)
+            parsed.conversation_key = validate.conversation_key(data, affinity)
             parsed.request_id = self.request_id
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
@@ -457,7 +457,7 @@ def make_handler(runtime: Runtime):
                     if now - writer_last >= sse.HEARTBEAT_EVERY:
                         writer.comment()
                         last_write = now
-                    if sse.client_gone(self):
+                    if sse.client_gone(self) or getattr(writer, "broken", False):
                         self._cancel_turn(fut, holder)
                         return "cancelled"
                     if fut.done() and events.empty():
@@ -474,7 +474,7 @@ def make_handler(runtime: Runtime):
                 adapter.feed(event)
                 last_write = time.time()
                 # Check for a disconnect on every event, not only when the stream idles.
-                if sse.client_gone(self):
+                if sse.client_gone(self) or getattr(writer, "broken", False):
                     self._cancel_turn(fut, holder)
                     return "cancelled"
             return holder.get("reason", reason)

@@ -4,7 +4,13 @@ Drop-in alternative to the agent WebSocket path: same normalised event stream, b
 plain HTTP POST. The stable system head is sent as a cached block so a large project
 context is billed once and reused, keeping time-to-first-token flat.
 """
-import asyncio, hashlib, json, time, urllib.error, urllib.request
+import asyncio
+import hashlib
+import json
+import socket
+import time
+import urllib.error
+import urllib.request
 
 import apierr
 import journal
@@ -13,6 +19,34 @@ import models as model_catalog
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
+
+
+def _force_close_response(resp):
+    """Instantaneously unblock threads waiting in WinSock recv() or HTTPResponse read()."""
+    if resp is None:
+        return
+    try:
+        fd = resp.fileno() if hasattr(resp, "fileno") else None
+        if fd is not None and fd != -1:
+            try:
+                s = socket.socket(fileno=fd)
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        resp.close()
+    except Exception:
+        pass
+
 _CACHE_MIN_CHARS = 0
 
 
@@ -268,16 +302,61 @@ class ArgStream:
         return ""
 
 
+def _extract_chunk_text(chunk):
+    if isinstance(chunk, str):
+        return chunk
+    if isinstance(chunk, dict):
+        return str(chunk.get("text") or chunk.get("content") or "")
+    if isinstance(chunk, list):
+        parts = []
+        for b in chunk:
+            if isinstance(b, dict):
+                parts.append(str(b.get("text") or b.get("content") or ""))
+            elif isinstance(b, str):
+                parts.append(b)
+        return " ".join(parts)
+    return str(chunk or "")
+
+
+def _is_user_chunk(chunk):
+    if isinstance(chunk, dict):
+        role = chunk.get("role")
+        if role in ("user", "human", "client"):
+            return True
+    elif isinstance(chunk, list):
+        if any(isinstance(b, dict) and b.get("role") in ("user", "human", "client") for b in chunk):
+            return True
+    text = _extract_chunk_text(chunk).lstrip()
+    lowered = text.lower()
+    return (lowered.startswith(("user:", "human:", "client:", "user task:"))
+            or text.startswith(("User:", "Human:", "Client:", "USER TASK:")))
+
+
+def _is_tool_result_chunk(chunk):
+    if isinstance(chunk, dict):
+        role = chunk.get("role")
+        ctype = chunk.get("type")
+        if role in ("tool", "function") or ctype in ("tool_result", "exec_result"):
+            return True
+    elif isinstance(chunk, list):
+        if any(isinstance(b, dict) and (b.get("role") in ("tool", "function") or b.get("type") in ("tool_result", "exec_result")) for b in chunk):
+            return True
+    text = _extract_chunk_text(chunk).lstrip()
+    lowered = text.lower()
+    return (lowered.startswith(("[tool result", "[tool_result", "[command result", "[exec_result", "tool:", "tool result"))
+            or "[tool result" in lowered or "[tool_result" in lowered or "[command result" in lowered)
+
+
 def cache_key_for(head):
     return hashlib.sha256(head.encode("utf-8")).hexdigest()[:24]
 
 
-def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None):
+def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
     """Assemble the request body.
 
     The stable head becomes a cached system block and the history is sent as one
-    message per chunk, with the breakpoint moved to the end every turn so the
-    previous prefix is read from cache instead of being reprocessed.
+    message per chunk, preserving prior turn endpoints as cache breakpoints so
+    intermediate multi-tool turns do not discard prefix caches.
     """
     messages = []
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
@@ -291,23 +370,88 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         if prompt:
             messages.append({"role": "user", "content": prompt})
     else:
+        cache_indices = set()
+        turn_boundaries = set()
+        if cfg.get("direct_cache", True):
+            session_ends = [idx for idx in getattr(session, "_cached_turn_ends", []) if 0 <= idx < len(history) - 1] if session else []
+
+            # Chunk 0 is the initial conversation prompt and must ALWAYS be preserved
+            turn_boundaries.add(0)
+
+            for i, chunk in enumerate(history):
+                if _is_user_chunk(chunk):
+                    turn_boundaries.add(i)
+                if i + 1 < len(history) and _is_user_chunk(history[i + 1]):
+                    turn_boundaries.add(i)
+                if _is_tool_result_chunk(chunk):
+                    turn_boundaries.add(i)
+
+            known_boundaries = sorted(set(session_ends) | turn_boundaries)
+            # Anthropic enforces a strict maximum of 4 blocks with cache_control across the request.
+            # If head is cached, that leaves at most 3 blocks for history. Otherwise at most 4.
+            max_history_cache = 3 if (head and cache) else 4
+
+            chosen = set()
+            chosen.add(0)
+            chosen.add(len(history) - 1)
+
+            slots_left = max_history_cache - len(chosen)
+            intermediates = [i for i in known_boundaries if 0 < i < len(history) - 1]
+            if slots_left > 0 and intermediates:
+                for idx in intermediates[-slots_left:]:
+                    chosen.add(idx)
+
+            if len(chosen) < max_history_cache and len(history) >= 3:
+                for idx in reversed(range(1, len(history) - 1)):
+                    if len(chosen) >= max_history_cache:
+                        break
+                    chosen.add(idx)
+
+            cache_indices = chosen
+
         for index, part in enumerate(history):
+            should_cache = index in cache_indices
             if isinstance(part, list):
                 blocks = [dict(b) if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in part]
-                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                if should_cache:
                     target = next((b for b in reversed(blocks) if b.get("type") == "text"), blocks[-1])
                     target["cache"] = True
                 messages.append({"role": "user", "content": blocks})
             elif isinstance(part, dict):
                 block = dict(part)
-                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                if should_cache:
                     block["cache"] = True
                 messages.append({"role": "user", "content": [block]})
             else:
                 block = {"type": "text", "text": str(part)}
-                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                if should_cache:
                     block["cache"] = True
                 messages.append({"role": "user", "content": [block]})
+
+    # Hard safety check: ensure total blocks with cache: True NEVER exceeds 4 (Anthropic limit)
+    cached_blocks = [
+        b
+        for m in messages
+        for b in m.get("content", [])
+        if isinstance(b, dict) and b.get("cache")
+    ]
+    if len(cached_blocks) > 4:
+        for b in cached_blocks[1:-1]:
+            if len(cached_blocks) <= 4:
+                break
+            b.pop("cache", None)
+            cached_blocks = [
+                blk for m in messages for blk in m.get("content", [])
+                if isinstance(blk, dict) and blk.get("cache")
+            ]
+
+    if session is not None and history and cfg.get("direct_cache", True):
+        prior = [e for e in getattr(session, "_cached_turn_ends", []) if e < len(history) - 1]
+        all_ends = set(prior) | {e for e in turn_boundaries if e < len(history) - 1}
+        all_ends.add(0)
+        all_ends.add(len(history) - 1)
+        session._cached_turn_ends = sorted(all_ends)
+
     body = {"model": model_provider.get("model"),
             "messages": messages,
             "rit": make_rit(messages, tools),
@@ -397,7 +541,7 @@ async def _keepwarm(session, cfg):
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
     """Yield normalised relay events from the direct NDJSON stream."""
-    body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks)
+    body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
         body = {key: value for key, value in body.items() if key != "metadata"}
@@ -447,10 +591,18 @@ async def _stream_body(cfg, session, body, param_types=None):
     queue: asyncio.Queue = asyncio.Queue()
     holder = {"response": None}
 
+    def abort_direct():
+        _force_close_response(holder.get("response"))
+        loop.call_soon_threadsafe(queue.put_nowait, asyncio.CancelledError())
+
+    session._active_direct_abort = abort_direct
+
     def worker():
         try:
             attempt = 0
             while True:
+                if session._cancelled:
+                    return
                 request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                                  data=payload, headers=headers, method="POST")
                 try:
@@ -467,52 +619,53 @@ async def _stream_body(cfg, session, body, param_types=None):
                     holder["response"] = exc
                     raise apierr.ApiError(*_http_error(exc.code, detail))
             holder["response"] = response
+            if session._cancelled:
+                _force_close_response(response)
+                return
             for raw in response:
+                if session._cancelled:
+                    break
                 line = raw.strip()
                 if not line:
                     continue
                 loop.call_soon_threadsafe(queue.put_nowait, line)
         except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
-            loop.call_soon_threadsafe(queue.put_nowait, exc)
+            if not session._cancelled:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
-            try:
-                if holder["response"] is not None:
-                    holder["response"].close()
-            except Exception:
-                pass
+            _force_close_response(holder.get("response"))
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
     text, thinking = [], []
-    call = None
     produced = False
     attempts_left = 2
-    while True:
-        task = loop.run_in_executor(None, worker)
-        try:
-            async for event in _drain(cfg, session, queue, text, thinking, param_types):
-                produced = True
-                yield event
-        finally:
-            if not task.done():
+    try:
+        while True:
+            task = loop.run_in_executor(None, worker)
+            try:
+                async for event in _drain(cfg, session, queue, text, thinking, param_types):
+                    produced = True
+                    yield event
+            finally:
+                if not task.done():
+                    _force_close_response(holder.get("response"))
                 try:
-                    holder["response"] and holder["response"].close()
+                    await asyncio.wait_for(asyncio.shield(task), timeout=5)
                 except Exception:
                     pass
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=5)
-            except Exception:
-                pass
-        if session._cancelled:
-            yield {"type": "end", "reason": "cancelled"}
-            return
-        if produced or attempts_left <= 0:
-            break
-        # Copilot occasionally returns metadata+end_of_stream with no blocks at all.
-        attempts_left -= 1
-        holder["response"] = None
-    if text:
-        yield {"type": "final_text", "text": "".join(text)}
-    yield {"type": "end", "reason": "stop"}
+            if session._cancelled:
+                yield {"type": "end", "reason": "cancelled"}
+                return
+            if produced or attempts_left <= 0:
+                break
+            # Copilot occasionally returns metadata+end_of_stream with no blocks at all.
+            attempts_left -= 1
+            holder["response"] = None
+        if text:
+            yield {"type": "final_text", "text": "".join(text)}
+        yield {"type": "end", "reason": "stop"}
+    finally:
+        session._active_direct_abort = None
 
 
 async def _drain(cfg, session, queue, text, thinking, param_types=None):
@@ -544,8 +697,12 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
             continue
         if item is None:
             return
+        if isinstance(item, asyncio.CancelledError) or session._cancelled:
+            yield {"type": "end", "reason": "cancelled"}
+            return
         if isinstance(item, BaseException):
             raise item
+
         if cfg.get("direct_raw"):
             print("[raw]", str(item)[:200], flush=True)
         try:

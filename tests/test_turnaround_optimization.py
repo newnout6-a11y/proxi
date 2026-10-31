@@ -38,7 +38,7 @@ def test_tool_hash_normalization_canonical_order():
 
 
 def test_varying_tool_declarations_preserve_normalized_superset():
-    """Verify that a turn declaring fewer tools (e.g. 15 tools vs 18 tools) preserves the session's normalized tool schema."""
+    """Verify that a turn declaring fewer tools (e.g. 15 tools vs 18 tools) aligns the session's tool schema to the current turn."""
     session = RelaySession(type("B", (), {"cfg": {}})(), "t1")
     tools_18 = [{"name": f"tool_{i:02d}", "description": f"Tool {i}", "params": {}, "strict": True} for i in range(18)]
     tools_15 = tools_18[:15]
@@ -47,11 +47,11 @@ def test_varying_tool_declarations_preserve_normalized_superset():
     session.set_direct("head_v1", tools_18, "auto", 100)
     assert len(session.get_canonical_tools()) == 18
 
-    # Turn 2 passes only 15 tools (e.g. subagent invocation)
+    # Turn 2 passes only 15 tools: replaced with the current authorized set
     session.register_tools(tools_15)
     canonical = session.get_canonical_tools()
-    assert len(canonical) == 18
-    assert [t["name"] for t in canonical] == [t["name"] for t in sorted(tools_18, key=lambda x: x["name"])]
+    assert len(canonical) == 15
+    assert [t["name"] for t in canonical] == [t["name"] for t in sorted(tools_15, key=lambda x: x["name"])]
 
 
 def test_isolated_tool_less_request_context_alignment(tmp_path):

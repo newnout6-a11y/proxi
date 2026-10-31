@@ -200,7 +200,7 @@ def test_codex_catalog_requires_same_key_and_advertises_direct_tools(relay):
     assert model["tool_mode"] == "direct"
     assert model["shell_type"] == "unified_exec"
     assert model["apply_patch_tool_type"] == "freeform"
-    assert model["input_modalities"] == ["text"]
+    assert model["input_modalities"] == ["text", "image"]
     assert "high" in [item["effort"] for item in model["supported_reasoning_levels"]]
 
 

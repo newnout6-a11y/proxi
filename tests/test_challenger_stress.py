@@ -86,23 +86,23 @@ def test_multiturn_dynamic_tool_superset_growth_and_subagent_churn():
     session.set_direct("head_base", [t("Tool_A"), t("Tool_C")], "auto", 100)
     assert [x["name"] for x in session.get_canonical_tools()] == ["Tool_A", "Tool_C"]
 
-    # Turn 2: Subagent 1 declares Tool_B
+    # Turn 2: Subagent 1 declares Tool_B (replaces with current authorized tools)
     session.register_tools([t("Tool_B")])
-    assert [x["name"] for x in session.get_canonical_tools()] == ["Tool_A", "Tool_B", "Tool_C"]
+    assert [x["name"] for x in session.get_canonical_tools()] == ["Tool_B"]
 
     # Turn 3: Subagent 2 declares Tool_D and Tool_A
     session.register_tools([t("Tool_D"), t("Tool_A")])
-    assert [x["name"] for x in session.get_canonical_tools()] == ["Tool_A", "Tool_B", "Tool_C", "Tool_D"]
+    assert [x["name"] for x in session.get_canonical_tools()] == ["Tool_A", "Tool_D"]
 
-    # Turn 4: Tool-less compact registers empty list
+    # Turn 4: Tool-less compact registers empty list (retains prior canonical set for toolChoice none)
     session.register_tools([])
-    assert [x["name"] for x in session.get_canonical_tools()] == ["Tool_A", "Tool_B", "Tool_C", "Tool_D"]
+    assert [x["name"] for x in session.get_canonical_tools()] == ["Tool_A", "Tool_D"]
 
     # Turn 5: Parent resumes with Tool_C
     session.register_tools([t("Tool_C")])
     canonical = session.get_canonical_tools()
-    assert [x["name"] for x in canonical] == ["Tool_A", "Tool_B", "Tool_C", "Tool_D"]
-    assert len(canonical) == 4
+    assert [x["name"] for x in canonical] == ["Tool_C"]
+    assert len(canonical) == 1
 
 
 def test_interleaved_tool_and_toolless_requests_orchestrator(tmp_path):
@@ -206,18 +206,22 @@ def test_interleaved_tool_and_toolless_requests_orchestrator(tmp_path):
 
 def test_adversarial_reasoning_effort_matrix():
     """Verify reasoning effort resolution across a wide matrix of models and input values."""
-    # 1. Models that support high: claude-opus-5-5, claude-sonnet-5
+    # 1. Models that support high and max: claude-opus-5-5, claude-sonnet-5
     for m in ["claude-opus-5-5", "claude-sonnet-5"]:
         entry, eff = models.resolve_tolerant(m, "high")
         assert eff == "high", f"Effort high must be preserved on {m}"
         entry, eff = models.resolve_tolerant(m, "max")
-        assert eff == "max", f"Effort max must be preserved on {m}"
+        assert eff == "max", f"Effort max must be preserved on {m} without downgrade"
+        entry, eff = models.resolve_tolerant(m + "#max")
+        assert eff == "max", f"Effort max from model suffix #max must be preserved on {m}"
+        entry, eff = models.resolve_tolerant(m + ":max")
+        assert eff == "max", f"Effort max from model suffix :max must be preserved on {m}"
         entry, eff = models.resolve_tolerant(m, "medium")
         assert eff == "medium", f"Effort medium must be preserved on {m}"
         entry, eff = models.resolve_tolerant(m, "low")
         assert eff == "low", f"Effort low must be preserved on {m}"
 
-    # 2. Haiku only accepts low, medium, high, max:
+    # 2. Haiku accepts low, medium, high, max:
     # Test valid levels
     for valid_lvl in ["low", "medium", "high", "max"]:
         entry_h, eff_h = models.resolve_tolerant("claude-haiku-4-5-20251001", valid_lvl)
