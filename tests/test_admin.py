@@ -358,3 +358,13 @@ def test_journal_persists_jsonl_and_restores_tail(tmp_path):
 def test_journal_never_raises_on_odd_values():
     log = journal.Journal()
     assert log.emit("x.y", None, "bogus-level", value=float("nan"), obj=object(), deep=[[[[[[[[1]]]]]]]])["level"] == "info"
+
+
+def test_settings_reject_values_above_maximum(admin_relay):
+    """Without an upper bound rate_limit_rps=1e308 silently disabled the limiter."""
+    status, _body, _headers = admin_relay.patch({"rate_limit_rps": 1e308})
+    assert status == 400
+    status, _body, _headers = admin_relay.patch({"turn_timeout": 10 ** 12})
+    assert status == 400
+    status, _body, _headers = admin_relay.patch({"rate_limit_rps": 50})
+    assert status == 200, "legitimate values must still pass"

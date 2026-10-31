@@ -61,26 +61,27 @@ def _schema():
         "show_exec_output": "Вывод локальных команд",
     }.items():
         fields[key] = {"type": "boolean", "label": label}
-    for key, label, minimum in [
-        ("max_workers", "Параллельные запросы", 1),
-        ("max_conversations", "Сохранённые диалоги", 1),
-        ("conversation_idle_timeout", "Хранение неактивного диалога, с", 1),
-        ("turn_timeout", "Ожидание ответа, с", 1),
-        ("recv_timeout", "Ожидание WebSocket, с", 1),
-        ("upstream_timeout", "Ожидание соединения, с", 1),
-        ("session_refresh_interval", "Обновление авторизации, с", 0),
-        ("command_timeout", "Ожидание локальной команды, с", 1),
-        ("command_output_limit", "Вывод команды, байт (0 — без лимита)", 0),
-        ("max_exec_turns", "Циклы инструментов (0 — без лимита)", 0),
-        ("context_max_bytes", "Контекст проекта, байт", 1),
-        ("max_prompt_bytes", "Размер запроса, байт (0 — без лимита)", 0),
-        ("max_body_bytes", "Размер HTTP body, байт", 1),
-        ("max_frame_bytes", "Размер WebSocket frame, байт", 1),
+    for key, label, minimum, maximum in [
+        ("max_workers", "Параллельные запросы", 1, 512),
+        ("max_conversations", "Сохранённые диалоги", 1, 4096),
+        ("conversation_idle_timeout", "Хранение неактивного диалога, с", 1, 86400),
+        ("turn_timeout", "Ожидание ответа, с", 1, 86400),
+        ("recv_timeout", "Ожидание WebSocket, с", 1, 3600),
+        ("upstream_timeout", "Ожидание соединения, с", 1, 3600),
+        ("session_refresh_interval", "Обновление авторизации, с", 0, 86400),
+        ("command_timeout", "Ожидание локальной команды, с", 1, 86400),
+        ("command_output_limit", "Вывод команды, байт (0 — без лимита)", 0, 100_000_000),
+        ("max_exec_turns", "Циклы инструментов (0 — без лимита)", 0, 1000),
+        ("context_max_bytes", "Контекст проекта, байт", 1, 10_000_000),
+        ("max_prompt_bytes", "Размер запроса, байт (0 — без лимита)", 0, 1_073_741_824),
+        ("max_body_bytes", "Размер HTTP body, байт", 1, 1_073_741_824),
+        ("max_frame_bytes", "Размер WebSocket frame, байт", 1, 1_073_741_824),
     ]:
-        fields[key] = {"type": "integer", "label": label, "min": minimum}
-    fields["rate_limit_rps"] = {"type": "number", "label": "Запросов в секунду (0 — без лимита)", "min": 0}
+        fields[key] = {"type": "integer", "label": label, "min": minimum, "max": maximum}
+    fields["rate_limit_rps"] = {"type": "number", "label": "Запросов в секунду (0 — без лимита)",
+                                "min": 0, "max": 10_000}
     fields["rate_limit_burst"] = {"type": "number", "label": "Запас запросов", "min": 0,
-                                  "exclusive_minimum": True}
+                                  "exclusive_minimum": True, "max": 100_000}
     for key, field in fields.items():
         field["restart_required"] = key not in LIVE_SETTINGS
         field["description"] = ("Применяется к новым запросам сразу после сохранения."
@@ -210,6 +211,9 @@ class Admin:
             if "min" in field and (value < field["min"] or
                                    (field.get("exclusive_minimum") and value == field["min"])):
                 raise apierr.bad_request(f"'{key}' is below its minimum", param=key)
+            if "max" in field and value > field["max"]:
+                # Without an upper bound 1e308 would silently disable the limiter.
+                raise apierr.bad_request(f"'{key}' is above its maximum", param=key)
         if "session_mode" in changes and os.environ.get("RELAY_SESSION_MODE"):
             raise apierr.bad_request("session_mode is controlled by RELAY_SESSION_MODE", param="session_mode")
 
@@ -354,7 +358,13 @@ class Admin:
         # Credentials stay in headers, never URLs, static markup or responses.
         try:
             auth.verify(handler.headers, "", self.cfg["relay_api_key"])
-        except apierr.ApiError:
+        except apierr.ApiError as exc:
+            # Only a PRESENTED wrong key counts as brute-forcing; missing-key
+            # probes stay unthrottled.
+            if exc.message == "invalid relay API key":
+                wait = auth.register_auth_failure(handler.client_address[0])
+                if wait:
+                    raise apierr.too_many_requests("too many auth failures", round(wait, 1))
             journal.emit("admin.auth_failed", "Отклонён вход в админку: неверный ключ", "warn",
                          path=path, request_id=handler.request_id)
             raise

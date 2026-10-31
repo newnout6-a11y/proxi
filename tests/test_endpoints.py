@@ -12,7 +12,7 @@ def test_health_rejects_stale_balance(relay):
     assert status == 503
     assert body["ok"] is False
     assert body["upstream"] == "degraded"
-    assert "401" in body["error"]
+    assert body["balance_known"] is False
     assert body["session"]["keepalive"] is False
 
 

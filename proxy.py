@@ -96,6 +96,10 @@ def make_handler(runtime: Runtime):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "retool-relay/2"
+        # Idle keep-alive reads die after 75s: without this, 32 silent connections
+        # hold every worker slot forever (slowloris on a single-process relay).
+        # SSE heartbeats (10-15s) keep legitimate streams well below it.
+        timeout = 75
 
         def log_message(self, fmt, *args):
             return
@@ -209,7 +213,14 @@ def make_handler(runtime: Runtime):
                     raise apierr.not_found()
                 if route != "health":
                     query = parse_qs(parsed_url.query)
-                    auth.verify(self.headers, (query.get("key") or [""])[0], cfg["relay_api_key"])
+                    try:
+                        auth.verify(self.headers, (query.get("key") or [""])[0], cfg["relay_api_key"])
+                    except apierr.ApiError as exc:
+                        # A missing key is a routine probe; a PRESENTED wrong key is
+                        # brute-forcing and gets the always-on per-source budget.
+                        if exc.message == "invalid relay API key":
+                            self._throttle_auth_failure()
+                        raise
                 if route == "chat":
                     if not cfg["enable_chat"]:
                         raise apierr.not_found("chat API disabled")
@@ -271,6 +282,13 @@ def make_handler(runtime: Runtime):
             extra = {"retry-after": err.retry_after} if err.retry_after else None
             self._json(err.status, body, extra)
 
+        def _throttle_auth_failure(self):
+            # rate_limit_rps is off by default and covers only completions, so key
+            # brute-forcing gets its own always-on budget per source address.
+            wait = auth.register_auth_failure(self.client_address[0])
+            if wait:
+                raise apierr.too_many_requests("too many auth failures", round(wait, 1))
+
         def _count_tokens(self):
             """Claude Code asks for a token estimate before sending a turn."""
             data = validate.load_json(self._read_body())
@@ -317,14 +335,19 @@ def make_handler(runtime: Runtime):
                 ref = getattr(b, "refresher", None)
                 if ref and ref.status().get("stale"):
                     ok = False
+            # /health is the only unauthenticated route and carries CORS *: it must
+            # expose readiness booleans, not organization financials or raw
+            # upstream error text — those live behind /v1/balance with the key.
+            session = {key: value for key, value in runtime.backend.refresher.status().items()
+                       if not isinstance(value, str)}
             payload = {
                 "ok": ok,
                 "uptime_seconds": round(time.time() - runtime.started, 1),
                 "session_mode": cfg["session_mode"],
                 "models": len(model_catalog.catalog()),
                 "upstream": "ok" if ok else "degraded",
-                "error": balance.get("error") or balance.get("stale_error"),
-                "session": runtime.backend.refresher.status(),
+                "balance_known": ok,
+                "session": session,
             }
             self._json(200 if ok else 503, payload)
 
@@ -544,6 +567,8 @@ def main():
     print("=" * 64)
     print(" Retool AI relay")
     print(" listen:        http://" + cfg["host"] + ":" + str(cfg["port"]) + "/v1")
+    if cfg["host"] not in ("127.0.0.1", "localhost", "::1"):
+        print(" WARNING:       non-loopback address: /health and admin static are reachable from outside")
     print(" relay key:     " + auth.mask(cfg["relay_api_key"]) + "  (from " + auth.relay_key_source() + ")")
     print(" model default: " + cfg["model"] + " | effort: " + cfg["reasoning_effort"])
     print(" session mode:  " + cfg["session_mode"] + " | workspace: " + cfg["workspace_root"])
