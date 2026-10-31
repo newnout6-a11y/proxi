@@ -796,6 +796,28 @@ class SessionLease:
         return getattr(self.session, name)
 
     def cancel(self):
+        # The released flag is flipped on the pool loop. From an HTTP thread the
+        # check must run on that same loop, or a stale cancel lands after the next
+        # begin_request() and silently cancels the NEXT lease's turn. From the loop
+        # thread itself (in-turn backend callbacks) cancel stays synchronous —
+        # deferring it would break the immediate socket-closed contract.
+        session = self.session
+        loop = getattr(session, "_loop", None)
+        on_loop = False
+        try:
+            on_loop = loop is not None and loop.is_running() and asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            if not self.released:
+                session.cancel()
+            return
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._cancel_checked)
+        else:
+            self._cancel_checked()
+
+    def _cancel_checked(self):
         if not self.released:
             self.session.cancel()
 
@@ -926,6 +948,10 @@ class SessionPool:
                             session._cached_head = parent._cached_head
                         if getattr(parent, "_registered_tools", None):
                             session._registered_tools = dict(parent._registered_tools)
+                            # Remember the inherited snapshot: on release only
+                            # child-ADDED tools transfer back, so a narrowed or
+                            # replaced client set cannot be resurrected by a union.
+                            session._inherited_tools = set(parent._registered_tools)
                         if getattr(parent, "_direct", None):
                             session._direct = dict(parent._direct)
                         if getattr(parent, "_cached_turn_ends", None):
@@ -974,7 +1000,14 @@ class SessionPool:
                 if key and key in self._conversations:
                     parent = self._conversations[key]
                     if parent is not None and getattr(session, "_registered_tools", None):
-                        parent._registered_tools.update(session._registered_tools)
+                        # Transfer only tools the child ADDED over its inherited
+                        # snapshot: a plain union would resurrect tools the
+                        # parent's client has since removed or replaced.
+                        inherited = getattr(session, "_inherited_tools", set())
+                        added = {name: tool for name, tool in session._registered_tools.items()
+                                 if name not in inherited}
+                        if added:
+                            parent._registered_tools.update(added)
             if not keep or session._needs_drain or session._cancelled:
                 await session.aclose()
         finally:
