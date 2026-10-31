@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 
 import apierr
+import credits
 import journal
 import models as model_catalog
 
@@ -545,8 +546,13 @@ async def _keepwarm(session, cfg):
                 continue
             await asyncio.to_thread(_ping, session, body)
             session._warm_at = time.time()
+            prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
+            est_credits = prefix_tokens * credits.RATE_CACHE_READ
+            session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0) + est_credits, 4)
             journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
-                         thread=journal.tag(getattr(session, "thread_id", None)))
+                         thread=journal.tag(getattr(session, "thread_id", None)),
+                         prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
+                         est_credits_total=session._keepwarm_cost)
             if cfg.get("direct_debug"):
                 print("[warm] prefix refreshed", flush=True)
         except asyncio.CancelledError:
@@ -587,6 +593,15 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     finally:
         session._busy = False
         if body.get("openAICacheKey"):
+            prior_key = getattr(session, "_last_cache_key", None)
+            if prior_key and prior_key != body["openAICacheKey"]:
+                # A new key means the upstream prefix cache starts from zero: every
+                # history breakpoint misses and the whole prompt is written again.
+                journal.emit("cache.key_changed", "Кэш-ключ сменился — префикс будет перезаписан", "info",
+                             old=prior_key, new=body["openAICacheKey"], model=body.get("model"),
+                             tools=len(body.get("tools") or []),
+                             thread=journal.tag(getattr(session, "thread_id", None)))
+            session._last_cache_key = body["openAICacheKey"]
             session._warm_body = body
             session._warm_at = time.time()
             session._last_request_at = time.time()

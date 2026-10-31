@@ -13,6 +13,7 @@ import uuid
 
 import apierr
 import executor
+import credits
 import journal
 import models as model_catalog
 from context import build_system_instructions
@@ -562,9 +563,14 @@ class TurnRunner:
                             elif event["type"] == "credits":
                                 self.credits.record_turn(turn_id, event["value"])
                                 usage = event.get("usage") or {}
-                                log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s" % (
-                                    event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—")),
-                                    "info", credits=event["value"], **usage)
+                                breakdown = credits.cost_breakdown(usage)
+                                hit = breakdown["cache_hit_ratio"]
+                                log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
+                                    event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
+                                    "%d%%" % round(hit * 100) if hit is not None else "—"),
+                                    "info", credits=event["value"], **usage, **breakdown)
+                                if session is not None:
+                                    session._last_prefix_tokens = breakdown["prompt_tokens"]
                                 out.put(event)
                             elif event["type"] == "hitl":
                                 out.put(event)

@@ -2,6 +2,7 @@
 import asyncio
 from collections import deque
 import datetime as _datetime
+import hashlib
 import json
 import os
 import time
@@ -293,9 +294,22 @@ class RelaySession:
 
     def set_direct(self, head, tools, tool_choice, max_tokens, chunks=None):
         """Direct transport: cacheable head, chunked history and native client tools."""
+        prior = self._direct or {}
         if head:
+            if self._cached_head and self._cached_head != head:
+                # Head churn invalidates the cached prefix, so every history
+                # breakpoint misses and the whole prompt is written again.
+                journal.emit("cache.head_changed", "Head изменился — кэш префикса будет перезаписан", "info",
+                             old_sha=hashlib.sha256(self._cached_head.encode("utf-8")).hexdigest()[:12],
+                             new_sha=hashlib.sha256(head.encode("utf-8")).hexdigest()[:12],
+                             old_chars=len(self._cached_head), new_chars=len(head),
+                             thread=journal.tag(getattr(self, "thread_id", None)))
             self._cached_head = head
         if tools:
+            if prior.get("tools") and prior.get("tools") != tools:
+                journal.emit("cache.tools_changed", "Набор инструментов клиента изменился", "info",
+                             old_count=len(prior["tools"]), new_count=len(tools),
+                             thread=journal.tag(getattr(self, "thread_id", None)))
             self._registered_tools = {t["name"]: t for t in tools if isinstance(t, dict) and t.get("name")}
         self._direct = {"head": head or "", "tools": tools, "tool_choice": tool_choice,
                         "max_tokens": max_tokens, "chunks": chunks}
