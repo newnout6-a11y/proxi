@@ -59,6 +59,8 @@ DEFAULTS = {
     # Provider caches expire in minutes; re-read the prefix to hold it open.
     "cache_keepwarm_seconds": 240,
     "cache_keepwarm_idle": 1800,
+    "cache_keepwarm_during_turns": True,
+    "cache_keepwarm_turn_offset": 200,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -208,7 +210,8 @@ def load(path=CONFIG_PATH):
                     "turn_timeout", "recv_timeout", "upstream_timeout",
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
-                    "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle"):
+                    "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
+                    "cache_keepwarm_turn_offset"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):

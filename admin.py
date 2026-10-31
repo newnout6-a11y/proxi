@@ -59,6 +59,7 @@ def _schema():
         "show_unrouted_models": "Показывать модели без маршрута",
         "show_thinking": "Передавать мышление модели", "project_context": "Контекст проекта",
         "show_exec_output": "Вывод локальных команд",
+        "cache_keepwarm_during_turns": "Прогрев кэша во время длинных ходов",
     }.items():
         fields[key] = {"type": "boolean", "label": label}
     for key, label, minimum, maximum in [
@@ -76,6 +77,7 @@ def _schema():
         ("max_prompt_bytes", "Размер запроса, байт (0 — без лимита)", 0, 1_073_741_824),
         ("max_body_bytes", "Размер HTTP body, байт", 1, 1_073_741_824),
         ("max_frame_bytes", "Размер WebSocket frame, байт", 1, 1_073_741_824),
+        ("cache_keepwarm_turn_offset", "Прогрев кэша во время хода, с от начала", 30, 285),
     ]:
         fields[key] = {"type": "integer", "label": label, "min": minimum, "max": maximum}
     fields["rate_limit_rps"] = {"type": "number", "label": "Запросов в секунду (0 — без лимита)",
