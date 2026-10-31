@@ -43,6 +43,20 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _assert_public_peer(resp, where="image"):
+    """Post-connect check of the socket we ACTUALLY connected to. Closes the
+    DNS-rebinding window of check-then-connect: even if the name resolved to a
+    public address but the connection landed on an internal one, we bail out."""
+    try:
+        sock = resp.fp.raw._sock
+        peer = ipaddress.ip_address(sock.getpeername()[0])
+    except (AttributeError, OSError, ValueError):
+        return
+    if (peer.is_private or peer.is_loopback or peer.is_link_local
+            or peer.is_reserved or peer.is_multicast):
+        raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
+
+
 _IMAGE_OPENER = urllib.request.build_opener(_GuardedRedirectHandler())
 
 
@@ -155,6 +169,7 @@ def _extract_image_data(block, where):
                 max_bytes = 10 * 1024 * 1024
                 try:
                     with _IMAGE_OPENER.open(req, timeout=10) as r:
+                        _assert_public_peer(r, where)
                         ct = r.headers.get("content-type", "").split(";")[0].strip()
                         if ct:
                             mime_type = ct

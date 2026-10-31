@@ -23,22 +23,29 @@ _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to
 
 
 def _force_close_response(resp):
-    """Instantaneously unblock threads waiting in WinSock recv() or HTTPResponse read()."""
+    """Instantaneously unblock threads waiting in WinSock recv() or HTTPResponse read().
+
+    Windows needs a real closesocket() to abort a blocked recv(); shutdown() alone
+    does not wake it. The response's buffered reader is defused first, so the later
+    resp.close() cannot close the same descriptor a second time after the number
+    has been reused by an unrelated connection."""
     if resp is None:
         return
     try:
         fd = resp.fileno() if hasattr(resp, "fileno") else None
         if fd is not None and fd != -1:
             try:
+                if getattr(resp, "fp", None) is not None:
+                    resp.fp = None
+            except Exception:
+                pass
+            try:
                 s = socket.socket(fileno=fd)
                 try:
                     s.shutdown(socket.SHUT_RDWR)
                 except Exception:
                     pass
-                try:
-                    s.close()
-                except Exception:
-                    pass
+                s.close()
             except Exception:
                 pass
     except Exception:
@@ -492,6 +499,21 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     return body
 
 
+def _bounded_put(loop, queue, item, is_cancelled):
+    """Thread-safe bounded put that never duplicates: one put future is awaited
+    until it lands (a blocked worker is the backpressure) or the session dies.
+    Re-creating the future on a timeout would enqueue the item twice."""
+    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+    while True:
+        try:
+            future.result(timeout=5)
+            return
+        except TimeoutError:
+            if is_cancelled():
+                future.cancel()
+                return
+
+
 def _error_from_event(event):
     message = event.get("error")
     if isinstance(message, dict):
@@ -706,13 +728,7 @@ async def _stream_body(cfg, session, body, param_types=None):
                     continue
                 # Bounded hand-off: block this worker when the consumer is slower
                 # than upstream instead of buffering the whole stream in memory.
-                while not session._cancelled:
-                    future = asyncio.run_coroutine_threadsafe(queue.put(line), loop)
-                    try:
-                        future.result(timeout=5)
-                        break
-                    except TimeoutError:
-                        continue
+                _bounded_put(loop, queue, line, lambda: session._cancelled)
         except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
             if not session._cancelled:
                 hand_off_final(exc)
@@ -752,8 +768,14 @@ async def _stream_body(cfg, session, body, param_types=None):
             yield {"type": "final_text", "text": "".join(text)}
         if not saw_end and not session._cancelled:
             journal.emit("upstream.stream_truncated",
-                         "Поток upstream оборвался без end_of_stream — ответ может быть неполным", "warn",
+                         "Поток upstream оборвался без end_of_stream — ход завершён ошибкой", "warn",
                          model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)))
+            # An aborted stream must not masquerade as a clean stop: surface the
+            # failure instead of a successful end. No auto-retry — tool calls may
+            # already have been streamed to the client.
+            yield {"type": "error", "error": apierr.upstream_error(
+                "upstream stream ended without end_of_stream; the response may be incomplete")}
+            return
         yield {"type": "end", "reason": "stop"}
     finally:
         session._active_direct_abort = None

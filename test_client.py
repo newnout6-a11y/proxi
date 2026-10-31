@@ -1,7 +1,23 @@
-import argparse, json, sys, time, urllib.request, urllib.error
+import argparse, http.client, json, sys, time, urllib.request, urllib.error
 from auth import client_headers
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _open_with_retry(req, timeout):
+    """One transparent retry for transient loopback transport glitches (e.g. a
+    torn status line). HTTP errors are never retried; a retried POST may repeat
+    the turn, so this stays a single attempt and the first error is printed."""
+    for attempt in range(2):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (http.client.BadStatusLine, ConnectionError) as exc:
+            if attempt:
+                raise
+            print(f"\n[retry] transient transport error: {exc}", flush=True)
+            time.sleep(0.2)
 
 def main():
     parser = argparse.ArgumentParser(description="Retool AI Proxy Client")
@@ -49,7 +65,7 @@ def main():
 
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with _open_with_retry(req, 300) as resp:
             if args.no_stream:
                 res = json.loads(resp.read().decode("utf-8"))
                 text = res["choices"][0]["message"]["content"]
