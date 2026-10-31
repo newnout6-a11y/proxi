@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    # The relay is Windows-first (allowlisted powershell/cmd commands, cp866
+    # decoding, taskkill process-tree cleanup), so run the offline suite there.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run offline test suite
+        run: python -m pytest tests -q

@@ -508,7 +508,10 @@ def _error_from_event(event):
 
 
 def _ping(session, body):
-    """Cheap request that re-reads the cached prefix so its TTL does not lapse."""
+    """Cheap request that re-reads the cached prefix so its TTL does not lapse.
+
+    Returns the credits Retool actually billed for the ping (from the usage
+    metadata event), or None when the stream ended without reporting them."""
     payload = dict(body)
     payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
     model_name = payload.get("model")
@@ -522,11 +525,28 @@ def _ping(session, body):
                                      data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
                                      headers=session.backend.headers(), method="POST")
     response = urllib.request.urlopen(request, timeout=120)
+    actual_credits = None
     try:
-        for _ in response:
-            break
+        for index, raw in enumerate(response):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            if usage.get("creditsUsed") is not None:
+                actual_credits = float(usage["creditsUsed"])
+            if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
+                break
+            if index >= 200:
+                break
     finally:
         response.close()
+    return actual_credits
 
 
 async def _keepwarm(session, cfg):
@@ -544,15 +564,16 @@ async def _keepwarm(session, cfg):
             body = getattr(session, "_warm_body", None)
             if not body or getattr(session, "_busy", False):
                 continue
-            await asyncio.to_thread(_ping, session, body)
+            actual = await asyncio.to_thread(_ping, session, body)
             session._warm_at = time.time()
             prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
             est_credits = prefix_tokens * credits.RATE_CACHE_READ
-            session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0) + est_credits, 4)
+            session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0)
+                                           + (actual if actual is not None else est_credits), 4)
             journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
                          thread=journal.tag(getattr(session, "thread_id", None)),
                          prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
-                         est_credits_total=session._keepwarm_cost)
+                         actual_credits=actual, credits_total=session._keepwarm_cost)
             if cfg.get("direct_debug"):
                 print("[warm] prefix refreshed", flush=True)
         except asyncio.CancelledError:
@@ -622,12 +643,33 @@ async def _stream_body(cfg, session, body, param_types=None):
     headers["accept"] = "application/json"
     timeout = cfg.get("turn_timeout", 900)
     loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
+    # Bounded so a stalled consumer (slow or gone client) cannot balloon memory:
+    # the upstream worker blocks on hand-off, which backpressures the TCP read.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
     holder = {"response": None}
+
+    def hand_off_final(item):
+        """Land a terminal item (sentinel/error/cancel) without blocking. Safe from
+        any thread; sacrifices one buffered data line if the queue is full."""
+        def _put():
+            try:
+                queue.put_nowait(item)
+                return
+            except asyncio.QueueFull:
+                pass
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
+        loop.call_soon_threadsafe(_put)
 
     def abort_direct():
         _force_close_response(holder.get("response"))
-        loop.call_soon_threadsafe(queue.put_nowait, asyncio.CancelledError())
+        hand_off_final(asyncio.CancelledError())
 
     session._active_direct_abort = abort_direct
 
@@ -662,22 +704,32 @@ async def _stream_body(cfg, session, body, param_types=None):
                 line = raw.strip()
                 if not line:
                     continue
-                loop.call_soon_threadsafe(queue.put_nowait, line)
+                # Bounded hand-off: block this worker when the consumer is slower
+                # than upstream instead of buffering the whole stream in memory.
+                while not session._cancelled:
+                    future = asyncio.run_coroutine_threadsafe(queue.put(line), loop)
+                    try:
+                        future.result(timeout=5)
+                        break
+                    except TimeoutError:
+                        continue
         except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
             if not session._cancelled:
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
+                hand_off_final(exc)
         finally:
             _force_close_response(holder.get("response"))
-            loop.call_soon_threadsafe(queue.put_nowait, None)
+            hand_off_final(None)
 
     text, thinking = [], []
     produced = False
+    saw_end = False
     attempts_left = 2
     try:
         while True:
             task = loop.run_in_executor(None, worker)
             try:
-                async for event in _drain(cfg, session, queue, text, thinking, param_types):
+                flags = {}
+                async for event in _drain(cfg, session, queue, text, thinking, param_types, flags):
                     produced = True
                     yield event
             finally:
@@ -687,6 +739,7 @@ async def _stream_body(cfg, session, body, param_types=None):
                     await asyncio.wait_for(asyncio.shield(task), timeout=5)
                 except Exception:
                     pass
+            saw_end = bool(flags.get("end"))
             if session._cancelled:
                 yield {"type": "end", "reason": "cancelled"}
                 return
@@ -697,14 +750,19 @@ async def _stream_body(cfg, session, body, param_types=None):
             holder["response"] = None
         if text:
             yield {"type": "final_text", "text": "".join(text)}
+        if not saw_end and not session._cancelled:
+            journal.emit("upstream.stream_truncated",
+                         "Поток upstream оборвался без end_of_stream — ответ может быть неполным", "warn",
+                         model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)))
         yield {"type": "end", "reason": "stop"}
     finally:
         session._active_direct_abort = None
 
 
-async def _drain(cfg, session, queue, text, thinking, param_types=None):
+async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None):
     started = loop_now()
     think_started = None
+    flags = {} if flags is None else flags
     """Consume one attempt's NDJSON lines, yielding normalised events.
 
     Calls are keyed by id: a provider may interleave several tool calls in one
@@ -743,6 +801,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
             event = json.loads(item)
         except Exception:
             continue
+        if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
+            flags["end"] = True
+            return
         kind = event.get("event")
         if kind == "content_block_start":
             if event.get("type") == "thinking":
