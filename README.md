@@ -256,9 +256,10 @@ Gemini 3.x, Retool Power/Mini. Список статический: обновл
 ## Архитектура
 
 proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
-(контекст, exec-цикл) -> session.py (тред + WS, ретраи, отмена) -> adapters.py
-(три диалекта) + sse.py. Вспомогательное: auth.py, upstream_refresh.py, credits.py,
-executor.py, context.py, redact.py, apierr.py, models.py.
+(контекст, exec-цикл) -> session.py (диалоги: direct/WS, ретраи, отмена) -> direct.py
+(direct-транспорт, prompt caching) -> adapters.py (три диалекта) + sse.py.
+Вспомогательное: auth.py, upstream_refresh.py, credits.py, executor.py, context.py,
+redact.py, apierr.py, models.py.
 Реверс-инжиниринг протокола — PROTOCOL.md. Локальные capture/probe-артефакты
 исключены из Git: они могут содержать credentials. Удаление файлов из текущей
 ветки не удаляет ранее опубликованные секреты из истории; их следует отозвать.

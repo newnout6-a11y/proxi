@@ -37,6 +37,67 @@ def validate_guard():
     return _GuardedRedirectHandler()
 
 
+def test_force_close_closes_through_owner_and_never_twice():
+    """Blocked-in-readline scenario: the worker holds its own reference to the
+    buffered reader, so defusing resp.fp alone cannot stop a second close. The
+    close must go through the OWNING socket object, which then remembers -1 —
+    an unrelated connection that later reuses the number stays alive."""
+    import socket
+    import threading
+    import time
+
+    s1, s2 = socket.socketpair()
+    try:
+        reader = s1.makefile("rb")  # what http.client wraps in resp.fp.raw._sock
+
+        outcome = []
+        def worker():
+            try:
+                reader.readline()
+                outcome.append("eof")
+            except OSError:
+                outcome.append("oserror")
+
+        t = threading.Thread(target=worker)
+        t.start()
+        time.sleep(0.05)
+
+        class FakeResp:
+            def fileno(self):
+                return s1.fileno()
+            def close(self):
+                pass
+
+        resp = FakeResp()
+        resp.fp = SimpleNamespace(raw=SimpleNamespace(_sock=s1))
+        direct._force_close_response(resp)
+
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "blocked reader must be unbroken by the force close"
+        assert outcome and outcome[0] in ("eof", "oserror")
+        assert s1.fileno() == -1, "owning socket must forget the descriptor"
+
+        # The worker's cleanup path closes the socket object again after exiting:
+        # that must be a harmless no-op, not a second closesocket on the number.
+        s1.close()
+
+        # A fresh connection that may have received the reused number stays alive.
+        s3, s4 = socket.socketpair()
+        try:
+            s3.send(b"ping")
+            s4.settimeout(1.0)
+            assert s4.recv(4) == b"ping", "unrelated socket killed by a second close"
+        finally:
+            s3.close()
+            s4.close()
+    finally:
+        for sock in (s1, s2):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 def test_force_close_defuses_response_reader():
     """After the forced close the response must not own the fd anymore, so its
     later close() cannot hit a reused descriptor (Windows fd reuse)."""

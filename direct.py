@@ -22,15 +22,64 @@ MIN_OUTPUT_TOKENS = 16
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
 
 
+def _owning_socket(resp):
+    """Best-effort walk to the socket OBJECT that owns the descriptor (a real
+    http.client response is resp.fp.raw._sock). Closing through the owner makes
+    the owner forget the number, so no second close can hit a reused fd."""
+    seen = set()
+    cur = resp
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        raw = getattr(cur, "raw", None)
+        if raw is not None:
+            sock = getattr(raw, "_sock", None)
+            if sock is not None and hasattr(sock, "shutdown"):
+                return sock
+        cur = getattr(cur, "fp", None)
+    return None
+
+
 def _force_close_response(resp):
     """Instantaneously unblock threads waiting in WinSock recv() or HTTPResponse read().
 
     Windows needs a real closesocket() to abort a blocked recv(); shutdown() alone
-    does not wake it. The response's buffered reader is defused first, so the later
-    resp.close() cannot close the same descriptor a second time after the number
-    has been reused by an unrelated connection."""
+    does not wake it. The fd is closed through its OWNING socket object, which then
+    remembers -1: a worker thread that still holds the buffered reader (its own
+    reference survives resp.fp = None) can never close the number a second time
+    after it has been reused by an unrelated connection."""
     if resp is None:
         return
+    owner = None
+    try:
+        fd = resp.fileno() if hasattr(resp, "fileno") else None
+        owner = _owning_socket(resp) if fd is not None and fd != -1 else None
+    except Exception:
+        owner = None
+    if owner is not None:
+        try:
+            owner.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            # Bypass the makefile reference count: the blocked worker holds a
+            # reader, so a plain close() would only defer the real closesocket.
+            owner._real_close()
+        except Exception:
+            try:
+                owner.close()
+            except Exception:
+                pass
+        try:
+            if getattr(resp, "fp", None) is not None:
+                resp.fp = None
+        except Exception:
+            pass
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return
+    # Fallback for response shapes without a walkable socket chain.
     try:
         fd = resp.fileno() if hasattr(resp, "fileno") else None
         if fd is not None and fd != -1:
@@ -588,6 +637,7 @@ async def _keepwarm(session, cfg):
                 continue
             actual = await asyncio.to_thread(_ping, session, body)
             session._warm_at = time.time()
+            session._warm_failures = 0
             prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
             est_credits = prefix_tokens * credits.RATE_CACHE_READ
             session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0)
@@ -602,8 +652,17 @@ async def _keepwarm(session, cfg):
             return
         except Exception as exc:
             # A transient upstream/network error must not kill the warm cycle for
-            # the rest of the idle window; log and retry on the next interval.
-            journal.emit("cache.keepwarm", "Прогрев не удался, повтор на следующем интервале: " + str(exc), "warn")
+            # the rest of the idle window. A persistent failure (e.g. revoked
+            # session) stops the cycle after several attempts — the next real
+            # request recreates it.
+            failures = getattr(session, "_warm_failures", 0) + 1
+            session._warm_failures = failures
+            if failures >= 5:
+                journal.emit("cache.keepwarm",
+                             "Прогрев остановлен после %d неудач подряд: %s" % (failures, str(exc)[:200]), "warn")
+                return
+            journal.emit("cache.keepwarm",
+                         "Прогрев не удался, повтор на следующем интервале: %s" % str(exc)[:200], "warn")
 
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
