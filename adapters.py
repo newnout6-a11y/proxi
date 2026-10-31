@@ -565,4 +565,6 @@ def for_dialect(dialect, parsed, writer=None):
 def error_payload(dialect, err):
     if dialect == "anthropic":
         return err.anthropic_envelope()
+    if dialect == "responses":
+        return err.responses_envelope()
     return err.openai_envelope()

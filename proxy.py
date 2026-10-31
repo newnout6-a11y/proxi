@@ -194,7 +194,9 @@ def make_handler(runtime: Runtime):
             self.path = path
             self._query = parsed_url.query
             route = ROUTES.get((self.command, path))
-            dialect = "anthropic" if route == "anthropic" else "chat"
+            # /v1/responses clients need their own error envelope: a chat-shaped
+            # error without type:"error" leaves a strict SDK waiting forever.
+            dialect = {"anthropic": "anthropic", "responses": "responses"}.get(route, "chat")
             try:
                 self._log_route = route
                 if admin_module.is_admin_path(path):
@@ -263,7 +265,9 @@ def make_handler(runtime: Runtime):
                 self._log()
 
         def _error_response(self, err, dialect):
-            body = adapters.error_payload(dialect, err)
+            # Non-stream HTTP errors use the standard OpenAI envelope for both chat
+            # and responses routes; the flat responses shape is for SSE events only.
+            body = adapters.error_payload("chat" if dialect == "responses" else dialect, err)
             extra = {"retry-after": err.retry_after} if err.retry_after else None
             self._json(err.status, body, extra)
 
