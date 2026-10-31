@@ -228,8 +228,10 @@ def load(path=CONFIG_PATH):
             raise service_unavailable(f"config value '{float_key}' must be a number")
         if not math.isfinite(cfg[float_key]):
             raise service_unavailable(f"config value '{float_key}' must be finite")
-    if cfg["rate_limit_rps"] < 0 or cfg["rate_limit_burst"] <= 0:
-        raise service_unavailable("rate_limit_rps must be non-negative and rate_limit_burst must be positive")
+    if cfg["rate_limit_rps"] < 0 or cfg["rate_limit_burst"] < 1:
+        # burst < 1 can never reach the 1.0 token threshold: every completion
+        # would be 429 forever.
+        raise service_unavailable("rate_limit_rps must be non-negative and rate_limit_burst must be at least 1")
 
     accounts = cfg.get("accounts")
     if accounts is not None:

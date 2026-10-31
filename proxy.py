@@ -118,6 +118,7 @@ def make_handler(runtime: Runtime):
 
         def _json(self, status, payload, extra=None):
             self._status = status
+            self._response_started = True
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("content-type", "application/json; charset=utf-8")
@@ -134,9 +135,6 @@ def make_handler(runtime: Runtime):
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     self.close_connection = True
-
-        def _dialect(self):
-            return ROUTES.get((self.command, self.path), "")
 
         # -- entry --------------------------------------------------------
         def do_OPTIONS(self):
@@ -160,6 +158,12 @@ def make_handler(runtime: Runtime):
             self._dispatch()
 
         def do_PATCH(self):
+            self._dispatch()
+
+        def do_DELETE(self):
+            self._dispatch()
+
+        def do_TRACE(self):
             self._dispatch()
 
         def _log(self, note=""):
@@ -193,6 +197,7 @@ def make_handler(runtime: Runtime):
             self._model = "-"
             self._effort_str = ""
             self._error_code = None
+            self._response_started = False
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -257,9 +262,11 @@ def make_handler(runtime: Runtime):
                 if getattr(self, "_streaming", False):
                     writer = self._writer
                     writer.event("error", adapters.error_payload(dialect, err))
+                    # Journal must not report a mid-stream failure as 200/success.
+                    self._stream_status = err.status
                     writer.done()
                 else:
-                    self._error_response(err, dialect)
+                    self._respond_error(err, dialect)
             except Exception as exc:  # never leak a bare traceback
                 print("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]), flush=True)
                 self._error_code = "internal_error"
@@ -269,11 +276,20 @@ def make_handler(runtime: Runtime):
                 if getattr(self, "_streaming", False):
                     writer = self._writer
                     writer.event("error", adapters.error_payload(dialect, err))
+                    self._stream_status = err.status
                     writer.done()
                 else:
-                    self._error_response(err, dialect)
+                    self._respond_error(err, dialect)
             finally:
                 self._log()
+
+        def _respond_error(self, err, dialect):
+            if getattr(self, "_response_started", False):
+                # A status line already went out (a failed _json/_static write or a
+                # finished SSE): appending a second one corrupts the stream.
+                self.close_connection = True
+                return
+            self._error_response(err, dialect)
 
         def _error_response(self, err, dialect):
             # Non-stream HTTP errors use the standard OpenAI envelope for both chat
@@ -370,8 +386,17 @@ def make_handler(runtime: Runtime):
                 raise apierr.payload_too_large(cfg["max_body_bytes"])
             ctype = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
             if ctype and ctype != "application/json":
+                # The body stays unread: keep-alive would parse it as the next
+                # request line (request-smuggling style desync).
+                self.close_connection = True
                 raise apierr.ApiError(415, "unsupported_media_type", "content-type must be application/json")
-            return self.rfile.read(length)
+            try:
+                return self.rfile.read(length)
+            except Exception:
+                # The body was not fully consumed: keep-alive would parse the
+                # remainder as the next request line.
+                self.close_connection = True
+                raise
 
         def _completion(self, dialect):
             data = validate.load_json(self._read_body())
@@ -427,6 +452,7 @@ def make_handler(runtime: Runtime):
             self._writer = writer
             self._streaming = True
             writer.start({"x-request-id": self.request_id})
+            self._response_started = True
             self._model = parsed.model
             self._stream_status = 200
             adapter = adapters.for_dialect(dialect, parsed, writer)
@@ -616,7 +642,13 @@ def main():
                     await asyncio.gather(*tasks, return_exceptions=True)
                 runtime.loop.stop()
 
-            runtime.loop.call_soon_threadsafe(lambda: asyncio.create_task(_cancel_all()))
+            # Wait (bounded) so in-flight turns unwind and sessions release
+            # before the daemon loop thread is torn down with the interpreter.
+            future = asyncio.run_coroutine_threadsafe(_cancel_all(), runtime.loop)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                pass
         finally:
             server.server_close()
 

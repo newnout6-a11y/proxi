@@ -368,3 +368,12 @@ def test_settings_reject_values_above_maximum(admin_relay):
     assert status == 400
     status, _body, _headers = admin_relay.patch({"rate_limit_rps": 50})
     assert status == 200, "legitimate values must still pass"
+
+
+def test_settings_reject_burst_below_one(admin_relay):
+    """burst < 1 can never reach the 1.0 token threshold: all completions would
+    be 429 forever."""
+    status, _body, _headers = admin_relay.patch({"rate_limit_burst": 0.5})
+    assert status == 400
+    status, _body, _headers = admin_relay.patch({"rate_limit_burst": 4})
+    assert status == 200
