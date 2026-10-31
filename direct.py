@@ -773,7 +773,11 @@ async def _stream_body(cfg, session, body, param_types=None):
                     detail = exc.read()[:400].decode("utf-8", "replace")
                     if exc.code in (401, 403) and attempt == 0:
                         attempt = 1
-                        if session.backend.refresher.refresh():
+                        # The 401 may come from a header snapshot taken just before
+                        # a keepalive rotation: pass the rejected cookie so the
+                        # refresher adopts already-rotated credentials despite the
+                        # MIN_INTERVAL gate.
+                        if session.backend.refresher.refresh(rejected_cookie=headers.get("cookie")):
                             headers.update(session.backend.headers())
                             continue
                         raise apierr.upstream_auth_failed(detail)

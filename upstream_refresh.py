@@ -30,8 +30,17 @@ class Refresher:
         req = urllib.request.Request(self.cfg["base"] + "/api/refreshtoken",
                                      data=b"{}", headers=upstream_headers(self.cfg), method="POST")
         with urllib.request.urlopen(req, timeout=min(self.cfg["upstream_timeout"], 15)) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            if isinstance(body, dict) and (body.get("error") or body.get("success") is False):
+            # PROTOCOL.md specifies an empty body: an empty or non-JSON reply is a
+            # successful renewal, and its Set-Cookie headers must not be lost to a
+            # strict parser.
+            raw = resp.read()
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            if body.get("error") or body.get("success") is False:
                 raise ValueError("Retool rejected session renewal")
             return resp.headers.get_all("set-cookie") or []
 
@@ -84,7 +93,8 @@ class Refresher:
                         acc["xsrf"] = self.cfg["xsrf"]
                         break
             self._persist()
-            journal.emit("auth.refresh", "Сессия Retool продлена", "success", ok=True, forced=force,
+            journal.emit("auth.refresh", "Сессия Retool продлена",
+                         "warn" if self.persistence_error else "success", ok=True, forced=force,
                          rotated=bool(headers), persistence_error=self.persistence_error)
             self.last_error = None
             self.last_success_at = time.time()

@@ -140,6 +140,11 @@ def persist_auth(cfg):
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
+        try:
+            import stat as stat_module
+            os.chmod(temporary, stat_module.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            pass
         os.replace(temporary, path)
         cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
     finally:
