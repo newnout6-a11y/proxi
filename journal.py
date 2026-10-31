@@ -51,22 +51,35 @@ class Journal:
             self._load_tail(path)
 
     def _load_tail(self, path):
-        try:
-            with open(path, encoding="utf-8") as source:
-                lines = collections.deque(source, maxlen=self._events.maxlen)
-        except OSError:
-            return
+        # The rotated generation (.1) is read too: without it every rotation
+        # would silently drop its events from the restored history.
+        lines = collections.deque()
+        for source in (path + ".1", path):
+            try:
+                with open(source, encoding="utf-8") as handle:
+                    lines.extend(handle)
+            except OSError:
+                continue
         restored = []
         for line in lines:
             try:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(event, dict) and isinstance(event.get("seq"), int):
-                event["restored"] = True
-                restored.append(event)
+            if not isinstance(event, dict) or not isinstance(event.get("seq"), int):
+                continue
+            # Re-clean with the CURRENT patterns and secrets: events written by
+            # older code (or before a redact fixup) must not serve raw.
+            event = self._clean(event, self._secrets())
+            event["restored"] = True
+            restored.append(event)
         with self._cond:
+            # Concurrent writers may append to the file out of seq order; sort so
+            # the since/before scan in query() never truncates after a restart.
+            restored.sort(key=lambda item: item["seq"])
             for event in restored:
+                if event["seq"] <= self._seq:
+                    continue  # already known (re-configure), never duplicate
                 self._events.append(event)
             if restored:
                 self._seq = max(self._seq, max(event["seq"] for event in restored))
@@ -91,6 +104,10 @@ class Journal:
         cfg = self._cfg or {}
         values = [cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf", "thread_id", "page_uuid")]
         values += list(cfg.get("cookie_values") or [])
+        for account in cfg.get("accounts") or []:
+            if isinstance(account, dict):
+                values += [account.get(key) for key in ("cookie", "xsrf", "thread_id", "page_uuid")]
+                values += list(account.get("cookie_values") or [])
         return [value for value in values if isinstance(value, str) and len(value) >= 4]
 
     def _clean(self, value, secrets, depth=0):
@@ -102,7 +119,11 @@ class Journal:
                 text = text.replace(secret, "[redacted]")
             return text if len(text) <= 4000 else text[:4000] + "…[+%d]" % (len(text) - 4000)
         if isinstance(value, dict):
-            return {str(key): self._clean(item, secrets, depth + 1) for key, item in list(value.items())[:64]}
+            cleaned = {}
+            for key, item in list(value.items())[:64]:
+                # Keys are user-adjacent data too: a secret can sit in a key.
+                cleaned[self._clean(str(key), secrets, depth + 1)] = self._clean(item, secrets, depth + 1)
+            return cleaned
         if isinstance(value, (list, tuple, set)):
             return [self._clean(item, secrets, depth + 1) for item in list(value)[:64]]
         if value is None or isinstance(value, (bool, int)):
@@ -150,8 +171,16 @@ class Journal:
                     self._file.close()
                     self._file = None
                     os.replace(self._path, self._path + ".1")
-            except OSError:
+            except OSError as exc:
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
                 self._file = None
+                # A failed rotation (e.g. a locked .1 on Windows) would otherwise
+                # grow the file unbounded and silently; the journal cannot report
+                # on itself, so use stderr.
+                print("[journal] rotation failed: %s" % exc, flush=True)
 
     # -- reading -----------------------------------------------------------
     @property
