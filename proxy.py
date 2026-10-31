@@ -505,6 +505,14 @@ class BoundedServer(ThreadingHTTPServer):
             self.slots.release()
             raise
 
+    def handle_error(self, request, client_address):
+        # A client dropping the connection mid-request is routine (Ctrl+C,
+        # page reload); keep the console clean and let real errors through.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)

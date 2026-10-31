@@ -347,8 +347,17 @@ def _is_tool_result_chunk(chunk):
             or "[tool result" in lowered or "[tool_result" in lowered or "[command result" in lowered)
 
 
-def cache_key_for(head):
-    return hashlib.sha256(head.encode("utf-8")).hexdigest()[:24]
+def cache_key_for(head, model="", tools=None):
+    """Prefix cache key. The model and the toolset are part of the upstream prompt
+    prefix, so a change to either must not reuse the previous cache entry."""
+    digest = hashlib.sha256()
+    digest.update((model or "").encode("utf-8"))
+    digest.update(b"\x00")
+    if tools:
+        digest.update(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update((head or "").encode("utf-8"))
+    return digest.hexdigest()[:24]
 
 
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
@@ -417,12 +426,15 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             if isinstance(part, list):
                 blocks = [dict(b) if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in part]
                 if should_cache:
-                    target = next((b for b in reversed(blocks) if b.get("type") == "text"), blocks[-1])
-                    target["cache"] = True
+                    # Only text blocks carry the cache flag; an image-only chunk has no
+                    # cacheable text and upstream may reject the unknown placement.
+                    target = next((b for b in reversed(blocks) if b.get("type") == "text"), None)
+                    if target is not None:
+                        target["cache"] = True
                 messages.append({"role": "user", "content": blocks})
             elif isinstance(part, dict):
                 block = dict(part)
-                if should_cache:
+                if should_cache and block.get("type") == "text":
                     block["cache"] = True
                 messages.append({"role": "user", "content": [block]})
             else:
@@ -475,7 +487,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         if choice and choice != "auto":
             body["toolChoice"] = choice
     if cache and head:
-        body["openAICacheKey"] = cache_key_for(head)
+        body["openAICacheKey"] = cache_key_for(head, body.get("model"), tools)
     return body
 
 
@@ -539,8 +551,10 @@ async def _keepwarm(session, cfg):
                 print("[warm] prefix refreshed", flush=True)
         except asyncio.CancelledError:
             return
-        except Exception:
-            return
+        except Exception as exc:
+            # A transient upstream/network error must not kill the warm cycle for
+            # the rest of the idle window; log and retry on the next interval.
+            journal.emit("cache.keepwarm", "Прогрев не удался, повтор на следующем интервале: " + str(exc), "warn")
 
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,

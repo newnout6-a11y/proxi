@@ -82,13 +82,16 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
             snapshot = _git(workspace_root, "status", "--short", "--branch").splitlines()
             branch = (snapshot[0][3:].split("...", 1)[0]
                       if snapshot and snapshot[0].startswith("## ") else "")
-            status = "\n".join(snapshot[1:] if branch else snapshot)
+            # Sensitive file names must not leak into the head even as status lines.
+            status = "\n".join(
+                ln for ln in (snapshot[1:] if branch else snapshot)
+                if not is_sensitive_path(ln[3:].strip().strip('"').split(" -> ")[-1]))
             commit = _last_commit(workspace_root)
             if branch:
                 lines.append("Git branch: " + branch)
             if commit:
-                lines.append("Last commit: " + commit)
-            lines.append("Git status: " + (status[:600] if status else "clean"))
+                lines.append("Last commit: " + redact(commit, cookie_values=cookie_values))
+            lines.append("Git status: " + (redact(status, cookie_values=cookie_values)[:600] if status else "clean"))
         except Exception as exc:
             warnings.append("git read failed: " + str(exc))
 
@@ -132,8 +135,9 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
         if not os.path.isfile(path):
             continue
         try:
-            with open(path, encoding="utf-8", errors="replace") as handle:
-                snippet = handle.read(budget)
+            with open(path, "rb") as handle:
+                # Budget is in bytes; reading text would spend up to ~2x on Cyrillic docs.
+                snippet = handle.read(budget).decode("utf-8", "ignore")
         except OSError as exc:
             warnings.append(doc + " unreadable: " + str(exc))
             continue

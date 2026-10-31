@@ -142,8 +142,14 @@ class Backend:
 
         def call():
             req = urllib.request.Request(self.cfg["base"] + path, headers=upstream_headers(self.cfg), method="GET")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8", "replace"))
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read().decode("utf-8", "replace"))
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    # Direct-transport threads persist no sandpack messages.
+                    return {"messages": []}
+                raise
 
         return await asyncio.get_running_loop().run_in_executor(None, lambda: self.refresher.call(call))
 

@@ -675,7 +675,9 @@ class TurnRunner:
                         out.put({"type": "end", "reason": "cancelled"})
                         return
 
-                    if not command and not final_text.strip():
+                    if not direct_mode and not command and not final_text.strip():
+                        # Silent turns are explained via persisted sandpack messages,
+                        # which the direct transport never writes.
                         explained = await self._explain_empty(holder)
                         if explained is not None:
                             out.put({"type": "error", "error": explained})
@@ -742,15 +744,19 @@ class TurnRunner:
                     if not task_block:
                         task_block = "USER TASK:\n" + parsed.prompt
                     trail = "; ".join(
-                        (c[:60] + "…" if len(c) > 60 else c) + " -> exit " + str(e)
+                        (redact(c, cookie_values=self.cfg.get("cookie_values", ()))[:60] + "…" if len(c) > 60
+                         else redact(c, cookie_values=self.cfg.get("cookie_values", ()))) + " -> exit " + str(e)
                         for c, e in previous_steps[-4:]
                     ) or "(none yet)"
                     previous_steps.append((command, code))
                     self._remember(command, recent)
 
+                    # The command text is model-generated and may echo secrets; the
+                    # output is already redacted above. Mask commands before upstream.
                     header = task_block + "\n\nPrevious steps: " + trail
-                    last_followup = (command, code, output, header)
-                    followup_text = executor.format_command_followup(command, code, output, header)
+                    safe_command = redact(command, cookie_values=self.cfg.get("cookie_values", ()))
+                    last_followup = (safe_command, code, output, header)
+                    followup_text = executor.format_command_followup(safe_command, code, output, header)
                     exec_chunks.append(followup_text)
                     prompt = self._followup(instructions, reminder, *last_followup)
             finally:

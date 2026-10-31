@@ -127,7 +127,7 @@ def test_short_head_prompt_caching_without_char_threshold():
     assert body["messages"][0]["role"] == "system"
     assert body["messages"][0]["content"][0]["cache"] is True
     # openAICacheKey is present and matches hash
-    assert body.get("openAICacheKey") == direct.cache_key_for(short_head)
+    assert body.get("openAICacheKey") == direct.cache_key_for(short_head, "claude-opus-5-5", None)
 
 
 def test_reasoning_effort_clamping_and_preservation():
