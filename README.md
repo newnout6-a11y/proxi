@@ -198,10 +198,10 @@ E2E: `npx playwright test`.
 ## Каталог моделей
 
 Каталог и доступные уровни мышления сверены с picker/schema приложения Retool:
-Claude Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / 4.5 / 4.1 / 4, Claude Sonnet 5 / 4.6 / 4.5 / 4,
+Claude Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / 4.5 / 4.1 / 4, Claude Sonnet 5.5 / 5 / 4.6 / 4.5 / 4,
 Claude Fable 5, Claude Haiku 4.5, GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.4, GPT-5.3 Codex,
 GPT-5.2 / 5.1 / 5 / mini / nano, GPT-6 Astra/Sol/Luna, GPT-6.1 Sol,
-Gemini 3.x, Retool Power/Mini. Список статический: обновляется в `models.py`
+Gemini 3.x / 2.5 Pro / 2.5 Flash, Retool Power/Mini. Список статический: обновляется в `models.py`
 после проверки схемы Retool; наличие в каталоге не гарантирует доступ в организации.
 
 Маршрутизация в провайдера — по префиксу модели: claude-* → ресурс Anthropic, gpt-* → ресурс OpenAI.

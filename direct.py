@@ -20,6 +20,7 @@ import models as model_catalog
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
+_ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
 
 
 def _owning_socket(resp):
@@ -688,7 +689,9 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                     or "not available right now" not in (error.message or "").lower()):
                 raise
             if len(_ASSIST_ONLY) > 200:
-                _ASSIST_ONLY.clear()
+                # Flush only self-learned names: wiping the proven seeds would make
+                # known assist models pay a 400 + retry cycle all over again.
+                _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
             _ASSIST_ONLY.add(model_provider.get("model"))
             print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
             journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",

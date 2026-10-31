@@ -261,7 +261,8 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
         if strict:
             print("[unknown-model]", repr(model), '->', repr(name), flush=True)
             raise not_found(f"unknown model '{name}'; see GET /v1/models")
-        entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name, 'context': 200000}
+        entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name,
+                 'context': 200000, 'max_output': 128000}
     if effort is not None:
         allowed = entry.get('reasoning_effort_levels', EFFORTS_BY_PROVIDER.get(entry['provider'], ()))
         if not isinstance(effort, str) or effort.lower() not in allowed:
