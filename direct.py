@@ -7,6 +7,7 @@ context is billed once and reused, keeping time-to-first-token flat.
 import asyncio
 import hashlib
 import json
+import pathlib
 import socket
 import time
 import urllib.error
@@ -802,6 +803,24 @@ def _ensure_keepwarm(session, cfg):
         session._warm_task = asyncio.create_task(_keepwarm(session, cfg))
 
 
+def _dump_rejected_body(payload, detail):
+    """Land the exact upstream-rejected body on disk for offline bisection.
+
+    A 400 from the route validator ("Invalid request format") carries no field
+    detail, and client history only grows — every later retry re-sends the same
+    poison. The dump is local-only and holds the user's own conversation text.
+    """
+    try:
+        folder = pathlib.Path("logs/upstream-400")
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        (folder / ("%s-body.json" % stamp)).write_bytes(payload)
+        (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
+        print("[debug] upstream 400 body captured: logs/upstream-400/%s-body.json" % stamp, flush=True)
+    except Exception:  # noqa: BLE001 - diagnostics must never break the turn
+        pass
+
+
 async def _stream_body(cfg, session, body, param_types=None):
     payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
     if cfg.get("direct_debug"):
@@ -862,6 +881,8 @@ async def _stream_body(cfg, session, body, param_types=None):
                     break
                 except urllib.error.HTTPError as exc:
                     detail = exc.read()[:400].decode("utf-8", "replace")
+                    if exc.code == 400:
+                        _dump_rejected_body(payload, detail)
                     if exc.code in (401, 403) and attempt == 0:
                         attempt = 1
                         # The 401 may come from a header snapshot taken just before
