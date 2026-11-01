@@ -364,10 +364,12 @@ class TurnRunner:
             task_block = ""
             previous_steps = []
             last_followup = None
-            model_provider = {
-                "model": parsed.model,
-                "providerResourceName": model_catalog.provider_resource(self.cfg, parsed.entry),
-            }
+            if not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"]):
+                raise apierr.service_unavailable(f"provider '{parsed.entry['provider']}' is not routed")
+            # The resource is per-account (org-scoped UUID or __managed__): it is
+            # resolved from the acquired session's backend cfg below. Resolving it
+            # from the global cfg here would 503 account-only configurations.
+            model_provider = {"model": parsed.model}
             effort = parsed.effort
             if effort is None and parsed.entry.get("reasoning") and self.cfg.get("reasoning_effort"):
                 configured = self.cfg["reasoning_effort"]
@@ -405,11 +407,19 @@ class TurnRunner:
                     session = await self.pool.acquire(key) if key else await self.pool.acquire()
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
+                # Console lines (heartbeat, [cache]) carry the relay request id so
+                # concurrent requests of one conversation can be told apart.
+                acquired._request_tag = getattr(parsed, "request_id", None)
                 # Per-account AI resources: the resource UUID is org-scoped, so it
                 # must come from the backend cfg the turn actually runs on, not the
                 # global config (accounts[] can span tenants).
                 acc_cfg = getattr(getattr(acquired, "backend", None), "cfg", None) or self.cfg
-                model_provider["providerResourceName"] = model_catalog.provider_resource(acc_cfg, parsed.entry)
+                resource = model_catalog.provider_resource(acc_cfg, parsed.entry)
+                if resource:
+                    model_provider["providerResourceName"] = resource
+                else:
+                    # __managed__: omit the field entirely (never send null).
+                    model_provider.pop("providerResourceName", None)
                 log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
                     "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
                     isolated=bool(key and not native_tools), mode=self.cfg.get("session_mode"),
@@ -566,7 +576,13 @@ class TurnRunner:
                                 out.put({key: value for key, value in event.items() if key != "partial"}
                                         | {"tool_type": definition.get("x-client-type", "function")})
                             elif event["type"] == "credits":
-                                self.credits.record_turn(turn_id, event["value"])
+                                # Each upstream attempt (retry, exec follow-up) is billed
+                                # separately: a per-turn dedup key dropped all but the first.
+                                credit_events = holder.get("_credit_events", 0) + 1
+                                holder["_credit_events"] = credit_events
+                                self.credits.record_turn(
+                                    turn_id if credit_events == 1 else "%s#%d" % (turn_id, credit_events),
+                                    event["value"])
                                 usage = event.get("usage") or {}
                                 breakdown = credits.cost_breakdown(usage)
                                 hit = breakdown["cache_hit_ratio"]
@@ -575,7 +591,10 @@ class TurnRunner:
                                     "%d%%" % round(hit * 100) if hit is not None else "—"),
                                     "info", credits=event["value"], **usage, **breakdown)
                                 if session is not None:
-                                    session._last_prefix_tokens = breakdown["prompt_tokens"]
+                                    # Write through the lease: SessionLease only proxies
+                                    # reads, so keepwarm (which holds the real session)
+                                    # saw prefix_tokens=0 forever.
+                                    acquired._last_prefix_tokens = breakdown["prompt_tokens"]
                                 out.put(event)
                             elif event["type"] == "hitl":
                                 out.put(event)
@@ -583,6 +602,10 @@ class TurnRunner:
                             elif event["type"] == "end":
                                 holder["reason"] = event["reason"]
                                 upstream_completed = event["reason"] in ("stop", "tool_calls")
+                            elif event["type"] == "error":
+                                # A truncated upstream stream must reach the client as
+                                # an error, not fall through to a clean "stop".
+                                raise event["error"]
                     except apierr.ApiError:
                         raise
                     holder.setdefault("reason", "stop")
