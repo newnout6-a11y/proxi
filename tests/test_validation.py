@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 GOOD = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}
@@ -36,11 +38,12 @@ def test_unknown_model_is_404(relay):
                            {"model": "no-such-model", "messages": [{"role": "user", "content": "x"}]}) == 404
 
 
-def test_bad_effort_is_clamped_not_rejected(relay):
-    payload = dict(GOOD, reasoning_effort="turbo")
-    status, body = relay.json("/v1/chat/completions", payload)
-    assert status == 200
-    assert body["choices"][0]["message"]
+def test_bad_effort_is_rejected_not_clamped(relay):
+    """No provider defines 'turbo'/'extra' (the live route 422s them), so
+    clamping used to silently downgrade a client asking for more thinking."""
+    status, body = relay.json_any("/v1/chat/completions", dict(GOOD, reasoning_effort="turbo"))
+    assert status == 400
+    assert "must be one of" in json.dumps(body)
 
 
 def test_thinking_must_be_object(relay):

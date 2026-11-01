@@ -71,6 +71,15 @@ may implement route effort through a thinking budget rather than the direct
 provider's modern effort parameter. That distinction is not exposed as fake
 extra levels.
 
+Follow-up 2026-11-01 closed the last gap: no "extra" level exists anywhere.
+The Retool bundle defines the full universe of levels (OpenAI minimal/none/
+low/medium/high/xhigh/max, Anthropic low/medium/high/max, Google low/medium/
+high) with no such literal, desktop clients cannot send it, and the live route
+answers 422 "malformed" to `reasoningEffort:"extra"` on Claude models while
+accepting max. The relay therefore rejects values no provider defines (400
+with the allowed list) instead of silently clamping them to medium; known
+levels unsupported by a given model still clamp to the nearest one.
+
 GLM-5.3 is text-only and always reasons. Its public API supports low/high/max,
 but Retool-fast forwarding was not verified, so the relay does not advertise
 those selectors. GLM-5.3 Flash is a separate, unverified model; no capabilities

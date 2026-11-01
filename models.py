@@ -205,10 +205,14 @@ def nearest_effort(levels, requested):
 
 
 def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
-    """Like resolve(), but an unsupported effort is clamped instead of rejected.
+    """Like resolve(), but an unsupported known effort is clamped instead of rejected.
 
     Clients copy one effort across models, so e.g. xhigh legitimately reaches
-    Haiku, which only understands low/medium/high/max.
+    Haiku, which only understands low/medium/high/max. A value no provider
+    defines at all ("extra", "ultra", typos) is still rejected with a 400:
+    clamping it to medium would silently downgrade a client that asked for
+    more thinking (verified live 2026-11-01: the route answers 422 to such
+    values, so there is nothing to clamp towards).
     """
     raw_name = (model or default_model or "").strip()
     extracted_effort = effort
@@ -227,6 +231,8 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
     except ApiError as error:
         if error.status != 400:
             raise
+        if extracted_effort is None or str(extracted_effort).lower() not in EFFORT_ORDER:
+            raise  # not a level any provider defines: surface the 400, never guess
         entry, _ = resolve(base_name, None, strict=strict, default_model=default_model)
         levels = entry.get("reasoning_effort_levels") or []
         if not levels or not entry.get("reasoning", True):
