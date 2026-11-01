@@ -205,7 +205,14 @@ GIT_BLOCKED_RE = re.compile(
     r'|(?:^|\s)(?:config|alias|credential|submodule)\b'
     r'|(?:^|\s)(?:apply|am|bisect|daemon|difftool|fast-import|filter-branch)\b'
     r'|--upload-pack|--receive-pack'         # transport helpers execute arbitrary commands
-    r'|ext::|--exec-path', re.IGNORECASE)
+    r'|ext::|--exec-path'
+    r'|--config-env'                        # --config-env=core.fsmonitor=COMSPEC runs a program
+    r'|--open-files-in-pager'               # git grep runs the named pager
+    r'|--output(?:\s|=)'                    # git log/diff --output writes any path
+    r'|--git-dir|--work-tree',              # operate on repositories outside the workspace
+    re.IGNORECASE)
+# Case-sensitive: `git grep -O<prog>` runs <prog>, `git grep -o` is a legit flag.
+GIT_PAGER_RE = re.compile(r'(?:^|\s)-[a-zA-Z]*O')
 
 GLOBAL_BLOCKED_RE = re.compile(r'(?:^|\s)--pre(?:\s|=)', re.IGNORECASE)  # rg preprocessor = arbitrary exec
 
@@ -219,12 +226,14 @@ def _check_segments(segments, patterns, depth=0) -> None:
         # the same as the bare flag. Deliberate over-blocks: `git diff -C`, and any
         # argument merely containing a blocked word.
         flattened = segment.replace('"', "")
-        if base == "git" and GIT_BLOCKED_RE.search(flattened):
+        if base == "git" and (GIT_BLOCKED_RE.search(flattened) or GIT_PAGER_RE.search(flattened)):
             raise PolicyError("git command/config overrides require allow_all")
         if GLOBAL_BLOCKED_RE.search(flattened):
             raise PolicyError("command preprocessing flags require allow_all")
         shell = base in SHELLS
-        if not any(pattern.search(head) for pattern in patterns):
+        # Anchored at the segment start: narrow rules like `^git (status|log)\b`
+        # work again, and a pattern still cannot match a word mid-segment.
+        if not any(pattern.match(segment) or pattern.match(head) for pattern in patterns):
             raise PolicyError(
                 "command not allowlisted: '" + head + "' "
                 "(exec_policy=allowlist; add a pattern to exec_allowlist)")
