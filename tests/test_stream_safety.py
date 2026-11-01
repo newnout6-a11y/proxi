@@ -262,3 +262,20 @@ def test_ping_returns_none_without_usage_event(monkeypatch):
                         lambda request, timeout: _FakeResponse([line.encode() + b"\n" for line in events]))
     session = SimpleNamespace(backend=SimpleNamespace(cfg={"base": "http://upstream"}, headers=lambda: {}))
     assert direct._ping(session, {"model": "unknown-model"}) is None
+
+
+def test_rejected_body_dump_lands_files_and_never_raises(monkeypatch, tmp_path):
+    """The upstream 400 capture must write the exact payload plus the error
+    detail, and a failing dump must not break the turn."""
+    monkeypatch.chdir(tmp_path)
+    direct._dump_rejected_body(b'{"messages": []}', '{"statusCode":400,"message":"Invalid request format"}')
+    files = sorted(p.name for p in (tmp_path / "logs" / "upstream-400").iterdir())
+    assert len(files) == 2
+    body_file = tmp_path / "logs" / "upstream-400" / files[0]
+    assert body_file.read_bytes() == b'{"messages": []}'
+
+    # A hostile/unwritable target must be swallowed: diagnostics never break a turn.
+    import shutil
+    shutil.rmtree(tmp_path / "logs" / "upstream-400")
+    (tmp_path / "logs" / "upstream-400").write_text("not a dir", encoding="utf-8")
+    direct._dump_rejected_body(b"x", "y")  # must not raise
