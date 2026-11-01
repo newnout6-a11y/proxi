@@ -1,10 +1,35 @@
 """Relay-side authentication and upstream (Retool) auth headers."""
 import hmac
 import os
+import threading
+import time
 
 from apierr import unauthorized
 
 CLIENT_VERSION = "4.84.0-16f3123 (Build 409813)"
+
+# Always-on budget for wrong-key attempts (rate_limit_rps is off by default and
+# covers only completions). Memory is bounded: at most one entry per source IP.
+_FAILURE_WINDOW = 60.0
+_FAILURE_LIMIT = 200
+_FAILURES = {}
+_FAILURES_LOCK = threading.Lock()
+
+
+def register_auth_failure(client_ip):
+    """Record a failed key attempt for the source address. Returns the seconds a
+    repeat attempt must wait when the budget is exhausted, else None."""
+    now = time.time()
+    with _FAILURES_LOCK:
+        stamps = [t for t in _FAILURES.get(client_ip, []) if now - t < _FAILURE_WINDOW]
+        stamps.append(now)
+        _FAILURES[client_ip] = stamps
+        if len(_FAILURES) > 1024:
+            for ip in [ip for ip, s in _FAILURES.items() if not s or now - s[-1] > _FAILURE_WINDOW]:
+                _FAILURES.pop(ip, None)
+        if len(stamps) > _FAILURE_LIMIT:
+            return max(1.0, _FAILURE_WINDOW - (now - stamps[0]))
+    return None
 
 
 def client_headers(key=None):

@@ -76,7 +76,7 @@ def test_failed_auth_health_burst_is_cached_as_unhealthy(relay, monkeypatch):
     for _ in range(8):
         status, body = relay.json_any("/health", key=None)
         assert status == 503 and body["ok"] is False
-        assert "401" in body["error"]
+        assert body["balance_known"] is False
     assert len(fetches) == 1
 
 
@@ -160,7 +160,8 @@ def test_malformed_balance_health_failure_is_cached(relay, monkeypatch, payload)
     monkeypatch.setattr(urllib.request, "urlopen", route_request)
     for _ in range(2):
         status, body = relay.json_any("/health", key=None)
-        assert status == 503 and body["ok"] is False and body["error"]
+        assert status == 503 and body["ok"] is False and body["balance_known"] is False
+        assert "error" not in body
     assert len(calls) == 1
 
 
@@ -183,5 +184,6 @@ def test_empty_timeout_error_does_not_make_cached_health_healthy(relay, monkeypa
     failed = manager.get_balance(force_refresh=True)
     assert failed["stale"] is True and failed["stale_error"] == "TimeoutError"
     status, body = relay.json_any("/health", key=None)
-    assert status == 503 and body["ok"] is False and body["error"] == "TimeoutError"
+    assert status == 503 and body["ok"] is False and body["balance_known"] is False
+    assert "TimeoutError" not in str(body), "raw upstream error text must not leak"
     assert len(calls) == 2
