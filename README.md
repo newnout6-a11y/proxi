@@ -170,6 +170,7 @@ E2E: `npx playwright test`.
 | reasoning_effort | auto — рекомендация выбранной модели; явный уровень из клиента имеет приоритет |
 | agent_mode | 2 — рабочий режим агента (1 — более «разговорный», 3 — не проверялся) |
 | google_provider_resource_name, retool_fast_provider_resource_name | ресурсы для gemini-* и zai-org/*; без них эти модели дают 503 |
+| provider_resource_name, openai_provider_resource_name | ресурсы для claude-* и gpt-*; без них эти модели дают 503. Значение `__managed__` = тенант сам обслуживает модели (поле `providerResourceName` в запрос не отправляется); задаётся per-account в `accounts[]` |
 
 ### Как читается политика команд
 

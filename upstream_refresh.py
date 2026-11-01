@@ -54,6 +54,9 @@ class Refresher:
 
     def refresh(self, force=False, *, rejected_cookie=None) -> bool:
         """Single-flight renewal. A concurrent caller reuses the new credentials."""
+        # Multi-account: journal events must say WHICH tenant renewed/failed.
+        account_tag = journal.tag(self.cfg.get("page_uuid"))
+        tenant = (self.cfg.get("base") or "").replace("https://", "").replace("http://", "")
         with self._lock:
             if rejected_cookie is not None and self.cfg["cookie"] != rejected_cookie:
                 return True
@@ -74,13 +77,15 @@ class Refresher:
                 self._last_result = False
                 exc.close()
                 journal.emit("auth.refresh", "Продление сессии Retool не удалось: HTTP %s" % exc.code, "error",
-                             ok=False, status=exc.code, forced=force)
+                             ok=False, status=exc.code, forced=force,
+                             account=account_tag, tenant=tenant)
                 return False
             except Exception as exc:
                 self.last_error = redact(str(exc), cookie_values=self.cfg.get("cookie_values", []))
                 self._last_result = False
                 journal.emit("auth.refresh", "Продление сессии Retool не удалось", "error",
-                             ok=False, error=self.last_error, forced=force)
+                             ok=False, error=self.last_error, forced=force,
+                             account=account_tag, tenant=tenant)
                 return False
             merge_set_cookie(self.cfg, headers)
             if "_account_ref" in self.cfg and isinstance(self.cfg["_account_ref"], dict):
@@ -95,7 +100,8 @@ class Refresher:
             self._persist()
             journal.emit("auth.refresh", "Сессия Retool продлена",
                          "warn" if self.persistence_error else "success", ok=True, forced=force,
-                         rotated=bool(headers), persistence_error=self.persistence_error)
+                         rotated=bool(headers), persistence_error=self.persistence_error,
+                         account=account_tag, tenant=tenant)
             self.last_error = None
             self.last_success_at = time.time()
             self._last_result = True

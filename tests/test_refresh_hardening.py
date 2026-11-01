@@ -2,6 +2,7 @@
 import threading
 
 import auth
+import journal
 import upstream_refresh
 from auth import merge_set_cookie
 from upstream_refresh import Refresher
@@ -111,3 +112,21 @@ def test_auth_failure_table_is_bounded():
         assert len(auth._FAILURES) <= 4096, "flood of fresh IPs must be hard-capped"
     finally:
         auth._FAILURES.clear()
+
+
+def test_refresh_events_carry_account_tag(monkeypatch, tmp_path):
+    """With multiple accounts each auth.refresh event must say which tenant
+    renewed/failed — otherwise a 401 on one account is indistinguishable from
+    the other's."""
+    cfg = _cfg(tmp_path)
+    journal.JOURNAL.reset()  # the journal is process-global: isolate this test's events
+    monkeypatch.setattr(upstream_refresh.urllib.request, "urlopen",
+                        lambda req, timeout: _Resp(b"", cookies=["accessToken=fresh; Path=/"]))
+    refresher = Refresher(cfg)
+    assert refresher.refresh(rejected_cookie="accessToken=old; xsrfToken=old-xsrf; keep=1") is True
+    events = [e for e in journal.JOURNAL.query() if e["kind"] == "auth.refresh"]
+    assert events, "refresh must be journaled"
+    for e in events:
+        assert e["data"].get("account"), "auth.refresh must carry the account tag"
+        assert "example.invalid" in e["data"].get("tenant", ""), \
+            "tenant must be visible for multi-account diagnosis"

@@ -280,6 +280,11 @@ def provider_resource(cfg, entry):
     if not key:
         raise service_unavailable(f"provider '{entry['provider']}' is not routed")
     value = cfg.get(key)
+    if value == "__managed__":
+        # Per-account escape hatch: the tenant's own managed AI serves the model
+        # without an explicit provider resource (verified live: opus streams with
+        # the field omitted). build_body omits providerResourceName when None.
+        return None
     if not value:
         raise service_unavailable(
             f"model '{entry['id']}' needs config key '{key}' (provider resource is not configured)")

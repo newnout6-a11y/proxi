@@ -405,6 +405,11 @@ class TurnRunner:
                     session = await self.pool.acquire(key) if key else await self.pool.acquire()
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
+                # Per-account AI resources: the resource UUID is org-scoped, so it
+                # must come from the backend cfg the turn actually runs on, not the
+                # global config (accounts[] can span tenants).
+                acc_cfg = getattr(getattr(acquired, "backend", None), "cfg", None) or self.cfg
+                model_provider["providerResourceName"] = model_catalog.provider_resource(acc_cfg, parsed.entry)
                 log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
                     "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
                     isolated=bool(key and not native_tools), mode=self.cfg.get("session_mode"),
