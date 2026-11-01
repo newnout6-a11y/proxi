@@ -7,6 +7,8 @@ import threading
 import time
 import uuid
 
+from redact import redact
+
 EXEC_REGEX = re.compile(r"<exec_command>(.*?)</exec_command>", re.DOTALL | re.IGNORECASE)
 TOOL_REGEX = re.compile(r"<tool_call\b([^>]*)>(.*?)</tool_call>",
                         re.DOTALL | re.IGNORECASE)
@@ -198,15 +200,31 @@ def command_tool_call(text: str, tool_names):
             "arguments": json.dumps({field: command}, ensure_ascii=False, separators=(",", ":"))}
 
 
+GIT_BLOCKED_RE = re.compile(
+    r'(?:^|\s)-[cC]'                       # -c/-C incl. glued "-ccore.pager=cmd" and quoted "-c"
+    r'|(?:^|\s)(?:config|alias|credential|submodule)\b'
+    r'|(?:^|\s)(?:apply|am|bisect|daemon|difftool|fast-import|filter-branch)\b'
+    r'|--upload-pack|--receive-pack'         # transport helpers execute arbitrary commands
+    r'|ext::|--exec-path', re.IGNORECASE)
+
+GLOBAL_BLOCKED_RE = re.compile(r'(?:^|\s)--pre(?:\s|=)', re.IGNORECASE)  # rg preprocessor = arbitrary exec
+
+
 def _check_segments(segments, patterns, depth=0) -> None:
     for segment in segments:
-        head = segment.split()[0].strip('"')
-        if head.lower().removesuffix(".exe") == "git" and re.search(
-                r"(?:^|\s)(?:-c|-C|--config-env|--exec-path)(?:\s|=)|\b(?:config|alias|credential|submodule)\b",
-                segment, re.IGNORECASE):
+        parts = segment.split()
+        head = parts[0].strip('"') if parts else ""
+        base = os.path.basename(head.lower().removesuffix(".exe"))
+        # Quote-stripped copy: cmd strips quotes, so `git "-c" x=y` must be judged
+        # the same as the bare flag. Deliberate over-blocks: `git diff -C`, and any
+        # argument merely containing a blocked word.
+        flattened = segment.replace('"', "")
+        if base == "git" and GIT_BLOCKED_RE.search(flattened):
             raise PolicyError("git command/config overrides require allow_all")
-        shell = head.lower().removesuffix(".exe") in SHELLS
-        if not any(pattern.search(segment) for pattern in patterns):
+        if GLOBAL_BLOCKED_RE.search(flattened):
+            raise PolicyError("command preprocessing flags require allow_all")
+        shell = base in SHELLS
+        if not any(pattern.search(head) for pattern in patterns):
             raise PolicyError(
                 "command not allowlisted: '" + head + "' "
                 "(exec_policy=allowlist; add a pattern to exec_allowlist)")
@@ -237,6 +255,9 @@ def clean_env(workspace: str) -> dict:
     env = {key: os.environ[key] for key in ENV_KEEP if key in os.environ}
     env["PWD"] = workspace
     env["PYTHONIOENCODING"] = "utf-8"
+    # A hostile workspace shipping git.bat/cmd.bat/powershell.bat must not shadow
+    # the allowlisted executables via the current-directory search.
+    env["NoDefaultCurrentDirectoryInExePath"] = "1"
     return env
 
 
@@ -274,7 +295,7 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     except Exception as exc:
-        _audit(audit_path, cmd, -1, 0, str(exc))
+        _audit(audit_path, cmd, -1, 0.0, 0, error=str(exc))
         return -1, "Execution failed: " + str(exc)
 
     collected = {"out": [], "err": [], "size": 0}
@@ -346,14 +367,16 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
     return code, combined
 
 
-def _audit(path, cmd, code, duration, output_len):
+def _audit(path, cmd, code, duration, output_len, error=None):
     if not path:
         return
     try:
+        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": redact(cmd),
+                  "exit": code, "seconds": round(duration, 2), "output_chars": output_len}
+        if error:
+            record["error"] = str(error)[:300]
         with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": cmd,
-                                     "exit": code, "seconds": round(duration, 2),
-                                     "output_chars": output_len}, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         pass
 
