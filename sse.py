@@ -53,6 +53,9 @@ class StreamWriter:
 
 def client_gone(handler) -> bool:
     """Non-blocking check whether the peer closed the connection."""
+    writer = getattr(handler, "_writer", None)
+    if writer is not None and getattr(writer, "broken", False):
+        return True
     sock = getattr(handler, "connection", None)
     if sock is None:
         return False
@@ -63,3 +66,4 @@ def client_gone(handler) -> bool:
         return sock.recv(1, socket.MSG_PEEK) == b""
     except (OSError, ValueError):
         return True
+

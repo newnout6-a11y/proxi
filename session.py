@@ -2,6 +2,7 @@
 import asyncio
 from collections import deque
 import datetime as _datetime
+import hashlib
 import json
 import os
 import time
@@ -16,9 +17,9 @@ import websockets
 import apierr
 import journal
 from auth import upstream_headers
+from upstream_refresh import Refresher
 
 ISO_FMT = "%Y-%m-%dT%H:%M:%S"
-from upstream_refresh import Refresher
 
 MAX_FRAME_DEFAULT = 16 * 1024 * 1024
 MAX_PENDING_FRAMES = 256
@@ -142,8 +143,14 @@ class Backend:
 
         def call():
             req = urllib.request.Request(self.cfg["base"] + path, headers=upstream_headers(self.cfg), method="GET")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8", "replace"))
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read().decode("utf-8", "replace"))
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    # Direct-transport threads persist no sandpack messages.
+                    return {"messages": []}
+                raise
 
         return await asyncio.get_running_loop().run_in_executor(None, lambda: self.refresher.call(call))
 
@@ -282,25 +289,35 @@ class RelaySession:
         self._warm_at = 0
         self._warm_task = None
         self._last_request_at = time.time()
+        self._active_direct_abort = None
+        self._cached_turn_ends = []
 
     def set_direct(self, head, tools, tool_choice, max_tokens, chunks=None):
         """Direct transport: cacheable head, chunked history and native client tools."""
+        prior = self._direct or {}
         if head:
+            if self._cached_head and self._cached_head != head:
+                # Head churn invalidates the cached prefix, so every history
+                # breakpoint misses and the whole prompt is written again.
+                journal.emit("cache.head_changed", "Head изменился — кэш префикса будет перезаписан", "info",
+                             old_sha=hashlib.sha256(self._cached_head.encode("utf-8")).hexdigest()[:12],
+                             new_sha=hashlib.sha256(head.encode("utf-8")).hexdigest()[:12],
+                             old_chars=len(self._cached_head), new_chars=len(head),
+                             thread=journal.tag(getattr(self, "thread_id", None)))
             self._cached_head = head
         if tools:
-            for t in tools:
-                if isinstance(t, dict) and t.get("name"):
-                    self._registered_tools[t["name"]] = t
+            if prior.get("tools") and prior.get("tools") != tools:
+                journal.emit("cache.tools_changed", "Набор инструментов клиента изменился", "info",
+                             old_count=len(prior["tools"]), new_count=len(tools),
+                             thread=journal.tag(getattr(self, "thread_id", None)))
+            self._registered_tools = {t["name"]: t for t in tools if isinstance(t, dict) and t.get("name")}
         self._direct = {"head": head or "", "tools": tools, "tool_choice": tool_choice,
                         "max_tokens": max_tokens, "chunks": chunks}
 
     def register_tools(self, tools):
         """Register tools into the session's canonical tool schema."""
-        if not tools:
-            return
-        for t in tools:
-            if isinstance(t, dict) and t.get("name"):
-                self._registered_tools[t["name"]] = t
+        if tools:
+            self._registered_tools = {t["name"]: t for t in tools if isinstance(t, dict) and t.get("name")}
 
     def get_canonical_tools(self):
         """Return the normalized canonical tools registered in this session."""
@@ -318,6 +335,12 @@ class RelaySession:
         """Thread-safe cancellation: close the old socket to isolate its frames."""
         self._cancelled = True
         self._needs_drain = True
+        abort = getattr(self, "_active_direct_abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:
+                pass
         loop = self._loop
         if self.ws is not None and self._drain_task is None and loop is not None and not loop.is_closed():
             self._drain_task = asyncio.run_coroutine_threadsafe(self.aclose(), loop)
@@ -367,6 +390,12 @@ class RelaySession:
         await _answer_control(self.ws, raw)
 
     async def aclose(self):
+        abort = getattr(self, "_active_direct_abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:
+                pass
         task, self._warm_task = getattr(self, "_warm_task", None), None
         if task is not None and not task.done():
             task.cancel()
@@ -889,9 +918,9 @@ class SessionPool:
                                       or getattr(self._conversations.get(key), "_cached_head", None)
                                       or self.cfg.get("transport") == "direct"
                                       or len(self.backends) > 1):
-                    parent = self._conversations.get(key)
                     backend = self._next_backend()
                     session = RelaySession(backend, await self._new_thread_id(backend))
+                    parent = self._conversations.get(key)
                     if parent is not None:
                         if getattr(parent, "_cached_head", None):
                             session._cached_head = parent._cached_head
@@ -899,6 +928,8 @@ class SessionPool:
                             session._registered_tools = dict(parent._registered_tools)
                         if getattr(parent, "_direct", None):
                             session._direct = dict(parent._direct)
+                        if getattr(parent, "_cached_turn_ends", None):
+                            session._cached_turn_ends = list(parent._cached_turn_ends)
                     keep = False
                     lock = None
                 else:
@@ -916,21 +947,6 @@ class SessionPool:
             else:
                 backend = self._next_backend()
                 session = RelaySession(backend, await self._new_thread_id(backend))
-                if conversation_key and conversation_key in self._conversations:
-                    parent = self._conversations[conversation_key]
-                    if getattr(parent, "_cached_head", None):
-                        session._cached_head = parent._cached_head
-                    if getattr(parent, "_registered_tools", None):
-                        session._registered_tools = dict(parent._registered_tools)
-                    if getattr(parent, "_direct", None):
-                        session._direct = dict(parent._direct)
-                elif self._shared is not None:
-                    if getattr(self._shared, "_cached_head", None):
-                        session._cached_head = self._shared._cached_head
-                    if getattr(self._shared, "_registered_tools", None):
-                        session._registered_tools = dict(self._shared._registered_tools)
-                    if getattr(self._shared, "_direct", None):
-                        session._direct = dict(self._shared._direct)
             session.begin_request()
             lease = SessionLease(session)
             self._active[lease] = (session, key, lock, keep)
@@ -959,7 +975,7 @@ class SessionPool:
                     parent = self._conversations[key]
                     if parent is not None and getattr(session, "_registered_tools", None):
                         parent._registered_tools.update(session._registered_tools)
-            if not keep or session._needs_drain:
+            if not keep or session._needs_drain or session._cancelled:
                 await session.aclose()
         finally:
             if key is not None:

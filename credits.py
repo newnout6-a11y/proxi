@@ -8,6 +8,32 @@ import urllib.request
 CACHE_TTL = 30.0
 HISTORY_MAX = 200
 
+# Retool rates measured by a least-squares fit over 350 journal turns (2026-10-31).
+# Retool passes Anthropic pricing through: cache read 0.05x, cache write ~1.25x and
+# output ~5x of the base input rate. The tariff is flat — no long-context premium
+# up to at least 460k tokens (fit predicted 46.52 vs 46.53 actual on the record turn).
+RATE_INPUT = 0.000075
+RATE_CACHE_READ = 0.000004
+RATE_CACHE_WRITE = 0.000100
+RATE_OUTPUT = 0.000401
+
+
+def cost_breakdown(usage):
+    """Per-category credit cost and cache hit ratio for one turn's usage."""
+    inp = int(usage.get("input_tokens") or 0)
+    out = int(usage.get("output_tokens") or 0)
+    read = int(usage.get("cache_read") or 0)
+    write = int(usage.get("cache_write") or 0)
+    prompt = inp + read + write
+    return {
+        "cost_input": round(inp * RATE_INPUT, 5),
+        "cost_cache_read": round(read * RATE_CACHE_READ, 5),
+        "cost_cache_write": round(write * RATE_CACHE_WRITE, 5),
+        "cost_output": round(out * RATE_OUTPUT, 5),
+        "prompt_tokens": prompt,
+        "cache_hit_ratio": round(read / prompt, 4) if prompt else None,
+    }
+
 
 class CreditsManager:
     def __init__(self, base_url, headers_fn, refresher=None):

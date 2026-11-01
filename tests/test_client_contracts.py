@@ -150,7 +150,7 @@ def test_codex_catalog_advertises_direct_client_tools_and_actual_route_capabilit
     assert native["tool_mode"] == "direct"
     assert native["shell_type"] == "unified_exec"
     assert native["apply_patch_tool_type"] == "freeform"
-    assert native["input_modalities"] == ["text"]
+    assert native["input_modalities"] == ["text", "image"]
     assert native["supports_reasoning_summary_parameter"] is True
     assert native["default_reasoning_summary"] == "detailed"
     assert [value["effort"] for value in native["supported_reasoning_levels"]] == entry["reasoning_effort_levels"]
@@ -163,6 +163,7 @@ def test_codex_catalog_does_not_invent_reasoning_for_non_reasoning_model():
     entry = {"id": "plain-text-model", "reasoning": False, "reasoning_effort_levels": []}
     native = models.codex_catalog([entry])["models"][0]
     assert native["supported_reasoning_levels"] == []
+    assert native["input_modalities"] == ["text"]
     assert native["default_reasoning_level"] is None
     assert native["supports_reasoning_summary_parameter"] is False
     assert models.codex_catalog([]) == {"models": []}

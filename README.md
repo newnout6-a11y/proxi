@@ -166,7 +166,7 @@ E2E: `npx playwright test`.
 | rate_limit_rps | 0 — дополнительная локальная квота выключена; можно включить явно |
 | command_output_limit | 64 000 символов; 0 — весь вывод команды |
 | max_prompt_bytes | 0 — relay не обрезает prompt; положительный лимит проверяет весь UTF-8 prompt и возвращает 413 при переполнении |
-| context_max_bytes | 120 000 — сколько контекста проекта подмешивается |
+| context_max_bytes | 40 000 — сколько контекста проекта подмешивается; больше не значит лучше (консенсус 2026: компактный структурный контекст вместо больших выгрузок) |
 | reasoning_effort | auto — рекомендация выбранной модели; явный уровень из клиента имеет приоритет |
 | agent_mode | 2 — рабочий режим агента (1 — более «разговорный», 3 — не проверялся) |
 | google_provider_resource_name, retool_fast_provider_resource_name | ресурсы для gemini-* и zai-org/*; без них эти модели дают 503 |
@@ -256,9 +256,10 @@ Gemini 3.x, Retool Power/Mini. Список статический: обновл
 ## Архитектура
 
 proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
-(контекст, exec-цикл) -> session.py (тред + WS, ретраи, отмена) -> adapters.py
-(три диалекта) + sse.py. Вспомогательное: auth.py, upstream_refresh.py, credits.py,
-executor.py, context.py, redact.py, apierr.py, models.py.
+(контекст, exec-цикл) -> session.py (диалоги: direct/WS, ретраи, отмена) -> direct.py
+(direct-транспорт, prompt caching) -> adapters.py (три диалекта) + sse.py.
+Вспомогательное: auth.py, upstream_refresh.py, credits.py, executor.py, context.py,
+redact.py, apierr.py, models.py.
 Реверс-инжиниринг протокола — PROTOCOL.md. Локальные capture/probe-артефакты
 исключены из Git: они могут содержать credentials. Удаление файлов из текущей
 ветки не удаляет ранее опубликованные секреты из истории; их следует отозвать.

@@ -4,15 +4,106 @@ Drop-in alternative to the agent WebSocket path: same normalised event stream, b
 plain HTTP POST. The stable system head is sent as a cached block so a large project
 context is billed once and reused, keeping time-to-first-token flat.
 """
-import asyncio, hashlib, json, time, urllib.error, urllib.request
+import asyncio
+import hashlib
+import json
+import socket
+import time
+import urllib.error
+import urllib.request
 
 import apierr
+import credits
 import journal
 import models as model_catalog
 
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
+
+
+def _owning_socket(resp):
+    """Best-effort walk to the socket OBJECT that owns the descriptor (a real
+    http.client response is resp.fp.raw._sock). Closing through the owner makes
+    the owner forget the number, so no second close can hit a reused fd."""
+    seen = set()
+    cur = resp
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        raw = getattr(cur, "raw", None)
+        if raw is not None:
+            sock = getattr(raw, "_sock", None)
+            if sock is not None and hasattr(sock, "shutdown"):
+                return sock
+        cur = getattr(cur, "fp", None)
+    return None
+
+
+def _force_close_response(resp):
+    """Instantaneously unblock threads waiting in WinSock recv() or HTTPResponse read().
+
+    Windows needs a real closesocket() to abort a blocked recv(); shutdown() alone
+    does not wake it. The fd is closed through its OWNING socket object, which then
+    remembers -1: a worker thread that still holds the buffered reader (its own
+    reference survives resp.fp = None) can never close the number a second time
+    after it has been reused by an unrelated connection."""
+    if resp is None:
+        return
+    owner = None
+    try:
+        fd = resp.fileno() if hasattr(resp, "fileno") else None
+        owner = _owning_socket(resp) if fd is not None and fd != -1 else None
+    except Exception:
+        owner = None
+    if owner is not None:
+        try:
+            owner.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            # Bypass the makefile reference count: the blocked worker holds a
+            # reader, so a plain close() would only defer the real closesocket.
+            owner._real_close()
+        except Exception:
+            try:
+                owner.close()
+            except Exception:
+                pass
+        try:
+            if getattr(resp, "fp", None) is not None:
+                resp.fp = None
+        except Exception:
+            pass
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return
+    # Fallback for response shapes without a walkable socket chain.
+    try:
+        fd = resp.fileno() if hasattr(resp, "fileno") else None
+        if fd is not None and fd != -1:
+            try:
+                if getattr(resp, "fp", None) is not None:
+                    resp.fp = None
+            except Exception:
+                pass
+            try:
+                s = socket.socket(fileno=fd)
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                s.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        resp.close()
+    except Exception:
+        pass
+
 _CACHE_MIN_CHARS = 0
 
 
@@ -268,16 +359,70 @@ class ArgStream:
         return ""
 
 
-def cache_key_for(head):
-    return hashlib.sha256(head.encode("utf-8")).hexdigest()[:24]
+def _extract_chunk_text(chunk):
+    if isinstance(chunk, str):
+        return chunk
+    if isinstance(chunk, dict):
+        return str(chunk.get("text") or chunk.get("content") or "")
+    if isinstance(chunk, list):
+        parts = []
+        for b in chunk:
+            if isinstance(b, dict):
+                parts.append(str(b.get("text") or b.get("content") or ""))
+            elif isinstance(b, str):
+                parts.append(b)
+        return " ".join(parts)
+    return str(chunk or "")
 
 
-def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None):
+def _is_user_chunk(chunk):
+    if isinstance(chunk, dict):
+        role = chunk.get("role")
+        if role in ("user", "human", "client"):
+            return True
+    elif isinstance(chunk, list):
+        if any(isinstance(b, dict) and b.get("role") in ("user", "human", "client") for b in chunk):
+            return True
+    text = _extract_chunk_text(chunk).lstrip()
+    lowered = text.lower()
+    return (lowered.startswith(("user:", "human:", "client:", "user task:"))
+            or text.startswith(("User:", "Human:", "Client:", "USER TASK:")))
+
+
+def _is_tool_result_chunk(chunk):
+    if isinstance(chunk, dict):
+        role = chunk.get("role")
+        ctype = chunk.get("type")
+        if role in ("tool", "function") or ctype in ("tool_result", "exec_result"):
+            return True
+    elif isinstance(chunk, list):
+        if any(isinstance(b, dict) and (b.get("role") in ("tool", "function") or b.get("type") in ("tool_result", "exec_result")) for b in chunk):
+            return True
+    text = _extract_chunk_text(chunk).lstrip()
+    lowered = text.lower()
+    return (lowered.startswith(("[tool result", "[tool_result", "[command result", "[exec_result", "tool:", "tool result"))
+            or "[tool result" in lowered or "[tool_result" in lowered or "[command result" in lowered)
+
+
+def cache_key_for(head, model="", tools=None):
+    """Prefix cache key. The model and the toolset are part of the upstream prompt
+    prefix, so a change to either must not reuse the previous cache entry."""
+    digest = hashlib.sha256()
+    digest.update((model or "").encode("utf-8"))
+    digest.update(b"\x00")
+    if tools:
+        digest.update(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update((head or "").encode("utf-8"))
+    return digest.hexdigest()[:24]
+
+
+def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
     """Assemble the request body.
 
     The stable head becomes a cached system block and the history is sent as one
-    message per chunk, with the breakpoint moved to the end every turn so the
-    previous prefix is read from cache instead of being reprocessed.
+    message per chunk, preserving prior turn endpoints as cache breakpoints so
+    intermediate multi-tool turns do not discard prefix caches.
     """
     messages = []
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
@@ -291,23 +436,96 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         if prompt:
             messages.append({"role": "user", "content": prompt})
     else:
+        cache_indices = set()
+        turn_boundaries = set()
+        if cfg.get("direct_cache", True):
+            session_ends = [idx for idx in getattr(session, "_cached_turn_ends", []) if 0 <= idx < len(history) - 1] if session else []
+
+            # Chunk 0 is the initial conversation prompt and must ALWAYS be preserved
+            turn_boundaries.add(0)
+
+            for i, chunk in enumerate(history):
+                if _is_user_chunk(chunk):
+                    turn_boundaries.add(i)
+                if i + 1 < len(history) and _is_user_chunk(history[i + 1]):
+                    turn_boundaries.add(i)
+                if _is_tool_result_chunk(chunk):
+                    turn_boundaries.add(i)
+
+            known_boundaries = sorted(set(session_ends) | turn_boundaries)
+            # Anthropic enforces a strict maximum of 4 blocks with cache_control across the request.
+            # If head is cached, that leaves at most 3 blocks for history. Otherwise at most 4.
+            # The upstream backend adds its own cache_control breakpoint on the tool
+            # definitions, so with tools present one block stays reserved for it.
+            budget = 4 - (1 if tools else 0)
+            max_history_cache = budget - 1 if (head and cache) else budget
+
+            chosen = set()
+            chosen.add(0)
+            chosen.add(len(history) - 1)
+
+            slots_left = max_history_cache - len(chosen)
+            intermediates = [i for i in known_boundaries if 0 < i < len(history) - 1]
+            if slots_left > 0 and intermediates:
+                for idx in intermediates[-slots_left:]:
+                    chosen.add(idx)
+
+            if len(chosen) < max_history_cache and len(history) >= 3:
+                for idx in reversed(range(1, len(history) - 1)):
+                    if len(chosen) >= max_history_cache:
+                        break
+                    chosen.add(idx)
+
+            cache_indices = chosen
+
         for index, part in enumerate(history):
+            should_cache = index in cache_indices
             if isinstance(part, list):
                 blocks = [dict(b) if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in part]
-                if cfg.get("direct_cache", True) and index == len(history) - 1:
-                    target = next((b for b in reversed(blocks) if b.get("type") == "text"), blocks[-1])
-                    target["cache"] = True
+                if should_cache:
+                    # Only text blocks carry the cache flag; an image-only chunk has no
+                    # cacheable text and upstream may reject the unknown placement.
+                    target = next((b for b in reversed(blocks) if b.get("type") == "text"), None)
+                    if target is not None:
+                        target["cache"] = True
                 messages.append({"role": "user", "content": blocks})
             elif isinstance(part, dict):
                 block = dict(part)
-                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                if should_cache and block.get("type") == "text":
                     block["cache"] = True
                 messages.append({"role": "user", "content": [block]})
             else:
                 block = {"type": "text", "text": str(part)}
-                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                if should_cache:
                     block["cache"] = True
                 messages.append({"role": "user", "content": [block]})
+
+    # Hard safety check: ensure total blocks with cache: True NEVER exceeds the Anthropic
+    # limit. With tools present one block is reserved for the upstream tool breakpoint.
+    max_cache_blocks = 3 if tools else 4
+    cached_blocks = [
+        b
+        for m in messages
+        for b in m.get("content", [])
+        if isinstance(b, dict) and b.get("cache")
+    ]
+    if len(cached_blocks) > max_cache_blocks:
+        for b in cached_blocks[1:-1]:
+            if len(cached_blocks) <= max_cache_blocks:
+                break
+            b.pop("cache", None)
+            cached_blocks = [
+                blk for m in messages for blk in m.get("content", [])
+                if isinstance(blk, dict) and blk.get("cache")
+            ]
+
+    if session is not None and history and cfg.get("direct_cache", True):
+        prior = [e for e in getattr(session, "_cached_turn_ends", []) if e < len(history) - 1]
+        all_ends = set(prior) | {e for e in turn_boundaries if e < len(history) - 1}
+        all_ends.add(0)
+        all_ends.add(len(history) - 1)
+        session._cached_turn_ends = sorted(all_ends)
+
     body = {"model": model_provider.get("model"),
             "messages": messages,
             "rit": make_rit(messages, tools),
@@ -326,8 +544,23 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         if choice and choice != "auto":
             body["toolChoice"] = choice
     if cache and head:
-        body["openAICacheKey"] = cache_key_for(head)
+        body["openAICacheKey"] = cache_key_for(head, body.get("model"), tools)
     return body
+
+
+def _bounded_put(loop, queue, item, is_cancelled):
+    """Thread-safe bounded put that never duplicates: one put future is awaited
+    until it lands (a blocked worker is the backpressure) or the session dies.
+    Re-creating the future on a timeout would enqueue the item twice."""
+    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+    while True:
+        try:
+            future.result(timeout=5)
+            return
+        except TimeoutError:
+            if is_cancelled():
+                future.cancel()
+                return
 
 
 def _error_from_event(event):
@@ -346,7 +579,10 @@ def _error_from_event(event):
 
 
 def _ping(session, body):
-    """Cheap request that re-reads the cached prefix so its TTL does not lapse."""
+    """Cheap request that re-reads the cached prefix so its TTL does not lapse.
+
+    Returns the credits Retool actually billed for the ping (from the usage
+    metadata event), or None when the stream ended without reporting them."""
     payload = dict(body)
     payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
     model_name = payload.get("model")
@@ -360,11 +596,28 @@ def _ping(session, body):
                                      data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
                                      headers=session.backend.headers(), method="POST")
     response = urllib.request.urlopen(request, timeout=120)
+    actual_credits = None
     try:
-        for _ in response:
-            break
+        for index, raw in enumerate(response):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            if usage.get("creditsUsed") is not None:
+                actual_credits = float(usage["creditsUsed"])
+            if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
+                break
+            if index >= 200:
+                break
     finally:
         response.close()
+    return actual_credits
 
 
 async def _keepwarm(session, cfg):
@@ -382,22 +635,40 @@ async def _keepwarm(session, cfg):
             body = getattr(session, "_warm_body", None)
             if not body or getattr(session, "_busy", False):
                 continue
-            await asyncio.to_thread(_ping, session, body)
+            actual = await asyncio.to_thread(_ping, session, body)
             session._warm_at = time.time()
+            session._warm_failures = 0
+            prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
+            est_credits = prefix_tokens * credits.RATE_CACHE_READ
+            session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0)
+                                           + (actual if actual is not None else est_credits), 4)
             journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
-                         thread=journal.tag(getattr(session, "thread_id", None)))
+                         thread=journal.tag(getattr(session, "thread_id", None)),
+                         prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
+                         actual_credits=actual, credits_total=session._keepwarm_cost)
             if cfg.get("direct_debug"):
                 print("[warm] prefix refreshed", flush=True)
         except asyncio.CancelledError:
             return
-        except Exception:
-            return
+        except Exception as exc:
+            # A transient upstream/network error must not kill the warm cycle for
+            # the rest of the idle window. A persistent failure (e.g. revoked
+            # session) stops the cycle after several attempts — the next real
+            # request recreates it.
+            failures = getattr(session, "_warm_failures", 0) + 1
+            session._warm_failures = failures
+            if failures >= 5:
+                journal.emit("cache.keepwarm",
+                             "Прогрев остановлен после %d неудач подряд: %s" % (failures, str(exc)[:200]), "warn")
+                return
+            journal.emit("cache.keepwarm",
+                         "Прогрев не удался, повтор на следующем интервале: %s" % str(exc)[:200], "warn")
 
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
     """Yield normalised relay events from the direct NDJSON stream."""
-    body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks)
+    body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
         body = {key: value for key, value in body.items() if key != "metadata"}
@@ -424,6 +695,15 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     finally:
         session._busy = False
         if body.get("openAICacheKey"):
+            prior_key = getattr(session, "_last_cache_key", None)
+            if prior_key and prior_key != body["openAICacheKey"]:
+                # A new key means the upstream prefix cache starts from zero: every
+                # history breakpoint misses and the whole prompt is written again.
+                journal.emit("cache.key_changed", "Кэш-ключ сменился — префикс будет перезаписан", "info",
+                             old=prior_key, new=body["openAICacheKey"], model=body.get("model"),
+                             tools=len(body.get("tools") or []),
+                             thread=journal.tag(getattr(session, "thread_id", None)))
+            session._last_cache_key = body["openAICacheKey"]
             session._warm_body = body
             session._warm_at = time.time()
             session._last_request_at = time.time()
@@ -444,13 +724,42 @@ async def _stream_body(cfg, session, body, param_types=None):
     headers["accept"] = "application/json"
     timeout = cfg.get("turn_timeout", 900)
     loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
+    # Bounded so a stalled consumer (slow or gone client) cannot balloon memory:
+    # the upstream worker blocks on hand-off, which backpressures the TCP read.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
     holder = {"response": None}
+
+    def hand_off_final(item):
+        """Land a terminal item (sentinel/error/cancel) without blocking. Safe from
+        any thread; sacrifices one buffered data line if the queue is full."""
+        def _put():
+            try:
+                queue.put_nowait(item)
+                return
+            except asyncio.QueueFull:
+                pass
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
+        loop.call_soon_threadsafe(_put)
+
+    def abort_direct():
+        _force_close_response(holder.get("response"))
+        hand_off_final(asyncio.CancelledError())
+
+    session._active_direct_abort = abort_direct
 
     def worker():
         try:
             attempt = 0
             while True:
+                if session._cancelled:
+                    return
                 request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                                  data=payload, headers=headers, method="POST")
                 try:
@@ -467,57 +776,74 @@ async def _stream_body(cfg, session, body, param_types=None):
                     holder["response"] = exc
                     raise apierr.ApiError(*_http_error(exc.code, detail))
             holder["response"] = response
+            if session._cancelled:
+                _force_close_response(response)
+                return
             for raw in response:
+                if session._cancelled:
+                    break
                 line = raw.strip()
                 if not line:
                     continue
-                loop.call_soon_threadsafe(queue.put_nowait, line)
+                # Bounded hand-off: block this worker when the consumer is slower
+                # than upstream instead of buffering the whole stream in memory.
+                _bounded_put(loop, queue, line, lambda: session._cancelled)
         except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
-            loop.call_soon_threadsafe(queue.put_nowait, exc)
+            if not session._cancelled:
+                hand_off_final(exc)
         finally:
-            try:
-                if holder["response"] is not None:
-                    holder["response"].close()
-            except Exception:
-                pass
-            loop.call_soon_threadsafe(queue.put_nowait, None)
+            _force_close_response(holder.get("response"))
+            hand_off_final(None)
 
     text, thinking = [], []
-    call = None
     produced = False
+    saw_end = False
     attempts_left = 2
-    while True:
-        task = loop.run_in_executor(None, worker)
-        try:
-            async for event in _drain(cfg, session, queue, text, thinking, param_types):
-                produced = True
-                yield event
-        finally:
-            if not task.done():
+    try:
+        while True:
+            task = loop.run_in_executor(None, worker)
+            try:
+                flags = {}
+                async for event in _drain(cfg, session, queue, text, thinking, param_types, flags):
+                    produced = True
+                    yield event
+            finally:
+                if not task.done():
+                    _force_close_response(holder.get("response"))
                 try:
-                    holder["response"] and holder["response"].close()
+                    await asyncio.wait_for(asyncio.shield(task), timeout=5)
                 except Exception:
                     pass
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=5)
-            except Exception:
-                pass
-        if session._cancelled:
-            yield {"type": "end", "reason": "cancelled"}
+            saw_end = bool(flags.get("end"))
+            if session._cancelled:
+                yield {"type": "end", "reason": "cancelled"}
+                return
+            if produced or attempts_left <= 0:
+                break
+            # Copilot occasionally returns metadata+end_of_stream with no blocks at all.
+            attempts_left -= 1
+            holder["response"] = None
+        if text:
+            yield {"type": "final_text", "text": "".join(text)}
+        if not saw_end and not session._cancelled:
+            journal.emit("upstream.stream_truncated",
+                         "Поток upstream оборвался без end_of_stream — ход завершён ошибкой", "warn",
+                         model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)))
+            # An aborted stream must not masquerade as a clean stop: surface the
+            # failure instead of a successful end. No auto-retry — tool calls may
+            # already have been streamed to the client.
+            yield {"type": "error", "error": apierr.upstream_error(
+                "upstream stream ended without end_of_stream; the response may be incomplete")}
             return
-        if produced or attempts_left <= 0:
-            break
-        # Copilot occasionally returns metadata+end_of_stream with no blocks at all.
-        attempts_left -= 1
-        holder["response"] = None
-    if text:
-        yield {"type": "final_text", "text": "".join(text)}
-    yield {"type": "end", "reason": "stop"}
+        yield {"type": "end", "reason": "stop"}
+    finally:
+        session._active_direct_abort = None
 
 
-async def _drain(cfg, session, queue, text, thinking, param_types=None):
+async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None):
     started = loop_now()
     think_started = None
+    flags = {} if flags is None else flags
     """Consume one attempt's NDJSON lines, yielding normalised events.
 
     Calls are keyed by id: a provider may interleave several tool calls in one
@@ -544,14 +870,21 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
             continue
         if item is None:
             return
+        if isinstance(item, asyncio.CancelledError) or session._cancelled:
+            yield {"type": "end", "reason": "cancelled"}
+            return
         if isinstance(item, BaseException):
             raise item
+
         if cfg.get("direct_raw"):
             print("[raw]", str(item)[:200], flush=True)
         try:
             event = json.loads(item)
         except Exception:
             continue
+        if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
+            flags["end"] = True
+            return
         kind = event.get("event")
         if kind == "content_block_start":
             if event.get("type") == "thinking":

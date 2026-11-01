@@ -45,7 +45,7 @@
   "show_exec_output": true,
 
   "project_context": true,
-  "context_max_bytes": 120000,
+  "context_max_bytes": 40000,
   "max_prompt_bytes": 0,
   "workspace_root": "C:\\your\\project\\path"
 }

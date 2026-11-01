@@ -179,7 +179,8 @@ def codex_catalog(entries=None):
             'truncation_policy': {'mode': 'tokens', 'limit': 10000},
             'context_window': entry.get('context', 128000),
             'effective_context_window_percent': 95,
-            'experimental_supported_tools': [], 'input_modalities': ['text'],
+            'experimental_supported_tools': [],
+            'input_modalities': ['text', 'image'] if entry.get('vision') else ['text'],
             'supports_search_tool': False, 'supports_experimental_context': False,
             'use_responses_lite': False, 'supports_reasoning_effort_updates': False,
             'node_repl_disabled': True, 'tool_mode': 'direct',
@@ -209,18 +210,30 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
     Clients copy one effort across models, so e.g. xhigh legitimately reaches
     Haiku, which only understands low/medium/high/max.
     """
+    raw_name = (model or default_model or "").strip()
+    extracted_effort = effort
+    base_name = raw_name
+    for sep in ("#", ":"):
+        if sep in raw_name:
+            parts = raw_name.split(sep, 1)
+            cand = parts[1].strip().lower()
+            if cand in EFFORT_ORDER:
+                if extracted_effort is None:
+                    extracted_effort = cand
+                base_name = parts[0].strip()
+            break
     try:
-        return resolve(model, effort, strict=strict, default_model=default_model)
+        return resolve(base_name, extracted_effort, strict=strict, default_model=default_model)
     except ApiError as error:
-        entry, _ = resolve(model, None, strict=strict, default_model=default_model)
-        levels = entry.get("reasoning_effort_levels") or []
         if error.status != 400:
             raise
+        entry, _ = resolve(base_name, None, strict=strict, default_model=default_model)
+        levels = entry.get("reasoning_effort_levels") or []
         if not levels or not entry.get("reasoning", True):
-            print("[effort] %s -> None (reasoning not supported) for %s" % (effort, entry["id"]), flush=True)
+            print("[effort] %s -> None (reasoning not supported) for %s" % (extracted_effort, entry["id"]), flush=True)
             return entry, None
-        clamped = nearest_effort(levels, effort)
-        print("[effort] %s -> %s for %s" % (effort, clamped, entry["id"]), flush=True)
+        clamped = nearest_effort(levels, extracted_effort)
+        print("[effort] %s -> %s for %s" % (extracted_effort, clamped, entry["id"]), flush=True)
         return entry, clamped
 
 

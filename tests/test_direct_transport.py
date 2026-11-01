@@ -63,7 +63,7 @@ def test_head_becomes_a_cached_system_block_with_a_stable_key():
     body = direct.build_body(cfg, {"model": "m", "reasoningEffort": "low"}, head, "tail", None, "auto", 32)
     assert body["messages"][0]["content"][0]["cache"] is True
     assert body["messages"][1] == {"role": "user", "content": "tail"}
-    assert body["openAICacheKey"] == direct.cache_key_for(head)
+    assert body["openAICacheKey"] == direct.cache_key_for(head, "m", None)
     assert body["metadata"] == {"sandpackAgent": True}
     assert body["reasoningEffort"] == "low"
     assert body["maxCompletionTokens"] == 32
@@ -72,7 +72,7 @@ def test_head_becomes_a_cached_system_block_with_a_stable_key():
 def test_short_head_is_cached_with_stable_key():
     body = direct.build_body({"direct_cache": True}, {"model": "m"}, "short", "tail", None, "auto", None)
     assert body["messages"][0] == {"role": "system", "content": [{"type": "text", "text": "short", "cache": True}]}
-    assert body["openAICacheKey"] == direct.cache_key_for("short")
+    assert body["openAICacheKey"] == direct.cache_key_for("short", "m", None)
 
 
 def test_cache_disabled_omits_cache_markers_and_key():

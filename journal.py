@@ -215,7 +215,17 @@ class Journal:
     def turns(self, limit=60):
         """Group turn-scoped events into compact traces, newest first."""
         traces = collections.OrderedDict()
-        for event in self._snapshot():
+        snapshot = self._snapshot()
+        # http.request events carry the client user-agent; attach it to the turn
+        # trace so per-client cache economics (opencode vs claude-cli) are queryable.
+        clients = {}
+        for event in snapshot:
+            if event["kind"] == "http.request":
+                rid = str(event.get("request_id") or "")
+                client = (event.get("data") or {}).get("client")
+                if rid and client:
+                    clients[rid] = str(client)[:60]
+        for event in snapshot:
             turn_id = event.get("turn_id")
             if not turn_id:
                 continue
@@ -223,8 +233,9 @@ class Journal:
             if trace is None:
                 trace = traces[turn_id] = {"turn_id": turn_id, "started": event["ts"], "ended": None,
                                            "status": "running", "model": None, "effort": None,
-                                           "transport": None, "dialect": None, "credits": 0.0,
-                                           "ttft_ms": None, "duration_ms": None, "tools": 0, "commands": 0,
+                                           "transport": None, "dialect": None, "client": clients.get(str(event.get("request_id"))),
+                                           "credits": 0.0, "ttft_ms": None, "duration_ms": None,
+                                           "tools": 0, "commands": 0,
                                            "errors": 0, "cache_read": 0, "cache_write": 0,
                                            "events": 0, "request_id": event.get("request_id")}
             data = event.get("data") or {}

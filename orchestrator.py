@@ -13,6 +13,7 @@ import uuid
 
 import apierr
 import executor
+import credits
 import journal
 import models as model_catalog
 from context import build_system_instructions
@@ -94,7 +95,16 @@ class _ClientText:
             self.pending = self.pending[-keep:] if keep else ""
             break
         if final and self.closing:
-            visible.append(self.suppressed + self.pending)
+            total = self.suppressed + self.pending
+            tag_name = self.closing.replace("</", "<").rstrip(">")
+            rem = total
+            if rem.lower().startswith(tag_name.lower()):
+                rem = rem[len(tag_name):].lstrip(">").strip()
+            is_quoted_markup = rem.startswith("`") or rem.startswith('"') or rem.startswith("'")
+            if any(tok in rem for tok in ("{", "```", '"name"', '"arguments"')):
+                is_quoted_markup = False
+            if is_quoted_markup:
+                visible.append(total)
             self.pending = ""
             self.closing = None
             self.suppressed = ""
@@ -235,7 +245,6 @@ class TurnRunner:
         if not tools or getattr(parsed, "tool_choice", "auto") == "none":
             return ""
         choice = getattr(parsed, "tool_choice", "auto")
-        names = [item["function"]["name"] for item in tools]
         return (
             "\n\n[NATIVE CLIENT TOOLS]\n"
             "The client supplied these tools. Do not execute them locally. "
@@ -321,7 +330,6 @@ class TurnRunner:
             if isinstance(choice, dict):
                 tool_names = [choice["function"]["name"]]
             direct_mode = self.cfg.get("transport") == "direct"
-            conv_key = getattr(parsed, "conversation_key", None)
             is_native = bool(native_tools)
             instructions = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._instructions(native_tools=is_native))
@@ -348,10 +356,8 @@ class TurnRunner:
                     instructions += reminder
                 reminder = ""
                 prompt = parsed.prompt
-                full_prompt = prompt
             elif native_tools:
                 prompt = (instructions + reminder + _CONV_HEADER + parsed.prompt + _NATIVE_CONTINUE)
-                full_prompt = prompt
             else:
                 prompt = (instructions + "\n\n" + parsed.prompt) if instructions else parsed.prompt
                 prompt += reminder
@@ -453,20 +459,25 @@ class TurnRunner:
                         elif chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
 
-                        tools_converted = direct.tools_to_retool(parsed.tools) if native_tools else []
-                        if hasattr(direct_target, "register_tools"):
-                            direct_target.register_tools(tools_converted)
-
                         if native_tools:
-                            final_tools = direct_target.get_canonical_tools() if (
-                                hasattr(direct_target, "has_tools") and direct_target.has_tools()) else tools_converted
+                            tools_converted = direct.tools_to_retool(parsed.tools)
+                            if hasattr(direct_target, "register_tools"):
+                                direct_target.register_tools(tools_converted)
+                            final_tools = tools_converted
                             final_choice = getattr(parsed, "tool_choice", "auto")
                             final_head = instructions
                         else:
                             # Tool-less requests (such as title generation, /compact, /goal Stop hook)
-                            # Align head and tools with the cached prefix so it does not invalidate openAICacheKey
                             cached_head = getattr(direct_target, "_cached_head", None)
-                            final_head = cached_head if cached_head else instructions
+                            if cached_head:
+                                final_head = cached_head
+                                if parsed.system and cached_head != instructions:
+                                    client_sys = f"[CLIENT INSTRUCTIONS]\n{parsed.system}"
+                                    if client_sys not in stream_prompt and parsed.system not in stream_prompt:
+                                        chunks.append(client_sys)
+                            else:
+                                final_head = instructions
+
                             if hasattr(direct_target, "has_tools") and direct_target.has_tools():
                                 final_tools = direct_target.get_canonical_tools()
                                 final_choice = "none"
@@ -552,9 +563,14 @@ class TurnRunner:
                             elif event["type"] == "credits":
                                 self.credits.record_turn(turn_id, event["value"])
                                 usage = event.get("usage") or {}
-                                log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s" % (
-                                    event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—")),
-                                    "info", credits=event["value"], **usage)
+                                breakdown = credits.cost_breakdown(usage)
+                                hit = breakdown["cache_hit_ratio"]
+                                log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
+                                    event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
+                                    "%d%%" % round(hit * 100) if hit is not None else "—"),
+                                    "info", credits=event["value"], **usage, **breakdown)
+                                if session is not None:
+                                    session._last_prefix_tokens = breakdown["prompt_tokens"]
                                 out.put(event)
                             elif event["type"] == "hitl":
                                 out.put(event)
@@ -562,10 +578,12 @@ class TurnRunner:
                             elif event["type"] == "end":
                                 holder["reason"] = event["reason"]
                                 upstream_completed = event["reason"] in ("stop", "tool_calls")
-                    except apierr.ApiError as exc:
+                    except apierr.ApiError:
                         raise
                     holder.setdefault("reason", "stop")
-                    if holder.get("reason") == "cancelled":
+                    if holder.get("reason") == "cancelled" or cancelled.is_set():
+                        holder["reason"] = "cancelled"
+                        self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "cancelled"})
                         return
                     if holder.get("reason") == "timeout":
@@ -595,8 +613,18 @@ class TurnRunner:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
-                    if not direct_mode and native_tools and not visible_text.strip() and re.search(r"<tool_call\b", final_text, re.IGNORECASE):
-                        raise apierr.upstream_error("upstream returned a malformed or disallowed client tool call")
+                    if not direct_mode and native_tools:
+                        has_envelope = bool(re.search(r"<tool_call\b[^>]*>.*?</tool_call>", final_text, re.DOTALL | re.IGNORECASE))
+                        if not has_envelope and re.search(r"<tool_call\b", final_text, re.IGNORECASE):
+                            match = re.search(r"<tool_call\b([^>]*)>(.*)$", final_text, re.DOTALL | re.IGNORECASE)
+                            if match:
+                                after = match.group(2).strip()
+                                if any(tok in after for tok in ("{", "```", '"name"', '"arguments"')):
+                                    has_envelope = True
+                                elif not match.group(2).startswith("`"):
+                                    has_envelope = True
+                        if has_envelope:
+                            raise apierr.upstream_error("upstream returned a malformed or disallowed client tool call")
                     if native_tools and not direct_mode:
                         # Some upstream transports only provide a final snapshot.
                         # Feed its unstreamed suffix once instead of duplicating it.
@@ -648,7 +676,14 @@ class TurnRunner:
                                   if last_followup else self._check_prompt(prompt + summary))
                         continue
 
-                    if not command and not final_text.strip():
+                    if cancelled.is_set() or holder.get("reason") == "cancelled":
+                        self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
+                        out.put({"type": "end", "reason": "cancelled"})
+                        return
+
+                    if not direct_mode and not command and not final_text.strip():
+                        # Silent turns are explained via persisted sandpack messages,
+                        # which the direct transport never writes.
                         explained = await self._explain_empty(holder)
                         if explained is not None:
                             out.put({"type": "error", "error": explained})
@@ -715,15 +750,19 @@ class TurnRunner:
                     if not task_block:
                         task_block = "USER TASK:\n" + parsed.prompt
                     trail = "; ".join(
-                        (c[:60] + "…" if len(c) > 60 else c) + " -> exit " + str(e)
+                        (redact(c, cookie_values=self.cfg.get("cookie_values", ()))[:60] + "…" if len(c) > 60
+                         else redact(c, cookie_values=self.cfg.get("cookie_values", ()))) + " -> exit " + str(e)
                         for c, e in previous_steps[-4:]
                     ) or "(none yet)"
                     previous_steps.append((command, code))
                     self._remember(command, recent)
 
+                    # The command text is model-generated and may echo secrets; the
+                    # output is already redacted above. Mask commands before upstream.
                     header = task_block + "\n\nPrevious steps: " + trail
-                    last_followup = (command, code, output, header)
-                    followup_text = executor.format_command_followup(command, code, output, header)
+                    safe_command = redact(command, cookie_values=self.cfg.get("cookie_values", ()))
+                    last_followup = (safe_command, code, output, header)
+                    followup_text = executor.format_command_followup(safe_command, code, output, header)
                     exec_chunks.append(followup_text)
                     prompt = self._followup(instructions, reminder, *last_followup)
             finally:

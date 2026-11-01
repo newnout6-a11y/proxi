@@ -331,6 +331,11 @@ def test_clear_resets_buffer_and_records_the_clear(admin_relay):
     status, body, _ = admin_relay.request("/admin/api/events/clear", {}, method="POST",
                                           headers={"x-admin-request": "1", "origin": admin_relay.url})
     assert status == 200
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if len(journal.JOURNAL.query()) >= 2:
+            break
+        time.sleep(0.01)
     assert [e["kind"] for e in journal.JOURNAL.query()] == ["admin.journal_cleared", "http.request"]
 
 

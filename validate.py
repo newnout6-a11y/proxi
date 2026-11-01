@@ -1,12 +1,63 @@
 """Strict request parsing for every supported dialect."""
+import base64
 import hashlib
+import ipaddress
 import json
 import math
+import socket
+import urllib.parse
+import urllib.request
 
 from apierr import bad_request, unprocessable, ApiError
 import models as model_catalog
 
 MAX_TOKENS_CAP = 1_000_000  # absolute ceiling when a model has no catalog value
+
+
+def _assert_public_http_url(url, where="image"):
+    """SSRF guard: resolve every address for the host and reject non-public ones."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise unprocessable("failed to fetch image attachments: only http(s) URLs are allowed", param=where)
+    hostname = parsed.hostname or ""
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        raise unprocessable("failed to fetch image attachments: invalid destination host", param=where)
+    for info in infos:
+        try:
+            ip_obj = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+                or ip_obj.is_reserved or ip_obj.is_multicast or ip_obj.is_unspecified):
+            raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
+
+
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect target: a public URL must not bounce to an
+    internal address (SSRF via redirects)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _assert_public_peer(resp, where="image"):
+    """Post-connect check of the socket we ACTUALLY connected to. Closes the
+    DNS-rebinding window of check-then-connect: even if the name resolved to a
+    public address but the connection landed on an internal one, we bail out."""
+    try:
+        sock = resp.fp.raw._sock
+        peer = ipaddress.ip_address(sock.getpeername()[0])
+    except (AttributeError, OSError, ValueError):
+        return
+    if (peer.is_private or peer.is_loopback or peer.is_link_local
+            or peer.is_reserved or peer.is_multicast):
+        raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
+
+
+_IMAGE_OPENER = urllib.request.build_opener(_GuardedRedirectHandler())
 
 
 class Parsed:
@@ -113,21 +164,12 @@ def _extract_image_data(block, where):
                         mime_type = mime
                     data_b64 = rest.strip()
             elif url.startswith("http://") or url.startswith("https://"):
-                import urllib.request, urllib.parse, socket, ipaddress, base64
-                parsed_url = urllib.parse.urlparse(url)
-                hostname = parsed_url.hostname or ""
-                try:
-                    ip = socket.gethostbyname(hostname)
-                    ip_obj = ipaddress.ip_address(ip)
-                    if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
-                        raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
-                except (socket.gaierror, ValueError):
-                    raise unprocessable("failed to fetch image attachments: invalid destination host", param=where)
-
+                _assert_public_http_url(url, where)
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 max_bytes = 10 * 1024 * 1024
                 try:
-                    with urllib.request.urlopen(req, timeout=10) as r:
+                    with _IMAGE_OPENER.open(req, timeout=10) as r:
+                        _assert_public_peer(r, where)
                         ct = r.headers.get("content-type", "").split(";")[0].strip()
                         if ct:
                             mime_type = ct
