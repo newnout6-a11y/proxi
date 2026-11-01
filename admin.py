@@ -80,8 +80,8 @@ def _schema():
         fields[key] = {"type": "integer", "label": label, "min": minimum, "max": maximum}
     fields["rate_limit_rps"] = {"type": "number", "label": "Запросов в секунду (0 — без лимита)",
                                 "min": 0, "max": 10_000}
-    fields["rate_limit_burst"] = {"type": "number", "label": "Запас запросов", "min": 0,
-                                  "exclusive_minimum": True, "max": 100_000}
+    fields["rate_limit_burst"] = {"type": "number", "label": "Запас запросов", "min": 1,
+                                  "max": 100_000}
     for key, field in fields.items():
         field["restart_required"] = key not in LIVE_SETTINGS
         field["description"] = ("Применяется к новым запросам сразу после сохранения."
