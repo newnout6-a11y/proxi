@@ -106,7 +106,7 @@ JSON Schema конвертируется, `$ref` и незнакомые клю�
 
 ## Конфигурация
 
-    "transport": "direct"     // direct (быстро) или agent (только WebSocket)
+    "transport": "direct"     // единственное допустимое значение; устаревший agent (WebSocket) отключён и отклоняется config.load
     "direct_cache": true      // кэшировать стабильный system-блок
 
 `max_prompt_bytes`, `context_max_bytes` и остальные лимиты действуют так же.

@@ -85,7 +85,8 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
             # Sensitive file names must not leak into the head even as status lines.
             status = "\n".join(
                 ln for ln in (snapshot[1:] if branch else snapshot)
-                if not is_sensitive_path(ln[3:].strip().strip('"').split(" -> ")[-1]))
+                if not any(is_sensitive_path(part.strip().strip('"'))
+                           for part in ln[3:].split(" -> ")))
             commit = _last_commit(workspace_root)
             if branch:
                 lines.append("Git branch: " + branch)

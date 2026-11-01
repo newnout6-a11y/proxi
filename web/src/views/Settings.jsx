@@ -79,7 +79,7 @@ export default function SettingsView({ apiKey, onUnauthorized }) {
 
   const schema = state?.schema || {};
   const groups = [
-    ['Модель и поведение', ['model', 'reasoning_effort', 'session_mode', 'exec_policy', 'show_thinking', 'project_context', 'show_exec_output', 'strict_models', 'show_unrouted_models']],
+    ['Модель и поведение', ['model', 'reasoning_effort', 'session_mode', 'exec_policy', 'show_thinking', 'project_context', 'show_exec_output', 'strict_models', 'show_unrouted_models', 'cache_keepwarm_during_turns']],
     ['API', ['enable_chat', 'enable_responses', 'enable_anthropic']],
     ['Лимиты и таймауты', Object.keys(schema).filter((key) => ['integer', 'number'].includes(schema[key].type))],
   ];

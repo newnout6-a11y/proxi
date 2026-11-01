@@ -1,5 +1,6 @@
 """OpenAI/Anthropic compatible relay over the Retool AI agent WebSocket."""
 import asyncio
+import concurrent.futures
 import json
 import os
 import queue
@@ -60,6 +61,11 @@ class Runtime:
     def __init__(self, cfg):
         self.cfg = cfg
         self.loop = asyncio.new_event_loop()
+        # Each direct turn holds one executor thread for its whole stream; the
+        # default pool (~min(32, cpu+4)) silently capped concurrent turns below
+        # max_workers and starved keepwarm pings / refreshes behind them.
+        self.loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(32, int(cfg.get("max_workers", 32)) * 2 + 8), thread_name_prefix="relay-io"))
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.backend = Backend(cfg)
         self.pool = SessionPool(self.backend)
@@ -640,7 +646,6 @@ def main():
                     t.cancel()
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
-                runtime.loop.stop()
 
             # Wait (bounded) so in-flight turns unwind and sessions release
             # before the daemon loop thread is torn down with the interpreter.
@@ -649,6 +654,9 @@ def main():
                 future.result(timeout=10)
             except Exception:
                 pass
+            # Stop only after the future resolved: stopping inside the coroutine
+            # left its result callback unrun and shutdown always waited the full 10s.
+            runtime.loop.call_soon_threadsafe(runtime.loop.stop)
         finally:
             server.server_close()
 

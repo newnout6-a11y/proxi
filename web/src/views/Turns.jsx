@@ -16,7 +16,7 @@ function buildTraces(events) {
     let trace = map.get(event.turn_id);
     if (!trace) {
       trace = { id: event.turn_id, started: event.ts, ended: null, status: 'running', model: null, effort: null,
-        transport: null, dialect: null, ttft: null, duration: null, credits: 0, cacheRead: 0, cacheWrite: 0,
+        transport: null, dialect: null, ttft: null, duration: null, credits: 0, inputTokens: 0, cacheRead: 0, cacheWrite: 0,
         tools: 0, commands: 0, errors: 0, thinking: 0, args: 0, events: [] };
       map.set(event.turn_id, trace);
     }
@@ -27,6 +27,8 @@ function buildTraces(events) {
     if (event.kind === 'upstream.first_token') trace.ttft = data.ttft_ms;
     if (event.kind === 'upstream.usage') {
       trace.credits += Number(data.credits) || 0;
+      // Uncached input belongs in the hit-ratio denominator (matches Overview).
+      trace.inputTokens += Number(data.input_tokens) || 0;
       trace.cacheRead += Number(data.cache_read) || 0;
       trace.cacheWrite += Number(data.cache_write) || 0;
     }

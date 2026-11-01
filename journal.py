@@ -36,6 +36,7 @@ class Journal:
         self._path = None
         self._file = None
         self._file_lock = threading.Lock()
+        self._rotate_retry_at = 0.0
         self.started = time.time()
 
     # -- configuration -----------------------------------------------------
@@ -96,6 +97,12 @@ class Journal:
             if self._path:
                 try:
                     open(self._path, "w", encoding="utf-8").close()
+                except OSError:
+                    pass
+                try:
+                    # _load_tail restores .1 too: a cleared journal must not
+                    # come back after a restart.
+                    os.remove(self._path + ".1")
                 except OSError:
                     pass
 
@@ -167,7 +174,7 @@ class Journal:
                     self._file = open(self._path, "a", encoding="utf-8")
                 self._file.write(line)
                 self._file.flush()
-                if self._file.tell() > MAX_FILE_BYTES:
+                if self._file.tell() > MAX_FILE_BYTES and time.time() >= self._rotate_retry_at:
                     self._file.close()
                     self._file = None
                     os.replace(self._path, self._path + ".1")
@@ -177,6 +184,9 @@ class Journal:
                 except Exception:
                     pass
                 self._file = None
+                # Back off: an oversized file would otherwise retry (and print)
+                # on every single event.
+                self._rotate_retry_at = time.time() + 60.0
                 # A failed rotation (e.g. a locked .1 on Windows) would otherwise
                 # grow the file unbounded and silently; the journal cannot report
                 # on itself, so use stderr.

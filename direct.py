@@ -556,16 +556,17 @@ def _bounded_put(loop, queue, item, is_cancelled, max_wait=120.0):
         timeout = 5.0 if deadline is None else max(0.05, min(5.0, deadline - time.monotonic()))
         try:
             future.result(timeout=timeout)
-            return
+            return True
         except TimeoutError:
             if is_cancelled():
                 future.cancel()
-                return
+                return False
             if deadline is not None and time.monotonic() >= deadline:
                 future.cancel()
                 journal.emit("direct.queue_drop",
-                             "Кадр отброшен: потребитель потока не отвечал дольше %d с" % int(max_wait), "warn")
-                return
+                             "Кадр отброшен: потребитель не отвечал дольше %d с — ход прерван" % int(max_wait),
+                             "warn")
+                return False
 
 
 def _error_from_event(event):
@@ -613,6 +614,9 @@ def _ping(session, body):
                 continue
             if not isinstance(event, dict):
                 continue
+            if event.get("event") == "error":
+                # A failed ping must not be reported as a refreshed TTL.
+                raise _error_from_event(event)
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             if usage.get("creditsUsed") is not None:
                 actual_credits = float(usage["creditsUsed"])
@@ -641,6 +645,8 @@ async def _keepwarm(session, cfg):
     idle = float(cfg.get("cache_keepwarm_idle", 1800) or 1800)
     during_turns = bool(cfg.get("cache_keepwarm_during_turns", True))
     turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), 285.0)
+    turn_seq = 0
+    during = False
     while True:
         try:
             busy = bool(getattr(session, "_busy", False))
@@ -661,14 +667,20 @@ async def _keepwarm(session, cfg):
             if time.time() - last_req > idle:
                 return
             body = getattr(session, "_warm_body", None)
+            if during and getattr(session, "_turn_body", None):
+                # Ping the ACTIVE turn's body: it carries this turn's newest cache
+                # breakpoint and exists on a session's very first turn.
+                body = session._turn_body
             if not body:
                 continue
             if not during:
                 if busy or getattr(session, "_warm_at", 0) and time.time() - getattr(session, "_warm_at", 0) < interval:
                     continue
             was_during = during
+            turn_seq = getattr(session, "_turn_seq", 0)
             actual = await asyncio.to_thread(_ping, session, body)
-            if was_during:
+            if was_during and getattr(session, "_turn_seq", 0) == turn_seq:
+                # A late ping must not mark a NEWER turn as already pinged.
                 session._turn_pinged = True
             session._warm_at = time.time()
             session._warm_failures = 0
@@ -703,7 +715,7 @@ async def _keepwarm(session, cfg):
             # session) stops the cycle after several attempts — the next real
             # request recreates it. A failed during-turn ping is not retried
             # inside the same turn (one upstream request per turn, no 429 feed).
-            if during:
+            if during and getattr(session, "_turn_seq", 0) == turn_seq:
                 session._turn_pinged = True
             failures = getattr(session, "_warm_failures", 0) + 1
             session._warm_failures = failures
@@ -725,6 +737,14 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     session._busy = True
     session._turn_started_at = time.time()
     session._turn_pinged = False
+    session._turn_seq = getattr(session, "_turn_seq", 0) + 1
+    session._last_request_at = time.time()
+    rejected = False
+    if body.get("openAICacheKey"):
+        session._turn_body = body
+        # Start the scheduler with the turn, not after it: a session's first long
+        # turn needs its anchored during-turn ping too.
+        _ensure_keepwarm(session, cfg)
     try:
         try:
             async for event in _stream_body(cfg, session, body, param_types):
@@ -744,11 +764,18 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
                          model=model_provider.get("model"))
             body = {key: value for key, value in body.items() if key != "metadata"}
+            if body.get("openAICacheKey"):
+                session._turn_body = body
             async for event in _stream_body(cfg, session, body, param_types):
                 yield event
+    except apierr.ApiError as error:
+        # A body upstream rejected (400/413/422) must not become the keepwarm body.
+        rejected = 400 <= error.status < 500 and error.status not in (401, 403, 408, 429)
+        raise
     finally:
         session._busy = False
-        if body.get("openAICacheKey"):
+        session._turn_body = None
+        if body.get("openAICacheKey") and not rejected:
             prior_key = getattr(session, "_last_cache_key", None)
             if prior_key and prior_key != body["openAICacheKey"]:
                 # A new key means the upstream prefix cache starts from zero: every
@@ -759,11 +786,20 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                              thread=journal.tag(getattr(session, "thread_id", None)))
             session._last_cache_key = body["openAICacheKey"]
             session._warm_body = body
-            session._warm_at = time.time()
+            # The TTL counts from the last cache touch: this request's start or a
+            # later during-turn ping, NOT the turn's end; otherwise a pause after
+            # a long turn outlives the 5-minute entry before the next idle ping.
+            session._warm_at = max(session._turn_started_at, getattr(session, "_warm_at", 0) or 0)
             session._last_request_at = time.time()
-            task = getattr(session, "_warm_task", None)
-            if task is None or task.done():
-                session._warm_task = asyncio.create_task(_keepwarm(session, cfg))
+            _ensure_keepwarm(session, cfg)
+
+
+def _ensure_keepwarm(session, cfg):
+    task = getattr(session, "_warm_task", None)
+    if task is None or task.done():
+        # A fresh cycle gets a fresh failure budget.
+        session._warm_failures = 0
+        session._warm_task = asyncio.create_task(_keepwarm(session, cfg))
 
 
 async def _stream_body(cfg, session, body, param_types=None):
@@ -780,12 +816,17 @@ async def _stream_body(cfg, session, body, param_types=None):
     loop = asyncio.get_running_loop()
     # Bounded so a stalled consumer (slow or gone client) cannot balloon memory:
     # the upstream worker blocks on hand-off, which backpressures the TCP read.
-    queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
-    holder = {"response": None}
+    # One queue per attempt: a retried attempt must never read the previous
+    # worker's terminal sentinel (it made every retry end empty at once).
+    holder = {"response": None, "queue": None}
 
-    def hand_off_final(item):
+    def hand_off_final(item, queue=None):
         """Land a terminal item (sentinel/error/cancel) without blocking. Safe from
         any thread; sacrifices one buffered data line if the queue is full."""
+        queue = queue if queue is not None else holder["queue"]
+        if queue is None:
+            return
+
         def _put():
             try:
                 queue.put_nowait(item)
@@ -808,7 +849,7 @@ async def _stream_body(cfg, session, body, param_types=None):
 
     session._active_direct_abort = abort_direct
 
-    def worker():
+    def worker(queue):
         try:
             attempt = 0
             while True:
@@ -845,13 +886,16 @@ async def _stream_body(cfg, session, body, param_types=None):
                     continue
                 # Bounded hand-off: block this worker when the consumer is slower
                 # than upstream instead of buffering the whole stream in memory.
-                _bounded_put(loop, queue, line, lambda: session._cancelled)
+                if not _bounded_put(loop, queue, line, lambda: session._cancelled):
+                    # Dropped or cancelled: stop reading. The missing end_of_stream
+                    # surfaces as a truncated-stream error, never a silent hole.
+                    break
         except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
             if not session._cancelled:
-                hand_off_final(exc)
+                hand_off_final(exc, queue)
         finally:
             _force_close_response(holder.get("response"))
-            hand_off_final(None)
+            hand_off_final(None, queue)
 
     text, thinking = [], []
     produced = False
@@ -859,11 +903,16 @@ async def _stream_body(cfg, session, body, param_types=None):
     attempts_left = 2
     try:
         while True:
-            task = loop.run_in_executor(None, worker)
+            queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
+            holder["queue"] = queue
+            task = loop.run_in_executor(None, worker, queue)
             try:
                 flags = {}
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags):
-                    produced = True
+                    if event.get("type") not in ("credits", "thinking_heartbeat"):
+                        # A metadata-only reply (credits + end_of_stream) is still
+                        # an empty attempt and must get its retry.
+                        produced = True
                     yield event
             finally:
                 if not task.done():
@@ -911,7 +960,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
     calls = {}
     current = None
     call_seq = 0  # monotonic: a finished call leaves `calls`, len() would repeat ids
-    req_id = getattr(session, "thread_id", None) or "req"
+    # The relay request id matches the `relay <id> POST ...` console lines:
+    # concurrent requests of one conversation interleave in the same console.
+    req_id = getattr(session, "_request_tag", None) or getattr(session, "thread_id", None) or "req"
 
     def _final_call_event(key):
         call = calls.pop(key, None)
@@ -1028,6 +1079,10 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 # the streamed arguments would be cut short and later deltas lost.
                 continue
             ended = event.get("toolCallId")
+            if ended is not None and ended not in calls:
+                # An end for an unknown (already finished) call must not close
+                # whichever other call happens to be on top of the stack.
+                continue
             if ended is not None and ended in calls:
                 key = ended
                 if ended in stack:
@@ -1041,8 +1096,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         elif kind == "metadata":
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
-                print("[cache] in=%s read=%s write=%s credits=%s" % (
-                    usage.get("inputTokens"), usage.get("promptTokensReadFromCache"),
+                print("[%s] [cache] in=%s read=%s write=%s credits=%s" % (
+                    req_id, usage.get("inputTokens"), usage.get("promptTokensReadFromCache"),
                     usage.get("promptTokensWrittenToCache"), usage.get("creditsUsed")), flush=True)
             credits_used = usage.get("creditsUsed")
             try:

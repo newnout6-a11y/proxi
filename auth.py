@@ -107,6 +107,7 @@ def merge_set_cookie(cfg, headers) -> bool:
     changed = False
     dirty = False
     xsrf = cfg["xsrf"]
+    xsrf_set = False
     for raw in headers or []:
         pair = raw.split(";")[0]
         if "=" not in pair:
@@ -116,9 +117,10 @@ def merge_set_cookie(cfg, headers) -> bool:
         if value == "":
             if jar.pop(key, None) is not None:
                 dirty = True
-                if key in ("xsrfToken", "__Host-xsrfToken"):
-                    # The deleted cookie must not keep a stale xsrf header alive.
-                    xsrf = ""
+                if key in ("xsrfToken", "__Host-xsrfToken") and not xsrf_set:
+                    # The deleted cookie must not keep a stale xsrf header alive
+                    # (unless this same batch already set the other name).
+                    xsrf = jar.get("__Host-xsrfToken") or jar.get("xsrfToken") or ""
             continue
         if jar.get(key) != value:
             jar[key] = value
@@ -128,6 +130,7 @@ def merge_set_cookie(cfg, headers) -> bool:
             dirty = dirty or xsrf != value
             changed = changed or xsrf != value
             xsrf = value
+            xsrf_set = True
     if dirty:
         cfg.update(cookie="; ".join(key + "=" + value for key, value in jar.items()),
                    cookie_values=list(jar.values()), xsrf=xsrf)

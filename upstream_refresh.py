@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from auth import merge_set_cookie, upstream_headers
@@ -56,7 +57,9 @@ class Refresher:
         """Single-flight renewal. A concurrent caller reuses the new credentials."""
         # Multi-account: journal events must say WHICH tenant renewed/failed.
         account_tag = journal.tag(self.cfg.get("page_uuid"))
-        tenant = (self.cfg.get("base") or "").replace("https://", "").replace("http://", "")
+        base = self.cfg.get("base")
+        # Hostname only: credentials, paths or queries in the URL stay out of logs.
+        tenant = (urllib.parse.urlsplit(base).hostname or "") if isinstance(base, str) else ""
         with self._lock:
             if rejected_cookie is not None and self.cfg["cookie"] != rejected_cookie:
                 return True

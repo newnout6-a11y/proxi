@@ -143,8 +143,15 @@ def _reject_images_unsupported(entry, data):
     system = data.get("system") if isinstance(data, dict) else None
     if isinstance(system, list):
         blocks.extend(b for b in system if isinstance(b, dict))
+    raw_input = data.get("input") if isinstance(data, dict) else None
+    for item in raw_input if isinstance(raw_input, list) else []:
+        # Responses API: images arrive as input items or inside item content.
+        if isinstance(item, dict):
+            blocks.append(item)
+            if isinstance(item.get("content"), list):
+                blocks.extend(b for b in item["content"] if isinstance(b, dict))
     for block in blocks:
-        if block.get("type") in ("image", "image_url") or "imageData" in block or "image_url" in block:
+        if block.get("type") in ("image", "image_url", "input_image") or "imageData" in block or "image_url" in block:
             raise unprocessable(f"model {entry['id']} does not support image input", param="messages")
 
 
