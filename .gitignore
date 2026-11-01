@@ -4,3 +4,21 @@ __pycache__/
 *.pyd
 *.bak
 *.log
+
+# runtime secrets and state (keep config.example.json in git)
+config.json
+cookies.txt
+relay_key.txt
+commands.log
+relay.log
+relay.pid
+crash.log
+.session-*.tmp
+.pytest_cache/
+probes/chunks/
+
+# Private investigation artifacts can contain captured upstream credentials.
+.verify*/
+/probes/
+/r.txt
+/logs/

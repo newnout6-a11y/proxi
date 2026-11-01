@@ -1,11 +1,20 @@
 import json, sys, time, urllib.request, urllib.error
+from auth import client_headers
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 BASE = "http://127.0.0.1:8787"
 
+
+def _urlopen(request, **kwargs):
+    if isinstance(request, str):
+        request = urllib.request.Request(request)
+    for name, value in client_headers().items():
+        request.add_header(name, value)
+    return urllib.request.urlopen(request, **kwargs)
+
 def test_models():
     print("\n--- 1. Testing /v1/models ---")
-    r = json.loads(urllib.request.urlopen(f"{BASE}/v1/models").read().decode("utf-8"))
+    r = json.loads(_urlopen(f"{BASE}/v1/models").read().decode("utf-8"))
     models = [m["id"] for m in r.get("data", [])]
     print(f"Available models ({len(models)}): {', '.join(models)}")
     assert "claude-opus-5-5" in models
@@ -14,7 +23,7 @@ def test_models():
 
 def test_balance():
     print("\n--- 2. Testing /v1/balance ---")
-    r = json.loads(urllib.request.urlopen(f"{BASE}/v1/balance").read().decode("utf-8"))
+    r = json.loads(_urlopen(f"{BASE}/v1/balance").read().decode("utf-8"))
     print(f"Balance info: Available={r.get('available')} / Total={r.get('monthly_allocation')} | Reset={r.get('reset_date')}")
     assert r.get("available") is not None
     print("PASS: balance endpoint")
@@ -31,7 +40,7 @@ def test_non_streaming():
         data=json.dumps(payload).encode("utf-8"),
         headers={"content-type": "application/json"}
     )
-    res = json.loads(urllib.request.urlopen(req, timeout=60).read().decode("utf-8"))
+    res = json.loads(_urlopen(req, timeout=60).read().decode("utf-8"))
     content = res["choices"][0]["message"]["content"]
     usage = res.get("usage", {})
     print(f"Response: {content.strip()}")
@@ -51,7 +60,7 @@ def test_streaming_openai():
         headers={"content-type": "application/json"}
     )
     collected = []
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with _urlopen(req, timeout=60) as resp:
         for line in resp:
             s = line.decode("utf-8", "replace").strip()
             if not s or s == "data: [DONE]":
@@ -71,7 +80,7 @@ def test_local_exec_and_context():
     payload = {
         "model": "claude-opus-5-5",
         "stream": True,
-        "messages": [{"role": "user", "content": "Используй команду на моем ПК чтобы прочитать первые 2 строки файла config.json"}]
+        "messages": [{"role": "user", "content": "Используй команду на моем ПК чтобы прочитать первые 2 строки файла README.md"}]
     }
     req = urllib.request.Request(
         f"{BASE}/v1/chat/completions",
@@ -79,7 +88,7 @@ def test_local_exec_and_context():
         headers={"content-type": "application/json"}
     )
     collected = []
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with _urlopen(req, timeout=120) as resp:
         for line in resp:
             s = line.decode("utf-8", "replace").strip()
             if not s or s == "data: [DONE]":
@@ -94,7 +103,7 @@ def test_local_exec_and_context():
     full_text = "".join(collected)
     print("\n")
     print(f"Total response length: {len(full_text)}")
-    assert "config.json" in full_text.lower() or "base" in full_text.lower()
+    assert "readme" in full_text.lower() or "relay" in full_text.lower()
     print("PASS: local command execution & context")
 
 if __name__ == "__main__":

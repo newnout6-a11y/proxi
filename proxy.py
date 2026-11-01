@@ -1,11 +1,28 @@
-"""OpenAI-compatible facade over Retool AI Agent with Local PC Execution, Context Injection and Credits Tracking."""
-import asyncio, json, os, queue, re, sys, threading, time, uuid, urllib.request, urllib.error
+"""OpenAI/Anthropic compatible relay over the Retool AI agent WebSocket."""
+import asyncio
+import json
+import os
+import queue
+import signal
+import socket
+import sys
+import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import websockets
+from urllib.parse import urlparse, parse_qs
 
+import adapters
+import apierr
+import auth
+from redact import redact
+import config as config_module
+import models as model_catalog
+import sse
+import validate
 from credits import CreditsManager
-from context import build_system_instructions
-from executor import extract_command, run_command, format_command_followup
+from orchestrator import TurnRunner
+from session import Backend, SessionPool
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -13,436 +30,473 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(HERE, "config.json")
-CFG = json.load(open(CONFIG_PATH, encoding="utf-8"))
-
-PORT = int(os.environ.get("PROXY_PORT", CFG.get("port", 8787)))
-TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", 180))
-RECV_TIMEOUT = int(os.environ.get("RECV_TIMEOUT", 60))
-
-SUPPORTED_MODELS = [
-    {"id": "claude-opus-5-5", "provider": "anthropic"},
-    {"id": "claude-sonnet-4-6", "provider": "anthropic"},
-    {"id": "claude-haiku-4-5-20251001", "provider": "anthropic"},
-    {"id": "gpt-5.2", "provider": "openai"},
-    {"id": "gpt-5.1", "provider": "openai"},
-    {"id": "gpt-5", "provider": "openai"},
-    {"id": "gpt-4.1", "provider": "openai"},
-]
-
-def api_headers():
-    return {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "origin": CFG["base"],
-        "referer": CFG["base"] + "/",
-        "user-agent": CFG["ua"],
-        "cookie": CFG["cookie"],
-        "x-xsrf-token": CFG["xsrf"],
-        "x-retool-client-version": "4.84.0-8ec403c (Build 409410)",
-    }
-
-def api_post(path, payload):
-    data = json.dumps(payload, ensure_ascii=True).encode("ascii")
-    req = urllib.request.Request(CFG["base"] + path, data=data, headers=api_headers(), method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code}: {e.read()[:300].decode('utf-8', 'replace')}")
-
-CREDITS = CreditsManager(CFG["base"], api_headers)
-LOOP = asyncio.new_event_loop()
-threading.Thread(target=LOOP.run_forever, daemon=True).start()
 
 
-def resolve_model_provider(requested_model, requested_effort=None):
-    model = (requested_model or CFG.get("model", "claude-opus-5-5")).strip()
-    
-    # Provider mapping
-    if any(k in model.lower() for k in ("gpt", "openai", "o1", "o3")):
-        provider = CFG.get("openai_provider_resource_name", "1b7f4c97-241f-4117-a710-18c7cbfa74b1")
-    elif any(k in model.lower() for k in ("claude", "anthropic", "sonnet", "opus", "haiku")):
-        provider = CFG.get("provider_resource_name", "ffd4d570-7c6b-414f-b95a-1a695676d0a8")
-    else:
-        provider = CFG.get("provider_resource_name", "ffd4d570-7c6b-414f-b95a-1a695676d0a8")
+class RateLimiter:
+    def __init__(self, rate, burst):
+        self.rate = rate
+        self.burst = burst
+        self.tokens = burst
+        self.stamp = time.monotonic()
+        self.lock = threading.Lock()
 
-    effort = requested_effort or CFG.get("reasoning_effort", "high")
-    return model, provider, effort
+    def take(self):
+        if self.rate <= 0:
+            return 0.0
+        with self.lock:
+            now = time.monotonic()
+            self.tokens = min(self.burst, self.tokens + (now - self.stamp) * self.rate)
+            self.stamp = now
+            if self.tokens < 1.0:
+                return max(0.05, (1.0 - self.tokens) / self.rate)
+            self.tokens -= 1.0
+            return 0.0
 
 
-class Session:
-    def __init__(self):
-        self.ws = None
-        self.lock = asyncio.Lock()
+class Runtime:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        self.backend = Backend(cfg)
+        self.pool = SessionPool(self.backend)
+        self.credits = CreditsManager(cfg["base"], lambda: auth.upstream_headers(cfg), self.backend.refresher)
+        self.runner = TurnRunner(cfg, self.credits, self.pool)
+        self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
+        self.started = time.time()
 
-    async def ensure_ws(self):
-        if self.ws is not None and not self.ws.closed:
+
+ROUTES = {
+    ("POST", "/v1/chat/completions"): "chat",
+    ("POST", "/v1/responses"): "responses",
+    ("POST", "/v1/messages"): "anthropic",
+    ("POST", "/v1/messages/count_tokens"): "count_tokens",
+    ("GET", "/v1/models"): "models",
+    ("GET", "/v1/models/"): "models",
+    ("GET", "/codex/models"): "codex_models",
+    ("GET", "/v1/balance"): "balance",
+    ("GET", "/v1/usage"): "usage",
+    ("GET", "/health"): "health",
+}
+
+
+def make_handler(runtime: Runtime):
+    cfg = runtime.cfg
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "retool-relay/2"
+
+        def log_message(self, fmt, *args):
             return
-        st = await LOOP.run_in_executor(
-            None,
-            lambda: api_post("/api/ai/retool-next-agent/start", {
-                "threadId": CFG["thread_id"],
-                "pageUuid": CFG["page_uuid"],
-                "environmentName": "production",
-            }),
-        )
-        sep = "&" if "?" in st["url"] else "?"
-        url = st["url"] + sep + "sandboxToken=" + st["sandboxToken"]
-        self.ws = await websockets.connect(url, origin=CFG["base"], max_size=None, ping_interval=None)
-        
-        # Drain backlog
-        while True:
+
+        # -- helpers ------------------------------------------------------
+        def _cors(self):
+            self.send_header("access-control-allow-origin", "*")
+            self.send_header("access-control-allow-headers",
+                             "authorization, x-api-key, anthropic-version, anthropic-beta, content-type, "
+                             "x-request-id, x-session-affinity, x-session-id, x-opencode-session")
+            self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
+            self.send_header("access-control-expose-headers", "x-request-id, retry-after")
+
+        def _json(self, status, payload, extra=None):
+            self._status = status
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.send_header("x-request-id", self.request_id)
+            if extra:
+                for key, value in extra.items():
+                    self.send_header(key, str(value))
+            self._cors()
+            self.end_headers()
+            if self.command != "HEAD":
+                try:
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    self.close_connection = True
+
+        def _dialect(self):
+            return ROUTES.get((self.command, self.path), "")
+
+        # -- entry --------------------------------------------------------
+        def do_OPTIONS(self):
+            self.request_id = uuid.uuid4().hex[:12]
+            self.send_response(204)
+            self.send_header("x-request-id", self.request_id)
+            self._cors()
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            self._dispatch()
+
+        def do_POST(self):
+            self._dispatch()
+
+        def do_HEAD(self):
+            self._dispatch()
+
+        def do_PUT(self):
+            self._dispatch()
+
+        def _log(self, note=""):
+            status = getattr(self, "_status", 0) or getattr(self, "_stream_status", 0)
+            took = (time.time() - self._started) * 1000
+            model = getattr(self, "_model", "-")
+            print("relay %s %s %s %s %s %.0fms %s" % (
+                self.request_id, self.command, redact(self.path), status, model, took, note), flush=True)
+
+        def _dispatch(self):
+            self.request_id = uuid.uuid4().hex[:12]
+            self._started = time.time()
+            # Keep-alive reuses the handler: a stale status from the previous
+            # request (e.g. a 404 probe) must not leak into this log line.
+            self._status = 0
+            self._stream_status = 0
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path
+            self.path = path
+            route = ROUTES.get((self.command, path))
+            dialect = "anthropic" if route == "anthropic" else "chat"
             try:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=0.4)
-                ev = json.loads(raw)
-                if ev.get("type") == "ping":
-                    await self.ws.send('{"type":"pong"}')
-            except asyncio.TimeoutError:
-                break
-
-    async def run_single_ws_turn(self, prompt, model_provider, out, show_text=True):
-        await self.ensure_ws()
-        await self.ws.send(json.dumps({
-            "type": "user_prompt",
-            "prompt": prompt,
-            "modelProvider": model_provider,
-            "attachments": [],
-            "taggedResourceNames": [],
-            "taggedResourceIds": [],
-            "r2OnboardingTemplateId": None,
-            "messageId": str(uuid.uuid4()),
-            "expectedThreadId": CFG["thread_id"],
-            "agentMode": 2,
-            "testingEnabled": False,
-            "requestOrigin": "Browser",
-        }, ensure_ascii=True))
-
-        deadline = time.time() + TURN_TIMEOUT
-        current_msg_id = None
-        last_content = ""
-        full_turn_text = ""
-        turn_credits = 0.0
-
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                if show_text:
-                    out.put(f"\n[turn timeout after {TURN_TIMEOUT}s]")
-                break
-
-            try:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=min(remaining, RECV_TIMEOUT))
-            except asyncio.TimeoutError:
-                if time.time() >= deadline:
-                    if show_text:
-                        out.put(f"\n[turn timeout after {TURN_TIMEOUT}s]")
-                    break
-                continue
-
-            ev = json.loads(raw)
-            kind = ev.get("type")
-
-            if kind == "ping":
-                await self.ws.send('{"type":"pong"}')
-            elif kind == "text":
-                content = ev.get("content") or ""
-                # Content in Retool WebSocket text frames is cumulative for the current turn
-                if len(content) >= len(last_content):
-                    delta = content[len(last_content):]
+                self._log_route = route
+                if route is None:
+                    if any(method_path[1] == path for method_path in ROUTES):
+                        raise apierr.method_not_allowed()
+                    raise apierr.not_found()
+                if route != "health":
+                    query = parse_qs(parsed_url.query)
+                    auth.verify(self.headers, (query.get("key") or [""])[0], cfg["relay_api_key"])
+                if route == "chat":
+                    if not cfg["enable_chat"]:
+                        raise apierr.not_found("chat API disabled")
+                    self._completion("chat")
+                elif route == "responses":
+                    if not cfg["enable_responses"]:
+                        raise apierr.not_found("responses API disabled")
+                    self._completion("responses")
+                elif route == "anthropic":
+                    if not cfg["enable_anthropic"]:
+                        raise apierr.not_found("anthropic API disabled")
+                    self._completion("anthropic")
+                elif route == "count_tokens":
+                    if not cfg["enable_anthropic"]:
+                        raise apierr.not_found("anthropic API disabled")
+                    self._count_tokens()
+                elif route == "models":
+                    self._models()
+                elif route == "codex_models":
+                    self._json(200, model_catalog.codex_catalog(
+                        [entry for entry in model_catalog.catalog() if self._model_routable(entry)]))
+                elif route == "balance":
+                    balance = runtime.credits.get_balance(force_refresh=True)
+                    status = 200 if balance.get("available") is not None or balance.get("stale") else 503
+                    self._json(status, balance)
+                elif route == "usage":
+                    self._json(200, runtime.credits.usage())
+                elif route == "health":
+                    self._health()
+            except apierr.ApiError as err:
+                if err.status >= 400:
+                    print("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]), flush=True)
+                if getattr(self, "_streaming", False):
+                    writer = self._writer
+                    writer.event("error", adapters.error_payload(dialect, err))
+                    writer.done()
                 else:
-                    delta = content
-
-                last_content = content
-                full_turn_text = content
-
-                if show_text and delta:
-                    out.put(delta)
-            elif kind == "clear_streaming":
-                # Retool UI event; content remains cumulative in subsequent text frames
-                pass
-            elif kind == "run_credits_persisted":
-                turn_credits = ev.get("creditsUsed", 0.0)
-                CREDITS.record_turn_cost(turn_credits)
-            elif kind == "hitl":
-                hitl_obj = ev.get("hitl") or {}
-                hitl_type = hitl_obj.get("hitlType") or ev.get("hitlType") or "askUser"
-                questions = hitl_obj.get("hitlProps", {}).get("questions", [])
-                q_texts = []
-                if isinstance(questions, list):
-                    for q in questions:
-                        if isinstance(q, dict) and q.get("question"):
-                            q_texts.append(q["question"])
-                        elif isinstance(q, str):
-                            q_texts.append(q)
-                hitl_msg = "\n".join(q_texts) if q_texts else (hitl_obj.get("message") or f"[hitl: {hitl_type}]")
-                if show_text:
-                    out.put(f"\n{hitl_msg}")
-                full_turn_text += f"\n{hitl_msg}"
-                break
-            elif kind == "agent_loop_done":
-                # Wait briefly (up to 0.8s) for trailing run_credits_persisted
-                t_end = time.time() + 0.8
-                while time.time() < t_end and turn_credits == 0.0:
-                    try:
-                        raw_trail = await asyncio.wait_for(self.ws.recv(), timeout=0.3)
-                        ev_trail = json.loads(raw_trail)
-                        if ev_trail.get("type") == "run_credits_persisted":
-                            turn_credits = ev_trail.get("creditsUsed", 0.0)
-                            CREDITS.record_turn_cost(turn_credits)
-                            break
-                        elif ev_trail.get("type") == "ping":
-                            await self.ws.send('{"type":"pong"}')
-                    except asyncio.TimeoutError:
-                        break
-                break
-            elif kind == "error":
-                err_msg = f"\n[error] {ev}"
-                if show_text:
-                    out.put(err_msg)
-                full_turn_text += err_msg
-                break
-
-        return full_turn_text, turn_credits
-
-    async def run_turn(self, messages, requested_model, requested_effort, out, usage_box):
-        async with self.lock:
-            total_credits = 0.0
-            try:
-                # 1. Resolve model & provider
-                model, provider, effort = resolve_model_provider(requested_model, requested_effort)
-                model_provider = {
-                    "model": model,
-                    "providerResourceName": provider,
-                    "reasoningEffort": effort
-                }
-                print(f"[Turn] Model: {model} | Provider: {provider} | Effort: {effort}", flush=True)
-
-                # 2. Build instructions & context
-                ws_root = CFG.get("workspace_root") or os.getcwd()
-                enable_ctx = bool(CFG.get("project_context", True))
-                enable_exec = bool(CFG.get("local_exec", True))
-                max_exec_turns = int(CFG.get("max_exec_turns", 5))
-                show_exec_output = bool(CFG.get("show_exec_output", True))
-
-                sys_instruction = build_system_instructions(ws_root, enable_ctx, enable_exec)
-                
-                # Flatten user / chat messages
-                user_content = flatten_messages(messages)
-                current_prompt = f"{sys_instruction}\n\n{user_content}" if sys_instruction else user_content
-
-                exec_step = 0
-                while True:
-                    turn_text, turn_cred = await self.run_single_ws_turn(
-                        current_prompt, model_provider, out, show_text=True
-                    )
-                    total_credits += turn_cred
-
-                    # 3. Check for local command execution
-                    if enable_exec and exec_step < max_exec_turns:
-                        cmd = extract_command(turn_text)
-                        if cmd:
-                            exec_step += 1
-                            print(f"[LOCAL EXEC #{exec_step}]: `{cmd}` in `{ws_root}`", flush=True)
-                            if show_exec_output:
-                                out.put(f"\n\n*[Executing: `{cmd}`]*\n")
-
-                            ret, output = run_command(cmd, cwd=ws_root, timeout=40)
-                            print(f"[LOCAL EXEC #{exec_step} Result]: Exit {ret} ({len(output)} chars)", flush=True)
-
-                            if show_exec_output:
-                                out.put(f"```text\n{output}\n```\n\n")
-
-                            current_prompt = format_command_followup(cmd, ret, output)
-                            continue
-
-                    break
-
-            except Exception as exc:
-                print(f"[proxy error] {exc}", flush=True)
-                out.put(f"\n[proxy error] {exc}")
-                if self.ws is not None:
-                    try:
-                        await self.ws.close()
-                    except Exception:
-                        pass
-                    self.ws = None
+                    self._error_response(err, dialect)
+            except Exception as exc:  # never leak a bare traceback
+                print("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]), flush=True)
+                err = apierr.internal(str(exc) or exc.__class__.__name__)
+                if getattr(self, "_streaming", False):
+                    writer = self._writer
+                    writer.event("error", adapters.error_payload(dialect, err))
+                    writer.done()
+                else:
+                    self._error_response(err, dialect)
             finally:
-                usage_box["total_credits"] = total_credits
-                out.put(None)
+                self._log()
 
+        def _error_response(self, err, dialect):
+            body = adapters.error_payload(dialect, err)
+            extra = {"retry-after": err.retry_after} if err.retry_after else None
+            self._json(err.status, body, extra)
 
-SESSION = Session()
+        def _count_tokens(self):
+            """Claude Code asks for a token estimate before sending a turn."""
+            data = validate.load_json(self._read_body())
+            # The real count_tokens endpoint does not require max_tokens.
+            data.setdefault("max_tokens", 1)
+            parsed = validate.parse_anthropic(data, cfg)
+            text = parsed.system + "\n" + parsed.prompt
+            self._json(200, {"input_tokens": adapters.approx_tokens(text)})
 
+        def _models(self):
+            data = [{
+                "id": model["id"],
+                "object": "model",
+                "owned_by": model["provider"],
+                "label": model["label"],
+                "context_window": model["context"],
+                "max_output_tokens": model.get("max_output"),
+                **{key: model[key] for key in ("metadata_checked_at", "metadata_source", "metadata_status", "metadata_notes")
+                   if key in model},
+                "capabilities": {"reasoning": model["reasoning"], "tools": model["tools"],
+                                 "vision": False,
+                                 "reasoning_effort_levels": model.get("reasoning_effort_levels", []),
+                                 "default_reasoning_effort": model.get("default_reasoning_effort"),
+                                 "reasoning_effort_control": model.get("reasoning_effort_control", "selectable")},
+            } for model in model_catalog.catalog()
+                if self._model_routable(model)]
+            self._json(200, {"object": "list", "data": data})
 
-def flatten_messages(messages):
-    parts = []
-    for m in messages:
-        role = m.get("role", "user")
-        c = m.get("content")
-        if isinstance(c, list):
-            c = "".join(b.get("text", "") for b in c if isinstance(b, dict))
-        if role == "system":
-            parts.append(f"[System Instruction]: {c}")
-        elif role == "user":
-            parts.append(f"User: {c}")
-        elif role == "assistant":
-            parts.append(f"Assistant: {c}")
-        else:
-            parts.append(f"{role}: {c}")
-    return "\n\n".join(parts)
+        def _model_routable(self, model) -> bool:
+            """Hide models whose provider resource is not configured."""
+            if cfg.get("show_unrouted_models"):
+                return True
+            if not any(cfg.get(k) for k in model_catalog.PROVIDER_RESOURCE_KEY.values()):
+                return True  # nothing configured yet: list everything, calls fail with a clear 503
+            if model["id"] == cfg.get("model"):
+                return True  # the configured default stays visible
+            key = model_catalog.PROVIDER_RESOURCE_KEY.get(model["provider"])
+            return bool(key and cfg.get(key))
 
+        def _health(self):
+            balance = runtime.credits.get_balance()
+            ok = balance.get("available") is not None and not balance.get("stale")
+            payload = {
+                "ok": ok,
+                "uptime_seconds": round(time.time() - runtime.started, 1),
+                "session_mode": cfg["session_mode"],
+                "models": len(model_catalog.catalog()),
+                "upstream": "ok" if ok else "degraded",
+                "error": balance.get("error") or balance.get("stale_error"),
+                "session": runtime.backend.refresher.status(),
+            }
+            self._json(200 if ok else 503, payload)
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *a):
-        pass
-
-    def _json(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("content-type", "application/json; charset=utf-8")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path.startswith("/v1/models"):
-            data = [{"id": m["id"], "object": "model", "owned_by": m["provider"]} for m in SUPPORTED_MODELS]
-            return self._json(200, {"object": "list", "data": data})
-
-        if self.path.startswith("/v1/balance") or self.path.startswith("/credits") or self.path.startswith("/balance"):
-            bal = CREDITS.get_balance(force_refresh=True)
-            return self._json(200, bal)
-
-        if self.path.startswith("/health"):
-            return self._json(200, {"ok": True, "model": CFG["model"]})
-
-        self._json(404, {"error": {"message": "not found"}})
-
-    def do_POST(self):
-        if not self.path.startswith("/v1/chat/completions"):
-            return self._json(404, {"error": {"message": "not found"}})
-
-        raw = self.rfile.read(int(self.headers.get("content-length", "0")))
-        try:
-            req = json.loads(raw or b"{}")
-        except Exception:
-            return self._json(400, {"error": {"message": "bad json"}})
-
-        messages = req.get("messages", [])
-        requested_model = req.get("model") or CFG.get("model")
-        requested_effort = req.get("reasoning_effort") or req.get("thinking", {}).get("effort")
-        stream = bool(req.get("stream"))
-
-        cid = "chatcmpl-" + uuid.uuid4().hex[:16]
-        created = int(time.time())
-
-        out = queue.Queue()
-        usage_box = {"total_credits": 0.0}
-
-        def pump():
-            fut = asyncio.run_coroutine_threadsafe(
-                SESSION.run_turn(messages, requested_model, requested_effort, out, usage_box),
-                LOOP
-            )
-            collected = []
+        # -- completions --------------------------------------------------
+        def _read_body(self):
+            raw_len = self.headers.get("content-length")
+            if raw_len is None:
+                self.close_connection = True
+                raise apierr.bad_request("Content-Length header is required")
             try:
-                while True:
-                    try:
-                        piece = out.get(timeout=0.05)
-                    except queue.Empty:
-                        if fut.done() and out.empty():
-                            break
-                        continue
-                    if piece is None:
+                length = int(raw_len)
+            except (TypeError, ValueError):
+                # Body length is unknown, so the connection cannot be reused.
+                self.close_connection = True
+                raise apierr.bad_request("Content-Length must be an integer")
+            if length <= 0:
+                raise apierr.bad_request("empty request body")
+            if length > cfg["max_body_bytes"]:
+                self.close_connection = True
+                raise apierr.payload_too_large(cfg["max_body_bytes"])
+            ctype = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype and ctype != "application/json":
+                raise apierr.ApiError(415, "unsupported_media_type", "content-type must be application/json")
+            return self.rfile.read(length)
+
+        def _completion(self, dialect):
+            data = validate.load_json(self._read_body())
+            if dialect == "anthropic":
+                parsed = validate.parse_anthropic(data, cfg)
+            elif dialect == "responses":
+                parsed = validate.parse_responses(data, cfg)
+            else:
+                parsed = validate.parse_chat(data, cfg)
+            affinity = (self.headers.get("x-session-affinity") or
+                        self.headers.get("x-session-id") or
+                        self.headers.get("x-opencode-session"))
+            parsed.conversation_key = validate.conversation_key(data, affinity)
+
+            wait = runtime.limiter.take()
+            if wait:
+                raise apierr.too_many_requests("relay rate limit reached", wait)
+
+            events = queue.Queue()
+            holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
+            fut = asyncio.run_coroutine_threadsafe(runtime.runner.run(parsed, events, holder), runtime.loop)
+
+            prompt_text = parsed.system + "\n" + parsed.prompt
+            if not parsed.stream:
+                adapter = adapters.for_dialect(dialect, parsed)
+                reason = self._collect(fut, events, adapter, prompt_text, holder)
+                payload = adapter.end(reason, prompt_text)
+                self._json(200, payload)
+                return
+
+            writer = sse.StreamWriter(self)
+            self._writer = writer
+            self._streaming = True
+            writer.start({"x-request-id": self.request_id})
+            self._model = parsed.model
+            self._stream_status = 200
+            adapter = adapters.for_dialect(dialect, parsed, writer)
+            adapter.begin()
+            reason = self._pump(fut, events, adapter, holder, writer)
+            adapter.end(reason, prompt_text)
+
+        def _collect(self, fut, events, adapter, prompt_text, holder_session=None):
+            holder_session = holder_session or {}
+            reason = "stop"
+            while True:
+                try:
+                    event = events.get(timeout=0.1)
+                except queue.Empty:
+                    # Non-stream turns can be abandoned as well: cancel upstream on disconnect.
+                    if sse.client_gone(self):
+                        self._cancel_turn(fut, holder_session)
+                        return "cancelled"
+                    if fut.done() and events.empty():
                         break
-                    collected.append(piece)
-                    if stream:
-                        chunk = {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": requested_model,
-                            "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
-                        }
-                        self.wfile.write(b"data: " + json.dumps(chunk, ensure_ascii=False).encode("utf-8") + b"\n\n")
-                        self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                pass
-            return "".join(collected)
+                    continue
+                if event is None:
+                    break
+                kind = event.get("type")
+                if kind == "error":
+                    raise event["error"]
+                if kind == "end":
+                    reason = event.get("reason", "stop")
+                    continue
+                adapter.feed(event)
+                if sse.client_gone(self):
+                    self._cancel_turn(fut, holder_session)
+                    return "cancelled"
+            return reason
 
-        if not stream:
-            text = pump()
-            bal = CREDITS.get_balance()
-            return self._json(200, {
-                "id": cid,
-                "object": "chat.completion",
-                "created": created,
-                "model": requested_model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": len(str(messages)) // 4,
-                    "completion_tokens": len(text) // 4,
-                    "total_tokens": (len(str(messages)) + len(text)) // 4,
-                    "credits_used": round(usage_box["total_credits"], 4),
-                    "credits_available": bal.get("available")
-                }
-            })
+        def _cancel_turn(self, fut, holder):
+            event = holder.get("cancel_event")
+            if event is not None:
+                event.set()
+            session = holder.get("session")
+            if session is not None:
+                session.cancel()
+            fut.cancel()
 
-        self.send_response(200)
-        self.send_header("content-type", "text/event-stream")
-        self.send_header("cache-control", "no-cache")
-        self.send_header("connection", "close")
-        self.end_headers()
+        def _pump(self, fut, events, adapter, holder, writer):
+            """Stream events to the client, sending heartbeats and honouring disconnects."""
+            last_write = time.time()
+            reason = "stop"
+            while True:
+                try:
+                    event = events.get(timeout=0.25)
+                except queue.Empty:
+                    now = time.time()
+                    if now - last_write >= sse.HEARTBEAT_EVERY:
+                        writer.comment()
+                        last_write = now
+                    if sse.client_gone(self):
+                        self._cancel_turn(fut, holder)
+                        return "cancelled"
+                    if fut.done() and events.empty():
+                        break
+                    continue
+                if event is None:
+                    break
+                if event.get("type") == "error":
+                    raise event["error"]
+                if event.get("type") == "end":
+                    reason = event.get("reason", "stop")
+                    holder["reason"] = reason
+                    continue
+                adapter.feed(event)
+                last_write = time.time()
+                # Check for a disconnect on every event, not only when the stream idles.
+                if sse.client_gone(self):
+                    self._cancel_turn(fut, holder)
+                    return "cancelled"
+            return holder.get("reason", reason)
 
+    return Handler
+
+
+class BoundedServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # Windows SO_REUSEADDR permits two relay processes to own the same port,
+    # making clients randomly hit old code after a restart.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def __init__(self, address, handler, slots):
+        super().__init__(address, handler)
+        self.slots = slots
+
+    def process_request(self, request, client_address):
+        self.slots.acquire()
         try:
-            first = {
-                "id": cid,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": requested_model,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-            self.wfile.write(b"data: " + json.dumps(first, ensure_ascii=False).encode("utf-8") + b"\n\n")
-            pump()
-            stop = {
-                "id": cid,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": requested_model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            self.wfile.write(b"data: " + json.dumps(stop, ensure_ascii=False).encode("utf-8") + b"\n\ndata: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+def main():
+    cfg = config_module.load()
+    cfg["command_log"] = os.path.join(HERE, "commands.log")
+    runtime = Runtime(cfg)
+    handler = make_handler(runtime)
+    slots = threading.BoundedSemaphore(cfg["max_workers"])
+    server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
+
+    runtime.backend.refresher.start()
+    balance = runtime.credits.get_balance(force_refresh=True)
+    print("=" * 64)
+    print(" Retool AI relay")
+    print(" listen:        http://" + cfg["host"] + ":" + str(cfg["port"]) + "/v1")
+    print(" relay key:     " + auth.mask(cfg["relay_api_key"]) + "  (from " + auth.relay_key_source() + ")")
+    print(" model default: " + cfg["model"] + " | effort: " + cfg["reasoning_effort"])
+    print(" session mode:  " + cfg["session_mode"] + " | workspace: " + cfg["workspace_root"])
+    print(" exec policy:   " + cfg["exec_policy"] + " | max turns: " + str(cfg["max_exec_turns"]))
+    if balance.get("available") is not None:
+        print(" balance:       " + str(balance["available"]) + " / " + str(balance.get("monthly_allocation")))
+    else:
+        print(" upstream:      DEGRADED " + str(balance.get("error")))
+    print("=" * 64)
+
+    def stop(*_):
+        print("\nshutting down…")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, stop)
+        except (ValueError, OSError):
             pass
+
+    def _thread_crash(args):
+        print("thread crash:", args.exc_type.__name__, args.exc_value, flush=True)
+
+    threading.excepthook = _thread_crash
+
+    try:
+        while True:
+            try:
+                server.serve_forever()
+                break
+            except Exception as exc:  # never lose the listener on a stray error
+                print("serve_forever crashed:", exc, flush=True)
+                time.sleep(0.5)
+    finally:
+        try:
+            runtime.backend.refresher.stop()
+            runtime.loop.call_soon_threadsafe(runtime.loop.stop)
+        finally:
+            server.server_close()
 
 
 if __name__ == "__main__":
-    if not CFG.get("cookie"):
-        sys.exit("config.json: поле cookie пустое")
-
-    bal = CREDITS.get_balance()
-    avail = bal.get("available")
-    alloc = bal.get("monthly_allocation")
-    reset_d = bal.get("reset_date")
-    print("=" * 60)
-    print(" Retool AI Agent OpenAI-Compatible Proxy Relay")
-    print(f" Proxy URL:     http://127.0.0.1:{PORT}/v1")
-    print(f" Default Model: {CFG.get('model', 'claude-opus-5-5')}")
-    print(f" Workspace:     {CFG.get('workspace_root', os.getcwd())}")
-    print(f" Local Exec:    {CFG.get('local_exec', True)}")
-    print(f" Proj Context:  {CFG.get('project_context', True)}")
-    print(f" Effort:        {CFG.get('reasoning_effort', 'high')}")
-    if avail is not None:
-        print(f" Balance:       {avail} / {alloc} credits (Reset: {reset_d})")
-    print("=" * 60)
-
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    srv.serve_forever()
+    main()

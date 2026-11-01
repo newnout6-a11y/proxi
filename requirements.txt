@@ -1,0 +1,5 @@
+# Runtime dependency of the relay (pinned: WS client API differs between majors).
+websockets==13.1
+
+# Test-only
+pytest>=8,<9

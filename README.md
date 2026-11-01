@@ -1,165 +1,233 @@
-# Retool AI Agent OpenAI-Compatible Proxy Relay
+# Retool AI relay (OpenAI / Anthropic compatible)
 
-Высокопроизводительный OpenAI-совместимый прокси-сервер (фасад) над внутренним WebSocket-протоколом **Retool Next AI Agent**.
+Локальный HTTP-relay над внутренним WebSocket-протоколом Retool AI Agent.
+Даёт доступ к моделям, доступным вашей организации Retool, из обычных OpenAI- и
+Anthropic-клиентов (Codex, opencode, Aider, Continue, Claude Code, curl).
 
-Позволяет использовать флагманские модели (**Claude Opus 5.5**, **Claude Sonnet 4.6**, **GPT-5.2**, **GPT-5.1** и др.) через существующие квоты вашей организации в Retool в любых стандартных OpenAI-клиентах (Cursor, Continue, Aider, Open-WebUI, curl и т.д.).
+Честная рамка: это адаптер к внутреннему протоколу, а не официальный API Retool.
+Совместимость ограничена списком ниже.
 
----
+## Возможности
 
-## Ключевые возможности
+- POST /v1/chat/completions — OpenAI Chat Completions, streaming и non-streaming.
+- POST /v1/responses — OpenAI Responses API (streaming и non-streaming).
+- POST /v1/messages — Anthropic Messages API (streaming и non-streaming, x-api-key).
+- GET /v1/models — каталог моделей с capabilities и размером контекста.
+- GET /v1/balance, GET /v1/usage, GET /health (503, когда upstream недоступен).
+- Обязательный локальный ключ relay: Authorization: Bearer, x-api-key или ?key=.
+- Изоляция: один Retool-тред и WebSocket на один диалог; OpenCode affinity
+  (`x-session-affinity`/`X-Session-Id`) разделяет диалоги, а tool-result ходы
+  остаются в том же треде.
+- Локальное выполнение команд (<exec_command>) с allowlist, чистым окружением
+  и убийством дерева процессов по таймауту.
+- Инжект контекста проекта с redaction секретов.
+- Учёт кредитов по каждому ходу, credits_used в usage, история в /v1/usage.
+- Фоновое продление сессии Retool каждые 15 минут, сохранение cookies после
+  ротации и общий повтор при 401/403 для моделей, истории сообщений и баланса.
+- Прямой транспорт по умолчанию: обычный POST вместо WebSocket и кэшируемый
+  system-блок с инструкциями и контекстом проекта. Первый токен — около 2 секунд
+  вместе с контекстом; модель, которую прямой путь не отдаёт, автоматически
+  уходит на WebSocket. Замеры — [docs/direct-transport.md](docs/direct-transport.md).
 
-- 🚀 **Полная совместимость с OpenAI API**:
-  - `POST /v1/chat/completions` с поддержкой как потокового вывода (Server-Sent Events / SSE), так и обычных ответов.
-  - `GET /v1/models` — динамический каталог моделей Claude и GPT.
-  - `GET /v1/balance` — проверка доступных кредитов Retool и даты обновления квоты.
-- ⚡ **Автономное выполнение команд на локальном ПК (`local_exec`)**:
-  - Агент может выполнять shell-команды на хост-машине через тег `<exec_command>команда</exec_command>`.
-  - Прокси перехватывает команду, исполняет её с `cwd=workspace_root`, получает вывод и возвращает агенту в следующем шаге (multi-turn loop).
-  - В потоковом режиме процесс выполнения команд наглядно отображается пользователю.
-- 📂 **Автоматический сбор контекста проекта (`project_context`)**:
-  - Автоматически сканирует Git (текущую ветку, хэш последнего коммита, статус изменений) и дерево файлов проекта (до 60 файлов).
-  - Подгружает выжимку документации (`README.md`, `PROTOCOL.md`, манифесты пакетов) и инжектирует в системный контекст.
-- 💰 **Мониторинг кредитов и баланса**:
-  - Отслеживание баланса организации (`/api/credits/balance`).
-  - Логирование стоимости каждого запроса (`run_credits_persisted`) и расчет остатка в реальном времени.
-  - Поле `usage` в ответах API возвращает точные данные о списанных кредитах.
-- 🔀 **Интеллектуальная маршрутизация моделей и провайдеров**:
-  - Модели `claude-*` автоматически маршрутизируются на ресурс Anthropic.
-  - Модели `gpt-*` автоматически маршрутизируются на ресурс OpenAI.
-  - Проброс уровня рассуждений (`reasoningEffort: low | medium | high | minimal | max`).
-- 🛠️ **Исправленный стриминг**:
-  - Корректная обработка кумулятивных текстовых фреймов Retool WS (нарезка дельт без дублирования текста).
-  - Обработка UI-сигналов `clear_streaming` и HITL (Human-in-the-loop).
+## Установка
 
----
+    python -m pip install -r requirements.txt
+    copy config.example.json config.json     # заполнить base/page_uuid/cookie/xsrf/workspace_root
+    python proxy.py                          # ключ сам появится в relay_key.txt
 
-## Архитектура проекта
+Фоновый запуск, переживающий закрытие терминала и перезапускающийся при падении:
 
-```text
-├── proxy.py              # Основной HTTP/SSE сервер-прокси
-├── credits.py            # Менеджер квот и баланса Retool
-├── context.py            # Сборщик контекста проекта (Git, файлы, документация)
-├── executor.py           # Изолированный движок локального выполнения команд
-├── config.json           # Рабочая конфигурация (сессия, ключи, пути)
-├── config.example.json   # Шаблон конфигурации
-├── test_suite.py         # Полный интеграционный тестовый набор
-├── test_client.py        # Интерактивный CLI-клиент для тестирования
-├── PROTOCOL.md           # Реверс-инжиниринг спецификация WebSocket Retool
-└── probes/               # Архив исследовательских скриптов и пробников
-```
+    Start-Process pwsh -ArgumentList '-NoProfile','-File','scripts\run_relay.ps1' -WindowStyle Hidden -PassThru |
+        ForEach-Object { $_.Id | Out-File relay.pid }
+    taskkill /PID (Get-Content relay.pid) /T /F     # остановить (супервизор перезапустит — убивать с /T)
 
----
+Если RELAY_API_KEY и relay_api_key не заданы, ключ генерируется в relay_key.txt
+и печатается в баннере маскированно.
 
-## Быстрый старт
+Секреты можно держать вне файла: RETOOL_COOKIE, RETOOL_XSRF, RETOOL_BASE,
+RETOOL_PAGE_UUID, RETOOL_THREAD_ID, RELAY_API_KEY. Для OpenCode affinity приходит
+в `x-session-affinity`/`X-Session-Id`; config.json и cookies.txt в .gitignore.
 
-### 1. Настройка конфигурации
+Сессия продлевается через `/api/refreshtoken` при запуске и затем каждые
+`session_refresh_interval` секунд (по умолчанию 900). Новые cookie и xsrf
+атомарно сохраняются в исходный `config.json`, остальные настройки остаются
+на месте. После перезапуска используется последняя сохранённая сессия.
+При ошибках продление повторяется с паузой от 20 секунд до 5 минут;
+параллельные клиенты используют одно обновление. `0` отключает фоновое продление.
 
-Скопируйте `config.example.json` в `config.json` и укажите данные вашей сессии Retool:
+Для секретов из `RETOOL_COOKIE`/`RETOOL_XSRF` обновление работает в памяти:
+значения окружения не записываются в конфигурацию. Если выполнен новый вход
+и обновлён `config.json`, работающий relay подхватит его при следующем продлении
+или ошибке авторизации. Истёкшую или отозванную сервером сессию без действующих
+учётных данных `/api/refreshtoken` восстановить не может — нужен новый вход.
+Состояние фонового продления и ошибки сохранения видны в `/health`;
+устаревший кэш баланса означает `503`, а не успешную проверку upstream.
 
-```json
-{
-  "base": "https://<your-subdomain>.retool.com",
-  "page_uuid": "<page-uuid>",
-  "thread_id": "<thread-uuid>",
-  "cookie": "<cookie-with-accessToken-and-cf_clearance>",
-  "xsrf": "<x-xsrf-token>",
-  "port": 8787,
-  "model": "claude-opus-5-5",
-  "provider_resource_name": "ffd4d570-7c6b-414f-b95a-1a695676d0a8",
-  "openai_provider_resource_name": "1b7f4c97-241f-4117-a710-18c7cbfa74b1",
-  "reasoning_effort": "high",
-  "local_exec": true,
-  "show_exec_output": true,
-  "max_exec_turns": 5,
-  "project_context": true,
-  "workspace_root": "C:\\your\\project\\path"
-}
-```
+## Использование
 
-### 2. Запуск сервера
+    curl.exe http://127.0.0.1:8787/v1/chat/completions -H "Authorization: Bearer $env:RELAY_API_KEY" -H "content-type: application/json" -d "{\"model\":\"claude-opus-5-5\",\"messages\":[{\"role\":\"user\",\"content\":\"привет\"}]}"
 
-```bash
-python proxy.py
-```
+Codex (~/.codex/config.toml):
 
-При запуске сервер выводит баннер с текущим балансом:
-```text
-============================================================
- Retool AI Agent OpenAI-Compatible Proxy Relay
- Proxy URL:     http://127.0.0.1:8787/v1
- Default Model: claude-opus-5-5
- Workspace:     C:\specialinay_papka
- Local Exec:    True
- Proj Context:  True
- Effort:        high
- Balance:       120.61 / 3000 credits (Reset: 2026-11-27)
-============================================================
-```
+    model = "gpt-6-sol"
+    model_provider = "retool"
+    model_reasoning_effort = "high"
+    model_reasoning_summary = "detailed"
+    web_search = "disabled"
+    [model_providers.retool]
+    name = "Retool relay"
+    base_url = "http://127.0.0.1:8787/v1"
+    wire_api = "responses"
+    env_key = "RELAY_API_KEY"
+    supports_websockets = false
+    model_catalog_url = "http://127.0.0.1:8787/codex/models"
 
-### 3. Проверка тестами
+`/codex/models` предоставляет Codex-совместимые описания уровней мышления и
+инструментов (`exec_command`, freeform `apply_patch`, namespaces субагентов).
+Встроенный server-side `web_search` Responses не реализован; клиентские
+инструменты поиска, объявленные как function tools, проходят обычный bridge.
 
-Запуск сквозного интеграционного теста:
-```bash
-python test_suite.py
-```
+Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` и
+`ANTHROPIC_API_KEY=<тот же relay key>` (или `ANTHROPIC_AUTH_TOKEN`).
+В bare-режиме Claude Code использует `ANTHROPIC_API_KEY`.
 
-Проверка баланса через CLI:
-```bash
-python test_client.py --balance
-```
+Для DeepSeek Harness используйте провайдера `retool` через OpenAI Chat:
+`baseURL: http://127.0.0.1:8787/v1`, `thinkingFormat: deepseek`.
+Схемы настроек трёх клиентов и границы IDE-команд — в
+[docs/client-setup.md](docs/client-setup.md).
 
-Просмотр доступных моделей:
-```bash
-python test_client.py --models
-```
+### Thinking и работа с проектом
 
-Отправка произвольного запроса:
-```bash
-python test_client.py "Прочитай первые 5 строк файла PROTOCOL.md" --model claude-opus-5-5
-python test_client.py "Say hello from GPT" --model gpt-5.2
-```
+Relay передаёт полученный от провайдера thinking отдельно от ответа:
+Chat — `reasoning_content`, Responses — reasoning summary item/events,
+Anthropic — thinking content blocks. Это только данные, которые Retool
+раскрывает: скрытую цепочку рассуждений relay не восстанавливает и не выдумывает.
+Если провайдер вернул пустой thinking, блок текста останется пустым.
+В Claude Code блоки по умолчанию свёрнуты: `Ctrl+O` раскрывает их;
+`showThinkingSummaries: true` включает отображение кратких сводок.
 
----
+Уровень меняется настоящим полем Retool `modelProvider.reasoningEffort`:
+`reasoning_effort` в Chat, `reasoning.effort` в Responses,
+`thinking.type=adaptive` + `output_config.effort` в Anthropic.
+Допустимые уровни конкретной модели перечислены в
+`/v1/models → capabilities.reasoning_effort_levels`. Неподдерживаемый уровень
+возвращает ошибку. Legacy `thinking.budget_tokens` переводится в уровень;
+точный бюджет токенов Retool этим интерфейсом не предоставляет.
 
-## Примеры использования API
+Если клиент передал инструменты, модель получает его system/developer instructions,
+историю и полные результаты инструментов. Файлы, изменения и тесты выполняются
+инструментами клиента: workspace клиента имеет приоритет над папкой relay.
+Поддержаны обычные function tools и Responses custom tools (`apply_patch`).
+Без инструментов клиента relay добавляет список файлов, Git-состояние и выдержки
+AGENTS/README/PROTOCOL настроенного workspace; дополнительные чтения доступны
+через локальный exec-протокол. Это не загрузка всего репозитория в prompt.
 
-### Проверка баланса кредитов
-```bash
-curl http://127.0.0.1:8787/v1/balance
-```
-Ответ:
-```json
-{
-  "available": 120.6099,
-  "monthly_allocation": 3000,
-  "used_month": 2879.3901,
-  "reset_date": "2026-11-27T08:50:28.593Z",
-  "is_low": true,
-  "session_used": 0.54
-}
-```
+## Конфигурация
 
-### Список моделей
-```bash
-curl http://127.0.0.1:8787/v1/models
-```
+Все ключи с дефолтами — в config.example.json. Важное:
 
-### Запрос к чату (cURL)
-```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-opus-5-5",
-    "messages": [{"role": "user", "content": "Покажи статус git в проекте"}],
-    "stream": true
-  }'
-```
+| ключ | смысл |
+| --- | --- |
+| session_mode | per_conversation (по умолчанию), per_request (новый тред на каждый запрос) или shared (один тред) |
+| max_conversations, conversation_idle_timeout | максимум 128 persistent-диалогов, неактивные вытесняются через 900 с |
+| exec_policy | allowlist (по умолчанию), allow_all, off |
+| exec_allowlist | regex-список разрешённых первых слов команд (см. ниже) |
+| strict_models | true — неизвестная модель даёт 404 вместо тихой маршрутизации |
+| max_body_bytes, max_frame_bytes, max_workers | границы памяти/параллелизма: 32 МиБ запроса, 16 МиБ WS-кадра, 32 воркера |
+| rate_limit_rps | 0 — дополнительная локальная квота выключена; можно включить явно |
+| command_output_limit | 64 000 символов; 0 — весь вывод команды |
+| max_prompt_bytes | 0 — relay не обрезает prompt; положительный лимит проверяет весь UTF-8 prompt и возвращает 413 при переполнении |
+| context_max_bytes | 120 000 — сколько контекста проекта подмешивается |
+| reasoning_effort | auto — рекомендация выбранной модели; явный уровень из клиента имеет приоритет |
+| agent_mode | 2 — рабочий режим агента (1 — более «разговорный», 3 — не проверялся) |
+| google_provider_resource_name, retool_fast_provider_resource_name | ресурсы для gemini-* и zai-org/*; без них эти модели дают 503 |
 
----
+### Как читается политика команд
 
-## Подключение к сторонним клиентам
+Команда режется на сегменты по переводам строк и разделителям `&& || | ; &` **вне кавычек**.
+Для каждого сегмента проверяется первое слово. Для `powershell`, `pwsh` и `cmd` тело после
+`-Command` / `-c` / `/c` проверяется рекурсивно по списку разрешённых cmdlet-ов
+(`Get-Content`, `Get-ChildItem`, `Select-String`, `dir`, `type`, `findstr`, `ping` и т. п.).
+Поэтому `powershell -Command "Get-ChildItem; Get-Date"` проходит, а `powershell -c "calc"` — нет.
+`allowlist` ограничивает **список программ**, а не файловую систему: `type C:\Windows\win.ini`
+или чтение другого абсолютного пути возможны. Allowlist не является песочницей
+файловой системы. Подстановки cmd, PowerShell script blocks/вложенные выражения,
+неявные и encoded shell-команды блокируются; Python/Node/npm/curl не разрешены
+по умолчанию. Полноценные правки и тесты используйте через инструменты клиента
+с его разрешениями. `allow_all` остаётся явным выбором владельца relay.
 
-В любом приложении (Cursor, Continue, Aider, Open-WebUI):
-- **Base URL**: `http://127.0.0.1:8787/v1`
-- **API Key**: любой произвольный текст (например, `sk-retool`)
-- **Model**: `claude-opus-5-5` или `gpt-5.2`
+Таймауты: ход — 900 с (`turn_timeout`), чтение кадра — 120 с (`recv_timeout`), команда — 300 с.
+Таймаут чтения кадра сам по себе не завершает генерацию. Эти значения ограничивают
+максимальное ожидание; успешный ответ отправляется сразу после готовности.
+Количество шагов исполнения не ограничено (`max_exec_turns: 0`). Ограничение шагов можно
+включить вручную: тогда на исчерпании агент получает финальный ход без команд. Отдельно
+стоит предохранитель от цикла: если одна и та же команда повторяется, исполнение
+останавливается и агент обязан дать сводку.
+`max_tokens` валидируется по модели. Контексты, output caps, рекомендуемые уровни
+и границы подтверждения сведены в [аудите каталога](docs/model-catalog-audit.md).
+
+## Каталог моделей
+
+Каталог и доступные уровни мышления сверены с picker/schema приложения Retool:
+Claude Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / 4.5 / 4.1 / 4, Claude Sonnet 5 / 4.6 / 4.5 / 4,
+Claude Fable 5, Claude Haiku 4.5, GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.4, GPT-5.3 Codex,
+GPT-5.2 / 5.1 / 5 / mini / nano, GPT-6 Astra/Sol/Luna, GPT-6.1 Sol,
+Gemini 3.x, Retool Power/Mini. Список статический: обновляется в `models.py`
+после проверки схемы Retool; наличие в каталоге не гарантирует доступ в организации.
+
+Маршрутизация в провайдера — по префиксу модели: claude-* → ресурс Anthropic, gpt-* → ресурс OpenAI.
+
+## Коды ответов
+
+400 битый JSON/заголовки, 401 нет или неверный relay-ключ, 404 неизвестный маршрут или модель,
+405 неверный метод, 413 слишком большое тело, 415 не JSON, 422 неверные типы полей,
+429 локальный rate limit, лимит Retool или исчерпанные кредиты плана
+(`insufficient_credits`), 502 отказ upstream/сессии, 503 upstream недоступен, 504 таймаут хода.
+
+## Ограничения (важно)
+
+- Retool WebSocket не принимает поле `tools` нативно. Relay делает совместимый
+  bridge: схемы инструментов добавляются в prompt, `<tool_call>...</tool_call>`
+  преобразуется в OpenAI Chat `tool_calls` или Responses `function_call`, а
+  следующий `role=tool`/`function_call_output` ход передаёт полный результат модели.
+  Это полноценный клиентский tool protocol, но не нативный tool API Retool.
+- temperature, top_p, stop, n, seed, response_format, logprobs принимаются, но upstream
+  их не применяет; список игнорируемых полей пишется в лог.
+- max_tokens/max_output_tokens проверяются по модели, но Retool не принимает
+  точный лимит генерации через этот WebSocket; relay не обещает его соблюдение.
+- Изображения не передаются: image input явно отклоняется с 422, vision=false.
+- usage по токенам приблизительный (len/4, флаг estimated), достоверны только кредиты.
+- HITL-вопрос агента отдаётся как текст; отдельного API ответа на HITL нет.
+- Промпт собирается из всей истории запроса; авт-обрезки по контексту нет.
+- Retool не даёт удалять треды: созданные диалоговые треды копятся.
+- Состав моделей статичен; доступность конкретной модели проверяет upstream.
+- Прямой транспорт опирается на недокументированный маркер `metadata.sandpackAgent`:
+  официально Opus 5.5 на managed-ключе помечен недоступным, а на практике отвечает.
+  Поведение может измениться; `transport: "agent"` возвращает прежний путь целиком.
+
+## Что проверено вживую (Retool, свежая сессия)
+
+- все три диалекта в streaming и non-streaming возвращают реальный ответ модели;
+- маршрутизация провайдеров: `claude-opus-4-8` → Anthropic, `gpt-5.5` → OpenAI;
+- два параллельных запроса создают два треда и не видят историю друг друга;
+- allowlisted-команда (`dir`) исполняется локально, неразрешённая (`whoami`) даёт код 126
+  и текст политики, аудит пишется в `commands.log`;
+- пустые ходы диагностируются: исчерпание кредитов отдаётся как `429 insufficient_credits`,
+  а не пустой `200`;
+- upstream 401 при мёртвой сессии отдаётся как `502 upstream_auth_error` после попытки refresh.
+
+## Тесты
+
+    python -m pytest -q          # offline, без сети
+    python test_client.py --models
+    python test_client.py "Проверь проект" --effort high
+
+## Архитектура
+
+proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
+(контекст, exec-цикл) -> session.py (тред + WS, ретраи, отмена) -> adapters.py
+(три диалекта) + sse.py. Вспомогательное: auth.py, upstream_refresh.py, credits.py,
+executor.py, context.py, redact.py, apierr.py, models.py.
+Реверс-инжиниринг протокола — PROTOCOL.md. Локальные capture/probe-артефакты
+исключены из Git: они могут содержать credentials. Удаление файлов из текущей
+ветки не удаляет ранее опубликованные секреты из истории; их следует отозвать.
