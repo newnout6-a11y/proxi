@@ -19,6 +19,11 @@ class ApiError(Exception):
         # Anthropic uses a flat type + message pair.
         return {"type": "error", "error": {"type": self.code, "message": self.message}}
 
+    def responses_envelope(self) -> dict:
+        # Responses SSE errors are flat events with an explicit type; without it a
+        # strict SDK keeps waiting for response.completed forever.
+        return {"type": "error", "code": self.code, "message": self.message, "param": self.param}
+
 
 def bad_request(message: str, param=None) -> ApiError:
     return ApiError(400, "invalid_request_error", message, param=param)

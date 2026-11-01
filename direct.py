@@ -199,17 +199,12 @@ def coerce_arguments(raw, params):
         if key not in data or not isinstance(spec, dict):
             continue
         value = data[key]
-        kind = spec.get("type")
-        if kind == "number" and isinstance(value, str):
-            try:
-                data[key] = float(value) if "." in value else int(value)
-                changed = True
-            except ValueError:
-                pass
-        elif spec.get("type") == "boolean" and isinstance(value, str):
-            if value.lower() in ("true", "false"):
-                data[key] = value.lower() == "true"
-                changed = True
+        # _coerce_value rejects inf/nan, so the batch path cannot emit a bare
+        # Infinity that would make the arguments invalid JSON.
+        coerced = _coerce_value(value, spec) if isinstance(value, str) else None
+        if coerced is not None:
+            data[key] = coerced
+            changed = True
     return json.dumps(data, ensure_ascii=False) if changed else text
 
 
@@ -852,7 +847,22 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
     stack = []  # open calls, newest last; deltas belong to the newest open block
     calls = {}
     current = None
+    call_seq = 0  # monotonic: a finished call leaves `calls`, len() would repeat ids
     req_id = getattr(session, "thread_id", None) or "req"
+
+    def _final_call_event(key):
+        call = calls.pop(key, None)
+        if call is None:
+            return None
+        streamed = call["out"] + call["stream"].finish()
+        raw = "".join(call["args"])
+        # The streamed text is already coerced; fall back for non-JSON or empty input.
+        try:
+            json.loads(streamed)
+            final = streamed
+        except ValueError:
+            final = coerce_arguments(raw, (param_types or {}).get(call["name"]))
+        return {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": final}
     while True:
         if session._cancelled:
             yield {"type": "end", "reason": "cancelled"}
@@ -882,8 +892,19 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             event = json.loads(item)
         except Exception:
             continue
+        if not isinstance(event, dict):
+            # A valid JSON line that is not an object (a number, a list) must be
+            # skipped, not kill the turn with an AttributeError.
+            continue
         if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
             flags["end"] = True
+            # A stream can end with calls still open: finalize them exactly like
+            # content_block_end would, or the client keeps a dangling partial.
+            while stack:
+                final_event = _final_call_event(stack.pop())
+                if final_event is not None:
+                    yield final_event
+            current = None
             return
         kind = event.get("event")
         if kind == "content_block_start":
@@ -894,12 +915,19 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 yield {"type": "thinking_start"}
             elif event.get("type") == "tool_call":
                 think_started = None
-                current = event.get("toolCallId") or "call_%d" % len(calls)
-                calls[current] = {"id": event.get("toolCallId"), "name": event.get("toolName"), "args": [],
+                if event.get("toolCallId"):
+                    current = event["toolCallId"]
+                else:
+                    current = "call_%d" % call_seq
+                    call_seq += 1
+                # Store the resolved key as the id: upstream may omit toolCallId,
+                # and adapters merge calls by id — an absent id would glue every
+                # id-less call into one "call_0".
+                calls[current] = {"id": current, "name": event.get("toolName"), "args": [],
                                   "out": "", "stream": ArgStream((param_types or {}).get(event.get("toolName")))}
                 stack.append(current)
                 # Announce the call immediately so clients render it while arguments generate.
-                yield {"type": "tool_call", "id": event.get("toolCallId"), "name": event.get("toolName"),
+                yield {"type": "tool_call", "id": current, "name": event.get("toolName"),
                        "arguments": "", "partial": True}
         elif kind == "content_block_delta":
             block = event.get("type")
@@ -931,27 +959,35 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                     yield {"type": "tool_call", "id": call["id"], "name": call["name"],
                            "arguments": call["out"], "partial": True}
         elif kind == "content_block_end":
-            key = stack.pop() if stack else current
-            call = calls.pop(key, None) if key is not None else None
-            if call is not None:
-                streamed = call["out"] + call["stream"].finish()
-                raw = "".join(call["args"])
-                # The streamed text is already coerced; fall back for non-JSON or empty input.
-                try:
-                    json.loads(streamed)
-                    final = streamed
-                except ValueError:
-                    final = coerce_arguments(raw, (param_types or {}).get(call["name"]))
-                yield {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": final}
+            btype = event.get("type")
+            if btype is not None and btype != "tool_call":
+                # Ends of text/thinking blocks must not finalize an open tool call:
+                # the streamed arguments would be cut short and later deltas lost.
+                continue
+            ended = event.get("toolCallId")
+            if ended is not None and ended in calls:
+                key = ended
+                if ended in stack:
+                    stack.remove(ended)
+            else:
+                key = stack.pop() if stack else current
+            final_event = _final_call_event(key)
+            if final_event is not None:
+                yield final_event
             current = stack[-1] if stack else None
         elif kind == "metadata":
-            usage = event.get("usage") or {}
+            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 print("[cache] in=%s read=%s write=%s credits=%s" % (
                     usage.get("inputTokens"), usage.get("promptTokensReadFromCache"),
                     usage.get("promptTokensWrittenToCache"), usage.get("creditsUsed")), flush=True)
-            if usage.get("creditsUsed") is not None:
-                yield {"type": "credits", "value": float(usage["creditsUsed"]),
+            credits_used = usage.get("creditsUsed")
+            try:
+                credits_value = float(credits_used) if credits_used is not None else None
+            except (TypeError, ValueError):
+                credits_value = None
+            if credits_value is not None:
+                yield {"type": "credits", "value": credits_value,
                        "usage": {"input_tokens": usage.get("inputTokens"),
                                  "output_tokens": usage.get("outputTokens"),
                                  "cache_read": usage.get("promptTokensReadFromCache"),
