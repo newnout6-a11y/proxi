@@ -713,8 +713,8 @@ class TurnRunner:
 
                     if self.cfg["show_exec_output"]:
                         out.put({"type": "exec_start", "cmd": command})
-                    log("exec.start", "Локальная команда: %s" % command[:160], "info",
-                        command=command[:2000], policy=self.cfg["exec_policy"], step=exec_steps + 1)
+                    log("exec.start", "Локальная команда: %s" % redact(command)[:160], "info",
+                        command=redact(command)[:2000], policy=self.cfg["exec_policy"], step=exec_steps + 1)
                     exec_started = time.time()
 
                     try:
@@ -739,7 +739,7 @@ class TurnRunner:
                     exec_steps += 1
                     log("exec.result", "Команда завершилась с кодом %s" % code,
                         "success" if code == 0 else "warn" if code == 126 else "error",
-                        command=command[:2000], exit=code, output=(output or "")[:1500],
+                        command=redact(command)[:2000], exit=code, output=(output or "")[:1500],
                         output_chars=len(output or ""), duration_ms=round((time.time() - exec_started) * 1000),
                         blocked=code == 126)
 
@@ -782,7 +782,7 @@ class TurnRunner:
             duration = round((time.time() - turn_started) * 1000)
             err = outcome["error"]
             if err is not None:
-                log("turn.error", "%s: %s" % (err.code, (err.message or "")[:300]), "error",
+                log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]), "error",
                     status=err.status, code=err.code)
                 reason = "error"
             else:
