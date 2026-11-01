@@ -543,18 +543,27 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     return body
 
 
-def _bounded_put(loop, queue, item, is_cancelled):
+def _bounded_put(loop, queue, item, is_cancelled, max_wait=120.0):
     """Thread-safe bounded put that never duplicates: one put future is awaited
     until it lands (a blocked worker is the backpressure) or the session dies.
-    Re-creating the future on a timeout would enqueue the item twice."""
+    Re-creating the future on a timeout would enqueue the item twice. A consumer
+    that vanished without cancelling cannot hold the worker forever: after
+    max_wait the line is dropped — the turn is dead by then anyway."""
     future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+    deadline = time.monotonic() + max_wait if max_wait else None
     while True:
+        timeout = 5.0 if deadline is None else max(0.05, min(5.0, deadline - time.monotonic()))
         try:
-            future.result(timeout=5)
+            future.result(timeout=timeout)
             return
         except TimeoutError:
             if is_cancelled():
                 future.cancel()
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                future.cancel()
+                journal.emit("direct.queue_drop",
+                             "Кадр отброшен: потребитель потока не отвечал дольше %d с" % int(max_wait), "warn")
                 return
 
 
