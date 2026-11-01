@@ -271,8 +271,10 @@ def load(path=CONFIG_PATH):
         raise service_unavailable("session_mode must be 'per_request', 'per_conversation' or 'shared'")
     if cfg["session_mode"] == "shared" and not cfg.get("thread_id"):
         raise service_unavailable("session_mode 'shared' requires 'thread_id'")
-    if cfg.get("transport") not in ("direct", "agent"):
-        raise service_unavailable("transport must be 'direct' or 'agent'")
+    if cfg.get("transport") != "direct":
+        # README: the legacy WebSocket sandbox ("agent") path is disabled. Accepting
+        # it silently would revive every unmaintained WS-only code path.
+        raise service_unavailable("transport must be 'direct' (the legacy 'agent' WebSocket transport is disabled)")
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
         raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
 

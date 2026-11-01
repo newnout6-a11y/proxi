@@ -1,4 +1,5 @@
 """Local administration: public build assets and authenticated, bounded APIs."""
+import contextlib
 import json
 import math
 import os
@@ -232,7 +233,13 @@ class Admin:
         if not path:
             raise apierr.service_unavailable("Relay settings have no writable configuration file")
         # Coordinate with renewal's read/merge/write to preserve rotated credentials.
-        with self.lock, self.runtime.backend.refresher._lock:
+        with self.lock, contextlib.ExitStack() as locks:
+            # Every account's refresher persists rotated cookies through the same
+            # file: hold all their locks, not only account 0's.
+            backends = getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]
+            for refresher_lock in {id(r._lock): r._lock for r in
+                                   (getattr(b, "refresher", None) for b in backends) if r}.values():
+                locks.enter_context(refresher_lock)
             saved = self._saved()
             desired = self._settings(saved)["settings"]
             candidate = {**desired, **changes}
