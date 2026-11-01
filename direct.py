@@ -7,11 +7,13 @@ context is billed once and reused, keeping time-to-first-token flat.
 import asyncio, hashlib, json, time, urllib.error, urllib.request
 
 import apierr
+import journal
+import models as model_catalog
 
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
-_ASSIST_ONLY = set()  # models proven to live only on the Assist list
-_CACHE_MIN_CHARS = 3000
+_ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
+_CACHE_MIN_CHARS = 0
 
 
 def loop_now():
@@ -69,17 +71,23 @@ def _param_schema(schema, required):
 
 
 def tools_to_retool(tools):
-    """Translate client function tools to the Retool tool declaration shape."""
+    """Translate client function tools to the Retool tool declaration shape with canonical ordering."""
     converted = []
-    for tool in tools or []:
+    sorted_tools = sorted(
+        tools or [],
+        key=lambda item: (item.get("function", {}).get("name") if isinstance(item, dict) and isinstance(item.get("function"), dict)
+                          else (item.get("name") if isinstance(item, dict) else "")) or ""
+    )
+    for tool in sorted_tools:
         function = tool.get("function") if isinstance(tool, dict) else None
         if not isinstance(function, dict) or not function.get("name"):
             continue
         params = {}
         schema = function.get("parameters") or {}
-        required = schema.get("required") or []
-        for name, sub in (schema.get("properties") or {}).items():
-            params[name] = _param_schema(sub, name in required)
+        required = set(schema.get("required") or [])
+        properties = schema.get("properties") or {}
+        for name in sorted(properties.keys()):
+            params[name] = _param_schema(properties[name], name in required)
         converted.append({"name": function["name"],
                           "description": (function.get("description") or "")[:1000],
                           "params": params, "strict": True})
@@ -114,6 +122,152 @@ def coerce_arguments(raw, params):
     return json.dumps(data, ensure_ascii=False) if changed else text
 
 
+def _coerce_value(value, spec):
+    """Coerce one string scalar like coerce_arguments; None when it stays a string."""
+    kind = spec.get("type") if isinstance(spec, dict) else None
+    if kind == "number":
+        try:
+            number = float(value) if "." in value else int(value)
+        except ValueError:
+            return None
+        return number if number == number and number not in (float("inf"), float("-inf")) else None
+    if kind == "boolean" and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    return None
+
+
+class ArgStream:
+    """Stream tool-call JSON as it arrives while keeping coerce_arguments' repairs.
+
+    Only a top-level string value of a number/boolean parameter is held until it
+    closes, then emitted coerced. Everything else (long string bodies, nested
+    values) passes through at once, so the emitted text is always a prefix of
+    the final arguments and clients can render the call while it is generated.
+    Anything unexpected switches to verbatim pass-through.
+    """
+
+    def __init__(self, params):
+        self.params = params or {}
+        self.state = "pre"
+        self.depth = 0
+        self.in_string = False
+        self.escape = False
+        self.key = []
+        self.held = None
+
+    def _coercible(self, raw_key):
+        try:
+            name = json.loads('"' + raw_key + '"')
+        except ValueError:
+            return False
+        spec = self.params.get(name)
+        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean")
+
+    def feed(self, chunk):
+        out = []
+        for char in chunk or "":
+            state = self.state
+            if state == "pass":
+                out.append(char)
+            elif state == "pre":
+                out.append(char)
+                if char == "{":
+                    self.depth, self.state = 1, "key"
+                elif not char.isspace():
+                    self.state = "pass"
+            elif state == "hold":
+                self.held.append(char)
+                if self.escape:
+                    self.escape = False
+                elif char == "\\":
+                    self.escape = True
+                elif char == '"':
+                    raw = "".join(self.held)
+                    self.held = None
+                    try:
+                        value = json.loads(raw)
+                    except ValueError:
+                        value = None
+                    coerced = _coerce_value(value, self.params.get(self.key_name)) if isinstance(value, str) else None
+                    out.append(raw if coerced is None else json.dumps(coerced))
+                    self.state = "after"
+            elif state == "keystr":
+                out.append(char)
+                if self.escape:
+                    self.escape = False
+                    self.key.append(char)
+                elif char == "\\":
+                    self.escape = True
+                    self.key.append(char)
+                elif char == '"':
+                    self.state = "colon"
+                else:
+                    self.key.append(char)
+            elif state == "key":
+                out.append(char)
+                if char == '"':
+                    self.key, self.state = [], "keystr"
+                elif char == "}":
+                    self.state = "done"
+                elif not char.isspace() and char != ",":
+                    self.state = "pass"
+            elif state == "colon":
+                out.append(char)
+                if char == ":":
+                    self.state = "value"
+                elif not char.isspace():
+                    self.state = "pass"
+            elif state == "value":
+                if char.isspace():
+                    out.append(char)
+                elif char == '"' and self._coercible("".join(self.key)):
+                    self.key_name = json.loads('"' + "".join(self.key) + '"')
+                    self.held, self.escape, self.state = ['"'], False, "hold"
+                else:
+                    out.append(char)
+                    self.state = "inval"
+                    self._track(char)
+            elif state == "inval":
+                out.append(char)
+                if not self.in_string and self.depth == 1 and char in ",}":
+                    self.state = "key" if char == "," else "done"
+                else:
+                    self._track(char)
+            elif state == "after":
+                out.append(char)
+                if char == ",":
+                    self.state = "key"
+                elif char == "}":
+                    self.state = "done"
+                elif not char.isspace():
+                    self.state = "pass"
+            else:  # done: trailing characters are relayed verbatim
+                out.append(char)
+        return "".join(out)
+
+    def _track(self, char):
+        if self.in_string:
+            if self.escape:
+                self.escape = False
+            elif char == "\\":
+                self.escape = True
+            elif char == '"':
+                self.in_string = False
+        elif char == '"':
+            self.in_string = True
+        elif char in "{[":
+            self.depth += 1
+        elif char in "}]":
+            self.depth -= 1
+
+    def finish(self):
+        """Flush a value left open by a truncated stream verbatim."""
+        if self.held is not None:
+            raw, self.held = "".join(self.held), None
+            return raw
+        return ""
+
+
 def cache_key_for(head):
     return hashlib.sha256(head.encode("utf-8")).hexdigest()[:24]
 
@@ -132,16 +286,28 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         if cache:
             block["cache"] = True
         messages.append({"role": "system", "content": [block]})
-    history = [str(part) for part in (chunks or []) if part]
+    history = [part for part in (chunks or []) if part]
     if not history:
         if prompt:
             messages.append({"role": "user", "content": prompt})
     else:
         for index, part in enumerate(history):
-            block = {"type": "text", "text": part}
-            if cfg.get("direct_cache", True) and index == len(history) - 1:
-                block["cache"] = True
-            messages.append({"role": "user", "content": [block]})
+            if isinstance(part, list):
+                blocks = [dict(b) if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in part]
+                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                    target = next((b for b in reversed(blocks) if b.get("type") == "text"), blocks[-1])
+                    target["cache"] = True
+                messages.append({"role": "user", "content": blocks})
+            elif isinstance(part, dict):
+                block = dict(part)
+                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                    block["cache"] = True
+                messages.append({"role": "user", "content": [block]})
+            else:
+                block = {"type": "text", "text": str(part)}
+                if cfg.get("direct_cache", True) and index == len(history) - 1:
+                    block["cache"] = True
+                messages.append({"role": "user", "content": [block]})
     body = {"model": model_provider.get("model"),
             "messages": messages,
             "rit": make_rit(messages, tools),
@@ -159,7 +325,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             (tool_choice or {}).get("function", {}).get("name") if isinstance(tool_choice, dict) else None)
         if choice and choice != "auto":
             body["toolChoice"] = choice
-    if cache:
+    if cache and head:
         body["openAICacheKey"] = cache_key_for(head)
     return body
 
@@ -183,7 +349,13 @@ def _ping(session, body):
     """Cheap request that re-reads the cached prefix so its TTL does not lapse."""
     payload = dict(body)
     payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
-    payload["reasoningEffort"] = "low"
+    model_name = payload.get("model")
+    entry = model_catalog._BY_ID.get(model_name)
+    levels = entry.get("reasoning_effort_levels") or () if entry else ()
+    if levels:
+        payload["reasoningEffort"] = "low" if "low" in levels else levels[0]
+    else:
+        payload["reasoningEffort"] = "low"
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                      data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
                                      headers=session.backend.headers(), method="POST")
@@ -202,17 +374,22 @@ async def _keepwarm(session, cfg):
         return
     idle = float(cfg.get("cache_keepwarm_idle", 1800) or 1800)
     while True:
-        await asyncio.sleep(interval)
-        body = getattr(session, "_warm_body", None)
-        if not body or getattr(session, "_busy", False):
-            continue
-        if time.time() - getattr(session, "_warm_at", 0) > idle:
-            return
         try:
+            await asyncio.sleep(interval)
+            last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
+            if time.time() - last_req > idle:
+                return
+            body = getattr(session, "_warm_body", None)
+            if not body or getattr(session, "_busy", False):
+                continue
             await asyncio.to_thread(_ping, session, body)
             session._warm_at = time.time()
+            journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
+                         thread=journal.tag(getattr(session, "thread_id", None)))
             if cfg.get("direct_debug"):
                 print("[warm] prefix refreshed", flush=True)
+        except asyncio.CancelledError:
+            return
         except Exception:
             return
 
@@ -239,6 +416,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 _ASSIST_ONLY.clear()
             _ASSIST_ONLY.add(model_provider.get("model"))
             print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
+            journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
+                         model=model_provider.get("model"))
             body = {key: value for key, value in body.items() if key != "metadata"}
             async for event in _stream_body(cfg, session, body, param_types):
                 yield event
@@ -247,6 +426,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         if body.get("openAICacheKey"):
             session._warm_body = body
             session._warm_at = time.time()
+            session._last_request_at = time.time()
             task = getattr(session, "_warm_task", None)
             if task is None or task.done():
                 session._warm_task = asyncio.create_task(_keepwarm(session, cfg))
@@ -255,8 +435,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 async def _stream_body(cfg, session, body, param_types=None):
     payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
     if cfg.get("direct_debug"):
-        print("[body]", json.dumps({k: v for k, v in body.items() if k != "messages"}, ensure_ascii=False), flush=True)
-        print("[msgs]", json.dumps(body["messages"], ensure_ascii=False)[:1500], flush=True)
+        body_summary = {k: v for k, v in body.items() if k not in ("messages", "tools")}
+        if "tools" in body:
+            body_summary["tools_count"] = len(body["tools"])
+        print("[body]", json.dumps(body_summary, ensure_ascii=False), flush=True)
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
     headers["accept"] = "application/json"
@@ -335,6 +517,7 @@ async def _stream_body(cfg, session, body, param_types=None):
 
 async def _drain(cfg, session, queue, text, thinking, param_types=None):
     started = loop_now()
+    think_started = None
     """Consume one attempt's NDJSON lines, yielding normalised events.
 
     Calls are keyed by id: a provider may interleave several tool calls in one
@@ -343,16 +526,27 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
     stack = []  # open calls, newest last; deltas belong to the newest open block
     calls = {}
     current = None
+    req_id = getattr(session, "thread_id", None) or "req"
     while True:
         if session._cancelled:
             yield {"type": "end", "reason": "cancelled"}
             return
-        item = await queue.get()
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            if think_started is not None and not text and not stack and not calls:
+                elapsed = loop_now() - think_started
+                print(f"[{req_id}] Model is actively reasoning... ({round(elapsed)}s elapsed)", flush=True)
+                journal.emit("upstream.thinking_heartbeat",
+                             f"Модель активно думает ({round(elapsed)} с)",
+                             "debug", elapsed=round(elapsed, 1), thread=journal.tag(req_id))
+                yield {"type": "thinking_heartbeat", "elapsed": round(elapsed, 1)}
+            continue
         if item is None:
             return
         if isinstance(item, BaseException):
             raise item
-        if cfg.get("direct_debug"):
+        if cfg.get("direct_raw"):
             print("[raw]", str(item)[:200], flush=True)
         try:
             event = json.loads(item)
@@ -360,10 +554,20 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
             continue
         kind = event.get("event")
         if kind == "content_block_start":
-            if event.get("type") == "tool_call":
+            if event.get("type") == "thinking":
+                # Opus 5.5 streams no thinking text, only this early start and a final
+                # signature; surfacing the start replaces silence with "thinking".
+                think_started = loop_now()
+                yield {"type": "thinking_start"}
+            elif event.get("type") == "tool_call":
+                think_started = None
                 current = event.get("toolCallId") or "call_%d" % len(calls)
-                calls[current] = {"id": event.get("toolCallId"), "name": event.get("toolName"), "args": []}
+                calls[current] = {"id": event.get("toolCallId"), "name": event.get("toolName"), "args": [],
+                                  "out": "", "stream": ArgStream((param_types or {}).get(event.get("toolName")))}
                 stack.append(current)
+                # Announce the call immediately so clients render it while arguments generate.
+                yield {"type": "tool_call", "id": event.get("toolCallId"), "name": event.get("toolName"),
+                       "arguments": "", "partial": True}
         elif kind == "content_block_delta":
             block = event.get("type")
             if block == "text":
@@ -374,31 +578,51 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None):
                     text.append(piece)
                     yield {"type": "text", "delta": piece}
             elif block == "thinking":
+                if think_started is None:
+                    think_started = loop_now()
                 piece = event.get("partialThinking") or ""
                 if piece:
                     thinking.append(piece)
                     yield {"type": "thinking", "delta": piece}
             elif block == "signature":
+                think_started = None
                 if event.get("partialSignature"):
                     yield {"type": "thinking_signature", "signature": event["partialSignature"]}
             elif block == "tool_call" and current in calls:
-                calls[current]["args"].append(event.get("partialInputs") or "")
+                call = calls[current]
+                piece = event.get("partialInputs") or ""
+                call["args"].append(piece)
+                emitted = call["stream"].feed(piece)
+                if emitted:
+                    call["out"] += emitted
+                    yield {"type": "tool_call", "id": call["id"], "name": call["name"],
+                           "arguments": call["out"], "partial": True}
         elif kind == "content_block_end":
             key = stack.pop() if stack else current
             call = calls.pop(key, None) if key is not None else None
             if call is not None:
-                yield {"type": "tool_call", "id": call["id"], "name": call["name"],
-                       "arguments": coerce_arguments(
-                           "".join(call["args"]), (param_types or {}).get(call["name"]))}
+                streamed = call["out"] + call["stream"].finish()
+                raw = "".join(call["args"])
+                # The streamed text is already coerced; fall back for non-JSON or empty input.
+                try:
+                    json.loads(streamed)
+                    final = streamed
+                except ValueError:
+                    final = coerce_arguments(raw, (param_types or {}).get(call["name"]))
+                yield {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": final}
             current = stack[-1] if stack else None
         elif kind == "metadata":
             usage = event.get("usage") or {}
-            if cfg.get("direct_debug"):
+            if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 print("[cache] in=%s read=%s write=%s credits=%s" % (
                     usage.get("inputTokens"), usage.get("promptTokensReadFromCache"),
                     usage.get("promptTokensWrittenToCache"), usage.get("creditsUsed")), flush=True)
             if usage.get("creditsUsed") is not None:
-                yield {"type": "credits", "value": float(usage["creditsUsed"])}
+                yield {"type": "credits", "value": float(usage["creditsUsed"]),
+                       "usage": {"input_tokens": usage.get("inputTokens"),
+                                 "output_tokens": usage.get("outputTokens"),
+                                 "cache_read": usage.get("promptTokensReadFromCache"),
+                                 "cache_write": usage.get("promptTokensWrittenToCache")}}
         elif kind == "error":
             raise _error_from_event(event)
 

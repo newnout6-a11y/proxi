@@ -48,6 +48,9 @@ DEFAULTS = {
     "enable_anthropic": True,
     "enable_chat": True,
     "show_thinking": True,
+    # OpenAI-compatible clients open a reasoning view only on non-empty text; Opus 5.5
+    # reasons silently, so this label is shown when thinking starts ("" disables it).
+    "thinking_placeholder": "Модель думает…\n",
     "enable_responses": True,
     "reasoning_effort": "auto",
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
@@ -99,12 +102,35 @@ def persist_auth(cfg):
     if not path or not cfg.get("_persist_auth", False):
         return
     saved = _read_file(path)
-    if saved.get("base", "").rstrip("/") != cfg["base"].rstrip("/"):
+    acc_match = None
+    if isinstance(saved.get("accounts"), list):
+        for acc in saved["accounts"]:
+            if isinstance(acc, dict):
+                if cfg.get("page_uuid") and acc.get("page_uuid") == cfg.get("page_uuid"):
+                    acc_match = acc
+                    break
+                elif not cfg.get("page_uuid") and acc.get("base", "").rstrip("/") == cfg["base"].rstrip("/"):
+                    acc_match = acc
+                    break
+    expected_base = (acc_match.get("base") if acc_match and acc_match.get("base") else saved.get("base", "")).rstrip("/")
+    if expected_base != cfg["base"].rstrip("/"):
         raise ValueError("session configuration origin changed")
-    disk_auth = (saved.get("cookie"), saved.get("xsrf"))
+    disk_auth = (acc_match.get("cookie"), acc_match.get("xsrf")) if acc_match else (saved.get("cookie"), saved.get("xsrf"))
     if disk_auth != cfg.get("_disk_auth", disk_auth):
         raise ValueError("session configuration changed during renewal")
-    saved.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
+    if not saved.get("accounts") or (not acc_match and cfg.get("page_uuid") == saved.get("page_uuid")):
+        saved.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
+    if isinstance(saved.get("accounts"), list):
+        for acc in saved["accounts"]:
+            if isinstance(acc, dict):
+                if cfg.get("page_uuid") and acc.get("page_uuid") == cfg.get("page_uuid"):
+                    acc["cookie"] = cfg["cookie"]
+                    acc["xsrf"] = cfg["xsrf"]
+                    break
+                elif not cfg.get("page_uuid") and acc.get("base", "").rstrip("/") == cfg["base"].rstrip("/"):
+                    acc["cookie"] = cfg["cookie"]
+                    acc["xsrf"] = cfg["xsrf"]
+                    break
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
@@ -126,12 +152,26 @@ def reload_auth(cfg):
     if not cfg.get("_config_path") or not cfg.get("_persist_auth", False):
         return False
     saved = _read_file(cfg["_config_path"])
-    if (saved.get("base", "").rstrip("/") != cfg["base"].rstrip("/")
-            or not saved.get("cookie") or not saved.get("xsrf")
-            or (saved["cookie"], saved["xsrf"]) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"]))):
+    acc_match = None
+    if isinstance(saved.get("accounts"), list):
+        for acc in saved["accounts"]:
+            if isinstance(acc, dict):
+                if cfg.get("page_uuid") and acc.get("page_uuid") == cfg.get("page_uuid"):
+                    acc_match = acc
+                    break
+                elif not cfg.get("page_uuid") and acc.get("base", "").rstrip("/") == cfg["base"].rstrip("/"):
+                    acc_match = acc
+                    break
+    target = acc_match if acc_match is not None else saved
+    base = target.get("base") or saved.get("base", "")
+    cookie = target.get("cookie")
+    xsrf = target.get("xsrf")
+    if (base.rstrip("/") != cfg["base"].rstrip("/")
+            or not cookie or not xsrf
+            or (cookie, xsrf) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"]))):
         return False
-    cfg.update(cookie=saved["cookie"], xsrf=saved["xsrf"], _disk_auth=(saved["cookie"], saved["xsrf"]),
-               cookie_values=[p.strip().split("=", 1)[1] for p in saved["cookie"].split(";") if "=" in p])
+    cfg.update(cookie=cookie, xsrf=xsrf, _disk_auth=(cookie, xsrf),
+               cookie_values=[p.strip().split("=", 1)[1] for p in cookie.split(";") if "=" in p])
     return True
 
 
@@ -191,6 +231,25 @@ def load(path=CONFIG_PATH):
     if cfg["rate_limit_rps"] < 0 or cfg["rate_limit_burst"] <= 0:
         raise service_unavailable("rate_limit_rps must be non-negative and rate_limit_burst must be positive")
 
+    accounts = cfg.get("accounts")
+    if accounts is not None:
+        if not isinstance(accounts, list) or not accounts:
+            raise service_unavailable("'accounts' must be a non-empty array")
+        for i, acc in enumerate(accounts):
+            if not isinstance(acc, dict):
+                raise service_unavailable(f"account #{i} must be an object")
+            acc_missing = [k for k in ("cookie", "xsrf", "base", "page_uuid") if not acc.get(k)]
+            if acc_missing:
+                raise service_unavailable(f"account #{i} is missing required credentials: " + ", ".join(acc_missing))
+        if not cfg.get("base") and accounts:
+            cfg["base"] = accounts[0]["base"]
+        if not cfg.get("page_uuid") and accounts:
+            cfg["page_uuid"] = accounts[0]["page_uuid"]
+        if not cfg.get("cookie") and accounts:
+            cfg["cookie"] = accounts[0]["cookie"]
+        if not cfg.get("xsrf") and accounts:
+            cfg["xsrf"] = accounts[0]["xsrf"]
+
     missing = [k for k in REQUIRED if not cfg.get(k)]
     if missing:
         raise service_unavailable("config is missing required keys: " + ", ".join(missing))
@@ -215,10 +274,20 @@ def load(path=CONFIG_PATH):
 
     cfg["relay_api_key"] = _ensure_relay_key(cfg)
     # Mask cookie secrets, but not plain host names (else the subdomain gets hidden).
-    cfg["cookie_values"] = [
-        seg.split("=", 1)[1]
-        for seg in cfg["cookie"].split("; ")
-        if "=" in seg and not HOSTNAME.fullmatch(seg.split("=", 1)[1])
-    ]
+    cookie_strings = []
+    if cfg.get("cookie"):
+        cookie_strings.append(cfg["cookie"])
+    if isinstance(cfg.get("accounts"), list):
+        for acc in cfg["accounts"]:
+            if isinstance(acc, dict) and acc.get("cookie"):
+                cookie_strings.append(acc["cookie"])
+    cookie_vals = []
+    for c_str in cookie_strings:
+        for seg in c_str.split("; "):
+            if "=" in seg:
+                val = seg.split("=", 1)[1]
+                if val and not HOSTNAME.fullmatch(val) and val not in cookie_vals:
+                    cookie_vals.append(val)
+    cfg["cookie_values"] = cookie_vals
     cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
     return cfg

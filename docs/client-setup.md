@@ -1,5 +1,68 @@
 # Coding clients
 
+## OpenCode
+
+OpenCode Desktop and CLI configure custom providers via `~/.config/opencode/opencode.jsonc` (or project-level `opencode.json`).
+
+The relay runs at `http://127.0.0.1:8787/v1` under `@ai-sdk/openai-compatible`.
+
+Example provider configuration with custom reasoning effort variants:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "retool-relay": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Retool relay",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "relay-..."
+      },
+      "models": {
+        "claude-opus-5-5": {
+          "name": "Claude Opus 5.5",
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "tool_call": true,
+          "attachment": true,
+          "reasoning": true,
+          "variants": {
+            "low": { "name": "Low", "reasoningEffort": "low", "settings": { "reasoningEffort": "low" } },
+            "medium": { "name": "Medium", "reasoningEffort": "medium", "settings": { "reasoningEffort": "medium" } },
+            "high": { "name": "High", "reasoningEffort": "high", "settings": { "reasoningEffort": "high" } },
+            "max": { "name": "Max", "reasoningEffort": "max", "settings": { "reasoningEffort": "max" } }
+          }
+        },
+        "gpt-6.1": {
+          "name": "GPT 6.1",
+          "limit": {
+            "context": 1050000,
+            "output": 128000
+          },
+          "tool_call": true,
+          "attachment": true,
+          "reasoning": true,
+          "variants": {
+            "low": { "name": "Low", "reasoningEffort": "low", "settings": { "reasoningEffort": "low" } },
+            "medium": { "name": "Medium", "reasoningEffort": "medium", "settings": { "reasoningEffort": "medium" } },
+            "high": { "name": "High", "reasoningEffort": "high", "settings": { "reasoningEffort": "high" } },
+            "xhigh": { "name": "Extra High", "reasoningEffort": "xhigh", "settings": { "reasoningEffort": "xhigh" } },
+            "max": { "name": "Max", "reasoningEffort": "max", "settings": { "reasoningEffort": "max" } }
+          }
+        }
+      }
+    }
+  },
+  "model": "retool-relay/claude-opus-5-5"
+}
+```
+
+> [!NOTE]
+> OpenCode requires the `variants` field to be a dictionary/object mapping variant IDs to their configuration (`{ "id": { ... } }`). Passing an array (`[ ... ]`) causes schema validation failure and skips loading the provider.
+
 ## DeepSeek Harness
 
 The Desktop shortcut `DeepSeek Harness.lnk` launches the installed
@@ -79,8 +142,7 @@ Validation used the installed Harness 0.1.5-rc.2 adapter against local mock SSE:
 the same relay key authenticated, a reasoning delta became a Harness reasoning
 block, and `get_goal` became a normal tool-call block. These mock summaries
 verify transport behavior; they are not evidence that the upstream always emits
-thinking. Text-only input is advertised because this relay does not forward
-image attachments.
+thinking. Multimodal image inputs are supported and forwarded for vision-capable models (e.g. Claude Opus 5.5, Sonnet 5, GPT-5.5) on the direct transport.
 
 The installed adapter also passed a real Retool request: Claude Opus 5.5 returned
 `get_goal`, arguments `{}`, finish `tool-calls`, in 26.37 seconds. This verified

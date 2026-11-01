@@ -13,6 +13,8 @@ commands.log
 relay.log
 relay.pid
 crash.log
+journal.jsonl
+journal.jsonl.1
 .session-*.tmp
 .pytest_cache/
 probes/chunks/
@@ -22,3 +24,12 @@ probes/chunks/
 /probes/
 /r.txt
 /logs/
+
+# Frontend dependencies and generated source tokens (distribution is shipped).
+/web/node_modules/
+/web/src/tokens.css
+/web/test-results/
+/web/playwright-report/
+
+# agent scratch work
+.agents/

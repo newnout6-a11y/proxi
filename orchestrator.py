@@ -13,6 +13,7 @@ import uuid
 
 import apierr
 import executor
+import journal
 import models as model_catalog
 from context import build_system_instructions
 from redact import redact
@@ -32,6 +33,14 @@ def _b(text: str) -> int:
     return len((text or "").encode("utf-8"))
 
 
+def _preview(value, limit=600):
+    """Compact, bounded rendering of tool arguments for the journal."""
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _trim(text: str, budget: int) -> str:
     if budget <= 0 or not text:
         return ""
@@ -40,9 +49,6 @@ def _trim(text: str, budget: int) -> str:
         return text
     return raw[:budget].decode("utf-8", "ignore")
 
-
-# Models the direct copilot path rejects but the agent path still serves.
-_DIRECT_UNSUPPORTED = re.compile(r"not available right now|Invalid model for Copilot", re.IGNORECASE)
 
 
 class _ClientText:
@@ -53,6 +59,7 @@ class _ClientText:
     def __init__(self):
         self.pending = ""
         self.closing = None
+        self.suppressed = ""
         self.leading_space = ""
         self.visible = False
 
@@ -64,24 +71,33 @@ class _ClientText:
             if self.closing:
                 end = lowered.find(self.closing)
                 if end < 0:
-                    # Keep just enough tail to recognize a fragmented closing tag.
-                    self.pending = self.pending[-len(self.closing) + 1:]
+                    keep = len(self.closing) - 1
+                    if len(self.pending) > keep:
+                        self.suppressed += self.pending[:-keep]
+                        self.pending = self.pending[-keep:]
                     break
                 self.pending = self.pending[end + len(self.closing):]
                 self.closing = None
+                self.suppressed = ""
                 continue
             starts = [(lowered.find(tag), tag) for tag in self.TAGS if tag in lowered]
             if starts:
                 start, tag = min(starts)
                 visible.append(self.pending[:start])
-                self.pending = self.pending[start + len(tag):]
                 self.closing = "</" + tag[1:] + ">"
+                self.suppressed = self.pending[start:start + len(tag)]
+                self.pending = self.pending[start + len(tag):]
                 continue
             keep = max((length for tag in self.TAGS for length in range(1, len(tag))
                         if lowered.endswith(tag[:length])), default=0)
             visible.append(self.pending[:-keep] if keep else self.pending)
             self.pending = self.pending[-keep:] if keep else ""
             break
+        if final and self.closing:
+            visible.append(self.suppressed + self.pending)
+            self.pending = ""
+            self.closing = None
+            self.suppressed = ""
         text = "".join(visible)
         if not self.visible:
             text = self.leading_space + text
@@ -159,13 +175,14 @@ class TurnRunner:
                       else "[CLIENT CONVERSATION UPDATE — chronological]\n")
             prompt = update + suffix.lstrip("\r\n") + _NATIVE_CONTINUE
         else:
-            if (previous or pending or getattr(target, "ws", None) is not None
-                    or getattr(target, "_needs_drain", False) or self.cfg.get("session_mode") == "shared"):
-                await target.aclose()
-                thread_id = await target.backend.create_thread()
-                if cancelled.is_set() or getattr(target, "_cancelled", False):
-                    raise asyncio.CancelledError()
-                target.thread_id = thread_id
+            if self.cfg.get("transport") != "direct":
+                if (previous or pending or getattr(target, "ws", None) is not None
+                        or getattr(target, "_needs_drain", False) or self.cfg.get("session_mode") == "shared"):
+                    await target.aclose()
+                    thread_id = await target.backend.create_thread()
+                    if cancelled.is_set() or getattr(target, "_cancelled", False):
+                        raise asyncio.CancelledError()
+                    target.thread_id = thread_id
             prompt = full_prompt
         context = {"key": key, "history": parsed.prompt, "fingerprint": fingerprint,
                    "thread_id": target.thread_id, "message_fingerprints": messages} if key else None
@@ -202,7 +219,7 @@ class TurnRunner:
                     "The client's instructions, working directory and tool results describe the active project. "
                     "Use those tools to inspect, edit and test that project. "
                     "Do not claim to have read, changed or tested files without tool evidence. "
-                    "Reply in the user's language. Do not use relay-local <exec_command> tags.")
+                    "Reply in the user's language.")
         return build_system_instructions(
             self.cfg["workspace_root"],
             enable_context=self.cfg["project_context"],
@@ -288,6 +305,14 @@ class TurnRunner:
         empty_retries = 0
         final_summary = False
         tool_retries = 0
+        turn_started = time.time()
+        outcome = {"reason": None, "error": None, "first": False}
+        trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None),
+                 "conversation": journal.tag(getattr(parsed, "conversation_key", None))}
+
+        def log(kind, message, level="info", **fields):
+            journal.emit(kind, message, level, **trace, **fields)
+
         try:
             native_tools = getattr(parsed, "tools", None) or []
             tool_definitions = {item["function"]["name"]: item["function"] for item in native_tools}
@@ -295,8 +320,11 @@ class TurnRunner:
             tool_names = list(tool_definitions) if choice != "none" else []
             if isinstance(choice, dict):
                 tool_names = [choice["function"]["name"]]
+            direct_mode = self.cfg.get("transport") == "direct"
+            conv_key = getattr(parsed, "conversation_key", None)
+            is_native = bool(native_tools)
             instructions = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._instructions(native_tools=bool(native_tools)))
+                None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
                 raise asyncio.CancelledError()
             reminder = ""
@@ -311,7 +339,6 @@ class TurnRunner:
                 )
             if parsed.system:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
-            direct_mode = self.cfg.get("transport") == "direct"
             if direct_mode and native_tools:
                 reminder = self._tool_prompt_native(parsed)
             if direct_mode:
@@ -346,21 +373,36 @@ class TurnRunner:
                         configured = parsed.entry.get("default_reasoning_effort") or (
                             "medium" if not levels or "medium" in levels else levels[0])
                 if configured is not None:
-                    _, effort = model_catalog.resolve(parsed.model, configured)
+                    _, effort = model_catalog.resolve_tolerant(
+                        parsed.model, configured, strict=self.cfg.get("strict_models", True),
+                        default_model=self.cfg.get("model"))
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
+            log("turn.begin", "Ход %s · effort %s · %s" % (parsed.model, effort or "—",
+                                                          "direct" if direct_mode else "agent"),
+                model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
+                dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
+                tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
+                prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
+                messages=len(getattr(parsed, "message_chunks", None) or []))
 
             base_prompt = self._check_prompt(prompt)
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
-                if key and not native_tools:
-                    # Tool-less calls supply their complete history. Affinity alone
+                can_exec = self._can_exec(0) and not native_tools
+                if not direct_mode and key and not native_tools and not can_exec:
+                    # Tool-less calls in agent mode supply their complete history. Affinity alone
                     # must not add prior standalone jobs to that client context.
                     session = await self.pool.acquire(key, isolated=True)
                 else:
                     session = await self.pool.acquire(key) if key else await self.pool.acquire()
                 holder["session"] = session
+                acquired = session.session if isinstance(session, SessionLease) else session
+                log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
+                    "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
+                    isolated=bool(key and not native_tools), mode=self.cfg.get("session_mode"),
+                    wait_ms=round((time.time() - turn_started) * 1000))
                 native_target, native_context = None, None
                 if native_tools:
                     prompt, native_target, native_context = await self._native_prompt(
@@ -373,8 +415,9 @@ class TurnRunner:
                     # Preserve legacy anonymous shared-mode invalidation. Explicit
                     # tool-less requests never acquire or mutate the native session.
                     target = session.session if isinstance(session, SessionLease) else session
-                    if getattr(target, "_client_context", None):
+                    if not direct_mode and getattr(target, "_client_context", None):
                         target._client_context_pending = True
+                exec_chunks = []
                 while True:
                     self._check_prompt(prompt)
                     if cancelled.is_set():
@@ -400,26 +443,71 @@ class TurnRunner:
                     if direct_mode:
                         if instructions and stream_prompt.startswith(instructions):
                             stream_prompt = stream_prompt[len(instructions):]
-                        chunks = list(getattr(parsed, "message_chunks", None) or [])
-                        if chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
+                        chunks = list(getattr(parsed, "message_chunks", None) or ([parsed.prompt] if getattr(parsed, "prompt", None) else []))
+                        if exec_chunks:
+                            if stream_prompt and len(stream_prompt.strip()) < len(exec_chunks[-1]):
+                                exec_chunks[-1] = stream_prompt.strip()
+                            chunks.extend(exec_chunks)
+                        elif last_followup:
+                            chunks.append(stream_prompt.strip())
+                        elif chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
+
+                        tools_converted = direct.tools_to_retool(parsed.tools) if native_tools else []
+                        if hasattr(direct_target, "register_tools"):
+                            direct_target.register_tools(tools_converted)
+
+                        if native_tools:
+                            final_tools = direct_target.get_canonical_tools() if (
+                                hasattr(direct_target, "has_tools") and direct_target.has_tools()) else tools_converted
+                            final_choice = getattr(parsed, "tool_choice", "auto")
+                            final_head = instructions
+                        else:
+                            # Tool-less requests (such as title generation, /compact, /goal Stop hook)
+                            # Align head and tools with the cached prefix so it does not invalidate openAICacheKey
+                            cached_head = getattr(direct_target, "_cached_head", None)
+                            final_head = cached_head if cached_head else instructions
+                            if hasattr(direct_target, "has_tools") and direct_target.has_tools():
+                                final_tools = direct_target.get_canonical_tools()
+                                final_choice = "none"
+                            else:
+                                final_tools = None
+                                final_choice = "none"
+
                         direct_target.set_direct(
-                            instructions,
-                            direct.tools_to_retool(parsed.tools) if tool_names else None,
-                            getattr(parsed, "tool_choice", "auto"), getattr(parsed, "max_tokens", None),
+                            final_head,
+                            final_tools,
+                            final_choice,
+                            getattr(parsed, "max_tokens", None),
                             chunks)
                     stream = (session.stream(stream_prompt, model_provider, tool_names=tool_names)
                               if native_tools else session.stream(stream_prompt, model_provider))
+                    log("upstream.request", "Запрос к upstream (%s)" % ("direct" if direct_mode else "agent"),
+                        "debug", transport="direct" if direct_mode else "agent",
+                        prompt_chars=len(stream_prompt or ""), attempt=empty_retries + tool_retries + exec_steps + 1)
+                    first_token = False
+                    think_started = None
+                    tool_started = {}
                     try:
                         async for event in stream:
+                            if not first_token and event["type"] in ("text", "thinking", "tool_call"):
+                                first_token = True
+                                ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                log("upstream.first_token", "Первый токен через %d мс" % ttft,
+                                    "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
                             if event["type"] == "text":
+                                if not upstream_text:
+                                    ms = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                    log("upstream.text_start", "Модель начала писать текст через %d мс" % ms,
+                                        "debug", ms=ms)
                                 final_text += event["delta"]
                                 upstream_text += event["delta"]
                                 # Tool envelopes are parsed only after the complete
                                 # upstream turn, so do not leak their markup to a
                                 # native client. Ordinary text remains streamed.
-                                if not native_tools:
+                                if direct_mode or not native_tools:
                                     out.put(event)
+                                    visible_text += event["delta"]
                                 else:
                                     visible = native_text.feed(event["delta"])
                                     if visible:
@@ -428,14 +516,45 @@ class TurnRunner:
                             elif event["type"] == "final_text":
                                 if event.get("text"):
                                     final_text = event["text"]
+                            elif event["type"] == "thinking_start":
+                                think_started = time.time()
+                                ms = round((think_started - holder["upstream_started_at"]) * 1000)
+                                log("upstream.thinking_start", "Модель начала думать через %d мс" % ms, "info",
+                                    ms=ms)
+                                out.put(event)
                             elif event["type"] in ("thinking", "thinking_signature"):
+                                if event["type"] == "thinking_signature" and think_started:
+                                    span = round((time.time() - think_started) * 1000)
+                                    log("upstream.thinking_end", "Мышление заняло %d мс" % span, "info",
+                                        thinking_ms=span)
+                                    think_started = None
+                                out.put(event)
+                            elif event["type"] == "thinking_heartbeat":
                                 out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
-                                streamed_tool_call = True
+                                if not event.get("partial"):
+                                    streamed_tool_call = True
                                 definition = tool_definitions[event["name"]]
-                                out.put({**event, "tool_type": definition.get("x-client-type", "function")})
+                                call_key = event.get("id") or event["name"]
+                                if call_key not in tool_started:
+                                    tool_started[call_key] = time.time()
+                                    ms = round((tool_started[call_key] - holder["upstream_started_at"]) * 1000)
+                                    log("upstream.tool_start", "Модель начала вызов %s через %d мс" % (event["name"], ms),
+                                        "debug", name=event["name"], call_id=event.get("id"), ms=ms)
+                                if not event.get("partial"):
+                                    args_ms = round((time.time() - tool_started[call_key]) * 1000)
+                                    log("tool.call", "Инструмент клиента: %s (аргументы %d мс)" % (event["name"], args_ms),
+                                        "info", name=event["name"], call_id=event.get("id"),
+                                        arguments=_preview(event.get("arguments")), streamed=True,
+                                        args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
+                                out.put({key: value for key, value in event.items() if key != "partial"}
+                                        | {"tool_type": definition.get("x-client-type", "function")})
                             elif event["type"] == "credits":
                                 self.credits.record_turn(turn_id, event["value"])
+                                usage = event.get("usage") or {}
+                                log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s" % (
+                                    event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—")),
+                                    "info", credits=event["value"], **usage)
                                 out.put(event)
                             elif event["type"] == "hitl":
                                 out.put(event)
@@ -444,13 +563,7 @@ class TurnRunner:
                                 holder["reason"] = event["reason"]
                                 upstream_completed = event["reason"] in ("stop", "tool_calls")
                     except apierr.ApiError as exc:
-                        if not (direct_mode and exc.status == 400
-                                and _DIRECT_UNSUPPORTED.search(exc.message or "")):
-                            raise
-                        # The model exists but not on this path: retry over the agent socket.
-                        direct_mode = False
-                        prompt = instructions + "\n\n" + prompt
-                        continue
+                        raise
                     holder.setdefault("reason", "stop")
                     if holder.get("reason") == "cancelled":
                         out.put({"type": "end", "reason": "cancelled"})
@@ -459,8 +572,8 @@ class TurnRunner:
                         out.put({"type": "end", "reason": "timeout"})
                         return
 
-                    native_calls = executor.extract_tool_calls(final_text, tool_names) if tool_names else []
-                    if not native_calls and tool_names:
+                    native_calls = (executor.extract_tool_calls(final_text, tool_names) if tool_names else []) if not direct_mode else []
+                    if not direct_mode and not native_calls and tool_names:
                         command_call = executor.command_tool_call(final_text, tool_names)
                         if command_call is not None:
                             native_calls = [command_call]
@@ -468,6 +581,9 @@ class TurnRunner:
                         if not streamed_tool_call:
                             for native_call in native_calls:
                                 definition = tool_definitions[native_call["name"]]
+                                log("tool.call", "Инструмент клиента: %s" % native_call["name"], "info",
+                                    name=native_call["name"], call_id=native_call.get("id"),
+                                    arguments=_preview(native_call.get("arguments")), streamed=False)
                                 out.put({"type": "tool_call", **native_call,
                                          "tool_type": definition.get("x-client-type", "function")})
                         holder["reason"] = "tool_calls"
@@ -479,9 +595,9 @@ class TurnRunner:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "tool_calls"})
                         return
-                    if native_tools and re.search(r"<(?:tool_call|exec_command)\b", final_text, re.IGNORECASE):
+                    if not direct_mode and native_tools and not visible_text.strip() and re.search(r"<tool_call\b", final_text, re.IGNORECASE):
                         raise apierr.upstream_error("upstream returned a malformed or disallowed client tool call")
-                    if native_tools:
+                    if native_tools and not direct_mode:
                         # Some upstream transports only provide a final snapshot.
                         # Feed its unstreamed suffix once instead of duplicating it.
                         suffix = (final_text[len(upstream_text):]
@@ -495,7 +611,10 @@ class TurnRunner:
                         r"no (?:access|tools)|не (?:могу|доступ|имею)|нет доступа)", final_text, re.IGNORECASE)
                     if tool_names and refuses_tools and tool_retries < 1 and not visible_text.strip():
                         tool_retries += 1
-                        native_context = None  # Retry prompts are not part of the client history.
+                        log("turn.retry", "Модель отказалась от инструментов — повтор с коррекцией", "warn",
+                            reason="tool_refusal")
+                        if not direct_mode:
+                            native_context = None  # Retry prompts are not part of the client history in agent mode.
                         prompt = (base_prompt + "\n\n[CLIENT TOOL TRANSPORT CORRECTION]\n"
                                   "Your previous reply treated the client's tools as unavailable. "
                                   "Invoke a supplied tool using <tool_call> JSON instead of Retool sandbox tools. "
@@ -521,6 +640,8 @@ class TurnRunner:
                     # Loop guard: the same command keeps coming back (any period).
                     if command and not final_summary and self._looks_looping(command, recent):
                         final_summary = True
+                        log("exec.loop_guard", "Команда повторяется — исполнение остановлено", "warn",
+                            command=command[:300])
                         summary = ("\n\n[ИТОГ] Команда '" + command + "' повторяется. "
                                    "Команды больше не выполняй, дай итоговый ответ.")
                         prompt = (self._followup(instructions, reminder + summary, *last_followup)
@@ -536,7 +657,9 @@ class TurnRunner:
                     if not command and not final_text.strip() and empty_retries < 1:
                         # Silent turn: insist once, keeping the full system prompt.
                         empty_retries += 1
-                        native_context = None  # Retry prompts are not part of the client history.
+                        log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
+                        if not direct_mode:
+                            native_context = None  # Retry prompts are not part of the client history in agent mode.
                         prompt = (base_prompt + "\n\n[RETRY] Предыдущий ход вернул пустой ответ. "
                                   "Ответь сейчас: нужна команда — выведи <exec_command>...</exec_command>, "
                                   "иначе дай короткий текстовый ответ.")
@@ -548,11 +671,16 @@ class TurnRunner:
 
                     if not can_exec or not command:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
+                        if direct_mode and native_target is not None and upstream_completed and not cancelled.is_set():
+                            native_target._client_context_pending = False
                         out.put({"type": "end", "reason": holder.get("reason", "stop")})
                         return
 
                     if self.cfg["show_exec_output"]:
                         out.put({"type": "exec_start", "cmd": command})
+                    log("exec.start", "Локальная команда: %s" % command[:160], "info",
+                        command=command[:2000], policy=self.cfg["exec_policy"], step=exec_steps + 1)
+                    exec_started = time.time()
 
                     try:
                         code, output = await asyncio.get_running_loop().run_in_executor(
@@ -574,6 +702,11 @@ class TurnRunner:
                         raise asyncio.CancelledError()
                     output = redact(output, cookie_values=self.cfg.get("cookie_values", ()))
                     exec_steps += 1
+                    log("exec.result", "Команда завершилась с кодом %s" % code,
+                        "success" if code == 0 else "warn" if code == 126 else "error",
+                        command=command[:2000], exit=code, output=(output or "")[:1500],
+                        output_chars=len(output or ""), duration_ms=round((time.time() - exec_started) * 1000),
+                        blocked=code == 126)
 
                     if self.cfg["show_exec_output"]:
                         out.put({"type": "exec_result", "cmd": command, "output": output, "exit": code})
@@ -590,16 +723,33 @@ class TurnRunner:
 
                     header = task_block + "\n\nPrevious steps: " + trail
                     last_followup = (command, code, output, header)
+                    followup_text = executor.format_command_followup(command, code, output, header)
+                    exec_chunks.append(followup_text)
                     prompt = self._followup(instructions, reminder, *last_followup)
             finally:
                 if session is not None:
                     await self.pool.release(session)
         except apierr.ApiError as err:
+            outcome["error"] = err
             out.put({"type": "error", "error": err})
         except asyncio.CancelledError:
+            outcome["reason"] = "cancelled"
             out.put({"type": "end", "reason": "cancelled"})
             raise
         except Exception as exc:  # defensive: never mask a crash as success
-            out.put({"type": "error", "error": apierr.internal(str(exc))})
+            outcome["error"] = apierr.internal(str(exc))
+            out.put({"type": "error", "error": outcome["error"]})
         finally:
+            duration = round((time.time() - turn_started) * 1000)
+            err = outcome["error"]
+            if err is not None:
+                log("turn.error", "%s: %s" % (err.code, (err.message or "")[:300]), "error",
+                    status=err.status, code=err.code)
+                reason = "error"
+            else:
+                reason = outcome["reason"] or holder.get("reason") or "stop"
+            log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
+                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout") else "success",
+                reason=reason, duration_ms=duration, exec_steps=exec_steps,
+                retries=empty_retries + tool_retries)
             out.put(None)

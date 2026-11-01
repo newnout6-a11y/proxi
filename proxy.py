@@ -13,12 +13,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import adapters
+import admin as admin_module
 import apierr
 import auth
+import journal
 from redact import redact
 import config as config_module
 import models as model_catalog
 import sse
+import models
 import validate
 from credits import CreditsManager
 from orchestrator import TurnRunner
@@ -60,10 +63,17 @@ class Runtime:
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.backend = Backend(cfg)
         self.pool = SessionPool(self.backend)
-        self.credits = CreditsManager(cfg["base"], lambda: auth.upstream_headers(cfg), self.backend.refresher)
+        if getattr(self.pool, "backends", None):
+            self.backend = self.pool.backend
+        self.credits = CreditsManager(self.backend.cfg.get("base", cfg.get("base")),
+                                      lambda: auth.upstream_headers(self.backend.cfg),
+                                      self.backend.refresher)
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
+        self.journal = journal.JOURNAL
+        self.journal.configure(cfg, cfg.get("journal_path"))
+        self.admin = admin_module.Admin(self)
 
 
 ROUTES = {
@@ -92,6 +102,9 @@ def make_handler(runtime: Runtime):
 
         # -- helpers ------------------------------------------------------
         def _cors(self):
+            if admin_module.is_admin_path(urlparse(self.path).path):
+                admin_module.security_headers(self)
+                return
             self.send_header("access-control-allow-origin", "*")
             self.send_header("access-control-allow-headers",
                              "authorization, x-api-key, anthropic-version, anthropic-beta, content-type, "
@@ -142,12 +155,28 @@ def make_handler(runtime: Runtime):
         def do_PUT(self):
             self._dispatch()
 
+        def do_PATCH(self):
+            self._dispatch()
+
         def _log(self, note=""):
             status = getattr(self, "_status", 0) or getattr(self, "_stream_status", 0)
             took = (time.time() - self._started) * 1000
             model = getattr(self, "_model", "-")
-            print("relay %s %s %s %s %s %.0fms %s" % (
-                self.request_id, self.command, redact(self.path), status, model, took, note), flush=True)
+            effort = getattr(self, "_effort_str", "")
+            effort_tag = f" [{effort}]" if effort and model != "-" else ""
+            print("relay %s %s %s %s %s%s %.0fms %s" % (
+                self.request_id, self.command, redact(self.path), status, model, effort_tag, took, note), flush=True)
+            route = getattr(self, "_log_route", None)
+            # Admin polling and live streams would drown the journal in its own traffic.
+            if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
+                return
+            level = "error" if status >= 500 or status == 0 else "warn" if status >= 400 else "success"
+            journal.emit("http.request", "%s %s → %s" % (self.command, self.path, status or "—"), level,
+                         request_id=self.request_id, method=self.command, path=self.path, route=route,
+                         status=status, duration_ms=round(took), model=None if model == "-" else model,
+                         stream=bool(getattr(self, "_streaming", False)),
+                         client=self.headers.get("user-agent", "")[:120] if self.headers else "",
+                         error=getattr(self, "_error_code", None))
 
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
@@ -156,13 +185,22 @@ def make_handler(runtime: Runtime):
             # request (e.g. a 404 probe) must not leak into this log line.
             self._status = 0
             self._stream_status = 0
+            self._streaming = False
+            self._model = "-"
+            self._effort_str = ""
+            self._error_code = None
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
+            self._query = parsed_url.query
             route = ROUTES.get((self.command, path))
             dialect = "anthropic" if route == "anthropic" else "chat"
             try:
                 self._log_route = route
+                if admin_module.is_admin_path(path):
+                    self._log_route = "admin"
+                    runtime.admin.handle(self, path)
+                    return
                 if route is None:
                     if any(method_path[1] == path for method_path in ROUTES):
                         raise apierr.method_not_allowed()
@@ -200,6 +238,7 @@ def make_handler(runtime: Runtime):
                 elif route == "health":
                     self._health()
             except apierr.ApiError as err:
+                self._error_code = err.code
                 if err.status >= 400:
                     print("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]), flush=True)
                 if getattr(self, "_streaming", False):
@@ -210,6 +249,9 @@ def make_handler(runtime: Runtime):
                     self._error_response(err, dialect)
             except Exception as exc:  # never leak a bare traceback
                 print("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]), flush=True)
+                self._error_code = "internal_error"
+                journal.emit("http.exception", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "error",
+                             request_id=self.request_id, path=self.path)
                 err = apierr.internal(str(exc) or exc.__class__.__name__)
                 if getattr(self, "_streaming", False):
                     writer = self._writer
@@ -245,7 +287,7 @@ def make_handler(runtime: Runtime):
                 **{key: model[key] for key in ("metadata_checked_at", "metadata_source", "metadata_status", "metadata_notes")
                    if key in model},
                 "capabilities": {"reasoning": model["reasoning"], "tools": model["tools"],
-                                 "vision": False,
+                                 "vision": bool(model.get("vision", False)),
                                  "reasoning_effort_levels": model.get("reasoning_effort_levels", []),
                                  "default_reasoning_effort": model.get("default_reasoning_effort"),
                                  "reasoning_effort_control": model.get("reasoning_effort_control", "selectable")},
@@ -267,6 +309,10 @@ def make_handler(runtime: Runtime):
         def _health(self):
             balance = runtime.credits.get_balance()
             ok = balance.get("available") is not None and not balance.get("stale")
+            for b in getattr(runtime.pool, "backends", []):
+                ref = getattr(b, "refresher", None)
+                if ref and ref.status().get("stale"):
+                    ok = False
             payload = {
                 "ok": ok,
                 "uptime_seconds": round(time.time() - runtime.started, 1),
@@ -310,11 +356,32 @@ def make_handler(runtime: Runtime):
                 parsed = validate.parse_chat(data, cfg)
             affinity = (self.headers.get("x-session-affinity") or
                         self.headers.get("x-session-id") or
-                        self.headers.get("x-opencode-session"))
-            parsed.conversation_key = validate.conversation_key(data, affinity)
+                        self.headers.get("x-opencode-session") or
+                        self.headers.get("x-conversation-id") or
+                        self.headers.get("session-id") or
+                        self.headers.get("conversation-id"))
+            parsed.conversation_key = validate.conversation_key(data, affinity, allow_content_fallback=True)
+            parsed.request_id = self.request_id
+            parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
+            parsed.dialect = dialect
+            self._model = parsed.model
+
+            effective_effort = parsed.effort
+            if effective_effort is None and parsed.entry.get("reasoning") and cfg.get("reasoning_effort"):
+                conf = cfg["reasoning_effort"]
+                if conf == "auto":
+                    conf = parsed.entry.get("default_reasoning_effort") or "medium"
+                _, effective_effort = models.resolve_tolerant(parsed.model, conf, strict=False)
+            self._effort_str = effective_effort or "none"
+
+            tools_count = len(getattr(parsed, "tools", None) or [])
+            note = " [title/auxiliary]" if tools_count == 0 and len(parsed.prompt or "") < 200 else ""
+            print(f"[{self.request_id}] {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()}{note}", flush=True)
 
             wait = runtime.limiter.take()
             if wait:
+                journal.emit("http.rate_limited", "Локальный лимит запросов: ждать %.2f с" % wait, "warn",
+                             request_id=self.request_id, retry_after=round(wait, 2))
                 raise apierr.too_many_requests("relay rate limit reached", wait)
 
             events = queue.Queue()
@@ -386,7 +453,8 @@ def make_handler(runtime: Runtime):
                     event = events.get(timeout=0.25)
                 except queue.Empty:
                     now = time.time()
-                    if now - last_write >= sse.HEARTBEAT_EVERY:
+                    writer_last = getattr(writer, "last_write", last_write)
+                    if now - writer_last >= sse.HEARTBEAT_EVERY:
                         writer.comment()
                         last_write = now
                     if sse.client_gone(self):
@@ -447,12 +515,19 @@ class BoundedServer(ThreadingHTTPServer):
 def main():
     cfg = config_module.load()
     cfg["command_log"] = os.path.join(HERE, "commands.log")
+    cfg.setdefault("journal_path", os.path.join(HERE, "journal.jsonl"))
     runtime = Runtime(cfg)
+    journal.emit("relay.start", "Relay запущен на %s:%s" % (cfg["host"], cfg["port"]), "success",
+                 host=cfg["host"], port=cfg["port"], model=cfg["model"], transport=cfg.get("transport"),
+                 session_mode=cfg["session_mode"], exec_policy=cfg["exec_policy"])
     handler = make_handler(runtime)
     slots = threading.BoundedSemaphore(cfg["max_workers"])
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
 
-    runtime.backend.refresher.start()
+    backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
+    refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
+    for r in refreshers:
+        r.start()
     balance = runtime.credits.get_balance(force_refresh=True)
     print("=" * 64)
     print(" Retool AI relay")
@@ -492,8 +567,19 @@ def main():
                 time.sleep(0.5)
     finally:
         try:
-            runtime.backend.refresher.stop()
-            runtime.loop.call_soon_threadsafe(runtime.loop.stop)
+            backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
+            refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
+            for r in refreshers:
+                r.stop()
+            async def _cancel_all():
+                tasks = [t for t in asyncio.all_tasks(runtime.loop) if t is not asyncio.current_task()]
+                for t in tasks:
+                    t.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                runtime.loop.stop()
+
+            runtime.loop.call_soon_threadsafe(lambda: asyncio.create_task(_cancel_all()))
         finally:
             server.server_close()
 

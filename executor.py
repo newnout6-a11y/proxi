@@ -8,7 +8,7 @@ import time
 import uuid
 
 EXEC_REGEX = re.compile(r"<exec_command>(.*?)</exec_command>", re.DOTALL | re.IGNORECASE)
-TOOL_REGEX = re.compile(r"<tool_call(?:\s+name=[\"']([^\"']+)[\"'])?>(.*?)</tool_call>",
+TOOL_REGEX = re.compile(r"<tool_call\b([^>]*)>(.*?)</tool_call>",
                         re.DOTALL | re.IGNORECASE)
 SEPARATORS = ("&&", "||", "|", ";", "&", "\n", "\r")
 SHELLS = ("powershell", "pwsh", "cmd")
@@ -112,14 +112,19 @@ def extract_tool_call(text: str, allowed=None):
     if not matches:
         return None
     match = matches[-1]
+    attrs = match.group(1) or ""
     raw = match.group(2).strip()
+    raw = re.sub(r"^" + FENCE + r"[a-zA-Z]*\n?", "", raw)
+    raw = re.sub(r"\n?" + FENCE + "$", "", raw).strip()
     try:
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return None
     if not isinstance(value, dict):
         return None
-    name = match.group(1) or value.get("name") or value.get("tool") or value.get("toolName")
+    attr_name_match = re.search(r'\b(?:name|function)=["\']?([^"\'\s>]+)["\']?', attrs, re.IGNORECASE)
+    attr_id_match = re.search(r'\bid=["\']?([^"\'\s>]+)["\']?', attrs, re.IGNORECASE)
+    name = (attr_name_match.group(1) if attr_name_match else None) or value.get("name") or value.get("tool") or value.get("toolName")
     if not isinstance(name, str) or not name.strip():
         return None
     name = name.strip()
@@ -134,7 +139,22 @@ def extract_tool_call(text: str, allowed=None):
             name = matches[0]
     if allowed and name not in allowed:
         return None
-    arguments = value.get("arguments", value.get("input", value.get("parameters", {})))
+    if "arguments" in value:
+        arguments = value["arguments"]
+    elif "input" in value:
+        arguments = value["input"]
+    elif "parameters" in value:
+        arguments = value["parameters"]
+    elif attr_name_match:
+        json_name = value.get("name") or value.get("tool") or value.get("toolName")
+        if json_name and (name == json_name or name.endswith("." + json_name)):
+            arguments = {k: v for k, v in value.items() if k not in ("name", "id", "tool", "toolName", "namespace", "tool_call_id")}
+        else:
+            arguments = {k: v for k, v in value.items() if k not in ("id", "tool_call_id")}
+    elif "name" in value:
+        arguments = {k: v for k, v in value.items() if k not in ("name", "id", "tool", "toolName", "namespace", "tool_call_id")}
+    else:
+        arguments = value
     if isinstance(arguments, str):
         try:
             json.loads(arguments)
@@ -146,7 +166,8 @@ def extract_tool_call(text: str, allowed=None):
             encoded = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
             return None
-    return {"id": str(value.get("id") or value.get("tool_call_id") or "call_" + uuid.uuid4().hex[:20]),
+    call_id = (attr_id_match.group(1) if attr_id_match else None) or value.get("id") or value.get("tool_call_id") or "call_" + uuid.uuid4().hex[:20]
+    return {"id": str(call_id),
             "name": name, "arguments": encoded}
 
 
@@ -168,11 +189,11 @@ def command_tool_call(text: str, tool_names):
     if not command:
         return None
     names = set(tool_names or ())
-    name = next((actual for candidate in ("bash", "shell", "exec_command", "run_command")
+    name = next((actual for candidate in ("bash", "shell", "exec_command", "run_command", "execute_command", "run_shell_command", "terminal", "command")
                  for actual in names if actual.lower() == candidate), None)
     if name is None:
         return None
-    field = "command" if name.lower() in ("bash", "shell") else "cmd"
+    field = "cmd" if name.lower() in ("exec_command", "cmd") else "command"
     return {"id": "call_" + uuid.uuid4().hex[:20], "name": name,
             "arguments": json.dumps({field: command}, ensure_ascii=False, separators=(",", ":"))}
 

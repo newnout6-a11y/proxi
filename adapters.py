@@ -23,6 +23,11 @@ class _Base:
         self.text = ""
         self.thinking = ""
         self.credits = 0.0
+        self.cache_read = 0
+        self.cache_write = 0
+        self.reasoning_tokens = 0
+        self.input_tokens = None
+        self.output_tokens = None
         self.exec_lines = 0
         self.tool_calls = []
         self._custom_tools = {
@@ -35,12 +40,15 @@ class _Base:
     def feed(self, event):
         kind = event.get("type")
         if kind == "thinking":
+            self.thinking += event["delta"]
             if not self.parsed.show_thinking:
                 return
-            self.thinking += event["delta"]
             self._think(event["delta"])
             if event.get("signature"):
                 self._signature(event["signature"])
+        elif kind == "thinking_start":
+            if self.parsed.show_thinking:
+                self._think_start()
         elif kind == "thinking_signature":
             if self.parsed.show_thinking:
                 self._signature(event.get("signature", ""))
@@ -50,7 +58,22 @@ class _Base:
         elif kind == "tool_call":
             self._feed_tool_call(event)
         elif kind == "credits":
-            self.credits += event["value"]
+            self.credits += event.get("value", 0.0)
+            usage = event.get("usage") or {}
+            if usage.get("cache_read") is not None:
+                self.cache_read = (self.cache_read or 0) + int(usage["cache_read"])
+            if usage.get("cache_write") is not None:
+                self.cache_write = (self.cache_write or 0) + int(usage["cache_write"])
+            if usage.get("input_tokens") is not None:
+                self.input_tokens = (self.input_tokens or 0) + int(usage["input_tokens"])
+            if usage.get("output_tokens") is not None:
+                self.output_tokens = (self.output_tokens or 0) + int(usage["output_tokens"])
+            output_tokens = self.output_tokens
+            if self.thinking:
+                self.reasoning_tokens = approx_tokens(self.thinking)
+            elif output_tokens is not None:
+                tool_text = "".join(c.get("name", "") + c.get("arguments", "") for c in self.tool_calls)
+                self.reasoning_tokens = max(0, int(output_tokens) - approx_tokens(self.text) - approx_tokens(tool_text))
         elif kind == "hitl":
             block = ("\n\n" if self.text else "") + event["question"]
             self.text += block
@@ -66,14 +89,26 @@ class _Base:
 
     def usage(self, prompt_text=None):
         sent = getattr(self.parsed, "_full_prompt_text", None)
-        prompt = approx_tokens(sent or (self._prompt_text if prompt_text is None else prompt_text))
-        completion = approx_tokens(self.text)
+        prompt = self.input_tokens if self.input_tokens is not None else approx_tokens(
+            sent or (self._prompt_text if prompt_text is None else prompt_text))
+        if self.cache_read or self.cache_write:
+            prompt = max(prompt, (self.cache_read or 0) + (self.cache_write or 0) + (self.input_tokens or 0))
+        tool_text = "".join(c.get("name", "") + c.get("arguments", "") for c in self.tool_calls)
+        base_completion = approx_tokens(self.text) + approx_tokens(tool_text)
+        reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
+        if self.output_tokens is not None:
+            completion = int(self.output_tokens)
+        else:
+            completion = base_completion + reasoning
         return prompt, completion
 
     def _text(self, delta):
         raise NotImplementedError
 
     def _think(self, delta):
+        pass
+
+    def _think_start(self):
         pass
 
     def _signature(self, signature):
@@ -135,6 +170,12 @@ class ChatAdapter(_Base):
         if self.writer:
             self.writer.data(self._chunk({"reasoning_content": delta}))
 
+    def _think_start(self):
+        # Display-only label: it is streamed but never stored in self.thinking.
+        label = getattr(self.parsed, "thinking_placeholder", "")
+        if label and self.writer:
+            self.writer.data(self._chunk({"reasoning_content": label}))
+
     def _tool_call(self, index, call, delta, new=False):
         if not self.writer:
             return
@@ -150,24 +191,52 @@ class ChatAdapter(_Base):
         finish = FINISH_MAP.get(reason, "stop")
         if self.writer:
             self.writer.data(self._chunk({}, finish))
+            prompt, completion = self.usage(prompt_text)
+            reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
+            usage_dict = {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion,
+                "cached_tokens": self.cache_read or 0,
+                "cache_read_input_tokens": self.cache_read or 0,
+                "cache_creation_input_tokens": self.cache_write or 0,
+                "prompt_tokens_details": {
+                    "cached_tokens": self.cache_read or 0,
+                    "cache_read_tokens": self.cache_read or 0,
+                    "cache_write_tokens": self.cache_write or 0,
+                    "cache_creation_input_tokens": self.cache_write or 0,
+                },
+                "input_tokens_details": {
+                    "cached_tokens": self.cache_read or 0,
+                    "cache_read_tokens": self.cache_read or 0,
+                    "cache_write_tokens": self.cache_write or 0,
+                    "cache_creation_input_tokens": self.cache_write or 0,
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": reasoning,
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": reasoning,
+                },
+                "credits_used": round(self.credits, 5),
+                "estimated": True,
+            }
             if self.parsed.wants_usage:
-                prompt, completion = self.usage(prompt_text)
                 self.writer.data({"id": self.id, "object": "chat.completion.chunk",
                                   "created": self.created, "model": self.parsed.model,
                                   "choices": [],
-                                  "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
-                                            "total_tokens": prompt + completion,
-                                            "credits_used": round(self.credits, 5), "estimated": True}})
+                                  "usage": usage_dict})
             self.writer.done()
         return self.payload(reason, prompt_text)
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
+        reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
                 "choices": [{"index": 0, "message": {"role": "assistant",
                                                      "content": self.text or (None if self.tool_calls else ""),
-                                                     **({"reasoning_content": self.thinking} if self.thinking else {}),
+                                                     **({"reasoning_content": self.thinking} if (self.thinking and self.parsed.show_thinking) else {}),
                                                      **({"tool_calls": [{"id": call["id"], "type": "function",
                                                                           "function": {"name": call["name"],
                                                                                        "arguments": call["arguments"]}}
@@ -176,6 +245,23 @@ class ChatAdapter(_Base):
                              "finish_reason": FINISH_MAP.get(reason, "tool_calls" if self.tool_calls else "stop")}],
                 "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
                           "total_tokens": prompt + completion,
+                          "cached_tokens": self.cache_read or 0,
+                          "cache_read_input_tokens": self.cache_read or 0,
+                          "cache_creation_input_tokens": self.cache_write or 0,
+                          "prompt_tokens_details": {
+                              "cached_tokens": self.cache_read or 0,
+                              "cache_read_tokens": self.cache_read or 0,
+                              "cache_write_tokens": self.cache_write or 0,
+                              "cache_creation_input_tokens": self.cache_write or 0,
+                          },
+                          "input_tokens_details": {
+                              "cached_tokens": self.cache_read or 0,
+                              "cache_read_tokens": self.cache_read or 0,
+                              "cache_write_tokens": self.cache_write or 0,
+                              "cache_creation_input_tokens": self.cache_write or 0,
+                          },
+                          "completion_tokens_details": {"reasoning_tokens": reasoning},
+                          "output_tokens_details": {"reasoning_tokens": reasoning},
                           "credits_used": round(self.credits, 5), "estimated": True}}
 
 
@@ -273,6 +359,11 @@ class ResponsesAdapter(_Base):
                                                              "output_index": index,
                                                              "summary_index": 0, "delta": delta})
 
+    def _think_start(self):
+        label = getattr(self.parsed, "thinking_placeholder", "")
+        if label and self.writer:
+            self._think(label)
+
     def _tool_call(self, index, call, delta, new=False):
         custom = call.get("tool_type") == "custom"
         kind = "custom_tool_call" if custom else "function_call"
@@ -322,6 +413,7 @@ class ResponsesAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
+        reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
         if not self._items:
             self._ensure_item("message", self.item_id)
         status = "incomplete" if reason == "timeout" else "completed"
@@ -332,6 +424,10 @@ class ResponsesAdapter(_Base):
                 "output_text": self.text,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "total_tokens": prompt + completion,
+                          "input_token_details": {"cached_tokens": self.cache_read},
+                          "output_token_details": {"reasoning_tokens": reasoning},
+                          "input_tokens_details": {"cached_tokens": self.cache_read},
+                          "output_tokens_details": {"reasoning_tokens": reasoning},
                           "credits_used": round(self.credits, 5), "estimated": True}}
 
 
@@ -378,6 +474,11 @@ class AnthropicAdapter(_Base):
         self._emit("content_block_start", {"type": "content_block_start", "index": self.index,
                                            "content_block": dict(block)})
         return block
+
+    def _think_start(self):
+        # An open thinking block lets the client show "thinking" while the
+        # provider reasons silently; the later signature attaches to it.
+        self._open("thinking")
 
     def _think(self, delta):
         block = self._open("thinking")
@@ -426,7 +527,10 @@ class AnthropicAdapter(_Base):
         return "end_turn"
 
     def end(self, reason, prompt_text=None):
-        usage = {"input_tokens": self.usage(prompt_text)[0], "output_tokens": self.usage(prompt_text)[1]}
+        raw_prompt, completion = self.usage(prompt_text)
+        non_cached = self.input_tokens if self.input_tokens is not None else max(0, raw_prompt - (self.cache_read or 0) - (self.cache_write or 0))
+        usage = {"input_tokens": non_cached, "output_tokens": completion,
+                 "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_write}
         if not self._blocks:
             self._open("text")
         self._close_blocks()
@@ -439,11 +543,14 @@ class AnthropicAdapter(_Base):
         return self.payload(reason, prompt_text)
 
     def payload(self, reason, prompt_text=None):
-        prompt, completion = self.usage(prompt_text)
+        raw_prompt, completion = self.usage(prompt_text)
+        non_cached = self.input_tokens if self.input_tokens is not None else max(0, raw_prompt - (self.cache_read or 0) - (self.cache_write or 0))
         return {"id": self.id, "type": "message", "role": "assistant", "model": self.parsed.model,
                 "content": [dict(block) for block in self._blocks] or [{"type": "text", "text": ""}],
                 "stop_reason": self._stop_reason(reason), "stop_sequence": None,
-                "usage": {"input_tokens": prompt, "output_tokens": completion,
+                "usage": {"input_tokens": non_cached, "output_tokens": completion,
+                          "cache_read_input_tokens": self.cache_read,
+                          "cache_creation_input_tokens": self.cache_write,
                           "credits_used": round(self.credits, 5), "estimated": True}}
 
 

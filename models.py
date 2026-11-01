@@ -36,7 +36,8 @@ ALIASES = {"claude-opus": "claude-opus-5-5", "claude-sonnet": "claude-sonnet-5",
            "claude-sonnet-5.5": "claude-sonnet-5-5",
            "claude-haiku": "claude-haiku-4-5-20251001", "gpt-5.6": "gpt-5.6-sol",
            "claude-opus-5.5": "claude-opus-5-5", "claude-opus-4.8": "claude-opus-4-8",
-           "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol"}
+           "claude-sonnet-4.6": "claude-sonnet-4-6", "gpt-6": "gpt-6-sol",
+           "gpt-6.1": "gpt-6.1-sol"}
 
 CATALOG = [
     {"id": "gpt-6.1-sol", "label": "GPT 6.1-sol", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
@@ -213,18 +214,36 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
     except ApiError as error:
         entry, _ = resolve(model, None, strict=strict, default_model=default_model)
         levels = entry.get("reasoning_effort_levels") or []
-        if error.status != 400 or not levels or not entry.get("reasoning", True):
+        if error.status != 400:
             raise
+        if not levels or not entry.get("reasoning", True):
+            print("[effort] %s -> None (reasoning not supported) for %s" % (effort, entry["id"]), flush=True)
+            return entry, None
         clamped = nearest_effort(levels, effort)
         print("[effort] %s -> %s for %s" % (effort, clamped, entry["id"]), flush=True)
         return entry, clamped
 
 
 def resolve(model, effort=None, *, strict=True, default_model=None):
-    name = _canonical(model or default_model or '')
+    raw_name = (model or default_model or '').strip()
+    for sep in ('#', ':'):
+        if sep in raw_name:
+            parts = raw_name.split(sep, 1)
+            cand = parts[1].strip().lower()
+            if cand in EFFORT_ORDER:
+                if effort is None:
+                    effort = cand
+                raw_name = parts[0].strip()
+            break
+    name = _canonical(raw_name)
     if not name:
         raise bad_request("'model' is required", param='model')
     entry = _BY_ID.get(name)
+    if entry is None and '/' in name:
+        stripped = _canonical(name.split('/', 1)[1])
+        if stripped in _BY_ID:
+            name = stripped
+            entry = _BY_ID.get(name)
     if entry is None:
         if strict:
             print("[unknown-model]", repr(model), '->', repr(name), flush=True)

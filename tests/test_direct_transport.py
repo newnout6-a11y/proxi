@@ -69,8 +69,14 @@ def test_head_becomes_a_cached_system_block_with_a_stable_key():
     assert body["maxCompletionTokens"] == 32
 
 
-def test_short_head_is_not_cached_but_still_a_system_message():
+def test_short_head_is_cached_with_stable_key():
     body = direct.build_body({"direct_cache": True}, {"model": "m"}, "short", "tail", None, "auto", None)
+    assert body["messages"][0] == {"role": "system", "content": [{"type": "text", "text": "short", "cache": True}]}
+    assert body["openAICacheKey"] == direct.cache_key_for("short")
+
+
+def test_cache_disabled_omits_cache_markers_and_key():
+    body = direct.build_body({"direct_cache": False}, {"model": "m"}, "short", "tail", None, "auto", None)
     assert body["messages"][0] == {"role": "system", "content": [{"type": "text", "text": "short"}]}
     assert "openAICacheKey" not in body
 
@@ -165,3 +171,92 @@ def test_stringly_typed_numbers_and_booleans_are_repaired():
 def test_coercion_keeps_unparsable_arguments_verbatim():
     assert direct.coerce_arguments("not json", {"a": {"type": "number"}}) == "not json"
     assert direct.coerce_arguments("", {}) == "{}"
+
+
+def test_drain_surfaces_silent_thinking_start():
+    import asyncio as _asyncio
+
+    class _S:
+        _cancelled = False
+
+    async def collect():
+        q = _asyncio.Queue()
+        for line in ('{"event":"content_block_start","type":"thinking"}',
+                     '{"event":"content_block_delta","type":"thinking","partialThinking":""}',
+                     '{"event":"content_block_delta","type":"signature","partialSignature":"sig"}',
+                     '{"event":"content_block_end"}',
+                     '{"event":"content_block_start","type":"text"}',
+                     '{"event":"content_block_delta","type":"text","partialText":"42"}'):
+            q.put_nowait(line)
+        q.put_nowait(None)
+        return [e async for e in direct._drain({}, _S(), q, [], [])]
+
+    kinds = [e["type"] for e in _asyncio.run(collect())]
+    assert kinds == ["thinking_start", "thinking_signature", "text"]
+
+
+def test_anthropic_adapter_opens_thinking_block_before_text():
+    import adapters
+
+    class W:
+        def __init__(self):
+            self.events = []
+
+        def event(self, name, payload):
+            self.events.append((name, payload))
+
+    parsed = type("P", (), {"show_thinking": True, "model": "claude-opus-5-5", "system": "", "prompt": "x",
+                            "tools": []})()
+    writer = W()
+    adapter = adapters.AnthropicAdapter(parsed, writer)
+    adapter.feed({"type": "thinking_start"})
+    adapter.feed({"type": "thinking_signature", "signature": "sig"})
+    adapter.feed({"type": "text", "delta": "42"})
+    starts = [p["content_block"]["type"] for n, p in writer.events if n == "content_block_start"]
+    assert starts == ["thinking", "text"]
+    sig = [p for n, p in writer.events if n == "content_block_delta" and p["delta"]["type"] == "signature_delta"]
+    assert sig and sig[0]["index"] == 0
+    assert writer.events[0][0] == "content_block_start"
+
+
+def test_thinking_start_is_hidden_when_thinking_disabled():
+    import adapters
+
+    class W:
+        def __init__(self):
+            self.events = []
+
+        def event(self, name, payload):
+            self.events.append((name, payload))
+
+    parsed = type("P", (), {"show_thinking": False, "model": "m", "system": "", "prompt": "x", "tools": []})()
+    writer = W()
+    adapter = adapters.AnthropicAdapter(parsed, writer)
+    adapter.feed({"type": "thinking_start"})
+    adapter.feed({"type": "text", "delta": "ok"})
+    assert [p["content_block"]["type"] for n, p in writer.events if n == "content_block_start"] == ["text"]
+
+
+def test_direct_session_stream_tool_calls_marks_completed():
+    import session as session_mod
+
+    class FakeBackend:
+        cfg = {"transport": "direct", "session_mode": "per_conversation", "thread_id": "t1"}
+
+    sess = session_mod.RelaySession(FakeBackend(), "thread-1")
+
+    async def fake_iter(*args, **kwargs):
+        yield {"type": "tool_call", "id": "call_1", "name": "test", "arguments": "{}"}
+        yield {"type": "end", "reason": "tool_calls"}
+
+    sess._stream_turn = fake_iter
+
+    async def run():
+        events = []
+        async for e in sess.stream("prompt", {"model": "claude-opus-5-5"}):
+            events.append(e)
+        return events
+
+    evs = asyncio.run(run())
+    assert len(evs) == 2
+    assert not sess._needs_drain
