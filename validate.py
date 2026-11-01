@@ -125,6 +125,29 @@ def _opt_int(data, key, low=1, high=MAX_TOKENS_CAP):
     return value
 
 
+def _reject_images_unsupported(entry, data):
+    """The catalog `vision` flag is otherwise declarative: upstream rejects image
+    input for non-vision models with a bare 400. Fail fast with a clear 422."""
+    if entry.get("vision", True):
+        return
+    blocks = []
+    messages = data.get("messages") if isinstance(data, dict) else None
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            blocks.extend(b for b in content if isinstance(b, dict))
+        elif isinstance(content, dict):
+            blocks.append(content)
+    system = data.get("system") if isinstance(data, dict) else None
+    if isinstance(system, list):
+        blocks.extend(b for b in system if isinstance(b, dict))
+    for block in blocks:
+        if block.get("type") in ("image", "image_url") or "imageData" in block or "image_url" in block:
+            raise unprocessable(f"model {entry['id']} does not support image input", param="messages")
+
+
 def _cap(entry) -> int:
     """Per-model completion ceiling from the catalog."""
     return int(entry.get("max_output") or MAX_TOKENS_CAP)
@@ -560,6 +583,7 @@ def parse_chat(data, cfg):
     entry, effort = model_catalog.resolve_tolerant(
         _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
+    _reject_images_unsupported(entry, data)
     messages = _messages(data)
     system, chunks = _render_chunks(messages)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
@@ -578,6 +602,7 @@ def parse_responses(data, cfg):
     entry, effort = model_catalog.resolve_tolerant(
         _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
+    _reject_images_unsupported(entry, data)
 
     raw_input = data.get("input")
     if isinstance(raw_input, str):
@@ -607,6 +632,7 @@ def parse_anthropic(data, cfg):
     entry, effort = model_catalog.resolve_tolerant(
         model, _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
+    _reject_images_unsupported(entry, data)
     messages = _messages(data)
     system, chunks = _render_chunks(messages, allow_system=False)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]

@@ -63,7 +63,7 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 - `providerResourceName`: UUID провайдера (Anthropic, OpenAI, Google и др.).
 - `messages`: массив сообщений диалога. Поддерживает текстовые и мультимодальные (`type: "image"`) блоки.
 - `tools`: массив схем клиентских инструментов (принимаются нативно без bridging).
-- `reasoningEffort`: строгая валидация (`"none"`, `"low"`, `"medium"`, `"high"`, `"max"`). Недопустимые значения отклоняются с 422.
+- `reasoningEffort`: валидация по per-model списку уровней (`/v1/models → capabilities.reasoning_effort_levels`); набор шире перечисленного здесь — включает `minimal` (GPT-5) и `xhigh`/`max` (GPT-6*). Недопустимый уровень для маршрута через tolerant-resolve даёт 400, а неподдерживаемый для конкретной модели молча клампится к ближайшему; 422 возвращают только конфликтующие thinking-контроли.
 - `openAICacheKey`: ключ кэширования префикса промпта для KV-кэша.
 - `metadata.sandpackAgent: true`: открывает доступ к моделям, управляемым через Sandpack-инфраструктуру.
 

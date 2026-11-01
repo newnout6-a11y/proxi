@@ -1,7 +1,8 @@
 # Model catalog audit — 2026-10-29
 
-The catalog retains all 37 Retool model IDs: 15 OpenAI, 14 Anthropic, 6 Google and
-2 Retool-fast. A provider deprecation does not remove a still-advertised Retool
+The catalog retains all 38 Retool model IDs: 15 OpenAI, 15 Anthropic, 6 Google and
+2 Retool-fast (claude-sonnet-5-5 was added on 2026-10-31, after this audit's date;
+its row matches the Claude 1M group: 1 000 000 / 128 000, levels low/medium/high/max). A provider deprecation does not remove a still-advertised Retool
 ID. Resource availability is evaluated separately from model capabilities.
 
 `metadata_checked_at`, `metadata_source`, `metadata_status` and optional
