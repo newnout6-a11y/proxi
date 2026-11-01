@@ -192,3 +192,32 @@ Heartbeat был подписан **thread id** (`direct-8659…`), а не requ
 `proxy.py`. Ночью этого не делал — relay обслуживал текущую сессию.
 
 Результаты мержа (хэши merge-коммитов) дописаны ниже по мере выполнения.
+
+### Результат мержа (выполнено ~03:10)
+
+Каждый PR перед мержем перенацелен на `main` и смержен merge-коммитом; ветки сохранены.
+
+| PR | merge-коммит |
+|---|---|
+| #1 relay-hardening-native-tools | `f536ba3` |
+| #2 admin-console-latency | `1540ebe` |
+| #3 prompt-cache-limits-and-direct-hardening | `029f11d` |
+| #4 adapters-stream-hardening | `25d99be` |
+| #5 admin-security | `f49f46b` |
+| #6 session-pool-hardening | `e985dc6` |
+| #7 proxy-http-hardening | `d6d0dcd` |
+| #8 executor-hardening | `1312d41` |
+| #9 refresh-rotation-hardening | `4f4860a` |
+| #10 journal-hardening | `8170a65` |
+| #11 catalog-hardening | `198dead` |
+| #12 dist-rebuild | `7133b1f` |
+| #13 keepwarm-during-turns | `9381bca` |
+| #14 review-fixes | `c95feb7` |
+
+Проверка: дерево `main` после #14 (`6853c0e…`) идентично дереву проверенной
+ветки `codex/review-fixes` (`aabfdd6`), на которой прошёл полный набор — 901 passed.
+Открытых PR не осталось.
+
+Worktree с исправлениями: `C:\rf` (можно удалить: `git worktree remove ../rf`).
+Живая папка `C:\specialinay_papka` по-прежнему на `codex/keepwarm-during-turns`,
+relay работает на старом коде до `git checkout main && git pull` и перезапуска.
