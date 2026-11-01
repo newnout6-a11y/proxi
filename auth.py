@@ -27,6 +27,10 @@ def register_auth_failure(client_ip):
         if len(_FAILURES) > 1024:
             for ip in [ip for ip, s in _FAILURES.items() if not s or now - s[-1] > _FAILURE_WINDOW]:
                 _FAILURES.pop(ip, None)
+        while len(_FAILURES) > 4096:
+            # Absolute bound: a flood of fresh IPs must not grow the table forever.
+            oldest = min(_FAILURES.items(), key=lambda item: item[1][-1])[0]
+            _FAILURES.pop(oldest, None)
         if len(stamps) > _FAILURE_LIMIT:
             return max(1.0, _FAILURE_WINDOW - (now - stamps[0]))
     return None
@@ -112,6 +116,9 @@ def merge_set_cookie(cfg, headers) -> bool:
         if value == "":
             if jar.pop(key, None) is not None:
                 dirty = True
+                if key in ("xsrfToken", "__Host-xsrfToken"):
+                    # The deleted cookie must not keep a stale xsrf header alive.
+                    xsrf = ""
             continue
         if jar.get(key) != value:
             jar[key] = value

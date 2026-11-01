@@ -114,4 +114,9 @@ def relay(monkeypatch, tmp_path):
 
     yield Ctx()
     server.shutdown()
-    server.server_close()
+    try:
+        server.server_close()
+    except OSError:
+        # CI (Windows runners) has shown the listener socket already closed by
+        # the OS at teardown; the fixture is done either way.
+        pass
