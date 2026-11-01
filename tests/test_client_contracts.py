@@ -270,10 +270,19 @@ def test_unsupported_effort_is_clamped_to_the_nearest_supported_level():
     assert effort == "high"
     entry, effort = models.resolve_tolerant("gpt-5.5", "minimal")
     assert effort == "low"
-    entry, effort = models.resolve_tolerant("claude-opus-5-5", "ultra")
-    assert effort == "medium"
     entry, effort = models.resolve_tolerant("gpt-6-sol", "xhigh")
     assert effort == "xhigh"
+
+
+def test_effort_no_provider_defines_is_rejected_not_clamped():
+    """'extra'/'ultra' are not levels anywhere (Retool bundle has no such
+    literal; the live route answers 422 to them) — clamping them to medium
+    used to silently downgrade a client asking for more thinking."""
+    for bogus in ("extra", "ultra", "banana"):
+        with pytest.raises(apierr.ApiError) as raised:
+            models.resolve_tolerant("claude-opus-5-5", bogus)
+        assert raised.value.status == 400
+        assert "must be one of" in str(raised.value)
 
 
 def test_clamped_effort_still_validates_at_the_dialect_layer():

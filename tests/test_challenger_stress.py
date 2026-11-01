@@ -231,8 +231,11 @@ def test_adversarial_reasoning_effort_matrix():
     entry_h_clamp, eff_h_clamp = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh")
     assert eff_h_clamp == "high", "Haiku unsupported 'xhigh' must clamp to 'high'"
 
-    entry_h2, eff_h2 = models.resolve_tolerant("claude-haiku-4-5-20251001", "invalid_value")
-    assert eff_h2 in ("low", "medium", "high", "max"), "Invalid effort must safely clamp"
+    # A value no provider defines is rejected with a 400 instead of being
+    # silently clamped to medium (live 2026-11-01: the route 422s such values).
+    with pytest.raises(apierr.ApiError) as raised_invalid:
+        models.resolve_tolerant("claude-haiku-4-5-20251001", "invalid_value")
+    assert raised_invalid.value.status == 400
 
     # 3. Non-reasoning models must return None without raising unhandled 400
     for non_reasoning in ["zai-org/GLM-5.3-Flash"]:
