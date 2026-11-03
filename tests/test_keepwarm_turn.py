@@ -47,9 +47,12 @@ async def test_reused_keepwarm_labels_the_body_owner_not_the_first_request(monke
             finished.set()
         return event
 
+    observed = []
+
     def ping(_session, body):
-        assert body["model"] == "model-B"
-        assert client_context.current() == request_b
+        # Runs in to_thread and _keepwarm swallows exceptions: asserts here would
+        # never fail the test, so only record and check after the run.
+        observed.append((body["model"], client_context.current()))
         # A request that starts while this blocking ping runs must not change
         # the identity of the result/error already being produced.
         session._warm_identity = {"client": "opencode", "request_id": "req-C", "chat_title": "Третий чат"}
@@ -82,6 +85,7 @@ async def test_reused_keepwarm_labels_the_body_owner_not_the_first_request(monke
     assert session._warm_task is first_task
     try:
         await asyncio.wait_for(finished.wait(), timeout=2)
+        assert observed and all(item == ("model-B", request_b) for item in observed)
         assert captured[0]["request_id"] == "req-B"
         assert captured[0]["data"]["chat_title"] == "Второй чат"
         assert "Первый чат" not in captured[0]["message"]
