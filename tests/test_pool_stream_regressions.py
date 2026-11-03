@@ -1,8 +1,4 @@
-"""Focused characterization checks for proxi 188fd76.
-
-These checks record current behavior, including limitations. They are not fixes.
-Only synthetic credentials and localhost HTTP are used; no paid model calls.
-"""
+"""Regression checks for account routing, repeated keepwarm and stream timeouts."""
 import asyncio
 import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,7 +38,7 @@ def pool_config(**overrides):
     ("gpt-5.5", "xhigh", "high"),
 ])
 def test_observed_effective_effort(model, requested, effective):
-    entry, got = models.resolve_tolerant(model, requested)
+    entry, got = models.resolve_tolerant(model, requested, allow_downgrade=True)
     assert got == effective
     print("EVIDENCE effort", model, requested, "->", got)
 
@@ -54,39 +50,36 @@ def test_unknown_effort_is_rejected(requested):
     assert caught.value.status == 400
 
 
-def test_pool_can_select_account_without_required_provider_resource():
+def test_pool_selects_only_accounts_with_required_provider_resource():
     pool = SessionPool(Backend(pool_config()))
-    chosen = pool._next_backend()
-    assert chosen is pool.backends[0]
     entry, _ = models.resolve("claude-opus-5-5")
-    with pytest.raises(ApiError) as caught:
-        models.provider_resource(chosen.cfg, entry)
-    assert caught.value.status == 503
-    assert models.provider_resource(pool.backends[1].cfg, entry) is None
-    print("EVIDENCE pool chose unroutable account while another is routable")
+    chosen = pool._next_backend(entry)
+    assert chosen is pool.backends[1]
+    assert models.provider_resource(chosen.cfg, entry) is None
 
 
-def test_account_inherits_global_resource_even_for_different_tenant():
+def test_account_cannot_inherit_a_resource_from_a_different_tenant():
     cfg = pool_config(provider_resource_name="synthetic-resource-from-tenant-a",
                       accounts=[{"page_uuid": "page-a"},
                                 {"page_uuid": "page-b", "base": "https://tenant-b.invalid"}])
     pool = SessionPool(Backend(cfg))
     entry, _ = models.resolve("claude-opus-5-5")
-    assert models.provider_resource(pool.backends[1].cfg, entry) == "synthetic-resource-from-tenant-a"
-    print("EVIDENCE tenant B inherits tenant A's resource config without validation")
+    with pytest.raises(ApiError) as caught:
+        models.provider_resource(pool.backends[1].cfg, entry)
+    assert caught.value.status == 503
 
 
 @pytest.mark.asyncio
-async def test_parallel_same_conversation_moves_child_to_other_account():
+async def test_parallel_same_conversation_keeps_the_same_account():
     pool = SessionPool(Backend(pool_config(provider_resource_name="__managed__")))
-    parent = await pool.acquire("conversation")
+    entry, _ = models.resolve("claude-opus-5-5")
+    parent = await pool.acquire("conversation", model_entry=entry)
     parent.session._cached_head = "synthetic canonical prefix"
-    child = await pool.acquire("conversation")
+    child = await pool.acquire("conversation", model_entry=entry)
     try:
         assert parent.backend is pool.backends[0]
-        assert child.backend is pool.backends[1]
+        assert child.backend is pool.backends[0]
         assert child.session._cached_head == parent.session._cached_head
-        print("EVIDENCE same conversation parent/account A, parallel child/account B")
     finally:
         await pool.release(child)
         await pool.release(parent)
@@ -95,7 +88,8 @@ async def test_parallel_same_conversation_moves_child_to_other_account():
 
 
 @pytest.mark.asyncio
-async def test_virtual_900_second_turn_only_pings_once(monkeypatch):
+@pytest.mark.parametrize("duration", [900, 1800])
+async def test_long_turn_repeatedly_refreshes_inside_the_ttl(monkeypatch, duration):
     clock = SimpleNamespace(now=1000.0)
     start = clock.now
     original_sleep = asyncio.sleep
@@ -108,7 +102,7 @@ async def test_virtual_900_second_turn_only_pings_once(monkeypatch):
 
     async def sleep(delay):
         clock.now += delay
-        if clock.now - start >= 901:
+        if clock.now - start >= duration + 1:
             raise asyncio.CancelledError()
         await original_sleep(0)
 
@@ -126,12 +120,14 @@ async def test_virtual_900_second_turn_only_pings_once(monkeypatch):
     await direct._keepwarm(session, {"cache_keepwarm_seconds":240,
         "cache_keepwarm_idle":1800, "cache_keepwarm_during_turns":True,
         "cache_keepwarm_turn_offset":200})
-    assert calls == [200.0]
-    assert clock.now - start >= 900
-    print("EVIDENCE virtual turn >=900s, ping ages:", calls)
+    assert calls[0] == pytest.approx(200, abs=0.1)
+    assert len(calls) == (3 if duration == 900 else 7)
+    assert all(right - left < 241 for left, right in zip(calls, calls[1:]))
+    assert duration - calls[-1] < 300
+    assert clock.now - start >= duration
 
 
-def test_ping_replaces_effort_with_low(monkeypatch):
+def test_ping_preserves_effort(monkeypatch):
     captured = []
 
     class Response:
@@ -150,8 +146,77 @@ def test_ping_replaces_effort_with_low(monkeypatch):
     body = {"model":"claude-opus-5-5", "reasoningEffort":"max", "cache":True}
     direct._ping(session, body)
     assert body["reasoningEffort"] == "max"
-    assert captured[0]["reasoningEffort"] == "low"
-    print("EVIDENCE warm ping uses low while main request uses max")
+    assert captured[0]["reasoningEffort"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_model_routing_is_applied_before_creating_a_session():
+    pool = SessionPool(Backend(pool_config()))
+    entry, _ = models.resolve("claude-opus-5-5")
+    lease = await pool.acquire("conversation", model_entry=entry)
+    try:
+        assert lease.backend is pool.backends[1]
+    finally:
+        await pool.release(lease)
+        for session in pool._conversations.values():
+            await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_missing_route_releases_slots_and_conversation_locks():
+    pool = SessionPool(Backend(pool_config(accounts=[{"page_uuid": "p", "base": "https://tenant-a.invalid"}])))
+    entry, _ = models.resolve("claude-opus-5-5")
+    with pytest.raises(ApiError) as caught:
+        await pool.acquire("conversation", model_entry=entry)
+    assert caught.value.status == 503
+    assert pool._slots._value == 8
+    assert not pool._conversation_locks
+    assert not pool._conversation_refs
+
+
+def test_truncated_ping_does_not_claim_a_refreshed_cache(monkeypatch):
+    class Response:
+        def __iter__(self):
+            return iter([b'{"event":"metadata","usage":{"creditsUsed":0.1}}\n'])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", lambda *_a, **_k: Response())
+    session = SimpleNamespace(backend=SimpleNamespace(cfg={"base": "https://fixture.invalid"}, headers=lambda: {}))
+    with pytest.raises(ApiError, match="end_of_stream"):
+        direct._ping(session, {"model": "claude-opus-5-5", "reasoningEffort": "max"})
+
+
+@pytest.mark.asyncio
+async def test_failed_keepwarm_retries_with_backoff_without_claiming_cache_hits(monkeypatch):
+    clock = SimpleNamespace(now=1000.0)
+    original_sleep = asyncio.sleep
+    calls = []
+    session = SimpleNamespace(_busy=True, _turn_started_at=1000.0, _turn_seq=1,
+                              _warm_body={"model": "fixture"}, _last_request_at=1000.0)
+
+    async def sleep(delay):
+        clock.now += delay
+        if clock.now >= 1900:
+            raise asyncio.CancelledError()
+        await original_sleep(0)
+
+    async def to_thread(fn, *args):
+        return fn(*args)
+
+    def fail(*_):
+        calls.append(clock.now)
+        raise OSError("synthetic failure")
+
+    monkeypatch.setattr(direct.time, "time", lambda: clock.now)
+    monkeypatch.setattr(direct.asyncio, "sleep", sleep)
+    monkeypatch.setattr(direct.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(direct, "_ping", fail)
+    await direct._keepwarm(session, {"cache_keepwarm_seconds": 240, "cache_keepwarm_turn_offset": 200})
+    assert len(calls) == 2
+    assert calls[1] - calls[0] >= 240
+    assert getattr(session, "_warm_at", 0) == 0
 
 
 @pytest.mark.parametrize("upstream_blank_heartbeats", [False, True])

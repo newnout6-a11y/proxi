@@ -64,6 +64,14 @@ RETOOL_PAGE_UUID, RETOOL_THREAD_ID, RELAY_API_KEY. Для OpenCode affinity пр
 Состояние фонового продления и ошибки сохранения видны в `/health`;
 устаревший кэш баланса означает `503`, а не успешную проверку upstream.
 
+При первой загрузке каждому `accounts[]` назначается и сохраняется уникальный
+`account_id`. Обновление ищет точный ID с проверкой tenant; одинаковые страницы
+не объединяют аккаунты. Запись настроек и ротаций использует общую межпроцессную
+блокировку, а продление одного ID в одном файле выполняется одним владельцем.
+Ресурс другого tenant не наследуется из глобальных настроек. Новые диалоги
+выбирают аккаунт с маршрутом нужной модели; параллельный запрос существующего
+диалога использует тот же аккаунт.
+
 ## Использование
 
     curl.exe http://127.0.0.1:8787/v1/chat/completions -H "Authorization: Bearer $env:RELAY_API_KEY" -H "content-type: application/json" -d "{\"model\":\"claude-opus-5-5\",\"messages\":[{\"role\":\"user\",\"content\":\"привет\"}]}"
@@ -119,7 +127,11 @@ relay в начале мышления отправляет метку `thinking
 `thinking.type=adaptive` + `output_config.effort` в Anthropic.
 Допустимые уровни конкретной модели перечислены в
 `/v1/models → capabilities.reasoning_effort_levels`. Неподдерживаемый уровень
-возвращает ошибку. Legacy `thinking.budget_tokens` переводится в уровень;
+возвращает 400 до обращения к upstream. Явный `allow_effort_downgrade: true`
+разрешает приближение известных уровней; журнал хранит requested/effective effort
+и причину выбора. Неизвестные `extra`/`ultra` отклоняются в обоих режимах.
+На 3 ноября Retool принимает для Opus 5.5 `high`/`max`, а сырой `xhigh` даёт 422.
+Legacy `thinking.budget_tokens` переводится в уровень;
 точный бюджет токенов Retool этим интерфейсом не предоставляет.
 
 Если клиент передал инструменты, модель получает его system/developer instructions,
@@ -168,6 +180,7 @@ E2E: `npx playwright test`.
 | max_prompt_bytes | 0 — relay не обрезает prompt; положительный лимит проверяет весь UTF-8 prompt и возвращает 413 при переполнении |
 | context_max_bytes | 40 000 — сколько контекста проекта подмешивается; больше не значит лучше (консенсус 2026: компактный структурный контекст вместо больших выгрузок) |
 | reasoning_effort | auto — рекомендация выбранной модели; явный уровень из клиента имеет приоритет |
+| allow_effort_downgrade | false — неподдерживаемый уровень отклоняется; true явно разрешает совместимое приближение |
 | agent_mode | 2 — рабочий режим агента (1 — более «разговорный», 3 — не проверялся) |
 | google_provider_resource_name, retool_fast_provider_resource_name | ресурсы для gemini-* и zai-org/*; без них эти модели дают 503 |
 | provider_resource_name, openai_provider_resource_name | ресурсы для claude-* и gpt-*; без них эти модели дают 503. Значение `__managed__` = тенант сам обслуживает модели (поле `providerResourceName` в запрос не отправляется); задаётся per-account в `accounts[]` |

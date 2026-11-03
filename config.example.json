@@ -15,7 +15,7 @@
   "cache_keepwarm_note": "провайдерский кэш живёт минуты; relay перечитывает префикс, чтобы он не истёк. 0 выключает",
   "cache_keepwarm_during_turns": true,
   "cache_keepwarm_turn_offset": 200,
-  "cache_keepwarm_turn_note": "пинг на 200-й секунде хода продлевает 5-минутный TTL: без него ход длиннее 5 мин перезаписывает весь контекст на следующем ходе",
+  "cache_keepwarm_turn_note": "первый пинг на 200-й секунде; затем не реже каждых 240 с при успешных запросах. TTL подтверждается только cache read/write телеметрией",
   "session_mode": "per_conversation",
   "strict_models": true,
   "enable_responses": true,
@@ -34,6 +34,7 @@
   "provider_resource_name": "<YOUR-ANTHROPIC-PROVIDER-RESOURCE-UUID>",
   "openai_provider_resource_name": "<YOUR-OPENAI-PROVIDER-RESOURCE-UUID>",
   "reasoning_effort": "auto",
+  "allow_effort_downgrade": false,
   "exec_policy": "allowlist",
   "exec_policy_note": "allowlist режет команду по \\n и \\u0026\\u0026 || | ; \\u0026 вне кавычек; тело powershell/cmd после -Command/-c проверяется рекурсивно",
   "exec_allowlist": [

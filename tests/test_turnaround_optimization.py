@@ -142,11 +142,11 @@ def test_reasoning_effort_clamping_and_preservation():
     assert effort_sonnet == "high"
 
     # 3. Haiku only accepts low, medium, high, max: 'xhigh' clamps to 'high'
-    entry_haiku, effort_haiku = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh")
+    entry_haiku, effort_haiku = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh", allow_downgrade=True)
     assert effort_haiku == "high"
 
     # 4. Non-reasoning model safely clamps effort to None without 400 error
-    entry_glm, effort_glm = models.resolve_tolerant("zai-org/GLM-5.3-Flash", "high")
+    entry_glm, effort_glm = models.resolve_tolerant("zai-org/GLM-5.3-Flash", "high", allow_downgrade=True)
     assert effort_glm is None
 
 

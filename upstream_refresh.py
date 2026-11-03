@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 
 from auth import merge_set_cookie, upstream_headers
-from config import persist_auth, reload_auth
+from config import _account_record, persist_auth, reload_auth, renewal_lock
 import journal
 from redact import redact
 
@@ -54,9 +54,18 @@ class Refresher:
             self.persistence_error = "cannot save renewed session: " + type(exc).__name__
 
     def refresh(self, force=False, *, rejected_cookie=None) -> bool:
+        try:
+            with renewal_lock(self.cfg):
+                return self._refresh_locked(force, rejected_cookie=rejected_cookie)
+        except OSError as exc:
+            self.last_error = "cannot coordinate session renewal: " + type(exc).__name__
+            self._last_result = False
+            return False
+
+    def _refresh_locked(self, force=False, *, rejected_cookie=None) -> bool:
         """Single-flight renewal. A concurrent caller reuses the new credentials."""
         # Multi-account: journal events must say WHICH tenant renewed/failed.
-        account_tag = journal.tag(self.cfg.get("page_uuid"))
+        account_tag = journal.tag(self.cfg.get("account_id") or self.cfg.get("page_uuid"))
         base = self.cfg.get("base")
         # Hostname only: credentials, paths or queries in the URL stay out of logs.
         tenant = (urllib.parse.urlsplit(base).hostname or "") if isinstance(base, str) else ""
@@ -94,12 +103,10 @@ class Refresher:
             if "_account_ref" in self.cfg and isinstance(self.cfg["_account_ref"], dict):
                 self.cfg["_account_ref"]["cookie"] = self.cfg["cookie"]
                 self.cfg["_account_ref"]["xsrf"] = self.cfg["xsrf"]
-            if isinstance(self.cfg.get("accounts"), list):
-                for acc in self.cfg["accounts"]:
-                    if isinstance(acc, dict) and acc.get("page_uuid") == self.cfg.get("page_uuid"):
-                        acc["cookie"] = self.cfg["cookie"]
-                        acc["xsrf"] = self.cfg["xsrf"]
-                        break
+            elif isinstance(self.cfg.get("accounts"), list):
+                record = _account_record(self.cfg, self.cfg)
+                if record is not None:
+                    record.update(cookie=self.cfg["cookie"], xsrf=self.cfg["xsrf"])
             self._persist()
             journal.emit("auth.refresh", "Сессия Retool продлена",
                          "warn" if self.persistence_error else "success", ok=True, forced=force,

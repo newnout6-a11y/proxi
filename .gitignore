@@ -7,6 +7,8 @@ __pycache__/
 
 # runtime secrets and state (keep config.example.json in git)
 config.json
+*.json.lock
+*.json.auth-*.lock
 cookies.txt
 relay_key.txt
 commands.log

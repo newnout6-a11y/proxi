@@ -592,18 +592,17 @@ def _ping(session, body):
     metadata event), or None when the stream ended without reporting them."""
     payload = dict(body)
     payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
-    model_name = payload.get("model")
-    entry = model_catalog._BY_ID.get(model_name)
-    levels = entry.get("reasoning_effort_levels") or () if entry else ()
-    if levels:
-        payload["reasoningEffort"] = "low" if "low" in levels else levels[0]
-    else:
-        payload["reasoningEffort"] = "low"
+    # Effort can be part of the provider cache scope. Preserve the exact request
+    # settings rather than replacing max with low during a cache refresh.
+    headers = session.backend.headers()
+    headers["content-type"] = "application/json"
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                      data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
-                                     headers=session.backend.headers(), method="POST")
+                                     headers=headers, method="POST")
     response = urllib.request.urlopen(request, timeout=120)
     actual_credits = None
+    complete = False
+    session._last_warm_usage = {}
     try:
         for index, raw in enumerate(response):
             line = raw.strip()
@@ -619,113 +618,103 @@ def _ping(session, body):
                 # A failed ping must not be reported as a refreshed TTL.
                 raise _error_from_event(event)
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            session._last_warm_usage.update(usage)
             if usage.get("creditsUsed") is not None:
                 actual_credits = float(usage["creditsUsed"])
             if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
+                complete = True
                 break
             if index >= 200:
                 break
     finally:
         response.close()
+    if not complete:
+        raise apierr.upstream_error("cache refresh ended without end_of_stream")
     return actual_credits
 
 
 async def _keepwarm(session, cfg):
-    """Hold the provider cache open while a conversation is in use.
+    """Refresh active and idle prefixes, scheduling from request starts.
 
-    Two refresh modes. Between turns: a ping every `cache_keepwarm_seconds`.
-    During a long turn (opt-out via `cache_keepwarm_during_turns=false`): one
-    anchored ping at `turn_start + cache_keepwarm_turn_offset` seconds — the
-    upstream KV TTL is 5 minutes measured from the start of the request, so a
-    310s+ generation would otherwise expire the prefix mid-turn and the next
-    turn would rewrite the whole context (30+ credits). A ping reads the still-
-    alive prefix (~0.05x price), which refreshes the TTL for the next turn."""
+    Only one ping runs per session. Active turns get their first refresh at
+    the configured offset, then at most every 240s (inside the 5-minute TTL).
+    Failures back off; an unknown cache result is never reported as a hit.
+    """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
     if interval <= 0:
         return
     idle = float(cfg.get("cache_keepwarm_idle", 1800) or 1800)
     during_turns = bool(cfg.get("cache_keepwarm_during_turns", True))
     turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), 285.0)
-    turn_seq = 0
-    during = False
+    active_interval = min(interval, 240.0)
+    scheduled_seq = None
+    next_turn_ping = 0.0
+    retry_at = 0.0
     while True:
         try:
+            await asyncio.sleep(0.05)
+            now = time.time()
             busy = bool(getattr(session, "_busy", False))
-            turn_started = getattr(session, "_turn_started_at", 0) or 0
-            pinged = bool(getattr(session, "_turn_pinged", False))
-            during = (during_turns and busy and turn_started and not pinged
-                      and 0.0 <= time.time() - turn_started <= 285.0)
-            if during:
-                # Anchored to the turn start: sleep out the rest of the offset.
-                await asyncio.sleep(max(0.05, turn_started + turn_offset - time.time()))
-            else:
-                await asyncio.sleep(1.0)
-            busy = bool(getattr(session, "_busy", False))
-            turn_started = getattr(session, "_turn_started_at", 0) or 0
-            during = (during_turns and busy and turn_started and not pinged
-                      and turn_offset <= time.time() - turn_started <= 285.0)
+            started = getattr(session, "_turn_started_at", 0) or 0
+            seq = getattr(session, "_turn_seq", 0)
+            if seq != scheduled_seq:
+                scheduled_seq = seq
+                next_turn_ping = started + turn_offset
             last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
-            if time.time() - last_req > idle:
+            if not busy and now - last_req > idle:
                 return
             body = getattr(session, "_warm_body", None)
-            if during and getattr(session, "_turn_body", None):
-                # Ping the ACTIVE turn's body: it carries this turn's newest cache
-                # breakpoint and exists on a session's very first turn.
-                body = session._turn_body
-            if not body:
-                continue
-            if not during:
-                if busy or getattr(session, "_warm_at", 0) and time.time() - getattr(session, "_warm_at", 0) < interval:
+            if busy:
+                if not during_turns or not started:
+                    await asyncio.sleep(0.95)
                     continue
-            was_during = during
-            turn_seq = getattr(session, "_turn_seq", 0)
-            actual = await asyncio.to_thread(_ping, session, body)
-            if was_during and getattr(session, "_turn_seq", 0) == turn_seq:
-                # A late ping must not mark a NEWER turn as already pinged.
-                session._turn_pinged = True
-            session._warm_at = time.time()
-            session._warm_failures = 0
-            prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
-            est_credits = prefix_tokens * credits.RATE_CACHE_READ
-            session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0)
-                                           + (actual if actual is not None else est_credits), 4)
-            if during:
-                # The user asked to SEE the mid-turn TTL refresh: console always,
-                # journal at info level (idle pings stay debug).
-                turn_age = round(time.time() - turn_started)
-                paid = actual if actual is not None else round(est_credits, 2)
-                print(f"[warm] TTL продлён во время хода: +{turn_age}s от начала, "
-                      f"кэш-чтение {paid} credits, всего {session._keepwarm_cost}", flush=True)
-                journal.emit("cache.keepwarm", "Прогрев кэша во время хода: TTL продлён", "info",
-                             model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
-                             during_turn=True, turn_age_seconds=turn_age,
-                             prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
-                             actual_credits=actual, credits_total=session._keepwarm_cost)
+                body = getattr(session, "_turn_body", None) or body
+                due = max(next_turn_ping, retry_at)
             else:
-                journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
-                             thread=journal.tag(getattr(session, "thread_id", None)),
-                             prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
-                             actual_credits=actual, credits_total=session._keepwarm_cost)
-            if cfg.get("direct_debug"):
-                print("[warm] prefix refreshed", flush=True)
+                due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
+            if not body or now < due:
+                await asyncio.sleep(min(0.95, max(0.05, due - now)))
+                continue
+            ping_started = now
+            actual = await asyncio.to_thread(_ping, session, body)
+            if busy and getattr(session, "_turn_seq", 0) == seq:
+                session._turn_pinged = True
+                next_turn_ping = ping_started + active_interval
+            session._warm_at = ping_started
+            session._warm_failures = 0
+            retry_at = 0.0
+            prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
+            estimate = prefix_tokens * credits.RATE_CACHE_READ
+            if actual is not None:
+                session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0) + actual, 4)
+            else:
+                session._keepwarm_estimated_cost = round(
+                    getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
+            usage = getattr(session, "_last_warm_usage", {})
+            touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
+                "promptTokensReadFromCache", "promptTokensWrittenToCache"))
+            journal.emit("cache.keepwarm",
+                         "Кэш прочитан или записан при прогреве" if touched else
+                         "Запрос прогрева завершён; использование кэша не подтверждено",
+                         "info" if busy else "debug",
+                         model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
+                         during_turn=busy, turn_age_seconds=round(ping_started - started) if busy else None,
+                         prefix_tokens=prefix_tokens, est_credits=round(estimate, 4),
+                         actual_credits=actual, credits_total=getattr(session, "_keepwarm_cost", 0.0),
+                         cache_verified=touched, usage=usage)
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            # A transient upstream/network error must not kill the warm cycle for
-            # the rest of the idle window. A persistent failure (e.g. revoked
-            # session) stops the cycle after several attempts — the next real
-            # request recreates it. A failed during-turn ping is not retried
-            # inside the same turn (one upstream request per turn, no 429 feed).
-            if during and getattr(session, "_turn_seq", 0) == turn_seq:
+            if busy and getattr(session, "_turn_seq", 0) == seq:
                 session._turn_pinged = True
             failures = getattr(session, "_warm_failures", 0) + 1
             session._warm_failures = failures
             if failures >= 5:
-                journal.emit("cache.keepwarm",
-                             "Прогрев остановлен после %d неудач подряд: %s" % (failures, str(exc)[:200]), "warn")
+                journal.emit("cache.keepwarm", "Прогрев остановлен после пяти неудач", "warn")
                 return
-            journal.emit("cache.keepwarm",
-                         "Прогрев не удался, повтор на следующем интервале: %s" % str(exc)[:200], "warn")
+            retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
+            next_turn_ping = retry_at
+            journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn")
 
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,

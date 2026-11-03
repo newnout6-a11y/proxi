@@ -32,7 +32,7 @@ class Pool:
     def __init__(self, session):
         self.session = session
 
-    async def acquire(self, *args):
+    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None):
         return self.session
 
     async def release(self, session):

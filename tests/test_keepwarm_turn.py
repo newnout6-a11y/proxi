@@ -81,7 +81,7 @@ async def test_during_turn_ping_skipped_when_disabled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_during_turn_ping_failure_is_not_retried(monkeypatch):
+async def test_during_turn_ping_failure_has_no_immediate_retry(monkeypatch):
     session = _Session()
     session._busy = True
     session._turn_started_at = time.time() - 201
@@ -99,7 +99,7 @@ async def test_during_turn_ping_failure_is_not_retried(monkeypatch):
 
     task = asyncio.create_task(direct._keepwarm(session, cfg))
     await asyncio.sleep(1.5)
-    assert len(calls) == 1, "a failed during-turn ping must not be retried in the same turn"
+    assert len(calls) == 1, "a failed during-turn ping must back off before retrying"
     assert session._turn_pinged is True
     task.cancel()
     try:

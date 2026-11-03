@@ -228,7 +228,7 @@ def test_adversarial_reasoning_effort_matrix():
         assert eff_h == valid_lvl
 
     # Test clamping of invalid levels on Haiku
-    entry_h_clamp, eff_h_clamp = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh")
+    entry_h_clamp, eff_h_clamp = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh", allow_downgrade=True)
     assert eff_h_clamp == "high", "Haiku unsupported 'xhigh' must clamp to 'high'"
 
     # A value no provider defines is rejected with a 400 instead of being
@@ -239,7 +239,7 @@ def test_adversarial_reasoning_effort_matrix():
 
     # 3. Non-reasoning models must return None without raising unhandled 400
     for non_reasoning in ["zai-org/GLM-5.3-Flash"]:
-        entry_nr, eff_nr = models.resolve_tolerant(non_reasoning, "high")
+        entry_nr, eff_nr = models.resolve_tolerant(non_reasoning, "high", allow_downgrade=True)
         assert eff_nr is None, f"Non-reasoning model {non_reasoning} must return None effort"
 
 

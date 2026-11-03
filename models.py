@@ -204,10 +204,10 @@ def nearest_effort(levels, requested):
                                           _EFFORT_RANK.get(level, wanted)))
 
 
-def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
-    """Like resolve(), but an unsupported known effort is clamped instead of rejected.
+def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False):
+    """Resolve exactly; explicit compatibility permits known-level mapping.
 
-    Clients copy one effort across models, so e.g. xhigh legitimately reaches
+    Compatibility mapping is opt-in. Clients copy one effort across models, so e.g. xhigh reaches
     Haiku, which only understands low/medium/high/max. A value no provider
     defines at all ("extra", "ultra", typos) is still rejected with a 400:
     clamping it to medium would silently downgrade a client that asked for
@@ -229,6 +229,8 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
     try:
         return resolve(base_name, extracted_effort, strict=strict, default_model=default_model)
     except ApiError as error:
+        if not allow_downgrade:
+            raise
         if error.status != 400:
             raise
         if extracted_effort is None or str(extracted_effort).lower() not in EFFORT_ORDER:

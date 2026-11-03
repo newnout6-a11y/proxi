@@ -33,7 +33,7 @@ class FakePool:
         self.session = session
         self.acquires = 0
 
-    async def acquire(self):
+    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None):
         self.acquires += 1
         return self.session
 

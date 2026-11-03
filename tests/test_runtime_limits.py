@@ -23,7 +23,7 @@ def runner(tmp_path, session=None, **overrides):
     class Pool:
         calls = 0
 
-        async def acquire(self, *args):
+        async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None):
             self.calls += 1
             return session
 

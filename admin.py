@@ -61,6 +61,7 @@ def _schema():
         "show_thinking": "Передавать мышление модели", "project_context": "Контекст проекта",
         "show_exec_output": "Вывод локальных команд",
         "cache_keepwarm_during_turns": "Прогрев кэша во время длинных ходов",
+        "allow_effort_downgrade": "Разрешать приближение неподдерживаемого effort",
     }.items():
         fields[key] = {"type": "boolean", "label": label}
     for key, label, minimum, maximum in [
@@ -240,6 +241,7 @@ class Admin:
             for refresher_lock in {id(r._lock): r._lock for r in
                                    (getattr(b, "refresher", None) for b in backends) if r}.values():
                 locks.enter_context(refresher_lock)
+            locks.enter_context(config.storage_lock(path))
             saved = self._saved()
             desired = self._settings(saved)["settings"]
             candidate = {**desired, **changes}

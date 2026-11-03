@@ -16,6 +16,7 @@ import websockets
 
 import apierr
 import journal
+import models as model_catalog
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -846,6 +847,10 @@ class SessionPool:
                 custom_ws = None
             for acc in self.cfg["accounts"]:
                 acc_cfg = dict(self.cfg)
+                if acc.get("base", self.cfg.get("base", "")).rstrip("/") != self.cfg.get("base", "").rstrip("/"):
+                    for resource_key in model_catalog.PROVIDER_RESOURCE_KEY.values():
+                        if resource_key not in acc:
+                            acc_cfg.pop(resource_key, None)
                 acc_cfg.update(acc)
                 acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
                 acc_cfg["_account_ref"] = acc
@@ -863,9 +868,21 @@ class SessionPool:
         self._slots = asyncio.BoundedSemaphore(max(1, self.cfg["max_workers"]))
         self._active = {}
 
-    def _next_backend(self) -> Backend:
-        if len(self.backends) <= 1:
-            return self.backend
+    @staticmethod
+    def _check_route(backend, model_entry):
+        if model_entry is not None:
+            model_catalog.provider_resource(backend.cfg, model_entry)
+
+    def _next_backend(self, model_entry=None) -> Backend:
+        eligible = []
+        for backend in self.backends:
+            try:
+                self._check_route(backend, model_entry)
+            except apierr.ApiError:
+                continue
+            eligible.append(backend)
+        if not eligible:
+            raise apierr.service_unavailable("no account has a route for the requested model")
         counts = {b: 0 for b in self.backends}
         for s in self._conversations.values():
             if getattr(s, "backend", None) in counts:
@@ -875,7 +892,7 @@ class SessionPool:
                 counts[session.backend] += 2
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % len(self.backends)
-        return min(self.backends, key=lambda b: (counts[b], (self.backends.index(b) - idx) % len(self.backends)))
+        return min(eligible, key=lambda b: (counts[b], (self.backends.index(b) - idx) % len(self.backends)))
 
     @property
     def mode(self):
@@ -910,7 +927,7 @@ class SessionPool:
         maker = getattr(b, "new_thread_id", None)
         return await maker() if maker is not None else await b.create_thread()
 
-    async def acquire(self, conversation_key=None, *, isolated=False) -> SessionLease:
+    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None) -> SessionLease:
         """Take one slot and return an independently releasable request handle."""
         await self._slots.acquire()
         lock = None
@@ -920,6 +937,7 @@ class SessionPool:
         keep = False
         try:
             if not isolated and self.mode == "shared":
+                self._check_route(self.backend, model_entry)
                 lock = self._lock
                 await lock.acquire()
                 locked = True
@@ -940,9 +958,10 @@ class SessionPool:
                                       or getattr(self._conversations.get(key), "_cached_head", None)
                                       or self.cfg.get("transport") == "direct"
                                       or len(self.backends) > 1):
-                    backend = self._next_backend()
-                    session = RelaySession(backend, await self._new_thread_id(backend))
                     parent = self._conversations.get(key)
+                    backend = parent.backend if parent is not None else self._next_backend(model_entry)
+                    self._check_route(backend, model_entry)
+                    session = RelaySession(backend, await self._new_thread_id(backend))
                     if parent is not None:
                         if getattr(parent, "_cached_head", None):
                             session._cached_head = parent._cached_head
@@ -963,15 +982,16 @@ class SessionPool:
                     locked = True
                     session = self._conversations.get(key)
                     if session is None:
-                        backend = self._next_backend()
+                        backend = self._next_backend(model_entry)
                         session = RelaySession(backend, await self._new_thread_id(backend))
                         self._conversations[key] = session
                         journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),
                                      pool=len(self._conversations))
                     keep = True
+                    self._check_route(session.backend, model_entry)
             else:
-                backend = self._next_backend()
+                backend = self._next_backend(model_entry)
                 session = RelaySession(backend, await self._new_thread_id(backend))
             session.begin_request()
             lease = SessionLease(session)

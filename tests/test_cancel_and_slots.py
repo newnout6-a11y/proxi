@@ -118,7 +118,7 @@ def test_deep_exec_chain_respects_prompt_limit(tmp_path, monkeypatch):
             yield {"type": "end", "reason": "stop"}
 
     class Pool:
-        async def acquire(self):
+        async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None):
             return Session()
 
         async def release(self, session):

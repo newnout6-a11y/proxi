@@ -70,6 +70,7 @@ class Parsed:
         self.model = ""
         self.entry = {}
         self.effort = None
+        self.requested_effort = None
         self.stream = False
         self.max_tokens = None
         self.temperature = None
@@ -413,6 +414,15 @@ def _messages(data, *, min_items=1):
 
 
 def _finish(data, parsed):
+    parsed.requested_effort = _effort(data)
+    if parsed.requested_effort is None:
+        for separator in ("#", ":"):
+            name = data.get("model") or ""
+            if separator in name:
+                candidate = name.split(separator, 1)[1].strip().lower()
+                if candidate in model_catalog.EFFORT_ORDER:
+                    parsed.requested_effort = candidate
+                break
     declared = [k for k in ("n", "seed", "presence_penalty", "frequency_penalty",
                             "logprobs", "top_logprobs", "response_format", "modalities", "metadata")
                 if data.get(k) is not None]
@@ -588,7 +598,8 @@ def conversation_key(data, header_value=None, allow_content_fallback=False):
 def parse_chat(data, cfg):
     parsed = Parsed()
     entry, effort = model_catalog.resolve_tolerant(
-        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
+        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
+        allow_downgrade=cfg.get("allow_effort_downgrade", False))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     _reject_images_unsupported(entry, data)
     messages = _messages(data)
@@ -607,7 +618,8 @@ def parse_chat(data, cfg):
 def parse_responses(data, cfg):
     parsed = Parsed()
     entry, effort = model_catalog.resolve_tolerant(
-        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
+        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
+        allow_downgrade=cfg.get("allow_effort_downgrade", False))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     _reject_images_unsupported(entry, data)
 
@@ -637,7 +649,8 @@ def parse_anthropic(data, cfg):
     parsed = Parsed()
     model = _opt_str(data, "model")
     entry, effort = model_catalog.resolve_tolerant(
-        model, _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"))
+        model, _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
+        allow_downgrade=cfg.get("allow_effort_downgrade", False))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     _reject_images_unsupported(entry, data)
     messages = _messages(data)

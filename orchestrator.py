@@ -371,8 +371,10 @@ class TurnRunner:
             # from the global cfg here would 503 account-only configurations.
             model_provider = {"model": parsed.model}
             effort = parsed.effort
+            requested_effort = getattr(parsed, "requested_effort", None) or effort
             if effort is None and parsed.entry.get("reasoning") and self.cfg.get("reasoning_effort"):
                 configured = self.cfg["reasoning_effort"]
+                requested_effort = configured
                 if configured == "auto":
                     levels = parsed.entry.get("reasoning_effort_levels", ())
                     if parsed.entry.get("reasoning_effort_control") == "provider-managed":
@@ -383,12 +385,16 @@ class TurnRunner:
                 if configured is not None:
                     _, effort = model_catalog.resolve_tolerant(
                         parsed.model, configured, strict=self.cfg.get("strict_models", True),
-                        default_model=self.cfg.get("model"))
+                        default_model=self.cfg.get("model"),
+                        allow_downgrade=self.cfg.get("allow_effort_downgrade", False))
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
             log("turn.begin", "Ход %s · effort %s · %s" % (parsed.model, effort or "—",
                                                           "direct" if direct_mode else "agent"),
                 model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
+                requested_effort=requested_effort, effective_effort=effort,
+                effort_resolution=("model_default" if requested_effort in (None, "auto") else
+                                   "exact" if requested_effort == effort else "compatibility"),
                 dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
                 tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
                 prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
@@ -402,9 +408,9 @@ class TurnRunner:
                 if not direct_mode and key and not native_tools and not can_exec:
                     # Tool-less calls in agent mode supply their complete history. Affinity alone
                     # must not add prior standalone jobs to that client context.
-                    session = await self.pool.acquire(key, isolated=True)
+                    session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry)
                 else:
-                    session = await self.pool.acquire(key) if key else await self.pool.acquire()
+                    session = await self.pool.acquire(key, model_entry=parsed.entry)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
                 # Console lines (heartbeat, [cache]) carry the relay request id so
