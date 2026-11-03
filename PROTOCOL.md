@@ -27,12 +27,13 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 {
   "model": "claude-opus-5-5",
   "rit": "99a368f5194fc7ea",
-  "providerResourceName": "ffd4d570-7c6b-414f-b95a-1a695676d0a8",
+  "providerResourceName": "<PROVIDER-RESOURCE-UUID>",
   "messages": [
     {
       "role": "system",
-      "content": "Инструкции и контекст проекта...",
-      "cache": true
+      "content": [
+        {"type": "text", "text": "Инструкции и контекст проекта...", "cache": true}
+      ]
     },
     {
       "role": "user",
@@ -44,19 +45,36 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
   ],
   "tools": [
     {
-      "name": "exec_command",
+      "name": "shell",
       "description": "...",
-      "parameters": { ... }
+      "params": {
+        "command": {"type": "string", "description": "...", "required": true}
+      },
+      "strict": true
     }
   ],
   "reasoningEffort": "high",
-  "openAICacheKey": "<uuid-хеш от head>",
+  "maxCompletionTokens": 4096,
+  "toolChoice": "required",
+  "openAICacheKey": "<первые 24 hex-символа sha256(model + tools + head)>",
   "metadata": {
-    "sandpackAgent": true,
-    "environmentName": "production"
+    "sandpackAgent": true
   }
 }
 ```
+
+Состав тела, как его формирует `direct.build_body`:
+- `content` системного и пользовательских сообщений — массив блоков; `cache: true`
+  ставится на текстовый блок. Строка допустима только для одиночного prompt без истории.
+- Каждый tool — `name`, `description`, `params` (типизированные параметры с `required`)
+  и `strict: true`; JSON Schema клиента преобразуется в этот вид.
+- `toolChoice` отправляется только если клиент задал не `auto` (`required` или имя инструмента);
+  `maxCompletionTokens` — только если клиент задал лимит, не меньше 16.
+- `openAICacheKey` — `sha256(model, 0x00, tools JSON, 0x00, head)[:24]`; `rit` — не криптографический
+  hint целостности от длины `messages` и `tools`.
+- `metadata` содержит только `sandpackAgent`; для моделей из списка Assist поле не отправляется
+  (relay убирает его и при повторе после ответа «not available right now»).
+- `providerResourceName` не отправляется, если ресурс не задан (`__managed__`).
 
 ### Поля и валидация upstream (Zod-схема Retool):
 - `model`: идентификатор модели (например `claude-opus-5-5`, `gpt-5.5`).
