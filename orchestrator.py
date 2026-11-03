@@ -488,6 +488,7 @@ class TurnRunner:
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
+                parent_key = getattr(parsed, "parent_conversation_key", None)
                 can_exec = self._can_exec(0) and not native_tools and not client_text
                 persistent_text = (direct_mode and not native_tools
                                    and self.cfg.get("session_mode") != "per_request"
@@ -495,16 +496,22 @@ class TurnRunner:
                                    and (key or self.cfg.get("session_mode") == "shared"))
                 isolated = not native_tools and not persistent_text and (direct_mode or client_text or (key and not can_exec))
                 failover = {"exclude": exclude} if exclude else {}
+                if parent_key and parent_key != key:
+                    failover["parent_key"] = parent_key
+                child_scope = (("subagent", key) if parent_key and key
+                               and self.cfg.get("session_mode") == "shared" else None)
                 if persistent_text:
                     # Ordinary text chats retain idle keepwarm, with state separate
                     # from native tools even when their conversation ID is the same.
-                    session = await self.pool.acquire(key, context_scope="text", model_entry=parsed.entry, **failover)
+                    session = await self.pool.acquire(key, context_scope=(child_scope, "text") if child_scope else "text",
+                                                      model_entry=parsed.entry, **failover)
                 elif isolated:
                     # A standalone job can share account affinity, never the main chat's
                     # tools, head, implicit history, cache breakpoints or idle keepwarm.
                     session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry, **failover)
                 else:
-                    session = await self.pool.acquire(key, model_entry=parsed.entry, **failover)
+                    scoped = {"context_scope": child_scope} if child_scope else {}
+                    session = await self.pool.acquire(key, model_entry=parsed.entry, **scoped, **failover)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
                 # Debit the account that actually served the turn.

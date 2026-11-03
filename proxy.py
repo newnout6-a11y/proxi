@@ -134,7 +134,8 @@ def make_handler(runtime: Runtime):
                              "authorization, x-api-key, anthropic-version, anthropic-beta, content-type, "
                              "x-request-id, x-session-affinity, x-session-id, x-opencode-session, "
                              "x-proxi-client, x-proxi-session-id, x-proxi-chat-title, x-proxi-agent, "
-                             "x-proxi-parent-session-id, x-opencode-session-id, x-opencode-parent-session-id")
+                             "x-proxi-parent-session-id, x-opencode-session-id, x-opencode-parent-session-id, "
+                             "x-claude-code-session-id, x-claude-code-agent-id")
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
             self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after")
 
@@ -474,13 +475,8 @@ def make_handler(runtime: Runtime):
                 parsed = validate.parse_responses(data, cfg)
             else:
                 parsed = validate.parse_chat(data, cfg)
-            affinity = (self.headers.get("x-session-affinity") or
-                        self.headers.get("x-session-id") or
-                        self.headers.get("x-opencode-session") or
-                        self.headers.get("x-conversation-id") or
-                        self.headers.get("session-id") or
-                        self.headers.get("conversation-id"))
-            parsed.conversation_key = validate.conversation_key(data, affinity)
+            parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
+                data, self.headers, client_context.current())
             parsed.request_id = self.request_id
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect

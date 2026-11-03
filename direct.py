@@ -700,7 +700,7 @@ async def _keepwarm(session, cfg):
                 scheduled_seq = seq
                 next_turn_ping = started + turn_offset
             last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
-            if not busy and now - last_req > idle:
+            if not busy and not getattr(session, "_cache_dependents", 0) and now - last_req > idle:
                 return
             body = getattr(session, "_warm_body", None)
             identity = getattr(session, "_warm_identity", None) or {}

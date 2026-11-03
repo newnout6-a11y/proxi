@@ -1,4 +1,4 @@
-/** Add local chat names to Proxi logs without changing conversation affinity. */
+/** Send the calling session's identity and local chat names to Proxi. */
 export const ProxiSessionLabels = async ({ client }) => ({
   "chat.headers": async (input, output) => {
     if (input.model.providerID !== "retool-relay") return

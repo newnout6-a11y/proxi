@@ -212,7 +212,10 @@ def test_new_external_relay_key_stays_with_config(tmp_path, monkeypatch):
     assert (tmp_path / "relay_key.txt").read_text(encoding="utf-8").strip() == generated
 
 
-def test_label_headers_do_not_change_affinity(relay):
+def test_session_id_routes_affinity_while_display_labels_do_not(relay):
     chat = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}
     relay.json("/v1/chat/completions", chat, headers={"x-proxi-client": "opencode", "x-proxi-session-id": "ses_title"})
+    assert relay.fake.seen[-1].conversation_key == "header:ses_title"
+    relay.json("/v1/chat/completions", chat, headers={"x-proxi-client": "opencode",
+               "x-proxi-chat-title": "display only", "x-proxi-agent": "explore"})
     assert relay.fake.seen[-1].conversation_key is None

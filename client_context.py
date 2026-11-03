@@ -218,7 +218,9 @@ def describe(data, headers, cfg=None):
             "agent": clean(headers.get("x-proxi-agent") or headers.get("x-claude-code-agent-id") or
                            metadata.get("agent_id") or identity.get("agent_id"), 100),
             "parent_session_id": clean(headers.get("x-proxi-parent-session-id") or
-                                       headers.get("x-opencode-parent-session-id"), 160)}.items() if value}
+                                       headers.get("x-opencode-parent-session-id") or
+                                       metadata.get("parent_session_id") or
+                                       identity.get("parent_session_id"), 160)}.items() if value}
     if not title and session_id and client in _CLIENTS:
         home = Path((cfg or {}).get("client_metadata_home") or Path.home()).resolve()
         info.update(_local_title(client, session_id, home))
