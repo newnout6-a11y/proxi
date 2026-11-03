@@ -65,7 +65,9 @@ def test_real_runner_forwards_thinking_and_signature_before_answer(tmp_path):
               {"type": "text", "delta": "answer"}, {"type": "end", "reason": "stop"}]
     _, parsed, _, runner = setup(tmp_path, script)
     events = run(runner, parsed)
-    assert events[:3] == script[:3]
+    assert events[0] == {"type": "usage_start"}
+    visible = [event for event in events if event["type"] != "usage_start"]
+    assert visible[:3] == script[:3]
 
 
 @pytest.mark.parametrize("effort", ["low", "high", "max"])

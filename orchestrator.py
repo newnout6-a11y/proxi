@@ -137,7 +137,7 @@ class _FailoverOut:
         if event.get("type") == "error":
             self.error = event["error"]
             return
-        if event.get("type") != "credits":
+        if event.get("type") not in ("credits", "usage_start"):
             self.started = True
         self.out.put(event)
 
@@ -613,6 +613,7 @@ class TurnRunner:
                     first_token = False
                     think_started = None
                     tool_started = {}
+                    out.put({"type": "usage_start"})
                     try:
                         async for event in stream:
                             if not first_token and event["type"] in ("text", "thinking", "tool_call"):
@@ -654,7 +655,7 @@ class TurnRunner:
                                         thinking_ms=span)
                                     think_started = None
                                 out.put(event)
-                            elif event["type"] == "thinking_heartbeat":
+                            elif event["type"] in ("thinking_heartbeat", "usage_start"):
                                 out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 if not event.get("partial"):

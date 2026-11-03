@@ -1001,6 +1001,7 @@ async def _stream_body(cfg, session, body, param_types=None):
     attempts_left = 0 if client_context.current().get("request_purpose") in client_context.SERVICE_KINDS else 2
     try:
         while True:
+            yield {"type": "usage_start"}
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
             task = loop.run_in_executor(None, contextvars.copy_context().run, worker, queue)
