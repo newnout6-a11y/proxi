@@ -19,6 +19,7 @@ import apierr
 import credits
 import journal
 import client_context
+import console_log
 import models as model_catalog
 
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
@@ -704,6 +705,8 @@ async def _keepwarm(session, cfg):
             usage = getattr(session, "_last_warm_usage", {})
             touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
                 "promptTokensReadFromCache", "promptTokensWrittenToCache"))
+            request_id = client_context.current().get("request_id") or "keepwarm"
+            console_log.write(console_log.CacheMonitor().line(request_id, usage) + " [keepwarm] " + client_context.label())
             journal.emit("cache.keepwarm",
                          "Кэш прочитан или записан при прогреве" if touched else
                          "Запрос прогрева завершён; использование кэша не подтверждено",
@@ -952,7 +955,8 @@ async def _stream_body(cfg, session, body, param_types=None):
             task = loop.run_in_executor(None, contextvars.copy_context().run, worker, queue)
             try:
                 flags = {}
-                async for event in _drain(cfg, session, queue, text, thinking, param_types, flags):
+                async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
+                                          cache_scope=(body.get("model"), body.get("openAICacheKey"))):
                     if event.get("type") not in ("credits", "thinking_heartbeat"):
                         # A metadata-only reply (credits + end_of_stream) is still
                         # an empty attempt and must get its retry.
@@ -991,7 +995,7 @@ async def _stream_body(cfg, session, body, param_types=None):
         session._active_direct_abort = None
 
 
-async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None):
+async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None, *, cache_scope=None):
     started = loop_now()
     think_started = None
     flags = {} if flags is None else flags
@@ -1007,6 +1011,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
     # The relay request id matches the `relay <id> POST ...` console lines:
     # concurrent requests of one conversation interleave in the same console.
     req_id = getattr(session, "_request_tag", None) or getattr(session, "thread_id", None) or "req"
+    monitor = getattr(session, "_console_cache_monitor", None)
+    if monitor is None:
+        monitor = session._console_cache_monitor = console_log.CacheMonitor()
 
     def _final_call_event(key):
         call = calls.pop(key, None)
@@ -1030,7 +1037,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         except asyncio.TimeoutError:
             if think_started is not None and not text and not stack and not calls:
                 elapsed = loop_now() - think_started
-                print(f"[{req_id}] Model is actively reasoning... ({round(elapsed)}s elapsed)", flush=True)
+                console_log.write(f"[{req_id}] Model is actively reasoning... ({round(elapsed)}s elapsed)")
                 journal.emit("upstream.thinking_heartbeat",
                              f"Модель активно думает ({round(elapsed)} с)",
                              "debug", elapsed=round(elapsed, 1), thread=journal.tag(req_id))
@@ -1140,9 +1147,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         elif kind == "metadata":
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
-                print("[%s] [cache] in=%s read=%s write=%s credits=%s" % (
-                    req_id, usage.get("inputTokens"), usage.get("promptTokensReadFromCache"),
-                    usage.get("promptTokensWrittenToCache"), usage.get("creditsUsed")), flush=True)
+                console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
+                                  (" " + client_context.label() if client_context.label() else ""))
             credits_used = usage.get("creditsUsed")
             try:
                 credits_value = float(credits_used) if credits_used is not None else None

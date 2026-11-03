@@ -1,0 +1,51 @@
+# Цветные консольные логи и баланс
+
+`read` — бирюзовый, обычный `write` — янтарный, стоимость — сиреневая.
+Красный `WRITE HIGH` появляется от 50 000 записанных токенов; `WRITE SPIKE` —
+при росте write относительно предыдущего запроса того же диалога/модели минимум
+в четыре раза и на 8192 токена. Большой cache read сам по себе не предупреждает.
+Частичные metadata-сообщения одного запроса сравниваются с прежним запросом,
+а не друг с другом. Показатели кэширования, списания и API-ответы не изменяются.
+
+После каждого модельного запроса, в том числе streaming, выводятся общий
+`balance`, месячный `limit` и `spent` за этот запрос с учётом повторных попыток.
+Баланс берётся из текущего локального снимка CreditsManager без сетевого запроса
+и ожидания в обработчике. `LOCAL ESTIMATE` означает остаток после локальных
+списаний, `STALE` — устаревший снимок или ошибку последнего обновления,
+`UNAVAILABLE` — отсутствие данных. Это не новый серверный замер на каждый запрос.
+
+Прямой запуск relay автоматически включает ANSI в терминале. Фоновый супервизор
+пишет обычный UTF-8 файл без цветовых кодов; для его просмотра:
+
+```powershell
+python scripts/watch_relay.py
+python scripts/watch_relay.py --demo
+```
+
+Можно указать путь к файлу, `--lines N` и `--no-follow`. `NO_COLOR` отключает цвет,
+`FORCE_COLOR=1` включает принудительно. Маскирование секретов выполняется до
+вставки ANSI, в том числе для некорректных model/effort.
+
+Проверки выполнены из рабочего checkout:
+
+```text
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests/test_console_log.py tests/test_client_context.py tests/test_health_cache.py tests/test_cache_observability.py -o addopts= -q --tb=short
+61 passed in 13.26s
+
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests -o addopts= -q --tb=short
+1043 passed in 135.88s
+
+git diff --check
+exit 0
+```
+
+Проверены границы красных сигналов, большой read без предупреждения, изоляция
+диалогов/моделей, повторные metadata, некорректные счётчики, отсутствие ANSI в
+перенаправлении, redaction, списание баланса без повторного учёта, streaming,
+неизвестный/отрицательный/устаревший баланс и чтение/усечение файла просмотрщиком.
+Синтаксис scripts/run_relay.ps1 проверен PowerShell Parser: ошибок нет.
+
+Визуально просмотрен синтетический PNG-пример, построенный из реального ANSI-
+форматтера, `logs/console-preview.png`; это пример оформления, не баланс аккаунта.
+Общий HTML design-gate `node scripts/accuracy_report.mjs` отсутствует в этом
+Python-проекте (MODULE_NOT_FOUND); успешной проверкой он не считался.

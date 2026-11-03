@@ -8,6 +8,7 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location (Split-Path -Parent $here)
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONUTF8 = "1"
+$env:NO_COLOR = "1" # This supervisor redirects to a plain file; colorize in watch_relay.py.
 $relayArgs = @("-u", "proxy.py")
 if ($Config) { $relayArgs += @("--config", $Config) }
 if ($StateDir) {

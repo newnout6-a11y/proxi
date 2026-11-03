@@ -20,6 +20,7 @@ import apierr
 import auth
 import journal
 import client_context
+import console_log
 from redact import redact
 import config as config_module
 import models as model_catalog
@@ -184,10 +185,14 @@ def make_handler(runtime: Runtime):
             model = getattr(self, "_model", "-")
             effort = getattr(self, "_effort_str", "")
             effort_tag = f" [{effort}]" if effort and model != "-" else ""
-            print(journal.scrub("relay %s %s %s %s %s%s %.0fms %s" % (
+            console_log.write("relay %s %s %s %s %s%s %.0fms %s" % (
                 self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
-                " ".join(part for part in (client_context.label(), note) if part))), flush=True)
+                " ".join(part for part in (client_context.label(), note) if part)))
             route = getattr(self, "_log_route", None)
+            if route in ("chat", "responses", "anthropic"):
+                snapshot = getattr(runtime.credits, "balance_snapshot", None)
+                if snapshot:
+                    console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used))
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
                 return
@@ -210,6 +215,7 @@ def make_handler(runtime: Runtime):
             self._streaming = False
             self._model = "-"
             self._effort_str = ""
+            self._credits_used = None
             self._error_code = None
             self._response_started = False
             parsed_url = urlparse(self.path)
@@ -274,7 +280,7 @@ def make_handler(runtime: Runtime):
                 self._error_code = err.code
                 self._log_error(err)
                 if err.status >= 400:
-                    print(journal.scrub("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160])), flush=True)
+                    console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
                 if getattr(self, "_streaming", False):
                     writer = self._writer
                     writer.event("error", self._error_payload(dialect, err))
@@ -284,7 +290,7 @@ def make_handler(runtime: Runtime):
                 else:
                     self._respond_error(err, dialect)
             except Exception as exc:  # never leak a bare traceback
-                print(journal.scrub("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200])), flush=True)
+                console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]))
                 self._error_code = "internal_error"
                 journal.emit("http.exception", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "error",
                              request_id=self.request_id, path=self.path)
@@ -475,7 +481,7 @@ def make_handler(runtime: Runtime):
 
             tools_count = len(getattr(parsed, "tools", None) or [])
             note = " [title/auxiliary]" if tools_count == 0 and len(parsed.prompt or "") < 200 else ""
-            print(journal.scrub(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()}{note}"), flush=True)
+            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()}{note}")
 
             wait = runtime.limiter.take()
             if wait:
@@ -524,6 +530,7 @@ def make_handler(runtime: Runtime):
                 if event is None:
                     break
                 kind = event.get("type")
+                self._track_credits(event)
                 if kind == "error":
                     raise event["error"]
                 if kind == "end":
@@ -534,6 +541,12 @@ def make_handler(runtime: Runtime):
                     self._cancel_turn(fut, holder_session)
                     return "cancelled"
             return reason
+
+        def _track_credits(self, event):
+            if event.get("type") == "credits":
+                cost = console_log.number(event.get("value"))
+                if cost is not None:
+                    self._credits_used = (self._credits_used or 0.0) + cost
 
         def _cancel_turn(self, fut, holder):
             event = holder.get("cancel_event")
@@ -567,6 +580,7 @@ def make_handler(runtime: Runtime):
                     break
                 if event.get("type") == "error":
                     raise event["error"]
+                self._track_credits(event)
                 if event.get("type") == "end":
                     reason = event.get("reason", "stop")
                     holder["reason"] = reason

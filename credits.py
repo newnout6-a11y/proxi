@@ -48,6 +48,7 @@ class CreditsManager:
         self._history = []
         self._seen_turns = set()
         self.last_error = None
+        self._balance_estimated = False
 
     def get_balance(self, force_refresh=False):
         # Coalesce simultaneous cache misses, including a failed auth refresh.
@@ -99,6 +100,7 @@ class CreditsManager:
             self._balance = dict(info)
             self._cached_at = time.monotonic()
             self.last_error = None
+            self._balance_estimated = False
         return dict(info, stale=False)
 
     def record_turn(self, turn_id, cost):
@@ -115,6 +117,14 @@ class CreditsManager:
                 del self._history[: len(self._history) - HISTORY_MAX]
             if self._balance and self._balance.get("available") is not None:
                 self._balance["available"] = round(self._balance["available"] - cost, 4)
+                self._balance_estimated = True
+
+    def balance_snapshot(self):
+        """Nonblocking console view; keep the local debit distinct from a fetch."""
+        with self._lock:
+            return dict(self._balance or {},
+                        stale=bool(self.last_error) or time.monotonic() - self._cached_at >= CACHE_TTL,
+                        estimated=self._balance_estimated)
 
     def usage(self):
         with self._lock:
