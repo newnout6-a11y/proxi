@@ -97,6 +97,26 @@ class Runtime:
         self.admin = admin_module.Admin(self)
 
 
+def account_tag(backend):
+    cfg = getattr(backend, "cfg", None) or {}
+    return journal.tag(cfg.get("account_id") or cfg.get("page_uuid")) or "account"
+
+
+def account_managers(runtime):
+    """(backend, CreditsManager) per account; the primary account follows runtime.credits."""
+    rows = []
+    for backend in runtime.accounts.backends:
+        manager = runtime.credits if backend is runtime.backend else runtime.accounts.managers.get(backend)
+        if manager is not None:
+            rows.append((backend, manager))
+    return rows or [(runtime.backend, runtime.credits)]
+
+
+def _known(value):
+    value = console_log.number(value, signed=True)
+    return value
+
+
 ROUTES = {
     ("POST", "/v1/chat/completions"): "chat",
     ("POST", "/v1/responses"): "responses",
@@ -211,9 +231,11 @@ def make_handler(runtime: Runtime):
                 self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
                 " ".join(part for part in (client_context.label(), local_note, note) if part)))
             if route in ("chat", "responses", "anthropic") and getattr(self, "_model_called", False):
-                snapshot = getattr(runtime.credits, "balance_snapshot", None)
+                backend, manager = self._serving_account()
+                snapshot = getattr(manager, "balance_snapshot", None)
                 if snapshot:
-                    console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used))
+                    tag = account_tag(backend) if backend is not None and len(runtime.accounts.backends) > 1 else None
+                    console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used, account=tag))
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
                 return
@@ -224,6 +246,17 @@ def make_handler(runtime: Runtime):
                          stream=bool(getattr(self, "_streaming", False)),
                          user_agent=self.headers.get("user-agent", "")[:120] if self.headers else "",
                          error=getattr(self, "_error_code", None))
+
+        def _serving_account(self):
+            """The account that answered this request, else the primary one."""
+            lease = (getattr(self, "_holder", None) or {}).get("session")
+            backend = getattr(getattr(lease, "session", lease), "backend", None)
+            if backend is None:
+                return None, runtime.credits
+            if backend is runtime.backend:
+                return backend, runtime.credits
+            manager = getattr(backend, "credits", None) or runtime.accounts.managers.get(backend)
+            return backend, manager or runtime.credits
 
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
@@ -238,6 +271,7 @@ def make_handler(runtime: Runtime):
             self._effort_str = ""
             self._credits_used = None
             self._model_called = False
+            self._holder = None
             self._error_code = None
             self._response_started = False
             self._client_trace = None
@@ -269,7 +303,6 @@ def make_handler(runtime: Runtime):
                         if exc.message == "invalid relay API key":
                             self._throttle_auth_failure()
                         raise
-                client_context.bind({**client_context.describe({}, self.headers, cfg), "request_id": self.request_id})
                 if route == "chat":
                     if not cfg["enable_chat"]:
                         raise apierr.not_found("chat API disabled")
@@ -292,11 +325,10 @@ def make_handler(runtime: Runtime):
                     self._json(200, model_catalog.codex_catalog(
                         [entry for entry in model_catalog.catalog() if self._model_routable(entry)]))
                 elif route == "balance":
-                    balance = runtime.credits.get_balance(force_refresh=True)
-                    status = 200 if balance.get("available") is not None or balance.get("stale") else 503
-                    self._json(status, dict(balance, accounts=runtime.accounts.status()))
+                    report = self._balance_report()
+                    self._json(200 if report["available"] is not None else 503, report)
                 elif route == "usage":
-                    self._json(200, runtime.credits.usage())
+                    self._json(200, self._usage_report())
                 elif route == "health":
                     self._health()
             except apierr.ApiError as err:
@@ -425,13 +457,96 @@ def make_handler(runtime: Runtime):
             key = model_catalog.PROVIDER_RESOURCE_KEY.get(model["provider"])
             return bool(key and cfg.get(key))
 
+        def _account_states(self):
+            return {backend: row for backend, row in zip(runtime.accounts.backends, runtime.accounts.status())}
+
+        def _balance_report(self):
+            rows = account_managers(runtime)
+            states = self._account_states()
+
+            def fetch(row):
+                return row[1].get_balance(force_refresh=True)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
+                infos = list(pool.map(fetch, rows))
+            accounts, known = [], []
+            for (backend, _manager), info in zip(rows, infos):
+                available = _known(info.get("available"))
+                entry = {"account": account_tag(backend),
+                         "state": (states.get(backend) or {}).get("state", "active"),
+                         "available": available,
+                         "monthly_allocation": info.get("monthly_allocation"),
+                         "reset_date": info.get("reset_date"),
+                         "stale": bool(info.get("stale"))}
+                error = info.get("error") or info.get("stale_error")
+                if error:
+                    entry["error"] = error
+                accounts.append(entry)
+                if available is not None:
+                    known.append(info)
+            allocation = [value for value in (_known(info.get("monthly_allocation")) for info in known)
+                          if value is not None]
+            total = round(sum(_known(info.get("available")) for info in known), 4) if known else None
+            report = {
+                "available": total,
+                "monthly_allocation": round(sum(allocation), 4) if allocation else None,
+                "used_month": round(sum(info.get("used_month") or 0.0 for info in known), 4) if known else None,
+                "reset_date": next((info["reset_date"] for info in known if info.get("reset_date")), None),
+                "is_low": any(info.get("is_low") for info in known),
+                "session_used": round(sum(_known(info.get("session_used")) or 0.0 for info in infos), 4),
+                "stale": any(info.get("stale") for info in known),
+                "unreported_usage": any(info.get("unreported_usage") for info in infos),
+                "accounts": accounts,
+            }
+            if not known:
+                report["error"] = next((entry["error"] for entry in accounts if entry.get("error")), None)
+            return report
+
+        def _usage_report(self):
+            rows, recent, accounts = account_managers(runtime), [], []
+            totals = {"session_used": 0.0, "turns": 0, "recent_total": 0.0}
+            available, unreported = [], False
+            for backend, manager in rows:
+                usage = manager.usage()
+                tag = account_tag(backend)
+                items = [dict(item, account=tag) for item in usage.get("recent") or []]
+                recent.extend(items)
+                used = console_log.number(usage.get("session_used")) or 0.0
+                turns = int(usage.get("turns") or 0)
+                totals["session_used"] += used
+                totals["turns"] += turns
+                totals["recent_total"] += console_log.number(usage.get("recent_total")) or sum(
+                    console_log.number(item.get("credits")) or 0.0 for item in items)
+                unreported = unreported or bool(usage.get("unreported_usage"))
+                balance = _known(usage.get("available"))
+                if balance is not None:
+                    available.append(balance)
+                accounts.append({"account": tag, "session_used": round(used, 4), "turns": turns,
+                                 "available": balance})
+            recent.sort(key=lambda item: item.get("ts") or 0)
+            return {"session_used": round(totals["session_used"], 4), "turns": totals["turns"],
+                    "recent": recent[-50:], "recent_total": round(totals["recent_total"], 4),
+                    "unreported_usage": unreported,
+                    "available": round(sum(available), 4) if available else None,
+                    "accounts": accounts}
+
         def _health(self):
-            balance = runtime.credits.get_balance()
-            ok = balance.get("available") is not None and not balance.get("stale")
-            for b in getattr(runtime.pool, "backends", []):
-                ref = getattr(b, "refresher", None)
-                if ref and ref.status().get("stale"):
-                    ok = False
+            # An account counts when the dispatcher routes to it and its own balance
+            # check is fresh; one healthy account keeps the relay serving.
+            states = self._account_states()
+            ok = known = False
+            routable = 0
+            counts = {}
+            for backend, manager in account_managers(runtime):
+                state = (states.get(backend) or {}).get("state") or (
+                    (getattr(backend, "unavailable", None) or {}).get("reason") or "active")
+                counts[state] = counts.get(state, 0) + 1
+                balance = manager.get_balance()
+                fresh = balance.get("available") is not None and not balance.get("stale")
+                known = known or fresh
+                if getattr(backend, "unavailable", None) is None:
+                    routable += 1
+                    ok = ok or fresh
             # /health is the only unauthenticated route and carries CORS *: it must
             # expose readiness booleans, not organization financials or raw
             # upstream error text — those live behind /v1/balance with the key.
@@ -443,8 +558,9 @@ def make_handler(runtime: Runtime):
                 "session_mode": cfg["session_mode"],
                 "models": len(model_catalog.catalog()),
                 "upstream": "ok" if ok else "degraded",
-                "balance_known": ok,
+                "balance_known": known,
                 "session": session,
+                "accounts": {"total": sum(counts.values()), "routable": routable, "states": counts},
             }
             self._json(200 if ok else 503, payload)
 
@@ -531,6 +647,7 @@ def make_handler(runtime: Runtime):
 
             events = queue.Queue()
             holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
+            self._holder = holder
             self._model_called = True
             fut = asyncio.run_coroutine_threadsafe(runtime.runner.run(parsed, events, holder), runtime.loop)
 

@@ -68,7 +68,7 @@ def dispatcher(accounts, managers=None, **cfg):
 
 def test_first_checks_are_staggered_and_parallel_is_bounded():
     accounts = [Account("a%d" % i) for i in range(20)]
-    value, clock = dispatcher(accounts, parallel=3)
+    value, clock = dispatcher(accounts, account_refresh_parallel=3)
     assert len(value.due()) == 1  # only the first account is due at start
     clock.now += 60
     jobs = value.due()
@@ -131,7 +131,14 @@ def test_pool_skips_exhausted_accounts_and_reports_402_when_none_left(tmp_path):
         lease = await pool.acquire("chat")
         assert lease.backend is other
         await pool.release(lease)
+        # Below the reserve but positive: the richest account still serves.
         other.unavailable = {"reason": "exhausted", "available": 1.0, "threshold": 20.0}
+        lease = await pool.acquire("new-chat")
+        assert lease.backend is pool.backends[0]
+        await pool.release(lease)
+        # Only confirmed-empty accounts end in 402.
+        pool.backends[0].unavailable = {"reason": "exhausted", "available": 0.0, "threshold": 20.0}
+        other.unavailable = {"reason": "exhausted", "available": -1.0, "threshold": 20.0}
         with pytest.raises(apierr.ApiError) as caught:
             await pool.acquire("new-chat")
         return caught.value
@@ -147,6 +154,7 @@ def test_signed_out_only_account_is_still_tried(tmp_path):
 
     async def scenario():
         lease = await pool.acquire("chat")
+        assert lease.backend is pool.backends[0]
         await pool.release(lease)
 
     asyncio.run(scenario())
@@ -202,7 +210,7 @@ def test_non_auth_renewal_failures_never_mark_account_signed_out(kind):
     value, clock = dispatcher([account])
     for _ in range(DEAD_AFTER + 2):
         value.refresh(account)
-        clock.now = value.pause_until
+        clock.now = max(value.pause_until, value.state[account]["next_refresh"])
     assert account.unavailable is None
 
 
@@ -243,7 +251,7 @@ def test_lone_signed_out_account_keeps_its_conversation(tmp_path):
     asyncio.run(scenario())
 
 
-def test_failed_migration_keeps_the_original_conversation(tmp_path):
+def test_lone_account_below_reserve_still_serves_and_keeps_its_conversation(tmp_path):
     _, pool, _ = setup(tmp_path, transport="direct", project_context=False)
 
     async def scenario():
@@ -251,6 +259,21 @@ def test_failed_migration_keeps_the_original_conversation(tmp_path):
         first = lease.session
         await pool.release(lease)
         pool.backends[0].unavailable = {"reason": "exhausted", "available": 2.0, "threshold": 20.0}
+        lease = await pool.acquire("chat")
+        assert lease.session is first
+        await pool.release(lease)
+
+    asyncio.run(scenario())
+
+
+def test_failed_migration_keeps_the_original_conversation(tmp_path):
+    _, pool, _ = setup(tmp_path, transport="direct", project_context=False)
+
+    async def scenario():
+        lease = await pool.acquire("chat")
+        first = lease.session
+        await pool.release(lease)
+        pool.backends[0].unavailable = {"reason": "exhausted", "available": 0.0, "threshold": 20.0}
         with pytest.raises(apierr.ApiError) as caught:
             await pool.acquire("chat")
         assert caught.value.status == 402
@@ -263,7 +286,7 @@ def test_failed_migration_keeps_the_original_conversation(tmp_path):
 def test_top_up_is_adopted_before_answering_402(tmp_path, monkeypatch):
     _, pool, runner = setup(tmp_path, transport="direct", project_context=False)
     account = pool.backends[0]
-    account.unavailable = {"reason": "exhausted", "available": 2.0, "threshold": 20.0}
+    account.unavailable = {"reason": "exhausted", "available": 0.0, "threshold": 20.0}
 
     async def stream(session, prompt, provider, tool_names=None):
         yield {"type": "text", "delta": "ok"}

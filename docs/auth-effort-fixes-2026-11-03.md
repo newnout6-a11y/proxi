@@ -17,8 +17,11 @@
   ротацию. Общая блокировка конфигурации во время сетевого запроса не удерживается.
 - Новая сессия выбирается среди аккаунтов с ресурсом нужной модели. Ресурсы
   другого tenant не наследуются. Параллельный дочерний запрос остаётся на аккаунте
-  беседы. У существующей беседы без нужного маршрута возвращается ошибка;
-  неявного переноса в другой tenant нет.
+  беседы, пока этот аккаунт доступен и имеет маршрут к модели. (Обновлено после
+  ревью #18: если аккаунт исчерпан, требует нового входа или не имеет маршрута,
+  беседа переносится на другой подходящий аккаунт; ошибка 503/402 возвращается,
+  только когда подходящего аккаунта нет. Ресурсы другого tenant по-прежнему
+  не наследуются.)
 - Активный ход получает первый keepwarm на настроенном offset, последующие —
   через `min(cache_keepwarm_seconds, 240)` секунд от начала ping. Запросы
   последовательны, ошибки используют backoff; idle-лимит не прерывает активный
@@ -39,7 +42,10 @@ uv run --python 3.14 --with-requirements requirements.txt --no-project python -m
 git diff --check
 ```
 
-Финальный результат: **984 passed in 133.13s**, whitespace check без ошибок.
+Результат на момент этого отчёта (исторический, для коммита проверки):
+**984 passed in 133.13s**, whitespace check без ошибок. Счётчик устарел: позднее
+набор вырос; актуальное число даёт `pytest --collect-only -q` (на ревизии этих
+правок собирается 1253 теста).
 Весь suite использует offline/localhost fixtures; live-пробы запускаются отдельно.
 
 Регрессии включают общие tenant/page при разных аккаунтах, перестановку записей,
@@ -53,12 +59,13 @@ git diff --check
 
 ## Live: сырой маршрут Retool
 
-Исходный конфиг читался напрямую как JSON, без миграции или сохранения. Пробы не
-вызывают refresh token. Модель — `claude-opus-5-5`, существующий managed resource,
+Исходный конфиг читался скриптом `probe_effort.py` напрямую как JSON, без миграции
+или сохранения (сам relay через `config.load()` при первом запуске дописывает
+`account_id`, см. «Границы»). Пробы не вызывают refresh token. Модель — `claude-opus-5-5`, существующий managed resource,
 короткий синтетический prompt, лимит ответа 1024 токена.
 
 ```powershell
-python scripts/probe_effort.py --config C:\specialinay_papka\config.json --efforts high xhigh max extra --timeout 90
+python scripts/probe_effort.py --config <repo>\config.json --efforts high xhigh max extra --timeout 90
 ```
 
 | Sent effort | HTTP | end_of_stream | Ответ | creditsUsed |
@@ -75,7 +82,7 @@ python scripts/probe_effort.py --config C:\specialinay_papka\config.json --effor
 ## Live: HTTP boundary этого checkout
 
 ```powershell
-python scripts/probe_effort.py --config C:\specialinay_papka\config.json --gateway-check --efforts high max xhigh extra --timeout 90
+python scripts/probe_effort.py --config <repo>\config.json --gateway-check --efforts high max xhigh extra --timeout 90
 ```
 
 Для каждого из Chat Completions, Responses, Anthropic:
@@ -94,7 +101,7 @@ python scripts/probe_effort.py --config C:\specialinay_papka\config.json --gatew
 ## Live: кэш при max без понижения effort
 
 ```powershell
-python scripts/probe_effort.py --config C:\specialinay_papka\config.json --efforts max --cache-check --timeout 90
+python scripts/probe_effort.py --config <repo>\config.json --efforts max --cache-check --timeout 90
 ```
 
 Синтетический system-prefix одинаков во всех трёх запросах:
@@ -115,9 +122,9 @@ python scripts/probe_effort.py --config C:\specialinay_papka\config.json --effor
 старого bundle-каталога с текущим backend:
 
 ```powershell
-python scripts/probe_effort.py --config C:\specialinay_papka\config.json --model gpt-6-sol --efforts xhigh max --timeout 90
+python scripts/probe_effort.py --config <repo>\config.json --model gpt-6-sol --efforts xhigh max --timeout 90
 foreach ($effortProbeModel in @('gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna')) {
-  python scripts/probe_effort.py --config C:\specialinay_papka\config.json --model $effortProbeModel --efforts xhigh max --timeout 90
+  python scripts/probe_effort.py --config <repo>\config.json --model $effortProbeModel --efforts xhigh max --timeout 90
 }
 ```
 
@@ -132,7 +139,7 @@ foreach ($effortProbeModel in @('gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna')) {
 
 ```powershell
 foreach ($effortFinalModel in @('gpt-6-sol', 'gpt-6.1-sol')) {
-  python scripts/probe_effort.py --config C:\specialinay_papka\config.json --model $effortFinalModel --gateway-check --dialects responses --efforts xhigh max --timeout 90
+  python scripts/probe_effort.py --config <repo>\config.json --model $effortFinalModel --gateway-check --dialects responses --efforts xhigh max --timeout 90
 }
 ```
 
@@ -152,8 +159,24 @@ GPT-6 route capabilities и списка Codex; регрессии провер�
 
 Job/replay API, восстановление скрытого вычисления после потери upstream,
 долговечные snapshots контекста и раздельные transport deadlines здесь не добавлены.
-Текущий маршрут не предоставляет подтверждённого resume API. Production-конфиг и
-запущенный основной relay не изменялись; проверялся изолированный checkout.
+Текущий маршрут не предоставляет подтверждённого resume API. Основной relay не
+перезапускался; проверялся изолированный checkout.
+
+Про конфиг: `probe_effort.py` читает его только для чтения, но `config.load()` при
+первом запуске relay один раз дописывает сгенерированный `account_id` в `config.json`
+(формат файла становится с отступом 2) и создаёт рядом файлы блокировок `*.lock`.
+Этого можно избежать, задав секреты через `RETOOL_COOKIE`/`RETOOL_XSRF` (запись
+отключена) либо сделав файл доступным только для чтения: тогда ID остаются в памяти,
+а в stderr выводится предупреждение. Поэтому утверждать, что запуск на рабочем
+конфиге ничего в нём не меняет, нельзя.
+
+## Дополнение: диспетчер аккаунтов (d723e4d, 3973979, cec7842)
+
+Эти коммиты PR #18 добавили `accounts.py` (разнесённое продление и проверка баланса
+всех аккаунтов, failover по балансу, исключение аккаунта после трёх отказов
+авторизации), кэш названий чатов и ограничение диагностики upstream. Актуальное
+поведение, включая правки после ревью #18, описано в README (раздел «Установка» и
+таблица конфигурации).
 
 ## Дополнение: неявный effort после проверки 82ea7bb
 

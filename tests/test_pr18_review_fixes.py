@@ -60,13 +60,15 @@ def test_keepalive_survives_an_unexpected_renewal_exception(tmp_path, monkeypatc
 
 def test_missing_local_title_is_cached_instead_of_rescanned(tmp_path, monkeypatch):
     client_context._CACHE.clear()
-    scans = []
-    monkeypatch.setattr(client_context, "_desktop_title", lambda *_a: {})
-    monkeypatch.setattr(client_context, "_claude_title", lambda *_a: scans.append(1) or {})
-    for _ in range(3):
-        assert client_context._local_title("claude-code", SESSION, tmp_path) == {}
-    assert len(scans) == 1
-    client_context._CACHE.clear()
+    try:
+        scans = []
+        monkeypatch.setattr(client_context, "_desktop_title", lambda *_a: {})
+        monkeypatch.setattr(client_context, "_claude_title", lambda *_a: scans.append(1) or {})
+        for _ in range(3):
+            assert client_context._local_title("claude-code", SESSION, tmp_path) == {}
+        assert len(scans) == 1
+    finally:
+        client_context._CACHE.clear()
 
 
 def test_keepwarm_reporting_failure_keeps_result_and_debit(monkeypatch):

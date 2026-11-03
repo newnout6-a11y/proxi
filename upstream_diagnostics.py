@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import pathlib
+import re
 import threading
 import time
 import uuid
@@ -16,6 +17,8 @@ _KNOWN = frozenset({"content_block_start", "content_block_delta", "content_block
                     "metadata", "end_of_stream", "error", "ping", "message_start", "message_delta", "message_stop"})
 _HEADERS = ("request-id", "x-request-id", "cf-ray", "content-type", "x-retool-api-version")
 _SIGNALS = ("stop_reason", "stopReason", "finish_reason", "finishReason", "statusCode", "code")
+# Request-body dump sets are pruned only when their name is exactly what _dump_rejected_body writes.
+_DUMP_SET = re.compile(r"^\d{8}-\d{6}-[^\W_]*-[0-9a-f]{12}-body\.json$")
 
 
 def _limit(cfg, key, default):
@@ -48,7 +51,8 @@ def prune_diagnostics(cfg, folder, keep=None):
                 ("-response.json", _limit(cfg, "upstream_attempt_summaries_max", 200), ("-response.json",))):
             if not limit:
                 continue
-            files = _oldest_first(folder.glob("*" + suffix))
+            files = _oldest_first(path for path in folder.glob("*" + suffix)
+                                  if suffix != "-body.json" or _DUMP_SET.match(path.name))
             removable = [p for p in files if keep is None or not p.name.startswith(keep)]
             for old in removable[:max(0, len(files) - limit)]:
                 stamp = old.name[:-len(suffix)]

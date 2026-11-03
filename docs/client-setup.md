@@ -71,8 +71,8 @@ OpenAI Chat Completions route for this relay. The same relay key also works
 with the OpenAI Responses and Anthropic Messages endpoints.
 
 The local setup adds `llm-pi-ai.providers.retool` to
-`C:\Users\Redmi\.dsh\settings.yaml` and the credential reference
-`RETOOL_RELAY_API_KEY` to `C:\Users\Redmi\.dsh\.credentials.yaml`.
+`%USERPROFILE%\.dsh\settings.yaml` and the credential reference
+`RETOOL_RELAY_API_KEY` to `%USERPROFILE%\.dsh\.credentials.yaml`.
 These files are outside this repository. Existing providers, comments, and the
 selected provider are preserved. Both documents are watched, so the running
 Harness picks up the added route without restarting existing chats.

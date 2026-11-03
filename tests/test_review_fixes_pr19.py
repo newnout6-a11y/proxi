@@ -50,6 +50,7 @@ def signature(value):
 @pytest.fixture(autouse=True)
 def fresh_run_state(monkeypatch):
     monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
+    monkeypatch.setattr(direct, "_DUMP_RECENT", {})
     monkeypatch.setattr(AttemptBudget, "wait", lambda self, delay, cancelled: None)
 
 
@@ -221,7 +222,9 @@ def _dump(tmp_path, model="claude-opus-5-5", purpose=None):
     session = SimpleNamespace(_request_tag="x")
     token = client_context.bind({"request_purpose": purpose} if purpose else {})
     try:
-        return direct._dump_empty_once(b'{"conversation":"AAAA"}', {"budget": AttemptBudget()},
+        # Distinct bodies per kind: identical bodies are deduplicated by sha256.
+        payload = json.dumps({"conversation": "AAAA", "kind": [purpose, model]}).encode()
+        return direct._dump_empty_once(payload, {"budget": AttemptBudget()},
                                        {"upstream_error_dir": str(tmp_path)}, session, model)
     finally:
         client_context.reset(token)
@@ -250,7 +253,7 @@ def test_failed_empty_dump_write_is_not_marked_as_done(tmp_path):
 
 def test_dump_sets_are_pruned_to_the_configured_limit(tmp_path):
     cfg = {"upstream_error_dir": str(tmp_path), "upstream_error_max_dumps": 5}
-    stamps = [direct._dump_rejected_body(b"{}", "bad", cfg=cfg, request_id="r%d" % i) for i in range(12)]
+    stamps = [direct._dump_rejected_body(b'{"i":%d}' % i, "bad", cfg=cfg, request_id="r%d" % i) for i in range(12)]
     assert len(list(tmp_path.glob("*-body.json"))) == 5
     assert len(list(tmp_path.glob("*-error.txt"))) == len(list(tmp_path.glob("*-metadata.json"))) == 5
     assert (tmp_path / (stamps[-1] + "-body.json")).exists()
@@ -261,7 +264,7 @@ def test_default_dump_retention_is_fifty(tmp_path):
     assert config.DEFAULTS["upstream_attempt_summaries_max"] == 200
     cfg = {"upstream_error_dir": str(tmp_path)}
     for i in range(53):
-        direct._dump_rejected_body(b"{}", "bad", cfg=cfg, request_id="r%d" % i)
+        direct._dump_rejected_body(b'{"i":%d}' % i, "bad", cfg=cfg, request_id="r%d" % i)
     assert len(list(tmp_path.glob("*-body.json"))) == 50
 
 

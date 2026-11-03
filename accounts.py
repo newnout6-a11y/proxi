@@ -44,8 +44,8 @@ class AccountDispatcher:
         for index, backend in enumerate(self.backends):
             offset = min(index * STARTUP_SPREAD, 60.0)
             self.state[backend] = {"next_refresh": now + offset, "next_balance": now + offset + 1.0,
-                                   "auth_failures": 0, "running": set(), "reasons": {},
-                                   "last_forced": float("-inf"), "available": None}
+                                   "auth_failures": 0, "soft_failures": 0, "running": set(), "reasons": {},
+                                   "last_forced": float("-inf"), "forced": None, "available": None}
             backend.unavailable = None
             if self.managers.get(backend) is not None:
                 backend.credits = self.managers[backend]
@@ -60,6 +60,11 @@ class AccountDispatcher:
     def start(self):
         if self.alive():
             return
+        with self._lock:
+            # Claims of a previous run (jobs cancelled by stop()) must not block scheduling.
+            self._busy = 0
+            for state in self.state.values():
+                state["running"].clear()
         self._stop.clear()
         self._executor = ThreadPoolExecutor(max_workers=self.parallel, thread_name_prefix="account-check")
         self._thread = threading.Thread(target=self._loop, name="account-dispatcher", daemon=True)
@@ -74,13 +79,26 @@ class AccountDispatcher:
 
     def _loop(self):
         while not self._stop.is_set():
-            try:
-                self.revive_renewed()
-                for backend, kind in self.due():
-                    self._executor.submit(self._run, backend, kind)
-            except Exception as exc:  # noqa: BLE001 - the scheduler must outlive one bad tick
-                journal.emit("account.dispatcher", "Ошибка планировщика аккаунтов: %s" % type(exc).__name__, "error")
+            self._tick()
             self._stop.wait(1.0)
+
+    def _tick(self):
+        try:
+            self.revive_renewed()
+            for backend, kind in self.due():
+                try:
+                    self._executor.submit(self._run, backend, kind)
+                except Exception as exc:  # noqa: BLE001 - executor shut down: release the claim
+                    self._unclaim(backend, kind)
+                    journal.emit("account.dispatcher", "Не удалось запустить проверку: %s" % type(exc).__name__,
+                                 "warn")
+        except Exception as exc:  # noqa: BLE001 - the scheduler must outlive one bad tick
+            journal.emit("account.dispatcher", "Ошибка планировщика аккаунтов: %s" % type(exc).__name__, "error")
+
+    def _unclaim(self, backend, kind):
+        with self._lock:
+            self.state[backend]["running"].discard(kind)
+            self._busy = max(0, self._busy - 1)
 
     # -- scheduling ----------------------------------------------------------
     def _tag(self, backend):
@@ -135,7 +153,7 @@ class AccountDispatcher:
         finally:
             with self._lock:
                 self.state[backend]["running"].discard(kind)
-                self._busy -= 1
+                self._busy = max(0, self._busy - 1)
 
     # -- state ---------------------------------------------------------------
     def _set_reason(self, backend, reason, details):
@@ -170,8 +188,12 @@ class AccountDispatcher:
 
     def refresh(self, backend):
         refresher = backend.refresher
-        ok = refresher.refresh(force=True)
-        kind = getattr(refresher, "last_failure_kind", None)
+        detailed = getattr(refresher, "refresh_detailed", None)
+        if detailed is not None:
+            ok, kind, error = detailed(force=True)
+        else:
+            ok = refresher.refresh(force=True)
+            kind, error = getattr(refresher, "last_failure_kind", None), getattr(refresher, "last_error", None)
         now = self.clock()
         changed = False
         with self._lock:
@@ -179,24 +201,31 @@ class AccountDispatcher:
             if ok:
                 self._network_failures = 0
                 state["auth_failures"] = 0
+                state["soft_failures"] = 0
                 state["next_refresh"] = now + self._jitter(self.interval)
                 changed = self._set_reason(backend, "auth_dead", None)
-            elif kind != "auth":
-                # The network, Retool (5xx) or local storage failed, not this account's
-                # session: every account waits together and nobody is marked signed out.
+            elif kind == "network":
+                # The network is down, not this account's session: every account waits
+                # together and nobody is marked signed out.
                 if now >= self.pause_until:
                     # Parallel checks failing together count as one outage.
                     self._network_failures += 1
-                pause = min(20.0 * 2 ** (max(self._network_failures, 1) - 1), NETWORK_PAUSE_MAX)
+                pause = min(20.0 * 2 ** min(max(self._network_failures, 1) - 1, 10), NETWORK_PAUSE_MAX)
                 self.pause_until = max(self.pause_until, now + pause)
                 state["next_refresh"] = self.pause_until
+            elif kind != "auth":
+                # Retool (5xx) or local storage failed for this account only: back off
+                # this account and keep renewing the others.
+                state["soft_failures"] += 1
+                pause = min(20.0 * 2 ** min(state["soft_failures"] - 1, 10), NETWORK_PAUSE_MAX)
+                state["next_refresh"] = now + self._jitter(pause)
             else:
                 state["auth_failures"] += 1
                 failures = state["auth_failures"]
-                state["next_refresh"] = now + self._jitter(min(20.0 * 2 ** (failures - 1), AUTH_RETRY_MAX))
+                state["next_refresh"] = now + self._jitter(min(20.0 * 2 ** min(failures - 1, 10), AUTH_RETRY_MAX))
                 if failures >= DEAD_AFTER:
                     changed = self._set_reason(backend, "auth_dead",
-                                               {"error": getattr(refresher, "last_error", None), "failures": failures,
+                                               {"error": error, "failures": failures,
                                                 "renewed_at": getattr(refresher, "last_success_at", None)})
             reason = backend.unavailable
         self._announce(backend, changed, reason)
@@ -260,10 +289,26 @@ class AccountDispatcher:
             return False
         with self._lock:
             state = self.state[backend]
-            if self.clock() - state["last_forced"] < FORCED_CHECK_GAP:
+            pending = state["forced"]
+            if pending is None:
+                if self.clock() - state["last_forced"] < FORCED_CHECK_GAP:
+                    return "exhausted" in state["reasons"]
+                state["last_forced"] = self.clock()
+                pending = state["forced"] = threading.Event()
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            # Another request is already confirming this balance: share its result.
+            pending.wait(30.0)
+            with self._lock:
                 return "exhausted" in state["reasons"]
-            state["last_forced"] = self.clock()
-        return self.check_balance(backend)
+        try:
+            return self.check_balance(backend)
+        finally:
+            with self._lock:
+                state["forced"] = None
+            pending.set()
 
     def status(self):
         with self._lock:

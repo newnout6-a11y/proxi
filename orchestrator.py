@@ -143,6 +143,15 @@ class _FailoverOut:
         self.out.put(event)
 
 
+def _may_be_balance_related(error):
+    """Rate limits, timeouts and client errors never justify a balance fetch."""
+    status = getattr(error, "status", 0) or 0
+    code = getattr(error, "code", None)
+    if status == 402 or (status == 429 and code == "insufficient_credits"):
+        return True
+    return status >= 500 and code != "upstream_timeout"
+
+
 class TurnRunner:
     def __init__(self, cfg, credits, pool):
         self.cfg = cfg
@@ -313,7 +322,7 @@ class TurnRunner:
             if message.get("senderRole") == "sandpack" and content.get("type") == "error":
                 text = str(content.get("error") or "").strip()
                 if "credit" in text.lower():
-                    return apierr.ApiError(429, "insufficient_credits", text or "Retool credits exhausted")
+                    return apierr.ApiError(402, "insufficient_credits", text or "Retool credits exhausted")
                 return apierr.upstream_error(text or "upstream returned an error message")
             if message.get("senderRole") == "sandpack" and content.get("type") in ("text", "tool_call"):
                 return None
@@ -361,7 +370,7 @@ class TurnRunner:
                     if await asyncio.to_thread(accounts.recheck_exhausted):
                         continue
                 if (retryable and backend is not None and backend not in exclude
-                        and error.status not in (400, 413, 422)):
+                        and _may_be_balance_related(error)):
                     # With no account left, the next acquire raises a clear 402.
                     exhausted = await asyncio.to_thread(accounts.check_balance_now, backend)
             except BaseException:
@@ -470,6 +479,7 @@ class TurnRunner:
                 requested_effort=requested_effort, effective_effort=effort,
                 effort_source=effort_source,
                 effort_resolution=("model_default" if requested_effort in (None, "auto") else
+                                   "provider_managed" if effort is None else
                                    "exact" if requested_effort == effort else "compatibility"),
                 dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
                 tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
