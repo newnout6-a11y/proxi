@@ -927,7 +927,7 @@ class SessionPool:
         maker = getattr(b, "new_thread_id", None)
         return await maker() if maker is not None else await b.create_thread()
 
-    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None) -> SessionLease:
+    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None, context_scope=None) -> SessionLease:
         """Take one slot and return an independently releasable request handle."""
         await self._slots.acquire()
         lock = None
@@ -936,7 +936,14 @@ class SessionPool:
         referenced = False
         keep = False
         try:
-            if not isolated and self.mode == "shared":
+            affinity_parent = (self._shared if self.mode == "shared" else
+                               self._conversations.get(conversation_key) or
+                               self._conversations.get((conversation_key, "text")))
+            affinity_backend = (self.backend if self.mode == "shared" else
+                                affinity_parent.backend if affinity_parent is not None else None)
+            if context_scope and (conversation_key or self.mode == "shared"):
+                conversation_key = (None if self.mode == "shared" else conversation_key, context_scope)
+            if not isolated and self.mode == "shared" and not context_scope:
                 self._check_route(self.backend, model_entry)
                 lock = self._lock
                 await lock.acquire()
@@ -945,7 +952,8 @@ class SessionPool:
                     self._shared = RelaySession(self.backend, self.cfg["thread_id"])
                 session = self._shared
                 keep = True
-            elif not isolated and self.mode == "per_conversation" and conversation_key:
+            elif not isolated and conversation_key and (self.mode == "per_conversation" or
+                                                        (self.mode == "shared" and context_scope)):
                 key = conversation_key
                 await self._evict_idle(make_room=key not in self._conversation_locks)
                 capacity = max(1, self.cfg.get("max_conversations", 128))
@@ -959,7 +967,7 @@ class SessionPool:
                                       or self.cfg.get("transport") == "direct"
                                       or len(self.backends) > 1):
                     parent = self._conversations.get(key)
-                    backend = parent.backend if parent is not None else self._next_backend(model_entry)
+                    backend = parent.backend if parent is not None else affinity_backend or self._next_backend(model_entry)
                     self._check_route(backend, model_entry)
                     session = RelaySession(backend, await self._new_thread_id(backend))
                     if parent is not None:
@@ -982,7 +990,8 @@ class SessionPool:
                     locked = True
                     session = self._conversations.get(key)
                     if session is None:
-                        backend = self._next_backend(model_entry)
+                        backend = affinity_backend or self._next_backend(model_entry)
+                        self._check_route(backend, model_entry)
                         session = RelaySession(backend, await self._new_thread_id(backend))
                         self._conversations[key] = session
                         journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
@@ -991,9 +1000,7 @@ class SessionPool:
                     keep = True
                     self._check_route(session.backend, model_entry)
             else:
-                parent = (self._shared if self.mode == "shared" else
-                          self._conversations.get(conversation_key) if conversation_key else None)
-                backend = parent.backend if isolated and parent is not None else self._next_backend(model_entry)
+                backend = affinity_backend if isolated and affinity_backend is not None else self._next_backend(model_entry)
                 self._check_route(backend, model_entry)
                 session = RelaySession(backend, await self._new_thread_id(backend))
             session.begin_request()

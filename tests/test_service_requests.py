@@ -205,12 +205,13 @@ def test_isolated_service_keeps_account_affinity_without_inheriting_parent_state
 
 @pytest.mark.parametrize("system,prompt,maximum,client,expected", [
     (CLASSIFIER, "User: inspect a Bash action", 64, "claude-code", "auto-mode-check"),
+    ("SDK prefix\n\n" + CLASSIFIER, "User: inspect a Bash action", 64, "claude-desktop", "auto-mode-check"),
     (TITLE, "User: " + "long title input " * 300, 64, "claude-desktop", "session-title"),
     ("", "User: .", 1, "claude-desktop", "connection-probe"),
     ("", "User: hi", 64, "claude-code", "client-text"),
     ("", "User: .", 1, "unknown", "generation"),
     ("", "User: hi", 64, "", "generation"),
-], ids=["classifier", "long-title", "desktop-probe", "short-chat", "unknown-probe", "anonymous-chat"])
+], ids=["classifier", "wrapped-classifier", "long-title", "desktop-probe", "short-chat", "unknown-probe", "anonymous-chat"])
 def test_purpose_uses_known_client_signatures_instead_of_prompt_length(system, prompt, maximum, client, expected):
     from types import SimpleNamespace
 

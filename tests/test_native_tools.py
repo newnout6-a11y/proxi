@@ -52,7 +52,7 @@ class ToolSession:
 
 
 class Pool:
-    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None):
+    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None, context_scope=None):
         return ToolSession()
 
     async def release(self, session):

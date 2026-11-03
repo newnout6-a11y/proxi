@@ -212,6 +212,22 @@ def nearest_effort(levels, requested):
                                           _EFFORT_RANK.get(level, wanted)))
 
 
+def effective_effort(entry, effort=None, configured=None):
+    """A global default is a preference; explicit client controls were validated by resolve."""
+    if effort is not None or not configured or not entry.get("reasoning", True):
+        return effort
+    configured = configured.lower() if isinstance(configured, str) else configured
+    if configured != "auto" and configured not in EFFORT_ORDER:
+        raise bad_request("invalid configured reasoning effort", param="reasoning_effort")
+    levels = entry.get("reasoning_effort_levels", EFFORTS_BY_PROVIDER.get(entry["provider"], ()))
+    if entry.get("reasoning_effort_control") == "provider-managed" or not levels:
+        return None
+    if configured == "auto":
+        preferred = entry.get("default_reasoning_effort")
+        return preferred if preferred in levels else ("medium" if "medium" in levels else levels[0])
+    return configured if configured in levels else nearest_effort(levels, configured)
+
+
 def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False):
     """Resolve exactly; explicit compatibility permits known-level mapping.
 

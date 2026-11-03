@@ -650,7 +650,11 @@ def _ping(session, body):
                 if mark_unknown:
                     mark_unknown()
             request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "keepwarm"
-            console_log.write(console_log.CacheMonitor().line(request_id, warm_usage)
+            monitor = getattr(session, "_console_warm_cache_monitor", None)
+            if monitor is None:
+                monitor = session._console_warm_cache_monitor = console_log.CacheMonitor()
+            console_log.write(monitor.line(request_id, warm_usage, sample_id=billing_id,
+                                          scope=(body.get("model"), body.get("openAICacheKey")))
                               + " [keepwarm] " + client_context.label())
             snapshot = getattr(manager, "balance_snapshot", None)
             if snapshot:

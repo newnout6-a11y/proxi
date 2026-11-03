@@ -51,6 +51,64 @@ def test_supported_effort_is_preserved(effort):
     assert validate.parse_chat(body("chat", effort), CFG).effort == effort
 
 
+@pytest.mark.parametrize("dialect,path", [("chat", "/v1/chat/completions"),
+                                         ("responses", "/v1/responses"),
+                                         ("anthropic", "/v1/messages")])
+@pytest.mark.parametrize("model,configured,expected", [
+    ("zai-org/GLM-5.3", "auto", "provider"),
+    ("zai-org/GLM-5.3", "max", "provider"),
+    ("gpt-5", "max", "high"),
+    ("gpt-5", "MAX", "high"),
+    ("gemini-3.5-flash", "max", "high"),
+    ("claude-haiku-4-5-20251001", "auto", "low"),
+])
+def test_implicit_gateway_default_adapts_to_the_requested_model(relay, capsys, dialect, path, model, configured, expected):
+    relay.cfg["reasoning_effort"] = configured
+    payload = dict(body(dialect, None), model=model)
+    status, _ = relay.json_any(path, payload)
+    assert status == 200
+    assert len(relay.fake.seen) == 1
+    assert "EFFORT: " + expected.upper() in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("dialect", ["chat", "responses", "anthropic"])
+@pytest.mark.parametrize("model,configured,expected", [
+    ("zai-org/GLM-5.3", "auto", None),
+    ("zai-org/GLM-5.3", "max", None),
+    ("gpt-5", "max", "high"),
+    ("gpt-5", "MAX", "high"),
+    ("gemini-3.5-flash", "max", "high"),
+    ("claude-opus-5-5", "max", "max"),
+])
+def test_runner_sends_the_same_model_aware_default(tmp_path, monkeypatch, dialect, model, configured, expected):
+    import asyncio
+    import journal
+    from test_native_context_reuse import run, setup
+    from test_service_requests import capture_direct
+
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[],
+                         reasoning_effort=configured, openai_provider_resource_name="o",
+                         google_provider_resource_name="g", retool_fast_provider_resource_name="r")
+    sent = capture_direct(monkeypatch)
+    parsed = getattr(validate, "parse_" + dialect)(dict(body(dialect, None), model=model), CFG)
+    before = journal.JOURNAL.last_seq
+    events = asyncio.run(run(runner, parsed))
+    assert events[-1] == {"type": "end", "reason": "stop"}
+    assert sent[0][1].get("reasoningEffort") == expected
+    begun = next(e for e in journal.JOURNAL.query(since=before) if e["kind"] == "turn.begin")
+    assert begun["data"]["requested_effort"] == configured
+    assert begun["data"]["effective_effort"] == expected
+
+
+@pytest.mark.parametrize("model,explicit", [("zai-org/GLM-5.3", "medium"),
+                                           ("gemini-3.5-flash", "max"),
+                                           ("gpt-5", "max")])
+def test_implicit_fallback_does_not_weaken_explicit_effort_validation(relay, model, explicit):
+    relay.cfg["reasoning_effort"] = "max"
+    status, _ = relay.json_any("/v1/messages", dict(body("anthropic", explicit), model=model))
+    assert status == 400 and not relay.fake.seen
+
+
 @pytest.mark.parametrize("compatibility", [False, True])
 def test_unknown_effort_is_never_guessed(compatibility):
     with pytest.raises(ApiError):

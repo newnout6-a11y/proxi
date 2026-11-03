@@ -105,13 +105,14 @@ class CacheMonitor:
         self.previous_write = None
         self.last_write = None
 
-    def line(self, request_id, usage, *, scope=None):
+    def line(self, request_id, usage, *, scope=None, sample_id=None):
         if scope != self.scope:
             self.scope = scope
             self.request = self.previous_write = self.last_write = None
-        if request_id != self.request:
+        sample_id = request_id if sample_id is None else sample_id
+        if sample_id != self.request:
             self.previous_write = self.last_write
-            self.request = request_id
+            self.request = sample_id
         read = number(usage.get("promptTokensReadFromCache"))
         written = number(usage.get("promptTokensWrittenToCache"))
         marker = ""

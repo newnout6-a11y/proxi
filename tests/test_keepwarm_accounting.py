@@ -100,6 +100,27 @@ def test_each_paid_ping_is_a_distinct_transaction(monkeypatch):
     assert len({entry["turn_id"] for entry in value.usage()["recent"]}) == 2
 
 
+def test_keepwarm_write_spikes_compare_distinct_pings_of_the_same_owner(monkeypatch, capsys):
+    value = manager()
+    target = session(value)
+    writes = iter([100, 9000, 9100, 40000])
+
+    def fetch(*_a, **_kw):
+        return response([{"event": "metadata", "usage": {
+            "creditsUsed": 0.01, "promptTokensWrittenToCache": next(writes)}}, {"event": "end_of_stream"}])
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", fetch)
+    body = {"model": "claude-opus-5-5", "openAICacheKey": "scope-a"}
+    direct._ping(target, body)
+    direct._ping(target, body)
+    direct._ping(target, body)
+    direct._ping(target, dict(body, openAICacheKey="scope-b"))
+    output = capsys.readouterr().out
+    assert "[WRITE SPIKE +8,900]" in output
+    assert output.count("[WRITE SPIKE") == 1
+    assert "[owner-request] [cache]" in output
+
+
 def test_cancelled_scheduler_still_accounts_for_its_inflight_ping(monkeypatch):
     value = manager()
     target = session(value)

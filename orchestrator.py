@@ -378,29 +378,19 @@ class TurnRunner:
             # resolved from the acquired session's backend cfg below. Resolving it
             # from the global cfg here would 503 account-only configurations.
             model_provider = {"model": parsed.model}
-            effort = parsed.effort
-            requested_effort = getattr(parsed, "requested_effort", None) or effort
-            if effort is None and parsed.entry.get("reasoning") and self.cfg.get("reasoning_effort"):
-                configured = self.cfg["reasoning_effort"]
-                requested_effort = configured
-                if configured == "auto":
-                    levels = parsed.entry.get("reasoning_effort_levels", ())
-                    if parsed.entry.get("reasoning_effort_control") == "provider-managed":
-                        configured = None
-                    else:
-                        configured = parsed.entry.get("default_reasoning_effort") or (
-                            "medium" if not levels or "medium" in levels else levels[0])
-                if configured is not None:
-                    _, effort = model_catalog.resolve_tolerant(
-                        parsed.model, configured, strict=self.cfg.get("strict_models", True),
-                        default_model=self.cfg.get("model"),
-                        allow_downgrade=self.cfg.get("allow_effort_downgrade", False))
+            effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"))
+            requested_effort = getattr(parsed, "requested_effort", None) or parsed.effort
+            effort_source = "client"
+            if requested_effort is None:
+                requested_effort = self.cfg.get("reasoning_effort") if parsed.entry.get("reasoning") else None
+                effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
             log("turn.begin", "Ход %s · effort %s · %s" % (parsed.model, effort or "—",
                                                           "direct" if direct_mode else "agent"),
                 model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
                 requested_effort=requested_effort, effective_effort=effort,
+                effort_source=effort_source,
                 effort_resolution=("model_default" if requested_effort in (None, "auto") else
                                    "exact" if requested_effort == effort else "compatibility"),
                 dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
@@ -413,8 +403,16 @@ class TurnRunner:
             try:
                 key = getattr(parsed, "conversation_key", None)
                 can_exec = self._can_exec(0) and not native_tools and not client_text
-                isolated = not native_tools and (direct_mode or client_text or (key and not can_exec))
-                if isolated:
+                persistent_text = (direct_mode and not native_tools
+                                   and self.cfg.get("session_mode") != "per_request"
+                                   and purpose not in client_context.SERVICE_KINDS
+                                   and (key or self.cfg.get("session_mode") == "shared"))
+                isolated = not native_tools and not persistent_text and (direct_mode or client_text or (key and not can_exec))
+                if persistent_text:
+                    # Ordinary text chats retain idle keepwarm, with state separate
+                    # from native tools even when their conversation ID is the same.
+                    session = await self.pool.acquire(key, context_scope="text", model_entry=parsed.entry)
+                elif isolated:
                     # A standalone job can share account affinity, never the main chat's
                     # tools, head, implicit history, cache breakpoints or idle keepwarm.
                     session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry)
@@ -439,6 +437,7 @@ class TurnRunner:
                 log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
                     "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
                     isolated=bool(isolated), mode=self.cfg.get("session_mode"),
+                    context_scope="text" if persistent_text else None,
                     wait_ms=round((time.time() - turn_started) * 1000))
                 native_target, native_context = None, None
                 if native_tools:

@@ -474,14 +474,10 @@ def make_handler(runtime: Runtime):
             parsed.dialect = dialect
             self._model = parsed.model
 
-            effective_effort = parsed.effort
-            if effective_effort is None and parsed.entry.get("reasoning") and cfg.get("reasoning_effort"):
-                conf = cfg["reasoning_effort"]
-                if conf == "auto":
-                    conf = parsed.entry.get("default_reasoning_effort") or "medium"
-                _, effective_effort = models.resolve_tolerant(
-                    parsed.model, conf, strict=False, allow_downgrade=cfg.get("allow_effort_downgrade", False))
-            self._effort_str = effective_effort or "none"
+            effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
+            self._effort_str = effective_effort or (
+                "provider" if parsed.entry.get("reasoning") and
+                parsed.entry.get("reasoning_effort_control") == "provider-managed" else "none")
 
             parsed.request_purpose = client_context.request_kind(parsed)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})

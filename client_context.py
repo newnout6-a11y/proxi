@@ -16,7 +16,8 @@ _LOCK = threading.Lock()
 _CLIENTS = {"claude-code": "Claude Code", "claude-desktop": "Claude Desktop", "opencode": "OpenCode"}
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 _READ_LIMIT = 256 * 1024
-CLIENT_TEXT_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe", "client-text"})
+SERVICE_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe"})
+CLIENT_TEXT_KINDS = SERVICE_KINDS | {"client-text"}
 
 
 def request_kind(parsed, identity=None):
@@ -24,7 +25,7 @@ def request_kind(parsed, identity=None):
     if getattr(parsed, "tools", None):
         return "client-tools"
     system = (getattr(parsed, "system", "") or "").lstrip()
-    if system.startswith("You are a security monitor for autonomous AI coding agents"):
+    if re.search(r"(?:^|\n)You are a security monitor for autonomous AI coding agents(?:\.|\n|$)", system):
         return "auto-mode-check"
     if system.startswith("You write short session titles. Reply with only the tagged fields the prompt asks for."):
         return "session-title"
