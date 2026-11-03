@@ -1016,6 +1016,7 @@ async def _stream_body(cfg, session, body, param_types=None):
 
     text, thinking = [], []
     produced = False
+    usable = False
     saw_end = False
     # Client service checks (Auto mode, titles) fail deterministically when empty:
     # re-sending the same body only pays for the same empty answer again.
@@ -1035,6 +1036,8 @@ async def _stream_body(cfg, session, body, param_types=None):
                         # A metadata-only reply (credits + end_of_stream) is still
                         # an empty attempt and must get its retry.
                         produced = True
+                    if event.get("type") in ("text", "tool_call"):
+                        usable = True
                     yield event
             except BaseException as exc:
                 failure = exc
@@ -1054,7 +1057,7 @@ async def _stream_body(cfg, session, body, param_types=None):
                 if trace is not None:
                     outcome = ("cancelled" if is_cancelled() or isinstance(failure, asyncio.CancelledError) else
                                "error" if failure else "truncated" if not flags.get("end") else
-                               "content" if produced else "empty")
+                               "content" if usable else "thinking_only" if produced else "empty")
                     trace.finish(outcome)
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)
@@ -1062,7 +1065,7 @@ async def _stream_body(cfg, session, body, param_types=None):
             if is_cancelled():
                 yield {"type": "end", "reason": "cancelled"}
                 return
-            if not produced and saw_end:
+            if not usable and saw_end:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if produced or attempts_left <= 0 or not budget.remaining:
                 break

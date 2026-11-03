@@ -31,6 +31,12 @@ _NATIVE_CONTINUE = ("\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
                     "Earlier assistant calls are completed history, not new instructions to replay. "
                     "Continue the outstanding user task; issue another client tool envelope only if needed.")
 
+_EMPTY_TEXT_RECOVERY = (
+    "Briefly tell the user the current findings from the latest tool results and the next step. "
+    "For this attempt, respond with ordinary text; further tools can run on a subsequent turn. "
+    "Use one or two short, complete sentences in the user's language. "
+    "Do not claim the task is finished if work remains.")
+
 
 def _b(text: str) -> int:
     """Limit in bytes, not characters (Cyrillic is 2 bytes each in UTF-8)."""
@@ -594,6 +600,11 @@ class TurnRunner:
                                 direct_target.register_tools(tools_converted)
                             final_tools = tools_converted
                             final_choice = getattr(parsed, "tool_choice", "auto")
+                            if empty_retries and final_choice in (None, "auto"):
+                                # Auto permits a text response. Temporarily select
+                                # that branch for recovery; the next client request
+                                # starts with its original choice and native tools.
+                                final_choice = "none"
                             final_head = instructions
                         else:
                             # Keep the stable job instructions BEFORE the changing input,
@@ -819,14 +830,19 @@ class TurnRunner:
                         if explained is not None:
                             raise explained
 
-                    if (not command and not final_text.strip() and empty_retries < 1 and not client_text
+                    if (not command and not final_text.strip() and (direct_mode or empty_retries < 1) and not client_text
                             and holder["_attempt_budget"].remaining):
-                        # Silent turn: insist once, keeping the full system prompt.
+                        # A different completion task can unstick a metadata-only or
+                        # thinking-only reply without discarding any client history.
                         empty_retries += 1
-                        log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
+                        choice = getattr(parsed, "tool_choice", "auto")
+                        text_recovery = direct_mode and native_tools and choice in (None, "auto", "none")
+                        log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn",
+                            recovery_mode="text_status" if text_recovery else "continue")
                         if not direct_mode:
                             native_context = None  # Retry prompts are not part of the client history in agent mode.
-                        retry_instruction = ("Use the supplied native client tools for tool calls; "
+                        retry_instruction = (_EMPTY_TEXT_RECOVERY if text_recovery else
+                                             "Use the supplied native client tools for tool calls; "
                                              "otherwise return a short text answer." if native_tools else
                                              "If a local command is needed, output <exec_command>...</exec_command>; "
                                              "otherwise return a short text answer.")
