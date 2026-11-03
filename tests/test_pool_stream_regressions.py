@@ -33,11 +33,11 @@ def pool_config(**overrides):
     ("claude-opus-5-5", "xhigh", "high"),
     ("claude-opus-5-5", "max", "max"),
     ("claude-haiku-4-5-20251001", "xhigh", "high"),
-    ("gpt-6-sol", "xhigh", "xhigh"),
+    ("gpt-6-sol", "xhigh", "high"),
     ("gpt-6.1-sol", "max", "max"),
     ("gpt-5.5", "xhigh", "high"),
 ])
-def test_observed_effective_effort(model, requested, effective):
+def test_explicit_effort_compatibility_mapping(model, requested, effective):
     entry, got = models.resolve_tolerant(model, requested, allow_downgrade=True)
     assert got == effective
     print("EVIDENCE effort", model, requested, "->", got)

@@ -133,7 +133,7 @@ def test_unsupported_route_effort_is_rejected(model, effort):
 
 
 def test_supported_efforts_are_real_per_model_capabilities():
-    for effort in ("none", "low", "medium", "high", "xhigh", "max"):
+    for effort in ("none", "low", "medium", "high", "max"):
         entry, selected = models.resolve("gpt-6-sol", effort)
         assert selected == effort
         assert effort in entry["reasoning_effort_levels"]
@@ -273,8 +273,8 @@ def test_unsupported_effort_is_clamped_to_the_nearest_supported_level():
     assert effort == "high"
     entry, effort = models.resolve_tolerant("gpt-5.5", "minimal", allow_downgrade=True)
     assert effort == "low"
-    entry, effort = models.resolve_tolerant("gpt-6-sol", "xhigh")
-    assert effort == "xhigh"
+    entry, effort = models.resolve_tolerant("gpt-6-sol", "xhigh", allow_downgrade=True)
+    assert effort == "high"
 
 
 def test_effort_no_provider_defines_is_rejected_not_clamped():

@@ -68,7 +68,7 @@ def test_real_runner_forwards_thinking_and_signature_before_answer(tmp_path):
     assert events[:3] == script[:3]
 
 
-@pytest.mark.parametrize("effort", ["low", "high", "xhigh", "max"])
+@pytest.mark.parametrize("effort", ["low", "high", "max"])
 def test_effort_is_an_actual_provider_parameter(tmp_path, effort):
     payload = {"model": "gpt-6-astra", "reasoning_effort": effort,
                "messages": [{"role": "user", "content": "inspect"}]}

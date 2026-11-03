@@ -11,17 +11,17 @@ EFFORTS_BY_PROVIDER = {
     "google": ("low", "medium", "high"),
 }
 
-# Per-model route capabilities from the Retool bundle. Provider-wide unions
-# advertise levels that individual models reject (for example GPT-5.5 xhigh).
+# Per-model route capabilities. Live 2026-11-03 supersedes the bundle's GPT-6
+# xhigh entries: copilotStreamGPT rejects that value with HTTP 422.
 _BASE_EFFORTS = ("low", "medium", "high")
 _EFFORTS_BY_MODEL = {
     "gpt-5": _BASE_EFFORTS + ("minimal",),
     "gpt-5.1": ("none",) + _BASE_EFFORTS,
     "gpt-5.2": ("none",) + _BASE_EFFORTS,
-    "gpt-6-astra": _BASE_EFFORTS + ("xhigh", "max"),
-    "gpt-6.1-sol": _BASE_EFFORTS + ("xhigh", "max"),
-    "gpt-6-sol": ("none",) + _BASE_EFFORTS + ("xhigh", "max"),
-    "gpt-6-luna": ("none",) + _BASE_EFFORTS + ("xhigh", "max"),
+    "gpt-6-astra": _BASE_EFFORTS + ("max",),
+    "gpt-6.1-sol": _BASE_EFFORTS + ("max",),
+    "gpt-6-sol": ("none",) + _BASE_EFFORTS + ("max",),
+    "gpt-6-luna": ("none",) + _BASE_EFFORTS + ("max",),
 }
 
 # Which config key holds the providerResourceName for each provider.
@@ -134,6 +134,14 @@ for _model in CATALOG:
     else:
         _model['metadata_status'] = 'provisional'
         _model['metadata_notes'] = 'Context is the Retool input reservation; full model limits and relay capabilities not independently verified.'
+
+for _name in ('gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'):
+    _entry = _BY_ID[_name]
+    _entry['reasoning_effort_checked_at'] = '2026-11-03'
+    _entry['metadata_notes'] = 'Live Retool managed route rejected xhigh with HTTP 422 on 2026-11-03.'
+    if _name in ('gpt-6-astra', 'gpt-6-luna'):
+        _entry['metadata_status'] = 'partial'
+        _entry['metadata_notes'] += ' This account also rejected max as model unavailable; availability is not verified.'
 
 _BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))
 

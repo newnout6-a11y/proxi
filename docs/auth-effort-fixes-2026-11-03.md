@@ -39,7 +39,7 @@ uv run --python 3.14 --with-requirements requirements.txt --no-project python -m
 git diff --check
 ```
 
-Результат: **968 passed in 119.30s**, whitespace check без ошибок.
+Финальный результат: **984 passed in 133.13s**, whitespace check без ошибок.
 Весь suite использует offline/localhost fixtures; live-пробы запускаются отдельно.
 
 Регрессии включают общие tenant/page при разных аккаунтах, перестановку записей,
@@ -48,7 +48,8 @@ git diff --check
 незанятую во время сети конфигурацию, освобождение слотов при отсутствии маршрута,
 виртуальные 900/1800-секундные ходы, backoff, truncated ping, строгий effort во всех
 трёх API и явную совместимость, а также закрытие временного HTTP-сервера и журнала
-диагностического CLI на Windows.
+диагностического CLI на Windows. Admin settings применяют ту же явную политику
+совместимости и запрещают выключать её, оставляя неподдерживаемый default.
 
 ## Live: сырой маршрут Retool
 
@@ -107,6 +108,40 @@ python scripts/probe_effort.py --config C:\specialinay_papka\config.json --effor
 Команда завершилась с кодом 0. Проверена совместимость конкретного префикса,
 маршрута и effort. Длительное удержание кэша на реальных 900/1800 секундах не
 измерялось: длительность планировщика проверена виртуальным временем.
+
+## Дополнительная live-проверка GPT-6
+
+После проверки Opus выполнены реальные пробы GPT, обнаружившие расхождение
+старого bundle-каталога с текущим backend:
+
+```powershell
+python scripts/probe_effort.py --config C:\specialinay_papka\config.json --model gpt-6-sol --efforts xhigh max --timeout 90
+foreach ($effortProbeModel in @('gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna')) {
+  python scripts/probe_effort.py --config C:\specialinay_papka\config.json --model $effortProbeModel --efforts xhigh max --timeout 90
+}
+```
+
+| Модель | Сырой xhigh | Сырой max | Дополнительная проверка |
+|---|---|---|---|
+| gpt-6-sol | 422 | 200, end_of_stream, 0.00144 кредита | Responses: max 200; xhigh локальный 400 без upstream |
+| gpt-6.1-sol | 422 | 200, end_of_stream, 0.00144 кредита | Responses: max 200; xhigh локальный 400 без upstream |
+| gpt-6-astra | 422 | 400, model unavailable | Gateway повторил без agent marker: 400, Invalid model for Copilot |
+| gpt-6-luna | 422 | 400, model unavailable | Gateway повторил без agent marker: 400, Invalid model for Copilot |
+
+Для Sol/6.1 фактическая проверка после исправления каталога:
+
+```powershell
+foreach ($effortFinalModel in @('gpt-6-sol', 'gpt-6.1-sol')) {
+  python scripts/probe_effort.py --config C:\specialinay_papka\config.json --model $effortFinalModel --gateway-check --dialects responses --efforts xhigh max --timeout 90
+}
+```
+
+Команды завершились с кодом 0. В этих Responses-пробах max передан без замены,
+каждый успешный запрос сообщил 0.0028 кредита. `xhigh` удалён из объявленных
+GPT-6 route capabilities и списка Codex; регрессии проверяют локальный отказ
+во всех трёх API. Отказ 422 происходит до проверки доступности Astra/Luna,
+поэтому исполнение их max не подтверждено. Их metadata помечена partial;
+доступность на других аккаунтах и ресурсах не проверялась.
 
 ## Границы
 

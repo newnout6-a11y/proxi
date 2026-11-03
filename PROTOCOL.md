@@ -63,7 +63,7 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 - `providerResourceName`: UUID провайдера (Anthropic, OpenAI, Google и др.).
 - `messages`: массив сообщений диалога. Поддерживает текстовые и мультимодальные (`type: "image"`) блоки.
 - `tools`: массив схем клиентских инструментов (принимаются нативно без bridging).
-- `reasoningEffort`: валидация по per-model списку уровней (`/v1/models → capabilities.reasoning_effort_levels`); набор включает `minimal` (GPT-5) и `xhigh`/`max` (GPT-6*). Неподдерживаемый уровень даёт 400 до upstream. Только явный `allow_effort_downgrade: true` разрешает приближение известных уровней; requested/effective effort и причина попадают в журнал. Неизвестные значения всегда дают 400; конфликтующие thinking-контроли — 422. Live 2026-11-03: Opus 5.5 принимает high/max, xhigh/extra отвергает с 422.
+- `reasoningEffort`: валидация по per-model списку уровней (`/v1/models → capabilities.reasoning_effort_levels`); набор включает `minimal` (GPT-5) и `max` (GPT-6*). Неподдерживаемый уровень даёт 400 до upstream. Только явный `allow_effort_downgrade: true` разрешает приближение известных уровней; requested/effective effort и причина попадают в журнал. Неизвестные значения всегда дают 400; конфликтующие thinking-контроли — 422. Live 2026-11-03: Opus 5.5 принимает high/max, GPT-6-sol и GPT-6.1-sol принимают max; xhigh отвергнут с 422 на всех проверенных GPT-6 маршрутах.
 - `openAICacheKey`: ключ кэширования префикса промпта для KV-кэша.
 - `metadata.sandpackAgent: true`: открывает доступ к моделям, управляемым через Sandpack-инфраструктуру.
 

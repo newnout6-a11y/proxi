@@ -60,10 +60,20 @@ def test_unknown_effort_is_never_guessed(compatibility):
 @pytest.mark.parametrize("dialect,path", [("chat", "/v1/chat/completions"),
                                          ("responses", "/v1/responses"),
                                          ("anthropic", "/v1/messages")])
-def test_gateway_rejects_before_the_runner_is_called(relay, dialect, path):
-    status, _ = relay.json_any(path, body(dialect, "xhigh"))
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"])
+def test_gateway_rejects_before_the_runner_is_called(relay, dialect, path, model):
+    data = dict(body(dialect, "xhigh"), model=model)
+    status, _ = relay.json_any(path, data)
     assert status == 400
     assert relay.fake.seen == []
+
+
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"])
+def test_codex_does_not_offer_live_rejected_effort(relay, model):
+    status, response = relay.json("/codex/models")
+    assert status == 200
+    entry = next(item for item in response["models"] if item["slug"] == model)
+    assert "xhigh" not in [item["effort"] for item in entry["supported_reasoning_levels"]]
 
 
 def test_live_probe_tests_the_raw_level_without_refreshing_or_printing_auth(monkeypatch):
