@@ -182,14 +182,21 @@ def test_invalid_model_and_effort_are_redacted_in_console(relay, capsys, field):
 
 def test_startup_config_uses_existing_credentials_and_separate_state(tmp_path, monkeypatch):
     config_file = tmp_path / "external.json"
+    state = tmp_path / "state"
     seen = []
     monkeypatch.setattr(proxy.config_module, "load", lambda path: seen.append(path) or
-                        {"secret": "preserved", "journal_path": "old-path"})
-    cfg = proxy.startup_config(["--config", str(config_file), "--state-dir", str(tmp_path / "state")])
+                        {"secret": "preserved", "journal_path": "old-path", "command_log": "old-commands",
+                         "upstream_error_dir": "old-dir"})
+    cfg = proxy.startup_config(["--config", str(config_file), "--state-dir", str(state)])
     assert seen == [str(config_file)]
     assert cfg["secret"] == "preserved"
-    assert Path(cfg["journal_path"]) == tmp_path / "state/journal.jsonl"
-    assert Path(cfg["upstream_error_dir"]) == tmp_path / "state/logs/upstream-400"
+    assert Path(cfg["journal_path"]) == state / "journal.jsonl"
+    assert Path(cfg["command_log"]) == state / "commands.log"
+    assert Path(cfg["upstream_error_dir"]) == state / "logs/upstream-400"
+    assert state.is_dir() and not config_file.exists()
+    # Without --state-dir an already configured path is kept as is.
+    kept = proxy.startup_config(["--config", str(config_file)])
+    assert kept["journal_path"] == "old-path" and kept["command_log"] == "old-commands"
 
 
 def test_external_config_uses_its_own_existing_relay_key(tmp_path, monkeypatch):
@@ -214,5 +221,6 @@ def test_new_external_relay_key_stays_with_config(tmp_path, monkeypatch):
 
 def test_label_headers_do_not_change_affinity(relay):
     chat = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}
+    relay.cfg["client_metadata_home"] = str(relay.workspace)
     relay.json("/v1/chat/completions", chat, headers={"x-proxi-client": "opencode", "x-proxi-session-id": "ses_title"})
     assert relay.fake.seen[-1].conversation_key is None

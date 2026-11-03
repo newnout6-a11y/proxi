@@ -128,9 +128,9 @@ class CacheMonitor:
             amount(written, tokens=True), amount(usage.get("creditsUsed")), marker)
 
 
-def balance_line(request_id, snapshot, spent=None):
+def balance_line(request_id, snapshot, spent=None, account=None):
     state = ("UNAVAILABLE" if number(snapshot.get("available"), signed=True) is None else
              "UNREPORTED USAGE" if snapshot.get("unreported_usage") else
              "STALE" if snapshot.get("stale") else "LOCAL ESTIMATE" if snapshot.get("estimated") else "CACHED")
-    return "[%s] [balance] balance=%s limit=%s spent=%s [%s]" % (
-        request_id, amount(snapshot.get("available"), signed=True), amount(snapshot.get("monthly_allocation")), amount(spent), state)
+    return "[%s] [balance]%s balance=%s limit=%s spent=%s [%s]" % (
+        request_id, " account=%s" % account if account else "", amount(snapshot.get("available"), signed=True), amount(snapshot.get("monthly_allocation")), amount(spent), state)
