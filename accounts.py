@@ -75,6 +75,7 @@ class AccountDispatcher:
     def _loop(self):
         while not self._stop.is_set():
             try:
+                self.revive_renewed()
                 for backend, kind in self.due():
                     self._executor.submit(self._run, backend, kind)
             except Exception as exc:  # noqa: BLE001 - the scheduler must outlive one bad tick
@@ -149,11 +150,11 @@ class AccountDispatcher:
         backend.unavailable = reasons.get("exhausted") or reasons.get("auth_dead")
         return (before is None) != (backend.unavailable is None)
 
-    def _announce(self, backend, changed):
+    def _announce(self, backend, changed, reason=None):
+        """`reason` is the state captured under the lock that changed it."""
         if not changed:
             return
         tag = self._tag(backend)
-        reason = backend.unavailable
         if reason is None:
             text = "[account] %s снова в пуле" % tag
             journal.emit("account.available", text, "success", account=tag)
@@ -180,10 +181,13 @@ class AccountDispatcher:
                 state["auth_failures"] = 0
                 state["next_refresh"] = now + self._jitter(self.interval)
                 changed = self._set_reason(backend, "auth_dead", None)
-            elif kind == "network":
-                # The network, not this account, failed: every account waits together.
-                self._network_failures += 1
-                pause = min(20.0 * 2 ** (self._network_failures - 1), NETWORK_PAUSE_MAX)
+            elif kind != "auth":
+                # The network, Retool (5xx) or local storage failed, not this account's
+                # session: every account waits together and nobody is marked signed out.
+                if now >= self.pause_until:
+                    # Parallel checks failing together count as one outage.
+                    self._network_failures += 1
+                pause = min(20.0 * 2 ** (max(self._network_failures, 1) - 1), NETWORK_PAUSE_MAX)
                 self.pause_until = max(self.pause_until, now + pause)
                 state["next_refresh"] = self.pause_until
             else:
@@ -192,9 +196,37 @@ class AccountDispatcher:
                 state["next_refresh"] = now + self._jitter(min(20.0 * 2 ** (failures - 1), AUTH_RETRY_MAX))
                 if failures >= DEAD_AFTER:
                     changed = self._set_reason(backend, "auth_dead",
-                                               {"error": getattr(refresher, "last_error", None), "failures": failures})
-        self._announce(backend, changed)
+                                               {"error": getattr(refresher, "last_error", None), "failures": failures,
+                                                "renewed_at": getattr(refresher, "last_success_at", None)})
+            reason = backend.unavailable
+        self._announce(backend, changed, reason)
         return ok
+
+    def revive_renewed(self):
+        """A request-path renewal (401 retry, new sign-in in config.json) also
+        proves the session is alive: return such accounts to the pool at once."""
+        revived = []
+        with self._lock:
+            for backend in self.backends:
+                dead = self.state[backend]["reasons"].get("auth_dead")
+                renewed = getattr(getattr(backend, "refresher", None), "last_success_at", None)
+                if dead and renewed is not None and renewed != dead.get("renewed_at"):
+                    self.state[backend]["auth_failures"] = 0
+                    if self._set_reason(backend, "auth_dead", None):
+                        revived.append((backend, backend.unavailable))
+        for backend, reason in revived:
+            self._announce(backend, True, reason)
+        return bool(revived)
+
+    def recheck_exhausted(self):
+        """Before answering 402, confirm excluded balances (a top-up is adopted at once)."""
+        with self._lock:
+            exhausted = [b for b in self.backends if "exhausted" in self.state[b]["reasons"]]
+        restored = False
+        for backend in exhausted:
+            if not self.check_balance_now(backend):
+                restored = True
+        return restored
 
     def check_balance(self, backend):
         """Fetch this account's balance; True when it is confirmed below the threshold."""
@@ -218,7 +250,8 @@ class AccountDispatcher:
                 else:
                     changed = self._set_reason(backend, "exhausted", None)
             exhausted = "exhausted" in state["reasons"]
-        self._announce(backend, changed)
+            reason = backend.unavailable
+        self._announce(backend, changed, reason)
         return exhausted
 
     def check_balance_now(self, backend):

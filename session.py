@@ -1025,14 +1025,20 @@ class SessionPool:
                     session = self._conversations.get(key)
                     if session is not None and not self._usable(session.backend, exclude):
                         # The account ran out or was signed out: move the conversation.
-                        # The new account must write the prefix cache once.
-                        old = session
-                        session = None
-                        self._conversations.pop(key, None)
-                        await old.aclose()
-                        journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
-                                     conversation=journal.tag(key),
-                                     reason=(getattr(old.backend, "unavailable", None) or {}).get("reason", "failover"))
+                        # Resolve the replacement first, so a 402/503 keeps the old state;
+                        # a lone fallback account is the same backend and is kept as is.
+                        replacement = affinity_backend or self._next_backend(model_entry, exclude)
+                        if replacement is not session.backend:
+                            self._check_route(replacement, model_entry)
+                            old = session
+                            session = RelaySession(replacement, await self._new_thread_id(replacement))
+                            self._conversations[key] = session
+                            await old.aclose()
+                            # The new account must write the prefix cache once.
+                            journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
+                                         conversation=journal.tag(key),
+                                         reason=(getattr(old.backend, "unavailable", None) or {}).get(
+                                             "reason", "failover"))
                     if session is None:
                         backend = affinity_backend or self._next_backend(model_entry, exclude)
                         self._check_route(backend, model_entry)

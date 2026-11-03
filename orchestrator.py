@@ -305,7 +305,10 @@ class TurnRunner:
         if session is None:
             return None
         try:
-            data = await self.pool.backend.get_messages(session.thread_id)
+            backend = getattr(session, "backend", None)
+            if not hasattr(backend, "get_messages"):
+                backend = self.pool.backend
+            data = await backend.get_messages(session.thread_id)
         except Exception as exc:
             print("[explain] fetch failed:", exc, flush=True)
             return None
@@ -337,6 +340,7 @@ class TurnRunner:
         are returned as before.
         """
         exclude = []
+        rechecked = False
         cancelled = holder.setdefault("cancel_event", threading.Event())
         while True:
             relay = _FailoverOut(out)
@@ -352,22 +356,36 @@ class TurnRunner:
             lease = holder.get("session")
             backend = getattr(getattr(lease, "session", lease), "backend", None)
             accounts = getattr(self, "accounts", None)
-            if (error is not None and not relay.started and not cancelled.is_set()
-                    and accounts is not None and backend is not None
-                    and error.code not in ("insufficient_credits", "prompt_too_large")
-                    and backend not in exclude):
-                # With no account left, the next acquire raises a clear 402.
-                exhausted = await asyncio.to_thread(accounts.check_balance_now, backend)
-                if exhausted:
-                    exclude.append(backend)
-                    tag = journal.tag(backend.cfg.get("account_id") or backend.cfg.get("page_uuid"))
-                    journal.emit("account.failover", "Баланс аккаунта закончился — запрос повторён на другом",
-                                 "warn", account=tag, request_id=getattr(parsed, "request_id", None),
-                                 error=error.code)
-                    console_log.write("[%s] [account] %s: баланс закончился, повтор на другом аккаунте" % (
-                        getattr(parsed, "request_id", None) or "req", tag))
-                    holder["reason"] = "stop"
-                    continue
+            retryable = (error is not None and not relay.started and not cancelled.is_set()
+                         and accounts is not None)
+            exhausted = False
+            try:
+                if (retryable and backend is None and error.code == "insufficient_credits"
+                        and not rechecked and hasattr(accounts, "recheck_exhausted")):
+                    # The pool refused before any upstream call: confirm the excluded
+                    # balances once, so a top-up is used without waiting for the timer.
+                    rechecked = True
+                    if await asyncio.to_thread(accounts.recheck_exhausted):
+                        continue
+                if (retryable and backend is not None and backend not in exclude
+                        and error.status not in (400, 413, 422)):
+                    # With no account left, the next acquire raises a clear 402.
+                    exhausted = await asyncio.to_thread(accounts.check_balance_now, backend)
+            except BaseException:
+                out.put({"type": "error", "error": error})
+                out.put(None)
+                raise
+            if exhausted:
+                exclude.append(backend)
+                cfg = getattr(backend, "cfg", None) or {}
+                tag = journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
+                journal.emit("account.failover", "Баланс аккаунта закончился — запрос повторён на другом",
+                             "warn", account=tag, request_id=getattr(parsed, "request_id", None),
+                             error=error.code)
+                console_log.write("[%s] [account] %s: баланс закончился, повтор на другом аккаунте" % (
+                    getattr(parsed, "request_id", None) or "req", tag))
+                holder["reason"] = "stop"
+                continue
             if error is not None:
                 out.put({"type": "error", "error": error})
             out.put(None)

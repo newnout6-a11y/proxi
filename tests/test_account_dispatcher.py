@@ -196,6 +196,90 @@ def test_unconfirmed_failure_is_returned_without_switching(tmp_path, monkeypatch
     assert events[-1]["type"] == "error" and events[-1]["error"].code == "upstream_error"
 
 
+@pytest.mark.parametrize("kind", ["upstream", "local", None])
+def test_non_auth_renewal_failures_never_mark_account_signed_out(kind):
+    account = Account("a", FakeRefresher([(False, kind)] * (DEAD_AFTER + 2)))
+    value, clock = dispatcher([account])
+    for _ in range(DEAD_AFTER + 2):
+        value.refresh(account)
+        clock.now = value.pause_until
+    assert account.unavailable is None
+
+
+def test_parallel_network_failures_count_as_one_outage():
+    accounts = [Account(n, FakeRefresher([(False, "network")])) for n in "abc"]
+    value, clock = dispatcher(accounts)
+    for account in accounts:
+        value.refresh(account)
+    assert value.pause_until == clock.now + 20.0
+
+
+def test_request_path_renewal_returns_signed_out_account_to_pool():
+    refresher = FakeRefresher([(False, "auth")] * DEAD_AFTER)
+    refresher.last_success_at = None
+    account = Account("a", refresher)
+    value, _ = dispatcher([account])
+    for _ in range(DEAD_AFTER):
+        value.refresh(account)
+    assert account.unavailable["reason"] == "auth_dead"
+    assert value.revive_renewed() is False
+    refresher.last_success_at = 12345.0  # a 401 retry adopted a new sign-in
+    assert value.revive_renewed() is True
+    assert account.unavailable is None
+
+
+def test_lone_signed_out_account_keeps_its_conversation(tmp_path):
+    _, pool, _ = setup(tmp_path, transport="direct", project_context=False)
+
+    async def scenario():
+        lease = await pool.acquire("chat")
+        first = lease.session
+        await pool.release(lease)
+        pool.backends[0].unavailable = {"reason": "auth_dead"}
+        lease = await pool.acquire("chat")
+        assert lease.session is first  # no cache rewrite on every request
+        await pool.release(lease)
+
+    asyncio.run(scenario())
+
+
+def test_failed_migration_keeps_the_original_conversation(tmp_path):
+    _, pool, _ = setup(tmp_path, transport="direct", project_context=False)
+
+    async def scenario():
+        lease = await pool.acquire("chat")
+        first = lease.session
+        await pool.release(lease)
+        pool.backends[0].unavailable = {"reason": "exhausted", "available": 2.0, "threshold": 20.0}
+        with pytest.raises(apierr.ApiError) as caught:
+            await pool.acquire("chat")
+        assert caught.value.status == 402
+        assert pool._conversations["chat"] is first
+        assert not pool._active and pool._slots._value == 8
+
+    asyncio.run(scenario())
+
+
+def test_top_up_is_adopted_before_answering_402(tmp_path, monkeypatch):
+    _, pool, runner = setup(tmp_path, transport="direct", project_context=False)
+    account = pool.backends[0]
+    account.unavailable = {"reason": "exhausted", "available": 2.0, "threshold": 20.0}
+
+    async def stream(session, prompt, provider, tool_names=None):
+        yield {"type": "text", "delta": "ok"}
+        yield {"type": "end", "reason": "stop"}
+
+    def recheck():
+        account.unavailable = None
+        return True
+
+    monkeypatch.setattr(RelaySession, "stream", stream)
+    runner.accounts = SimpleNamespace(recheck_exhausted=recheck, check_balance_now=lambda b: False)
+    events = asyncio.run(run(runner, request(FIRST)))
+    assert {"type": "text", "delta": "ok"} in events
+    assert not any(event["type"] == "error" for event in events)
+
+
 def _empty_stream(calls):
     def opener(*_a, **_kw):
         calls.append(1)

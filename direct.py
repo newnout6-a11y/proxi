@@ -870,14 +870,13 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
 _EMPTY_DUMPED = set()
 
 
-def _dump_empty_once(payload, flags, cfg, session):
-    """Keep one sample per distinct body of a completed stream with no output."""
-    digest = hashlib.sha256(payload).hexdigest()
-    if digest in _EMPTY_DUMPED:
+def _dump_empty_once(payload, flags, cfg, session, model=None):
+    """Keep one sample per request kind and model per relay run: each dump
+    holds conversation text, so distinct bodies must not pile up on disk."""
+    kind = (client_context.current().get("request_purpose") or "generation", model)
+    if kind in _EMPTY_DUMPED:
         return
-    if len(_EMPTY_DUMPED) > 512:
-        _EMPTY_DUMPED.clear()
-    _EMPTY_DUMPED.add(digest)
+    _EMPTY_DUMPED.add(kind)
     detail = json.dumps({"reason": "empty turn: end_of_stream without content blocks",
                          "usage": flags.get("last_usage")}, ensure_ascii=False)
     stamp = _dump_rejected_body(payload, detail, cfg=cfg, status="empty",
@@ -1030,7 +1029,7 @@ async def _stream_body(cfg, session, body, param_types=None):
                 yield {"type": "end", "reason": "cancelled"}
                 return
             if not produced and saw_end:
-                _dump_empty_once(payload, flags, cfg, session)
+                _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if produced or attempts_left <= 0:
                 break
             # Copilot occasionally returns metadata+end_of_stream with no blocks at all.

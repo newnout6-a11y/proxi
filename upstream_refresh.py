@@ -62,6 +62,7 @@ class Refresher:
                 return self._refresh_locked(force, rejected_cookie=rejected_cookie)
         except OSError as exc:
             self.last_error = "cannot coordinate session renewal: " + type(exc).__name__
+            self.last_failure_kind = "local"
             self._last_result = False
             return False
 
@@ -171,7 +172,8 @@ class Refresher:
 
     def status(self):
         owner = self.keepalive_owner
-        return {"keepalive": bool(self._thread and self._thread.is_alive()) or bool(owner is not None and owner.alive()),
+        return {"keepalive": bool(self._thread and self._thread.is_alive()) or bool(
+                    owner is not None and owner.alive() and owner.interval > 0),
                 "last_success_at": self.last_success_at, "error": self.last_error,
                 "persistence_error": self.persistence_error}
 
