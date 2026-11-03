@@ -18,6 +18,14 @@ def usage(read=0, write=0):
     return {"inputTokens": 4, "promptTokensReadFromCache": read, "promptTokensWrittenToCache": write, "creditsUsed": 0.25}
 
 
+def test_model_effort_and_cost_use_light_green_without_purple():
+    line = "[req] MODEL: claude-opus-5-5 | EFFORT: HIGH credits=0.2500 spent=0.2500"
+    colored = console_log.render(line, color=True)
+    for field in ("MODEL: claude-opus-5-5", "EFFORT: HIGH", "credits=0.2500", "spent=0.2500"):
+        assert "\x1b[92m" + field + "\x1b[0m" in colored
+    assert "\x1b[35m" not in colored and "\x1b[95m" not in colored
+
+
 def test_big_read_is_cyan_without_red_write_warning():
     line = console_log.CacheMonitor().line("req", usage(read=462838))
     colored = console_log.render(line, color=True)

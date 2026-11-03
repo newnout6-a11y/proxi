@@ -9,7 +9,7 @@ import journal
 
 # Terminal theme colors, by meaning; no fixed background or truecolor dependency.
 PALETTE = {"read": "36", "write": "33", "alert": "1;91", "success": "32",
-           "request": "34", "model": "35", "balance": "32", "muted": "90"}
+           "request": "34", "model": "92", "balance": "32", "muted": "90"}
 LARGE_WRITE = 50_000
 WRITE_JUMP = 8_192
 _LOCK = threading.Lock()
@@ -129,6 +129,7 @@ class CacheMonitor:
 
 def balance_line(request_id, snapshot, spent=None):
     state = ("UNAVAILABLE" if number(snapshot.get("available"), signed=True) is None else
+             "UNREPORTED USAGE" if snapshot.get("unreported_usage") else
              "STALE" if snapshot.get("stale") else "LOCAL ESTIMATE" if snapshot.get("estimated") else "CACHED")
     return "[%s] [balance] balance=%s limit=%s spent=%s [%s]" % (
         request_id, amount(snapshot.get("available"), signed=True), amount(snapshot.get("monthly_allocation")), amount(spent), state)

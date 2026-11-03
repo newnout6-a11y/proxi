@@ -105,10 +105,10 @@ def test_multiturn_dynamic_tool_superset_growth_and_subagent_churn():
     assert len(canonical) == 1
 
 
-def test_interleaved_tool_and_toolless_requests_orchestrator(tmp_path):
+def test_interleaved_tool_and_toolless_requests_orchestrator(tmp_path, monkeypatch):
     """Stress-test the TurnRunner orchestrator under rapid alternation between
     tool-bearing turns and tool-less (/compact, /goal, title) turns on the same conversation key.
-    Ensure cached head and openAICacheKey NEVER diverge or inject 30k project context.
+    Service calls must not replace the parent's cached head or inherit its tools.
     """
     cfg = dict(config.DEFAULTS, workspace_root=str(tmp_path), cookie_values=[],
                transport="direct", project_context=True, context_max_bytes=30000,
@@ -116,6 +116,12 @@ def test_interleaved_tool_and_toolless_requests_orchestrator(tmp_path):
 
     pool = SessionPool(Backend(cfg))
     runner = TurnRunner(cfg, type("C", (), {"record_turn": lambda *_: None})(), pool)
+
+    async def stream(_session, *_args, **_kwargs):
+        yield {"type": "text", "delta": "ok"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(RelaySession, "stream", stream)
 
     conv_key = "claude-metadata:adversarial-stress-session-001"
 
@@ -156,16 +162,15 @@ def test_interleaved_tool_and_toolless_requests_orchestrator(tmp_path):
         ],
     }, cfg)
     p2.conversation_key = conv_key
+    p2.request_purpose = "client-text"  # The HTTP layer identifies the Claude client.
 
     holder2 = {}
     asyncio.run(runner.run(p2, out, holder2))
     s2 = holder2["session"].session
-    # Tool-less turn must have EXACT same cached head and cache key
-    assert s2._direct["head"] == cached_head_1
-    assert direct.cache_key_for(s2._direct["head"]) == cache_key_1
-    # Must use canonical tools with choice "none"
+    assert s2 is not s1 and s2._direct["head"] == ""
+    assert s1._cached_head == cached_head_1
     assert s2._direct["tool_choice"] == "none"
-    assert len(s2._direct["tools"]) == 2
+    assert s2._direct["tools"] is None and not s2.has_tools()
 
     # Step 3: Tool-less /goal stop hook request
     p3 = validate.parse_anthropic({
@@ -176,13 +181,15 @@ def test_interleaved_tool_and_toolless_requests_orchestrator(tmp_path):
         ],
     }, cfg)
     p3.conversation_key = conv_key
+    p3.request_purpose = "client-text"
 
     holder3 = {}
     asyncio.run(runner.run(p3, out, holder3))
     s3 = holder3["session"].session
-    assert s3._direct["head"] == cached_head_1
-    assert direct.cache_key_for(s3._direct["head"]) == cache_key_1
+    assert s3 is not s1 and s3._direct["head"] == ""
+    assert s1._cached_head == cached_head_1
     assert s3._direct["tool_choice"] == "none"
+    assert s3._direct["tools"] is None and not s3.has_tools()
 
     # Step 4: Parent turn resumes with tools
     p4 = validate.parse_anthropic({
@@ -199,6 +206,7 @@ def test_interleaved_tool_and_toolless_requests_orchestrator(tmp_path):
     holder4 = {}
     asyncio.run(runner.run(p4, out, holder4))
     s4 = holder4["session"].session
+    assert s4 is s1
     assert s4._cached_head == cached_head_1
     assert direct.cache_key_for(s4._cached_head) == cache_key_1
     assert len(s4.get_canonical_tools()) == 2

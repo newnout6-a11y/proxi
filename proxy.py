@@ -185,10 +185,11 @@ def make_handler(runtime: Runtime):
             model = getattr(self, "_model", "-")
             effort = getattr(self, "_effort_str", "")
             effort_tag = f" [{effort}]" if effort and model != "-" else ""
+            route = getattr(self, "_log_route", None)
+            local_note = {"count_tokens": "[local-token-count]", "models": "[local-model-catalog]"}.get(route, "")
             console_log.write("relay %s %s %s %s %s%s %.0fms %s" % (
                 self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
-                " ".join(part for part in (client_context.label(), note) if part)))
-            route = getattr(self, "_log_route", None)
+                " ".join(part for part in (client_context.label(), local_note, note) if part)))
             if route in ("chat", "responses", "anthropic"):
                 snapshot = getattr(runtime.credits, "balance_snapshot", None)
                 if snapshot:
@@ -349,11 +350,14 @@ def make_handler(runtime: Runtime):
             """Claude Code asks for a token estimate before sending a turn."""
             data = validate.load_json(self._read_body())
             self._bind_client(data)
+            client_context.bind({**client_context.current(), "request_purpose": "local-token-count"})
             # The real count_tokens endpoint does not require max_tokens.
             data.setdefault("max_tokens", 1)
             parsed = validate.parse_anthropic(data, cfg)
             text = parsed.system + "\n" + parsed.prompt
-            self._json(200, {"input_tokens": adapters.approx_tokens(text)})
+            if parsed.tools:
+                text += "\n" + json.dumps(parsed.tools, ensure_ascii=False, separators=(",", ":"))
+            self._json(200, {"input_tokens": adapters.approx_tokens(text)}, {"x-proxi-token-count": "estimated"})
 
         def _models(self):
             data = [{
@@ -479,9 +483,9 @@ def make_handler(runtime: Runtime):
                     parsed.model, conf, strict=False, allow_downgrade=cfg.get("allow_effort_downgrade", False))
             self._effort_str = effective_effort or "none"
 
-            tools_count = len(getattr(parsed, "tools", None) or [])
-            note = " [title/auxiliary]" if tools_count == 0 and len(parsed.prompt or "") < 200 else ""
-            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()}{note}")
+            parsed.request_purpose = client_context.request_kind(parsed)
+            client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
+            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}")
 
             wait = runtime.limiter.take()
             if wait:

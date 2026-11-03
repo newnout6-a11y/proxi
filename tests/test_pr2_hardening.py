@@ -190,15 +190,16 @@ def test_tool_less_request_preserves_task_specific_system_prompt(tmp_path):
                              model="claude-opus-5-5",
                              entry={"id": "claude-opus-5-5", "provider": "anthropic", "reasoning": True},
                              effort="low", tools=[], tool_choice="none", conversation_key="conv-1",
-                             stream=True)
+                             stream=True, request_purpose="client-text")
 
     asyncio.run(runner.run(parsed, out, {}))
 
-    assert target_captured["head"] == "INITIAL CACHED HEAD FROM MAIN TURN"
+    assert target_captured["head"] == "Generate a short title"
     assert target_captured["tool_choice"] == "none"
-    # Distinct task-specific system instructions must reach set_direct via chunks
+    assert target_captured["tools"] is None
+    # The task's system stays in the cacheable system head, ahead of variable input.
     chunks = target_captured["chunks"]
-    assert any("[CLIENT INSTRUCTIONS]\nGenerate a short title" in str(c) for c in chunks)
+    assert chunks == ["Generate a 3-word title"]
 
 
 def test_native_turns_replace_tools_and_omit_removed_tools(tmp_path):

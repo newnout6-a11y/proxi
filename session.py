@@ -991,7 +991,10 @@ class SessionPool:
                     keep = True
                     self._check_route(session.backend, model_entry)
             else:
-                backend = self._next_backend(model_entry)
+                parent = (self._shared if self.mode == "shared" else
+                          self._conversations.get(conversation_key) if conversation_key else None)
+                backend = parent.backend if isolated and parent is not None else self._next_backend(model_entry)
+                self._check_route(backend, model_entry)
                 session = RelaySession(backend, await self._new_thread_id(backend))
             session.begin_request()
             lease = SessionLease(session)

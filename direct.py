@@ -606,7 +606,8 @@ def _ping(session, body):
     response = urllib.request.urlopen(request, timeout=120)
     actual_credits = None
     complete = False
-    session._last_warm_usage = {}
+    billing_id = "keepwarm:" + uuid.uuid4().hex
+    warm_usage = {}
     try:
         for index, raw in enumerate(response):
             line = raw.strip()
@@ -618,20 +619,46 @@ def _ping(session, body):
                 continue
             if not isinstance(event, dict):
                 continue
-            if event.get("event") == "error":
-                # A failed ping must not be reported as a refreshed TTL.
-                raise _error_from_event(event)
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
-            session._last_warm_usage.update(usage)
+            warm_usage.update(usage)
             if usage.get("creditsUsed") is not None:
-                actual_credits = float(usage["creditsUsed"])
+                reported = console_log.number(usage["creditsUsed"])
+                if reported is not None:
+                    actual_credits = reported
+            if event.get("event") == "error":
+                # Preserve any billed usage attached to the error, without claiming a refreshed TTL.
+                raise _error_from_event(event)
             if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
                 complete = True
                 break
             if index >= 200:
                 break
     finally:
-        response.close()
+        try:
+            response.close()
+        finally:
+            session._last_warm_usage = warm_usage
+            # Run in the worker, which can outlive a cancelled scheduler/lease.
+            # Multiple metadata snapshots belong to this ONE billed ping.
+            manager = getattr(session, "_credits_manager", None)
+            if actual_credits is not None:
+                session._keepwarm_cost = getattr(session, "_keepwarm_cost", 0.0) + actual_credits
+                if manager is not None:
+                    manager.record_turn(billing_id, actual_credits)
+            else:
+                mark_unknown = getattr(manager, "mark_usage_unknown", None)
+                if mark_unknown:
+                    mark_unknown()
+            request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "keepwarm"
+            console_log.write(console_log.CacheMonitor().line(request_id, warm_usage)
+                              + " [keepwarm] " + client_context.label())
+            snapshot = getattr(manager, "balance_snapshot", None)
+            if snapshot:
+                console_log.write(console_log.balance_line(request_id, snapshot(), actual_credits) + " [keepwarm]")
+            journal.emit("cache.keepwarm_usage", "Стоимость запроса прогрева", "info",
+                         billing_id=billing_id, model=body.get("model"), source="relay",
+                         request_purpose="cache-keepwarm", actual_credits=actual_credits,
+                         complete=complete, usage=warm_usage)
     if not complete:
         raise apierr.upstream_error("cache refresh ended without end_of_stream")
     return actual_credits
@@ -697,16 +724,12 @@ async def _keepwarm(session, cfg):
             retry_at = 0.0
             prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
             estimate = prefix_tokens * credits.RATE_CACHE_READ
-            if actual is not None:
-                session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0) + actual, 4)
-            else:
+            if actual is None:
                 session._keepwarm_estimated_cost = round(
                     getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
             usage = getattr(session, "_last_warm_usage", {})
             touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
                 "promptTokensReadFromCache", "promptTokensWrittenToCache"))
-            request_id = client_context.current().get("request_id") or "keepwarm"
-            console_log.write(console_log.CacheMonitor().line(request_id, usage) + " [keepwarm] " + client_context.label())
             journal.emit("cache.keepwarm",
                          "Кэш прочитан или записан при прогреве" if touched else
                          "Запрос прогрева завершён; использование кэша не подтверждено",
@@ -953,8 +976,8 @@ async def _stream_body(cfg, session, body, param_types=None):
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
             task = loop.run_in_executor(None, contextvars.copy_context().run, worker, queue)
+            flags = {}
             try:
-                flags = {}
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
                                           cache_scope=(body.get("model"), body.get("openAICacheKey"))):
                     if event.get("type") not in ("credits", "thinking_heartbeat"):
@@ -963,6 +986,10 @@ async def _stream_body(cfg, session, body, param_types=None):
                         produced = True
                     yield event
             finally:
+                if flags.get("usage_seen") and not flags.get("credits_reported"):
+                    mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
+                    if mark_unknown:
+                        mark_unknown()
                 if not task.done():
                     _force_close_response(holder.get("response"))
                 try:
@@ -1146,15 +1173,14 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             current = stack[-1] if stack else None
         elif kind == "metadata":
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            if usage:
+                flags["usage_seen"] = True
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
                                   (" " + client_context.label() if client_context.label() else ""))
-            credits_used = usage.get("creditsUsed")
-            try:
-                credits_value = float(credits_used) if credits_used is not None else None
-            except (TypeError, ValueError):
-                credits_value = None
+            credits_value = console_log.number(usage.get("creditsUsed"))
             if credits_value is not None:
+                flags["credits_reported"] = True
                 yield {"type": "credits", "value": credits_value,
                        "usage": {"input_tokens": usage.get("inputTokens"),
                                  "output_tokens": usage.get("outputTokens"),

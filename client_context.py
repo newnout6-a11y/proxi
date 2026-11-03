@@ -16,6 +16,24 @@ _LOCK = threading.Lock()
 _CLIENTS = {"claude-code": "Claude Code", "claude-desktop": "Claude Desktop", "opencode": "OpenCode"}
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 _READ_LIMIT = 256 * 1024
+CLIENT_TEXT_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe", "client-text"})
+
+
+def request_kind(parsed, identity=None):
+    """Describe known client calls; prompt length alone says nothing about purpose."""
+    if getattr(parsed, "tools", None):
+        return "client-tools"
+    system = (getattr(parsed, "system", "") or "").lstrip()
+    if system.startswith("You are a security monitor for autonomous AI coding agents"):
+        return "auto-mode-check"
+    if system.startswith("You write short session titles. Reply with only the tagged fields the prompt asks for."):
+        return "session-title"
+    info = current() if identity is None else identity
+    if (info.get("client") == "claude-desktop" and not system
+            and getattr(parsed, "max_tokens", None) == 1
+            and (getattr(parsed, "prompt", "") or "").strip() == "User: ."):
+        return "connection-probe"
+    return "client-text" if info.get("client") in _CLIENTS else "generation"
 
 
 def clean(value, limit=240):
@@ -180,6 +198,8 @@ def describe(data, headers, cfg=None):
     ua = str(headers.get("user-agent", "")).lower()
     if not client:
         client = next((name for name in _CLIENTS if name in ua), "")
+        if not client and re.search(r"\bclaude/\d", ua):
+            client = "claude-desktop"
         if not client and ("claude-cli" in ua or identity.get("session_id")):
             client = "claude-code"
     session_id = clean(headers.get("x-proxi-session-id") or identity.get("session_id") or

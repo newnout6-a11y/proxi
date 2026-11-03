@@ -15,6 +15,7 @@ import apierr
 import executor
 import credits
 import journal
+import client_context
 import models as model_catalog
 from context import build_system_instructions
 from redact import redact
@@ -331,21 +332,28 @@ class TurnRunner:
                 tool_names = [choice["function"]["name"]]
             direct_mode = self.cfg.get("transport") == "direct"
             is_native = bool(native_tools)
-            instructions = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._instructions(native_tools=is_native))
+            purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
+            client_text = purpose in client_context.CLIENT_TEXT_KINDS
+            if client_text:
+                # The client owns this job's system prompt and execution policy.
+                # A title/probe/permission check must not acquire relay project or shell instructions.
+                instructions = parsed.system or ""
+            else:
+                instructions = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
                 raise asyncio.CancelledError()
             reminder = ""
             if native_tools and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif not native_tools and self.cfg["exec_policy"] != "off":
+            elif not native_tools and not client_text and self.cfg["exec_policy"] != "off":
                 reminder = (
                     "\n\n[LOCAL EXEC REMINDER]\n"
                     "To run anything on the user's machine you MUST output "
                     "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
                     "Do not answer that you cannot run commands."
                 )
-            if parsed.system:
+            if parsed.system and not client_text:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
             if direct_mode and native_tools:
                 reminder = self._tool_prompt_native(parsed)
@@ -398,21 +406,23 @@ class TurnRunner:
                 dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
                 tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
                 prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
-                messages=len(getattr(parsed, "message_chunks", None) or []))
+                messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose)
 
             base_prompt = self._check_prompt(prompt)
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
-                can_exec = self._can_exec(0) and not native_tools
-                if not direct_mode and key and not native_tools and not can_exec:
-                    # Tool-less calls in agent mode supply their complete history. Affinity alone
-                    # must not add prior standalone jobs to that client context.
+                can_exec = self._can_exec(0) and not native_tools and not client_text
+                isolated = not native_tools and (direct_mode or client_text or (key and not can_exec))
+                if isolated:
+                    # A standalone job can share account affinity, never the main chat's
+                    # tools, head, implicit history, cache breakpoints or idle keepwarm.
                     session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry)
                 else:
                     session = await self.pool.acquire(key, model_entry=parsed.entry)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
+                acquired._credits_manager = self.credits
                 # Console lines (heartbeat, [cache]) carry the relay request id so
                 # concurrent requests of one conversation can be told apart.
                 acquired._request_tag = getattr(parsed, "request_id", None)
@@ -428,7 +438,7 @@ class TurnRunner:
                     model_provider.pop("providerResourceName", None)
                 log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
                     "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
-                    isolated=bool(key and not native_tools), mode=self.cfg.get("session_mode"),
+                    isolated=bool(isolated), mode=self.cfg.get("session_mode"),
                     wait_ms=round((time.time() - turn_started) * 1000))
                 native_target, native_context = None, None
                 if native_tools:
@@ -488,23 +498,11 @@ class TurnRunner:
                             final_choice = getattr(parsed, "tool_choice", "auto")
                             final_head = instructions
                         else:
-                            # Tool-less requests (such as title generation, /compact, /goal Stop hook)
-                            cached_head = getattr(direct_target, "_cached_head", None)
-                            if cached_head:
-                                final_head = cached_head
-                                if parsed.system and cached_head != instructions:
-                                    client_sys = f"[CLIENT INSTRUCTIONS]\n{parsed.system}"
-                                    if client_sys not in stream_prompt and parsed.system not in stream_prompt:
-                                        chunks.append(client_sys)
-                            else:
-                                final_head = instructions
-
-                            if hasattr(direct_target, "has_tools") and direct_target.has_tools():
-                                final_tools = direct_target.get_canonical_tools()
-                                final_choice = "none"
-                            else:
-                                final_tools = None
-                                final_choice = "none"
+                            # Keep the stable job instructions BEFORE the changing input,
+                            # in system role. The client supplied no tools for this job.
+                            final_head = instructions
+                            final_tools = None
+                            final_choice = "none"
 
                         direct_target.set_direct(
                             final_head,
@@ -687,7 +685,7 @@ class TurnRunner:
                         raise apierr.upstream_error("upstream did not honor the required client tool choice")
 
                     # Once the summary turn is requested, nothing is executed any more.
-                    can_exec = self._can_exec(exec_steps) and not final_summary
+                    can_exec = self._can_exec(exec_steps) and not final_summary and not client_text
                     command = executor.extract_command(final_text) if can_exec and not native_tools else None
 
                     if not final_summary and exec_steps and not self._can_exec(exec_steps):
@@ -723,7 +721,7 @@ class TurnRunner:
                             out.put({"type": "error", "error": explained})
                             return
 
-                    if not command and not final_text.strip() and empty_retries < 1:
+                    if not command and not final_text.strip() and empty_retries < 1 and not client_text:
                         # Silent turn: insist once, keeping the full system prompt.
                         empty_retries += 1
                         log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")

@@ -49,6 +49,9 @@ class CreditsManager:
         self._seen_turns = set()
         self.last_error = None
         self._balance_estimated = False
+        self._unreported_usage = False
+        self._usage_revision = 0
+        self._refresh_raced = False
 
     def get_balance(self, force_refresh=False):
         # Coalesce simultaneous cache misses, including a failed auth refresh.
@@ -58,9 +61,11 @@ class CreditsManager:
     def _get_balance(self, force_refresh):
         now = time.monotonic()
         with self._lock:
+            usage_revision = self._usage_revision
             if not force_refresh and now - self._cached_at < CACHE_TTL:
                 if self._balance:
-                    return dict(self._balance, stale=bool(self.last_error),
+                    return dict(self._balance, stale=bool(self.last_error or self._unreported_usage or self._refresh_raced),
+                                unreported_usage=self._unreported_usage,
                                 **({"stale_error": self.last_error} if self.last_error else {}))
                 return {"available": None, "error": self.last_error, "session_used": self.session_used}
         def fetch():
@@ -94,23 +99,38 @@ class CreditsManager:
                 self.last_error = str(exc) or type(exc).__name__
                 self._cached_at = time.monotonic()
                 if self._balance:
-                    return dict(self._balance, stale=True, stale_error=self.last_error)
+                    return dict(self._balance, stale=True, stale_error=self.last_error,
+                                unreported_usage=self._unreported_usage)
                 return {"available": None, "error": self.last_error, "session_used": self.session_used}
         with self._lock:
+            # A debit concurrent with this server snapshot may already be included.
+            # Do not subtract it twice or call the result fully reconciled.
+            self._refresh_raced = self._usage_revision != usage_revision
+            if not self._refresh_raced:
+                self._unreported_usage = False
+            info["session_used"] = round(self.session_used, 4)
             self._balance = dict(info)
             self._cached_at = time.monotonic()
             self.last_error = None
             self._balance_estimated = False
-        return dict(info, stale=False)
+            return dict(info, stale=self._refresh_raced or self._unreported_usage,
+                        unreported_usage=self._unreported_usage)
 
     def record_turn(self, turn_id, cost):
-        if not cost:
+        if isinstance(cost, bool):
+            return
+        try:
+            cost = float(cost)
+        except (ValueError, TypeError, OverflowError):
+            return
+        if not math.isfinite(cost) or cost <= 0:
             return
         with self._lock:
             if turn_id and turn_id in self._seen_turns:
                 return
             if turn_id:
                 self._seen_turns.add(turn_id)
+            self._usage_revision += 1
             self.session_used += cost
             self._history.append({"ts": time.time(), "turn_id": turn_id, "credits": round(cost, 5)})
             if len(self._history) > HISTORY_MAX:
@@ -119,11 +139,19 @@ class CreditsManager:
                 self._balance["available"] = round(self._balance["available"] - cost, 4)
                 self._balance_estimated = True
 
+    def mark_usage_unknown(self):
+        """A completed inference without creditsUsed is not a free inference."""
+        with self._lock:
+            self._unreported_usage = True
+            self._usage_revision += 1
+
     def balance_snapshot(self):
         """Nonblocking console view; keep the local debit distinct from a fetch."""
         with self._lock:
             return dict(self._balance or {},
-                        stale=bool(self.last_error) or time.monotonic() - self._cached_at >= CACHE_TTL,
+                        stale=bool(self.last_error or self._unreported_usage or self._refresh_raced)
+                              or time.monotonic() - self._cached_at >= CACHE_TTL,
+                        unreported_usage=self._unreported_usage,
                         estimated=self._balance_estimated)
 
     def usage(self):
@@ -131,4 +159,5 @@ class CreditsManager:
             total = sum(item["credits"] for item in self._history)
             return {"session_used": round(self.session_used, 4), "turns": len(self._history),
                     "recent": list(self._history[-50:]), "recent_total": round(total, 4),
+                    "unreported_usage": self._unreported_usage,
                     "available": (self._balance or {}).get("available")}
