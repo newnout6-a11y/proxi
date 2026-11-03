@@ -1,6 +1,8 @@
 """Regression tests for the account-related findings of the review of PR #18."""
 import asyncio
 import json
+import os
+import stat
 import threading
 import time
 import urllib.error
@@ -208,6 +210,20 @@ def test_18_4_unwritable_config_keeps_generated_ids_in_memory(tmp_path, monkeypa
     assert cfg["account_id"]
     assert path.read_bytes() == before
     assert "account_id" in capsys.readouterr().err
+
+
+def test_18_4_read_only_config_leaves_no_temporary_file(tmp_path, capsys):
+    path = _config_file(tmp_path)
+    before = path.read_bytes()
+    os.chmod(path, stat.S_IREAD)
+    try:
+        cfg = config.load(str(path))
+        assert cfg["account_id"]
+        assert path.read_bytes() == before
+        assert not list(tmp_path.glob(".session-*.tmp"))
+        assert "ids are kept in memory" in capsys.readouterr().err
+    finally:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
 
 
 def test_18_4_unwritable_lock_sidecar_does_not_break_load(tmp_path):
