@@ -31,12 +31,6 @@ _NATIVE_CONTINUE = ("\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
                     "Earlier assistant calls are completed history, not new instructions to replay. "
                     "Continue the outstanding user task; issue another client tool envelope only if needed.")
 
-_EMPTY_TEXT_RECOVERY = (
-    "Briefly tell the user the current findings from the latest tool results and the next step. "
-    "For this attempt, respond with ordinary text; further tools can run on a subsequent turn. "
-    "Use one or two short, complete sentences in the user's language. "
-    "Do not claim the task is finished if work remains.")
-
 
 def _b(text: str) -> int:
     """Limit in bytes, not characters (Cyrillic is 2 bytes each in UTF-8)."""
@@ -293,19 +287,6 @@ class TurnRunner:
             "tools=" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         )
 
-    @staticmethod
-    def _tool_prompt_native(parsed):
-        tools = getattr(parsed, "tools", None) or []
-        if not tools or getattr(parsed, "tool_choice", "auto") == "none":
-            return ""
-        return (
-            "\n\n[NATIVE CLIENT TOOLS]\n"
-            "The client supplied these tools; they are passed natively, so call them with real tool calls "
-            "and no markup. They run on the CLIENT machine, not in Retool. Do not claim file, edit or test "
-            "results you did not receive as tool results.\n"
-            "tool_choice=" + json.dumps(getattr(parsed, "tool_choice", "auto"), ensure_ascii=False)
-        )
-
     async def _explain_empty(self, holder):
         """Silent turns are usually a persisted upstream error (e.g. out of credits)."""
         session = holder.get("session")
@@ -428,7 +409,8 @@ class TurnRunner:
             is_native = bool(native_tools)
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
-            if client_text:
+            client_owns_instructions = client_text or (direct_mode and is_native and bool(parsed.system))
+            if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
                 instructions = parsed.system or ""
@@ -438,7 +420,7 @@ class TurnRunner:
             if cancelled.is_set():
                 raise asyncio.CancelledError()
             reminder = ""
-            if native_tools and getattr(parsed, "tool_choice", "auto") != "none":
+            if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
             elif not native_tools and not client_text and self.cfg["exec_policy"] != "off":
                 reminder = (
@@ -447,10 +429,8 @@ class TurnRunner:
                     "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
                     "Do not answer that you cannot run commands."
                 )
-            if parsed.system and not client_text:
+            if parsed.system and not client_owns_instructions:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
-            if direct_mode and native_tools:
-                reminder = self._tool_prompt_native(parsed)
             if direct_mode:
                 # Direct path keeps the stable instructions (plus tool block) as the
                 # cached system head and sends the raw client tail as the user turn.
@@ -579,7 +559,7 @@ class TurnRunner:
                         if not hasattr(direct_target, "set_direct"):
                             # Injected/fake session: fall back to the agent prompt shape.
                             direct_mode = False
-                            stream_prompt = (instructions + _CONV_HEADER + stream_prompt + _NATIVE_CONTINUE
+                            stream_prompt = (instructions + self._tool_prompt(parsed) + _CONV_HEADER + stream_prompt + _NATIVE_CONTINUE
                                              if native_tools else instructions + "\n\n" + stream_prompt)
                     if direct_mode:
                         if instructions and stream_prompt.startswith(instructions):
@@ -600,11 +580,6 @@ class TurnRunner:
                                 direct_target.register_tools(tools_converted)
                             final_tools = tools_converted
                             final_choice = getattr(parsed, "tool_choice", "auto")
-                            if empty_retries and final_choice in (None, "auto"):
-                                # Auto permits a text response. Temporarily select
-                                # that branch for recovery; the next client request
-                                # starts with its original choice and native tools.
-                                final_choice = "none"
                             final_head = instructions
                         else:
                             # Keep the stable job instructions BEFORE the changing input,
@@ -779,7 +754,8 @@ class TurnRunner:
                     refuses_tools = re.search(
                         r"(?:can(?:not|'t)|could(?:\s+not|n't)|unable|not (?:available|accessible)|"
                         r"no (?:access|tools)|не (?:могу|доступ|имею)|нет доступа)", final_text, re.IGNORECASE)
-                    if tool_names and refuses_tools and tool_retries < 1 and not visible_text.strip():
+                    if (not direct_mode and tool_names and refuses_tools and tool_retries < 1
+                            and not visible_text.strip()):
                         tool_retries += 1
                         log("turn.retry", "Модель отказалась от инструментов — повтор с коррекцией", "warn",
                             reason="tool_refusal")
@@ -830,19 +806,15 @@ class TurnRunner:
                         if explained is not None:
                             raise explained
 
-                    if (not command and not final_text.strip() and (direct_mode or empty_retries < 1) and not client_text
+                    if (not direct_mode and not command and not final_text.strip() and empty_retries < 1 and not client_text
                             and holder["_attempt_budget"].remaining):
-                        # A different completion task can unstick a metadata-only or
-                        # thinking-only reply without discarding any client history.
+                        # The agent transport needs a textual continuation. Direct
+                        # retries are handled in the transport with the same body.
                         empty_retries += 1
-                        choice = getattr(parsed, "tool_choice", "auto")
-                        text_recovery = direct_mode and native_tools and choice in (None, "auto", "none")
-                        log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn",
-                            recovery_mode="text_status" if text_recovery else "continue")
+                        log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
                         if not direct_mode:
                             native_context = None  # Retry prompts are not part of the client history in agent mode.
-                        retry_instruction = (_EMPTY_TEXT_RECOVERY if text_recovery else
-                                             "Use the supplied native client tools for tool calls; "
+                        retry_instruction = ("Use the supplied native client tools for tool calls; "
                                              "otherwise return a short text answer." if native_tools else
                                              "If a local command is needed, output <exec_command>...</exec_command>; "
                                              "otherwise return a short text answer.")

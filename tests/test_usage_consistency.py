@@ -239,7 +239,7 @@ def test_real_direct_and_orchestrator_retries_keep_one_context_and_bill_every_at
     assert len(bodies) == len(paid) == len({key for key, _ in paid}) == 4
     assert sum(cost for _, cost in paid) == pytest.approx(sum(RETRY_COSTS))
     assert all("[RETRY]" not in json.dumps(body) for body in bodies[:3])
-    assert "[RETRY]" in json.dumps(bodies[3])
+    assert all(body == bodies[0] for body in bodies)
     adapter = adapters.ChatAdapter(parsed_request)
     for event in events:
         adapter.feed(event)

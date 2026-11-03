@@ -11,7 +11,6 @@ import pytest
 import client_context
 import direct
 import journal
-from orchestrator import _EMPTY_TEXT_RECOVERY
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace
 from test_native_context_reuse import Backend, FIRST, request, run, setup
@@ -86,7 +85,7 @@ def test_five_attempts_total_have_correlated_diagnostics_and_error_outcome(harne
     ends = [d for k, d in harness.traces if k == "turn.end"]
     assert ends[-1]["reason"] == "error"
     assert any(k == "turn.error" for k, _ in harness.traces)
-    assert "[RETRY]" in json.dumps(harness.calls[3])
+    assert all(body == harness.calls[0] for body in harness.calls)
     assert "<exec_command>" not in json.dumps(harness.calls[3])
 
 
@@ -100,87 +99,99 @@ def test_success_at_or_before_fifth_attempt_stops_retries(harness, attempt):
 
 
 @pytest.mark.parametrize("thinking_only", [False, True])
-def test_plain_text_recovery_preserves_full_history_and_unsticks_empty_turn(harness, monkeypatch, thinking_only):
-    baseline = direct.urllib.request.urlopen
-
+@pytest.mark.parametrize("choice", ["auto", "none"])
+def test_retry_preserves_task_and_can_still_call_a_tool(harness, monkeypatch, thinking_only, choice):
     def opener(req, **kw):
         body = json.loads(req.data)
-        if _EMPTY_TEXT_RECOVERY in json.dumps(body):
-            harness.success = len(harness.calls) + 1
-        if thinking_only and not harness.success:
-            harness.calls.append(body)
-            return response({"event": "content_block_start", "type": "thinking"},
-                            {"event": "content_block_delta", "type": "signature", "partialSignature": "opaque"},
-                            {"event": "metadata", "usage": {"outputTokens": 40, "creditsUsed": 0.25}},
-                            {"event": "end_of_stream"})
-        return baseline(req, **kw)
+        harness.calls.append(body)
+        if len(harness.calls) == 4:
+            return response({"event": "content_block_start", "type": "tool_call", "toolCallId": "read-next", "toolName": "read_file"},
+                            {"event": "content_block_delta", "type": "tool_call", "partialInputs": '{"path":"README.md"}'},
+                            {"event": "content_block_end"}, {"event": "end_of_stream"})
+        return response(*([{"event": "content_block_start", "type": "thinking"},
+                           {"event": "content_block_delta", "type": "signature", "partialSignature": "opaque"}]
+                          if thinking_only else []),
+                        {"event": "metadata", "usage": {"outputTokens": 40 if thinking_only else 0, "creditsUsed": 0.25}},
+                        {"event": "end_of_stream"})
 
     monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
-    events = send(harness)
-    assert len(harness.calls) == (2 if thinking_only else 4)
-    assert events[-1] == {"type": "end", "reason": "stop"}
-    assert any(e.get("delta") == "OK" for e in events)
-    first, recovered = harness.calls[0], harness.calls[-1]
-    assert recovered["messages"][:-1] == first["messages"]
-    assert recovered["tools"] == first["tools"]
-    assert "toolChoice" not in first and recovered["toolChoice"] == "none"
-    for key in ("model", "reasoningEffort", "maxCompletionTokens", "openAICacheKey"):
-        assert recovered.get(key) == first.get(key)
-    assert any(d.get("recovery_mode") == "text_status" for k, d in harness.traces if k == "turn.retry")
+    parsed = request(FIRST, system="Use the current client instructions verbatim.")
+    parsed.tool_choice = choice
+    events = asyncio.run(run(harness.runner, parsed))
+    assert len(harness.calls) == 4
+    assert all(body == harness.calls[0] for body in harness.calls)
+    assert harness.calls[0]["messages"][0]["content"][0]["text"] == parsed.system
+    if choice == "auto":
+        assert "toolChoice" not in harness.calls[0]
+        assert events[-1] == {"type": "end", "reason": "tool_calls"}
+        assert any(e.get("type") == "tool_call" and e.get("name") == "read_file" for e in events)
+    else:
+        assert all(body["toolChoice"] == "none" for body in harness.calls)
+        assert events[-1]["type"] == "error"  # The fake provider violated an explicit choice=none.
+    assert harness.waits == [0, 0.5, 1.0, 2.0]
     if thinking_only:
         attempts = [d for k, d in harness.traces if k == "upstream.attempt"]
-        assert attempts[0]["outcome"] == "thinking_only"
-        assert harness.waits == [0, 0.5]
+        assert all(d["outcome"] == "thinking_only" for d in attempts[:3])
 
 
 @pytest.mark.parametrize("choice", ["required", {"type": "function", "function": {"name": "read_file"}}])
-def test_empty_recovery_respects_required_or_named_tool_choice(harness, choice):
+def test_empty_retries_respect_required_or_named_tool_choice(harness, choice):
     parsed = request(FIRST)
     parsed.tool_choice = choice
     events = asyncio.run(run(harness.runner, parsed))
-    assert len(harness.calls) == 3
+    assert len(harness.calls) == 5
     assert "required client tool choice" in str(events[-1]["error"])
-    assert all(_EMPTY_TEXT_RECOVERY not in json.dumps(body) for body in harness.calls)
+    assert all(body == harness.calls[0] for body in harness.calls)
     expected = "required" if choice == "required" else "read_file"
     assert all(body.get("toolChoice") == expected for body in harness.calls)
 
 
-def test_thinking_only_exhausts_same_five_attempt_budget(harness, monkeypatch):
+@pytest.mark.parametrize("kind", ["thinking", "whitespace"])
+def test_unusable_response_exhausts_same_five_attempt_budget(harness, monkeypatch, kind):
     def opener(req, **kw):
         harness.calls.append(json.loads(req.data))
-        return response({"event": "content_block_start", "type": "thinking"},
-                        {"event": "content_block_delta", "type": "signature", "partialSignature": "opaque"},
-                        {"event": "metadata", "usage": {"outputTokens": 40, "creditsUsed": 0.25}},
+        events = ([{"event": "content_block_start", "type": "thinking"},
+                   {"event": "content_block_delta", "type": "signature", "partialSignature": "opaque"}]
+                  if kind == "thinking" else [{"event": "content_block_delta", "type": "text", "partialText": " \n"}])
+        return response(*events, {"event": "metadata", "usage": {"outputTokens": 40, "creditsUsed": 0.25}},
                         {"event": "end_of_stream"})
 
     monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
     events = send(harness)
     assert len(harness.calls) == events[-1]["error"].upstream_attempts == 5
+    assert all(body == harness.calls[0] for body in harness.calls)
     assert events[-1]["error"].code == "upstream_empty_turn"
     assert harness.waits == [0, 0.5, 1.0, 2.0, 4.0]
 
 
-def test_next_client_turn_restores_auto_tools_after_text_recovery(harness, monkeypatch):
-    harness.success = 4
-    assert send(harness)[-1] == {"type": "end", "reason": "stop"}
-    assert harness.calls[-1]["toolChoice"] == "none"
+@pytest.mark.parametrize("dialect", ["chat", "responses", "anthropic"])
+def test_same_conversation_uses_current_system_and_tools_on_every_request(harness, dialect):
+    harness.success = 1
+    first = request(FIRST, system="OLD_CLIENT_INSTRUCTIONS", dialect=dialect)
+    assert asyncio.run(run(harness.runner, first))[-1]["reason"] == "stop"
+    harness.success = 2
+    tools = [{"type": "function", "function": {"name": "new_tool", "description": "New current tool instructions.",
+              "parameters": {"type": "object", "properties": {}}}}]
+    second = request(FIRST + [{"role": "assistant", "content": "OK"}, {"role": "user", "content": "NEXT"}],
+                     system="NEW_CLIENT_INSTRUCTIONS", tools=tools, dialect=dialect)
+    assert asyncio.run(run(harness.runner, second))[-1]["reason"] == "stop"
+    assert harness.calls[-1]["messages"][0]["content"][0]["text"] == "NEW_CLIENT_INSTRUCTIONS"
+    assert [t["name"] for t in harness.calls[-1]["tools"]] == ["new_tool"]
+    assert "OLD_CLIENT_INSTRUCTIONS" not in json.dumps(harness.calls[-1])
+    assert harness.calls[0]["openAICacheKey"] != harness.calls[-1]["openAICacheKey"]
 
-    def opener(req, **kw):
-        body = json.loads(req.data)
-        harness.calls.append(body)
-        assert "toolChoice" not in body
-        assert _EMPTY_TEXT_RECOVERY not in json.dumps(body)
-        return response({"event": "content_block_start", "type": "tool_call", "toolCallId": "read-next", "toolName": "read_file"},
-                        {"event": "content_block_delta", "type": "tool_call", "partialInputs": '{"path":"README.md"}'},
-                        {"event": "content_block_end"}, {"event": "end_of_stream"})
 
-    monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
-    parsed = request(FIRST + [{"role": "assistant", "content": "Verified progress."},
-                              {"role": "user", "content": "Read README.md now."}])
-    events = asyncio.run(run(harness.runner, parsed))
-    assert len(harness.calls) == 5
-    assert events[-1] == {"type": "end", "reason": "tool_calls"}
-    assert any(e.get("type") == "tool_call" and e.get("name") == "read_file" for e in events)
+def test_native_tool_descriptions_are_not_truncated(harness):
+    description = "tool instructions " * 120 + "REQUIRED_TOOL_SUFFIX"
+    parameter_description = "parameter instructions " * 60 + "REQUIRED_PARAM_SUFFIX"
+    tools = [{"type": "function", "function": {"name": "read_file", "description": description,
+              "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": parameter_description}}}}}]
+    harness.success = 1
+    parsed = request(FIRST, tools=tools)
+    assert asyncio.run(run(harness.runner, parsed))[-1]["reason"] == "stop"
+    tool = harness.calls[0]["tools"][0]
+    assert tool["description"] == description
+    assert tool["params"]["path"]["description"] == parameter_description
 
 
 def test_budget_and_dump_are_new_for_each_request_on_same_session(harness, tmp_path):

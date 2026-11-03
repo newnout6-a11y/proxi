@@ -165,7 +165,7 @@ def _param_schema(schema, required):
             name: _param_schema(sub, name in (schema.get("required") or []))
             for name, sub in (schema.get("properties") or {}).items()}}
     if schema.get("description"):
-        node["description"] = str(schema["description"])[:500]
+        node["description"] = str(schema["description"])
     node["required"] = bool(required)
     return node
 
@@ -189,7 +189,7 @@ def tools_to_retool(tools):
         for name in sorted(properties.keys()):
             params[name] = _param_schema(properties[name], name in required)
         converted.append({"name": function["name"],
-                          "description": (function.get("description") or "")[:1000],
+                          "description": function.get("description") or "",
                           "params": params, "strict": True})
     return converted
 
@@ -1015,14 +1015,14 @@ async def _stream_body(cfg, session, body, param_types=None):
             hand_off_final(None, queue)
 
     text, thinking = [], []
-    produced = False
-    usable = False
     saw_end = False
     # Client service checks (Auto mode, titles) fail deterministically when empty:
     # re-sending the same body only pays for the same empty answer again.
-    attempts_left = 0 if client_context.current().get("request_purpose") in client_context.SERVICE_KINDS else 2
+    service_request = client_context.current().get("request_purpose") in client_context.SERVICE_KINDS
     try:
         while True:
+            usable = False
+            thinking_seen = False
             yield {"type": "usage_start"}
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
@@ -1032,12 +1032,11 @@ async def _stream_body(cfg, session, body, param_types=None):
             try:
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
                                           cache_scope=(body.get("model"), body.get("openAICacheKey"))):
-                    if event.get("type") not in ("credits", "thinking_heartbeat"):
-                        # A metadata-only reply (credits + end_of_stream) is still
-                        # an empty attempt and must get its retry.
-                        produced = True
-                    if event.get("type") in ("text", "tool_call"):
+                    if (event.get("type") == "tool_call"
+                            or (event.get("type") == "text" and event.get("delta", "").strip())):
                         usable = True
+                    if event.get("type") in ("thinking", "thinking_start", "thinking_signature", "thinking_heartbeat"):
+                        thinking_seen = True
                     yield event
             except BaseException as exc:
                 failure = exc
@@ -1057,7 +1056,7 @@ async def _stream_body(cfg, session, body, param_types=None):
                 if trace is not None:
                     outcome = ("cancelled" if is_cancelled() or isinstance(failure, asyncio.CancelledError) else
                                "error" if failure else "truncated" if not flags.get("end") else
-                               "content" if usable else "thinking_only" if produced else "empty")
+                               "content" if usable else "thinking_only" if thinking_seen else "empty")
                     trace.finish(outcome)
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)
@@ -1067,10 +1066,12 @@ async def _stream_body(cfg, session, body, param_types=None):
                 return
             if not usable and saw_end:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
-            if produced or attempts_left <= 0 or not budget.remaining:
+            if usable or not saw_end or service_request or not budget.remaining:
                 break
-            # Copilot occasionally returns metadata+end_of_stream with no blocks at all.
-            attempts_left -= 1
+            # Retry the same request, including instructions, tool choice and
+            # full history. Never turn the user's task into a status-only job.
+            text.clear()
+            thinking.clear()
             holder["response"] = None
         if text:
             yield {"type": "final_text", "text": "".join(text)}
