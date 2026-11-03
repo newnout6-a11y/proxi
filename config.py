@@ -66,6 +66,10 @@ DEFAULTS = {
     "cache_keepwarm_idle": 1800,
     "cache_keepwarm_during_turns": True,
     "cache_keepwarm_turn_offset": 200,
+    # Accounts below this confirmed balance leave the routing pool.
+    "min_account_balance": 20,
+    "account_balance_interval": 300,
+    "account_refresh_parallel": 3,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -301,7 +305,7 @@ def _load(path):
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
-                    "cache_keepwarm_turn_offset"):
+                    "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -309,6 +313,14 @@ def _load(path):
 
     if cfg["session_refresh_interval"] < 0:
         raise service_unavailable("session_refresh_interval must be non-negative (0 disables keepalive)")
+    try:
+        cfg["min_account_balance"] = float(cfg["min_account_balance"])
+    except (TypeError, ValueError):
+        raise service_unavailable("min_account_balance must be a number")
+    if not math.isfinite(cfg["min_account_balance"]) or cfg["min_account_balance"] < 0:
+        raise service_unavailable("min_account_balance must be a finite non-negative number")
+    if cfg["account_balance_interval"] < 0 or cfg["account_refresh_parallel"] < 1:
+        raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit"):

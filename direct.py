@@ -867,6 +867,26 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
         pass
 
 
+_EMPTY_DUMPED = set()
+
+
+def _dump_empty_once(payload, flags, cfg, session):
+    """Keep one sample per distinct body of a completed stream with no output."""
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest in _EMPTY_DUMPED:
+        return
+    if len(_EMPTY_DUMPED) > 512:
+        _EMPTY_DUMPED.clear()
+    _EMPTY_DUMPED.add(digest)
+    detail = json.dumps({"reason": "empty turn: end_of_stream without content blocks",
+                         "usage": flags.get("last_usage")}, ensure_ascii=False)
+    stamp = _dump_rejected_body(payload, detail, cfg=cfg, status="empty",
+                                request_id=client_context.current().get("request_id")
+                                or getattr(session, "_request_tag", None))
+    journal.emit("upstream.empty_turn", "Пустой ответ upstream сохранён для диагностики", "warn",
+                 diagnostic_id=stamp)
+
+
 async def _stream_body(cfg, session, body, param_types=None):
     payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
     if cfg.get("direct_debug"):
@@ -977,7 +997,9 @@ async def _stream_body(cfg, session, body, param_types=None):
     text, thinking = [], []
     produced = False
     saw_end = False
-    attempts_left = 2
+    # Client service checks (Auto mode, titles) fail deterministically when empty:
+    # re-sending the same body only pays for the same empty answer again.
+    attempts_left = 0 if client_context.current().get("request_purpose") in client_context.SERVICE_KINDS else 2
     try:
         while True:
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
@@ -1007,6 +1029,8 @@ async def _stream_body(cfg, session, body, param_types=None):
             if session._cancelled:
                 yield {"type": "end", "reason": "cancelled"}
                 return
+            if not produced and saw_end:
+                _dump_empty_once(payload, flags, cfg, session)
             if produced or attempts_left <= 0:
                 break
             # Copilot occasionally returns metadata+end_of_stream with no blocks at all.
@@ -1182,6 +1206,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             if usage:
                 flags["usage_seen"] = True
+                flags["last_usage"] = usage
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
                                   (" " + client_context.label() if client_context.label() else ""))

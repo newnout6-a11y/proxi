@@ -68,7 +68,8 @@ def main():
             demo()
         else:
             for line in lines(args.path, tail=args.lines, follow=not args.no_follow):
-                console_log.write(line.rstrip("\r\n"))
+                # Older Windows PowerShell appended UTF-16 lines to the same file.
+                console_log.write(line.replace("\x00", "").rstrip("\r\n"))
     except KeyboardInterrupt:
         pass
 

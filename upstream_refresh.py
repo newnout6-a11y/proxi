@@ -26,6 +26,9 @@ class Refresher:
         self.last_success_at = None
         self._stop = threading.Event()
         self._thread = None
+        self.last_failure_kind = None
+        # Set by AccountDispatcher: it schedules renewals instead of this thread.
+        self.keepalive_owner = None
 
     def _default(self):
         req = urllib.request.Request(self.cfg["base"] + "/api/refreshtoken",
@@ -86,6 +89,7 @@ class Refresher:
                 headers = self._http_refresh()
             except urllib.error.HTTPError as exc:
                 self.last_error = f"session renewal failed: HTTP {exc.code}"
+                self.last_failure_kind = "auth" if exc.code in (401, 403) else "upstream"
                 self._last_result = False
                 exc.close()
                 journal.emit("auth.refresh", "Продление сессии Retool не удалось: HTTP %s" % exc.code, "error",
@@ -94,6 +98,8 @@ class Refresher:
                 return False
             except Exception as exc:
                 self.last_error = redact(str(exc), cookie_values=self.cfg.get("cookie_values", []))
+                self.last_failure_kind = ("network" if isinstance(exc, (urllib.error.URLError, OSError))
+                                          else "upstream")
                 self._last_result = False
                 journal.emit("auth.refresh", "Продление сессии Retool не удалось", "error",
                              ok=False, error=self.last_error, forced=force,
@@ -117,6 +123,7 @@ class Refresher:
                          rotated=bool(headers), persistence_error=self.persistence_error,
                          account=account_tag, tenant=tenant)
             self.last_error = None
+            self.last_failure_kind = None
             self.last_success_at = time.time()
             self._last_result = True
             # Retool may say "Authenticated, but token was not refreshed" until
@@ -137,7 +144,7 @@ class Refresher:
     def start(self):
         """Keep the session alive even when no client sends model requests."""
         interval = self.cfg.get("session_refresh_interval", 900)
-        if not interval or (self._thread and self._thread.is_alive()):
+        if not interval or (self._thread and self._thread.is_alive()) or self.keepalive_owner is not None:
             return
         self._stop.clear()
 
@@ -163,7 +170,8 @@ class Refresher:
             self._thread.join(timeout=16)
 
     def status(self):
-        return {"keepalive": bool(self._thread and self._thread.is_alive()),
+        owner = self.keepalive_owner
+        return {"keepalive": bool(self._thread and self._thread.is_alive()) or bool(owner is not None and owner.alive()),
                 "last_success_at": self.last_success_at, "error": self.last_error,
                 "persistence_error": self.persistence_error}
 

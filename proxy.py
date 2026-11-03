@@ -27,6 +27,7 @@ import models as model_catalog
 import sse
 import models
 import validate
+from accounts import AccountDispatcher
 from credits import CreditsManager
 from orchestrator import TurnRunner
 from session import Backend, SessionPool
@@ -74,10 +75,20 @@ class Runtime:
         self.pool = SessionPool(self.backend)
         if getattr(self.pool, "backends", None):
             self.backend = self.pool.backend
-        self.credits = CreditsManager(self.backend.cfg.get("base", cfg.get("base")),
-                                      lambda: auth.upstream_headers(self.backend.cfg),
-                                      self.backend.refresher)
+        backends = getattr(self.pool, "backends", None) or [self.backend]
+        managers = {}
+        for backend in backends:
+            if not hasattr(backend, "refresher"):
+                continue
+            managers[backend] = CreditsManager(
+                backend.cfg.get("base", cfg.get("base")),
+                (lambda b=backend: auth.upstream_headers(b.cfg)), backend.refresher)
+        self.credits = managers.get(self.backend) or CreditsManager(
+            self.backend.cfg.get("base", cfg.get("base")),
+            lambda: auth.upstream_headers(self.backend.cfg), getattr(self.backend, "refresher", None))
+        self.accounts = AccountDispatcher(list(managers), cfg, managers)
         self.runner = TurnRunner(cfg, self.credits, self.pool)
+        self.runner.accounts = self.accounts
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
         self.journal = journal.JOURNAL
@@ -273,7 +284,7 @@ def make_handler(runtime: Runtime):
                 elif route == "balance":
                     balance = runtime.credits.get_balance(force_refresh=True)
                     status = 200 if balance.get("available") is not None or balance.get("stale") else 503
-                    self._json(status, balance)
+                    self._json(status, dict(balance, accounts=runtime.accounts.status()))
                 elif route == "usage":
                     self._json(200, runtime.credits.usage())
                 elif route == "health":
@@ -662,9 +673,10 @@ def main(argv=None):
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
 
     backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
+    runtime.accounts.start()
     refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
     for r in refreshers:
-        r.start()
+        r.start()  # no-op for accounts the dispatcher schedules
     balance = runtime.credits.get_balance(force_refresh=True)
     print("=" * 64)
     print(" Retool AI relay")
@@ -710,6 +722,7 @@ def main(argv=None):
             refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
             for r in refreshers:
                 r.stop()
+            runtime.accounts.stop()
             async def _cancel_all():
                 tasks = [t for t in asyncio.all_tasks(runtime.loop) if t is not asyncio.current_task()]
                 for t in tasks:

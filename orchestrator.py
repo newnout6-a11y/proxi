@@ -16,6 +16,7 @@ import executor
 import credits
 import journal
 import client_context
+import console_log
 import models as model_catalog
 from context import build_system_instructions
 from redact import redact
@@ -121,11 +122,33 @@ class _ClientText:
         return text
 
 
+class _FailoverOut:
+    """Forwards turn events, holding back the error and end sentinel so the
+    runner can retry on another account before the client sees anything."""
+
+    def __init__(self, out):
+        self.out = out
+        self.error = None
+        self.started = False
+
+    def put(self, event):
+        if event is None:
+            return
+        if event.get("type") == "error":
+            self.error = event["error"]
+            return
+        if event.get("type") != "credits":
+            self.started = True
+        self.out.put(event)
+
+
 class TurnRunner:
     def __init__(self, cfg, credits, pool):
         self.cfg = cfg
         self.credits = credits
         self.pool = pool
+        # AccountDispatcher; set by Runtime when it manages account health.
+        self.accounts = None
 
     def _can_exec(self, steps: int) -> bool:
         """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
@@ -306,6 +329,51 @@ class TurnRunner:
         return None
 
     async def run(self, parsed, out: queue.Queue, holder: dict):
+        """Run a turn; retry on another account only after a confirmed low balance.
+
+        The retry happens only while nothing was sent to the client, and only
+        when the dispatcher's fresh balance fetch confirms the serving account
+        dropped below min_account_balance. Other failures (empty turns, 5xx)
+        are returned as before.
+        """
+        exclude = []
+        cancelled = holder.setdefault("cancel_event", threading.Event())
+        while True:
+            relay = _FailoverOut(out)
+            holder.pop("session", None)
+            try:
+                await self._run_once(parsed, relay, holder, exclude=tuple(exclude))
+            except BaseException:
+                if relay.error is not None:
+                    out.put({"type": "error", "error": relay.error})
+                out.put(None)
+                raise
+            error = relay.error
+            lease = holder.get("session")
+            backend = getattr(getattr(lease, "session", lease), "backend", None)
+            accounts = getattr(self, "accounts", None)
+            if (error is not None and not relay.started and not cancelled.is_set()
+                    and accounts is not None and backend is not None
+                    and error.code not in ("insufficient_credits", "prompt_too_large")
+                    and backend not in exclude):
+                # With no account left, the next acquire raises a clear 402.
+                exhausted = await asyncio.to_thread(accounts.check_balance_now, backend)
+                if exhausted:
+                    exclude.append(backend)
+                    tag = journal.tag(backend.cfg.get("account_id") or backend.cfg.get("page_uuid"))
+                    journal.emit("account.failover", "Баланс аккаунта закончился — запрос повторён на другом",
+                                 "warn", account=tag, request_id=getattr(parsed, "request_id", None),
+                                 error=error.code)
+                    console_log.write("[%s] [account] %s: баланс закончился, повтор на другом аккаунте" % (
+                        getattr(parsed, "request_id", None) or "req", tag))
+                    holder["reason"] = "stop"
+                    continue
+            if error is not None:
+                out.put({"type": "error", "error": error})
+            out.put(None)
+            return
+
+    async def _run_once(self, parsed, out, holder, exclude=()):
         turn_id = str(uuid.uuid4())
         holder["turn_id"] = turn_id
         # Loop detection is per client turn, never shared by concurrent chats.
@@ -408,19 +476,22 @@ class TurnRunner:
                                    and purpose not in client_context.SERVICE_KINDS
                                    and (key or self.cfg.get("session_mode") == "shared"))
                 isolated = not native_tools and not persistent_text and (direct_mode or client_text or (key and not can_exec))
+                failover = {"exclude": exclude} if exclude else {}
                 if persistent_text:
                     # Ordinary text chats retain idle keepwarm, with state separate
                     # from native tools even when their conversation ID is the same.
-                    session = await self.pool.acquire(key, context_scope="text", model_entry=parsed.entry)
+                    session = await self.pool.acquire(key, context_scope="text", model_entry=parsed.entry, **failover)
                 elif isolated:
                     # A standalone job can share account affinity, never the main chat's
                     # tools, head, implicit history, cache breakpoints or idle keepwarm.
-                    session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry)
+                    session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry, **failover)
                 else:
-                    session = await self.pool.acquire(key, model_entry=parsed.entry)
+                    session = await self.pool.acquire(key, model_entry=parsed.entry, **failover)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
-                acquired._credits_manager = self.credits
+                # Debit the account that actually served the turn.
+                account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
+                acquired._credits_manager = account_credits
                 # Console lines (heartbeat, [cache]) carry the relay request id so
                 # concurrent requests of one conversation can be told apart.
                 acquired._request_tag = getattr(parsed, "request_id", None)
@@ -583,7 +654,7 @@ class TurnRunner:
                                 # separately: a per-turn dedup key dropped all but the first.
                                 credit_events = holder.get("_credit_events", 0) + 1
                                 holder["_credit_events"] = credit_events
-                                self.credits.record_turn(
+                                account_credits.record_turn(
                                     turn_id if credit_events == 1 else "%s#%d" % (turn_id, credit_events),
                                     event["value"])
                                 usage = event.get("usage") or {}
