@@ -18,6 +18,49 @@ _HEADERS = ("request-id", "x-request-id", "cf-ray", "content-type", "x-retool-ap
 _SIGNALS = ("stop_reason", "stopReason", "finish_reason", "finishReason", "statusCode", "code")
 
 
+def _limit(cfg, key, default):
+    try:
+        return max(0, int(cfg.get(key, default)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _oldest_first(paths):
+    def age(path):
+        try:
+            return (path.stat().st_mtime_ns, path.name)
+        except OSError:
+            return (0, path.name)
+    return sorted(paths, key=age)
+
+
+def prune_diagnostics(cfg, folder, keep=None):
+    """Bound the diagnostics folder: private request bodies and attempt summaries.
+
+    Keeps the newest upstream_error_max_dumps dump sets (body/error/metadata share a
+    stamp) and upstream_attempt_summaries_max summaries; 0 disables that limit. The
+    entry just written (keep) is never removed. Never raises.
+    """
+    try:
+        folder = pathlib.Path(folder)
+        for suffix, limit, siblings in (
+                ("-body.json", _limit(cfg, "upstream_error_max_dumps", 50), ("-body.json", "-error.txt", "-metadata.json")),
+                ("-response.json", _limit(cfg, "upstream_attempt_summaries_max", 200), ("-response.json",))):
+            if not limit:
+                continue
+            files = _oldest_first(folder.glob("*" + suffix))
+            removable = [p for p in files if keep is None or not p.name.startswith(keep)]
+            for old in removable[:max(0, len(files) - limit)]:
+                stamp = old.name[:-len(suffix)]
+                for ending in siblings:
+                    try:
+                        (folder / (stamp + ending)).unlink()
+                    except OSError:
+                        pass
+    except Exception:  # noqa: BLE001 - housekeeping must never break a turn
+        pass
+
+
 class WireTrace:
     """Opt-in private bodies plus a timed timeline; never capture auth headers."""
     def __init__(self, cfg, trace_id, payload, *, root_key="upstream_trace_dir",
@@ -111,7 +154,11 @@ class AttemptTrace:
         tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
         self.id = "%s-%s-attempt%d-%s" % (time.strftime("%Y%m%d-%H%M%S"), tag, budget.used, uuid.uuid4().hex[:12])
         self.attempt = budget.used
+        self.step_attempt = getattr(budget, "step_used", 0) or budget.used
         self.started = time.monotonic()
+        self.summary = {}
+        self._text = None
+        self.written = False
         self.http_status = None
         self.headers = {}
         self.lines = self.bytes = self.malformed = self.scalars = 0
@@ -199,7 +246,8 @@ class AttemptTrace:
             return self.budget.last
         self.saved = True
         summary = {"diagnostic_id": self.id, "request_id": self.request_id,
-                   "attempt": self.attempt, "max_attempts": MAX_ATTEMPTS, "model": self.model,
+                   "attempt": self.attempt, "step_attempt": self.step_attempt,
+                   "max_attempts": MAX_ATTEMPTS, "model": self.model,
                    "outcome": outcome, "http_status": self.http_status,
                    "request_diagnostic_id": self.budget.empty_dump_id,
                    "upstream_request_id": self.headers.get("request-id") or self.headers.get("x-request-id"),
@@ -217,31 +265,54 @@ class AttemptTrace:
             self.wire.close()
             summary.update(wire_trace_id=self.id,
                            wire_trace_saved=not self.wire.failed and self.wire.folder is not None)
-        secrets = list(self.cfg.get("cookie_values") or [])
-        secrets += [str(self.cfg[k]) for k in ("cookie", "xsrf", "relay_api_key") if self.cfg.get(k)]
-        secrets += [segment.strip().split("=", 1)[1] for segment in self.cfg.get("cookie", "").split(";") if "=" in segment]
-        def scrub(value):
-            if isinstance(value, str):
-                for secret in secrets:
-                    if len(secret) >= 4:
-                        value = value.replace(secret, "[redacted]")
-                return redact(value, cookie_values=secrets)
-            if isinstance(value, dict):
-                return {scrub(k): scrub(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [scrub(v) for v in value]
-            return value
-        summary = scrub(summary)
-        wire = json.dumps(summary, ensure_ascii=False, allow_nan=False)
         try:
-            folder = pathlib.Path(self.cfg.get("upstream_error_dir") or "logs/upstream-400")
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / (self.id + "-response.json")).write_text(wire + "\n", encoding="utf-8")
-            summary["diagnostic_saved"] = True
-        except (OSError, UnicodeError):
-            summary["diagnostic_saved"] = False
+            secrets = list(self.cfg.get("cookie_values") or [])
+            secrets += [str(self.cfg[k]) for k in ("cookie", "xsrf", "relay_api_key") if self.cfg.get(k)]
+            secrets += [segment.strip().split("=", 1)[1] for segment in str(self.cfg.get("cookie") or "").split(";") if "=" in segment]
+
+            def scrub(value):
+                if isinstance(value, str):
+                    for secret in secrets:
+                        if len(secret) >= 4:
+                            value = value.replace(secret, "[redacted]")
+                    return redact(value, cookie_values=secrets)
+                if isinstance(value, dict):
+                    return {scrub(k): scrub(v) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [scrub(v) for v in value]
+                return value
+            summary = scrub(summary)
+            self._text = json.dumps(summary, ensure_ascii=False, allow_nan=False)
+        except Exception:  # noqa: BLE001 - diagnostics must never replace the original result
+            summary = {key: summary[key] for key in (
+                "diagnostic_id", "request_id", "attempt", "step_attempt", "max_attempts", "model", "outcome",
+                "http_status", "upstream_request_id") if key in summary}
+            self._text = None
+        self.summary = summary
+        summary["diagnostic_saved"] = False
+        if outcome != "content":
+            # A successful attempt is not an incident: no summary file per exec step.
+            self.save()
         if self.attempt >= self.budget.last.get("attempt", 0):
             self.budget.last = summary
-        journal.emit("upstream.attempt", "Попытка %d/5: %s" % (self.attempt, outcome),
+            self.budget.last_trace = self
+        journal.emit("upstream.attempt", "Попытка %d/%d: %s" % (self.step_attempt, MAX_ATTEMPTS, outcome),
                      "debug" if outcome == "content" else "warn", **summary)
         return summary
+
+    def save(self):
+        """Write the summary once; also used when an error later points at a content attempt."""
+        if self.written:
+            return
+        self.written = True
+        saved = False
+        if self._text is not None:
+            try:
+                folder = pathlib.Path(self.cfg.get("upstream_error_dir") or "logs/upstream-400")
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / (self.id + "-response.json")).write_text(self._text + "\n", encoding="utf-8")
+                saved = True
+                prune_diagnostics(self.cfg, folder, keep=self.id)
+            except (OSError, UnicodeError):
+                pass
+        self.summary["diagnostic_saved"] = saved

@@ -13,6 +13,7 @@
   "direct_cache": true,
   "client_trace_dir": "",
   "upstream_trace_dir": "",
+  "upstream_empty_retries": 1,
   "cache_keepwarm_seconds": 240,
   "cache_keepwarm_note": "провайдерский кэш живёт минуты; relay перечитывает префикс, чтобы он не истёк. 0 выключает",
   "cache_keepwarm_during_turns": true,

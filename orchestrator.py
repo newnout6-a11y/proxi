@@ -21,7 +21,7 @@ import models as model_catalog
 from context import build_system_instructions
 from redact import redact
 from session import SessionLease
-from upstream_attempts import AttemptBudget
+from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
 
 
 _CONV_HEADER = "\n\n[CLIENT CONVERSATION — chronological]\n"
@@ -330,7 +330,11 @@ class TurnRunner:
         exclude = []
         rechecked = False
         cancelled = holder.setdefault("cancel_event", threading.Event())
-        holder["_attempt_budget"] = AttemptBudget(cancelled)
+        max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
+        # Exec steps are bounded only by max_exec_turns; each step (plus the summary
+        # step) may spend up to MAX_ATTEMPTS POSTs, which is the hard cap per request.
+        holder["_attempt_budget"] = AttemptBudget(
+            cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None)
         while True:
             relay = _FailoverOut(out)
             holder.pop("session", None)
@@ -768,7 +772,10 @@ class TurnRunner:
                                   "For this requested task, issue the appropriate client tool call now.")
                         continue
                     if tool_names and (choice == "required" or isinstance(choice, dict)):
-                        raise apierr.upstream_error("upstream did not honor the required client tool choice")
+                        # Same error shape as an empty turn: diagnostic_id and attempt count.
+                        raise holder["_attempt_budget"].error(
+                            "upstream_tool_choice_ignored" if final_text.strip() else "upstream_empty_turn",
+                            "upstream did not honor the required client tool choice")
 
                     # Once the summary turn is requested, nothing is executed any more.
                     can_exec = self._can_exec(exec_steps) and not final_summary and not client_text
@@ -858,6 +865,8 @@ class TurnRunner:
                         raise asyncio.CancelledError()
                     output = redact(output, cookie_values=self.cfg.get("cookie_values", ()))
                     exec_steps += 1
+                    # A usable answer plus its executed command is progress, not a retry.
+                    holder["_attempt_budget"].new_step()
                     log("exec.result", "Команда завершилась с кодом %s" % code,
                         "success" if code == 0 else "warn" if code == 126 else "error",
                         command=redact(command)[:2000], exit=code, output=(output or "")[:1500],

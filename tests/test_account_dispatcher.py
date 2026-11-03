@@ -289,8 +289,9 @@ def _empty_stream(calls):
     return opener
 
 
-@pytest.mark.parametrize("purpose,expected", [("auto-mode-check", 1), ("client-tools", 5)])
+@pytest.mark.parametrize("purpose,expected", [("auto-mode-check", 1), ("client-tools", 2)])
 def test_service_empty_turn_is_not_resent_and_is_saved_once(tmp_path, monkeypatch, purpose, expected):
+    monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
     calls = []
     monkeypatch.setattr(direct.urllib.request, "urlopen", _empty_stream(calls))
     cfg = {"upstream_error_dir": str(tmp_path), "turn_timeout": 2}

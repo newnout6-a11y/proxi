@@ -1,16 +1,28 @@
-"""A request-wide budget shared by transport, prompt retries and account failover."""
+"""A step-wide budget shared by transport, prompt retries and account failover."""
 import threading
 import time
 
 import apierr
 
-MAX_ATTEMPTS = 5  # Initial POST plus at most four further POSTs, never five retries.
+MAX_ATTEMPTS = 5  # Initial POST plus at most four further POSTs per step, never five retries.
 
 
 class AttemptBudget:
-    def __init__(self, cancel_event=None):
+    """Counts POSTs of one client request.
+
+    The five-POST limit applies to one *step*: the initial POST and the retries after
+    failed attempts (empty answer, auth refresh, Assist fallback, failover, ...). A
+    relay exec step that produced usable output starts a new step via new_step();
+    exec steps are bounded only by max_exec_turns. total_cap is an optional hard cap
+    on all POSTs of the request, set only when max_exec_turns bounds the steps.
+    """
+
+    def __init__(self, cancel_event=None, total_cap=None):
         self.used = 0
+        self.step_used = 0
+        self.total_cap = total_cap
         self.last = {}
+        self.last_trace = None
         self.empty_dump_id = None
         self.empty_dump_attempted = False
         self.cancel_event = cancel_event
@@ -18,7 +30,19 @@ class AttemptBudget:
 
     @property
     def remaining(self):
-        return max(0, MAX_ATTEMPTS - self.used)
+        left = max(0, MAX_ATTEMPTS - self.step_used)
+        if self.total_cap:
+            left = min(left, max(0, self.total_cap - self.used))
+        return left
+
+    def new_step(self):
+        """A successful local exec follow-up is a new step with a fresh retry counter."""
+        with self._lock:
+            self.step_used = 0
+
+    def _limit_error(self):
+        limit = self.total_cap if self.total_cap and self.used >= self.total_cap else MAX_ATTEMPTS
+        return self.error("upstream_attempt_limit", "upstream attempt limit reached (%d attempts)" % limit)
 
     def wait(self, delay, cancelled):
         deadline = time.monotonic() + delay
@@ -33,19 +57,30 @@ class AttemptBudget:
 
     def take(self, cancelled):
         if not self.remaining:
-            raise self.error("upstream_attempt_limit", "upstream attempt limit reached (5 attempts)")
-        # A successful local exec follow-up is a new step, not a failed retry.
-        delay = min(0.5 * 2 ** max(0, self.used - 1), 4.0) if self.used and self.last.get("outcome") != "content" else 0
+            raise self._limit_error()
+        # The first POST of a step is not a retry and never waits.
+        delay = (min(0.5 * 2 ** max(0, self.step_used - 1), 4.0)
+                 if self.step_used and self.last.get("outcome") != "content" else 0)
         self.wait(delay, cancelled)
         if cancelled() or (self.cancel_event and self.cancel_event.is_set()):
             raise InterruptedError("upstream retry cancelled")
         with self._lock:
             if not self.remaining:
-                raise self.error("upstream_attempt_limit", "upstream attempt limit reached (5 attempts)")
+                raise self._limit_error()
             self.used += 1
+            self.step_used += 1
             return self.used
 
+    def persist_last(self):
+        """Write the last attempt's summary even when it was skipped as a content outcome."""
+        trace = self.last_trace
+        if trace is not None:
+            trace.save()
+
     def attach(self, error):
+        # An error that points at a diagnostic id must find its summary on disk,
+        # even when that attempt (a content outcome) was not saved on its own.
+        self.persist_last()
         if not getattr(error, "diagnostic_id", None):
             error.diagnostic_id = self.last.get("diagnostic_id")
         if not hasattr(error, "upstream_status"):

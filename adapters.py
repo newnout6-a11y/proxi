@@ -46,6 +46,7 @@ class _Base:
             self.cache_read = self.cache_write = self.reasoning_tokens = 0
             self.input_tokens = self.output_tokens = None
             self._usage_offsets = (len(self.text), len(self.thinking), len(self.tool_calls))
+            self._usage_boundary()
         elif kind == "thinking":
             self.thinking += event["delta"]
             if not self.parsed.show_thinking:
@@ -125,6 +126,9 @@ class _Base:
         pass
 
     def _signature(self, signature):
+        pass
+
+    def _usage_boundary(self):
         pass
 
     def _feed_tool_call(self, event):
@@ -498,6 +502,12 @@ class AnthropicAdapter(_Base):
         block["thinking"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                            "delta": {"type": "thinking_delta", "thinking": delta}})
+
+    def _usage_boundary(self):
+        # A new upstream attempt never continues the previous attempt's thinking
+        # block: a late signature must not be appended to it.
+        if self.open_kind == "thinking":
+            self._close_blocks()
 
     def _signature(self, signature):
         if signature and self.open_kind == "thinking":

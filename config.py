@@ -62,6 +62,9 @@ DEFAULTS = {
     "transport": "direct",
     "direct_cache": True,
     "upstream_trace_dir": "",  # explicit private raw request/response traces; disabled by default
+    "upstream_empty_retries": 1,           # extra identical POSTs after an empty/thinking-only answer (paid)
+    "upstream_error_max_dumps": 50,        # newest private request-body dump sets kept; 0 = unlimited
+    "upstream_attempt_summaries_max": 200,  # newest per-attempt *-response.json kept; 0 = unlimited
     "client_trace_dir": "",    # explicit private client request/response traces; disabled by default
     # Provider caches expire in minutes; re-read the prefix to hold it open.
     "cache_keepwarm_seconds": 240,
@@ -307,7 +310,8 @@ def _load(path):
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
-                    "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel"):
+                    "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
+                    "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -325,7 +329,8 @@ def _load(path):
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
-    for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit"):
+    for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
+                "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
         if cfg[key] < 0:
             raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
     for key in ("turn_timeout", "recv_timeout", "upstream_timeout", "command_timeout", "max_workers",
