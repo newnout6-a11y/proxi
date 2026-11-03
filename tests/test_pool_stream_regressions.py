@@ -230,7 +230,7 @@ def test_real_local_http_thinking_gap_and_read_timeout(upstream_blank_heartbeats
             self.send_response(200)
             self.send_header("Connection", "close")
             self.end_headers()
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 self.wfile.write(b'{"event":"content_block_start","type":"thinking"}\n')
                 self.wfile.flush()
                 for _ in range(10):
@@ -258,10 +258,13 @@ def test_real_local_http_thinking_gap_and_read_timeout(upstream_blank_heartbeats
             events = asyncio.run(run())
             assert events[-1] == {"type":"end", "reason":"stop"}
         else:
-            with pytest.raises(TimeoutError):
+            with pytest.raises(ApiError) as caught:
                 asyncio.run(run())
+            assert caught.value.status == 504
+            assert caught.value.code == "upstream_timeout"
+            assert caught.value.diagnostic_id
         print("EVIDENCE local HTTP thinking gap=0.5s, socket timeout=0.15s, upstream bytes=",
-              upstream_blank_heartbeats, "result=", "stop" if upstream_blank_heartbeats else "TimeoutError")
+              upstream_blank_heartbeats, "result=", "stop" if upstream_blank_heartbeats else "504 upstream_timeout")
     finally:
         httpd.shutdown()
         httpd.server_close()

@@ -326,8 +326,10 @@ def make_handler(runtime: Runtime):
             journal.emit("http.error", err.message, "error" if err.status >= 500 else "warn",
                          status=err.status, code=err.code, param=err.param, model=self._model,
                          effort=self._effort_str or None,
-                         stage="upstream" if hasattr(err, "upstream_status") else "relay",
+                         stage=getattr(err, "stage", "upstream" if hasattr(err, "upstream_status") else "relay"),
                          upstream_status=getattr(err, "upstream_status", None),
+                         upstream_attempts=getattr(err, "upstream_attempts", None),
+                         upstream_request_id=getattr(err, "upstream_request_id", None),
                          diagnostic_id=getattr(err, "diagnostic_id", None))
 
         def _error_payload(self, dialect, err):
@@ -335,6 +337,8 @@ def make_handler(runtime: Runtime):
             body["request_id"] = self.request_id
             if getattr(err, "diagnostic_id", None):
                 body["diagnostic_id"] = err.diagnostic_id
+            if hasattr(err, "upstream_attempts"):
+                body["upstream_attempts"] = err.upstream_attempts
             return body
 
         def _respond_error(self, err, dialect):

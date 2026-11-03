@@ -21,6 +21,7 @@ import models as model_catalog
 from context import build_system_instructions
 from redact import redact
 from session import SessionLease
+from upstream_attempts import AttemptBudget
 
 
 _CONV_HEADER = "\n\n[CLIENT CONVERSATION — chronological]\n"
@@ -342,6 +343,7 @@ class TurnRunner:
         exclude = []
         rechecked = False
         cancelled = holder.setdefault("cancel_event", threading.Event())
+        holder["_attempt_budget"] = AttemptBudget(cancelled)
         while True:
             relay = _FailoverOut(out)
             holder.pop("session", None)
@@ -357,7 +359,7 @@ class TurnRunner:
             backend = getattr(getattr(lease, "session", lease), "backend", None)
             accounts = getattr(self, "accounts", None)
             retryable = (error is not None and not relay.started and not cancelled.is_set()
-                         and accounts is not None)
+                         and accounts is not None and holder["_attempt_budget"].remaining > 0)
             exhausted = False
             try:
                 if (retryable and backend is None and error.code == "insufficient_credits"
@@ -517,6 +519,7 @@ class TurnRunner:
                 # Debit the account that actually served the turn.
                 account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
                 acquired._credits_manager = account_credits
+                acquired._attempt_budget = holder["_attempt_budget"]
                 # Console lines (heartbeat, [cache]) carry the relay request id so
                 # concurrent requests of one conversation can be told apart.
                 acquired._request_tag = getattr(parsed, "request_id", None)
@@ -814,23 +817,25 @@ class TurnRunner:
                         # which the direct transport never writes.
                         explained = await self._explain_empty(holder)
                         if explained is not None:
-                            out.put({"type": "error", "error": explained})
-                            return
+                            raise explained
 
-                    if not command and not final_text.strip() and empty_retries < 1 and not client_text:
+                    if (not command and not final_text.strip() and empty_retries < 1 and not client_text
+                            and holder["_attempt_budget"].remaining):
                         # Silent turn: insist once, keeping the full system prompt.
                         empty_retries += 1
                         log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
                         if not direct_mode:
                             native_context = None  # Retry prompts are not part of the client history in agent mode.
-                        prompt = (base_prompt + "\n\n[RETRY] Предыдущий ход вернул пустой ответ. "
-                                  "Ответь сейчас: нужна команда — выведи <exec_command>...</exec_command>, "
-                                  "иначе дай короткий текстовый ответ.")
+                        retry_instruction = ("Use the supplied native client tools for tool calls; "
+                                             "otherwise return a short text answer." if native_tools else
+                                             "If a local command is needed, output <exec_command>...</exec_command>; "
+                                             "otherwise return a short text answer.")
+                        prompt = (base_prompt + "\n\n[RETRY] The previous attempt returned an empty answer. "
+                                  + retry_instruction)
                         continue
 
                     if not command and not final_text.strip():
-                        out.put({"type": "error", "error": apierr.upstream_error("upstream returned an empty turn")})
-                        return
+                        raise holder["_attempt_budget"].error()
 
                     if not can_exec or not command:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)

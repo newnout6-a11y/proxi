@@ -7,6 +7,7 @@ context is billed once and reused, keeping time-to-first-token flat.
 import asyncio
 import contextvars
 import hashlib
+import http.client
 import json
 import pathlib
 import socket
@@ -21,6 +22,8 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
+from upstream_attempts import AttemptBudget
+from upstream_diagnostics import AttemptTrace
 
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
@@ -867,23 +870,21 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
         pass
 
 
-_EMPTY_DUMPED = set()
-
-
 def _dump_empty_once(payload, flags, cfg, session, model=None):
-    """Keep one sample per request kind and model per relay run: each dump
-    holds conversation text, so distinct bodies must not pile up on disk."""
-    kind = (client_context.current().get("request_purpose") or "generation", model)
-    if kind in _EMPTY_DUMPED:
-        return
-    _EMPTY_DUMPED.add(kind)
+    """Keep one private request body per client request, with per-attempt summaries."""
+    budget = flags["budget"]
+    if budget.empty_dump_attempted:
+        return budget.empty_dump_id
+    budget.empty_dump_attempted = True
     detail = json.dumps({"reason": "empty turn: end_of_stream without content blocks",
-                         "usage": flags.get("last_usage")}, ensure_ascii=False)
+                         "usage": budget.last.get("usage")}, ensure_ascii=False)
     stamp = _dump_rejected_body(payload, detail, cfg=cfg, status="empty",
                                 request_id=client_context.current().get("request_id")
                                 or getattr(session, "_request_tag", None))
     journal.emit("upstream.empty_turn", "Пустой ответ upstream сохранён для диагностики", "warn",
                  diagnostic_id=stamp)
+    budget.empty_dump_id = stamp
+    return stamp
 
 
 async def _stream_body(cfg, session, body, param_types=None):
@@ -898,11 +899,16 @@ async def _stream_body(cfg, session, body, param_types=None):
     headers["accept"] = "application/json"
     timeout = cfg.get("turn_timeout", 900)
     loop = asyncio.get_running_loop()
+    budget = getattr(session, "_attempt_budget", None) or AttemptBudget()
+    request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None)
+
+    def is_cancelled():
+        return session._cancelled or bool(budget.cancel_event and budget.cancel_event.is_set())
     # Bounded so a stalled consumer (slow or gone client) cannot balloon memory:
     # the upstream worker blocks on hand-off, which backpressures the TCP read.
     # One queue per attempt: a retried attempt must never read the previous
     # worker's terminal sentinel (it made every retry end empty at once).
-    holder = {"response": None, "queue": None}
+    holder = {"response": None, "queue": None, "trace": None}
 
     def hand_off_final(item, queue=None):
         """Land a terminal item (sentinel/error/cancel) without blocking. Safe from
@@ -937,14 +943,19 @@ async def _stream_body(cfg, session, body, param_types=None):
         try:
             attempt = 0
             while True:
-                if session._cancelled:
+                if is_cancelled():
                     return
+                budget.take(is_cancelled)
+                trace = AttemptTrace(cfg, budget, request_id, body.get("model"), payload)
+                holder["trace"] = trace
                 request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                                  data=payload, headers=headers, method="POST")
                 try:
                     response = urllib.request.urlopen(request, timeout=timeout)
                     break
                 except urllib.error.HTTPError as exc:
+                    trace.response(exc, exc.code)
+                    holder["response"] = exc
                     detail = exc.read(16384).decode("utf-8", "replace")
                     diagnostic = None
                     if exc.code in (400, 422):
@@ -962,32 +973,42 @@ async def _stream_body(cfg, session, body, param_types=None):
                         # refresher adopts already-rotated credentials despite the
                         # MIN_INTERVAL gate.
                         if session.backend.refresher.refresh(rejected_cookie=headers.get("cookie")):
+                            trace.finish("auth_retry")
+                            exc.close()
                             headers.update(session.backend.headers())
                             continue
-                        raise apierr.upstream_auth_failed(detail[:400])
+                        error = apierr.upstream_auth_failed(detail[:400])
+                        error.upstream_status = exc.code
+                        raise error
                     holder["response"] = exc
                     error = apierr.ApiError(*_http_error(exc.code, detail))
                     error.upstream_status = exc.code
                     error.diagnostic_id = diagnostic
                     raise error
             holder["response"] = response
-            if session._cancelled:
+            trace.response(response)
+            if is_cancelled():
                 _force_close_response(response)
                 return
             for raw in response:
-                if session._cancelled:
+                if is_cancelled():
                     break
                 line = raw.strip()
                 if not line:
                     continue
+                trace.observe(line)
                 # Bounded hand-off: block this worker when the consumer is slower
                 # than upstream instead of buffering the whole stream in memory.
-                if not _bounded_put(loop, queue, line, lambda: session._cancelled):
+                if not _bounded_put(loop, queue, line, is_cancelled):
                     # Dropped or cancelled: stop reading. The missing end_of_stream
                     # surfaces as a truncated-stream error, never a silent hole.
                     break
         except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
-            if not session._cancelled:
+            if not is_cancelled():
+                if isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException)):
+                    timed_out = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
+                    exc = (apierr.upstream_timeout("Retool response timed out") if timed_out else
+                           apierr.upstream_error("Retool connection failed: %s" % type(exc).__name__))
                 hand_off_final(exc, queue)
         finally:
             _force_close_response(holder.get("response"))
@@ -1005,7 +1026,8 @@ async def _stream_body(cfg, session, body, param_types=None):
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
             task = loop.run_in_executor(None, contextvars.copy_context().run, worker, queue)
-            flags = {}
+            flags = {"budget": budget}
+            failure = None
             try:
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
                                           cache_scope=(body.get("model"), body.get("openAICacheKey"))):
@@ -1014,6 +1036,9 @@ async def _stream_body(cfg, session, body, param_types=None):
                         # an empty attempt and must get its retry.
                         produced = True
                     yield event
+            except BaseException as exc:
+                failure = exc
+                raise
             finally:
                 if flags.get("usage_seen") and not flags.get("credits_reported"):
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
@@ -1025,28 +1050,36 @@ async def _stream_body(cfg, session, body, param_types=None):
                     await asyncio.wait_for(asyncio.shield(task), timeout=5)
                 except Exception:
                     pass
+                trace = holder.get("trace")
+                if trace is not None:
+                    outcome = ("cancelled" if is_cancelled() or isinstance(failure, asyncio.CancelledError) else
+                               "error" if failure else "truncated" if not flags.get("end") else
+                               "content" if produced else "empty")
+                    trace.finish(outcome)
+                if isinstance(failure, apierr.ApiError):
+                    budget.attach(failure)
             saw_end = bool(flags.get("end"))
-            if session._cancelled:
+            if is_cancelled():
                 yield {"type": "end", "reason": "cancelled"}
                 return
             if not produced and saw_end:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
-            if produced or attempts_left <= 0:
+            if produced or attempts_left <= 0 or not budget.remaining:
                 break
             # Copilot occasionally returns metadata+end_of_stream with no blocks at all.
             attempts_left -= 1
             holder["response"] = None
         if text:
             yield {"type": "final_text", "text": "".join(text)}
-        if not saw_end and not session._cancelled:
+        if not saw_end and not is_cancelled():
             journal.emit("upstream.stream_truncated",
                          "Поток upstream оборвался без end_of_stream — ход завершён ошибкой", "warn",
                          model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)))
             # An aborted stream must not masquerade as a clean stop: surface the
             # failure instead of a successful end. No auto-retry — tool calls may
             # already have been streamed to the client.
-            yield {"type": "error", "error": apierr.upstream_error(
-                "upstream stream ended without end_of_stream; the response may be incomplete")}
+            yield {"type": "error", "error": budget.attach(apierr.upstream_error(
+                "upstream stream ended without end_of_stream; the response may be incomplete"))}
             return
         yield {"type": "end", "reason": "stop"}
     finally:

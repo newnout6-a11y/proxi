@@ -69,14 +69,20 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 
 ### Формат ответа: NDJSON (Newline Delimited JSON stream):
 Каждая строка — отдельный JSON-объект:
-- `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
-- `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"..."}}`
-- `{"type":"content_block_start","index":1,"content_block":{"type":"tool_call","id":"...","name":"exec_command"}}`
-- `{"type":"content_block_delta","index":1,"delta":{"type":"partialInputs","partialInputs":"{\"cmd\":...}"}}`
-- `{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":"..."}}` (для моделей 5.x)
-- `{"type":"usage","usage":{"input_tokens":...,"cache_read_input_tokens":52509,"cache_creation_input_tokens":0,"output_tokens":...}}`
-- `{"type":"turn_credits_persisted","credits":0.015}`
-- `{"type":"end_of_stream"}`
+- `{"event":"content_block_start","type":"text"}`
+- `{"event":"content_block_delta","type":"text","partialText":"..."}`
+- `{"event":"content_block_start","type":"tool_call","toolCallId":"...","toolName":"shell"}`
+- `{"event":"content_block_delta","type":"tool_call","partialInputs":"{\"command\":...}"}`
+- `{"event":"content_block_start","type":"thinking"}`
+- `{"event":"content_block_delta","type":"signature","partialSignature":"..."}`
+- `{"event":"metadata","usage":{"inputTokens":4,"promptTokensReadFromCache":52509,"outputTokens":100,"creditsUsed":0.015}}`
+- `{"event":"end_of_stream"}` (также распознаётся `type: end_of_stream`)
+
+Это формат текущего direct-парсера. Ранее приведённая здесь форма
+`type: content_block_delta` с вложенным `delta` не поддерживается этим парсером;
+сводки `*-response.json` фиксируют её в `unsupported_event_shapes`, если она
+встретится. Наличие такой формы в диагностике требует отдельного исправления
+декодера, а не вывода, что модель ничего не сгенерировала.
 
 ---
 

@@ -293,7 +293,6 @@ def _empty_stream(calls):
 def test_service_empty_turn_is_not_resent_and_is_saved_once(tmp_path, monkeypatch, purpose, expected):
     calls = []
     monkeypatch.setattr(direct.urllib.request, "urlopen", _empty_stream(calls))
-    monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
     cfg = {"upstream_error_dir": str(tmp_path), "turn_timeout": 2}
     body = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": purpose}]}
     session = SimpleNamespace(backend=SimpleNamespace(headers=lambda: {}, cfg={"base": "https://example.invalid"}),

@@ -233,7 +233,6 @@ def test_real_direct_and_orchestrator_retries_keep_one_context_and_bill_every_at
         return io.BytesIO(b"\n".join(json.dumps(event).encode() for event in events) + b"\n")
 
     monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
-    monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
     parsed_request = request(FIRST, system="CLIENT_SYSTEM " * 100)
     events = asyncio.run(run(runner, parsed_request))
     assert events[-1] == {"type": "end", "reason": "stop"}
