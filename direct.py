@@ -654,6 +654,7 @@ async def _keepwarm(session, cfg):
     next_turn_ping = 0.0
     retry_at = 0.0
     while True:
+        context_token = client_context.bind({})
         try:
             await asyncio.sleep(0.05)
             now = time.time()
@@ -667,17 +668,24 @@ async def _keepwarm(session, cfg):
             if not busy and now - last_req > idle:
                 return
             body = getattr(session, "_warm_body", None)
+            identity = getattr(session, "_warm_identity", None) or {}
             if busy:
                 if not during_turns or not started:
                     await asyncio.sleep(0.95)
                     continue
-                body = getattr(session, "_turn_body", None) or body
+                turn_body = getattr(session, "_turn_body", None)
+                if turn_body:
+                    body = turn_body
+                    identity = getattr(session, "_turn_identity", None) or {}
                 due = max(next_turn_ping, retry_at)
             else:
                 due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
             if not body or now < due:
                 await asyncio.sleep(min(0.95, max(0.05, due - now)))
                 continue
+            # The scheduler spans turns: bind the owner of this exact body,
+            # snapshotting before to_thread so a following turn cannot relabel it.
+            client_context.bind(identity)
             ping_started = now
             actual = await asyncio.to_thread(_ping, session, body)
             if busy and getattr(session, "_turn_seq", 0) == seq:
@@ -718,6 +726,8 @@ async def _keepwarm(session, cfg):
             retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
             next_turn_ping = retry_at
             journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn")
+        finally:
+            client_context.reset(context_token)
 
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
@@ -727,7 +737,9 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
         body = {key: value for key, value in body.items() if key != "metadata"}
+    identity = client_context.current()
     session._busy = True
+    session._turn_identity = identity
     session._turn_started_at = time.time()
     session._turn_pinged = False
     session._turn_seq = getattr(session, "_turn_seq", 0) + 1
@@ -768,6 +780,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     finally:
         session._busy = False
         session._turn_body = None
+        session._turn_identity = None
         if body.get("openAICacheKey") and not rejected:
             prior_key = getattr(session, "_last_cache_key", None)
             if prior_key and prior_key != body["openAICacheKey"]:
@@ -779,6 +792,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                              thread=journal.tag(getattr(session, "thread_id", None)))
             session._last_cache_key = body["openAICacheKey"]
             session._warm_body = body
+            session._warm_identity = identity
             # The TTL counts from the last cache touch: this request's start or a
             # later during-turn ping, NOT the turn's end; otherwise a pause after
             # a long turn outlives the 5-minute entry before the next idle ping.
@@ -792,7 +806,7 @@ def _ensure_keepwarm(session, cfg):
     if task is None or task.done():
         # A fresh cycle gets a fresh failure budget.
         session._warm_failures = 0
-        session._warm_task = asyncio.create_task(_keepwarm(session, cfg))
+        session._warm_task = asyncio.create_task(_keepwarm(session, cfg), context=contextvars.Context())
 
 
 def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=None):

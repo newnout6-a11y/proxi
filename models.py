@@ -275,7 +275,6 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
             entry = _BY_ID.get(name)
     if entry is None:
         if strict:
-            print("[unknown-model]", repr(model), '->', repr(name), flush=True)
             raise not_found(f"unknown model '{name}'; see GET /v1/models")
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name,
                  'context': 200000, 'max_output': 128000}

@@ -37,6 +37,21 @@ def test_claude_real_custom_title_and_legacy_identity(tmp_path):
         assert info["title_source"] == "claude-custom-title"
 
 
+@pytest.mark.parametrize("message", ["unexpected-shape", ["unexpected-shape"], 123])
+def test_malformed_local_message_metadata_does_not_reject_model_turn(relay, tmp_path, monkeypatch, message):
+    transcript = tmp_path / ".claude/projects/project" / (SESSION + ".jsonl")
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({"type": "user", "message": message}) + "\n" +
+                          json.dumps({"type": "custom-title", "customTitle": "Рабочий чат"}), encoding="utf-8")
+    monkeypatch.setattr(client_context.Path, "home", classmethod(lambda cls: tmp_path))
+    payload = {"model": "claude-opus-5-5", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}],
+               "metadata": {"user_id": json.dumps({"session_id": SESSION})}}
+    status, _ = relay.json_any("/v1/messages", payload)
+    assert status == 200
+    assert len(relay.fake.seen) == 1
+    assert client_context.describe(payload, {})["chat_title"] == "Рабочий чат"
+
+
 def test_desktop_code_session_name_matches_cli_session(tmp_path):
     path = tmp_path / "AppData/Roaming/Claude/claude-code-sessions/account/org/local_1.json"
     path.parent.mkdir(parents=True)
@@ -143,6 +158,26 @@ def test_invalid_effort_has_chat_title_and_correlated_error(relay):
     assert error["request_id"] == body["request_id"]
     health = next(event for event in events if event["kind"] == "http.request" and event["data"]["path"] == "/health")
     assert "chat_title" not in health["data"]
+
+
+@pytest.mark.parametrize("field", ["model", "effort"])
+def test_invalid_model_and_effort_are_redacted_in_console(relay, capsys, field):
+    payload = {"model": "claude-opus-5-5", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}
+    if field == "model":
+        payload["model"] = relay.key
+    else:
+        payload["output_config"] = {"effort": relay.key}
+    before = journal.JOURNAL.last_seq
+    status, body = relay.json_any("/v1/messages", payload)
+    assert status in (400, 404)
+    deadline = time.monotonic() + 2
+    while not any(row["kind"] == "http.request" and row.get("request_id") == body["request_id"]
+                  for row in journal.JOURNAL.query(since=before)):
+        assert time.monotonic() < deadline, "HTTP completion was not journaled"
+        time.sleep(0.01)
+    output = capsys.readouterr().out
+    assert "relay " in output and "[redacted]" in output
+    assert relay.key not in output
 
 
 def test_startup_config_uses_existing_credentials_and_separate_state(tmp_path, monkeypatch):

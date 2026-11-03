@@ -80,7 +80,8 @@ def _claude_title(home, session_id):
             elif not title and row.get("type") == "summary" and row.get("summary"):
                 title, source = row["summary"], "claude-summary"
             if not first and row.get("type") == "user" and not row.get("isMeta"):
-                content = (row.get("message") or {}).get("content")
+                message = row.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
                 if isinstance(content, str) and not content.startswith("<"):
                     first = content
     if not title:

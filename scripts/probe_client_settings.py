@@ -16,7 +16,6 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import client_context
 
@@ -102,59 +101,105 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("mode", choices=["claude", "opencode", "opencode2"])
-parser.add_argument("--executable", help="Override the installed client executable path")
-options = parser.parse_args()
-server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-server.handle_error = lambda *args: None
-threading.Thread(target=server.serve_forever, daemon=True).start()
-url = "http://127.0.0.1:%s" % server.server_port
-mode = options.mode
-env = dict(os.environ)
-env["PYTHONUTF8"] = "1"
-home = Path.home()
-if mode == "claude":
-    env["PROXI_PROBE_CHILD"] = "1"
-    os.environ["PROXI_PROBE_CHILD"] = "1"
-    settings = {"env": {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_API_KEY": "offline-test-key", "ANTHROPIC_AUTH_TOKEN": ""}}
-    args = [options.executable or str(home / "AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
-            "--print", "--output-format", "json", "--no-session-persistence", "--setting-sources", "user",
-            "--settings", json.dumps(settings), "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-            "--tools", "Agent", "--allowedTools", "Agent", "--agents", json.dumps({"proxi-smoke": {
-                "description": "Offline child test", "prompt": "Return SUBAGENT_OK, no tools.", "model": "inherit", "effort": "xhigh", "tools": []}}),
-            "Run the proxi-smoke agent once, then return PROXI_SMOKE_OK. Do not use any other tools."]
-else:
-    config = {"provider": {"retool-relay": {"options": {"baseURL": url + "/v1", "apiKey": "offline-test-key"}}}}
-    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
-    exe = str(home / "AppData/Roaming/npm/node_modules/opencode-ai/node_modules/opencode-windows-x64/bin/opencode.exe")
-    if not Path(exe).exists():
-        exe = str(home / "AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode")
+def catalog_policy(config, catalog_output, mode):
+    """Check both schemas and the listed catalog; migrated disabled flags lie."""
     if mode == "opencode2":
-        exe = str(home / "AppData/Roaming/ai.opencode.desktop/cli/2.2.5-x64/opencode-cli.exe")
-    exe = options.executable or exe
-    args = [exe, "run", "--format", "json", "--title", "Proxi offline defaults probe", "Return PROXI_SMOKE_OK without tools."]
-    if mode == "opencode2":
-        args.insert(2, "--standalone")
-passed = False
-try:
-    with tempfile.TemporaryDirectory(prefix="proxi-client-probe-") as work:
-        result = subprocess.run(args, env=env, cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=85)
-    try:
-        stats = json.loads(result.stdout).get("subagent_stats")
-    except ValueError:
-        stats = None
-    turns = [row for row in records if not row["path"].split("?")[0].endswith("count_tokens")]
-    passed = result.returncode == 0 and "PROXI_SMOKE_OK" in result.stdout and len(turns) >= 3 and all(row["effort"] == "high" for row in turns)
+        configured = {}
+        for document in config:
+            configured.update((document.get("info") or {}).get("providers", {}).get("retool-relay", {}).get("models", {}))
+    else:
+        configured = config.get("provider", {}).get("retool-relay", {}).get("models", {})
+    forbidden = {"gpt-6-astra", "gpt-6-luna", "claude-haiku-4-5-20251001"}
+    variants = []
+    for name, model in configured.items():
+        choices = model.get("variants", {})
+        if (isinstance(choices, dict) and "xhigh" in choices or
+                isinstance(choices, list) and any(choice.get("id") == "xhigh" for choice in choices)):
+            variants.append(name)
+    listed = {line.strip().removeprefix("retool-relay/") for line in catalog_output.splitlines()
+              if line.strip().startswith("retool-relay/")}
+    policy = {"configured_models": len(configured), "catalog_models": len(listed),
+              "forbidden_models": sorted(forbidden.intersection(configured)),
+              "forbidden_variants": sorted(variants),
+              "catalog_forbidden_models": sorted(forbidden.intersection(listed))}
+    policy["passed"] = bool(configured and listed) and not any(policy[key] for key in (
+        "forbidden_models", "forbidden_variants", "catalog_forbidden_models"))
+    return policy
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=["claude", "opencode", "opencode2"])
+    parser.add_argument("--executable", help="Override the installed client executable path")
+    options = parser.parse_args()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.handle_error = lambda *args: None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%s" % server.server_port
+    mode = options.mode
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    home = Path.home()
     if mode == "claude":
-        passed = passed and bool(stats and stats.get("spawned") == 1 and stats.get("completed") == 1)
-    print(json.dumps({"mode": mode, "passed": passed, "exit_code": result.returncode, "requests": records,
-                      "subagent_stats": stats,
-                      "success_marker": "PROXI_SMOKE_OK" in result.stdout,
-                      "stderr_tail": result.stderr[-1000:] if result.returncode else "",
-                      "stdout_tail": result.stdout[-1000:] if result.returncode else ""}, ensure_ascii=False, indent=2))
-except subprocess.TimeoutExpired:
-    print(json.dumps({"mode": mode, "timeout": True, "requests": records}, ensure_ascii=False, indent=2))
-finally:
-    server.shutdown()
-sys.exit(0 if passed else 1)
+        env["PROXI_PROBE_CHILD"] = "1"
+        os.environ["PROXI_PROBE_CHILD"] = "1"
+        settings = {"env": {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_API_KEY": "offline-test-key", "ANTHROPIC_AUTH_TOKEN": ""}}
+        args = [options.executable or str(home / "AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+                "--print", "--output-format", "json", "--no-session-persistence", "--setting-sources", "user",
+                "--settings", json.dumps(settings), "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                "--tools", "Agent", "--allowedTools", "Agent", "--agents", json.dumps({"proxi-smoke": {
+                    "description": "Offline child test", "prompt": "Return SUBAGENT_OK, no tools.", "model": "inherit", "effort": "xhigh", "tools": []}}),
+                "Run the proxi-smoke agent once, then return PROXI_SMOKE_OK. Do not use any other tools."]
+    else:
+        config = {"provider": {"retool-relay": {"options": {"baseURL": url + "/v1", "apiKey": "offline-test-key"}}}}
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
+        exe = str(home / "AppData/Roaming/npm/node_modules/opencode-ai/node_modules/opencode-windows-x64/bin/opencode.exe")
+        if not Path(exe).exists():
+            exe = str(home / "AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode")
+        if mode == "opencode2":
+            exe = str(home / "AppData/Roaming/ai.opencode.desktop/cli/2.2.5-x64/opencode-cli.exe")
+        exe = options.executable or exe
+        args = [exe, "run", "--format", "json", "--title", "Proxi offline defaults probe", "Return PROXI_SMOKE_OK without tools."]
+        if mode == "opencode2":
+            args.insert(2, "--standalone")
+    passed = False
+    policy = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="proxi-client-probe-") as work:
+            if mode != "claude":
+                suffix = ["--standalone"] if mode == "opencode2" else []
+                resolved = subprocess.run([exe, "debug", "config", *suffix], env=env, cwd=work,
+                                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                resolved.check_returncode()
+                config = json.loads(resolved.stdout)
+                catalog = subprocess.run([exe, "models", *suffix], env=env, cwd=work, capture_output=True,
+                                         text=True, encoding="utf-8", errors="replace", timeout=30)
+                catalog.check_returncode()
+                policy = catalog_policy(config, catalog.stdout, mode)
+            result = subprocess.run(args, env=env, cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=85)
+        try:
+            stats = json.loads(result.stdout).get("subagent_stats")
+        except ValueError:
+            stats = None
+        turns = [row for row in records if not row["path"].split("?")[0].endswith("count_tokens")]
+        passed = result.returncode == 0 and "PROXI_SMOKE_OK" in result.stdout and len(turns) >= 3 and all(row["effort"] == "high" for row in turns)
+        if mode == "claude":
+            passed = passed and bool(stats and stats.get("spawned") == 1 and stats.get("completed") == 1)
+        else:
+            passed = passed and policy["passed"]
+        print(json.dumps({"mode": mode, "passed": passed, "exit_code": result.returncode, "requests": records,
+                          "catalog_policy": policy,
+                          "subagent_stats": stats,
+                          "success_marker": "PROXI_SMOKE_OK" in result.stdout,
+                          "stderr_tail": result.stderr[-1000:] if result.returncode else "",
+                          "stdout_tail": result.stdout[-1000:] if result.returncode else ""}, ensure_ascii=False, indent=2))
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"mode": mode, "timeout": True, "requests": records}, ensure_ascii=False, indent=2))
+    finally:
+        server.shutdown()
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

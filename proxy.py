@@ -184,9 +184,9 @@ def make_handler(runtime: Runtime):
             model = getattr(self, "_model", "-")
             effort = getattr(self, "_effort_str", "")
             effort_tag = f" [{effort}]" if effort and model != "-" else ""
-            print("relay %s %s %s %s %s%s %.0fms %s" % (
+            print(journal.scrub("relay %s %s %s %s %s%s %.0fms %s" % (
                 self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
-                journal.scrub(" ".join(part for part in (client_context.label(), note) if part))), flush=True)
+                " ".join(part for part in (client_context.label(), note) if part))), flush=True)
             route = getattr(self, "_log_route", None)
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
