@@ -31,6 +31,7 @@ from accounts import AccountDispatcher
 from credits import CreditsManager
 from orchestrator import TurnRunner
 from session import Backend, SessionPool
+from upstream_diagnostics import WireTrace
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -153,11 +154,18 @@ def make_handler(runtime: Runtime):
                     self.send_header(key, str(value))
             self._cors()
             self.end_headers()
+            trace = getattr(self, "_client_trace", None)
+            if trace:
+                trace.event("client_response_headers", http_status=status, content_type="application/json")
             if self.command != "HEAD":
                 try:
                     self.wfile.write(body)
                     self.wfile.flush()
+                    if trace:
+                        trace.raw(body)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    if trace:
+                        trace.event("client_write_failed")
                     self.close_connection = True
 
         # -- entry --------------------------------------------------------
@@ -232,6 +240,7 @@ def make_handler(runtime: Runtime):
             self._model_called = False
             self._error_code = None
             self._response_started = False
+            self._client_trace = None
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -320,6 +329,16 @@ def make_handler(runtime: Runtime):
                 try:
                     self._log()
                 finally:
+                    trace = self._client_trace
+                    if trace:
+                        http_status = self._status or (200 if self._streaming and self._response_started
+                                                       else self._stream_status)
+                        trace.event("client_end", http_status=http_status,
+                                    stream_status=self._stream_status, error=self._error_code)
+                        trace.close()
+                        if trace.failed:
+                            journal.emit("client.trace_failed", "Не удалось сохранить подробную трассу клиента",
+                                         "warn", request_id=self.request_id)
                     client_context.reset(context_token)
 
         def _log_error(self, err):
@@ -471,7 +490,14 @@ def make_handler(runtime: Runtime):
                 raise
 
         def _completion(self, dialect):
-            data = validate.load_json(self._read_body())
+            raw = self._read_body()
+            if cfg.get("client_trace_dir"):
+                trace_id = time.strftime("%Y%m%d-%H%M%S") + "-" + self.request_id + "-client"
+                self._client_trace = WireTrace(cfg, trace_id, raw, root_key="client_trace_dir",
+                                               response_file="response-body.bin")
+                self._client_trace.request(self.headers)
+                self._client_trace.event("client_request", method=self.command, path=self.path, dialect=dialect)
+            data = validate.load_json(raw)
             self._bind_client(data)
             if dialect == "anthropic":
                 parsed = validate.parse_anthropic(data, cfg)
@@ -492,6 +518,8 @@ def make_handler(runtime: Runtime):
                 parsed.entry.get("reasoning_effort_control") == "provider-managed" else "none")
 
             parsed.request_purpose = client_context.request_kind(parsed)
+            if self._client_trace:
+                self._client_trace.event("validated_request", parsed=vars(parsed), effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
             console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}")
 
@@ -542,6 +570,7 @@ def make_handler(runtime: Runtime):
                     continue
                 if event is None:
                     break
+                self._trace_relay_event(event)
                 kind = event.get("type")
                 self._track_credits(event)
                 if kind == "error":
@@ -560,6 +589,15 @@ def make_handler(runtime: Runtime):
                 cost = console_log.number(event.get("value"))
                 if cost is not None:
                     self._credits_used = (self._credits_used or 0.0) + cost
+
+        def _trace_relay_event(self, event):
+            trace = self._client_trace
+            if trace:
+                item = dict(event)
+                error = item.get("error")
+                if isinstance(error, Exception):
+                    item["error"] = {"exception_type": type(error).__name__, "message": str(error), **vars(error)}
+                trace.event("relay_event", event=item)
 
         def _cancel_turn(self, fut, holder):
             event = holder.get("cancel_event")
@@ -591,6 +629,7 @@ def make_handler(runtime: Runtime):
                     continue
                 if event is None:
                     break
+                self._trace_relay_event(event)
                 if event.get("type") == "error":
                     raise event["error"]
                 self._track_credits(event)

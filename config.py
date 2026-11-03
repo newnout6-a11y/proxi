@@ -61,6 +61,8 @@ DEFAULTS = {
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
     "transport": "direct",
     "direct_cache": True,
+    "upstream_trace_dir": "",  # explicit private raw request/response traces; disabled by default
+    "client_trace_dir": "",    # explicit private client request/response traces; disabled by default
     # Provider caches expire in minutes; re-read the prefix to hold it open.
     "cache_keepwarm_seconds": 240,
     "cache_keepwarm_idle": 1800,

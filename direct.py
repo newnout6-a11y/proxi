@@ -887,8 +887,11 @@ def _dump_empty_once(payload, flags, cfg, session, model=None):
     return stamp
 
 
-async def _stream_body(cfg, session, body, param_types=None):
-    payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
+async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
+    if payload is None:
+        payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
+    elif json.loads(payload) != body:
+        raise ValueError("replay payload does not match the supplied body")
     if cfg.get("direct_debug"):
         body_summary = {k: v for k, v in body.items() if k not in ("messages", "tools")}
         if "tools" in body:
@@ -950,13 +953,19 @@ async def _stream_body(cfg, session, body, param_types=None):
                 holder["trace"] = trace
                 request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                                  data=payload, headers=headers, method="POST")
+                trace.wire.request(headers)
                 try:
                     response = urllib.request.urlopen(request, timeout=timeout)
                     break
                 except urllib.error.HTTPError as exc:
                     trace.response(exc, exc.code)
                     holder["response"] = exc
-                    detail = exc.read(16384).decode("utf-8", "replace")
+                    detail_bytes = exc.read(16384)
+                    trace.wire.raw(detail_bytes)
+                    trace.wire.event("http_error_body_read", limit_bytes=16384,
+                                     bytes_read=len(detail_bytes),
+                                     may_be_incomplete=len(detail_bytes) == 16384)
+                    detail = detail_bytes.decode("utf-8", "replace")
                     diagnostic = None
                     if exc.code in (400, 422):
                         diagnostic = _dump_rejected_body(
@@ -991,6 +1000,7 @@ async def _stream_body(cfg, session, body, param_types=None):
                 _force_close_response(response)
                 return
             for raw in response:
+                trace.wire.raw(raw)
                 if is_cancelled():
                     break
                 line = raw.strip()
@@ -1003,7 +1013,11 @@ async def _stream_body(cfg, session, body, param_types=None):
                     # Dropped or cancelled: stop reading. The missing end_of_stream
                     # surfaces as a truncated-stream error, never a silent hole.
                     break
+            trace.wire.event("reader_end", cancelled=is_cancelled())
         except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
+            trace = holder.get("trace")
+            if trace:
+                trace.wire.event("reader_error", exception_type=type(exc).__name__)
             if not is_cancelled():
                 if isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException)):
                     timed_out = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
@@ -1032,6 +1046,9 @@ async def _stream_body(cfg, session, body, param_types=None):
             try:
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
                                           cache_scope=(body.get("model"), body.get("openAICacheKey"))):
+                    trace = holder.get("trace")
+                    if trace:
+                        trace.wire.event("parser_event", event=event)
                     if (event.get("type") == "tool_call"
                             or (event.get("type") == "text" and event.get("delta", "").strip())):
                         usable = True

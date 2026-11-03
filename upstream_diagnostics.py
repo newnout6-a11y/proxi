@@ -1,9 +1,10 @@
-"""Bounded response-shape diagnostics. Never store generated text or auth headers."""
+"""Response-shape summaries and explicitly enabled private wire traces."""
 from collections import Counter
 import hashlib
 import json
 import math
 import pathlib
+import threading
 import time
 import uuid
 
@@ -15,6 +16,92 @@ _KNOWN = frozenset({"content_block_start", "content_block_delta", "content_block
                     "metadata", "end_of_stream", "error", "ping", "message_start", "message_delta", "message_stop"})
 _HEADERS = ("request-id", "x-request-id", "cf-ray", "content-type", "x-retool-api-version")
 _SIGNALS = ("stop_reason", "stopReason", "finish_reason", "finishReason", "statusCode", "code")
+
+
+class WireTrace:
+    """Opt-in private bodies plus a timed timeline; never capture auth headers."""
+    def __init__(self, cfg, trace_id, payload, *, root_key="upstream_trace_dir",
+                 response_file="response-body.ndjson"):
+        self.folder = None
+        self.failed = False
+        self.started = time.monotonic()
+        # The reader runs in an executor while parser events and cancellation
+        # run on the event loop. Serialize close with writes on both threads.
+        self._lock = threading.RLock()
+        self._seq = 0
+        self._offset = 0
+        self._hash = hashlib.sha256()
+        self._raw = self._timeline = None
+        root = cfg.get(root_key)
+        self.enabled = bool(root)
+        if not self.enabled:
+            return
+        try:
+            self.folder = pathlib.Path(root) / trace_id
+            self.folder.mkdir(parents=True, exist_ok=False)
+            (self.folder / "request-body.json").write_bytes(payload)
+            self._raw = (self.folder / response_file).open("wb")
+            self._timeline = (self.folder / "timeline.jsonl").open("w", encoding="utf-8")
+            self.event("request", body_bytes=len(payload), body_sha256=hashlib.sha256(payload).hexdigest())
+        except (OSError, UnicodeError, TypeError, ValueError):
+            self.failed = True
+            self.close()
+
+    @staticmethod
+    def safe_headers(headers):
+        # Whitelist excludes cookies, auth, CSRF, request URLs and redirect URLs.
+        permitted = (*_HEADERS, "content-encoding", "content-length", "transfer-encoding",
+                     "date", "server", "cf-cache-status", "x-retool-client-version",
+                     "accept", "user-agent")
+        return {name: str(headers.get(name)) for name in permitted if headers.get(name)}
+
+    def event(self, stage, **fields):
+        with self._lock:
+            if self._timeline is None or self._timeline.closed or self.failed:
+                return
+            try:
+                self._seq += 1
+                row = {"seq": self._seq, "elapsed_ms": round((time.monotonic()-self.started)*1000, 3),
+                       "stage": stage, **fields}
+                self._timeline.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                self._timeline.flush()
+            except (OSError, UnicodeError, TypeError, ValueError, RecursionError):
+                self.failed = True
+
+    def request(self, headers):
+        self.event("request_headers", headers=self.safe_headers(headers))
+
+    def response(self, response, status):
+        self.event("response_headers", http_status=status,
+                   headers=self.safe_headers(getattr(response, "headers", None) or {}),
+                   response_version=getattr(response, "version", None),
+                   chunked=getattr(response, "chunked", None))
+
+    def raw(self, data):
+        with self._lock:
+            if self._raw is None or self._raw.closed or self.failed:
+                return
+            try:
+                offset = self._offset
+                self._raw.write(data)
+                self._raw.flush()
+                self._hash.update(data)
+                self._offset += len(data)
+                self.event("response_bytes", offset=offset, length=len(data))
+            except (OSError, ValueError):
+                self.failed = True
+
+    def close(self):
+        with self._lock:
+            if self._timeline is not None and not self._timeline.closed:
+                self.event("wire_end", response_bytes=self._offset, response_sha256=self._hash.hexdigest(),
+                           capture_failed=self.failed)
+            for handle in (self._raw, self._timeline):
+                try:
+                    if handle is not None:
+                        handle.close()
+                except OSError:
+                    self.failed = True
 
 
 class AttemptTrace:
@@ -37,11 +124,13 @@ class AttemptTrace:
         self.ended = False
         self.saved = False
         self.payload_hash = hashlib.sha256(payload).hexdigest()
+        self.wire = WireTrace(cfg, self.id, payload)
 
     def response(self, response, status=None):
         self.http_status = status or getattr(response, "status", None)
         headers = getattr(response, "headers", None) or {}
         self.headers = {key: str(headers.get(key))[:160] for key in _HEADERS if headers.get(key)}
+        self.wire.response(response, self.http_status)
 
     @staticmethod
     def count(counter, key):
@@ -123,6 +212,11 @@ class AttemptTrace:
                    "unsupported_event_shapes": dict(self.unsupported),
                    "tool_delta_chars": self.tool_chars, "thinking_delta_chars": self.thinking_chars,
                    "end_of_stream": self.ended, "signals": self.signals, "usage": self.usage}
+        if self.wire.enabled:
+            self.wire.event("attempt_end", outcome=outcome, summary=summary)
+            self.wire.close()
+            summary.update(wire_trace_id=self.id,
+                           wire_trace_saved=not self.wire.failed and self.wire.folder is not None)
         secrets = list(self.cfg.get("cookie_values") or [])
         secrets += [str(self.cfg[k]) for k in ("cookie", "xsrf", "relay_api_key") if self.cfg.get(k)]
         secrets += [segment.strip().split("=", 1)[1] for segment in self.cfg.get("cookie", "").split(";") if "=" in segment]
