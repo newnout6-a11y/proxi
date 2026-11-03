@@ -15,7 +15,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Run offline test suite
         run: python -m pytest tests -q
+      - name: Run OpenCode label plugin tests
+        run: node --test tests/test_opencode_labels.mjs

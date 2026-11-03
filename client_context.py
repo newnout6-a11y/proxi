@@ -1,4 +1,5 @@
 """Local client/chat labels, independent of upstream conversation affinity."""
+import collections
 import contextvars
 from contextlib import closing
 import json
@@ -11,7 +12,9 @@ import unicodedata
 from urllib.parse import unquote
 
 _CURRENT = contextvars.ContextVar("proxi_client", default=None)
-_CACHE = {}
+_CACHE = collections.OrderedDict()
+_CACHE_MAX = 1024
+_USER_ID_LIMIT = 4096
 _LOCK = threading.Lock()
 _CLIENTS = {"claude-code": "Claude Code", "claude-desktop": "Claude Desktop", "opencode": "OpenCode"}
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
@@ -47,6 +50,11 @@ def clean(value, limit=240):
     value = "".join(" " if ch.isspace() else ch for ch in value[:4096]
                     if not unicodedata.category(ch).startswith("C") or ch.isspace())
     return " ".join(value.split())[:limit]
+
+
+def _first(*values):
+    """First non-empty string: a truthy non-string must not hide a later header."""
+    return next((value for value in values if isinstance(value, str) and value.strip()), "")
 
 
 def current():
@@ -95,24 +103,16 @@ def _claude_title(home, session_id):
     if not _UUID.fullmatch(session_id):
         return {}
     projects = home / ".claude" / "projects"
-    first, title, source = "", "", ""
+    # Only titles the client itself assigned: a user's first prompt is private text.
+    title, source = "", ""
     for path in projects.glob("*/%s.jsonl" % session_id):
         for row in _json_lines(path):
             if row.get("type") == "custom-title" and row.get("customTitle"):
                 title, source = row["customTitle"], "claude-custom-title"
             elif not title and row.get("type") == "summary" and row.get("summary"):
                 title, source = row["summary"], "claude-summary"
-            if not first and row.get("type") == "user" and not row.get("isMeta"):
-                message = row.get("message")
-                content = message.get("content") if isinstance(message, dict) else None
-                if isinstance(content, str) and not content.startswith("<"):
-                    first = content
-    if not title:
-        for row in _json_lines(home / ".claude" / "history.jsonl"):
-            if row.get("sessionId") == session_id and row.get("display") and not first:
-                first = row["display"]
-    title = clean(title or first)
-    return {"chat_title": title, "title_source": source or "first-user-message"} if title else {}
+    title = clean(title)
+    return {"chat_title": title, "title_source": source} if title else {}
 
 
 def _desktop_title(home, session_id):
@@ -148,6 +148,7 @@ def _local_title(client, session_id, home):
     with _LOCK:
         cached = _CACHE.get(cache_key)
         if cached and cached[0] > time.monotonic():
+            _CACHE.move_to_end(cache_key)
             return dict(cached[1])
     result = {}
     try:
@@ -179,8 +180,9 @@ def _local_title(client, session_id, home):
     except (OSError, ValueError, sqlite3.Error):
         pass  # Missing/locked metadata must never delay or reject a model turn.
     with _LOCK:
-        if len(_CACHE) >= 1024:
-            _CACHE.clear()
+        _CACHE.pop(cache_key, None)
+        while len(_CACHE) >= _CACHE_MAX:
+            _CACHE.popitem(last=False)
         _CACHE[cache_key] = (time.monotonic() + (_TITLE_TTL if result else _MISS_TTL), result)
     return dict(result)
 
@@ -191,32 +193,34 @@ def describe(data, headers, cfg=None):
     metadata = metadata if isinstance(metadata, dict) else {}
     user = metadata.get("user_id")
     identity = {}
-    if isinstance(user, str):
+    # Client-controlled and parsed on the request path: bound it before json.loads.
+    if isinstance(user, str) and len(user) <= _USER_ID_LIMIT:
         try:
             identity = json.loads(user)
-        except ValueError:
+        except (ValueError, RecursionError):
             match = re.search(r"_session_(%s)$" % _UUID.pattern, user)
             if match:
                 identity = {"session_id": match[1]}
     identity = identity if isinstance(identity, dict) else {}
+    identity_session = _first(identity.get("session_id"))
     client = clean(headers.get("x-proxi-client"), 60).lower()
     ua = str(headers.get("user-agent", "")).lower()
     if not client:
         client = next((name for name in _CLIENTS if name in ua), "")
         if not client and re.search(r"\bclaude/\d", ua):
             client = "claude-desktop"
-        if not client and ("claude-cli" in ua or identity.get("session_id")):
+        if not client and ("claude-cli" in ua or identity_session):
             client = "claude-code"
-    session_id = clean(headers.get("x-proxi-session-id") or identity.get("session_id") or
-                       metadata.get("session_id") or headers.get("x-claude-code-session-id") or
-                       headers.get("x-opencode-session-id") or headers.get("x-session-id") or
-                       headers.get("x-opencode-session") or data.get("conversation_id") or
-                       data.get("session_id"), 160)
+    session_id = clean(_first(headers.get("x-proxi-session-id"), identity_session,
+                              metadata.get("session_id"), headers.get("x-claude-code-session-id"),
+                              headers.get("x-opencode-session-id"), headers.get("x-session-id"),
+                              headers.get("x-opencode-session"), data.get("conversation_id"),
+                              data.get("session_id")), 160)
     title = clean(unquote(str(headers.get("x-proxi-chat-title", "")))) or clean(metadata.get("chat_title"))
     info = {key: value for key, value in {"client": client, "client_session_id": session_id,
             "chat_title": title, "title_source": "client-header" if title else "",
-            "agent": clean(headers.get("x-proxi-agent") or headers.get("x-claude-code-agent-id") or
-                           metadata.get("agent_id") or identity.get("agent_id"), 100),
+            "agent": clean(_first(headers.get("x-proxi-agent"), headers.get("x-claude-code-agent-id"),
+                                  metadata.get("agent_id"), identity.get("agent_id")), 100),
             "parent_session_id": clean(headers.get("x-proxi-parent-session-id") or
                                        headers.get("x-opencode-parent-session-id"), 160)}.items() if value}
     if not title and session_id and client in _CLIENTS:

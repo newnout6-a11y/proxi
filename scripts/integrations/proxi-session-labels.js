@@ -8,11 +8,16 @@ export const ProxiSessionLabels = async ({ client }) => ({
     try {
       const result = await client.session.get({ path: { id: input.sessionID } })
       const session = result.data
-      if (typeof session?.title === "string") {
-        // HTTP/1 headers must be ASCII, including Russian and emoji chat names.
-        output.headers["X-Proxi-Chat-Title"] = encodeURIComponent(session.title.slice(0, 240))
-      }
       if (session?.parentID) output.headers["X-Proxi-Parent-Session-Id"] = session.parentID
+      if (typeof session?.title === "string") {
+        try {
+          // HTTP/1 headers must be ASCII, including Russian and emoji chat names.
+          // Cut by code points: slice() can split a surrogate pair and make encodeURIComponent throw.
+          output.headers["X-Proxi-Chat-Title"] = encodeURIComponent(Array.from(session.title).slice(0, 240).join(""))
+        } catch {
+          // A title that cannot be encoded is skipped; the parent link above is already set.
+        }
+      }
     } catch {
       // The relay can also read the local session DB; a lookup must not fail a turn.
     }
