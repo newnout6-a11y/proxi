@@ -190,7 +190,7 @@ def make_handler(runtime: Runtime):
             console_log.write("relay %s %s %s %s %s%s %.0fms %s" % (
                 self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
                 " ".join(part for part in (client_context.label(), local_note, note) if part)))
-            if route in ("chat", "responses", "anthropic"):
+            if route in ("chat", "responses", "anthropic") and getattr(self, "_model_called", False):
                 snapshot = getattr(runtime.credits, "balance_snapshot", None)
                 if snapshot:
                     console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used))
@@ -217,6 +217,7 @@ def make_handler(runtime: Runtime):
             self._model = "-"
             self._effort_str = ""
             self._credits_used = None
+            self._model_called = False
             self._error_code = None
             self._response_started = False
             parsed_url = urlparse(self.path)
@@ -491,6 +492,7 @@ def make_handler(runtime: Runtime):
 
             events = queue.Queue()
             holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
+            self._model_called = True
             fut = asyncio.run_coroutine_threadsafe(runtime.runner.run(parsed, events, holder), runtime.loop)
 
             prompt_text = parsed.system + "\n" + parsed.prompt

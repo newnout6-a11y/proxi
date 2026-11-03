@@ -16,6 +16,10 @@ _LOCK = threading.Lock()
 _CLIENTS = {"claude-code": "Claude Code", "claude-desktop": "Claude Desktop", "opencode": "OpenCode"}
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 _READ_LIMIT = 256 * 1024
+# Lookups scan local client folders on the request path. A found title is
+# re-read soon enough to show renames; a miss is retried less often.
+_TITLE_TTL = 15
+_MISS_TTL = 30
 SERVICE_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe"})
 CLIENT_TEXT_KINDS = SERVICE_KINDS | {"client-text"}
 
@@ -177,7 +181,7 @@ def _local_title(client, session_id, home):
     with _LOCK:
         if len(_CACHE) >= 1024:
             _CACHE.clear()
-        _CACHE[cache_key] = (time.monotonic() + 2, result)
+        _CACHE[cache_key] = (time.monotonic() + (_TITLE_TTL if result else _MISS_TTL), result)
     return dict(result)
 
 

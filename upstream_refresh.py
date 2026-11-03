@@ -104,7 +104,11 @@ class Refresher:
                 self.cfg["_account_ref"]["cookie"] = self.cfg["cookie"]
                 self.cfg["_account_ref"]["xsrf"] = self.cfg["xsrf"]
             elif isinstance(self.cfg.get("accounts"), list):
-                record = _account_record(self.cfg, self.cfg)
+                try:
+                    record = _account_record(self.cfg, self.cfg)
+                except ValueError:
+                    # Ambiguous in-memory mirror: the renewed root session still works.
+                    record = None
                 if record is not None:
                     record.update(cookie=self.cfg["cookie"], xsrf=self.cfg["xsrf"])
             self._persist()
@@ -140,7 +144,11 @@ class Refresher:
         def keepalive():
             delay = MIN_INTERVAL
             while not self._stop.is_set():
-                ok = self.refresh()
+                try:
+                    ok = self.refresh()
+                except Exception as exc:  # noqa: BLE001 - one failure must not end keepalive
+                    self.last_error = "session renewal failed: " + type(exc).__name__
+                    ok = False
                 wait = interval if ok else delay
                 delay = MIN_INTERVAL if ok else min(delay * 2, 300)
                 if self._stop.wait(wait):

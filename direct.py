@@ -649,20 +649,23 @@ def _ping(session, body):
                 mark_unknown = getattr(manager, "mark_usage_unknown", None)
                 if mark_unknown:
                     mark_unknown()
-            request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "keepwarm"
-            monitor = getattr(session, "_console_warm_cache_monitor", None)
-            if monitor is None:
-                monitor = session._console_warm_cache_monitor = console_log.CacheMonitor()
-            console_log.write(monitor.line(request_id, warm_usage, sample_id=billing_id,
-                                          scope=(body.get("model"), body.get("openAICacheKey")))
-                              + " [keepwarm] " + client_context.label())
-            snapshot = getattr(manager, "balance_snapshot", None)
-            if snapshot:
-                console_log.write(console_log.balance_line(request_id, snapshot(), actual_credits) + " [keepwarm]")
-            journal.emit("cache.keepwarm_usage", "Стоимость запроса прогрева", "info",
-                         billing_id=billing_id, model=body.get("model"), source="relay",
-                         request_purpose="cache-keepwarm", actual_credits=actual_credits,
-                         complete=complete, usage=warm_usage)
+            try:
+                request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "keepwarm"
+                monitor = getattr(session, "_console_warm_cache_monitor", None)
+                if monitor is None:
+                    monitor = session._console_warm_cache_monitor = console_log.CacheMonitor()
+                console_log.write(monitor.line(request_id, warm_usage, sample_id=billing_id,
+                                              scope=(body.get("model"), body.get("openAICacheKey")))
+                                  + " [keepwarm] " + client_context.label())
+                snapshot = getattr(manager, "balance_snapshot", None)
+                if snapshot:
+                    console_log.write(console_log.balance_line(request_id, snapshot(), actual_credits) + " [keepwarm]")
+                journal.emit("cache.keepwarm_usage", "Стоимость запроса прогрева", "info",
+                             billing_id=billing_id, model=body.get("model"), source="relay",
+                             request_purpose="cache-keepwarm", actual_credits=actual_credits,
+                             complete=complete, usage=warm_usage)
+            except Exception:  # noqa: BLE001 - reporting must not mask the ping's own outcome
+                pass
     if not complete:
         raise apierr.upstream_error("cache refresh ended without end_of_stream")
     return actual_credits
@@ -929,7 +932,7 @@ async def _stream_body(cfg, session, body, param_types=None):
                         diagnostic = _dump_rejected_body(
                             payload, detail, cfg=cfg, status=exc.code,
                             request_id=client_context.current().get("request_id") or getattr(session, "_request_tag", None))
-                        journal.emit("upstream.rejected", detail, "warn", upstream_status=exc.code,
+                        journal.emit("upstream.rejected", detail[:1000], "warn", upstream_status=exc.code,
                                      diagnostic_id=diagnostic, model=body.get("model"),
                                      effort=body.get("reasoningEffort"),
                                      upstream_request_id=exc.headers.get("request-id") or exc.headers.get("x-request-id"))
@@ -942,7 +945,7 @@ async def _stream_body(cfg, session, body, param_types=None):
                         if session.backend.refresher.refresh(rejected_cookie=headers.get("cookie")):
                             headers.update(session.backend.headers())
                             continue
-                        raise apierr.upstream_auth_failed(detail)
+                        raise apierr.upstream_auth_failed(detail[:400])
                     holder["response"] = exc
                     error = apierr.ApiError(*_http_error(exc.code, detail))
                     error.upstream_status = exc.code
@@ -1198,7 +1201,7 @@ def _http_error(status, detail):
     text = detail[:300]
     try:
         parsed = json.loads(detail)
-        text = parsed.get("message") or text
+        text = str(parsed.get("message") or text)[:300]
     except Exception:
         pass
     if status == 429:
