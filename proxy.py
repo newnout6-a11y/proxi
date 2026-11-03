@@ -1,5 +1,6 @@
 """OpenAI/Anthropic compatible relay over the Retool AI agent WebSocket."""
 import asyncio
+import argparse
 import concurrent.futures
 import json
 import os
@@ -18,6 +19,7 @@ import admin as admin_module
 import apierr
 import auth
 import journal
+import client_context
 from redact import redact
 import config as config_module
 import models as model_catalog
@@ -118,9 +120,11 @@ def make_handler(runtime: Runtime):
             self.send_header("access-control-allow-origin", "*")
             self.send_header("access-control-allow-headers",
                              "authorization, x-api-key, anthropic-version, anthropic-beta, content-type, "
-                             "x-request-id, x-session-affinity, x-session-id, x-opencode-session")
+                             "x-request-id, x-session-affinity, x-session-id, x-opencode-session, "
+                             "x-proxi-client, x-proxi-session-id, x-proxi-chat-title, x-proxi-agent, "
+                             "x-proxi-parent-session-id, x-opencode-session-id, x-opencode-parent-session-id")
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
-            self.send_header("access-control-expose-headers", "x-request-id, retry-after")
+            self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after")
 
         def _json(self, status, payload, extra=None):
             self._status = status
@@ -130,6 +134,7 @@ def make_handler(runtime: Runtime):
             self.send_header("content-type", "application/json; charset=utf-8")
             self.send_header("content-length", str(len(body)))
             self.send_header("x-request-id", self.request_id)
+            self.send_header("request-id", self.request_id)
             if extra:
                 for key, value in extra.items():
                     self.send_header(key, str(value))
@@ -147,6 +152,7 @@ def make_handler(runtime: Runtime):
             self.request_id = uuid.uuid4().hex[:12]
             self.send_response(204)
             self.send_header("x-request-id", self.request_id)
+            self.send_header("request-id", self.request_id)
             self._cors()
             self.send_header("content-length", "0")
             self.end_headers()
@@ -179,7 +185,8 @@ def make_handler(runtime: Runtime):
             effort = getattr(self, "_effort_str", "")
             effort_tag = f" [{effort}]" if effort and model != "-" else ""
             print("relay %s %s %s %s %s%s %.0fms %s" % (
-                self.request_id, self.command, redact(self.path), status, model, effort_tag, took, note), flush=True)
+                self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
+                journal.scrub(" ".join(part for part in (client_context.label(), note) if part))), flush=True)
             route = getattr(self, "_log_route", None)
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
@@ -189,11 +196,12 @@ def make_handler(runtime: Runtime):
                          request_id=self.request_id, method=self.command, path=self.path, route=route,
                          status=status, duration_ms=round(took), model=None if model == "-" else model,
                          stream=bool(getattr(self, "_streaming", False)),
-                         client=self.headers.get("user-agent", "")[:120] if self.headers else "",
+                         user_agent=self.headers.get("user-agent", "")[:120] if self.headers else "",
                          error=getattr(self, "_error_code", None))
 
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
+            context_token = client_context.bind({"request_id": self.request_id})
             self._started = time.time()
             # Keep-alive reuses the handler: a stale status from the previous
             # request (e.g. a 404 probe) must not leak into this log line.
@@ -232,6 +240,7 @@ def make_handler(runtime: Runtime):
                         if exc.message == "invalid relay API key":
                             self._throttle_auth_failure()
                         raise
+                client_context.bind({**client_context.describe({}, self.headers, cfg), "request_id": self.request_id})
                 if route == "chat":
                     if not cfg["enable_chat"]:
                         raise apierr.not_found("chat API disabled")
@@ -263,31 +272,50 @@ def make_handler(runtime: Runtime):
                     self._health()
             except apierr.ApiError as err:
                 self._error_code = err.code
+                self._log_error(err)
                 if err.status >= 400:
-                    print("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]), flush=True)
+                    print(journal.scrub("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160])), flush=True)
                 if getattr(self, "_streaming", False):
                     writer = self._writer
-                    writer.event("error", adapters.error_payload(dialect, err))
+                    writer.event("error", self._error_payload(dialect, err))
                     # Journal must not report a mid-stream failure as 200/success.
                     self._stream_status = err.status
                     writer.done()
                 else:
                     self._respond_error(err, dialect)
             except Exception as exc:  # never leak a bare traceback
-                print("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]), flush=True)
+                print(journal.scrub("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200])), flush=True)
                 self._error_code = "internal_error"
                 journal.emit("http.exception", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "error",
                              request_id=self.request_id, path=self.path)
                 err = apierr.internal(str(exc) or exc.__class__.__name__)
                 if getattr(self, "_streaming", False):
                     writer = self._writer
-                    writer.event("error", adapters.error_payload(dialect, err))
+                    writer.event("error", self._error_payload(dialect, err))
                     self._stream_status = err.status
                     writer.done()
                 else:
                     self._respond_error(err, dialect)
             finally:
-                self._log()
+                try:
+                    self._log()
+                finally:
+                    client_context.reset(context_token)
+
+        def _log_error(self, err):
+            journal.emit("http.error", err.message, "error" if err.status >= 500 else "warn",
+                         status=err.status, code=err.code, param=err.param, model=self._model,
+                         effort=self._effort_str or None,
+                         stage="upstream" if hasattr(err, "upstream_status") else "relay",
+                         upstream_status=getattr(err, "upstream_status", None),
+                         diagnostic_id=getattr(err, "diagnostic_id", None))
+
+        def _error_payload(self, dialect, err):
+            body = adapters.error_payload(dialect, err)
+            body["request_id"] = self.request_id
+            if getattr(err, "diagnostic_id", None):
+                body["diagnostic_id"] = err.diagnostic_id
+            return body
 
         def _respond_error(self, err, dialect):
             if getattr(self, "_response_started", False):
@@ -300,7 +328,7 @@ def make_handler(runtime: Runtime):
         def _error_response(self, err, dialect):
             # Non-stream HTTP errors use the standard OpenAI envelope for both chat
             # and responses routes; the flat responses shape is for SSE events only.
-            body = adapters.error_payload("chat" if dialect == "responses" else dialect, err)
+            body = self._error_payload("chat" if dialect == "responses" else dialect, err)
             extra = {"retry-after": err.retry_after} if err.retry_after else None
             self._json(err.status, body, extra)
 
@@ -314,6 +342,7 @@ def make_handler(runtime: Runtime):
         def _count_tokens(self):
             """Claude Code asks for a token estimate before sending a turn."""
             data = validate.load_json(self._read_body())
+            self._bind_client(data)
             # The real count_tokens endpoint does not require max_tokens.
             data.setdefault("max_tokens", 1)
             parsed = validate.parse_anthropic(data, cfg)
@@ -374,6 +403,16 @@ def make_handler(runtime: Runtime):
             self._json(200 if ok else 503, payload)
 
         # -- completions --------------------------------------------------
+        def _bind_client(self, data):
+            client_context.bind({**client_context.describe(data, self.headers, cfg), "request_id": self.request_id})
+            self._model = client_context.clean(data.get("model"), 100) or "-"
+            output = data.get("output_config")
+            reasoning = data.get("reasoning")
+            effort = (output.get("effort") if isinstance(output, dict) else None) or data.get("reasoning_effort")
+            if not effort and isinstance(reasoning, dict):
+                effort = reasoning.get("effort")
+            self._effort_str = client_context.clean(effort, 30)
+
         def _read_body(self):
             raw_len = self.headers.get("content-length")
             if raw_len is None:
@@ -406,6 +445,7 @@ def make_handler(runtime: Runtime):
 
         def _completion(self, dialect):
             data = validate.load_json(self._read_body())
+            self._bind_client(data)
             if dialect == "anthropic":
                 parsed = validate.parse_anthropic(data, cfg)
             elif dialect == "responses":
@@ -429,12 +469,13 @@ def make_handler(runtime: Runtime):
                 conf = cfg["reasoning_effort"]
                 if conf == "auto":
                     conf = parsed.entry.get("default_reasoning_effort") or "medium"
-                _, effective_effort = models.resolve_tolerant(parsed.model, conf, strict=False)
+                _, effective_effort = models.resolve_tolerant(
+                    parsed.model, conf, strict=False, allow_downgrade=cfg.get("allow_effort_downgrade", False))
             self._effort_str = effective_effort or "none"
 
             tools_count = len(getattr(parsed, "tools", None) or [])
             note = " [title/auxiliary]" if tools_count == 0 and len(parsed.prompt or "") < 200 else ""
-            print(f"[{self.request_id}] {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()}{note}", flush=True)
+            print(journal.scrub(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()}{note}"), flush=True)
 
             wait = runtime.limiter.take()
             if wait:
@@ -457,7 +498,7 @@ def make_handler(runtime: Runtime):
             writer = sse.StreamWriter(self)
             self._writer = writer
             self._streaming = True
-            writer.start({"x-request-id": self.request_id})
+            writer.start({"x-request-id": self.request_id, "request-id": self.request_id})
             self._response_started = True
             self._model = parsed.model
             self._stream_status = 200
@@ -579,10 +620,23 @@ class BoundedServer(ThreadingHTTPServer):
             self.slots.release()
 
 
-def main():
-    cfg = config_module.load()
-    cfg["command_log"] = os.path.join(HERE, "commands.log")
-    cfg.setdefault("journal_path", os.path.join(HERE, "journal.jsonl"))
+def startup_config(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default=config_module.CONFIG_PATH, help="Path to the existing relay config")
+    parser.add_argument("--state-dir", help="Directory for journal, command log and rejected upstream bodies")
+    args = parser.parse_args(argv)
+    cfg = config_module.load(os.path.abspath(args.config))
+    state = os.path.abspath(args.state_dir or HERE)
+    os.makedirs(state, exist_ok=True)
+    for key, relative in (("command_log", "commands.log"), ("journal_path", "journal.jsonl"),
+                          ("upstream_error_dir", os.path.join("logs", "upstream-400"))):
+        if args.state_dir or not cfg.get(key):
+            cfg[key] = os.path.join(state, relative)
+    return cfg
+
+
+def main(argv=None):
+    cfg = startup_config(argv)
     runtime = Runtime(cfg)
     journal.emit("relay.start", "Relay запущен на %s:%s" % (cfg["host"], cfg["port"]), "success",
                  host=cfg["host"], port=cfg["port"], model=cfg["model"], transport=cfg.get("transport"),

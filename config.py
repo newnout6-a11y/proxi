@@ -217,13 +217,14 @@ def _ensure_relay_key(cfg):
     key = os.environ.get("RELAY_API_KEY") or cfg.get("relay_api_key")
     if key:
         return key
-    if os.path.exists(KEY_PATH):
-        with open(KEY_PATH, encoding="utf-8") as fh:
+    key_path = os.path.join(os.path.dirname(cfg["_config_path"]), "relay_key.txt") if cfg.get("_config_path") else KEY_PATH
+    if os.path.exists(key_path):
+        with open(key_path, encoding="utf-8") as fh:
             key = fh.read().strip()
         if key:
             return key
     key = "relay-" + secrets.token_urlsafe(24)
-    with open(KEY_PATH, "w", encoding="utf-8") as fh:
+    with open(key_path, "w", encoding="utf-8") as fh:
         fh.write(key + "\n")
     return key
 

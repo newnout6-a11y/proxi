@@ -5,17 +5,20 @@ plain HTTP POST. The stable system head is sent as a cached block so a large pro
 context is billed once and reused, keeping time-to-first-token flat.
 """
 import asyncio
+import contextvars
 import hashlib
 import json
 import pathlib
 import socket
 import time
+import uuid
 import urllib.error
 import urllib.request
 
 import apierr
 import credits
 import journal
+import client_context
 import models as model_catalog
 
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
@@ -792,7 +795,7 @@ def _ensure_keepwarm(session, cfg):
         session._warm_task = asyncio.create_task(_keepwarm(session, cfg))
 
 
-def _dump_rejected_body(payload, detail):
+def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=None):
     """Land the exact upstream-rejected body on disk for offline bisection.
 
     A 400 from the route validator ("Invalid request format") carries no field
@@ -800,12 +803,19 @@ def _dump_rejected_body(payload, detail):
     poison. The dump is local-only and holds the user's own conversation text.
     """
     try:
-        folder = pathlib.Path("logs/upstream-400")
+        folder = pathlib.Path((cfg or {}).get("upstream_error_dir") or "logs/upstream-400")
         folder.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
+        stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
         (folder / ("%s-body.json" % stamp)).write_bytes(payload)
         (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
-        print("[debug] upstream 400 body captured: logs/upstream-400/%s-body.json" % stamp, flush=True)
+        metadata = {**client_context.current(), "request_id": request_id,
+                    "upstream_status": status, "diagnostic_id": stamp,
+                    "body_sha256": hashlib.sha256(payload).hexdigest()}
+        (folder / ("%s-metadata.json" % stamp)).write_text(
+            json.dumps(journal.scrub(metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+        print("[debug] upstream %s diagnostic: %s" % (status, stamp), flush=True)
+        return stamp
     except Exception:  # noqa: BLE001 - diagnostics must never break the turn
         pass
 
@@ -869,9 +879,16 @@ async def _stream_body(cfg, session, body, param_types=None):
                     response = urllib.request.urlopen(request, timeout=timeout)
                     break
                 except urllib.error.HTTPError as exc:
-                    detail = exc.read()[:400].decode("utf-8", "replace")
-                    if exc.code == 400:
-                        _dump_rejected_body(payload, detail)
+                    detail = exc.read(16384).decode("utf-8", "replace")
+                    diagnostic = None
+                    if exc.code in (400, 422):
+                        diagnostic = _dump_rejected_body(
+                            payload, detail, cfg=cfg, status=exc.code,
+                            request_id=client_context.current().get("request_id") or getattr(session, "_request_tag", None))
+                        journal.emit("upstream.rejected", detail, "warn", upstream_status=exc.code,
+                                     diagnostic_id=diagnostic, model=body.get("model"),
+                                     effort=body.get("reasoningEffort"),
+                                     upstream_request_id=exc.headers.get("request-id") or exc.headers.get("x-request-id"))
                     if exc.code in (401, 403) and attempt == 0:
                         attempt = 1
                         # The 401 may come from a header snapshot taken just before
@@ -883,7 +900,10 @@ async def _stream_body(cfg, session, body, param_types=None):
                             continue
                         raise apierr.upstream_auth_failed(detail)
                     holder["response"] = exc
-                    raise apierr.ApiError(*_http_error(exc.code, detail))
+                    error = apierr.ApiError(*_http_error(exc.code, detail))
+                    error.upstream_status = exc.code
+                    error.diagnostic_id = diagnostic
+                    raise error
             holder["response"] = response
             if session._cancelled:
                 _force_close_response(response)
@@ -915,7 +935,7 @@ async def _stream_body(cfg, session, body, param_types=None):
         while True:
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
-            task = loop.run_in_executor(None, worker, queue)
+            task = loop.run_in_executor(None, contextvars.copy_context().run, worker, queue)
             try:
                 flags = {}
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags):
