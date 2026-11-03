@@ -186,7 +186,7 @@ def test_health_is_ok_while_one_account_is_routable_and_healthy(multi):
     multi.backends[0].unavailable = {"reason": "auth_dead"}
     status, body, _ = multi.call("/health", key=None)
     assert status == 200 and body["ok"] is True
-    assert body["accounts"] == {"total": 2, "routable": 1, "states": {"auth_dead": 1, "active": 1}}
+    assert body["accounts"] == {"total": 2, "routable": 1, "reserve": 0, "states": {"auth_dead": 1, "active": 1}}
     assert "available" not in body and "monthly_allocation" not in body
 
 
@@ -196,9 +196,45 @@ def test_health_fails_without_a_routable_healthy_account(multi):
     status, body, _ = multi.call("/health", key=None)
     assert status == 503 and body["ok"] is False and body["upstream"] == "degraded"
     multi.managers_[1].balance["stale"] = False
+    multi.backends[0].unavailable = {"reason": "exhausted", "available": 0.0}
     multi.backends[1].unavailable = {"reason": "auth_dead"}
     status, body, _ = multi.call("/health", key=None)
     assert status == 503 and body["accounts"]["routable"] == 0
+
+
+def _exhausted(available):
+    return {"reason": "exhausted", "available": available, "threshold": 20.0}
+
+
+def test_health_counts_exhausted_accounts_with_credits_as_reserve(multi):
+    for backend in multi.backends:
+        backend.unavailable = _exhausted(15.0)
+    status, body, _ = multi.call("/health", key=None)
+    assert status == 200 and body["ok"] is True and body["upstream"] == "ok"
+    assert body["accounts"] == {"total": 2, "routable": 2, "reserve": 2, "states": {"exhausted": 2}}
+
+
+def test_health_treats_unknown_reserve_balance_as_serving(multi):
+    multi.backends[0].unavailable = _exhausted(None)
+    multi.backends[1].unavailable = _exhausted(0.0)
+    status, body, _ = multi.call("/health", key=None)
+    assert status == 200
+    assert body["accounts"]["routable"] == 1 and body["accounts"]["reserve"] == 1
+
+
+def test_health_fails_when_exhausted_accounts_have_no_credits(multi):
+    for backend in multi.backends:
+        backend.unavailable = _exhausted(0.0)
+    status, body, _ = multi.call("/health", key=None)
+    assert status == 503 and body["ok"] is False
+    assert body["accounts"] == {"total": 2, "routable": 0, "reserve": 0, "states": {"exhausted": 2}}
+
+
+def test_health_ignores_reserve_while_an_account_is_active(multi):
+    multi.backends[0].unavailable = _exhausted(15.0)
+    status, body, _ = multi.call("/health", key=None)
+    assert status == 200
+    assert body["accounts"] == {"total": 2, "routable": 1, "reserve": 0, "states": {"exhausted": 1, "active": 1}}
 
 
 # -- 18-9: chat titles come only from real titles ---------------------------

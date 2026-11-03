@@ -536,16 +536,26 @@ def make_handler(runtime: Runtime):
             states = self._account_states()
             ok = known = False
             routable = 0
+            reserve = 0
             counts = {}
-            for backend, manager in account_managers(runtime):
+            rows = account_managers(runtime)
+            # Mirror SessionPool._next_backend: active accounts first; when none is
+            # active, exhausted accounts with a positive or unknown balance (the
+            # failover reserve) are still served. A lone auth_dead account is also
+            # tried there as a last resort, but /health deliberately keeps reporting
+            # it as not routable: a signed-out account cannot be called healthy.
+            active = [backend for backend, _ in rows if getattr(backend, "unavailable", None) is None]
+            spare = [] if active else SessionPool._reserve([backend for backend, _ in rows])
+            for backend, manager in rows:
                 state = (states.get(backend) or {}).get("state") or (
                     (getattr(backend, "unavailable", None) or {}).get("reason") or "active")
                 counts[state] = counts.get(state, 0) + 1
                 balance = manager.get_balance()
                 fresh = balance.get("available") is not None and not balance.get("stale")
                 known = known or fresh
-                if getattr(backend, "unavailable", None) is None:
+                if backend in active or backend in spare:
                     routable += 1
+                    reserve += backend in spare
                     ok = ok or fresh
             # /health is the only unauthenticated route and carries CORS *: it must
             # expose readiness booleans, not organization financials or raw
@@ -560,7 +570,8 @@ def make_handler(runtime: Runtime):
                 "upstream": "ok" if ok else "degraded",
                 "balance_known": known,
                 "session": session,
-                "accounts": {"total": sum(counts.values()), "routable": routable, "states": counts},
+                "accounts": {"total": sum(counts.values()), "routable": routable, "reserve": reserve,
+                             "states": counts},
             }
             self._json(200 if ok else 503, payload)
 

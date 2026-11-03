@@ -6,6 +6,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import sys
 import tempfile
 import threading
@@ -164,11 +165,15 @@ def _write_file(path, saved):
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
-        import stat
         os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
         os.replace(temporary, path)
     finally:
         if temporary and os.path.exists(temporary):
+            # A read-only temp (copied from a read-only target) cannot be unlinked on Windows.
+            try:
+                os.chmod(temporary, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
             os.unlink(temporary)
 
 
