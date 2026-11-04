@@ -313,7 +313,7 @@ class Journal:
         count = int(window // bucket)
         buckets = [{"t": int(start + index * bucket), "requests": 0, "errors": 0, "latency": [],
                     "ttft": [], "credits": 0.0, "cache_read": 0, "cache_write": 0, "input": 0,
-                    "turns": 0, "tools": 0, "commands": 0} for index in range(count)]
+                    "output": 0, "turns": 0, "tools": 0, "commands": 0} for index in range(count)]
         totals = collections.Counter()
         statuses = collections.Counter()
         models = collections.Counter()
@@ -351,6 +351,8 @@ class Journal:
                 slot["cache_read"] += int(data.get("cache_read") or 0)
                 slot["cache_write"] += int(data.get("cache_write") or 0)
                 slot["input"] += int(data.get("input_tokens") or 0)
+                slot["output"] += int(data.get("output_tokens") or 0)
+                totals["output_tokens"] += int(data.get("output_tokens") or 0)
                 totals["credits"] += float(data.get("credits") or 0)
                 totals["cache_read"] += int(data.get("cache_read") or 0)
                 totals["cache_write"] += int(data.get("cache_write") or 0)
@@ -380,6 +382,7 @@ class Journal:
                        "tools": totals["tools"], "commands": totals["commands"],
                        "credits": round(totals["credits"], 4), "cache_read": cached,
                        "cache_write": totals["cache_write"], "input_tokens": totals["input_tokens"],
+                       "output_tokens": totals["output_tokens"],
                        "cache_hit_ratio": round(cached / prompt, 4) if prompt else None,
                        "latency_p50": percentile(latency_all, 0.5), "latency_p95": percentile(latency_all, 0.95),
                        "ttft_p50": percentile(ttft_all, 0.5), "ttft_p95": percentile(ttft_all, 0.95)},

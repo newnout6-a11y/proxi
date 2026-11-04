@@ -14,6 +14,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import account_report
 import adapters
 import admin as admin_module
 import apierr
@@ -95,26 +96,6 @@ class Runtime:
         self.journal = journal.JOURNAL
         self.journal.configure(cfg, cfg.get("journal_path"))
         self.admin = admin_module.Admin(self)
-
-
-def account_tag(backend):
-    cfg = getattr(backend, "cfg", None) or {}
-    return journal.tag(cfg.get("account_id") or cfg.get("page_uuid")) or "account"
-
-
-def account_managers(runtime):
-    """(backend, CreditsManager) per account; the primary account follows runtime.credits."""
-    rows = []
-    for backend in runtime.accounts.backends:
-        manager = runtime.credits if backend is runtime.backend else runtime.accounts.managers.get(backend)
-        if manager is not None:
-            rows.append((backend, manager))
-    return rows or [(runtime.backend, runtime.credits)]
-
-
-def _known(value):
-    value = console_log.number(value, signed=True)
-    return value
 
 
 ROUTES = {
@@ -234,7 +215,7 @@ def make_handler(runtime: Runtime):
                 backend, manager = self._serving_account()
                 snapshot = getattr(manager, "balance_snapshot", None)
                 if snapshot:
-                    tag = account_tag(backend) if backend is not None and len(runtime.accounts.backends) > 1 else None
+                    tag = account_report.account_tag(backend) if backend is not None and len(runtime.accounts.backends) > 1 else None
                     console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used, account=tag))
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
@@ -457,106 +438,17 @@ def make_handler(runtime: Runtime):
             key = model_catalog.PROVIDER_RESOURCE_KEY.get(model["provider"])
             return bool(key and cfg.get(key))
 
-        def _account_states(self):
-            return {backend: row for backend, row in zip(runtime.accounts.backends, runtime.accounts.status())}
-
         def _balance_report(self):
-            rows = account_managers(runtime)
-            states = self._account_states()
-
-            def fetch(row):
-                return row[1].get_balance(force_refresh=True)
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
-                infos = list(pool.map(fetch, rows))
-            accounts, known = [], []
-            for (backend, _manager), info in zip(rows, infos):
-                available = _known(info.get("available"))
-                entry = {"account": account_tag(backend),
-                         "state": (states.get(backend) or {}).get("state", "active"),
-                         "available": available,
-                         "monthly_allocation": info.get("monthly_allocation"),
-                         "reset_date": info.get("reset_date"),
-                         "stale": bool(info.get("stale"))}
-                error = info.get("error") or info.get("stale_error")
-                if error:
-                    entry["error"] = error
-                accounts.append(entry)
-                if available is not None:
-                    known.append(info)
-            allocation = [value for value in (_known(info.get("monthly_allocation")) for info in known)
-                          if value is not None]
-            total = round(sum(_known(info.get("available")) for info in known), 4) if known else None
-            report = {
-                "available": total,
-                "monthly_allocation": round(sum(allocation), 4) if allocation else None,
-                "used_month": round(sum(info.get("used_month") or 0.0 for info in known), 4) if known else None,
-                "reset_date": next((info["reset_date"] for info in known if info.get("reset_date")), None),
-                "is_low": any(info.get("is_low") for info in known),
-                "session_used": round(sum(_known(info.get("session_used")) or 0.0 for info in infos), 4),
-                "stale": any(info.get("stale") for info in known),
-                "unreported_usage": any(info.get("unreported_usage") for info in infos),
-                "accounts": accounts,
-            }
-            if not known:
-                report["error"] = next((entry["error"] for entry in accounts if entry.get("error")), None)
-            return report
+            return account_report.balance_report(account_report.collect(runtime, force_refresh=True))
 
         def _usage_report(self):
-            rows, recent, accounts = account_managers(runtime), [], []
-            totals = {"session_used": 0.0, "turns": 0, "recent_total": 0.0}
-            available, unreported = [], False
-            for backend, manager in rows:
-                usage = manager.usage()
-                tag = account_tag(backend)
-                items = [dict(item, account=tag) for item in usage.get("recent") or []]
-                recent.extend(items)
-                used = console_log.number(usage.get("session_used")) or 0.0
-                turns = int(usage.get("turns") or 0)
-                totals["session_used"] += used
-                totals["turns"] += turns
-                totals["recent_total"] += console_log.number(usage.get("recent_total")) or sum(
-                    console_log.number(item.get("credits")) or 0.0 for item in items)
-                unreported = unreported or bool(usage.get("unreported_usage"))
-                balance = _known(usage.get("available"))
-                if balance is not None:
-                    available.append(balance)
-                accounts.append({"account": tag, "session_used": round(used, 4), "turns": turns,
-                                 "available": balance})
-            recent.sort(key=lambda item: item.get("ts") or 0)
-            return {"session_used": round(totals["session_used"], 4), "turns": totals["turns"],
-                    "recent": recent[-50:], "recent_total": round(totals["recent_total"], 4),
-                    "unreported_usage": unreported,
-                    "available": round(sum(available), 4) if available else None,
-                    "accounts": accounts}
+            return account_report.usage_report(runtime)
 
         def _health(self):
             # An account counts when the dispatcher routes to it and its own balance
             # check is fresh; one healthy account keeps the relay serving.
-            states = self._account_states()
-            ok = known = False
-            routable = 0
-            reserve = 0
-            counts = {}
-            rows = account_managers(runtime)
-            # Mirror SessionPool._next_backend: active accounts first; when none is
-            # active, exhausted accounts with a positive or unknown balance (the
-            # failover reserve) are still served. A lone auth_dead account is also
-            # tried there as a last resort, but /health deliberately keeps reporting
-            # it as not routable: a signed-out account cannot be called healthy.
-            active = [backend for backend, _ in rows if getattr(backend, "unavailable", None) is None]
-            spare = [] if active else SessionPool._reserve([backend for backend, _ in rows])
-            for backend, manager in rows:
-                state = (states.get(backend) or {}).get("state") or (
-                    (getattr(backend, "unavailable", None) or {}).get("reason") or "active")
-                counts[state] = counts.get(state, 0) + 1
-                balance = manager.get_balance()
-                fresh = balance.get("available") is not None and not balance.get("stale")
-                known = known or fresh
-                if backend in active or backend in spare:
-                    routable += 1
-                    reserve += backend in spare
-                    ok = ok or fresh
+            summary = account_report.summarize(account_report.collect(runtime))
+            ok = summary["ok"]
             # /health is the only unauthenticated route and carries CORS *: it must
             # expose readiness booleans, not organization financials or raw
             # upstream error text — those live behind /v1/balance with the key.
@@ -568,10 +460,10 @@ def make_handler(runtime: Runtime):
                 "session_mode": cfg["session_mode"],
                 "models": len(model_catalog.catalog()),
                 "upstream": "ok" if ok else "degraded",
-                "balance_known": known,
+                "balance_known": summary["balance_known"],
                 "session": session,
-                "accounts": {"total": sum(counts.values()), "routable": routable, "reserve": reserve,
-                             "states": counts},
+                "accounts": {"total": summary["total"], "routable": summary["routable"],
+                             "reserve": summary["reserve"], "states": summary["states"]},
             }
             self._json(200 if ok else 503, payload)
 

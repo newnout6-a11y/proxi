@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlsplit
 
 from urllib.parse import parse_qs
 
+import account_report
 import apierr
 import auth
 import config
@@ -117,11 +118,27 @@ class Admin:
         self.lock = threading.Lock()
         self.schema = _schema()
 
+    def _account_secrets(self):
+        """Credentials of every account; short values are skipped so they cannot mangle ordinary text."""
+        secrets = []
+        for backend in getattr(self.runtime.accounts, "backends", None) or []:
+            cfg = getattr(backend, "cfg", None) or {}
+            secrets += [cfg.get("cookie"), cfg.get("xsrf")]
+            secrets += [part.partition("=")[2].strip() for part in str(cfg.get("cookie") or "").split(";")]
+            secrets += cfg.get("cookie_values") or []
+        secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= 8]
+        for backend in getattr(self.runtime.accounts, "backends", None) or []:
+            cfg = getattr(backend, "cfg", None) or {}
+            secrets += [str(cfg[key]) for key in ("account_id", "page_uuid", "thread_id", "base")
+                        if cfg.get(key) and len(str(cfg[key])) >= 5]
+        return sorted(set(secrets), key=len, reverse=True)
+
     def _safe(self, value):
         if isinstance(value, str):
             value = redact(value, cookie_values=self.cfg.get("cookie_values", []))
             secrets = [self.cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf")]
             secrets += self.cfg.get("cookie_values", [])
+            secrets += self._account_secrets()
             for secret in secrets:
                 if secret:
                     value = value.replace(secret, "[redacted]")
@@ -174,10 +191,36 @@ class Admin:
         return {"data": [{**entry, "routable": self._routable(entry), "available_verified": None}
                          for entry in models.catalog()], "default_model": self.cfg.get("model")}
 
+    def _accounts(self, entries, usage):
+        accounts = []
+        for entry, per_account in zip(entries, usage["accounts"]):
+            info, backend = entry["info"], entry["backend"]
+            error = info.get("error") or info.get("stale_error")
+            accounts.append({
+                "account": account_report.account_tag(backend), "state": entry["state"],
+                "routable": entry["routable"], "reserve": entry["reserve"],
+                "available": entry["available"],
+                "monthly_allocation": account_report.known(info.get("monthly_allocation")),
+                "used_month": account_report.known(info.get("used_month")),
+                "reset_date": info.get("reset_date"), "stale": bool(info.get("stale")),
+                "session_used": per_account.get("session_used", 0.0), "turns": per_account.get("turns", 0),
+                "auth_failures": entry["auth_failures"],
+                "last_renewed_at": getattr(getattr(backend, "refresher", None), "last_success_at", None),
+                "error": self._safe(str(error))[:200] if error else None,
+            })
+        return accounts
+
     def _overview(self, handler):
         runtime = self.runtime
-        balance = runtime.credits.get_balance()
-        ok = balance.get("available") is not None and not balance.get("stale")
+        entries = account_report.collect(runtime)
+        summary = account_report.summarize(entries)
+        usage = account_report.usage_report(runtime, [(entry["backend"], entry["manager"]) for entry in entries])
+        accounts = self._accounts(entries, usage)
+        balance = account_report.aggregate_balance([entry["info"] for entry in entries])
+        errors = [item["error"] for item in accounts if item["error"]]
+        if balance["available"] is None:
+            balance["error"] = errors[0] if errors else None
+        ok = summary["ok"]
         catalog = self._models()["data"]
         # Counters are sampled without iterating or exposing conversation keys.
         pool = runtime.pool
@@ -188,10 +231,16 @@ class Admin:
         authority = ("[" + host + "]" if ":" in host else host) + ":" + str(port)
         base_url = "http://" + authority
         return self._safe({
-            "health": {"ok": ok, "upstream": "ok" if ok else "degraded",
-                       "error": balance.get("error") or balance.get("stale_error")},
+            "health": {"ok": ok, "upstream": "ok" if ok else "degraded", "error": errors[0] if errors else None},
             "uptime_seconds": round(max(0, time.time() - runtime.started), 1),
-            "balance": balance, "usage": runtime.credits.usage(),
+            "balance": balance, "usage": usage,
+            "accounts": accounts,
+            "accounts_summary": {key: summary[key] for key in ("total", "routable", "reserve", "states")},
+            "limits": {"min_account_balance": self.cfg.get("min_account_balance"),
+                       "account_balance_interval": self.cfg.get("account_balance_interval"),
+                       "upstream_empty_retries": self.cfg.get("upstream_empty_retries", 1),
+                       "max_workers": self.cfg["max_workers"],
+                       "max_conversations": self.cfg["max_conversations"]},
             "session": runtime.backend.refresher.status(),
             "sessions": {"active": len(pool._active), "cached": len(pool._conversations),
                          "max_workers": self.cfg["max_workers"],
@@ -408,7 +457,10 @@ class Admin:
                 payload = {"data": self.runtime.journal.turns(_int_param(query, "limit", 60, 1, 500))}
             elif path == "/admin/api/metrics":
                 window = _int_param(query, "window", 3600, 300, 86400)
-                payload = self.runtime.journal.metrics(window=window, bucket=max(10, window // 60))
+                auto = max(10, window // 60) if window <= 3600 else 300 if window <= 21600 else 900
+                # At most 1440 buckets keep the response small whatever 'bucket' asks for.
+                bucket = _int_param(query, "bucket", auto, max(10, -(-window // 1440)), window)
+                payload = self.runtime.journal.metrics(window=window, bucket=bucket)
             else:
                 raise apierr.not_found()
         elif handler.command == "POST" and path == "/admin/api/session":
