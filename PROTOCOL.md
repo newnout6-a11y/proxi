@@ -72,6 +72,11 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
   `maxCompletionTokens` — только если клиент задал лимит, не меньше 16.
 - `openAICacheKey` — `sha256(model, 0x00, tools JSON, 0x00, head)[:24]`; `rit` — не криптографический
   hint целостности от длины `messages` и `tools`.
+- Для каждой части `rit` длина — `JSON.stringify(value).length` в единицах UTF-16;
+  хэш — `((length * 2654435761) >>> 0).toString(16).padStart(8, "0")`.
+  Умножение выполняется с округлением JavaScript Number (IEEE 754 binary64) до
+  приведения к uint32. При длинах около 3,4 млн единиц и выше точное целочисленное
+  умножение Python может дать другой результат и привести к `400 Invalid request format`.
 - `metadata` содержит только `sandpackAgent`; для моделей из списка Assist поле не отправляется
   (relay убирает его и при повторе после ответа «not available right now»).
 - `providerResourceName` не отправляется, если ресурс не задан (`__managed__`).
@@ -81,6 +86,15 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 - `providerResourceName`: UUID провайдера (Anthropic, OpenAI, Google и др.).
 - `messages`: массив сообщений диалога. Поддерживает текстовые и мультимодальные (`type: "image"`) блоки.
 - `tools`: массив схем клиентских инструментов (принимаются нативно без bridging).
+- Нативная история поддерживает `role: assistant` с блоками
+  `{type: "thinking", thinking: "", signature: "<opaque>"}` и
+  `{type: "tool_call", toolCallId, toolName, toolInput}`, а также `role: tool` с
+  `content: {toolCallId, toolResult}`. Relay сохраняет блоки принятого ответа и
+  возвращает их на tool result, сохраняя исходный prefix. Только cache hints
+  на текстовых/tool-call блоках могут перемещаться в пределах бюджета;
+  thinking/signature не меняются. Старый клиентский prefix остаётся текстовым
+  до первой принятой точки продолжения. Состояние изолировано по аккаунту и
+  диалогу; подробности и live-проверка — [в разборе](docs/thinking-latency-2026-11-04.md).
 - `reasoningEffort`: валидация по per-model списку уровней (`/v1/models → capabilities.reasoning_effort_levels`); набор включает `minimal` (GPT-5) и `max` (GPT-6*). Неподдерживаемый уровень даёт 400 до upstream. Только явный `allow_effort_downgrade: true` разрешает приближение известных уровней; requested/effective effort и причина попадают в журнал. Неизвестные значения всегда дают 400; конфликтующие thinking-контроли — 422. Live 2026-11-03: Opus 5.5 принимает high/max, GPT-6-sol и GPT-6.1-sol принимают max; xhigh отвергнут с 422 на всех проверенных GPT-6 маршрутах.
 - `openAICacheKey`: ключ кэширования префикса промпта для KV-кэша.
 - `metadata.sandpackAgent: true`: открывает доступ к моделям, управляемым через Sandpack-инфраструктуру.

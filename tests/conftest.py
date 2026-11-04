@@ -121,3 +121,5 @@ def relay(monkeypatch, tmp_path):
         # CI (Windows runners) has shown the listener socket already closed by
         # the OS at teardown; the fixture is done either way.
         pass
+    finally:
+        runtime.close()

@@ -32,6 +32,7 @@ from credits import CreditsManager
 from orchestrator import TurnRunner
 from session import Backend, SessionPool
 from upstream_diagnostics import WireTrace
+from io_workers import DaemonIOExecutor
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -66,12 +67,15 @@ class Runtime:
     def __init__(self, cfg):
         self.cfg = cfg
         self.loop = asyncio.new_event_loop()
+        self._lifecycle_lock = threading.Lock()
+        self._closing = False
         # Each direct turn holds one executor thread for its whole stream; the
         # default pool (~min(32, cpu+4)) silently capped concurrent turns below
         # max_workers and starved keepwarm pings / refreshes behind them.
-        self.loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(32, int(cfg.get("max_workers", 32)) * 2 + 8), thread_name_prefix="relay-io"))
-        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        self._io_executor = DaemonIOExecutor(max(32, int(cfg.get("max_workers", 32)) * 2 + 8))
+        self.loop._relay_io_executor = self._io_executor
+        self._loop_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self._loop_thread.start()
         self.backend = Backend(cfg)
         self.pool = SessionPool(self.backend)
         if getattr(self.pool, "backends", None):
@@ -95,6 +99,51 @@ class Runtime:
         self.journal = journal.JOURNAL
         self.journal.configure(cfg, cfg.get("journal_path"))
         self.admin = admin_module.Admin(self)
+
+    def submit(self, coroutine):
+        with self._lifecycle_lock:
+            if self._closing:
+                coroutine.close()
+                raise apierr.service_unavailable("relay is shutting down")
+            return asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+
+    async def _shutdown_tasks(self):
+        self.loop._relay_closing = True
+        sessions = {record[0] for record in self.pool._active.values()}
+        sessions.update(self.pool._conversations.values())
+        if self.pool._shared is not None:
+            sessions.add(self.pool._shared)
+        for session in sessions:
+            session.cancel()
+        if sessions:
+            await asyncio.gather(*(session.aclose() for session in sessions), return_exceptions=True)
+        # Session cleanup can finish turn generators; drain those tasks as well.
+        while True:
+            tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+            if not tasks:
+                break
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.loop.shutdown_asyncgens()
+
+    def close(self):
+        with self._lifecycle_lock:
+            if self._closing:
+                return
+            self._closing = True
+        future = asyncio.run_coroutine_threadsafe(self._shutdown_tasks(), self.loop)
+        try:
+            future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            journal.emit("relay.shutdown", "Истекло время завершения задач relay", "warn")
+        finally:
+            self._io_executor.shutdown(wait=False, cancel_futures=True)
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self._loop_thread.join(timeout=2)
+            if not self._loop_thread.is_alive():
+                self.loop.close()
 
 
 def account_tag(backend):
@@ -660,7 +709,7 @@ def make_handler(runtime: Runtime):
             holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
             self._holder = holder
             self._model_called = True
-            fut = asyncio.run_coroutine_threadsafe(runtime.runner.run(parsed, events, holder), runtime.loop)
+            fut = runtime.submit(runtime.runner.run(parsed, events, holder))
 
             prompt_text = parsed.system + "\n" + parsed.prompt
             if not parsed.stream:
@@ -790,9 +839,23 @@ class BoundedServer(ThreadingHTTPServer):
     def __init__(self, address, handler, slots):
         super().__init__(address, handler)
         self.slots = slots
+        self._stopping = threading.Event()
+
+    def shutdown(self):
+        self._stopping.set()
+        super().shutdown()
 
     def process_request(self, request, client_address):
-        self.slots.acquire()
+        while not self._stopping.is_set():
+            if self.slots.acquire(timeout=0.1):
+                break
+        else:
+            self.shutdown_request(request)
+            return
+        if self._stopping.is_set():
+            self.slots.release()
+            self.shutdown_request(request)
+            return
         try:
             super().process_request(request, client_address)
         except Exception:
@@ -860,7 +923,12 @@ def main(argv=None):
         print(" upstream:      DEGRADED " + str(balance.get("error")))
     print("=" * 64)
 
+    stop_requested = threading.Event()
+
     def stop(*_):
+        if stop_requested.is_set():
+            return
+        stop_requested.set()
         print("\nshutting down…")
         threading.Thread(target=server.shutdown, daemon=True).start()
 
@@ -881,34 +949,20 @@ def main(argv=None):
                 server.serve_forever()
                 break
             except Exception as exc:  # never lose the listener on a stray error
+                if stop_requested.is_set():
+                    break
                 print("serve_forever crashed:", exc, flush=True)
                 time.sleep(0.5)
     finally:
         try:
+            server.server_close()
+            runtime.close()
+        finally:
             backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
             refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
             for r in refreshers:
                 r.stop()
             runtime.accounts.stop()
-            async def _cancel_all():
-                tasks = [t for t in asyncio.all_tasks(runtime.loop) if t is not asyncio.current_task()]
-                for t in tasks:
-                    t.cancel()
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Wait (bounded) so in-flight turns unwind and sessions release
-            # before the daemon loop thread is torn down with the interpreter.
-            future = asyncio.run_coroutine_threadsafe(_cancel_all(), runtime.loop)
-            try:
-                future.result(timeout=10)
-            except Exception:
-                pass
-            # Stop only after the future resolved: stopping inside the coroutine
-            # left its result callback unrun and shutdown always waited the full 10s.
-            runtime.loop.call_soon_threadsafe(runtime.loop.stop)
-        finally:
-            server.server_close()
 
 
 if __name__ == "__main__":

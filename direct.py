@@ -22,6 +22,7 @@ import credits
 import journal
 import client_context
 import console_log
+import native_history
 import models as model_catalog
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
@@ -137,7 +138,10 @@ def _js_length(value):
 
 
 def _hash32(length):
-    return format((length * 2654435761) & 0xFFFFFFFF, "08x")
+    # Match JavaScript Number multiplication before >>> 0. The product exceeds
+    # 2**53 around 3.4M UTF-16 units; exact Python integers then produce a different
+    # hint for some lengths, so otherwise valid large requests are rejected.
+    return format(int(length * 2654435761.0) & 0xFFFFFFFF, "08x")
 
 
 def make_rit(messages, tools=None):
@@ -432,6 +436,12 @@ def cache_key_for(head, model="", tools=None):
     return digest.hexdigest()[:24]
 
 
+def _has_cacheable_text(chunk):
+    blocks = chunk if isinstance(chunk, list) else [chunk]
+    # Non-dict blocks become text in build_body; image dicts cannot carry cache.
+    return any(not isinstance(block, dict) or block.get("type") == "text" for block in blocks)
+
+
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
     """Assemble the request body.
 
@@ -441,6 +451,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     """
     messages = []
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
+    prefix_key = cache_key_for(head, model_provider.get("model"), tools) if cache and head else None
     if head:
         block = {"type": "text", "text": head}
         if cache:
@@ -456,7 +467,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         if cfg.get("direct_cache", True):
             session_ends = [idx for idx in getattr(session, "_cached_turn_ends", []) if 0 <= idx < len(history) - 1] if session else []
 
-            # Chunk 0 is the initial conversation prompt and must ALWAYS be preserved
+            # The initial prompt is useful when the marker budget leaves room.
             turn_boundaries.add(0)
 
             for i, chunk in enumerate(history):
@@ -475,18 +486,36 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             budget = 4 - (1 if tools else 0)
             max_history_cache = budget - 1 if (head and cache) else budget
 
-            chosen = set()
-            chosen.add(0)
-            chosen.add(len(history) - 1)
+            # An image-only tail cannot carry cache: selecting its index silently
+            # lost the recent history breakpoint and re-billed the whole prefix.
+            cacheable_indices = [i for i, part in enumerate(history) if _has_cacheable_text(part)]
+            cacheable = set(cacheable_indices)
+            chosen = {cacheable_indices[-1]} if cacheable_indices else set()
+            previous = [i for i in session_ends if i in cacheable]
+            warm_body = getattr(session, "_warm_body", None) if session is not None else None
+            if isinstance(warm_body, dict) and prefix_key and warm_body.get("openAICacheKey") == prefix_key:
+                warm_messages = warm_body.get("messages") or []
+                offset = int(bool(warm_messages and warm_messages[0].get("role") == "system"))
+                previous += [i - offset for i, message in enumerate(warm_messages)
+                             if i - offset in cacheable and i - offset < len(history) - 1
+                             and isinstance(message.get("content"), list)
+                             and any(isinstance(block, dict) and block.get("cache")
+                                     for block in message["content"])]
+            if previous:
+                # Provider lookup only scans a limited number of blocks before a
+                # breakpoint. Keep the old endpoint when a tool batch adds >20.
+                chosen.add(max(previous))
+            if cacheable_indices and len(chosen) < max_history_cache:
+                chosen.add(cacheable_indices[0])
 
             slots_left = max_history_cache - len(chosen)
-            intermediates = [i for i in known_boundaries if 0 < i < len(history) - 1]
+            intermediates = [i for i in known_boundaries if i in cacheable and i not in chosen]
             if slots_left > 0 and intermediates:
                 for idx in intermediates[-slots_left:]:
                     chosen.add(idx)
 
-            if len(chosen) < max_history_cache and len(history) >= 3:
-                for idx in reversed(range(1, len(history) - 1)):
+            if len(chosen) < max_history_cache:
+                for idx in reversed(cacheable_indices):
                     if len(chosen) >= max_history_cache:
                         break
                     chosen.add(idx)
@@ -537,6 +566,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     if session is not None and history and cfg.get("direct_cache", True):
         prior = [e for e in getattr(session, "_cached_turn_ends", []) if e < len(history) - 1]
         all_ends = set(prior) | {e for e in turn_boundaries if e < len(history) - 1}
+        all_ends.update(cache_indices)
         all_ends.add(0)
         all_ends.add(len(history) - 1)
         session._cached_turn_ends = sorted(all_ends)
@@ -558,34 +588,53 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             (tool_choice or {}).get("function", {}).get("name") if isinstance(tool_choice, dict) else None)
         if choice and choice != "auto":
             body["toolChoice"] = choice
-    if cache and head:
-        body["openAICacheKey"] = cache_key_for(head, body.get("model"), tools)
+    if prefix_key:
+        body["openAICacheKey"] = prefix_key
     return body
 
 
 def _bounded_put(loop, queue, item, is_cancelled, max_wait=120.0):
-    """Thread-safe bounded put that never duplicates: one put future is awaited
-    until it lands (a blocked worker is the backpressure) or the session dies.
-    Re-creating the future on a timeout would enqueue the item twice. A consumer
-    that vanished without cancelling cannot hold the worker forever: after
-    max_wait the line is dropped — the turn is dead by then anyway."""
-    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+    """One owner-loop callback retries a full queue; the producer waits for it.
+
+    Cancellation disables that callback before returning, preventing duplicates
+    or late enqueueing. No Queue.put coroutine is left behind on loop shutdown.
+    """
+    if is_cancelled() or loop.is_closed() or not loop.is_running():
+        return False
+    delivered = threading.Event()
+    lock = threading.Lock()
+    state = {"sent": False, "cancelled": False}
+
+    def put_once():
+        with lock:
+            if state["cancelled"]:
+                return
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                loop.call_later(0.05, put_once)
+                return
+            state["sent"] = True
+            delivered.set()
+
+    try:
+        loop.call_soon_threadsafe(put_once)
+    except RuntimeError:  # the loop closed between the check and the hand-off
+        return False
     deadline = time.monotonic() + max_wait if max_wait else None
-    while True:
-        timeout = 5.0 if deadline is None else max(0.05, min(5.0, deadline - time.monotonic()))
-        try:
-            future.result(timeout=timeout)
-            return True
-        except TimeoutError:
-            if is_cancelled():
-                future.cancel()
-                return False
-            if deadline is not None and time.monotonic() >= deadline:
-                future.cancel()
+    while not delivered.wait(0.1):
+        expired = deadline is not None and time.monotonic() >= deadline
+        if is_cancelled() or expired or loop.is_closed() or not loop.is_running():
+            with lock:
+                if state["sent"]:
+                    return True
+                state["cancelled"] = True
+            if expired:
                 journal.emit("direct.queue_drop",
                              "Кадр отброшен: потребитель не отвечал дольше %d с — ход прерван" % int(max_wait),
                              "warn")
-                return False
+            return False
+    return True
 
 
 def _error_from_event(event):
@@ -618,12 +667,16 @@ def _ping(session, body):
                                      data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
                                      headers=headers, method="POST")
     response = urllib.request.urlopen(request, timeout=120)
+    abort = lambda: _force_close_response(response)
+    session._active_warm_abort = abort
     actual_credits = None
     complete = False
     billing_id = "keepwarm:" + uuid.uuid4().hex
     warm_usage = {}
     try:
-        for index, raw in enumerate(response):
+        for raw in response:
+            if getattr(session, "_cancelled", False):
+                raise InterruptedError("cache refresh cancelled")
             line = raw.strip()
             if not line:
                 continue
@@ -645,9 +698,9 @@ def _ping(session, body):
             if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
                 complete = True
                 break
-            if index >= 200:
-                break
     finally:
+        if getattr(session, "_active_warm_abort", None) is abort:
+            session._active_warm_abort = None
         try:
             response.close()
         finally:
@@ -739,7 +792,13 @@ async def _keepwarm(session, cfg):
             # snapshotting before to_thread so a following turn cannot relabel it.
             client_context.bind(identity)
             ping_started = now
-            actual = await asyncio.to_thread(_ping, session, body)
+            loop = asyncio.get_running_loop()
+            io_executor = getattr(loop, "_relay_io_executor", None)
+            if io_executor is None:
+                actual = await asyncio.to_thread(_ping, session, body)
+            else:
+                actual = await loop.run_in_executor(io_executor, contextvars.copy_context().run,
+                                                    _ping, session, body)
             if busy and getattr(session, "_turn_seq", 0) == seq:
                 session._turn_pinged = True
                 next_turn_ping = ping_started + active_interval
@@ -772,10 +831,12 @@ async def _keepwarm(session, cfg):
             session._warm_failures = failures
             if failures >= 5:
                 journal.emit("cache.keepwarm", "Прогрев остановлен после пяти неудач", "warn")
+                console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire")
                 return
             retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
             next_turn_ping = retry_at
             journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn")
+            console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" % str(exc)[:200])
         finally:
             client_context.reset(context_token)
 
@@ -783,7 +844,33 @@ async def _keepwarm(session, cfg):
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
     """Yield normalised relay events from the direct NDJSON stream."""
-    body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
+    client = getattr(session, "_native_client_messages", None)
+    history = getattr(session, "_native_history", None)
+    # Output caps control the next generation, not the signed input prefix.
+    # OpenCode legitimately omits or changes them between tool follow-ups.
+    scope = json.dumps([getattr(session, "_native_conversation_key", None), model_provider,
+                        head, tools, tool_choice], sort_keys=True, ensure_ascii=True)
+    parent, messages = history.resume(scope, client) if history is not None and client is not None else (None, None)
+    if messages is not None:
+        body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
+        body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools)
+        body["rit"] = make_rit(body["messages"], tools)
+        journal.emit("native_history.resume", "Сохранённые assistant/thinking blocks возвращены upstream", "info",
+                     blocks=len(parent.assistant), messages=len(body["messages"]),
+                     signatures=sum(b["type"] == "thinking" for b in parent.assistant))
+        req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
+        console_log.write("[%s] [history] native continuation restored thinking=%d tool_calls=%d" % (
+            req_id, sum(b["type"] in ("thinking", "redacted_thinking") for b in parent.assistant),
+            sum(b["type"] == "tool_call" for b in parent.assistant)))
+    else:
+        if history is not None and history.branches and client is not None:
+            # Never attach an old signature to a rebuilt/edited prefix.
+            session._cached_turn_ends = []
+            session._warm_body = None
+            journal.emit("native_history.reset", "История или настройки изменились; прежняя подпись не переиспользуется",
+                         "warn", reason="prefix_or_settings_mismatch")
+        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
+    session._direct_reply = None
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
         body = {key: value for key, value in body.items() if key != "metadata"}
@@ -823,6 +910,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 session._turn_body = body
             async for event in _stream_body(cfg, session, body, param_types):
                 yield event
+        reply = getattr(session, "_direct_reply", None)
+        if client is not None and history is not None and reply is not None and not session._cancelled:
+            blocks, expected = reply
+            history.record(scope, client, body["messages"], blocks, expected, parent)
     except apierr.ApiError as error:
         # A body upstream rejected (400/413/422) must not become the keepwarm body.
         rejected = 400 <= error.status < 500 and error.status not in (401, 403, 408, 429)
@@ -852,6 +943,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 
 
 def _ensure_keepwarm(session, cfg):
+    if getattr(session, "_cancelled", False) or getattr(asyncio.get_running_loop(), "_relay_closing", False):
+        return
     task = getattr(session, "_warm_task", None)
     if task is None or task.done():
         # A fresh cycle gets a fresh failure budget.
@@ -932,6 +1025,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
     elif json.loads(payload) != body:
         raise ValueError("replay payload does not match the supplied body")
+    session._direct_reply = None
     if cfg.get("direct_debug"):
         body_summary = {k: v for k, v in body.items() if k not in ("messages", "tools")}
         if "tools" in body:
@@ -974,7 +1068,10 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 queue.put_nowait(item)
             except asyncio.QueueFull:
                 pass
-        loop.call_soon_threadsafe(_put)
+        try:
+            loop.call_soon_threadsafe(_put)
+        except RuntimeError:  # a cancelled daemon reader can outlive the loop
+            pass
 
     def abort_direct():
         _force_close_response(holder.get("response"))
@@ -1087,7 +1184,8 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             yield {"type": "usage_start"}
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
-            task = loop.run_in_executor(None, contextvars.copy_context().run, worker, queue)
+            task = loop.run_in_executor(getattr(loop, "_relay_io_executor", None),
+                                        contextvars.copy_context().run, worker, queue)
             flags = {"budget": budget}
             failure = None
             try:
@@ -1097,6 +1195,11 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     if trace:
                         trace.wire.event("parser_event", event=event)
                     kind = event.get("type")
+                    if kind == "thinking_start":
+                        # Display status is live even while this attempt's content
+                        # is buffered. Never expose a discarded signature or actual
+                        # thinking just to start the client's waiting indicator.
+                        yield {"type": "thinking_status", "source": "upstream"}
                     if kind == "tool_call" or (kind == "text" and event.get("delta", "").strip()):
                         usable = True
                     if kind in ("thinking", "thinking_start", "thinking_signature", "thinking_heartbeat"):
@@ -1114,7 +1217,10 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 failure = exc
                 raise
             finally:
-                if flags.get("usage_seen") and not flags.get("credits_reported"):
+                current_trace = holder.get("trace")
+                possibly_billed = (current_trace is not None and
+                                   (current_trace.http_status is None or 200 <= current_trace.http_status < 300))
+                if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
                     if mark_unknown:
                         mark_unknown()
@@ -1163,6 +1269,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             yield {"type": "error", "error": budget.attach(apierr.upstream_error(
                 "upstream stream ended without end_of_stream; the response may be incomplete"))}
             return
+        blocks = flags.get("assistant_blocks")
+        if usable and blocks and not is_cancelled():
+            session._direct_reply = (blocks, native_history.echo(blocks, param_types or {}, coerce_arguments))
+        elif usable and "assistant_blocks" in flags and blocks is None and not is_cancelled():
+            journal.emit("native_history.unavailable", "Ответ upstream нельзя сохранить для нативного продолжения",
+                         "warn", reason="unsupported_or_incomplete_blocks")
         yield {"type": "end", "reason": "stop"}
     finally:
         session._active_direct_abort = None
@@ -1181,6 +1293,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
     calls = {}
     current = None
     call_seq = 0  # monotonic: a finished call leaves `calls`, len() would repeat ids
+    capture = native_history.ReplyCapture() if getattr(session, "_native_client_messages", None) is not None else None
     # The relay request id matches the `relay <id> POST ...` console lines:
     # concurrent requests of one conversation interleave in the same console.
     req_id = getattr(session, "_request_tag", None) or getattr(session, "thread_id", None) or "req"
@@ -1210,9 +1323,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         except asyncio.TimeoutError:
             if think_started is not None and not text and not stack and not calls:
                 elapsed = loop_now() - think_started
-                console_log.write(f"[{req_id}] Model is actively reasoning... ({round(elapsed)}s elapsed)")
+                console_log.write(f"[{req_id}] Waiting for upstream reasoning output... ({round(elapsed)}s elapsed)")
                 journal.emit("upstream.thinking_heartbeat",
-                             f"Модель активно думает ({round(elapsed)} с)",
+                             f"Ожидаем ответ upstream после начала thinking ({round(elapsed)} с)",
                              "debug", elapsed=round(elapsed, 1), thread=journal.tag(req_id))
                 yield {"type": "thinking_heartbeat", "elapsed": round(elapsed, 1)}
             continue
@@ -1234,8 +1347,17 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             # A valid JSON line that is not an object (a number, a list) must be
             # skipped, not kill the turn with an AttributeError.
             continue
+        if capture is not None:
+            try:
+                capture.feed(event)
+            except (TypeError, ValueError, AttributeError):
+                # Unknown provider extensions must not corrupt signed history or
+                # change the existing stream parser's error handling.
+                capture.valid = False
         if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
             flags["end"] = True
+            if capture is not None:
+                flags["assistant_blocks"] = capture.finish()
             # A stream can end with calls still open: finalize them exactly like
             # content_block_end would, or the client keeps a dangling partial.
             while stack:
@@ -1250,6 +1372,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 # Opus 5.5 streams no thinking text, only this early start and a final
                 # signature; surfacing the start replaces silence with "thinking".
                 think_started = loop_now()
+                console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start")
+                journal.emit("upstream.thinking_signal", "Upstream сообщил начало блока thinking", "info",
+                             source="upstream", signal="content_block_start", thread=journal.tag(req_id))
                 yield {"type": "thinking_start"}
             elif event.get("type") == "tool_call":
                 think_started = None
