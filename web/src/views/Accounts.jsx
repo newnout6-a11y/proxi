@@ -70,7 +70,10 @@ function AccountRow({ account, busy, onAction, onPatch, onDelete, lastEnabled })
         <Priority value={account.priority} disabled={!!account.pending || busy} onSave={(priority) => onPatch({ priority })} />
         <Toggle id={`enabled-${account.account}`} checked={account.enabled !== false}
           label={`Аккаунт ${name} в маршрутизации`}
-          onChange={(enabled) => (!enabled && lastEnabled ? null : onPatch({ enabled }))} />
+          disabled={busy || account.pending === 'removed' || (account.enabled !== false && lastEnabled)}
+          title={account.pending === 'removed' ? 'Аккаунт удалён и исчезнет после перезапуска'
+            : account.enabled !== false && lastEnabled ? 'Это последний включённый аккаунт: без него relay не сможет отвечать' : undefined}
+          onChange={(enabled) => onPatch({ enabled })} />
       </div>
       <div className="pool-actions">
         <Button icon={Wallet} disabled={busy || !!account.pending} onClick={() => onAction('balance')}>Баланс</Button>
@@ -165,7 +168,8 @@ export default function Accounts({ apiKey, onUnauthorized }) {
 
   const accounts = data?.accounts || [];
   const summary = data?.summary;
-  const enabledCount = accounts.filter((a) => a.enabled !== false && a.pending !== 'removed').length;
+  // Only accounts that serve now count: an added one waits for a restart, a removed one is leaving
+  const enabledCount = accounts.filter((a) => a.enabled !== false && !a.pending).length;
 
   const action = (account) => (kind) => run(account.account, kind === 'balance' ? 'Баланс не получен' : 'Сессия не продлена',
     () => api(apiKey, `accounts/${account.account}/${kind}`, { method: 'POST', body: {} }),
@@ -221,7 +225,7 @@ export default function Accounts({ apiKey, onUnauthorized }) {
           <ul className="pool-list">
             {accounts.map((account) => (
               <AccountRow key={account.account} account={account} busy={!!busy[account.account]}
-                lastEnabled={account.enabled !== false && enabledCount <= 1}
+                lastEnabled={!account.pending && account.enabled !== false && enabledCount <= 1}
                 onAction={action(account)} onPatch={patch(account)} onDelete={remove(account)} />
             ))}
           </ul>

@@ -94,9 +94,9 @@ export function Empty({ art, title, text, hint }) {
   );
 }
 
-export function Toggle({ checked, onChange, label, id }) {
+export function Toggle({ checked, onChange, label, id, disabled, title }) {
   return (
-    <button type="button" role="switch" id={id} aria-checked={checked} aria-label={label}
+    <button type="button" role="switch" id={id} aria-checked={checked} aria-label={label} disabled={disabled} title={title}
       className={`toggle ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)}>
       <span className="toggle-knob" />
     </button>

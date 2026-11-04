@@ -929,6 +929,8 @@ class SessionPool:
             routable.append(backend)
         if not routable:
             raise apierr.service_unavailable("no account has a route for the requested model")
+        if not any(account_enabled(b) for b in routable) and any(account_enabled(b) for b in self.backends):
+            raise apierr.service_unavailable("no enabled account has a route for the requested model")
         eligible = [backend for backend in routable if self._usable(backend, exclude)]
         if not eligible:
             spare = self._reserve(routable, exclude)

@@ -45,7 +45,7 @@ function Field({ name, field, value, onChange, pending, dirty }) {
             const raw = e.target.value;
             onChange(raw === '' ? '' : field.type === 'integer' ? parseInt(raw, 10) : parseFloat(raw));
           }} />
-        <span className="unit">{field.unit || ''}</span>
+        {field.unit && <span className="unit">{field.unit}</span>}
       </span>
     );
   }

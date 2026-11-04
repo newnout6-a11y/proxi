@@ -100,6 +100,17 @@ test('spend is a line per bucket that falls back after its peak, and cache write
   await expect(page.locator('.c-write-line')).toHaveCount(1);
   await expect(page.locator('.c-spike')).toHaveCount(2);
   await expect(page.locator('.c-spike').first()).toContainText('+');
+  // Spike labels never overlap each other or another spike's dot, on a desktop or a phone
+  const overlapping = () => page.evaluate(() => {
+    const labels = [...document.querySelectorAll('.c-spike text')].map((t) => t.getBoundingClientRect());
+    const dots = [...document.querySelectorAll('.c-spike circle')].map((c) => c.getBoundingClientRect());
+    return labels.some((a, i) => labels.some((b, j) => i !== j && a.left < b.right && b.left < a.right))
+      || labels.some((a) => dots.filter((d) => d.left < a.right && a.left < d.right && d.top < a.bottom && a.top < d.bottom).length > 0);
+  });
+  expect(await overlapping()).toBe(false);
+  await page.setViewportSize({ width: 390, height: 900 });
+  await expect.poll(overlapping).toBe(false);
+  await expect(page.locator('.c-spike text')).not.toHaveCount(0);
 });
 
 test('metrics window switcher requests a 6 hour window', async ({ page }) => {
@@ -160,7 +171,9 @@ test('the last enabled account cannot be switched off', async ({ page }) => {
   await nav(page, 'Аккаунты');
   await page.getByRole('switch', { name: 'Аккаунт запасной в маршрутизации' }).click();
   await expect(page.locator('.pool-row').nth(1)).toContainText('выключен');
-  await page.getByRole('switch', { name: 'Аккаунт основной в маршрутизации' }).click();
+  const main = page.getByRole('switch', { name: 'Аккаунт основной в маршрутизации' });
+  await expect(main).toBeDisabled();
+  await expect(main).toHaveAttribute('title', /последний включённый/);
   expect(state.accountRequests.filter((r) => r.method === 'PATCH' && r.body?.enabled === false)).toHaveLength(1);
 });
 

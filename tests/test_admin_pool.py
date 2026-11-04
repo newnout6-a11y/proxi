@@ -157,7 +157,7 @@ def test_priority_and_label_are_saved_and_lower_priority_wins(pool):
 
 @pytest.mark.parametrize("payload", [{}, {"color": "red"}, {"priority": 100}, {"priority": -1},
                                      {"priority": True}, {"priority": 1.5}, {"enabled": "no"},
-                                     {"label": "x" * 41}, {"label": 5}])
+                                     {"label": "x" * 41}, {"label": 5}, {"label": "a\nb"}, {"label": "a\x00b"}])
 def test_invalid_patches_are_rejected_without_writing(pool, payload):
     before = pool.path.read_bytes()
     status, _ = pool.call("/admin/api/accounts/" + pool.tags[0], payload, method="PATCH")
@@ -286,7 +286,9 @@ def test_added_account_is_saved_with_an_id_and_waits_for_a_restart(pool):
 @pytest.mark.parametrize("change", [{"base": "http://tenant.retool.com"}, {"base": "https://tenant.retool.com/app"},
                                     {"base": "https://user:pw@tenant.retool.com"}, {"page_uuid": "not-a-uuid"},
                                     {"cookie": "a=b\r\nx-evil: 1"}, {"xsrf": ""}, {"label": "x" * 41},
-                                    {"extra": "field"}, {"cookie": None}])
+                                    {"extra": "field"}, {"cookie": None}, {"base": "https://tenant.retool.com:abc"},
+                                    {"base": "https://ten ant.retool.com"}, {"cookie": "accessToken=тест"},
+                                    {"provider_resource_name": "res\tname"}])
 def test_invalid_new_accounts_are_rejected(pool, change):
     before = pool.path.read_bytes()
     payload = {key: value for key, value in {**NEW, **change}.items() if value is not None}
@@ -353,6 +355,90 @@ def test_deleting_the_account_the_root_mirrors_removes_its_session_everywhere(po
 
 
 # -- configuration and settings ----------------------------------------------------
+def test_duplicate_detection_ignores_case(pool):
+    assert pool.call("/admin/api/accounts", NEW, method="POST")[0] == 200
+    upper = dict(NEW, page_uuid=NEW["page_uuid"].upper(), base="https://Tenant.Retool.com")
+    assert pool.call("/admin/api/accounts", upper, method="POST")[0] == 409
+
+
+@pytest.mark.parametrize("break_it", ["env", "no-cookie-in-file"])
+def test_adding_is_refused_when_the_running_session_is_not_in_the_file(admin_relay, break_it):
+    if break_it == "env":
+        admin_relay.cfg["_persist_auth"] = False  # RETOOL_COOKIE / RETOOL_XSRF
+    else:
+        saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
+        del saved["cookie"], saved["xsrf"]
+        admin_relay.path.write_text(json.dumps(saved), encoding="utf-8")
+    before = admin_relay.path.read_bytes()
+    status, body, _ = admin_relay.request("/admin/api/accounts", NEW, method="POST",
+                                          headers={"x-admin-request": "1", "origin": admin_relay.url})
+    assert status == 409 and "RETOOL_COOKIE" in body["error"]["message"]
+    assert admin_relay.path.read_bytes() == before
+
+
+def test_delete_scrubs_a_rotated_root_session_and_hands_root_resources_to_same_tenant_accounts(pool):
+    saved = pool.saved()
+    saved["accounts"][0]["cookie"] = "accessToken=rotated-cookie-123456"  # rotation writes accounts[i] only
+    saved["provider_resource_name"] = "root-resource"
+    saved["thread_id"] = "root-thread"
+    third = {key: value for key, value in _account("acc-c", "https://example.invalid").items()
+             if key != "provider_resource_name"}
+    saved["accounts"].append(third)
+    pool.path.write_text(json.dumps(saved), encoding="utf-8")
+    assert pool.call("/admin/api/accounts/" + pool.tags[0], {}, method="DELETE")[0] == 200
+    saved = pool.saved()
+    for key in ("cookie", "xsrf", "base", "page_uuid", "account_id", "thread_id", "provider_resource_name"):
+        assert key not in saved, key
+    encoded = json.dumps(saved)
+    assert "cookie-acc-a-123456" not in encoded and "rotated-cookie-123456" not in encoded
+    by_id = {record["account_id"]: record for record in saved["accounts"]}
+    assert by_id["acc-c"]["provider_resource_name"] == "root-resource"
+    assert by_id["acc-b"]["provider_resource_name"] == "resource-acc-b"
+    reloaded = config.load(str(pool.path))
+    assert reloaded["page_uuid"] == "page-acc-b" and reloaded["cookie"] == by_id["acc-b"]["cookie"]
+
+
+def test_shared_mode_keeps_its_account(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_saved(tmp_path, session_mode="shared", thread_id="thread-root")), encoding="utf-8")
+    runtime = proxy.Runtime(config.load(str(path)))
+    for backend in runtime.accounts.backends:
+        runtime.accounts.managers[backend] = backend.credits = FakeManager(50.0)
+    runtime.credits = runtime.accounts.managers[runtime.accounts.backends[0]]
+    try:
+        primary = journal.tag("acc-a")
+        for call in (lambda: runtime.admin._patch_account(primary, {"enabled": False}),
+                     lambda: runtime.admin._delete_account(primary)):
+            with pytest.raises(apierr.ApiError) as caught:
+                call()
+            assert caught.value.status == 409
+        assert runtime.pool.backend.cfg["enabled"] is True and len(json.loads(path.read_text())["accounts"]) == 2
+    finally:
+        runtime.loop.call_soon_threadsafe(runtime.loop.stop)
+
+
+def test_disabled_accounts_stay_off_the_network(pool, monkeypatch):
+    assert pool.call("/admin/api/accounts/" + pool.tags[1], {"enabled": False}, method="PATCH")[0] == 200
+    fetched = []
+    monkeypatch.setattr(pool.managers[1], "get_balance", lambda force_refresh=False: fetched.append(force_refresh))
+    for route in ("/admin/api/accounts", "/admin/api/overview"):
+        assert pool.call(route)[0] == 200
+    status, health = pool.call("/health")
+    assert status == 200 and fetched == []
+    assert accounts(pool)["accounts"][1]["available"] == 60.0  # the cached figure, not a fetch
+
+
+def test_no_route_on_enabled_accounts_is_named_as_such(tmp_path):
+    import models
+    _, sessions, _ = setup(tmp_path, transport="direct", project_context=False)
+    sessions.backends[0].cfg["enabled"] = False
+    sessions.backends.append(Backend(tmp_path, provider_resource_name=""))
+    entry = next(item for item in models.catalog() if item["provider"] == "anthropic")
+    with pytest.raises(apierr.ApiError) as caught:
+        sessions._next_backend(entry)
+    assert caught.value.status == 503 and "no enabled account has a route" in caught.value.message
+
+
 @pytest.mark.parametrize("field,value", [("priority", 100), ("priority", "1"), ("enabled", "yes"),
                                          ("label", "x" * 41)])
 def test_config_rejects_invalid_pool_fields(tmp_path, field, value):

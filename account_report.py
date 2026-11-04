@@ -46,7 +46,16 @@ def collect(runtime, *, force_refresh=False):
     spare = [] if active else SessionPool._reserve([backend for backend, _ in rows])
 
     def fetch(row):
-        return row[1].get_balance(force_refresh=force_refresh)
+        backend, manager = row
+        snapshot = getattr(manager, "balance_snapshot", None)
+        if not enabled(backend) and snapshot is not None:
+            # A switched-off account stays off the network (a stale cache would refetch and may
+            # renew the session); only an explicit admin balance check reaches Retool.
+            info = dict(snapshot())
+            info.setdefault("available", None)
+            info["stale"] = bool(info.get("stale")) and info["available"] is not None
+            return info
+        return manager.get_balance(force_refresh=force_refresh)
 
     if len(rows) == 1:
         infos = [fetch(rows[0])]

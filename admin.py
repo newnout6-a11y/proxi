@@ -36,6 +36,7 @@ NEW_ACCOUNT_OPTIONAL = ("label", "provider_resource_name", "openai_provider_reso
 ACCOUNT_RECORD_KEYS = ("base", "page_uuid", "cookie", "xsrf", "account_id", "thread_id", "label", "enabled",
                        "priority", *models.PROVIDER_RESOURCE_KEY.values())
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balance|renew))?")
 SETTING_GROUPS = ("routing", "model", "retries", "cache", "exec", "limits", "api")
 
@@ -53,6 +54,11 @@ def _list_param(query, name):
     for raw in query.get(name) or []:
         values += [item.strip() for item in raw.split(",") if item.strip()]
     return set(values) or None
+
+
+def _plain(value, *, ascii_only=False):
+    """No control characters; `ascii_only` also requires printable ASCII (values sent as HTTP headers)."""
+    return all(32 <= ord(char) < (127 if ascii_only else 0x110000) and ord(char) != 127 for char in value)
 
 
 def _schema():
@@ -440,7 +446,7 @@ class Admin:
                 raise apierr.bad_request("Unknown or protected account field", param=key)
             valid = ((key == "enabled" and type(value) is bool) or
                      (key == "priority" and type(value) is int and 0 <= value <= 99) or
-                     (key == "label" and isinstance(value, str) and len(value.strip()) <= 40))
+                     (key == "label" and isinstance(value, str) and len(value.strip()) <= 40 and _plain(value)))
             if not valid:
                 raise apierr.bad_request(f"Invalid value for '{key}'", param=key)
         if "label" in changes:
@@ -507,17 +513,23 @@ class Admin:
                     continue
                 raise apierr.bad_request(f"'{key}' must be a non-empty string", param=key)
             value = value.strip()
-            # Credentials become HTTP headers: control characters would split them.
-            if any(ord(char) < 32 or ord(char) == 127 for char in value) or len(value) > 16384:
+            # Everything but the label becomes part of an HTTP request: printable ASCII only,
+            # so a control character cannot split a header and a header cannot fail to encode.
+            if len(value) > 16384 or not _plain(value, ascii_only=key != "label"):
                 raise apierr.bad_request(f"Invalid value for '{key}'", param=key)
             record[key] = value
         parsed = urlsplit(record["base"])
-        if (parsed.scheme != "https" or not parsed.hostname or parsed.path not in ("", "/")
+        try:
+            parsed.port
+        except ValueError:
+            raise apierr.bad_request("'base' has an invalid port", param="base")
+        if (parsed.scheme != "https" or not HOSTNAME.fullmatch(parsed.hostname or "") or parsed.path not in ("", "/")
                 or parsed.query or parsed.fragment or parsed.username or parsed.password):
             raise apierr.bad_request("'base' must be an https origin such as https://tenant.retool.com", param="base")
         record["base"] = "https://" + parsed.netloc.lower()
         if not UUID.fullmatch(record["page_uuid"]):
             raise apierr.bad_request("'page_uuid' must be a UUID", param="page_uuid")
+        record["page_uuid"] = record["page_uuid"].lower()
         if len(record.get("label", "")) > 40:
             raise apierr.bad_request("'label' is longer than 40 characters", param="label")
         record.update(enabled=True, priority=0)
@@ -527,16 +539,26 @@ class Admin:
         record = self._new_account(data)
         with self._transaction() as (path, saved):
             for existing in self._records(saved):
-                if (str(existing.get("base") or saved.get("base") or "").rstrip("/") == record["base"]
-                        and existing.get("page_uuid") == record["page_uuid"]):
+                if (str(existing.get("base") or saved.get("base") or "").rstrip("/").lower() == record["base"]
+                        and str(existing.get("page_uuid") or "").lower() == record["page_uuid"]):
                     raise apierr.conflict("This Retool app is already in the pool")
             if not isinstance(saved.get("accounts"), list):
                 # A single-account configuration becomes a pool; the account keeps its id and session.
+                # Its session must be in the file: RETOOL_COOKIE/RETOOL_XSRF are not, and a pool
+                # record without them would stop the relay from starting.
+                if not (saved.get("cookie") and saved.get("xsrf")) or not self.cfg.get("_persist_auth", True):
+                    raise apierr.conflict("The current account's session comes from RETOOL_COOKIE/RETOOL_XSRF, "
+                                          "not config.json; move it into the file before adding accounts")
                 first = {key: saved[key] for key in ACCOUNT_RECORD_KEYS if key in saved}
+                if not first.get("account_id") and self.cfg.get("account_id"):
+                    first["account_id"] = self.cfg["account_id"]
                 for key in ("cookie", "xsrf"):
                     saved.pop(key, None)
-                saved["accounts"] = [first] if first else []
+                saved["accounts"] = [first]
             saved["accounts"].append(record)
+            for item in saved["accounts"]:
+                if isinstance(item, dict) and not all(item.get(key) for key in ("cookie", "xsrf", "base", "page_uuid")):
+                    raise apierr.conflict("An account in config.json has no stored session; fix the file first")
             config._assign_account_ids(saved)
             self._write(path, saved)
         tag = self._record_tag(record)
@@ -555,22 +577,39 @@ class Admin:
                 raise apierr.conflict("The last account cannot be removed")
             if backend is not None and account_enabled(backend) and not self._other_enabled(saved, backend):
                 raise apierr.conflict("The last enabled account cannot be removed")
+            if backend is not None and self.runtime.pool.mode == "shared" and backend is self.runtime.pool.backend:
+                raise apierr.conflict("Shared session mode serves only the first account")
             remaining = [item for item in saved["accounts"] if item is not record]
             if not any(isinstance(item, dict) and item.get("enabled", True) is not False for item in remaining):
                 raise apierr.conflict("No enabled account would remain")
             saved["accounts"] = remaining
             if self._same_account(saved, record) and (saved.get("base") or saved.get("page_uuid")):
-                # The root mirrored this account: drop its session there too; config.load
-                # fills base/page_uuid/cookie/xsrf from the first remaining account.
-                for key in ("base", "page_uuid", "cookie", "xsrf", "account_id"):
-                    if key in saved and saved[key] == record.get(key):
-                        saved.pop(key)
+                self._scrub_root(saved, record, remaining)
             self._write(path, saved)
             if backend is not None:
                 self._apply_live(backend, {"enabled": False})
         journal.emit("admin.account", "Аккаунт %s удалён из config.json" % tag, "warn", account=tag)
         return {"ok": True, "pending": "removed" if backend is not None else None,
                 "restart_required": backend is not None}
+
+    def _scrub_root(self, saved, record, remaining):
+        """The root mirrored the removed account: drop its identity and session there (a
+        rotated cookie lives only in accounts[i], so the root copy may be older and differ);
+        config.load fills base/page_uuid/cookie/xsrf from the first remaining account."""
+        for key in ("base", "page_uuid", "cookie", "xsrf", "account_id"):
+            saved.pop(key, None)
+        if (saved.get("session_mode") or self.cfg.get("session_mode")) != "shared":
+            saved.pop("thread_id", None)
+        base = str(record.get("base") or "").rstrip("/")
+        for key in models.PROVIDER_RESOURCE_KEY.values():
+            if key not in saved:
+                continue
+            value = saved.pop(key)
+            # Same-tenant accounts without their own resource inherited the root's: give it to
+            # them explicitly, so nothing depends on which account becomes the new root.
+            for item in remaining:
+                if isinstance(item, dict) and key not in item and str(item.get("base") or "").rstrip("/") == base:
+                    item[key] = value
 
     def _pool_route(self, handler, path, match):
         allowed = ("GET", "POST") if match is None else ("POST",) if match.group(2) else ("PATCH", "DELETE")
@@ -626,7 +665,10 @@ class Admin:
             raise apierr.service_unavailable("Relay settings have no writable configuration file")
         with self.lock, contextlib.ExitStack() as locks:
             # Every account's refresher persists rotated cookies through the same
-            # file: hold all their locks, not only account 0's.
+            # file: hold all their locks, not only account 0's. A renewal holds its lock
+            # for its HTTP round trip, so an admin write may wait for one to finish (up to
+            # upstream_timeout); storage_lock alone would keep the file consistent, the
+            # refresher locks keep a renewal from reading the file mid-transaction.
             backends = getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]
             for refresher_lock in {id(r._lock): r._lock for r in
                                    (getattr(b, "refresher", None) for b in backends) if r}.values():

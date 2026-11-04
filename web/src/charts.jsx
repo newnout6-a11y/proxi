@@ -140,8 +140,11 @@ export function SpendChart({ buckets, windowSec }) {
               <line className="c-average" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(model.average)) + 0.5} y2={Math.round(yAt(model.average)) + 0.5} />
             )}
             <circle className="c-peak" cx={xAt(model.peakIndex)} cy={yAt(model.peak)} r={4} />
-            <text className="c-label c-label-accent" x={xAt(model.peakIndex) + (peakRight ? -8 : 8)} y={yAt(model.peak) - 8}
-              textAnchor={peakRight ? 'end' : 'start'}>{fmtFixed(model.peak, 2)}</text>
+            {/* The figure is dropped when the scale's top tick already says it */}
+            {fmtFixed(model.peak, model.max < 1 ? 2 : 1) !== fmtFixed(model.max, model.max < 1 ? 2 : 1) && (
+              <text className="c-label c-label-accent" x={xAt(model.peakIndex) + (peakRight ? -8 : 8)} y={yAt(model.peak) - 8}
+                textAnchor={peakRight ? 'end' : 'start'}>{fmtFixed(model.peak, 2)}</text>
+            )}
           </>
         )}
         <line className="c-axis" x1={PAD.l} x2={W - PAD.r} y1={baseY} y2={baseY} />
@@ -233,13 +236,30 @@ export function CacheChart({ buckets, windowSec }) {
             <path className="c-read-line" d={readLine} />
             <path className="c-write-area" d={areaUnder(writeLine, writePts, writeBase)} />
             <path className="c-write-line" d={writeLine} />
-            {spikes.map((i) => (
-              <g key={`s${i}`} className="c-spike">
-                <circle cx={xAt(i)} cy={writeY(model.writes[i])} r={4} />
-                <text className="c-label c-label-accent" x={xAt(i) + (xAt(i) > W - 120 ? -8 : 8)} y={writeY(model.writes[i]) + 4}
-                  textAnchor={xAt(i) > W - 120 ? 'end' : 'start'}>+{fmtTokens(model.writes[i])}</text>
-              </g>
-            ))}
+            {(() => {
+              // Lay the labels out left to right by their real extent: a label goes right of its dot,
+              // or left of it near the edge, and is dropped when it would touch the previous one
+              let lastRight = -Infinity;
+              return spikes.map((i) => {
+                const text = `+${fmtTokens(model.writes[i])}`;
+                const width = text.length * 6.6;
+                const x = xAt(i);
+                const boxes = [[x + 8, x + 8 + width, 'start'], [x - 8 - width, x - 8, 'end']]
+                  .filter(([left, right]) => left >= PAD.l && right <= W - 4 && left > lastRight + 8
+                    && !spikes.some((j) => j !== i && xAt(j) > left - 6 && xAt(j) < right + 6));
+                const box = boxes[0];
+                if (box) lastRight = box[1];
+                return (
+                  <g key={`s${i}`} className="c-spike">
+                    <circle cx={x} cy={writeY(model.writes[i])} r={4} />
+                    {box && (
+                      <text className="c-label c-label-accent" x={box[2] === 'start' ? box[0] : box[1]} y={writeY(model.writes[i]) + 4}
+                        textAnchor={box[2]}>{text}</text>
+                    )}
+                  </g>
+                );
+              });
+            })()}
           </>
         )}
         <line className="c-axis" x1={PAD.l} x2={W - PAD.r} y1={readBase} y2={readBase} />

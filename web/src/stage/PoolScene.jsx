@@ -80,7 +80,7 @@ export function PoolScene() {
   return (
     <div className="pool-scene" role="img"
       aria-label="Как пул выбирает аккаунт: ход уходит на включённый аккаунт с меньшим приоритетом; когда его баланс ниже порога, он уходит в резерв и следующий ход получает запасной; выключенный аккаунт ходов не получает">
-      <Stage width={720} height={300} compact={{ below: 600, width: 358, height: 340 }} initial={initial} poster={POSTER}
+      <Stage width={720} height={300} compact={{ below: 600, width: 358, height: 352 }} initial={initial} poster={POSTER}
         script={script} theme={theme === 'light' ? 'light' : 'dark'} tokens={stageTokens(theme)} className="ps">
         {(s) => (
           <>

@@ -172,7 +172,7 @@
 .ps .ss-stage[data-layout="compact"] .ps-row { grid-template-columns: minmax(0, 1fr) 72px 52px 44px; column-gap: 8px; height: 40px; }
 .ps .ss-stage[data-layout="compact"] .ps-toggle { display: none; }
 .ps .ss-stage[data-layout="compact"] .ps-filler { grid-template-columns: minmax(0, 1fr) 72px; }
-.ps .ss-stage[data-layout="compact"] .ps-term { left: 16px; top: 228px; width: 326px; height: 96px; }
+.ps .ss-stage[data-layout="compact"] .ps-term { left: 16px; top: 228px; width: 326px; height: 108px; }
 
 /* --- add-account guide (static-card gold) ------------------------------------ */
 /* The browser keeps a 20px gutter left and top and runs off the right and bottom. */
@@ -196,4 +196,6 @@
 .ag .ag-key { font-family: var(--ss-mono); font-size: 11px; color: var(--ss-text-strong); }
 .ag .ag-val { display: flex; gap: 4px; min-width: 0; overflow: hidden; }
 .ag .ss-stage[data-layout="compact"] .ag-window { top: 16px; left: 16px; width: 360px; }
+.ag .ss-stage[data-layout="compact"] .ag-path { display: none; }
+.ag .ss-stage[data-layout="compact"] .ag-url { gap: 2px; font-size: 9.5px; }
 .ag .ss-stage[data-layout="compact"] .ag-row { grid-template-columns: 16px 80px minmax(0, 1fr); }
