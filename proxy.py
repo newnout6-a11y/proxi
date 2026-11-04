@@ -188,7 +188,8 @@ def make_handler(runtime: Runtime):
                              "x-proxi-parent-session-id, x-opencode-session-id, x-opencode-parent-session-id, "
                              "x-claude-code-session-id, x-claude-code-agent-id")
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
-            self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after")
+            self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after, "
+                             "x-proxi-ignored-parameters, x-proxi-system-messages")
 
         def _json(self, status, payload, extra=None):
             self._status = status
@@ -580,6 +581,11 @@ def make_handler(runtime: Runtime):
 
             parsed.request_purpose = client_context.request_kind(parsed)
             compatibility_headers = {}
+            if parsed.declared_ignored:
+                compatibility_headers['x-proxi-ignored-parameters'] = ','.join(parsed.declared_ignored)
+                journal.emit('request.compatibility',
+                             'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
+                             'warn', parameters=parsed.declared_ignored)
             if parsed.system_messages_normalized:
                 compatibility_headers['x-proxi-system-messages'] = 'merged-into-head'
                 journal.emit('request.compatibility',

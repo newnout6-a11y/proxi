@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import native_history
+import generation
 import math
 import socket
 import urllib.parse
@@ -76,6 +77,7 @@ class Parsed:
         self.stream = False
         self.max_tokens = None
         self.temperature = None
+        self.verbosity = None
         self.system = ""
         self.declared_ignored = []
         self.system_messages_normalized = False
@@ -416,7 +418,7 @@ def _messages(data, *, min_items=1):
     return messages
 
 
-def _finish(data, parsed):
+def _finish(data, parsed, dialect):
     source_messages = data.get('messages', data.get('input'))
     history_started = False
     if isinstance(source_messages, list):
@@ -436,11 +438,7 @@ def _finish(data, parsed):
                 if candidate in model_catalog.EFFORT_ORDER:
                     parsed.requested_effort = candidate
                 break
-    declared = [k for k in ("n", "seed", "presence_penalty", "frequency_penalty",
-                            "logprobs", "top_logprobs", "response_format", "modalities", "metadata")
-                if data.get(k) is not None]
-    if declared:
-        parsed.declared_ignored = declared
+    parsed.verbosity, parsed.declared_ignored = generation.controls(data, parsed.entry, dialect)
     stream_options = data.get("stream_options")
     if stream_options is None:
         stream_options = data.get("streamOptions")
@@ -648,7 +646,7 @@ def parse_chat(data, cfg):
                          or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
     parsed.temperature = _opt_float(data, "temperature")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed)
+    return _finish(data, parsed, 'chat')
 
 
 def parse_responses(data, cfg):
@@ -682,7 +680,7 @@ def parse_responses(data, cfg):
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed)
+    return _finish(data, parsed, 'responses')
 
 
 def parse_anthropic(data, cfg):
@@ -714,7 +712,7 @@ def parse_anthropic(data, cfg):
     if stop is not None and not isinstance(stop, list):
         raise unprocessable("'stop_sequences' must be an array", param="stop_sequences")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed)
+    return _finish(data, parsed, 'anthropic')
 
 
 def _effort(data):

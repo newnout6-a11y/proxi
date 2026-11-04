@@ -259,3 +259,51 @@ expanded scoped review: **319 passed in 18.47 seconds**, plus nine no-charge,
 partial/corrected-snapshot, retry, failure and cleanup probes. Both follow-up
 findings are closed. `git diff --check`: clean. Stage 4B generation controls
 remain the next substage; no design changes are included.
+
+## Stage 4B: generation control fidelity
+
+`verbosity` now maps from Chat's top-level control and Responses `text.verbosity`
+to the current Retool request. The same top-level extension works through
+Messages when selecting a supported GPT route. Capability metadata is limited
+to explicit current registry entries plus the live GPT-6 Sol probe; Codex
+discovery uses the same capability. Only this proven output control is excluded
+from native-history provider scope. Effort/resource/model/tool changes retain
+their existing invalidation behavior.
+
+Unsupported material semantics now fail with 422: strict/JSON output formats,
+nonempty stop controls, multiple choices, server-side prompt/state/background
+features, automatic truncation, audio modes, non-default service tiers and
+requests to prohibit parallel native tool calls. Compatible harmless defaults
+remain accepted. Chat/Messages' existing string conversation affinity remains
+local; Responses' server conversation is a different contract and is rejected.
+
+Unsupported sampling and optional cache/include/metadata fields are type-checked
+and exposed by names only through `x-proxi-ignored-parameters` and a compatibility
+journal event. This avoids silently pretending those controls reached Retool or
+logging their values. The exact audited field behavior and limits are documented
+in [relay-quality-and-prompts.md](relay-quality-and-prompts.md).
+
+Initial regressions reproduced 76 failures out of 77; three test assertions were
+then corrected to expect tool_calls at intermediate tool turns. Independent
+review found missing parallel-control enforcement, an ignored server prompt
+reference and stale Codex verbosity discovery; these gained additional failing
+regressions before correction. An initial full run exposed six local-affinity
+compatibility failures, which were fixed by distinguishing API dialects.
+
+Six isolated live GPT-6 Sol HTTP requests passed: verbosity low/medium/high via
+the three APIs, followed by a low → high → omitted sequence with two tool result
+continuations. Current values reached Retool; the previous raw prefix and cache
+key remained unchanged. The synthetic task returned the expected marker.
+Reported price: **0.03388 credits**; config hash unchanged. Three additional
+unsupported-control requests returned 422 with **zero additional upstream POSTs**.
+Private evidence: `.agents/model-audit-20261104/generation-live/manifest.json`
+and wire captures. This establishes protocol acceptance and prefix continuity,
+not a causal response-length guarantee or a measured cache hit.
+
+Final stage 4B full validation: **1802 passed in 216.93 seconds** using the full
+Python command above. Independent expanded review: **517 passed in 40.99
+seconds**, plus 18 HTTP/SSE probes checking 422 before runner invocation and
+names-only compatibility headers/journal for all three API dialects.
+`git diff --check`: clean. No unresolved findings remain in stages 3 or 4.
+Availability/catalog reconciliation and installed-client acceptance remain
+separate later stages; design work remains deferred.

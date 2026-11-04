@@ -85,6 +85,17 @@ CATALOG = [
 
 _BY_ID = {m['id']: m for m in CATALOG}
 
+# Explicit registry capabilities plus the live GPT-6 Sol route probe (2026-11-05).
+# Do not infer verbosity support from a model name or reasoning capability alone.
+_VERBOSITY_MODELS = {'gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5',
+                     'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-sol'}
+for _model in CATALOG:
+    _model['verbosity_levels'] = ['low', 'medium', 'high'] if _model['id'] in _VERBOSITY_MODELS else []
+    if _model['verbosity_levels']:
+        _model['verbosity_checked_at'] = '2026-11-05'
+        _model['verbosity_source'] = ('live Retool route' if _model['id'] == 'gpt-6-sol' else
+                                      'https://retool-edge.com/assets_vjs/main-DVkrwaG2.js')
+
 # Capabilities are dated independently of local resource availability. Values
 # marked provisional must not be presented as a verified upstream contract.
 _AUDIT_DATE = '2026-10-29'
@@ -230,7 +241,7 @@ def codex_catalog(entries=None):
             'include_apps_usage_instructions': False,
             'supports_reasoning_summary_parameter': bool(entry.get('reasoning')),
             'default_reasoning_summary': 'detailed' if entry.get('reasoning') else 'none',
-            'support_verbosity': False, 'default_verbosity': None,
+            'support_verbosity': bool(entry.get('verbosity_levels')), 'default_verbosity': None,
             'apply_patch_tool_type': 'freeform',
             'truncation_policy': {'mode': 'tokens', 'limit': 10000},
             'context_window': entry.get('context', 128000),

@@ -20,7 +20,7 @@
 | Публиковать живой каталог | Один каталог возможностей и проверка ресурсов всех включённых backend | Удаление недоступных advertisements и синхронизация установленных клиентов — отдельный этап live-аудита |
 | Завершать потоки и отмены | SSE/non-stream для Chat, Responses и Messages; bounded cleanup и daemon IO | Отключение клиента отменяет ход; неполный upstream не выдаётся за нормальный stop |
 | Повторять запросы осознанно | Есть лимит попыток, классификация ошибок, отдельный balance failover | Пустой ответ может быть платным; `upstream_empty_retries` и keepwarm требуют отдельного учёта |
-| Соблюдать запрошенные параметры | Effort и output cap реально передаются; GLM уровни проверены живьём | Sampling, stop и strict output formats пока не имеют подтверждённого mapping; молчаливое игнорирование — выявленный пробел |
+| Соблюдать проверенные параметры | Effort, output cap и подтверждённый verbosity передаются; неподдерживаемые материальные режимы отклоняются | Sampling и необеспечиваемые дополнительные hints обозначены именами в заголовке и журнале; неизвестные возможности всего OpenAI API этим не объявляются поддержанными |
 | Разделять протокол и клиент | Есть контрактные тесты и отдельные installed-client probes | HTTP smoke не доказывает работу всех кнопок Desktop, редактирование Aider или native server tools |
 
 ## Как работает наш system prompt
@@ -131,7 +131,43 @@ budget отклоняется до inference. `clear_at` для turn-scoped си
 | Retool-fast GLM | Оба маршрута ответили на четыре effort значения и на случайные картинки | Это возможности маршрута Retool; внутренняя реализация vision и точные thinking budgets не установлены |
 | Прямые tools | Передаём клиентские схемы, toolChoice и результаты; не переписываем их в просьбу «сделать вид» | Не каждый JSON Schema keyword поддержан исходной Retool tool schema |
 | Более точная диагностика | Можно связать raw attempt, первый upstream event, UI thinking start, usage, аккаунт и итог | Зелёный HTTP 200 и локальный таймер сами по себе не доказывают корректный ответ или вычисления |
-| Новые provider controls | В свежей схеме есть `verbosity` и `enableFineGrainedStreaming` | До mapping и живого теста это кандидаты на улучшение, а не заявленная поддержка relay |
+| Новые provider controls | `verbosity` передаётся для подтверждённых моделей; GPT-6 Sol проверен через три API и tool continuation | `enableFineGrainedStreaming` найден только в схеме: эффективность не подтверждена, настройка не включена |
+
+## Параметры генерации
+
+`verbosity` управляет подробностью видимого ответа, отдельно от reasoning effort.
+Chat Completions принимает `verbosity: "low" | "medium" | "high"`; Responses —
+`text: {"verbosity": "high"}`. Top-level поле также принимается совместимыми
+входами relay, включая Messages при выборе поддержанной GPT-модели. Противоречивые
+значения отклоняются. Параметр доступен только когда каталог содержит
+`verbosity_levels`; это не утверждение доступности самой модели на аккаунте.
+
+Текущий список основан на явном registry: GPT-5, 5.1, 5.2, 5.3 Codex, 5.4,
+5.5 и семейство 5.6 Sol/Terra/Luna; для GPT-6 Sol дополнительно выполнен живой
+тест. Поддержка не выводится автоматически из названия GPT или наличия thinking.
+Codex discovery публикует ту же возможность. Изменение verbosity не меняет
+scope подписанной входной истории: в tool loop передаётся текущее значение,
+а прежние assistant blocks и ключ кэша сохраняются. Это не обещание cache hit
+или фиксированной длины ответа при конкретном уровне.
+
+| Управление | Поведение relay |
+| --- | --- |
+| JSON/schema output formats, непустой `stop`/`stop_sequences`, `n > 1` | 422 до inference: маршрут не обеспечивает эту семантику |
+| `store: true`, `background: true`, `previous_response_id`, Responses `conversation`, server `prompt` reference | 422: серверное хранение/восстановление/шаблон этим маршрутом не реализованы |
+| `truncation: "auto"`, audio modalities, нестандартный `service_tier` | 422 вместо молчаливой смены поведения |
+| `parallel_tool_calls: false` или Anthropic `disable_parallel_tool_use: true` с tools | 422: последовательность native tool calls не гарантируется |
+| `n: 1`, plain text format, пустые stop, `store: false`, `background: false`, `truncation: "disabled"` | Принимаются как совместимые явные значения по умолчанию |
+| Chat/Messages строковый `conversation` | Сохраняет прежнюю локальную affinity; клиент передаёт полную историю. Это не серверный Responses conversation |
+| temperature, top_p, top_k, seed, penalties, logprobs/logit_bias | Типы/диапазоны проверяются; параметры не передаются upstream и перечисляются по именам в предупреждении |
+| prompt_cache_key, prompt_cache_retention, include, metadata | Проверяются формы, поля не передаются как настройки upstream; имена перечисляются в предупреждении. Локальная metadata-affinity по-прежнему работает |
+
+Предупреждение — `x-proxi-ignored-parameters` и событие `request.compatibility`.
+Они содержат только имена полей, без значений, stop-текстов, схем или metadata.
+Заголовок доступен браузерным клиентам через CORS. `store: false` не создаёт
+доступное по response ID хранилище Responses. Это не отключает оперативную
+историю для tool continuation, настроенные журналы и хранение Retool/поставщика.
+Cache retention hints не гарантируют TTL, а `include`
+не обещает дополнительных logprobs или зашифрованных reasoning items.
 
 ## Источники и границы доказательств
 

@@ -527,6 +527,8 @@ class TurnRunner:
                 effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
+            if getattr(parsed, 'verbosity', None) is not None:
+                model_provider['verbosity'] = parsed.verbosity
             log("turn.begin", "Ход %s · effort %s · %s" % (parsed.model, effort or "—",
                                                           "direct" if direct_mode else "agent"),
                 model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",

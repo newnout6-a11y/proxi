@@ -581,6 +581,8 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         body["providerResourceName"] = resource
     if model_provider.get("reasoningEffort"):
         body["reasoningEffort"] = model_provider["reasoningEffort"]
+    if model_provider.get('verbosity') is not None:
+        body['verbosity'] = model_provider['verbosity']
     if max_tokens:
         body["maxCompletionTokens"] = max(int(max_tokens), MIN_OUTPUT_TOKENS)
     if tools:
@@ -850,9 +852,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     """Yield normalised relay events from the direct NDJSON stream."""
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
-    # Output caps control the next generation, not the signed input prefix.
-    # OpenCode legitimately omits or changes them between tool follow-ups.
-    scope = json.dumps([getattr(session, "_native_conversation_key", None), model_provider,
+    # Output caps and verbosity control generation, not the signed input prefix.
+    # Clients legitimately omit or change them between tool follow-ups.
+    prefix_provider = {key: value for key, value in model_provider.items() if key != 'verbosity'}
+    scope = json.dumps([getattr(session, "_native_conversation_key", None), prefix_provider,
                         head, tools, tool_choice], sort_keys=True, ensure_ascii=True)
     parent, messages = history.resume(scope, client) if history is not None and client is not None else (None, None)
     if messages is not None:
