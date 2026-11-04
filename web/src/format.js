@@ -45,10 +45,28 @@ export function fmtDateTime(ts) {
   return new Date(ts * 1000).toLocaleString('ru-RU', { hour12: false });
 }
 
+/** Accepts a date (2026-12-01) or a full ISO timestamp (2026-11-29T10:36:15Z). */
+export function parseDay(iso) {
+  if (!iso) return null;
+  const text = String(iso);
+  const date = new Date(text.includes('T') ? text : `${text}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 export function fmtDay(iso) {
-  if (!iso) return '—';
-  const date = new Date(`${iso}T00:00:00`);
-  return Number.isNaN(date.getTime()) ? String(iso) : date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
+  const date = parseDay(iso);
+  if (!date) return iso ? String(iso) : '—';
+  return date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
+}
+
+/** Russian plural: plural(5, ['день', 'дня', 'дней']). */
+export function plural(n, forms) {
+  const a = Math.abs(Math.round(n)) % 100;
+  const b = a % 10;
+  if (a > 10 && a < 20) return forms[2];
+  if (b > 1 && b < 5) return forms[1];
+  if (b === 1) return forms[0];
+  return forms[2];
 }
 
 export function fmtAgo(ts, now = Date.now() / 1000) {

@@ -3,13 +3,14 @@
 // Serves web/dist through `vite preview` on 127.0.0.1:4173; all API traffic is mocked (tests/fixtures.js).
 import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from '@playwright/test';
 import { API_KEY, mockAdmin } from '../tests/fixtures.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const SHOTS = 'C:\\Users\\Redmi\\AppData\\Local\\Temp\\opencode\\admin-shots';
+const SHOTS = process.env.ADMIN_SHOTS_DIR || path.join(os.tmpdir(), 'opencode', 'admin-shots');
 const args = process.argv.slice(2);
 const name = args.find((a) => !a.startsWith('--')) || 'after';
 const outDir = path.isAbsolute(name) ? name : path.join(SHOTS, name);

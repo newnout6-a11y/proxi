@@ -1,0 +1,92 @@
+/* Stageshow scenes of the admin: the login hero and the empty-state stills.
+   The kit's own CSS is bundled by its components; these rules only place and
+   restyle them in the graphite + amber look. */
+
+/* --- login hero ----------------------------------------------------------- */
+/* A quiet well, as in the hero-demo gold: the window is pinned one gutter in
+   and runs off the right and bottom edges, so it reads as a crop, not a float. */
+.lh .ss-stage { overflow: hidden; border-radius: 14px; background: var(--ss-well); box-shadow: inset 0 0 0 1px var(--ss-line); }
+.lh .ss-stage[data-theme="dark"] { --ss-well: #0e0e0f; }
+.lh .ss-stage[data-theme="light"] { --ss-well: #efeff0; }
+
+.lh .lh-journal { position: absolute; top: 32px; left: 120px; width: 680px; height: 360px; }
+.lh .lh-body { display: flex; height: 100%; }
+.lh .lh-side {
+  display: flex; flex-direction: column; gap: 4px; flex: none; width: 140px; padding: 12px 8px;
+  border-right: 1px solid var(--ss-line); background: var(--ss-chrome);
+}
+.lh .lh-nav { display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 8px; border-radius: 6px; }
+.lh .lh-nav[data-on] { background: var(--ss-fill); }
+.lh .lh-nav-label { font-size: 11px; color: var(--ss-text-strong); }
+.lh .lh-main { display: flex; flex-direction: column; gap: 12px; width: 432px; padding: 16px; }
+.lh .lh-head { display: flex; align-items: flex-end; justify-content: space-between; }
+.lh .lh-title { font-size: 13px; font-weight: 500; color: var(--ss-text-strong); }
+.lh .lh-credits { display: grid; justify-items: end; gap: 2px; }
+.lh .lh-credits-label { font-size: 10px; color: var(--ss-text-faint); }
+.lh .lh-credits-value {
+  font-family: var(--ss-mono); font-size: 18px; color: var(--ss-text-strong); font-variant-numeric: tabular-nums;
+  animation: lh-in 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes lh-in { from { opacity: 0; transform: translateY(4px); } }
+/* Typed text never touches the block caret */
+.lh .ss-term__caret { margin-left: 8px; }
+.lh .lh-rows { display: grid; border-top: 1px solid var(--ss-line); }
+.lh .lh-row {
+  display: grid; grid-template-columns: 64px 1fr 40px 44px; align-items: center; column-gap: 12px;
+  min-height: 32px; border-bottom: 1px solid var(--ss-line-faint);
+}
+.lh .lh-focal { row-gap: 6px; padding: 8px 0; background: var(--ss-accent-soft); margin: 0 -8px; padding-left: 8px; padding-right: 8px; border-radius: 6px; }
+.lh .lh-time { font-family: var(--ss-mono); font-size: 10px; color: var(--ss-text-faint); }
+.lh .lh-model { font-family: var(--ss-mono); font-size: 11px; color: var(--ss-text-strong); }
+.lh .lh-status, .lh .lh-dur { font-family: var(--ss-mono); font-size: 11px; }
+.lh .lh-run { color: var(--ss-accent-text); }
+.lh .lh-ok { color: var(--ss-success-text); }
+.lh .lh-dur { color: var(--ss-text); justify-self: end; }
+.lh .lh-tape {
+  grid-column: 1 / -1; display: flex; gap: 2px; height: 6px; overflow: hidden; border-radius: 2px;
+  clip-path: inset(0 100% 0 0); transition: clip-path 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.lh .lh-tape i { display: block; height: 100%; border-radius: 1px; }
+.lh .lh-tape .p1 { flex: 1.9; background: var(--ss-ink-3); }
+.lh .lh-tape .p2 { flex: 6.4; background: var(--ss-ink-4); }
+.lh .lh-tape .p3 { flex: 2.3; background: var(--ss-ink-5); }
+.lh .lh-tape .p4 { flex: 11.2; background: var(--ss-text-strong); }
+.lh .lh-tape[data-phase="1"] { clip-path: inset(0 91% 0 0); }
+.lh .lh-tape[data-phase="2"] { clip-path: inset(0 62% 0 0); }
+.lh .lh-tape[data-phase="3"] { clip-path: inset(0 51% 0 0); }
+.lh .lh-tape[data-phase="4"] { clip-path: inset(0 0 0 0); }
+
+.lh .lh-term { position: absolute; left: 32px; top: 180px; width: 264px; height: 128px; box-shadow: var(--ss-shadow-satellite); }
+.lh .lh-term .ss-term { font-size: 11px; }
+.lh .lh-term-line { color: var(--ss-term-dim, #8a8a90); padding-top: 4px; font-family: var(--ss-mono); font-size: 11px; }
+.lh .lh-term-ok { color: #f5a524; }
+
+/* Compact, as in the hero-demo gold: the window keeps one 16px gutter on three
+   sides and runs off the bottom; the terminal straddles it as a satellite. */
+.lh .ss-stage[data-layout="compact"] .lh-journal { top: 16px; left: 16px; width: 440px; height: 420px; }
+.lh .ss-stage[data-layout="compact"] .lh-side { display: none; }
+.lh .ss-stage[data-layout="compact"] .lh-main { width: 342px; }
+.lh .ss-stage[data-layout="compact"] .lh-term { top: 196px; left: 16px; width: 310px; height: 128px; }
+
+/* --- empty-state stills --------------------------------------------------- */
+.art { width: min(400px, 100%); margin: 0 auto 8px; }
+.art .ss-stage { overflow: hidden; background: transparent; }
+.art .art-window { position: absolute; top: 16px; left: 24px; width: 420px; height: 240px; }
+.art .art-rows { display: grid; padding: 8px 16px; }
+.art .art-row {
+  display: grid; grid-template-columns: 64px 1fr 28px; align-items: center; column-gap: 12px; min-height: 32px;
+  border-bottom: 1px solid var(--ss-line-faint);
+}
+.art .art-turn { grid-template-columns: 112px 1fr 44px; }
+.art .art-focal { background: var(--ss-accent-soft); border-radius: 6px; margin: 4px -8px; padding: 0 8px; border-bottom: 0; }
+.art .art-time, .art .art-tag { font-family: var(--ss-mono); font-size: 10px; color: var(--ss-text-faint); }
+.art .art-tag { color: var(--ss-success-text); }
+.art .art-msg, .art .art-model { font-family: var(--ss-mono); font-size: 11px; color: var(--ss-text-strong); }
+.art .art-tape { display: flex; gap: 2px; height: 6px; border-radius: 2px; overflow: hidden; }
+.art .art-tape i { display: block; height: 100%; }
+.art .art-tape .p1 { flex: 1.9; background: var(--ss-ink-3); }
+.art .art-tape .p2 { flex: 6.4; background: var(--ss-ink-4); }
+.art .art-tape .p3 { flex: 2.3; background: var(--ss-ink-5); }
+.art .art-tape .p4 { flex: 11.2; background: var(--ss-text-strong); }
+.art .art-tape-filler { background: var(--ss-ink-3); }
+.art .ss-stage[data-layout="compact"] .art-window { left: 16px; width: 340px; }

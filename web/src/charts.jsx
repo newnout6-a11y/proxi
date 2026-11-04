@@ -48,30 +48,35 @@ export function CacheChart({ buckets, windowSec }) {
   const H = Math.max(size.h, 240);
   const plotW = Math.max(10, W - PAD.l - PAD.r);
   const plotH = H - PAD.t - PAD.b;
-  const axisY = Math.round(PAD.t + plotH * 0.62) + 0.5;
-  const readH = axisY - PAD.t;
-  const writeH = PAD.t + plotH - axisY;
   const step = n ? plotW / n : plotW;
 
   const model = useMemo(() => {
     const maxRead = Math.max(0, ...buckets.map((b) => b.cache_read || 0));
     const maxWrite = Math.max(0, ...buckets.map((b) => b.cache_write || 0));
-    const maxCredits = Math.max(0, ...buckets.map((b) => b.credits || 0));
     const readMax = niceMax(maxRead);
     const writeMax = niceMax(maxWrite);
-    const creditMax = niceMax(maxCredits);
-    const k = Math.min(readH / readMax, writeH / writeMax);
-    return { maxRead, maxWrite, maxCredits, readMax, writeMax, creditMax, k };
-  }, [buckets, readH, writeH]);
+    // Both halves share one token scale; the axis sits where that scale puts it,
+    // so a quiet write side takes little room instead of an empty band.
+    const share = readMax / (readMax + writeMax);
+    const split = Math.max(0.6, Math.min(0.86, share));
+    let running = 0;
+    const cumulative = buckets.map((b) => (running += Number(b.credits) || 0));
+    return { maxRead, maxWrite, readMax, writeMax, split, cumulative, total: running };
+  }, [buckets]);
 
-  const empty = !n || (!model.maxRead && !model.maxWrite && !model.maxCredits);
+  const axisY = Math.round(PAD.t + plotH * model.split) + 0.5;
+  const readH = axisY - PAD.t;
+  const writeH = PAD.t + plotH - axisY;
+  const k = Math.min(readH / model.readMax, writeH / model.writeMax);
+  const empty = !n || (!model.maxRead && !model.maxWrite && !model.total);
   const barW = Math.max(1, step * 0.72);
   const xAt = (i) => PAD.l + (i + 0.5) * step;
-  const creditPts = buckets.map((b, i) => ({
-    x: xAt(i), y: axisY - 2 - (isNum(b.credits) ? (b.credits / model.creditMax) * (readH - 8) : 0),
+  // Credits as a running total: the burn over the window, rising to the window's spend.
+  const creditPts = model.cumulative.map((value, i) => ({
+    x: xAt(i), y: axisY - 2 - (model.total ? (value / model.total) * (readH - 12) : 0),
   }));
-  const readTicks = [model.readMax / 2, model.readMax].filter((v) => v * model.k <= readH + 1);
-  const writeTicks = [model.writeMax].filter((v) => v * model.k <= writeH + 1);
+  const readTicks = [model.readMax / 2, model.readMax].filter((v) => v * k <= readH + 1);
+  const writeTicks = [model.writeMax].filter((v) => v * k <= writeH + 1 && v * k >= 14);
   const labelIdx = n ? [0, 0.25, 0.5, 0.75, 1].map((f) => Math.min(n - 1, Math.round(f * (n - 1)))) : [];
   const active = hover !== null && buckets[hover] ? hover : null;
   const bucket = active !== null ? buckets[active] : null;
@@ -97,20 +102,25 @@ export function CacheChart({ buckets, windowSec }) {
         onPointerMove={onMove} onPointerLeave={() => setHover(null)}>
         {readTicks.map((v) => (
           <g key={`r${v}`}>
-            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(axisY - v * model.k) + 0.5} y2={Math.round(axisY - v * model.k) + 0.5} />
-            <text className="c-label" x={PAD.l - 8} y={axisY - v * model.k + 4} textAnchor="end">{fmtTokens(v)}</text>
+            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(axisY - v * k) + 0.5} y2={Math.round(axisY - v * k) + 0.5} />
+            <text className="c-label" x={PAD.l - 8} y={axisY - v * k + 4} textAnchor="end">{fmtTokens(v)}</text>
           </g>
         ))}
         {writeTicks.map((v) => (
           <g key={`w${v}`}>
-            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(axisY + v * model.k) + 0.5} y2={Math.round(axisY + v * model.k) + 0.5} />
-            <text className="c-label" x={PAD.l - 8} y={axisY + v * model.k + 4} textAnchor="end">{fmtTokens(v)}</text>
+            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(axisY + v * k) + 0.5} y2={Math.round(axisY + v * k) + 0.5} />
+            <text className="c-label" x={PAD.l - 8} y={axisY + v * k + 4} textAnchor="end">{fmtTokens(v)}</text>
           </g>
         ))}
         <text className="c-label" x={PAD.l - 8} y={axisY + 4} textAnchor="end">0</text>
+        {!empty && (
+          <text className="c-label c-label-accent" x={W - PAD.r} y={Math.max(PAD.t + 10, creditPts[n - 1].y - 8)} textAnchor="end">
+            {fmtFixed(model.total, 2)}
+          </text>
+        )}
         {!empty && buckets.map((b, i) => {
-          const r = (b.cache_read || 0) * model.k;
-          const w = (b.cache_write || 0) * model.k;
+          const r = (b.cache_read || 0) * k;
+          const w = (b.cache_write || 0) * k;
           return (
             <g key={b.t} className={i === active ? 'on' : undefined}>
               {r > 0 && <rect className="c-read" x={xAt(i) - barW / 2} y={axisY - r} width={barW} height={r} />}
@@ -140,6 +150,7 @@ export function CacheChart({ buckets, windowSec }) {
           <dd><span>чтение кэша</span><b className="num">{fmtTokens(bucket.cache_read)}</b></dd>
           <dd><span>запись кэша</span><b className="num">{fmtTokens(bucket.cache_write)}</b></dd>
           <dd><span>кредиты</span><b className="num">{fmtFixed(bucket.credits, 3)}</b></dd>
+          <dd><span>с начала окна</span><b className="num">{fmtFixed(model.cumulative[active], 2)}</b></dd>
           <dd><span>запросы</span><b className="num">{fmtInt(bucket.requests)}</b></dd>
         </dl>
       )}
