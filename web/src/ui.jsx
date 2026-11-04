@@ -1,11 +1,11 @@
 import { createContext, useCallback, useContext, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Check, CircleCheck, CircleX, Copy, Info, TriangleAlert, X } from 'lucide-react';
-import { spring } from './motion.jsx';
+import { Check, CircleAlert, CircleCheck, Copy, Info, X } from 'lucide-react';
+import { ease } from './motion.jsx';
 
 const ToastContext = createContext(() => {});
 
-const TOAST_ICON = { success: CircleCheck, error: CircleX, warn: TriangleAlert, info: Info };
+const TOAST_ICON = { success: CircleCheck, error: CircleAlert, warn: CircleAlert, info: Info };
 
 export function ToastProvider({ children }) {
   const [toasts, setToasts] = useState([]);
@@ -25,28 +25,17 @@ export function ToastProvider({ children }) {
           {toasts.map((toast) => {
             const Icon = TOAST_ICON[toast.tone] || Info;
             return (
-              <motion.div
-                key={toast.id}
-                layout
-                className={`toast tone-${toast.tone}`}
-                initial={{ opacity: 0, x: 60, scale: 0.92 }}
-                animate={{ opacity: 1, x: 0, scale: 1 }}
-                exit={{ opacity: 0, x: 60, scale: 0.92, transition: { duration: 0.18 } }}
-                transition={spring}
-              >
-                <Icon size={18} />
+              <motion.div key={toast.id} className={`toast tone-${toast.tone}`}
+                initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, transition: { duration: 0.15 } }}
+                transition={{ duration: 0.2, ease }}>
+                <Icon size={16} strokeWidth={1.5} aria-hidden="true" />
                 <div>
                   <strong>{toast.title}</strong>
                   {toast.text && <p>{toast.text}</p>}
                 </div>
                 <button type="button" className="icon-button ghost" aria-label="Закрыть уведомление" onClick={() => dismiss(toast.id)}>
-                  <X size={14} />
+                  <X size={16} strokeWidth={1.5} />
                 </button>
-                <motion.span
-                  className="toast-timer"
-                  initial={{ scaleX: 1 }} animate={{ scaleX: 0 }}
-                  transition={{ duration: (toast.duration || 4200) / 1000, ease: 'linear' }}
-                />
               </motion.div>
             );
           })}
@@ -60,85 +49,56 @@ export function useToast() {
   return useContext(ToastContext);
 }
 
-export function Badge({ tone = 'neutral', children, title }) {
-  return <span className={`badge tone-${tone}`} title={title}>{children}</span>;
+/** Quiet status text: mono, muted, optionally toned. */
+export function Tag({ tone = 'muted', children, title }) {
+  return <span className={`tag tone-${tone}`} title={title}>{children}</span>;
 }
 
 export function Button({ children, tone = 'default', icon: Icon, className = '', ...rest }) {
   return (
-    <motion.button
-      type="button"
-      className={`button tone-${tone} ${className}`}
-      whileHover={{ y: -1 }}
-      whileTap={{ scale: 0.96 }}
-      transition={spring}
-      {...rest}
-    >
-      {Icon && <Icon size={16} aria-hidden="true" />}
+    <button type="button" className={`button tone-${tone} ${className}`} {...rest}>
+      {Icon && <Icon size={16} strokeWidth={1.5} aria-hidden="true" />}
       {children}
-    </motion.button>
+    </button>
   );
+}
+
+export function Kbd({ children }) {
+  return <kbd className="keycap">{children}</kbd>;
 }
 
 export function CopyButton({ value, label = 'Копировать' }) {
   const [done, setDone] = useState(false);
   return (
-    <motion.button
-      type="button"
-      className="icon-button"
-      aria-label={label}
-      title={label}
-      whileTap={{ scale: 0.85 }}
+    <button type="button" className="icon-button" aria-label={label} title={label}
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(value);
           setDone(true);
           setTimeout(() => setDone(false), 1400);
         } catch { /* clipboard may be blocked */ }
-      }}
-    >
-      <AnimatePresence mode="wait" initial={false}>
-        <motion.span
-          key={done ? 'done' : 'copy'}
-          initial={{ scale: 0.4, rotate: -40, opacity: 0 }}
-          animate={{ scale: 1, rotate: 0, opacity: 1 }}
-          exit={{ scale: 0.4, rotate: 40, opacity: 0 }}
-          transition={{ duration: 0.16 }}
-          className="icon-swap"
-        >
-          {done ? <Check size={15} /> : <Copy size={15} />}
-        </motion.span>
-      </AnimatePresence>
-    </motion.button>
+      }}>
+      {done ? <Check size={16} strokeWidth={1.5} /> : <Copy size={16} strokeWidth={1.5} />}
+    </button>
   );
 }
 
-export function Empty({ icon: Icon, title, text }) {
+export function Empty({ art, title, text, hint }) {
   return (
-    <motion.div className="empty" initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }}>
-      {Icon && (
-        <motion.span className="empty-icon" animate={{ y: [0, -6, 0] }} transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}>
-          <Icon size={26} />
-        </motion.span>
-      )}
+    <div className="empty">
+      {art}
       <strong>{title}</strong>
       {text && <p>{text}</p>}
-    </motion.div>
+      {hint && <p className="empty-hint mono">{hint}</p>}
+    </div>
   );
 }
 
 export function Toggle({ checked, onChange, label, id }) {
   return (
-    <button
-      type="button"
-      role="switch"
-      id={id}
-      aria-checked={checked}
-      aria-label={label}
-      className={`toggle ${checked ? 'on' : ''}`}
-      onClick={() => onChange(!checked)}
-    >
-      <motion.span className="toggle-knob" layout transition={spring} />
+    <button type="button" role="switch" id={id} aria-checked={checked} aria-label={label}
+      className={`toggle ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)}>
+      <span className="toggle-knob" />
     </button>
   );
 }

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
-import { AnimatePresence, motion, LayoutGroup } from 'motion/react';
+import { AnimatePresence, motion } from 'motion/react';
 import { Boxes, Gauge, LogOut, Moon, Route, ScrollText, Settings, Sun } from 'lucide-react';
 import { api, clearKey, loadKey, saveKey } from './api.js';
-import { ToastProvider, useToast } from './ui.jsx';
-import { PulseDot, spring } from './motion.jsx';
-import { useJournal } from './useJournal.js';
+import { ToastProvider, useToast, Kbd } from './ui.jsx';
+import { Dot, ease } from './motion.jsx';
+import { ThemeContext, applyTheme, initialTheme } from './theme.js';
+import { useJournal, usePolling } from './useJournal.js';
 import Login from './Login.jsx';
 import Overview from './views/Overview.jsx';
 import Journal from './views/Journal.jsx';
@@ -13,35 +14,46 @@ import Models from './views/Models.jsx';
 import SettingsView from './views/Settings.jsx';
 
 const NAV = [
-  { id: 'overview', label: 'Обзор', icon: Gauge },
-  { id: 'journal', label: 'Журнал', icon: ScrollText },
-  { id: 'turns', label: 'Ходы', icon: Route },
-  { id: 'models', label: 'Модели', icon: Boxes },
-  { id: 'settings', label: 'Настройки', icon: Settings },
+  { id: 'overview', label: 'Обзор', icon: Gauge, group: 'Мониторинг' },
+  { id: 'journal', label: 'Журнал', icon: ScrollText, group: 'Мониторинг' },
+  { id: 'turns', label: 'Ходы', icon: Route, group: 'Мониторинг' },
+  { id: 'models', label: 'Модели', icon: Boxes, group: 'Настройка' },
+  { id: 'settings', label: 'Настройки', icon: Settings, group: 'Настройка' },
 ];
+const GROUPS = ['Мониторинг', 'Настройка'];
 
-function initialTheme() {
-  try {
-    const saved = localStorage.getItem('relay.admin.theme');
-    if (saved) return saved;
-  } catch { /* ignore */ }
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+function Mark() {
+  return (
+    <svg className="brand-mark" width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">
+      <rect x="2" y="3" width="16" height="3" rx="1" className="m-ink" />
+      <rect x="2" y="8.5" width="10" height="3" rx="1" className="m-ink" />
+      <rect x="2" y="14" width="13" height="3" rx="1" className="m-accent" />
+    </svg>
+  );
 }
 
-function Shell({ apiKey, onLogout }) {
+function Shell({ apiKey, onLogout, theme, setTheme }) {
   const toast = useToast();
   const [view, setView] = useState(() => (NAV.some((n) => `#${n.id}` === location.hash) ? location.hash.slice(1) : 'overview'));
-  const [theme, setTheme] = useState(initialTheme);
+  const [overview, setOverview] = useState(null);
+  const [overviewError, setOverviewError] = useState('');
   const unauthorized = useCallback(() => {
-    toast({ tone: 'error', title: 'Сессия админки закрыта', text: 'Ключ больше не принимается relay.' });
+    toast({ tone: 'error', title: 'Сессия админки закрыта', text: 'Ключ больше не принимается relay' });
     onLogout(false);
   }, [onLogout, toast]);
   const journal = useJournal(apiKey, unauthorized);
 
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    try { localStorage.setItem('relay.admin.theme', theme); } catch { /* ignore */ }
-  }, [theme]);
+  const loadOverview = useCallback(async () => {
+    try {
+      setOverview(await api(apiKey, 'overview'));
+      setOverviewError('');
+    } catch (failure) {
+      if (failure.status === 401) unauthorized();
+      else setOverviewError(failure.message);
+    }
+  }, [apiKey, unauthorized]);
+  usePolling(loadOverview, 8000, [apiKey]);
+
   useEffect(() => { history.replaceState(null, '', `#${view}`); }, [view]);
   useEffect(() => {
     const onKey = (event) => {
@@ -54,73 +66,55 @@ function Shell({ apiKey, onLogout }) {
   }, []);
 
   const errors = journal.events.filter((e) => e.level === 'error' && Date.now() / 1000 - e.ts < 600).length;
-  const props = { apiKey, journal, onUnauthorized: unauthorized, go: setView };
+  const props = { apiKey, journal, overview, overviewError, refreshOverview: loadOverview, onUnauthorized: unauthorized, go: setView };
+  const streamLabel = journal.status === 'live' ? 'Поток журнала: live' : journal.status === 'reconnecting' ? 'Переподключение' : 'Подключение';
 
   return (
     <div className="shell">
       <aside className="rail">
-        <motion.div className="brand" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} transition={spring}>
-          <span className="brand-mark">r</span>
-          <div><strong>relay</strong><small>диспетчерская</small></div>
-        </motion.div>
-        <LayoutGroup>
-          <nav aria-label="Разделы">
-            {NAV.map((item, index) => {
-              const Icon = item.icon;
-              const active = view === item.id;
-              return (
-                <motion.button
-                  key={item.id}
-                  type="button"
-                  className={`nav-item ${active ? 'active' : ''}`}
-                  aria-current={active ? 'page' : undefined}
-                  onClick={() => setView(item.id)}
-                  initial={{ opacity: 0, x: -16 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ ...spring, delay: 0.05 * index }}
-                  whileTap={{ scale: 0.97 }}
-                >
-                  {active && <motion.span layoutId="nav-pill" className="nav-pill" transition={spring} />}
-                  <Icon size={18} aria-hidden="true" />
-                  <span>{item.label}</span>
-                  {item.id === 'journal' && errors > 0 && (
-                    <motion.b className="nav-count" initial={{ scale: 0 }} animate={{ scale: 1 }} key={errors}
-                      title="Ошибки за 10 минут">{errors}</motion.b>
-                  )}
-                  <kbd>{index + 1}</kbd>
-                </motion.button>
-              );
-            })}
-          </nav>
-        </LayoutGroup>
+        <div className="brand"><Mark /><strong>relay</strong></div>
+        <nav aria-label="Разделы">
+          {GROUPS.map((group) => (
+            <div className="nav-group" key={group}>
+              <p className="nav-label">{group}</p>
+              {NAV.map((item, index) => {
+                if (item.group !== group) return null;
+                const Icon = item.icon;
+                const active = view === item.id;
+                return (
+                  <button key={item.id} type="button" className={`nav-item ${active ? 'active' : ''}`}
+                    aria-current={active ? 'page' : undefined} onClick={() => setView(item.id)}>
+                    <Icon size={16} strokeWidth={1.5} aria-hidden="true" />
+                    <span className="nav-text">{item.label}</span>
+                    {item.id === 'journal' && errors > 0 && <b className="nav-count num" title="Ошибки за 10 минут">{errors}</b>}
+                    <Kbd>{index + 1}</Kbd>
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </nav>
         <div className="rail-foot">
-          <div className={`stream-state state-${journal.status}`}>
-            <PulseDot tone={journal.status === 'live' ? 'success' : 'warn'} live={journal.status === 'live'} />
-            {journal.status === 'live' ? 'Поток журнала: live' : journal.status === 'reconnecting' ? 'Переподключение…' : 'Подключение…'}
+          <div className="stream-state">
+            <Dot tone={journal.status === 'live' ? 'pos' : 'warn'} live={journal.status === 'live'} />
+            {streamLabel}
           </div>
           <div className="rail-actions">
-            <motion.button type="button" className="icon-button rail-btn" aria-label="Сменить тему"
-              whileTap={{ rotate: 180, scale: 0.9 }} onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}>
-              <AnimatePresence mode="wait" initial={false}>
-                <motion.span key={theme} className="icon-swap" initial={{ y: -14, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 14, opacity: 0 }}>
-                  {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-                </motion.span>
-              </AnimatePresence>
-            </motion.button>
-            <button type="button" className="button tone-rail" onClick={() => onLogout(true)}>
-              <LogOut size={15} /> Выйти
+            <button type="button" className="icon-button" aria-label="Сменить тему" onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}>
+              {theme === 'dark' ? <Sun size={16} strokeWidth={1.5} /> : <Moon size={16} strokeWidth={1.5} />}
+            </button>
+            <button type="button" className="button" onClick={() => onLogout(true)}>
+              <LogOut size={16} strokeWidth={1.5} aria-hidden="true" /> Выйти
             </button>
           </div>
         </div>
       </aside>
       <main className="main">
-        <AnimatePresence mode="wait">
-          {view === 'overview' && <Overview key="overview" {...props} />}
-          {view === 'journal' && <Journal key="journal" {...props} />}
-          {view === 'turns' && <Turns key="turns" {...props} />}
-          {view === 'models' && <Models key="models" {...props} />}
-          {view === 'settings' && <SettingsView key="settings" {...props} />}
-        </AnimatePresence>
+        {view === 'overview' && <Overview key="overview" {...props} />}
+        {view === 'journal' && <Journal key="journal" {...props} />}
+        {view === 'turns' && <Turns key="turns" {...props} />}
+        {view === 'models' && <Models key="models" {...props} />}
+        {view === 'settings' && <SettingsView key="settings" {...props} />}
       </main>
     </div>
   );
@@ -128,6 +122,8 @@ function Shell({ apiKey, onLogout }) {
 
 export default function App() {
   const [apiKey, setApiKey] = useState(loadKey);
+  const [theme, setTheme] = useState(initialTheme);
+  useEffect(() => { applyTheme(theme); }, [theme]);
 
   const login = useCallback((key, remember) => {
     saveKey(key, remember);
@@ -142,18 +138,15 @@ export default function App() {
   }, [apiKey]);
 
   return (
-    <ToastProvider>
-      <AnimatePresence mode="wait">
-        {apiKey ? (
-          <motion.div key="shell" className="app-root" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-            <Shell apiKey={apiKey} onLogout={logout} />
+    <ThemeContext.Provider value={theme}>
+      <ToastProvider>
+        <AnimatePresence mode="wait">
+          <motion.div key={apiKey ? 'shell' : 'login'} className="app-root" initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }} transition={{ duration: 0.2, ease }}>
+            {apiKey ? <Shell apiKey={apiKey} onLogout={logout} theme={theme} setTheme={setTheme} /> : <Login onLogin={login} />}
           </motion.div>
-        ) : (
-          <motion.div key="login" className="app-root" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, scale: 1.03, filter: 'blur(10px)' }}>
-            <Login onLogin={login} />
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </ToastProvider>
+        </AnimatePresence>
+      </ToastProvider>
+    </ThemeContext.Provider>
   );
 }
