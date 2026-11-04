@@ -22,6 +22,7 @@ import credits
 import journal
 import client_context
 import console_log
+import native_history
 import models as model_catalog
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
@@ -843,7 +844,31 @@ async def _keepwarm(session, cfg):
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
     """Yield normalised relay events from the direct NDJSON stream."""
-    body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
+    client = getattr(session, "_native_client_messages", None)
+    history = getattr(session, "_native_history", None)
+    scope = json.dumps([getattr(session, "_native_conversation_key", None), model_provider,
+                        head, tools, tool_choice, max_tokens], sort_keys=True, ensure_ascii=True)
+    parent, messages = history.resume(scope, client) if history is not None and client is not None else (None, None)
+    if messages is not None:
+        body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
+        body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools)
+        body["rit"] = make_rit(body["messages"], tools)
+        journal.emit("native_history.resume", "Сохранённые assistant/thinking blocks возвращены upstream", "info",
+                     blocks=len(parent.assistant), messages=len(body["messages"]),
+                     signatures=sum(b["type"] == "thinking" for b in parent.assistant))
+        req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
+        console_log.write("[%s] [history] native continuation restored thinking=%d tool_calls=%d" % (
+            req_id, sum(b["type"] in ("thinking", "redacted_thinking") for b in parent.assistant),
+            sum(b["type"] == "tool_call" for b in parent.assistant)))
+    else:
+        if history is not None and history.branches and client is not None:
+            # Never attach an old signature to a rebuilt/edited prefix.
+            session._cached_turn_ends = []
+            session._warm_body = None
+            journal.emit("native_history.reset", "История или настройки изменились; прежняя подпись не переиспользуется",
+                         "warn", reason="prefix_or_settings_mismatch")
+        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
+    session._direct_reply = None
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
         body = {key: value for key, value in body.items() if key != "metadata"}
@@ -883,6 +908,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 session._turn_body = body
             async for event in _stream_body(cfg, session, body, param_types):
                 yield event
+        reply = getattr(session, "_direct_reply", None)
+        if client is not None and history is not None and reply is not None and not session._cancelled:
+            blocks, expected = reply
+            history.record(scope, client, body["messages"], blocks, expected, parent)
     except apierr.ApiError as error:
         # A body upstream rejected (400/413/422) must not become the keepwarm body.
         rejected = 400 <= error.status < 500 and error.status not in (401, 403, 408, 429)
@@ -994,6 +1023,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
     elif json.loads(payload) != body:
         raise ValueError("replay payload does not match the supplied body")
+    session._direct_reply = None
     if cfg.get("direct_debug"):
         body_summary = {k: v for k, v in body.items() if k not in ("messages", "tools")}
         if "tools" in body:
@@ -1237,6 +1267,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             yield {"type": "error", "error": budget.attach(apierr.upstream_error(
                 "upstream stream ended without end_of_stream; the response may be incomplete"))}
             return
+        blocks = flags.get("assistant_blocks")
+        if usable and blocks and not is_cancelled():
+            session._direct_reply = (blocks, native_history.echo(blocks, param_types or {}, coerce_arguments))
+        elif usable and "assistant_blocks" in flags and blocks is None and not is_cancelled():
+            journal.emit("native_history.unavailable", "Ответ upstream нельзя сохранить для нативного продолжения",
+                         "warn", reason="unsupported_or_incomplete_blocks")
         yield {"type": "end", "reason": "stop"}
     finally:
         session._active_direct_abort = None
@@ -1255,6 +1291,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
     calls = {}
     current = None
     call_seq = 0  # monotonic: a finished call leaves `calls`, len() would repeat ids
+    capture = native_history.ReplyCapture() if getattr(session, "_native_client_messages", None) is not None else None
     # The relay request id matches the `relay <id> POST ...` console lines:
     # concurrent requests of one conversation interleave in the same console.
     req_id = getattr(session, "_request_tag", None) or getattr(session, "thread_id", None) or "req"
@@ -1308,8 +1345,17 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             # A valid JSON line that is not an object (a number, a list) must be
             # skipped, not kill the turn with an AttributeError.
             continue
+        if capture is not None:
+            try:
+                capture.feed(event)
+            except (TypeError, ValueError, AttributeError):
+                # Unknown provider extensions must not corrupt signed history or
+                # change the existing stream parser's error handling.
+                capture.valid = False
         if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
             flags["end"] = True
+            if capture is not None:
+                flags["assistant_blocks"] = capture.finish()
             # A stream can end with calls still open: finalize them exactly like
             # content_block_end would, or the client keeps a dangling partial.
             while stack:

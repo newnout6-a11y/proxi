@@ -608,6 +608,9 @@ class TurnRunner:
                             final_choice,
                             getattr(parsed, "max_tokens", None),
                             chunks)
+                        direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
+                                                                 if native_tools else None)
+                        direct_target._native_conversation_key = key
                     stream = (session.stream(stream_prompt, model_provider, tool_names=tool_names)
                               if native_tools else session.stream(stream_prompt, model_provider))
                     log("upstream.request", "Запрос к upstream (%s)" % ("direct" if direct_mode else "agent"),

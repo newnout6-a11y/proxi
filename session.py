@@ -11,6 +11,7 @@ import urllib.request
 import uuid
 
 import direct
+import native_history
 
 import websockets
 
@@ -293,6 +294,9 @@ class RelaySession:
         self._active_direct_abort = None
         self._active_warm_abort = None
         self._cached_turn_ends = []
+        self._native_history = native_history.History()
+        self._native_client_messages = None
+        self._native_conversation_key = None
 
     def set_direct(self, head, tools, tool_choice, max_tokens, chunks=None):
         """Direct transport: cacheable head, chunked history and native client tools."""
@@ -1084,6 +1088,11 @@ class SessionPool:
                     self._check_route(backend, model_entry)
                     session = RelaySession(backend, await self._new_thread_id(backend))
                     if parent is not None:
+                        if parent.backend is backend:
+                            # Immutable snapshots are shared only by branches of
+                            # this same conversation/account. Child replies must
+                            # remain available after its temporary lease closes.
+                            session._native_history = parent._native_history
                         if getattr(parent, "_cached_head", None):
                             session._cached_head = parent._cached_head
                         if getattr(parent, "_registered_tools", None):
