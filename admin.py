@@ -520,13 +520,14 @@ class Admin:
             record[key] = value
         parsed = urlsplit(record["base"])
         try:
-            parsed.port
+            port = parsed.port
         except ValueError:
             raise apierr.bad_request("'base' has an invalid port", param="base")
         if (parsed.scheme != "https" or not HOSTNAME.fullmatch(parsed.hostname or "") or parsed.path not in ("", "/")
                 or parsed.query or parsed.fragment or parsed.username or parsed.password):
             raise apierr.bad_request("'base' must be an https origin such as https://tenant.retool.com", param="base")
-        record["base"] = "https://" + parsed.netloc.lower()
+        # Rebuilt from its parts: no trailing ':' or default port survives into the config
+        record["base"] = "https://" + parsed.hostname + (f":{port}" if port and port != 443 else "")
         if not UUID.fullmatch(record["page_uuid"]):
             raise apierr.bad_request("'page_uuid' must be a UUID", param="page_uuid")
         record["page_uuid"] = record["page_uuid"].lower()
@@ -610,6 +611,12 @@ class Admin:
             for item in remaining:
                 if isinstance(item, dict) and key not in item and str(item.get("base") or "").rstrip("/") == base:
                     item[key] = value
+        # The root now mirrors the first remaining account, its resources included, so model
+        # listings that read the root (/v1/models) keep seeing the routes that exist.
+        first = next((item for item in remaining if isinstance(item, dict)), {})
+        for key in models.PROVIDER_RESOURCE_KEY.values():
+            if first.get(key):
+                saved[key] = first[key]
 
     def _pool_route(self, handler, path, match):
         allowed = ("GET", "POST") if match is None else ("POST",) if match.group(2) else ("PATCH", "DELETE")
@@ -684,7 +691,9 @@ class Admin:
         with self._transaction() as (path, saved):
             desired = self._settings(saved)["settings"]
             candidate = {**desired, **changes}
-            if candidate["session_mode"] == "shared" and not (saved.get("thread_id") or self.cfg.get("thread_id")):
+            # Judge what the next start will see: the file or RETOOL_THREAD_ID, not the running cfg
+            # (a deleted account's root thread_id may still be in memory).
+            if candidate["session_mode"] == "shared" and not (saved.get("thread_id") or os.environ.get("RETOOL_THREAD_ID")):
                 raise apierr.bad_request("shared mode requires a configured thread_id", param="session_mode")
             if candidate["reasoning_effort"] != "auto":
                 models.resolve_tolerant(candidate["model"], candidate["reasoning_effort"], strict=True,

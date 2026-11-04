@@ -120,7 +120,7 @@ function Catalog({ apiKey, onUnauthorized }) {
       </div>
       {shown.map((model) => (
         <article key={model.id} className={`model-card ${model.id === data?.default_model ? 'is-default' : ''}`}>
-          <span className="model-name"><strong>{model.label}</strong><code>{model.id}</code></span>
+          <span className="model-name" title={`${model.label} · ${model.id}`}><strong>{model.label}</strong><code>{model.id}</code></span>
           <span className="model-provider">{model.provider}</span>
           <span className="num">{fmtTokens(model.context)}</span>
           <span className="model-effort">{model.reasoning ? (model.reasoning_effort_levels || []).join(' · ') || 'есть' : 'нет'}</span>

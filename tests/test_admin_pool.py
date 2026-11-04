@@ -387,8 +387,10 @@ def test_delete_scrubs_a_rotated_root_session_and_hands_root_resources_to_same_t
     pool.path.write_text(json.dumps(saved), encoding="utf-8")
     assert pool.call("/admin/api/accounts/" + pool.tags[0], {}, method="DELETE")[0] == 200
     saved = pool.saved()
-    for key in ("cookie", "xsrf", "base", "page_uuid", "account_id", "thread_id", "provider_resource_name"):
+    for key in ("cookie", "xsrf", "base", "page_uuid", "account_id", "thread_id"):
         assert key not in saved, key
+    # The root now mirrors the first remaining account's resources, not the removed one's
+    assert saved["provider_resource_name"] == "resource-acc-b"
     encoded = json.dumps(saved)
     assert "cookie-acc-a-123456" not in encoded and "rotated-cookie-123456" not in encoded
     by_id = {record["account_id"]: record for record in saved["accounts"]}
@@ -396,6 +398,22 @@ def test_delete_scrubs_a_rotated_root_session_and_hands_root_resources_to_same_t
     assert by_id["acc-b"]["provider_resource_name"] == "resource-acc-b"
     reloaded = config.load(str(pool.path))
     assert reloaded["page_uuid"] == "page-acc-b" and reloaded["cookie"] == by_id["acc-b"]["cookie"]
+
+
+def test_shared_mode_cannot_be_chosen_once_the_root_thread_is_gone(pool):
+    assert pool.call("/admin/api/accounts/" + pool.tags[0], {}, method="DELETE")[0] == 200
+    pool.runtime.cfg["thread_id"] = "thread-still-in-memory"
+    status, body = pool.call("/admin/api/settings", {"settings": {"session_mode": "shared"}}, method="PATCH")
+    assert status == 400 and "thread_id" in body["error"]["message"]
+    assert config.load(str(pool.path))["session_mode"] == "per_conversation"
+
+
+@pytest.mark.parametrize("base,stored", [("https://Tenant.Retool.com:", "https://tenant.retool.com"),
+                                         ("https://tenant.retool.com:443/", "https://tenant.retool.com"),
+                                         ("https://tenant.retool.com:8443", "https://tenant.retool.com:8443")])
+def test_new_account_base_is_rebuilt_from_its_parts(pool, base, stored):
+    assert pool.call("/admin/api/accounts", dict(NEW, base=base), method="POST")[0] == 200
+    assert pool.saved()["accounts"][-1]["base"] == stored
 
 
 def test_shared_mode_keeps_its_account(tmp_path):

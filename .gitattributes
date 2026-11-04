@@ -1,4 +1,5 @@
 # The admin build is committed: keep its inputs and outputs byte-identical across platforms,
 # so a fresh `npm run build` on Windows reproduces web/dist exactly.
 web/index.html text eol=lf
+web/public/** text eol=lf
 web/dist/** -text
