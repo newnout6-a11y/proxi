@@ -101,9 +101,9 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
           ))}
         </nav>
         <div className="rail-foot">
-          <div className="stream-state">
+          {/* The dot alone carries the state; the words stay for the tooltip and screen readers */}
+          <div className="stream-state" role="status" title={streamLabel} aria-label={streamLabel}>
             <Dot tone={journal.status === 'live' ? 'pos' : 'warn'} live={journal.status === 'live'} />
-            {streamLabel}
           </div>
           <div className="rail-actions">
             <button type="button" className="icon-button" aria-label="Сменить тему" onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}>
