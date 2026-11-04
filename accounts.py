@@ -20,6 +20,19 @@ FORCED_CHECK_GAP = 15.0   # at most one on-demand balance fetch per account per 
 STARTUP_SPREAD = 2.0      # seconds between accounts' first checks
 NETWORK_PAUSE_MAX = 300.0
 AUTH_RETRY_MAX = 600.0
+PRIORITY_MAX = 99
+LABEL_MAX = 40
+
+
+def enabled(backend):
+    """An operator can switch an account off in the admin panel without deleting it."""
+    return (getattr(backend, "cfg", None) or {}).get("enabled", True) is not False
+
+
+def priority(backend):
+    """Lower is preferred for new conversations; 0 when unset."""
+    value = (getattr(backend, "cfg", None) or {}).get("priority", 0)
+    return value if type(value) is int else 0
 
 
 class AccountDispatcher:
@@ -117,7 +130,8 @@ class AccountDispatcher:
                 if self._busy >= self.parallel:
                     break
                 state = self.state[backend]
-                if state["running"] or now < self.pause_until:
+                if state["running"] or now < self.pause_until or not enabled(backend):
+                    # A switched-off account is only checked on an explicit admin request.
                     continue
                 manager = self.managers.get(backend)
                 snapshot = getattr(manager, "balance_snapshot", None)
@@ -250,7 +264,7 @@ class AccountDispatcher:
     def recheck_exhausted(self):
         """Before answering 402, confirm excluded balances (a top-up is adopted at once)."""
         with self._lock:
-            exhausted = [b for b in self.backends if "exhausted" in self.state[b]["reasons"]]
+            exhausted = [b for b in self.backends if "exhausted" in self.state[b]["reasons"] and enabled(b)]
         restored = False
         for backend in exhausted:
             if not self.check_balance_now(backend):

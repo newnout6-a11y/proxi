@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import threading
@@ -18,15 +19,25 @@ import auth
 import config
 import journal
 import models
+from accounts import enabled as account_enabled, priority as account_priority
 from redact import redact
 import sse
 import validate
 
 
 BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
-LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst"}
+LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
+POOL_FIELDS = {"enabled", "priority", "label"}
+NEW_ACCOUNT_REQUIRED = ("base", "page_uuid", "cookie", "xsrf")
+NEW_ACCOUNT_OPTIONAL = ("label", "provider_resource_name", "openai_provider_resource_name")
+# Moved into accounts[0] when a single-account configuration becomes a pool.
+ACCOUNT_RECORD_KEYS = ("base", "page_uuid", "cookie", "xsrf", "account_id", "thread_id", "label", "enabled",
+                       "priority", *models.PROVIDER_RESOURCE_KEY.values())
+UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balance|renew))?")
+SETTING_GROUPS = ("routing", "model", "retries", "cache", "exec", "limits", "api")
 
 
 def _int_param(query, name, default, low, high):
@@ -45,53 +56,114 @@ def _list_param(query, name):
 
 
 def _schema():
-    fields = {
-        "model": {"type": "string", "label": "Модель по умолчанию",
-                  "enum": [entry["id"] for entry in models.catalog()]},
-        "reasoning_effort": {"type": "string", "label": "Уровень мышления",
-                             "enum": ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"]},
-        "session_mode": {"type": "string", "label": "Режим сессий",
-                         "enum": ["per_request", "per_conversation", "shared"]},
-        "exec_policy": {"type": "string", "label": "Политика локальных команд",
-                        "enum": ["off", "allowlist", "allow_all"]},
-    }
-    for key, label in {
-        "enable_chat": "Chat Completions API", "enable_responses": "Responses API",
-        "enable_anthropic": "Anthropic API", "strict_models": "Проверять имена моделей",
-        "show_unrouted_models": "Показывать модели без маршрута",
-        "show_thinking": "Передавать мышление модели", "project_context": "Контекст проекта",
-        "show_exec_output": "Вывод локальных команд",
-        "cache_keepwarm_during_turns": "Прогрев кэша во время длинных ходов",
-        "allow_effort_downgrade": "Разрешать приближение неподдерживаемого effort",
-    }.items():
-        fields[key] = {"type": "boolean", "label": label}
-    for key, label, minimum, maximum in [
-        ("max_workers", "Параллельные запросы", 1, 512),
-        ("max_conversations", "Сохранённые диалоги", 1, 4096),
-        ("conversation_idle_timeout", "Хранение неактивного диалога, с", 1, 86400),
-        ("turn_timeout", "Ожидание ответа, с", 1, 86400),
-        ("recv_timeout", "Ожидание WebSocket, с", 1, 3600),
-        ("upstream_timeout", "Ожидание соединения, с", 1, 3600),
-        ("session_refresh_interval", "Обновление авторизации, с", 0, 86400),
-        ("command_timeout", "Ожидание локальной команды, с", 1, 86400),
-        ("command_output_limit", "Вывод команды, байт (0 — без лимита)", 0, 100_000_000),
-        ("max_exec_turns", "Циклы инструментов (0 — без лимита)", 0, 1000),
-        ("context_max_bytes", "Контекст проекта, байт", 1, 10_000_000),
-        ("max_prompt_bytes", "Размер запроса, байт (0 — без лимита)", 0, 1_073_741_824),
-        ("max_body_bytes", "Размер HTTP body, байт", 1, 1_073_741_824),
-        ("max_frame_bytes", "Размер WebSocket frame, байт", 1, 1_073_741_824),
-        ("cache_keepwarm_turn_offset", "Прогрев кэша во время хода, с от начала", 30, 285),
-    ]:
-        fields[key] = {"type": "integer", "label": label, "min": minimum, "max": maximum}
-    fields["rate_limit_rps"] = {"type": "number", "label": "Запросов в секунду (0 — без лимита)",
-                                "min": 0, "max": 10_000}
-    fields["rate_limit_burst"] = {"type": "number", "label": "Запас запросов", "min": 1,
-                                  "max": 100_000}
-    for key, field in fields.items():
-        field["restart_required"] = key not in LIVE_SETTINGS
-        field["description"] = ("Применяется к новым запросам сразу после сохранения."
-                                if key in LIVE_SETTINGS else
-                                "Сохраняется в конфигурации. Применится после перезапуска relay.")
+    catalog_ids = [entry["id"] for entry in models.catalog()]
+    # (key, type, label, group, description, unit, min, max, enum)
+    rows = [
+        ("session_mode", "string", "Режим сессий", "routing",
+         "Как диалоги клиентов привязываются к тредам Retool: свой тред на диалог, новый на каждый запрос "
+         "или один общий", None, None, None, ["per_request", "per_conversation", "shared"]),
+        ("min_account_balance", "number", "Порог резерва", "routing",
+         "Аккаунт с балансом ниже порога уходит в резерв и получает запросы, только когда ниже порога все",
+         "кредитов", 0, 1_000_000, None),
+        ("account_balance_interval", "integer", "Проверка баланса", "routing",
+         "Как часто спрашивать у Retool баланс каждого включённого аккаунта; 0 — раз в час",
+         "с", 0, 86400, None),
+        ("session_refresh_interval", "integer", "Продление сессии", "routing",
+         "Как часто продлевать сессию Retool каждого включённого аккаунта; 0 — не продлевать по таймеру",
+         "с", 0, 86400, None),
+        ("account_refresh_parallel", "integer", "Проверок одновременно", "routing",
+         "Сколько аккаунтов можно проверять или продлевать одновременно", None, 1, 32, None),
+        ("max_conversations", "integer", "Открытые диалоги", "routing",
+         "Сколько диалогов relay держит открытыми; при переполнении закрывается самый давний неактивный",
+         None, 1, 4096, None),
+        ("conversation_idle_timeout", "integer", "Хранение неактивного диалога", "routing",
+         "Через сколько секунд простоя диалог закрывается и следующий запрос начнёт новый тред Retool",
+         "с", 1, 86400, None),
+        ("model", "string", "Модель по умолчанию", "model",
+         "Модель для запросов, в которых клиент не указал свою", None, None, None, catalog_ids),
+        ("reasoning_effort", "string", "Уровень мышления", "model",
+         "Уровень мышления, если клиент его не передал; auto оставляет выбор модели", None, None, None,
+         ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        ("allow_effort_downgrade", "boolean", "Подбирать ближайший effort", "model",
+         "Если модель не поддерживает запрошенный уровень мышления, взять ближайший вместо ошибки",
+         None, None, None, None),
+        ("show_thinking", "boolean", "Передавать мышление модели", "model",
+         "Отдавать клиенту блоки мышления модели, когда Retool их присылает",
+         None, None, None, None),
+        ("strict_models", "boolean", "Проверять имена моделей", "model",
+         "Отклонять запрос с неизвестной моделью вместо подстановки похожей", None, None, None, None),
+        ("show_unrouted_models", "boolean", "Показывать модели без маршрута", "model",
+         "Перечислять в /v1/models модели, для которых у аккаунтов нет ресурса Retool",
+         None, None, None, None),
+        ("project_context", "boolean", "Контекст проекта", "model",
+         "Добавлять к запросу краткое описание рабочей папки relay", None, None, None, None),
+        ("context_max_bytes", "integer", "Размер контекста проекта", "model",
+         "Предел описания рабочей папки, которое добавляется к каждому запросу", "байт", 1, 10_000_000, None),
+        ("upstream_empty_retries", "integer", "Повторы пустого ответа", "retries",
+         "Сколько раз повторить запрос, если Retool вернул пустой ответ или одно мышление; каждый повтор платный",
+         None, 0, 4, None),
+        ("upstream_error_max_dumps", "integer", "Дампы ошибок", "retries",
+         "Сколько последних наборов диагностики с телом запроса хранить после ошибок; 0 — все",
+         None, 0, 10_000, None),
+        ("upstream_attempt_summaries_max", "integer", "Сводки попыток", "retries",
+         "Сколько последних сводок попыток обращения к Retool хранить на диске; 0 — все", None, 0, 100_000, None),
+        ("cache_keepwarm_seconds", "integer", "Интервал прогрева", "cache",
+         "Как часто перечитывать начало диалога, чтобы кэш промпта не остыл; 0 — прогрев выключен",
+         "с", 0, 3600, None),
+        ("cache_keepwarm_idle", "integer", "Прогрев после запроса", "cache",
+         "Сколько секунд после последнего запроса диалог ещё прогревают", "с", 1, 86400, None),
+        ("cache_keepwarm_during_turns", "boolean", "Прогрев во время хода", "cache",
+         "Прогревать кэш и во время длинного хода, пока модель ещё отвечает", None, None, None, None),
+        ("cache_keepwarm_turn_offset", "integer", "Первый прогрев в ходе", "cache",
+         "Через сколько секунд от начала хода отправить первый прогрев", "с", 30, 285, None),
+        ("exec_policy", "string", "Локальные команды", "exec",
+         "Какие команды модель может выполнить на этой машине: никакие, из списка разрешённых или любые",
+         None, None, None, ["off", "allowlist", "allow_all"]),
+        ("show_exec_output", "boolean", "Показывать вывод команд", "exec",
+         "Передавать клиенту вывод выполненных команд", None, None, None, None),
+        ("command_timeout", "integer", "Ожидание команды", "exec",
+         "Сколько ждать завершения одной команды", "с", 1, 86400, None),
+        ("command_output_limit", "integer", "Вывод команды", "exec",
+         "Сколько вывода команды вернуть модели; 0 — без ограничения", "байт", 0, 100_000_000, None),
+        ("max_exec_turns", "integer", "Циклы команд в ходе", "exec",
+         "Сколько циклов «команда — ответ» допускается в одном ходе; 0 — без ограничения", None, 0, 1000, None),
+        ("max_workers", "integer", "Параллельные запросы", "limits",
+         "Сколько запросов relay обслуживает одновременно; остальные ждут", None, 1, 512, None),
+        ("rate_limit_rps", "number", "Запросов в секунду", "limits",
+         "Сколько запросов в секунду принимать от клиентов; 0 — без ограничения", None, 0, 10_000, None),
+        ("rate_limit_burst", "number", "Запас запросов", "limits",
+         "Сколько запросов подряд можно принять сверх темпа, прежде чем включится ограничение",
+         None, 1, 100_000, None),
+        ("turn_timeout", "integer", "Ожидание ответа", "limits",
+         "Максимальная длительность одного хода модели", "с", 1, 86400, None),
+        ("upstream_timeout", "integer", "Ожидание Retool", "limits",
+         "Сколько ждать соединения и ответа на HTTP-запрос к Retool", "с", 1, 3600, None),
+        ("recv_timeout", "integer", "Ожидание WebSocket", "limits",
+         "Сколько ждать следующего сообщения по WebSocket Retool", "с", 1, 3600, None),
+        ("max_prompt_bytes", "integer", "Размер промпта", "limits",
+         "Отклонять запросы с промптом больше этого размера; 0 — без ограничения", "байт", 0, 1_073_741_824, None),
+        ("max_body_bytes", "integer", "Размер HTTP body", "limits",
+         "Максимальный размер тела HTTP-запроса от клиента", "байт", 1, 1_073_741_824, None),
+        ("max_frame_bytes", "integer", "Размер WebSocket frame", "limits",
+         "Максимальный размер одного кадра WebSocket от Retool", "байт", 1, 1_073_741_824, None),
+        ("enable_chat", "boolean", "Chat Completions API", "api",
+         "Принимать запросы OpenAI Chat Completions на /v1/chat/completions", None, None, None, None),
+        ("enable_responses", "boolean", "Responses API", "api",
+         "Принимать запросы OpenAI Responses на /v1/responses", None, None, None, None),
+        ("enable_anthropic", "boolean", "Anthropic API", "api",
+         "Принимать запросы Anthropic Messages на /v1/messages", None, None, None, None),
+    ]
+    fields = {}
+    for key, kind, label, group, description, unit, minimum, maximum, enum in rows:
+        field = {"type": kind, "label": label, "group": group, "description": description,
+                 "restart_required": key not in LIVE_SETTINGS}
+        if unit:
+            field["unit"] = unit
+        if minimum is not None:
+            field.update(min=minimum, max=maximum)
+        if enum is not None:
+            field["enum"] = enum
+        fields[key] = field
     return fields
 
 
@@ -254,6 +326,273 @@ class Admin:
             "connection": {"openai_base_url": base_url + "/v1", "anthropic_base_url": base_url},
         })
 
+    # -- account pool ------------------------------------------------------------
+    @staticmethod
+    def _records(saved):
+        if isinstance(saved.get("accounts"), list):
+            return [record for record in saved["accounts"] if isinstance(record, dict)]
+        return [saved] if saved.get("base") or saved.get("page_uuid") else []
+
+    @staticmethod
+    def _same_account(record, cfg):
+        if record.get("account_id") and cfg.get("account_id"):
+            return record["account_id"] == cfg["account_id"]
+        return (str(record.get("base") or "").rstrip("/") == str(cfg.get("base") or "").rstrip("/")
+                and record.get("page_uuid") == cfg.get("page_uuid"))
+
+    @staticmethod
+    def _record_tag(record):
+        return journal.tag(record.get("account_id") or record.get("page_uuid")) or "account"
+
+    def _live_backends(self):
+        return getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]
+
+    def _pool(self):
+        """Loaded accounts (with live state) plus accounts saved but not loaded until a restart."""
+        runtime = self.runtime
+        entries = account_report.collect(runtime)
+        usage = account_report.usage_report(runtime, [(entry["backend"], entry["manager"]) for entry in entries])
+        records = self._records(self._saved()) if self.cfg.get("_config_path") else None
+        pool = []
+        for entry, item in zip(entries, self._accounts(entries, usage)):
+            backend = entry["backend"]
+            removed = records is not None and not any(self._same_account(r, backend.cfg) for r in records)
+            pool.append({**item, "label": backend.cfg.get("label") or "", "enabled": account_enabled(backend),
+                         "priority": account_priority(backend),
+                         "last_balance_at": getattr(entry["manager"], "last_fetched_at", None),
+                         "pending": "removed" if removed else None, "_backend": backend})
+        loaded = [entry["backend"].cfg for entry in entries]
+        for record in records or []:
+            if any(self._same_account(record, cfg) for cfg in loaded):
+                continue
+            pool.append({
+                "account": self._record_tag(record), "label": record.get("label") or "",
+                "enabled": record.get("enabled", True) is not False,
+                "priority": record["priority"] if type(record.get("priority")) is int else 0,
+                "state": "pending", "routable": False, "reserve": False, "available": None,
+                "monthly_allocation": None, "used_month": None, "reset_date": None, "stale": False,
+                "session_used": 0.0, "turns": 0, "auth_failures": 0, "last_renewed_at": None,
+                "last_balance_at": None, "error": None, "pending": "added", "_record": record})
+        return pool
+
+    @staticmethod
+    def _public(account):
+        return {key: value for key, value in account.items() if not key.startswith("_")}
+
+    def _find(self, tag, pool=None):
+        for account in self._pool() if pool is None else pool:
+            if account["account"] == tag:
+                return account
+        raise apierr.not_found("Unknown account")
+
+    def _account_response(self, tag, **extra):
+        return self._safe({**extra, "account": self._public(self._find(tag))})
+
+    def _pool_response(self):
+        pool = self._pool()
+        live = [account for account in pool if account["pending"] != "removed"]
+        states = {}
+        for account in live:
+            states[account["state"]] = states.get(account["state"], 0) + 1
+        return self._safe({
+            "accounts": [self._public(account) for account in pool],
+            "summary": {"total": len(live), "enabled": sum(account["enabled"] for account in live),
+                        "routable": sum(account["routable"] for account in live),
+                        "reserve": sum(account["reserve"] for account in live), "states": states},
+            "limits": {key: self.cfg.get(key, config.DEFAULTS.get(key))
+                       for key in ("min_account_balance", "account_balance_interval", "account_refresh_parallel")},
+            "restart_required": any(account["pending"] for account in pool),
+        })
+
+    def _saved_record(self, saved, account):
+        backend = account.get("_backend")
+        for record in self._records(saved):
+            if (self._same_account(record, backend.cfg) if backend is not None
+                    else self._record_tag(record) == account["account"]):
+                return record
+        raise apierr.conflict("The account changed in config.json; reload the page")
+
+    def _other_enabled(self, saved, backend):
+        """Loaded, still configured and enabled accounts other than `backend`."""
+        records = self._records(saved)
+        return [other for other in self._live_backends() if other is not backend and account_enabled(other)
+                and any(self._same_account(record, other.cfg) for record in records)]
+
+    @staticmethod
+    def _write(path, saved):
+        try:
+            config._write_file(path, saved)
+        except (OSError, ValueError):
+            raise apierr.service_unavailable("Cannot save relay settings")
+
+    @staticmethod
+    def _apply_live(backend, changes):
+        backend.cfg.update(changes)
+        reference = backend.cfg.get("_account_ref")
+        if isinstance(reference, dict) and reference is not backend.cfg:
+            reference.update(changes)
+
+    def _patch_account(self, tag, changes):
+        if not changes:
+            raise apierr.bad_request("Expected enabled, priority or label")
+        for key, value in changes.items():
+            if key not in POOL_FIELDS:
+                raise apierr.bad_request("Unknown or protected account field", param=key)
+            valid = ((key == "enabled" and type(value) is bool) or
+                     (key == "priority" and type(value) is int and 0 <= value <= 99) or
+                     (key == "label" and isinstance(value, str) and len(value.strip()) <= 40))
+            if not valid:
+                raise apierr.bad_request(f"Invalid value for '{key}'", param=key)
+        if "label" in changes:
+            changes["label"] = changes["label"].strip()
+        account = self._find(tag)
+        if account["pending"] == "removed":
+            raise apierr.conflict("The account is removed from config.json and leaves after a restart")
+        backend = account.get("_backend")
+        with self._transaction() as (path, saved):
+            record = self._saved_record(saved, account)
+            if changes.get("enabled") is False and backend is not None and account_enabled(backend):
+                if not self._other_enabled(saved, backend):
+                    raise apierr.conflict("The last enabled account cannot be switched off")
+                if self.runtime.pool.mode == "shared" and backend is self.runtime.pool.backend:
+                    raise apierr.conflict("Shared session mode serves only the first account")
+            record.update(changes)
+            self._write(path, saved)
+            if backend is not None:
+                self._apply_live(backend, changes)
+        journal.emit("admin.account", "Аккаунт %s изменён: %s" % (tag, ", ".join(sorted(changes))), "info",
+                     account=tag, changed=changes)
+        return self._account_response(tag)
+
+    def _loaded(self, tag):
+        account = self._find(tag)
+        backend = account.get("_backend")
+        if backend is None or backend not in self.runtime.accounts.state:
+            raise apierr.conflict("The account is not loaded yet; restart the relay")
+        return backend
+
+    def _check_balance(self, tag):
+        backend = self._loaded(tag)
+        self.runtime.accounts.check_balance(backend)
+        journal.emit("admin.account", "Баланс аккаунта %s запрошен вручную" % tag, "info", account=tag)
+        return self._account_response(tag)
+
+    def _renew(self, tag):
+        backend = self._loaded(tag)
+        if getattr(backend, "refresher", None) is None:
+            raise apierr.conflict("The account has no session to renew")
+        error = None
+        try:
+            ok = bool(self.runtime.accounts.refresh(backend))
+        except Exception as exc:  # noqa: BLE001 - a failed renewal is an answer, not a server error
+            ok, error = False, type(exc).__name__
+        if not ok:
+            error = getattr(backend.refresher, "last_error", None) or error or "session renewal failed"
+        journal.emit("admin.account", "Сессия аккаунта %s %s вручную" % (tag, "продлена" if ok else "не продлена"),
+                     "success" if ok else "warn", account=tag)
+        return self._account_response(tag, ok=ok, error=self._safe(str(error))[:200] if error else None)
+
+    @staticmethod
+    def _new_account(data):
+        unknown = set(data) - set(NEW_ACCOUNT_REQUIRED) - set(NEW_ACCOUNT_OPTIONAL)
+        if unknown:
+            raise apierr.bad_request("Unknown account field", param=sorted(unknown)[0])
+        record = {}
+        for key in NEW_ACCOUNT_REQUIRED + NEW_ACCOUNT_OPTIONAL:
+            value = data.get(key)
+            if value is None and key in NEW_ACCOUNT_OPTIONAL:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                if key in NEW_ACCOUNT_OPTIONAL and isinstance(value, str):
+                    continue
+                raise apierr.bad_request(f"'{key}' must be a non-empty string", param=key)
+            value = value.strip()
+            # Credentials become HTTP headers: control characters would split them.
+            if any(ord(char) < 32 or ord(char) == 127 for char in value) or len(value) > 16384:
+                raise apierr.bad_request(f"Invalid value for '{key}'", param=key)
+            record[key] = value
+        parsed = urlsplit(record["base"])
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.path not in ("", "/")
+                or parsed.query or parsed.fragment or parsed.username or parsed.password):
+            raise apierr.bad_request("'base' must be an https origin such as https://tenant.retool.com", param="base")
+        record["base"] = "https://" + parsed.netloc.lower()
+        if not UUID.fullmatch(record["page_uuid"]):
+            raise apierr.bad_request("'page_uuid' must be a UUID", param="page_uuid")
+        if len(record.get("label", "")) > 40:
+            raise apierr.bad_request("'label' is longer than 40 characters", param="label")
+        record.update(enabled=True, priority=0)
+        return record
+
+    def _add_account(self, data):
+        record = self._new_account(data)
+        with self._transaction() as (path, saved):
+            for existing in self._records(saved):
+                if (str(existing.get("base") or saved.get("base") or "").rstrip("/") == record["base"]
+                        and existing.get("page_uuid") == record["page_uuid"]):
+                    raise apierr.conflict("This Retool app is already in the pool")
+            if not isinstance(saved.get("accounts"), list):
+                # A single-account configuration becomes a pool; the account keeps its id and session.
+                first = {key: saved[key] for key in ACCOUNT_RECORD_KEYS if key in saved}
+                for key in ("cookie", "xsrf"):
+                    saved.pop(key, None)
+                saved["accounts"] = [first] if first else []
+            saved["accounts"].append(record)
+            config._assign_account_ids(saved)
+            self._write(path, saved)
+        tag = self._record_tag(record)
+        journal.emit("admin.account", "Добавлен аккаунт %s, подключится после перезапуска" % tag, "success",
+                     account=tag, label=record.get("label", ""))
+        return self._account_response(tag, restart_required=True)
+
+    def _delete_account(self, tag):
+        account = self._find(tag)
+        if account["pending"] == "removed":
+            raise apierr.conflict("The account is already removed and leaves after a restart")
+        backend = account.get("_backend")
+        with self._transaction() as (path, saved):
+            record = self._saved_record(saved, account)
+            if not isinstance(saved.get("accounts"), list) or len(self._records(saved)) <= 1:
+                raise apierr.conflict("The last account cannot be removed")
+            if backend is not None and account_enabled(backend) and not self._other_enabled(saved, backend):
+                raise apierr.conflict("The last enabled account cannot be removed")
+            remaining = [item for item in saved["accounts"] if item is not record]
+            if not any(isinstance(item, dict) and item.get("enabled", True) is not False for item in remaining):
+                raise apierr.conflict("No enabled account would remain")
+            saved["accounts"] = remaining
+            if self._same_account(saved, record) and (saved.get("base") or saved.get("page_uuid")):
+                # The root mirrored this account: drop its session there too; config.load
+                # fills base/page_uuid/cookie/xsrf from the first remaining account.
+                for key in ("base", "page_uuid", "cookie", "xsrf", "account_id"):
+                    if key in saved and saved[key] == record.get(key):
+                        saved.pop(key)
+            self._write(path, saved)
+            if backend is not None:
+                self._apply_live(backend, {"enabled": False})
+        journal.emit("admin.account", "Аккаунт %s удалён из config.json" % tag, "warn", account=tag)
+        return {"ok": True, "pending": "removed" if backend is not None else None,
+                "restart_required": backend is not None}
+
+    def _pool_route(self, handler, path, match):
+        allowed = ("GET", "POST") if match is None else ("POST",) if match.group(2) else ("PATCH", "DELETE")
+        if handler.command not in allowed:
+            raise apierr.method_not_allowed()
+        if handler.command == "GET":
+            return self._pool_response()
+        # Guard failures must close a connection whose body was not consumed.
+        handler.close_connection = True
+        self._mutation_guard(handler)
+        data = validate.load_json(handler._read_body())
+        if match is None:
+            return self._add_account(data)
+        tag, action = match.groups()
+        if action == "balance":
+            return self._check_balance(tag)
+        if action == "renew":
+            return self._renew(tag)
+        if handler.command == "PATCH":
+            return self._patch_account(tag, data)
+        return self._delete_account(tag)
+
     def _validate(self, changes):
         if not isinstance(changes, dict) or not changes:
             raise apierr.bad_request("'settings' must be a non-empty object")
@@ -279,12 +618,12 @@ class Admin:
         if "session_mode" in changes and os.environ.get("RELAY_SESSION_MODE"):
             raise apierr.bad_request("session_mode is controlled by RELAY_SESSION_MODE", param="session_mode")
 
-    def _update(self, changes):
-        self._validate(changes)
+    @contextlib.contextmanager
+    def _transaction(self):
+        """Read/merge/write of config.json, serialized with renewal's cookie rotation."""
         path = self.cfg.get("_config_path")
         if not path:
             raise apierr.service_unavailable("Relay settings have no writable configuration file")
-        # Coordinate with renewal's read/merge/write to preserve rotated credentials.
         with self.lock, contextlib.ExitStack() as locks:
             # Every account's refresher persists rotated cookies through the same
             # file: hold all their locks, not only account 0's.
@@ -296,7 +635,11 @@ class Admin:
                 locks.enter_context(config.storage_lock(path))
             except TimeoutError:
                 raise apierr.service_unavailable("Relay settings are busy: configuration storage is locked")
-            saved = self._saved()
+            yield path, self._saved()
+
+    def _update(self, changes):
+        self._validate(changes)
+        with self._transaction() as (path, saved):
             desired = self._settings(saved)["settings"]
             candidate = {**desired, **changes}
             if candidate["session_mode"] == "shared" and not (saved.get("thread_id") or self.cfg.get("thread_id")):
@@ -333,6 +676,15 @@ class Admin:
                     limiter.rate = self.cfg["rate_limit_rps"]
                     limiter.burst = self.cfg["rate_limit_burst"]
                     limiter.tokens = min(limiter.tokens, limiter.burst)
+                dispatcher = self.runtime.accounts
+                if {"min_account_balance", "account_balance_interval"} & set(applied):
+                    with dispatcher._lock:
+                        dispatcher.threshold = float(self.cfg["min_account_balance"])
+                        dispatcher.balance_interval = float(self.cfg["account_balance_interval"] or 0)
+                        # Re-judge every account against the new threshold at the next tick.
+                        now = dispatcher.clock()
+                        for state in dispatcher.state.values():
+                            state["next_balance"] = min(state["next_balance"], now)
             return {**self._settings(saved), "saved": True, "changed": changed, "applied": applied}
 
     def _mutation_guard(self, handler):
@@ -442,6 +794,10 @@ class Admin:
                          path=path, request_id=handler.request_id)
             raise
         query = parse_qs(getattr(handler, "_query", "") or "")
+        account_match = ACCOUNT_PATH.fullmatch(path)
+        if path == "/admin/api/accounts" or account_match:
+            handler._json(200, self._pool_route(handler, path, account_match))
+            return
         if handler.command == "GET":
             if path == "/admin/api/overview":
                 payload = self._overview(handler)

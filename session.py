@@ -17,6 +17,7 @@ import websockets
 import apierr
 import journal
 import models as model_catalog
+from accounts import enabled as account_enabled, priority as account_priority
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -852,6 +853,9 @@ class SessionPool:
                         if resource_key not in acc:
                             acc_cfg.pop(resource_key, None)
                 acc_cfg.update(acc)
+                # Pool controls belong to the account record, never inherited from the root.
+                acc_cfg.update(enabled=acc.get("enabled", True), priority=acc.get("priority", 0),
+                               label=acc.get("label", ""))
                 acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
                 acc_cfg["_account_ref"] = acc
                 acc_cfg["_disk_auth"] = (acc.get("cookie"), acc.get("xsrf"))
@@ -883,8 +887,10 @@ class SessionPool:
 
     @staticmethod
     def _usable(backend, exclude=()):
-        """The dispatcher marks exhausted or signed-out accounts unavailable."""
-        return backend not in exclude and getattr(backend, "unavailable", None) is None
+        """The dispatcher marks exhausted or signed-out accounts unavailable; the
+        operator can switch an account off."""
+        return (backend not in exclude and getattr(backend, "unavailable", None) is None
+                and account_enabled(backend))
 
     @staticmethod
     def _reserve(backends, exclude=()):
@@ -893,7 +899,7 @@ class SessionPool:
         spare = []
         for backend in backends:
             reason = getattr(backend, "unavailable", None) or {}
-            if backend in exclude or reason.get("reason") != "exhausted":
+            if backend in exclude or reason.get("reason") != "exhausted" or not account_enabled(backend):
                 continue
             available = reason.get("available")
             if available is None or available > 0:
@@ -902,6 +908,9 @@ class SessionPool:
 
     @staticmethod
     def _unusable_error(backends):
+        backends = [b for b in backends if account_enabled(b)]
+        if not backends:
+            return apierr.service_unavailable("no enabled account: every account is switched off")
         reasons = [getattr(b, "unavailable", None) or {} for b in backends]
         exhausted = [(journal.tag(b.cfg.get("account_id") or b.cfg.get("page_uuid")), r.get("available"))
                      for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
@@ -930,7 +939,7 @@ class SessionPool:
         if not eligible:
             # A signed-out account is still better than no account: its 401 makes the
             # refresher re-read config.json, so a fresh sign-in is adopted at once.
-            eligible = [backend for backend in routable if backend not in exclude
+            eligible = [backend for backend in routable if backend not in exclude and account_enabled(backend)
                         and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"]
         if not eligible:
             raise self._unusable_error(routable)
@@ -943,7 +952,9 @@ class SessionPool:
                 counts[session.backend] += 2
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % len(self.backends)
-        return min(eligible, key=lambda b: (counts[b], (self.backends.index(b) - idx) % len(self.backends)))
+        # Operator priority first (lower wins), then the least loaded, then round-robin.
+        return min(eligible, key=lambda b: (account_priority(b), counts[b],
+                                            (self.backends.index(b) - idx) % len(self.backends)))
 
     @property
     def mode(self):
@@ -1038,6 +1049,8 @@ class SessionPool:
                 conversation_key = (None if self.mode == "shared" else conversation_key, context_scope)
             if not isolated and self.mode == "shared" and not context_scope:
                 self._check_route(self.backend, model_entry)
+                if not account_enabled(self.backend):
+                    raise apierr.service_unavailable("the shared-mode account is switched off")
                 if (self.backend in exclude or
                         ((getattr(self.backend, "unavailable", None) or {}).get("reason") == "exhausted"
                          and not self._reserve([self.backend], exclude))):

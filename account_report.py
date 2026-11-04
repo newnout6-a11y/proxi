@@ -3,6 +3,7 @@ import concurrent.futures
 
 import console_log
 import journal
+from accounts import enabled
 from session import SessionPool
 
 
@@ -40,7 +41,8 @@ def collect(runtime, *, force_refresh=False):
     """
     rows = account_managers(runtime)
     states = account_states(runtime)
-    active = [backend for backend, _ in rows if getattr(backend, "unavailable", None) is None]
+    active = [backend for backend, _ in rows
+              if getattr(backend, "unavailable", None) is None and enabled(backend)]
     spare = [] if active else SessionPool._reserve([backend for backend, _ in rows])
 
     def fetch(row):
