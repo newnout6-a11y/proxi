@@ -1,7 +1,10 @@
 """Regression and verification tests for PR #2 fixes and direct transport latency hardening."""
 import asyncio
+import copy
 import queue
 from types import SimpleNamespace
+
+import pytest
 
 import direct
 import models
@@ -93,6 +96,41 @@ def test_direct_tools_cache_budget_reserves_upstream_breakpoint_slot():
     cached_no_tools = [b for m in body_no_tools["messages"] for b in m.get("content", [])
                        if isinstance(b, dict) and b.get("cache")]
     assert len(cached_no_tools) == 4
+
+
+@pytest.mark.parametrize("tools", [None, [{"name": "inspect", "params": {}, "strict": True}]])
+@pytest.mark.parametrize("image_tail", [
+    {"type": "image", "imageData": "first", "mimeType": "image/png"},
+    [{"type": "image", "imageData": "first", "mimeType": "image/png"},
+     {"type": "image", "imageData": "second", "mimeType": "image/jpeg"}],
+])
+def test_image_only_tail_keeps_the_recent_text_cache_boundary(tools, image_tail):
+    history = ["User: start"] + ["[tool result id=%d] ok" % i for i in range(40)]
+    session = SimpleNamespace(_cached_turn_ends=[])
+    direct.build_body({}, {"model": "claude-opus-5-5"}, "stable head", "", tools,
+                      "auto", 32, chunks=history, session=session)
+    chunks = history + [image_tail]
+    original = copy.deepcopy(chunks)
+    body = direct.build_body({}, {"model": "claude-opus-5-5"}, "stable head", "", tools,
+                             "auto", 32, chunks=chunks, session=session)
+    assert body["messages"][-2]["content"][-1].get("cache") is True
+    expected_tail = image_tail if isinstance(image_tail, list) else [image_tail]
+    assert body["messages"][-1]["content"] == expected_tail
+    assert len(body["messages"]) == len(chunks) + 1
+    cached = [block for message in body["messages"] for block in message["content"]
+              if isinstance(block, dict) and block.get("cache")]
+    assert len(cached) == (3 if tools else 4)
+    assert chunks == original
+
+
+def test_image_only_history_preserves_images_without_invalid_cache_flags():
+    image = {"type": "image", "imageData": "fixture", "mimeType": "image/png"}
+    body = direct.build_body({}, {"model": "claude-opus-5-5"}, "stable head", "",
+                             [{"name": "inspect", "params": {}}], "auto", 32,
+                             chunks=[[image], image])
+    assert [message["content"] for message in body["messages"][1:]] == [[image], [image]]
+    assert sum(bool(block.get("cache")) for message in body["messages"]
+               for block in message["content"]) == 1
 
 
 def test_client_text_suppresses_incomplete_tool_envelopes():

@@ -43,6 +43,28 @@ def test_large_initial_write_is_red_and_keeps_warning_without_color():
     assert "\x1b" not in console_log.render(line, color=False)
 
 
+@pytest.mark.parametrize("missing_write", [None, "omitted"])
+def test_large_uncached_input_warns_even_without_a_cache_write_counter(missing_write):
+    metadata = {"inputTokens": 689302, "promptTokensReadFromCache": 10939,
+                "creditsUsed": 55.491516}
+    if missing_write is None:
+        metadata["promptTokensWrittenToCache"] = None
+    line = console_log.CacheMonitor().line("cold-input", metadata)
+    assert "[INPUT HIGH]" in line
+    assert "[INPUT HIGH]" in console_log.render(line, color=False)
+    colored = console_log.render(line, color=True)
+    for field in ("in=689,302", "credits=55.4915", "[INPUT HIGH]"):
+        assert "\x1b[1;91m" + field + "\x1b[0m" in colored
+    assert "\x1b[36mread=10,939\x1b[0m" in colored
+
+
+def test_uncached_input_alert_has_a_floor_and_can_coexist_with_write_alerts():
+    monitor = console_log.CacheMonitor()
+    assert "INPUT HIGH" not in monitor.line("small", dict(usage(), inputTokens=49999))
+    line = console_log.CacheMonitor().line("large", dict(usage(write=50000), inputTokens=50000))
+    assert "[INPUT HIGH]" in line and "[WRITE HIGH]" in line
+
+
 def test_write_jump_compares_previous_request_not_metadata_in_same_request():
     monitor = console_log.CacheMonitor()
     monitor.line("req-A", usage(write=100), scope=("opus", "key"))

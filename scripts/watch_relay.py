@@ -48,6 +48,8 @@ def demo():
                           "promptTokensWrittenToCache": write, "creditsUsed": cost}))
         console_log.write(console_log.balance_line(request, {"available": remaining,
                           "monthly_allocation": 5000, "estimated": True}, cost))
+    console_log.write(monitor.line("req-uncached", {"inputTokens": 689302,
+                      "promptTokensReadFromCache": 10939, "creditsUsed": 55.491516}))
 
 
 def main():

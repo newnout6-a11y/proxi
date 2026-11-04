@@ -435,6 +435,12 @@ def cache_key_for(head, model="", tools=None):
     return digest.hexdigest()[:24]
 
 
+def _has_cacheable_text(chunk):
+    blocks = chunk if isinstance(chunk, list) else [chunk]
+    # Non-dict blocks become text in build_body; image dicts cannot carry cache.
+    return any(not isinstance(block, dict) or block.get("type") == "text" for block in blocks)
+
+
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
     """Assemble the request body.
 
@@ -478,18 +484,20 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             budget = 4 - (1 if tools else 0)
             max_history_cache = budget - 1 if (head and cache) else budget
 
-            chosen = set()
-            chosen.add(0)
-            chosen.add(len(history) - 1)
+            # An image-only tail cannot carry cache: selecting its index silently
+            # lost the recent history breakpoint and re-billed the whole prefix.
+            cacheable_indices = [i for i, part in enumerate(history) if _has_cacheable_text(part)]
+            cacheable = set(cacheable_indices)
+            chosen = {cacheable_indices[0], cacheable_indices[-1]} if cacheable_indices else set()
 
             slots_left = max_history_cache - len(chosen)
-            intermediates = [i for i in known_boundaries if 0 < i < len(history) - 1]
+            intermediates = [i for i in known_boundaries if i in cacheable and i not in chosen]
             if slots_left > 0 and intermediates:
                 for idx in intermediates[-slots_left:]:
                     chosen.add(idx)
 
-            if len(chosen) < max_history_cache and len(history) >= 3:
-                for idx in reversed(range(1, len(history) - 1)):
+            if len(chosen) < max_history_cache:
+                for idx in reversed(cacheable_indices):
                     if len(chosen) >= max_history_cache:
                         break
                     chosen.add(idx)
