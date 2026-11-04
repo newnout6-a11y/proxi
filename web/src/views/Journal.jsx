@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ArrowDown, ChevronRight, Download, Pause, Play, Search, Trash, X } from 'lucide-react';
 import { api } from '../api.js';
-import { Dot, Page, ease } from '../motion.jsx';
+import { Dot, Section, ease } from '../motion.jsx';
 import { Button, CopyButton, Empty, Tag, useToast } from '../ui.jsx';
 import { CATEGORIES, LEVELS, category } from '../catalog.js';
 import { fmtClock, fmtDateTime, fmtInt } from '../format.js';
@@ -38,7 +38,7 @@ function Detail({ event }) {
   );
 }
 
-export default function Journal({ apiKey, journal, overview, onUnauthorized }) {
+export default function Journal({ apiKey, journal, overview, onUnauthorized, embedded }) {
   const toast = useToast();
   const [levels, setLevels] = useState(() => new Set());
   const [cats, setCats] = useState(() => new Set());
@@ -102,10 +102,10 @@ export default function Journal({ apiKey, journal, overview, onUnauthorized }) {
   const filtering = levels.size > 0 || cats.size > 0 || query;
 
   return (
-    <Page className="journal">
+    <Section embedded={embedded} className="journal">
       <header className="page-head">
         <div>
-          <h1>Журнал событий</h1>
+          {!embedded && <h1>Журнал событий</h1>}
           <p className="page-meta">в буфере {fmtInt(journal.events.length)} · показано {fmtInt(shown.length)} из {fmtInt(filtered.length)}</p>
         </div>
         <div className="head-actions">
@@ -200,6 +200,6 @@ export default function Journal({ apiKey, journal, overview, onUnauthorized }) {
           )}
         </div>
       </section>
-    </Page>
+    </Section>
   );
 }

@@ -15,6 +15,11 @@ export function Page({ children, className = '' }) {
   );
 }
 
+/** A page on its own, or the same content inside another page (no second entrance). */
+export function Section({ embedded, className = '', children }) {
+  return embedded ? <div className={`stack ${className}`}>{children}</div> : <Page className={className}>{children}</Page>;
+}
+
 /** A figure that tweens from its previous value to the new one. */
 export function AnimatedNumber({ value, format = (v) => fmtFixed(v, 2), className = '' }) {
   const reduce = useReducedMotion();

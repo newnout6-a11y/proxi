@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Boxes, Gauge, LogOut, Moon, Route, ScrollText, Settings, Sun } from 'lucide-react';
+import { Activity as ActivityIcon, Gauge, LogOut, Moon, Settings, Sun, Users } from 'lucide-react';
 import { api, clearKey, loadKey, saveKey } from './api.js';
 import { ToastProvider, useToast, Kbd } from './ui.jsx';
 import { Dot, ease } from './motion.jsx';
@@ -8,19 +8,22 @@ import { ThemeContext, applyTheme, initialTheme } from './theme.js';
 import { useJournal, usePolling } from './useJournal.js';
 import Login from './Login.jsx';
 import Overview from './views/Overview.jsx';
-import Journal from './views/Journal.jsx';
-import Turns from './views/Turns.jsx';
-import Models from './views/Models.jsx';
+import Accounts from './views/Accounts.jsx';
+import Activity from './views/Activity.jsx';
 import SettingsView from './views/Settings.jsx';
 
 const NAV = [
-  { id: 'overview', label: 'Обзор', icon: Gauge, group: 'Мониторинг' },
-  { id: 'journal', label: 'Журнал', icon: ScrollText, group: 'Мониторинг' },
-  { id: 'turns', label: 'Ходы', icon: Route, group: 'Мониторинг' },
-  { id: 'models', label: 'Модели', icon: Boxes, group: 'Настройка' },
-  { id: 'settings', label: 'Настройки', icon: Settings, group: 'Настройка' },
+  { id: 'overview', label: 'Сводка', icon: Gauge, group: 'Наблюдение' },
+  { id: 'activity', label: 'Активность', icon: ActivityIcon, group: 'Наблюдение' },
+  { id: 'accounts', label: 'Аккаунты', icon: Users, group: 'Управление' },
+  { id: 'settings', label: 'Настройки', icon: Settings, group: 'Управление' },
 ];
-const GROUPS = ['Мониторинг', 'Настройка'];
+const GROUPS = ['Наблюдение', 'Управление'];
+
+function viewFromHash() {
+  const id = location.hash.slice(1).split('/')[0];
+  return NAV.some((n) => n.id === id) ? id : 'overview';
+}
 
 function Mark() {
   return (
@@ -34,7 +37,7 @@ function Mark() {
 
 function Shell({ apiKey, onLogout, theme, setTheme }) {
   const toast = useToast();
-  const [view, setView] = useState(() => (NAV.some((n) => `#${n.id}` === location.hash) ? location.hash.slice(1) : 'overview'));
+  const [view, setView] = useState(viewFromHash);
   const [overview, setOverview] = useState(null);
   const [overviewError, setOverviewError] = useState('');
   const unauthorized = useCallback(() => {
@@ -54,7 +57,10 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
   }, [apiKey, unauthorized]);
   usePolling(loadOverview, 8000, [apiKey]);
 
-  useEffect(() => { history.replaceState(null, '', `#${view}`); }, [view]);
+  useEffect(() => {
+    // Activity keeps its own sub-tab in the hash (#activity/events).
+    if (!location.hash.startsWith(`#${view}`)) history.replaceState(null, '', `#${view}`);
+  }, [view]);
   useEffect(() => {
     const onKey = (event) => {
       if (event.target.closest('input, textarea, select') || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -86,7 +92,7 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
                     aria-current={active ? 'page' : undefined} onClick={() => setView(item.id)}>
                     <Icon size={16} strokeWidth={1.5} aria-hidden="true" />
                     <span className="nav-text">{item.label}</span>
-                    {item.id === 'journal' && errors > 0 && <b className="nav-count num" title="Ошибки за 10 минут">{errors}</b>}
+                    {item.id === 'activity' && errors > 0 && <b className="nav-count num" title="Ошибки за 10 минут">{errors}</b>}
                     <Kbd>{index + 1}</Kbd>
                   </button>
                 );
@@ -111,9 +117,8 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
       </aside>
       <main className="main">
         {view === 'overview' && <Overview key="overview" {...props} />}
-        {view === 'journal' && <Journal key="journal" {...props} />}
-        {view === 'turns' && <Turns key="turns" {...props} />}
-        {view === 'models' && <Models key="models" {...props} />}
+        {view === 'activity' && <Activity key="activity" {...props} />}
+        {view === 'accounts' && <Accounts key="accounts" {...props} />}
         {view === 'settings' && <SettingsView key="settings" {...props} />}
       </main>
     </div>

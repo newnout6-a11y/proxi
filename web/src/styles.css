@@ -353,7 +353,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 /* --- models ---------------------------------------------------------------- */
 .model-table { padding: 0; overflow: hidden; }
 .model-cols, .model-card {
-  display: grid; grid-template-columns: minmax(200px, 2fr) 96px 80px 80px minmax(140px, 1.4fr) minmax(160px, 1.4fr);
+  display: grid; grid-template-columns: minmax(200px, 2fr) 96px 80px minmax(140px, 1.4fr) minmax(180px, 1.4fr);
   align-items: center; gap: var(--space-4); padding: 0 var(--space-4);
 }
 .model-cols { height: 40px; border-bottom: 1px solid var(--line); font-size: var(--text-xs); color: var(--muted); }
@@ -413,14 +413,104 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 .login-hero { display: flex; align-items: center; justify-content: center; min-width: 0; padding: var(--space-10); overflow: hidden; }
 .login-hero > * { width: min(720px, 100%); }
 
+/* --- spend chart, cache facts ----------------------------------------------- */
+.c-spend { fill: var(--chart-read); }
+.c-spend.peak { fill: var(--accent); }
+.c-spend.on { fill: var(--ink); }
+.c-average { stroke: var(--accent-line); stroke-width: 1; stroke-dasharray: 4 4; opacity: 0.7; }
+.lg-spend { background: var(--chart-read); }
+.lg-peak { background: var(--accent); }
+.lg-average { height: 0 !important; border-top: 1px dashed var(--accent-line); }
+.chart-frame-small, .chart-panel .chart-frame-small { height: 200px; min-height: 200px; flex: none; }
+.cache-facts { display: grid; gap: var(--space-3); align-content: start; }
+.cache-facts .panel-head { margin-bottom: 0; }
+.figure { font-size: var(--text-figure); font-weight: 500; line-height: 1; font-variant-numeric: tabular-nums; }
+.facts { display: grid; gap: var(--space-2); margin: 0; }
+.facts div { display: flex; justify-content: space-between; gap: var(--space-3); font-size: var(--text-sm); color: var(--ink-2); }
+.facts dd { margin: 0; color: var(--ink); font-family: var(--mono); font-size: var(--text-sm); }
+.link-button { padding: 0; border: 0; background: none; color: var(--accent-text); cursor: pointer; font-size: var(--text-sm); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line-strong); }
+.link-button:hover { text-decoration-color: currentColor; }
+.stack { display: grid; gap: var(--space-4); }
+
+/* --- tabs ------------------------------------------------------------------- */
+.tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: var(--radius-control); background: var(--raised); border: 1px solid var(--line); }
+.tabs button {
+  display: inline-flex; align-items: center; gap: var(--space-2); height: 32px; padding: 0 var(--space-3); border: 0; border-radius: 6px;
+  background: none; color: var(--ink-2); cursor: pointer; font-size: var(--text-sm);
+  transition: background-color var(--duration-fast) var(--ease), color var(--duration-fast) var(--ease);
+}
+.tabs button:hover { color: var(--ink); }
+.tabs button[aria-selected="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-small), inset 0 0 0 1px var(--line-strong); }
+.activity .stack > .page-head { margin-bottom: 0; }
+.activity .stack > .page-head:empty { display: none; }
+
+/* --- account pool ----------------------------------------------------------- */
+.pool { padding: 0; overflow: hidden; }
+.pool-help { padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--line); }
+.pool-help p { max-width: 64rem; }
+.priority-field { display: inline-flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs); color: var(--muted); }
+.cache-facts .panel-head .figure { font-size: var(--text-figure); }
+.ov-side { align-content: start; }
+.pool-list { display: grid; margin: 0; padding: 0; list-style: none; }
+.pool-row {
+  display: grid; align-items: center; gap: var(--space-3) var(--space-5); padding: var(--space-4) var(--space-5);
+  grid-template-columns: minmax(150px, 1fr) minmax(140px, 0.9fr) minmax(220px, 1.6fr) minmax(170px, 1.2fr) auto auto;
+}
+.pool-row + .pool-row { border-top: 1px solid var(--line); }
+.pool-row.is-off > :not(.pool-controls):not(.pool-actions) { opacity: 0.55; }
+.pool-name { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
+.pool-name > span { display: grid; min-width: 0; }
+.pool-name strong { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pool-name code { justify-self: start; background: none; padding: 0; color: var(--muted); }
+.pool-state { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); font-size: var(--text-sm); color: var(--ink-2); }
+.pool-money { display: grid; gap: 6px; min-width: 0; }
+.pool-money-row { display: flex; align-items: baseline; gap: var(--space-2); font-size: var(--text-sm); }
+.pool-money-row b { font-weight: 500; font-size: var(--text-md); }
+.pool-meta, .pool-health { font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); }
+.pool-health { display: grid; gap: 2px; min-width: 0; }
+.pool-health span { overflow-wrap: anywhere; }
+.pool-controls { display: flex; align-items: center; gap: var(--space-3); }
+.pool-actions { display: flex; align-items: center; gap: var(--space-2); }
+.priority {
+  width: 56px; height: var(--control-height); padding: 0 var(--space-2); border-radius: var(--radius-control);
+  border: 1px solid var(--line-strong); background: var(--raised); color: var(--ink); font-family: var(--mono); font-size: var(--text-sm); text-align: center;
+}
+.add-form { display: grid; gap: var(--space-4); }
+.add-form .panel-head { margin-bottom: 0; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3) var(--space-4); }
+.field-wide { grid-column: 1 / -1; }
+.add-form input, .add-form textarea {
+  width: 100%; padding: var(--space-2) var(--space-3); border-radius: var(--radius-control); border: 1px solid var(--line-strong);
+  background: var(--raised); color: var(--ink); font-family: var(--mono); font-size: var(--text-sm); resize: vertical;
+}
+.add-form input { height: 36px; }
+.form-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
+
+/* --- settings ---------------------------------------------------------------- */
+.settings-hint { margin: -4px 0 var(--space-2); font-size: var(--text-sm); color: var(--muted); }
+.setting-when { color: var(--muted); font-family: var(--mono); font-size: 11px !important; }
+.number-field { display: inline-flex; align-items: center; gap: var(--space-2); }
+.unit { font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); }
+.model-head { align-items: flex-end; }
+.model-empty { padding: var(--space-4); }
+.model-table .panel-head { padding: var(--space-5) var(--space-4) 0; margin-bottom: var(--space-3); }
+
 /* --- responsive ------------------------------------------------------------ */
+/* The full one-line pool row needs ~1560px; below that controls and actions get their own column. */
+@media (max-width: 1560px) {
+  .pool-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .pool-money { grid-column: 1 / 3; }
+  .pool-health { grid-column: 1 / 3; }
+  .pool-controls { grid-column: 3; grid-row: 1; justify-content: flex-end; }
+  .pool-actions { grid-column: 3; grid-row: 2 / 4; align-self: end; justify-content: flex-end; }
+}
 @media (max-width: 1280px) {
   .ov-main, .ov-bottom { grid-template-columns: minmax(0, 1fr); }
   .trace-cols { display: none; }
   .trace-head { grid-template-columns: 136px minmax(120px, 1fr) minmax(160px, 2fr) 96px; }
   .trace-head > .trace-num { display: none; }
   .model-cols { display: none; }
-  .model-card { grid-template-columns: minmax(0, 1fr) 80px 80px minmax(140px, 1fr); padding-top: var(--space-2); padding-bottom: var(--space-2); }
+  .model-card { grid-template-columns: minmax(0, 1fr) 80px minmax(140px, 1fr); padding-top: var(--space-2); padding-bottom: var(--space-2); }
   .model-provider, .model-effort { display: none; }
 }
 @media (max-width: 1024px) {
@@ -444,7 +534,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
   .rail { position: sticky; z-index: 20; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; align-content: flex-start; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-right: 0; border-bottom: 1px solid var(--line); }
   .rail .brand { order: 0; }
   /* All five sections always visible: equal columns, icon above a short label. */
-  nav { order: 2; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; gap: 2px; }
+  nav { order: 2; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; gap: 2px; }
   .nav-group { display: contents; }
   .nav-label, .nav-item .keycap, .nav-item .nav-count { display: none; }
   .nav-item { width: auto; height: 44px; flex-direction: column; justify-content: center; gap: 2px; padding: 0 2px; font-size: var(--text-xs); text-align: center; }
@@ -471,6 +561,16 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
   .setting { grid-template-columns: minmax(0, 1fr); }
   .setting-control { flex-wrap: wrap; }
   .setting-control select, .setting-control input[type="number"] { min-width: 0; width: 100%; }
+}
+@media (max-width: 860px) {
+  .pool-row { grid-template-columns: minmax(0, 1fr) auto; padding: var(--space-4); }
+  .pool-name { grid-column: 1; }
+  .pool-controls { grid-column: 2; grid-row: 1; }
+  .pool-state, .pool-money, .pool-health { grid-column: 1 / -1; }
+  .pool-actions { grid-column: 1 / -1; grid-row: auto; flex-direction: row; flex-wrap: wrap; }
+  .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .activity .page-head .tabs { width: 100%; }
+  .tabs button { flex: 1; justify-content: center; }
 }
 @media (max-width: 360px) {
   .nav-item { font-size: 10px; }

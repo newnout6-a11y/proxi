@@ -21,12 +21,12 @@ const BASE = 'http://127.0.0.1:4173/admin/';
 const SECTIONS = [
   { id: 'login', login: false },
   { id: 'overview', key: '1' },
-  { id: 'journal', key: '2' },
-  { id: 'turns', key: '3' },
-  { id: 'models', key: '4' },
-  { id: 'settings', key: '5' },
-  { id: 'journal-empty', key: '2', empty: true },
-  { id: 'turns-empty', key: '3', empty: true },
+  { id: 'activity-turns', key: '2' },
+  { id: 'activity-events', key: '2', tab: 'Все события' },
+  { id: 'accounts', key: '3' },
+  { id: 'settings', key: '4' },
+  { id: 'activity-events-empty', key: '2', tab: 'Все события', empty: true },
+  { id: 'activity-turns-empty', key: '2', empty: true },
 ];
 const VIEWPORTS = { desktop: { width: 1440, height: 900 }, mobile: { width: 390, height: 844 } };
 
@@ -65,6 +65,7 @@ try {
           await page.waitForTimeout(400);
           await page.evaluate(() => { location.hash = ''; });
           await page.keyboard.press(section.key);
+          if (section.tab) await page.getByRole('tab', { name: new RegExp(section.tab) }).click();
         }
         await page.waitForTimeout(section.id === 'overview' ? 3200 : 1800);
         const file = path.join(outDir, `${section.id}-${theme}-${vpName}.png`);

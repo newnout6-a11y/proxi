@@ -148,6 +148,20 @@ const accounts = [
     last_renewed_at: NOW - 940, error: null },
 ];
 
+function poolAccount(account, label, priority) {
+  return { account, label, enabled: true, priority, state: 'active', routable: true, reserve: false, available: 0,
+    monthly_allocation: 3000, used_month: 0, reset_date: RESET_DATE, stale: false, session_used: 0, turns: 0,
+    auth_failures: 0, last_renewed_at: NOW - 60, last_balance_at: NOW - 45, error: null, pending: null };
+}
+
+function poolSummary(pool) {
+  const live = pool.filter((a) => a.pending !== 'removed');
+  const states = {};
+  for (const a of live) states[a.state] = (states[a.state] || 0) + 1;
+  return { total: live.length, enabled: live.filter((a) => a.enabled !== false).length,
+    routable: live.filter((a) => a.routable && a.enabled !== false).length, reserve: live.filter((a) => a.reserve).length, states };
+}
+
 export function settingsResponse(settings, effective, schema) {
   const pending = Object.keys(settings).filter((key) => settings[key] !== effective[key]);
   return { settings, effective, schema, pending_restart: pending, restart_required: pending.length > 0, writable: true };
@@ -160,7 +174,8 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
   const events = empty ? [] : rich ? richJournal() : journal;
   const models = rich ? [...catalog, ...extraCatalog] : catalog;
   const state = { settings: { ...initial }, effective: { ...initial }, requests: [], patches: [], sessions: [],
-    stream: [], streamRequests: 0, cleared: false };
+    stream: [], streamRequests: 0, cleared: false, accountRequests: [],
+    pool: accounts.map((a, i) => ({ ...poolAccount(a.account, i ? 'запасной' : 'основной', i), ...a })) };
   const overview = {
     health: { ok: true, upstream: 'ok', error: null }, uptime_seconds: 5432,
     balance: { available: 1495.09, monthly_allocation: 6000, used_month: 4504.91, reset_date: RESET_DATE, stale: false },
@@ -206,6 +221,29 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     if (path === '/admin/api/events/clear' && method === 'POST') {
       state.cleared = true;
       return reply(200, { ok: true, last_seq: 0 });
+    }
+    if (path === '/admin/api/accounts' && method === 'GET') {
+      return reply(200, { accounts: state.pool, summary: poolSummary(state.pool), restart_required: state.pool.some((a) => a.pending),
+        limits: { min_account_balance: 20, account_balance_interval: 300, account_refresh_parallel: 3 } });
+    }
+    if (path === '/admin/api/accounts' && method === 'POST') {
+      const body = request.postDataJSON();
+      state.accountRequests.push({ method, path, body, headers });
+      const added = { ...poolAccount('acc-new', body.label || '', 1), available: null, monthly_allocation: null, pending: 'added', state: 'active' };
+      state.pool.push(added);
+      return reply(200, { account: added, restart_required: true });
+    }
+    const accountMatch = path.match(/^\/admin\/api\/accounts\/([^/]+)(?:\/(balance|renew))?$/);
+    if (accountMatch) {
+      const [, tag, action] = accountMatch;
+      const account = state.pool.find((a) => a.account === tag);
+      if (!account) return reply(404, { error: { message: 'Unknown account' } });
+      state.accountRequests.push({ method, path, body: request.postData() ? request.postDataJSON() : null, headers });
+      if (action === 'balance' && method === 'POST') { account.last_balance_at = NOW; return reply(200, { account }); }
+      if (action === 'renew' && method === 'POST') { account.last_renewed_at = NOW; return reply(200, { ok: true, account }); }
+      if (!action && method === 'PATCH') { Object.assign(account, request.postDataJSON()); return reply(200, { account }); }
+      if (!action && method === 'DELETE') { account.pending = 'removed'; return reply(200, { ok: true, pending: 'removed', restart_required: true }); }
+      return reply(405, { error: { message: 'Method not allowed' } });
     }
     if (path === '/admin/api/settings' && method === 'GET') return reply(200, settingsResponse(state.settings, state.effective, schema));
     if (path === '/admin/api/settings' && method === 'PATCH') {

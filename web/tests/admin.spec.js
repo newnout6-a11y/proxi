@@ -6,10 +6,15 @@ async function login(page, { remember = false } = {}) {
   await page.getByLabel('Relay key').fill(API_KEY);
   await page.getByLabel('Запомнить до закрытия вкладки').setChecked(remember);
   await page.getByRole('button', { name: 'Войти' }).click();
-  await expect(page.getByRole('heading', { name: 'Обзор' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Сводка' })).toBeVisible();
 }
 
 const nav = (page, name) => page.getByRole('navigation').getByRole('button', { name: new RegExp(name) }).click();
+
+async function openEvents(page) {
+  await nav(page, 'Активность');
+  await page.getByRole('tab', { name: /Все события/ }).click();
+}
 
 test.beforeEach(async ({ page }) => {
   page.on('pageerror', (error) => { throw error; });
@@ -27,7 +32,7 @@ test('rejects an invalid key, then logs in and announces the session', async ({ 
   await expect(page.getByRole('alert')).toContainText('Неверный ключ');
   await page.getByLabel('Relay key').fill(API_KEY);
   await page.getByRole('button', { name: 'Войти' }).click();
-  await expect(page.getByRole('heading', { name: 'Обзор' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Сводка' })).toBeVisible();
   await expect.poll(() => state.sessions.length).toBe(1);
   expect(state.sessions[0].body).toEqual({ action: 'login' });
   expect(state.sessions[0].headers['x-admin-request']).toBe('1');
@@ -44,7 +49,7 @@ test('keeps the key in memory unless tab storage is chosen, and logs out', async
   await login(page, { remember: true });
   expect(await page.evaluate((key) => sessionStorage.getItem(key), MEMORY_KEY)).toBe(API_KEY);
   await page.reload();
-  await expect(page.getByRole('heading', { name: 'Обзор' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Сводка' })).toBeVisible();
   await page.getByRole('button', { name: 'Выйти' }).click();
   await expect(page.getByLabel('Relay key')).toBeVisible();
   expect(await page.evaluate((key) => sessionStorage.getItem(key), MEMORY_KEY)).toBeNull();
@@ -62,17 +67,31 @@ test('login hero is a stageshow scene and shows its payoff poster under reduced 
   await context.close();
 });
 
-test('overview shows balance, forecast, stats, chart, models and the live feed', async ({ page }) => {
+test('summary shows the pool balance, forecast, spend per bucket, cache and models', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
   await expect(page.locator('.figure-xl')).toContainText('495,09');
+  await expect(page.locator('.instrument-label')).toContainText('2 аккаунта');
   await expect(page.locator('.forecast')).toContainText('хватит примерно на');
   await expect(page.getByText('Retool отвечает')).toBeVisible();
-  await expect(page.locator('.stat', { hasText: 'Попадание в кэш' })).toContainText('%');
-  await expect(page.locator('.chart')).toBeVisible();
-  await expect(page.locator('.feed-row', { hasText: 'POST /v1/messages → 200' })).toBeVisible();
+  await expect(page.locator('.stat', { hasText: 'Потрачено за окно' })).toBeVisible();
+  await expect(page.locator('.cache-facts .figure')).toContainText('%');
+  await expect(page.locator('.chart')).toHaveCount(2);
+  await expect(page.locator('.legend', { hasText: 'за каждые 1 мин' })).toBeVisible();
   await expect(page.locator('.rank li')).toHaveCount(2);
-  await expect(page.locator('code', { hasText: 'http://127.0.0.1:8787/v1' })).toBeVisible();
+  // The summary no longer repeats the journal, recent turns or IDE connection.
+  await expect(page.locator('.feed-row')).toHaveCount(0);
+  await expect(page.locator('.recent-row')).toHaveCount(0);
+});
+
+test('spend chart draws one bar per busy bucket, so spend falls back after a peak', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  const heights = await page.locator('.c-spend').evaluateAll((bars) => bars.map((b) => Number(b.getAttribute('height'))));
+  expect(heights.length).toBeGreaterThan(10);
+  const peak = heights.indexOf(Math.max(...heights));
+  expect(heights.slice(peak + 1).some((h) => h < heights[peak])).toBe(true);
+  await expect(page.locator('.c-spend.peak')).toHaveCount(1);
 });
 
 test('metrics window switcher requests a 6 hour window', async ({ page }) => {
@@ -80,24 +99,80 @@ test('metrics window switcher requests a 6 hour window', async ({ page }) => {
   await login(page);
   await page.getByRole('group', { name: 'Окно метрик' }).getByRole('button', { name: '6 ч' }).click();
   await expect.poll(() => state.requests.some(({ url }) => url.includes('metrics?window=21600'))).toBe(true);
-  await expect(page.getByText(/последние 6 часов/)).toBeVisible();
+  await expect(page.locator('.page-meta')).toContainText('последние 6 часов');
+  await expect(page.locator('.forecast')).toContainText('последние 6 часов');
 });
 
-test('accounts block lists every account and marks the reserve', async ({ page }) => {
+test('accounts page lists the pool and marks the reserve', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
-  const rows = page.locator('.acc');
+  await nav(page, 'Аккаунты');
+  const rows = page.locator('.pool-row');
   await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toContainText('основной');
   await expect(rows.nth(0)).toContainText('pro-main');
-  await expect(rows.nth(1)).toContainText('pro-spare');
   await expect(rows.nth(1)).toContainText('резерв');
+});
+
+test('accounts can be disabled, reprioritised, checked and renewed with the CSRF header', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('switch', { name: 'Аккаунт запасной в маршрутизации' }).click();
+  await expect.poll(() => state.accountRequests.find((r) => r.method === 'PATCH')?.body).toEqual({ enabled: false });
+  await expect(page.locator('.pool-row').nth(1)).toContainText('выключен');
+
+  const priority = page.locator('.pool-row').nth(0).getByLabel('Приоритет: меньше — раньше');
+  await priority.fill('5');
+  await priority.press('Enter');
+  await expect.poll(() => state.accountRequests.some((r) => r.method === 'PATCH' && r.body?.priority === 5)).toBe(true);
+
+  await page.locator('.pool-row').nth(0).getByRole('button', { name: 'Баланс' }).click();
+  await expect(page.getByText('Баланс обновлён')).toBeVisible();
+  await page.locator('.pool-row').nth(0).getByRole('button', { name: 'Продлить' }).click();
+  await expect(page.getByText('Сессия продлена').first()).toBeVisible();
+  expect(state.accountRequests.map((r) => r.path)).toEqual(expect.arrayContaining([
+    '/admin/api/accounts/pro-main/balance', '/admin/api/accounts/pro-main/renew']));
+  expect(state.accountRequests.every((r) => r.headers['x-admin-request'] === '1')).toBe(true);
+});
+
+test('the last enabled account cannot be switched off', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('switch', { name: 'Аккаунт запасной в маршрутизации' }).click();
+  await expect(page.locator('.pool-row').nth(1)).toContainText('выключен');
+  await page.getByRole('switch', { name: 'Аккаунт основной в маршрутизации' }).click();
+  expect(state.accountRequests.filter((r) => r.method === 'PATCH' && r.body?.enabled === false)).toHaveLength(1);
+});
+
+test('accounts can be added and removed; both wait for a restart', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByLabel('Название').fill('третий');
+  await page.getByLabel('Адрес Retool').fill('https://tenant.retool.com');
+  await page.getByLabel('page_uuid приложения').fill('11111111-2222-3333-4444-555555555555');
+  await page.getByLabel('xsrf').fill('xsrf-value');
+  await page.getByLabel('Cookie').fill('accessToken=abc');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect(page.getByText('Аккаунт добавлен')).toBeVisible();
+  const post = state.accountRequests.find((r) => r.method === 'POST' && r.path === '/admin/api/accounts');
+  expect(post.body).toEqual({ label: 'третий', base: 'https://tenant.retool.com',
+    page_uuid: '11111111-2222-3333-4444-555555555555', cookie: 'accessToken=abc', xsrf: 'xsrf-value' });
+  await expect(page.locator('.pool-row', { hasText: 'третий' })).toContainText('подключится после перезапуска');
+  await expect(page.getByText(/вступят в силу после перезапуска/)).toBeVisible();
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Удалить аккаунт запасной' }).click();
+  await expect(page.locator('.pool-row', { hasText: 'запасной' })).toContainText('удалён');
 });
 
 test('journal streams new events, filters, searches and expands details', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
-  await nav(page, 'Журнал');
-  await expect(page.getByRole('heading', { name: 'Журнал событий' })).toBeVisible();
+  await openEvents(page);
   await expect(page.locator('.log-row')).toHaveCount(journal.length);
 
   state.stream.push(ev(8, 'tool.call', 'Инструмент клиента: live-marker', 'info', { turn_id: 'turn-alpha-1' }));
@@ -126,7 +201,7 @@ test('journal streams new events, filters, searches and expands details', async 
 test('journal clear asks for confirmation and empties the buffer into the illustrated empty state', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
-  await nav(page, 'Журнал');
+  await openEvents(page);
   page.once('dialog', (dialog) => dialog.accept());
   await page.getByRole('button', { name: 'Очистить' }).click();
   await expect(page.getByText('Журнал пуст')).toBeVisible();
@@ -134,10 +209,11 @@ test('journal clear asks for confirmation and empties the buffer into the illust
   expect(state.requests.some(({ path, headers }) => path === '/admin/api/events/clear' && headers['x-admin-request'] === '1')).toBe(true);
 });
 
-test('turn traces aggregate journal events into a turn tape and steps', async ({ page }) => {
+test('activity opens on turns, aggregated into a turn tape and steps', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
-  await nav(page, 'Ходы');
+  await nav(page, 'Активность');
+  await expect(page.getByRole('tab', { name: /Ходы моделей/ })).toHaveAttribute('aria-selected', 'true');
   const trace = page.locator('.trace').first();
   await expect(trace).toContainText('claude-opus-5-5');
   await expect(trace).toContainText('effort high');
@@ -151,7 +227,7 @@ test('turn traces aggregate journal events into a turn tape and steps', async ({
 test('turn traces show hidden thinking and tool argument time', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
-  await nav(page, 'Ходы');
+  await nav(page, 'Активность');
   state.stream.push(
     ev(20, 'turn.begin', 'Ход', 'info', { turn_id: 'turn-beta-2', data: { model: 'claude-opus-5-5', effort: 'high' } }),
     ev(21, 'upstream.thinking_end', 'Мышление заняло 6400 мс', 'info', { turn_id: 'turn-beta-2', data: { thinking_ms: 6400 } }),
@@ -165,15 +241,18 @@ test('turn traces show hidden thinking and tool argument time', async ({ page })
 test('turns empty state shows the stageshow illustration', async ({ page }) => {
   await mockAdmin(page, { empty: true });
   await login(page);
-  await nav(page, 'Ходы');
+  await nav(page, 'Активность');
   await expect(page.getByText('Ходов пока нет')).toBeVisible();
   await expect(page.locator('.empty .art .ss-stage')).toBeVisible();
 });
 
-test('models can be searched and filtered by route', async ({ page }) => {
+test('settings group fields by purpose and hold the model catalog and IDE connection', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
-  await nav(page, 'Модели');
+  await nav(page, 'Настройки');
+  await expect(page.getByRole('region', { name: 'Модель и мышление' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Лимиты и таймауты' })).toBeVisible();
+  await expect(page.locator('code', { hasText: 'http://127.0.0.1:8787/v1' })).toBeVisible();
   await expect(page.locator('.model-card')).toHaveCount(2);
   await page.getByLabel('Поиск модели').fill('gpt');
   await expect(page.locator('.model-card')).toHaveCount(1);
@@ -203,8 +282,10 @@ test('keyboard shortcuts switch sections and the theme toggles', async ({ page }
   await mockAdmin(page);
   await login(page);
   await page.keyboard.press('2');
-  await expect(page.getByRole('heading', { name: 'Журнал событий' })).toBeVisible();
-  await page.keyboard.press('5');
+  await expect(page.getByRole('heading', { name: 'Активность' })).toBeVisible();
+  await page.keyboard.press('3');
+  await expect(page.getByRole('heading', { name: 'Аккаунты' })).toBeVisible();
+  await page.keyboard.press('4');
   await expect(page.getByRole('heading', { name: 'Настройки' })).toBeVisible();
   const before = await page.evaluate(() => document.documentElement.dataset.theme);
   await page.getByRole('button', { name: 'Сменить тему' }).click();
@@ -240,9 +321,10 @@ for (const width of [320, 414]) {
     await noOverflow();
     await login(page);
     await noOverflow();
-    for (const name of ['Журнал', 'Ходы', 'Модели', 'Настройки']) {
+    for (const name of ['Активность', 'Аккаунты', 'Настройки']) {
       await nav(page, name);
       await noOverflow();
     }
+    await page.getByRole('tab', { name: /Все события/ }).count();
   });
 }

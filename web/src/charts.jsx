@@ -1,5 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { isNum, fmtShortTime, fmtTokens, fmtNum, fmtFixed, fmtInt, fmtMs } from './format.js';
+import { isNum, fmtShortTime, fmtTokens, fmtFixed, fmtInt, fmtMs } from './format.js';
 import { PHASES, phasesOf } from './turns.js';
 
 function useSize() {
@@ -25,95 +25,152 @@ function niceMax(value) {
   return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * pow;
 }
 
-function smooth(points) {
-  if (!points.length) return '';
-  let d = `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
-  for (let i = 1; i < points.length; i += 1) {
-    const a = points[i - 1];
-    const b = points[i];
-    const mid = (a.x + b.x) / 2;
-    d += ` C${mid.toFixed(1)},${a.y.toFixed(1)} ${mid.toFixed(1)},${b.y.toFixed(1)} ${b.x.toFixed(1)},${b.y.toFixed(1)}`;
-  }
-  return d;
+const PAD = { l: 56, r: 16, t: 12, b: 28 };
+
+/** The bucket length in words: "1 мин", "5 мин", "15 мин". */
+export function bucketLabel(windowSec, count) {
+  if (!count) return '';
+  const seconds = Math.round(windowSec / count);
+  return seconds % 60 === 0 ? `${seconds / 60}\u00a0мин` : `${seconds}\u00a0с`;
 }
 
-const PAD = { l: 60, r: 16, t: 12, b: 28 };
+function timeLabels(buckets, plotW) {
+  const n = buckets.length;
+  const fractions = plotW < 420 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
+  return n ? fractions.map((f) => Math.min(n - 1, Math.round(f * (n - 1)))) : [];
+}
 
-/** Mirrored cache chart: read above the axis, write below, credits as a thin line. */
-export function CacheChart({ buckets, windowSec }) {
-  const [ref, size] = useSize();
+function useHover(n, step) {
   const [hover, setHover] = useState(null);
+  const onMove = (event) => {
+    if (!n) return;
+    const box = event.currentTarget.getBoundingClientRect();
+    const i = Math.floor((event.clientX - box.left - PAD.l) / step);
+    setHover(i < 0 || i >= n ? null : i);
+  };
+  return [hover, onMove, () => setHover(null)];
+}
+
+function Tip({ W, x, children }) {
+  const flip = x > W - 220;
+  return <dl className="chart-tip" style={flip ? { right: W - x + 12 } : { left: x + 12 }}>{children}</dl>;
+}
+
+/** Credits spent in each bucket: bars rise with a heavy turn and fall back with a light one. */
+export function SpendChart({ buckets, windowSec }) {
+  const [ref, size] = useSize();
   const n = buckets.length;
   const W = size.w;
-  const H = Math.max(size.h, 240);
+  const H = Math.max(size.h, 200);
   const plotW = Math.max(10, W - PAD.l - PAD.r);
   const plotH = H - PAD.t - PAD.b;
   const step = n ? plotW / n : plotW;
+  const [hover, onMove, onLeave] = useHover(n, step);
+
+  const model = useMemo(() => {
+    const values = buckets.map((b) => Number(b.credits) || 0);
+    const peak = Math.max(0, ...values);
+    const total = values.reduce((s, v) => s + v, 0);
+    const busy = values.filter((v) => v > 0).length;
+    return { values, peak, peakIndex: values.indexOf(peak), total, max: niceMax(peak), average: busy ? total / busy : 0 };
+  }, [buckets]);
+
+  const empty = !n || !model.total;
+  const baseY = PAD.t + plotH + 0.5;
+  const yAt = (v) => baseY - (v / model.max) * plotH;
+  const barW = Math.max(1, step * 0.7);
+  const xAt = (i) => PAD.l + (i + 0.5) * step;
+  const ticks = [model.max / 2, model.max];
+  const labels = timeLabels(buckets, plotW);
+  const active = hover !== null && buckets[hover] ? hover : null;
+  const bucket = active !== null ? buckets[active] : null;
+  const span = bucketLabel(windowSec, n);
+  const summary = empty ? 'Расхода за окно не было'
+    : `Расход кредитов за каждые ${span}: всего ${fmtFixed(model.total, 2)}, максимум ${fmtFixed(model.peak, 2)}`;
+
+  return (
+    <div className="chart-frame" ref={ref}>
+      <svg className="chart" width={W} height={H} role="img" aria-label={summary} onPointerMove={onMove} onPointerLeave={onLeave}>
+        {ticks.map((v) => (
+          <g key={v}>
+            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(v)) + 0.5} y2={Math.round(yAt(v)) + 0.5} />
+            <text className="c-label" x={PAD.l - 8} y={yAt(v) + 4} textAnchor="end">{fmtFixed(v, v < 1 ? 2 : 1)}</text>
+          </g>
+        ))}
+        <text className="c-label" x={PAD.l - 8} y={baseY + 4} textAnchor="end">0</text>
+        {!empty && model.values.map((v, i) => (v > 0 ? (
+          <rect key={buckets[i].t} className={`c-spend${i === model.peakIndex ? ' peak' : ''}${i === active ? ' on' : ''}`}
+            x={xAt(i) - barW / 2} y={yAt(v)} width={barW} height={Math.max(1, baseY - yAt(v))} />
+        ) : null))}
+        {!empty && model.average > 0 && (
+          <g>
+            <line className="c-average" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(model.average)) + 0.5} y2={Math.round(yAt(model.average)) + 0.5} />
+          </g>
+        )}
+        <line className="c-axis" x1={PAD.l} x2={W - PAD.r} y1={baseY} y2={baseY} />
+        {labels.map((i, j) => (
+          <text key={`t${i}${j}`} className="c-label" x={xAt(i)} y={H - 8}
+            textAnchor={j === 0 ? 'start' : j === labels.length - 1 ? 'end' : 'middle'}>{fmtShortTime(buckets[i].t)}</text>
+        ))}
+        {bucket && <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={baseY} />}
+      </svg>
+      {empty && <p className="chart-empty">Расхода за окно не было</p>}
+      {bucket && (
+        <Tip W={W} x={xAt(active)}>
+          <dt className="mono">{fmtShortTime(bucket.t)}–{fmtShortTime(bucket.t + windowSec / n)}</dt>
+          <dd><span>кредиты</span><b className="num">{fmtFixed(bucket.credits, 2)}</b></dd>
+          <dd><span>запросы</span><b className="num">{fmtInt(bucket.requests)}</b></dd>
+          <dd><span>ходы</span><b className="num">{fmtInt(bucket.turns)}</b></dd>
+          <dd><span>первый токен</span><b className="num">{fmtMs(bucket.ttft)}</b></dd>
+        </Tip>
+      )}
+    </div>
+  );
+}
+
+/** Prompt cache per bucket: read above the axis, write below, on one token scale. */
+export function CacheChart({ buckets, windowSec }) {
+  const [ref, size] = useSize();
+  const n = buckets.length;
+  const W = size.w;
+  const H = Math.max(size.h, 160);
+  const plotW = Math.max(10, W - PAD.l - PAD.r);
+  const plotH = H - PAD.t - PAD.b;
+  const step = n ? plotW / n : plotW;
+  const [hover, onMove, onLeave] = useHover(n, step);
 
   const model = useMemo(() => {
     const maxRead = Math.max(0, ...buckets.map((b) => b.cache_read || 0));
     const maxWrite = Math.max(0, ...buckets.map((b) => b.cache_write || 0));
     const readMax = niceMax(maxRead);
     const writeMax = niceMax(maxWrite);
-    // Both halves share one token scale; the axis sits where that scale puts it,
-    // so a quiet write side takes little room instead of an empty band.
-    const share = readMax / (readMax + writeMax);
-    const split = Math.max(0.6, Math.min(0.86, share));
-    let running = 0;
-    const cumulative = buckets.map((b) => (running += Number(b.credits) || 0));
-    return { maxRead, maxWrite, readMax, writeMax, split, cumulative, total: running };
+    const split = Math.max(0.6, Math.min(0.86, readMax / (readMax + writeMax)));
+    return { maxRead, maxWrite, readMax, writeMax, split };
   }, [buckets]);
 
   const axisY = Math.round(PAD.t + plotH * model.split) + 0.5;
   const readH = axisY - PAD.t;
   const writeH = PAD.t + plotH - axisY;
   const k = Math.min(readH / model.readMax, writeH / model.writeMax);
-  const empty = !n || (!model.maxRead && !model.maxWrite && !model.total);
-  const barW = Math.max(1, step * 0.72);
+  const empty = !n || (!model.maxRead && !model.maxWrite);
+  const barW = Math.max(1, step * 0.7);
   const xAt = (i) => PAD.l + (i + 0.5) * step;
-  // Credits as a running total: the burn over the window, rising to the window's spend.
-  const creditPts = model.cumulative.map((value, i) => ({
-    x: xAt(i), y: axisY - 2 - (model.total ? (value / model.total) * (readH - 12) : 0),
-  }));
-  const readTicks = [model.readMax / 2, model.readMax].filter((v) => v * k <= readH + 1);
-  const writeTicks = [model.writeMax].filter((v) => v * k <= writeH + 1 && v * k >= 14);
-  // Fewer time labels on narrow charts, so neighbours never touch.
-  const fractions = plotW < 420 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
-  const labelIdx = n ? fractions.map((f) => Math.min(n - 1, Math.round(f * (n - 1)))) : [];
+  const labels = timeLabels(buckets, plotW);
   const active = hover !== null && buckets[hover] ? hover : null;
   const bucket = active !== null ? buckets[active] : null;
-
-  const summary = empty ? 'Нет данных за окно'
+  const summary = empty ? 'Обращений к кэшу за окно не было'
     : `Кэш за окно: прочитано ${fmtTokens(buckets.reduce((s, b) => s + (b.cache_read || 0), 0))}, `
-      + `записано ${fmtTokens(buckets.reduce((s, b) => s + (b.cache_write || 0), 0))}, `
-      + `кредитов ${fmtFixed(buckets.reduce((s, b) => s + (b.credits || 0), 0), 2)}`;
-
-  function onMove(event) {
-    if (!n) return;
-    const box = event.currentTarget.getBoundingClientRect();
-    const i = Math.floor((event.clientX - box.left - PAD.l) / step);
-    setHover(i < 0 || i >= n ? null : i);
-  }
-
-  const tipLeft = bucket ? xAt(active) : 0;
-  const flip = tipLeft > W - 220;
+      + `записано ${fmtTokens(buckets.reduce((s, b) => s + (b.cache_write || 0), 0))}`;
 
   return (
-    <div className="chart-frame" ref={ref}>
-      <svg className="chart" width={W} height={H} role="img" aria-label={summary}
-        onPointerMove={onMove} onPointerLeave={() => setHover(null)}>
-        {readTicks.map((v) => (
-          <g key={`r${v}`}>
-            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(axisY - v * k) + 0.5} y2={Math.round(axisY - v * k) + 0.5} />
-            <text className="c-label" x={PAD.l - 8} y={axisY - v * k + 4} textAnchor="end">{fmtTokens(v)}</text>
+    <div className="chart-frame chart-frame-small" ref={ref}>
+      <svg className="chart" width={W} height={H} role="img" aria-label={summary} onPointerMove={onMove} onPointerLeave={onLeave}>
+        {model.readMax * k <= readH + 1 && (
+          <g>
+            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(axisY - model.readMax * k) + 0.5} y2={Math.round(axisY - model.readMax * k) + 0.5} />
+            <text className="c-label" x={PAD.l - 8} y={axisY - model.readMax * k + 4} textAnchor="end">{fmtTokens(model.readMax)}</text>
           </g>
-        ))}
-        {writeTicks.map((v) => (
-          <g key={`w${v}`}>
-            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(axisY + v * k) + 0.5} y2={Math.round(axisY + v * k) + 0.5} />
-            <text className="c-label" x={PAD.l - 8} y={axisY + v * k + 4} textAnchor="end">{fmtTokens(v)}</text>
-          </g>
-        ))}
+        )}
         <text className="c-label" x={PAD.l - 8} y={axisY + 4} textAnchor="end">0</text>
         {!empty && buckets.map((b, i) => {
           const r = (b.cache_read || 0) * k;
@@ -126,30 +183,20 @@ export function CacheChart({ buckets, windowSec }) {
           );
         })}
         <line className="c-axis" x1={PAD.l} x2={W - PAD.r} y1={axisY} y2={axisY} />
-        {!empty && <path className="c-credits" d={smooth(creditPts)} />}
-        {labelIdx.map((i, j) => (
+        {labels.map((i, j) => (
           <text key={`t${i}${j}`} className="c-label" x={xAt(i)} y={H - 8}
-            textAnchor={j === 0 ? 'start' : j === labelIdx.length - 1 ? 'end' : 'middle'}>
-            {fmtShortTime(buckets[i].t)}
-          </text>
+            textAnchor={j === 0 ? 'start' : j === labels.length - 1 ? 'end' : 'middle'}>{fmtShortTime(buckets[i].t)}</text>
         ))}
-        {bucket && (
-          <g>
-            <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={PAD.t + plotH} />
-            <circle className="c-dot" cx={creditPts[active].x} cy={creditPts[active].y} r="3.5" />
-          </g>
-        )}
+        {bucket && <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={PAD.t + plotH} />}
       </svg>
-      {empty && <p className="chart-empty">Нет данных за окно</p>}
+      {empty && <p className="chart-empty">Обращений к кэшу за окно не было</p>}
       {bucket && (
-        <dl className="chart-tip" style={flip ? { right: W - tipLeft + 12 } : { left: tipLeft + 12 }}>
+        <Tip W={W} x={xAt(active)}>
           <dt className="mono">{fmtShortTime(bucket.t)}–{fmtShortTime(bucket.t + windowSec / n)}</dt>
-          <dd><span>чтение кэша</span><b className="num">{fmtTokens(bucket.cache_read)}</b></dd>
-          <dd><span>запись кэша</span><b className="num">{fmtTokens(bucket.cache_write)}</b></dd>
-          <dd><span>кредиты</span><b className="num">{fmtFixed(bucket.credits, 2)}</b></dd>
-          <dd><span>с начала окна</span><b className="num">{fmtFixed(model.cumulative[active], 2)}</b></dd>
-          <dd><span>запросы</span><b className="num">{fmtInt(bucket.requests)}</b></dd>
-        </dl>
+          <dd><span>прочитано</span><b className="num">{fmtTokens(bucket.cache_read)}</b></dd>
+          <dd><span>записано</span><b className="num">{fmtTokens(bucket.cache_write)}</b></dd>
+          <dd><span>без кэша</span><b className="num">{fmtTokens(bucket.input)}</b></dd>
+        </Tip>
       )}
     </div>
   );
@@ -195,3 +242,5 @@ export function TapeLegend() {
     </ul>
   );
 }
+
+export { isNum };

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ChevronRight } from 'lucide-react';
-import { Page, ease } from '../motion.jsx';
+import { Section, ease } from '../motion.jsx';
 import { Empty, Tag } from '../ui.jsx';
 import { TapeLegend, TurnTape } from '../charts.jsx';
 import { LEVELS, STATUS_TONE, TURN_STATUS } from '../catalog.js';
@@ -26,17 +26,17 @@ function Steps({ trace }) {
   );
 }
 
-export default function Turns({ journal, overview }) {
+export default function Turns({ journal, overview, embedded }) {
   const traces = useMemo(() => buildTraces(journal.events), [journal.events]);
   const [open, setOpen] = useState(null);
   const list = traces.slice(0, 120);
   const max = Math.max(1, ...list.map((trace) => phasesOf(trace).total));
 
   return (
-    <Page className="turns">
+    <Section embedded={embedded} className="turns">
       <header className="page-head">
         <div>
-          <h1>Ходы моделей</h1>
+          {!embedded && <h1>Ходы моделей</h1>}
           <p className="page-meta">{fmtInt(traces.length)} в буфере · длина ленты в общем масштабе</p>
         </div>
         <TapeLegend />
@@ -95,6 +95,6 @@ export default function Turns({ journal, overview }) {
             hint={overview?.connection?.anthropic_base_url || 'http://127.0.0.1:8787'} />
         )}
       </section>
-    </Page>
+    </Section>
   );
 }
