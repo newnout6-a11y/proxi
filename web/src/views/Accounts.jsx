@@ -59,8 +59,8 @@ function AccountRow({ account, busy, onAction, onPatch, onDelete, lastEnabled })
         </span>
       </div>
       <div className="pool-health">
-        <span>баланс: {fmtAgo(account.last_balance_at)}</span>
-        <span>сессия: {fmtAgo(account.last_renewed_at)}</span>
+        <span>баланс: {account.last_balance_at ? fmtAgo(account.last_balance_at) : 'ещё не проверялся'}</span>
+        <span>сессия: {account.last_renewed_at ? fmtAgo(account.last_renewed_at) : 'ещё не продлевалась'}</span>
         {account.auth_failures > 0 && <span className="neg-text">отказов входа подряд: {account.auth_failures}</span>}
         {account.error && <span className="neg-text" title={account.error}>{account.error}</span>}
       </div>

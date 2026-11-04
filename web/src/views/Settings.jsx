@@ -19,6 +19,7 @@ export const GROUPS = [
 ];
 
 const groupOf = (field) => field.group || 'limits';
+const CATALOG_FOLD = 10;
 const OPTION_LABELS = {
   session_mode: { per_conversation: 'сессия на каждый диалог', per_request: 'сессия на каждый запрос', shared: 'одна общая сессия' },
   exec_policy: { off: 'выключены', allowlist: 'только из списка разрешённых', allow_all: 'любые команды' },
@@ -44,7 +45,7 @@ function Field({ name, field, value, onChange, pending, dirty }) {
             const raw = e.target.value;
             onChange(raw === '' ? '' : field.type === 'integer' ? parseInt(raw, 10) : parseFloat(raw));
           }} />
-        {field.unit && <span className="unit">{field.unit}</span>}
+        <span className="unit">{field.unit || ''}</span>
       </span>
     );
   }
@@ -54,10 +55,10 @@ function Field({ name, field, value, onChange, pending, dirty }) {
       <label htmlFor={id}>
         <strong>{field.label}</strong>
         {description && <small>{description}</small>}
-        <small className="setting-when">{field.restart_required ? 'применится после перезапуска relay' : 'применяется сразу'}</small>
       </label>
       <div className="setting-control">
         {pending && <Tag tone="warn" title="Сохранено, применится после перезапуска">ждёт перезапуска</Tag>}
+        {!field.restart_required && !pending && <span className="setting-when">сразу</span>}
         {control}
       </div>
     </div>
@@ -89,12 +90,16 @@ function Catalog({ apiKey, onUnauthorized }) {
   const [data, setData] = useState(null);
   const [query, setQuery] = useState('');
   const [onlyRoutable, setOnlyRoutable] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   usePolling(async () => {
     try { setData(await api(apiKey, 'models')); } catch (failure) { if (failure.status === 401) onUnauthorized(); }
   }, 60000, [apiKey]);
   const all = data?.data || [];
   const items = all.filter((model) => (!onlyRoutable || model.routable)
     && (!query || `${model.id} ${model.label} ${model.provider}`.toLowerCase().includes(query.toLowerCase())));
+  // The default model leads; a long catalog is folded unless searched or expanded.
+  items.sort((a, b) => (b.id === data?.default_model) - (a.id === data?.default_model));
+  const shown = expanded || query ? items : items.slice(0, CATALOG_FOLD);
   return (
     <section className="panel model-table" aria-label="Каталог моделей">
       <div className="panel-head model-head">
@@ -113,7 +118,7 @@ function Catalog({ apiKey, onUnauthorized }) {
           </label>
         </div>
       </div>
-      {items.map((model) => (
+      {shown.map((model) => (
         <article key={model.id} className={`model-card ${model.id === data?.default_model ? 'is-default' : ''}`}>
           <span className="model-name"><strong>{model.label}</strong><code>{model.id}</code></span>
           <span className="model-provider">{model.provider}</span>
@@ -126,6 +131,13 @@ function Catalog({ apiKey, onUnauthorized }) {
         </article>
       ))}
       {data && !items.length && <p className="muted small model-empty">Модели не найдены</p>}
+      {shown.length < items.length && (
+        <div className="model-more">
+          <button type="button" className="link-button" onClick={() => setExpanded(true)}>
+            показать все {fmtInt(items.length)}
+          </button>
+        </div>
+      )}
     </section>
   );
 }
@@ -175,7 +187,7 @@ export default function SettingsView({ apiKey, overview, onUnauthorized }) {
       <header className="page-head">
         <div>
           <h1>Настройки</h1>
-          <p className="page-meta">записываются в config.json relay · подключение IDE и каталог моделей внизу</p>
+          <p className="page-meta">записываются в config.json и применяются после перезапуска relay, кроме помеченных «сразу» · подключение IDE и каталог моделей внизу</p>
         </div>
         <div className="head-actions">
           {state?.restart_required && <Tag tone="warn">ждут перезапуска: {state.pending_restart.length}</Tag>}

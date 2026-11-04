@@ -287,7 +287,8 @@ test('settings show backend groups, real descriptions and units', async ({ page 
   }
   const reserve = page.getByRole('region', { name: 'Аккаунты и маршрутизация' }).locator('.setting', { hasText: 'Порог резерва' });
   await expect(reserve).toContainText('уходит в резерв');
-  await expect(reserve).toContainText('применяется сразу');
+  await expect(reserve).toContainText('сразу');
+  await expect(page.getByRole('region', { name: 'Кэш промпта' }).locator('.setting-when')).toHaveCount(0);
   await expect(reserve.locator('.unit')).toHaveText('кредитов');
   await expect(page.locator('#setting-session_mode option', { hasText: 'сессия на каждый диалог' })).toHaveCount(1);
 });
@@ -322,10 +323,10 @@ test('keyboard shortcuts switch sections and the theme toggles', async ({ page }
   expect(await page.evaluate(() => document.documentElement.dataset.theme)).not.toBe(before);
 });
 
-test('no glow, gradient or backdrop blur remains in the shipped styles', async ({ page }) => {
-  await mockAdmin(page);
+test('no glow, gradient, uppercase or heavy weight in any section', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
   await login(page);
-  const found = await page.evaluate(() => {
+  const scan = () => page.evaluate(() => {
     const bad = [];
     for (const el of document.querySelectorAll('.shell *')) {
       if (el.closest('.ss-stage')) continue;
@@ -337,7 +338,13 @@ test('no glow, gradient or backdrop blur remains in the shipped styles', async (
     }
     return bad;
   });
-  expect(found).toEqual([]);
+  const found = { overview: await scan() };
+  for (const name of ['Активность', 'Аккаунты', 'Настройки']) {
+    await nav(page, name);
+    if (name === 'Аккаунты') await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+    found[name] = await scan();
+  }
+  expect(found).toEqual({ overview: [], Активность: [], Аккаунты: [], Настройки: [] });
 });
 
 for (const width of [320, 414]) {
