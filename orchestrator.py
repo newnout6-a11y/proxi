@@ -18,7 +18,7 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
-from context import build_system_instructions
+from context import DEFAULT_RELAY_SYSTEM_PROMPT, build_system_instructions
 from redact import redact
 from session import SessionLease
 from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
@@ -240,14 +240,38 @@ class TurnRunner:
             target._client_context = context
             target._client_context_pending = False
 
-    def _followup(self, instructions, reminder, command, code, output, header):
+    @staticmethod
+    def _direct_text(instructions, chunks):
+        """Text actually sent in the system head and each retained content block."""
+        parts = [instructions] if instructions else []
+        def append(value):
+            if isinstance(value, str):
+                if value:
+                    parts.append(value)
+            elif isinstance(value, list):
+                for block in value:
+                    append(block)
+            elif isinstance(value, dict) and value.get('type') == 'text':
+                append(value.get('text'))
+        for chunk in chunks:
+            append(chunk)
+        return '\n'.join(parts)
+
+    def _followup(self, instructions, reminder, command, code, output, header, *, direct_chunks=None):
+        def tail(body):
+            return executor.format_command_followup(command, code, body, header) + reminder
+
         def compose(body):
-            text = executor.format_command_followup(command, code, body, header) + reminder
+            text = tail(body)
             return instructions + "\n\n" + text if instructions else text
+
+        def full(body):
+            return (compose(body) if direct_chunks is None else
+                    self._direct_text(instructions, [*direct_chunks, tail(body)]))
 
         limit = int(self.cfg.get("max_prompt_bytes", 0) or 0)
         if limit > 0:
-            fixed = self._check_prompt(compose(""))
+            fixed = self._check_prompt(full(""))
             budget = limit - _b(fixed)
             if _b(output) > budget:
                 notice = "\n[command output truncated to configured prompt byte limit]"
@@ -255,10 +279,13 @@ class TurnRunner:
                     raise apierr.ApiError(413, "prompt_too_large",
                                          "configured max_prompt_bytes leaves no room for command output")
                 output = _trim(output, budget - _b(notice)) + notice
-        return self._check_prompt(compose(output))
+        self._check_prompt(full(output))
+        return compose(output)
 
     def _instructions(self, native_tools=False):
         if native_tools:
+            if self.cfg.get('relay_system_prompt') is not None:
+                return self.cfg['relay_system_prompt']
             return ("[ROLE]\nYou are a coding assistant using the client's tools. "
                     "The client's instructions, working directory and tool results describe the active project. "
                     "Use those tools to inspect, edit and test that project. "
@@ -273,6 +300,18 @@ class TurnRunner:
             system_prompt=self.cfg.get('relay_system_prompt'),
             exec_policy=self.cfg["exec_policy"],
         )
+
+    def _client_instructions(self, instructions):
+        """Compose only policy text, never relay workspace or shell capabilities."""
+        mode = self.cfg.get('relay_system_prompt_mode', 'standalone')
+        if mode == 'standalone':
+            return instructions
+        policy = self.cfg.get('relay_system_prompt')
+        if policy is None:
+            policy = DEFAULT_RELAY_SYSTEM_PROMPT
+        if mode == 'replace':
+            return policy
+        return '\n\n'.join(part for part in (instructions, policy) if part)
 
     @staticmethod
     def _tool_prompt(parsed):
@@ -423,11 +462,13 @@ class TurnRunner:
             is_native = bool(native_tools)
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
-            client_owns_instructions = client_text or (direct_mode and bool(parsed.system))
+            client_owns_instructions = client_text or bool(parsed.system)
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
                 instructions = parsed.system or ""
+                if purpose not in client_context.SERVICE_KINDS:
+                    instructions = self._client_instructions(instructions)
             else:
                 instructions = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: self._instructions(native_tools=is_native))
@@ -487,6 +528,9 @@ class TurnRunner:
                 prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
                 messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose)
 
+            client_chunks = list(getattr(parsed, 'message_chunks', None) or ([parsed.prompt] if parsed.prompt else []))
+            if direct_mode:
+                self._check_prompt(self._direct_text(instructions, client_chunks))
             base_prompt = self._check_prompt(prompt)
             session = None
             try:
@@ -577,17 +621,17 @@ class TurnRunner:
                             stream_prompt = (instructions + self._tool_prompt(parsed) + _CONV_HEADER + stream_prompt + _NATIVE_CONTINUE
                                              if native_tools else instructions + "\n\n" + stream_prompt)
                     if direct_mode:
-                        if instructions and stream_prompt.startswith(instructions):
-                            stream_prompt = stream_prompt[len(instructions):]
-                        chunks = list(getattr(parsed, "message_chunks", None) or ([parsed.prompt] if getattr(parsed, "prompt", None) else []))
+                        if last_followup and instructions and stream_prompt.startswith(instructions + '\n\n'):
+                            stream_prompt = stream_prompt[len(instructions) + 2:]
+                        chunks = list(client_chunks)
                         if exec_chunks:
-                            if stream_prompt and len(stream_prompt.strip()) < len(exec_chunks[-1]):
-                                exec_chunks[-1] = stream_prompt.strip()
+                            exec_chunks[-1] = stream_prompt
                             chunks.extend(exec_chunks)
                         elif last_followup:
                             chunks.append(stream_prompt.strip())
                         elif chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
+                        self._check_prompt(self._direct_text(instructions, chunks or [stream_prompt]))
 
                         if native_tools:
                             tools_converted = direct.tools_to_retool(parsed.tools)
@@ -803,7 +847,8 @@ class TurnRunner:
                         final_summary = True
                         summary = ("\n\n[ИТОГ] Команды больше не выполняй. "
                                    "Дай итоговый ответ по уже собранной информации, на русском.")
-                        prompt = (self._followup(instructions, reminder + summary, *last_followup)
+                        prompt = (self._followup(instructions, reminder + summary, *last_followup,
+                                                direct_chunks=client_chunks + exec_chunks[:-1] if direct_mode else None)
                                   if last_followup else self._check_prompt(prompt + summary))
                         continue
 
@@ -814,7 +859,8 @@ class TurnRunner:
                             command=command[:300])
                         summary = ("\n\n[ИТОГ] Команда '" + command + "' повторяется. "
                                    "Команды больше не выполняй, дай итоговый ответ.")
-                        prompt = (self._followup(instructions, reminder + summary, *last_followup)
+                        prompt = (self._followup(instructions, reminder + summary, *last_followup,
+                                                direct_chunks=client_chunks + exec_chunks[:-1] if direct_mode else None)
                                   if last_followup else self._check_prompt(prompt + summary))
                         continue
 
@@ -911,7 +957,8 @@ class TurnRunner:
                     last_followup = (safe_command, code, output, header)
                     followup_text = executor.format_command_followup(safe_command, code, output, header)
                     exec_chunks.append(followup_text)
-                    prompt = self._followup(instructions, reminder, *last_followup)
+                    prompt = self._followup(instructions, reminder, *last_followup,
+                                            direct_chunks=client_chunks + exec_chunks[:-1] if direct_mode else None)
             finally:
                 if session is not None:
                     await self.pool.release(session)

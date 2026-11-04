@@ -155,3 +155,68 @@ returned HTTP 403 for every tenant: `Data retention enabled Anthropic models are
 not enabled for your organization.` No feature flag or access restriction was
 changed. Fable 5 and 5.1 remain blocked by this organization prerequisite; Google
 and Astra separately require suitable BYOK resources.
+
+### Stage 3 extension: full user policy — 2026-11-05
+
+The configurable prompt now supports a complete user-defined role, rules,
+style and behavioral boundaries. `relay_system_prompt_mode` explicitly selects
+`standalone` (compatible default), `append` (client instructions, then user
+policy), or `replace` (user policy alone). `null` selects the default policy;
+an empty string is deliberate. Native-tools requests without a system now also
+honor the custom policy. The direct transport sends it in an actual system
+message for all three API dialects; the legacy agent transport composes text.
+
+Recognized safety checks, title generation and connection probes preserve their
+service-specific contract. General client text requests receive the configured
+policy. Client execution ownership remains unchanged even after replacement:
+custom instructions cannot enable relay shell execution for an IDE request.
+Prompt instructions describe desired behavior; actual tool permissions enforce
+command/file access.
+
+Signed native tool continuations preserve the same head and cache key while
+policy is unchanged. Changing policy or composition invalidates the old signed
+prefix, and the next unchanged continuation resumes its new history.
+
+New regressions reproduced **21 failures before implementation**. After the
+implementation, the prompt/service/native-history/context/budget suite passed
+**177 tests in 4.77 seconds**. Exact command:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests/test_prompt_ownership.py tests/test_native_history.py tests/test_service_requests.py tests/test_native_context_reuse.py tests/test_prompt_bytes.py -o addopts= -q --tb=short
+```
+
+Independent scoped review: **291 passed in 20.08 seconds**, no confirmed code
+defects. The design/admin UI and stage 4 changes are outside this extension.
+
+Review also reproduced an existing direct-transport budget defect: the system
+head bypassed `max_prompt_bytes`. The limit now checks the complete UTF-8 head
+and retained text chunks before transmission and the initial request before
+acquiring upstream. Direct execution follow-ups reserve the original history
+and earlier results, trimming only the new command output to the remaining
+budget. Summary follow-ups use the same rule. Boundary regressions cover
+standalone/append/replace, an exact byte boundary, one byte over, and small/large
+command outputs with and without an execution step cap. Related scoped suite:
+**196 passed in 6.42 seconds**. The independent reviewer reproduced and helped
+close two follow-up cases that the first budget correction missed.
+
+An earlier full run, before those final follow-up corrections, passed **1658
+tests in 212.33 seconds**. The final full run is recorded below.
+
+Isolated live checks confirmed exact policy markers and real system heads for
+append and replace across Chat, Responses and Messages. Tool continuations
+returned the actual synthetic tool result and retained the cache key; the
+replace probe also compared replayed raw assistant blocks with the saved reply.
+The simple tasks emitted no thinking blocks at either low or high, so these
+live runs do not prove signed-thinking replay. Signature preservation and
+policy-change reset are covered by dedicated offline protocol regressions.
+An initial live verifier incorrectly required a thinking block on every tool
+call; its failed assertion is retained alongside the evidence, not called a
+model or preservation failure. Across the three probes: **15 HTTP 200 upstream
+requests**, reported total **0.47428 credits**, user configuration hash unchanged.
+Private evidence: `.agents/model-audit-20261104/full-policy-live*/manifest.json`
+and corresponding wire captures. No host tool was executed.
+
+Final stage 3 extension full validation: **1664 passed in 214.04 seconds** using
+the full Python command above. Independent final scoped run: **253 passed in
+6.54 seconds**, plus eight direct boundary probes including three commands in
+sequence. `git diff --check`: clean. No unresolved stage 3 findings remain.
