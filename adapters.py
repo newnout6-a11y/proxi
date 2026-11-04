@@ -30,6 +30,7 @@ class _Base:
         self.output_tokens = None
         self.exec_lines = 0
         self.tool_calls = []
+        self._usage_offsets = (0, 0, 0)
         self._custom_tools = {
             tool.get("function", {}).get("name")
             for tool in getattr(parsed, "tools", [])
@@ -39,7 +40,14 @@ class _Base:
 
     def feed(self, event):
         kind = event.get("type")
-        if kind == "thinking":
+        if kind == "usage_start":
+            # One client response may include several paid upstream attempts.
+            # Context size describes the latest one; credits cover all of them.
+            self.cache_read = self.cache_write = self.reasoning_tokens = 0
+            self.input_tokens = self.output_tokens = None
+            self._usage_offsets = (len(self.text), len(self.thinking), len(self.tool_calls))
+            self._usage_boundary()
+        elif kind == "thinking":
             self.thinking += event["delta"]
             if not self.parsed.show_thinking:
                 return
@@ -60,20 +68,18 @@ class _Base:
         elif kind == "credits":
             self.credits += event.get("value", 0.0)
             usage = event.get("usage") or {}
-            if usage.get("cache_read") is not None:
-                self.cache_read = (self.cache_read or 0) + int(usage["cache_read"])
-            if usage.get("cache_write") is not None:
-                self.cache_write = (self.cache_write or 0) + int(usage["cache_write"])
-            if usage.get("input_tokens") is not None:
-                self.input_tokens = (self.input_tokens or 0) + int(usage["input_tokens"])
-            if usage.get("output_tokens") is not None:
-                self.output_tokens = (self.output_tokens or 0) + int(usage["output_tokens"])
+            if usage:
+                # Token counters are a snapshot, never a sum of retry costs.
+                self.cache_read = int(usage.get("cache_read") or 0)
+                self.cache_write = int(usage.get("cache_write") or 0)
+                self.input_tokens = int(usage["input_tokens"]) if usage.get("input_tokens") is not None else None
+                self.output_tokens = int(usage["output_tokens"]) if usage.get("output_tokens") is not None else None
             output_tokens = self.output_tokens
-            if self.thinking:
-                self.reasoning_tokens = approx_tokens(self.thinking)
+            thinking = self.thinking[self._usage_offsets[1]:]
+            if thinking:
+                self.reasoning_tokens = approx_tokens(thinking)
             elif output_tokens is not None:
-                tool_text = "".join(c.get("name", "") + c.get("arguments", "") for c in self.tool_calls)
-                self.reasoning_tokens = max(0, int(output_tokens) - approx_tokens(self.text) - approx_tokens(tool_text))
+                self.reasoning_tokens = max(0, int(output_tokens) - self._completion_estimate())
         elif kind == "hitl":
             block = ("\n\n" if self.text else "") + event["question"]
             self.text += block
@@ -87,15 +93,23 @@ class _Base:
             self.text += block
             self._text(block)
 
+    def _completion_estimate(self):
+        text_at, _, calls_at = self._usage_offsets
+        tool_text = "".join(c.get("name", "") + c.get("arguments", "") for c in self.tool_calls[calls_at:])
+        return approx_tokens(self.text[text_at:]) + approx_tokens(tool_text)
+
+    def _reasoning_usage(self):
+        reasoning = self.reasoning_tokens or approx_tokens(self.thinking[self._usage_offsets[1]:])
+        return min(reasoning, self.output_tokens) if self.output_tokens is not None else reasoning
+
     def usage(self, prompt_text=None):
         sent = getattr(self.parsed, "_full_prompt_text", None)
         prompt = self.input_tokens if self.input_tokens is not None else approx_tokens(
             sent or (self._prompt_text if prompt_text is None else prompt_text))
         if self.cache_read or self.cache_write:
             prompt = max(prompt, (self.cache_read or 0) + (self.cache_write or 0) + (self.input_tokens or 0))
-        tool_text = "".join(c.get("name", "") + c.get("arguments", "") for c in self.tool_calls)
-        base_completion = approx_tokens(self.text) + approx_tokens(tool_text)
-        reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
+        base_completion = self._completion_estimate()
+        reasoning = self._reasoning_usage()
         if self.output_tokens is not None:
             completion = int(self.output_tokens)
         else:
@@ -112,6 +126,9 @@ class _Base:
         pass
 
     def _signature(self, signature):
+        pass
+
+    def _usage_boundary(self):
         pass
 
     def _feed_tool_call(self, event):
@@ -192,7 +209,7 @@ class ChatAdapter(_Base):
         if self.writer:
             self.writer.data(self._chunk({}, finish))
             prompt, completion = self.usage(prompt_text)
-            reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
+            reasoning = self._reasoning_usage()
             usage_dict = {
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
@@ -231,7 +248,7 @@ class ChatAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
-        reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
+        reasoning = self._reasoning_usage()
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
                 "choices": [{"index": 0, "message": {"role": "assistant",
@@ -413,7 +430,7 @@ class ResponsesAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
-        reasoning = self.reasoning_tokens or approx_tokens(self.thinking)
+        reasoning = self._reasoning_usage()
         if not self._items:
             self._ensure_item("message", self.item_id)
         status = "incomplete" if reason == "timeout" else "completed"
@@ -485,6 +502,12 @@ class AnthropicAdapter(_Base):
         block["thinking"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                            "delta": {"type": "thinking_delta", "thinking": delta}})
+
+    def _usage_boundary(self):
+        # A new upstream attempt never continues the previous attempt's thinking
+        # block: a late signature must not be appended to it.
+        if self.open_kind == "thinking":
+            self._close_blocks()
 
     def _signature(self, signature):
         if signature and self.open_kind == "thinking":

@@ -26,15 +26,25 @@ class StreamWriter:
         if cors is not None:
             cors()
         self.handler.end_headers()
+        trace = getattr(self.handler, "_client_trace", None)
+        if trace:
+            trace.event("client_response_headers", http_status=200, content_type="text/event-stream")
 
     def raw(self, text: str):
         if self.broken:
             return
         try:
-            self.handler.wfile.write(text.encode("utf-8"))
+            data = text.encode("utf-8")
+            self.handler.wfile.write(data)
             self.handler.wfile.flush()
+            trace = getattr(self.handler, "_client_trace", None)
+            if trace:
+                trace.raw(data)
             self.last_write = time.time()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            trace = getattr(self.handler, "_client_trace", None)
+            if trace:
+                trace.event("client_write_failed")
             self.broken = True
 
     def event(self, name, payload):

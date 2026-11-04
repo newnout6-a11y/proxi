@@ -13,6 +13,7 @@ import journal
 import validate
 from orchestrator import TurnRunner
 from session import RelaySession
+from upstream_attempts import AttemptBudget
 from test_native_context_reuse import FIRST, Backend, request, run, setup
 from test_service_requests import capture_direct
 
@@ -100,7 +101,7 @@ def test_empty_turn_is_marked_dumped_only_after_a_successful_write(tmp_path, mon
     monkeypatch.setattr(direct, "_dump_rejected_body", dump)
     session = SimpleNamespace(_request_tag="r")
     for _ in range(3):
-        direct._dump_empty_once(b"{}", {"last_usage": None}, {}, session, "model-x")
+        direct._dump_empty_once(b"{}", {"budget": AttemptBudget()}, {}, session, "model-x")
     assert len(attempts) == 2
 
 

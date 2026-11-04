@@ -21,6 +21,7 @@ import models as model_catalog
 from context import build_system_instructions
 from redact import redact
 from session import SessionLease
+from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
 
 
 _CONV_HEADER = "\n\n[CLIENT CONVERSATION — chronological]\n"
@@ -137,7 +138,7 @@ class _FailoverOut:
         if event.get("type") == "error":
             self.error = event["error"]
             return
-        if event.get("type") != "credits":
+        if event.get("type") not in ("credits", "usage_start"):
             self.started = True
         self.out.put(event)
 
@@ -295,19 +296,6 @@ class TurnRunner:
             "tools=" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         )
 
-    @staticmethod
-    def _tool_prompt_native(parsed):
-        tools = getattr(parsed, "tools", None) or []
-        if not tools or getattr(parsed, "tool_choice", "auto") == "none":
-            return ""
-        return (
-            "\n\n[NATIVE CLIENT TOOLS]\n"
-            "The client supplied these tools; they are passed natively, so call them with real tool calls "
-            "and no markup. They run on the CLIENT machine, not in Retool. Do not claim file, edit or test "
-            "results you did not receive as tool results.\n"
-            "tool_choice=" + json.dumps(getattr(parsed, "tool_choice", "auto"), ensure_ascii=False)
-        )
-
     async def _explain_empty(self, holder):
         """Silent turns are usually a persisted upstream error (e.g. out of credits)."""
         session = holder.get("session")
@@ -351,6 +339,11 @@ class TurnRunner:
         exclude = []
         rechecked = False
         cancelled = holder.setdefault("cancel_event", threading.Event())
+        max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
+        # Exec steps are bounded only by max_exec_turns; each step (plus the summary
+        # step) may spend up to MAX_ATTEMPTS POSTs, which is the hard cap per request.
+        holder["_attempt_budget"] = AttemptBudget(
+            cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None)
         while True:
             relay = _FailoverOut(out)
             holder.pop("session", None)
@@ -366,7 +359,7 @@ class TurnRunner:
             backend = getattr(getattr(lease, "session", lease), "backend", None)
             accounts = getattr(self, "accounts", None)
             retryable = (error is not None and not relay.started and not cancelled.is_set()
-                         and accounts is not None)
+                         and accounts is not None and holder["_attempt_budget"].remaining > 0)
             exhausted = False
             try:
                 if (retryable and backend is None and error.code == "insufficient_credits"
@@ -429,7 +422,8 @@ class TurnRunner:
             is_native = bool(native_tools)
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
-            if client_text:
+            client_owns_instructions = client_text or (direct_mode and is_native and bool(parsed.system))
+            if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
                 instructions = parsed.system or ""
@@ -439,7 +433,7 @@ class TurnRunner:
             if cancelled.is_set():
                 raise asyncio.CancelledError()
             reminder = ""
-            if native_tools and getattr(parsed, "tool_choice", "auto") != "none":
+            if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
             elif not native_tools and not client_text and self.cfg["exec_policy"] != "off":
                 reminder = (
@@ -448,10 +442,8 @@ class TurnRunner:
                     "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
                     "Do not answer that you cannot run commands."
                 )
-            if parsed.system and not client_text:
+            if parsed.system and not client_owns_instructions:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
-            if direct_mode and native_tools:
-                reminder = self._tool_prompt_native(parsed)
             if direct_mode:
                 # Direct path keeps the stable instructions (plus tool block) as the
                 # cached system head and sends the raw client tail as the user turn.
@@ -498,6 +490,7 @@ class TurnRunner:
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
+                parent_key = getattr(parsed, "parent_conversation_key", None)
                 can_exec = self._can_exec(0) and not native_tools and not client_text
                 persistent_text = (direct_mode and not native_tools
                                    and self.cfg.get("session_mode") != "per_request"
@@ -505,21 +498,28 @@ class TurnRunner:
                                    and (key or self.cfg.get("session_mode") == "shared"))
                 isolated = not native_tools and not persistent_text and (direct_mode or client_text or (key and not can_exec))
                 failover = {"exclude": exclude} if exclude else {}
+                if parent_key and parent_key != key:
+                    failover["parent_key"] = parent_key
+                child_scope = (("subagent", key) if parent_key and key
+                               and self.cfg.get("session_mode") == "shared" else None)
                 if persistent_text:
                     # Ordinary text chats retain idle keepwarm, with state separate
                     # from native tools even when their conversation ID is the same.
-                    session = await self.pool.acquire(key, context_scope="text", model_entry=parsed.entry, **failover)
+                    session = await self.pool.acquire(key, context_scope=(child_scope, "text") if child_scope else "text",
+                                                      model_entry=parsed.entry, **failover)
                 elif isolated:
                     # A standalone job can share account affinity, never the main chat's
                     # tools, head, implicit history, cache breakpoints or idle keepwarm.
                     session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry, **failover)
                 else:
-                    session = await self.pool.acquire(key, model_entry=parsed.entry, **failover)
+                    scoped = {"context_scope": child_scope} if child_scope else {}
+                    session = await self.pool.acquire(key, model_entry=parsed.entry, **scoped, **failover)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
                 # Debit the account that actually served the turn.
                 account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
                 acquired._credits_manager = account_credits
+                acquired._attempt_budget = holder["_attempt_budget"]
                 # Console lines (heartbeat, [cache]) carry the relay request id so
                 # concurrent requests of one conversation can be told apart.
                 acquired._request_tag = getattr(parsed, "request_id", None)
@@ -573,7 +573,7 @@ class TurnRunner:
                         if not hasattr(direct_target, "set_direct"):
                             # Injected/fake session: fall back to the agent prompt shape.
                             direct_mode = False
-                            stream_prompt = (instructions + _CONV_HEADER + stream_prompt + _NATIVE_CONTINUE
+                            stream_prompt = (instructions + self._tool_prompt(parsed) + _CONV_HEADER + stream_prompt + _NATIVE_CONTINUE
                                              if native_tools else instructions + "\n\n" + stream_prompt)
                     if direct_mode:
                         if instructions and stream_prompt.startswith(instructions):
@@ -616,6 +616,7 @@ class TurnRunner:
                     first_token = False
                     think_started = None
                     tool_started = {}
+                    out.put({"type": "usage_start"})
                     try:
                         async for event in stream:
                             if not first_token and event["type"] in ("text", "thinking", "tool_call"):
@@ -657,7 +658,7 @@ class TurnRunner:
                                         thinking_ms=span)
                                     think_started = None
                                 out.put(event)
-                            elif event["type"] == "thinking_heartbeat":
+                            elif event["type"] in ("thinking_heartbeat", "usage_start"):
                                 out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 if not event.get("partial"):
@@ -767,7 +768,8 @@ class TurnRunner:
                     refuses_tools = re.search(
                         r"(?:can(?:not|'t)|could(?:\s+not|n't)|unable|not (?:available|accessible)|"
                         r"no (?:access|tools)|не (?:могу|доступ|имею)|нет доступа)", final_text, re.IGNORECASE)
-                    if tool_names and refuses_tools and tool_retries < 1 and not visible_text.strip():
+                    if (not direct_mode and tool_names and refuses_tools and tool_retries < 1
+                            and not visible_text.strip()):
                         tool_retries += 1
                         log("turn.retry", "Модель отказалась от инструментов — повтор с коррекцией", "warn",
                             reason="tool_refusal")
@@ -780,7 +782,10 @@ class TurnRunner:
                                   "For this requested task, issue the appropriate client tool call now.")
                         continue
                     if tool_names and (choice == "required" or isinstance(choice, dict)):
-                        raise apierr.upstream_error("upstream did not honor the required client tool choice")
+                        # Same error shape as an empty turn: diagnostic_id and attempt count.
+                        raise holder["_attempt_budget"].error(
+                            "upstream_tool_choice_ignored" if final_text.strip() else "upstream_empty_turn",
+                            "upstream did not honor the required client tool choice")
 
                     # Once the summary turn is requested, nothing is executed any more.
                     can_exec = self._can_exec(exec_steps) and not final_summary and not client_text
@@ -816,23 +821,26 @@ class TurnRunner:
                         # which the direct transport never writes.
                         explained = await self._explain_empty(holder)
                         if explained is not None:
-                            out.put({"type": "error", "error": explained})
-                            return
+                            raise explained
 
-                    if not command and not final_text.strip() and empty_retries < 1 and not client_text:
-                        # Silent turn: insist once, keeping the full system prompt.
+                    if (not direct_mode and not command and not final_text.strip() and empty_retries < 1 and not client_text
+                            and holder["_attempt_budget"].remaining):
+                        # The agent transport needs a textual continuation. Direct
+                        # retries are handled in the transport with the same body.
                         empty_retries += 1
                         log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
                         if not direct_mode:
                             native_context = None  # Retry prompts are not part of the client history in agent mode.
-                        prompt = (base_prompt + "\n\n[RETRY] Предыдущий ход вернул пустой ответ. "
-                                  "Ответь сейчас: нужна команда — выведи <exec_command>...</exec_command>, "
-                                  "иначе дай короткий текстовый ответ.")
+                        retry_instruction = ("Use the supplied native client tools for tool calls; "
+                                             "otherwise return a short text answer." if native_tools else
+                                             "If a local command is needed, output <exec_command>...</exec_command>; "
+                                             "otherwise return a short text answer.")
+                        prompt = (base_prompt + "\n\n[RETRY] The previous attempt returned an empty answer. "
+                                  + retry_instruction)
                         continue
 
                     if not command and not final_text.strip():
-                        out.put({"type": "error", "error": apierr.upstream_error("upstream returned an empty turn")})
-                        return
+                        raise holder["_attempt_budget"].error()
 
                     if not can_exec or not command:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
@@ -867,6 +875,8 @@ class TurnRunner:
                         raise asyncio.CancelledError()
                     output = redact(output, cookie_values=self.cfg.get("cookie_values", ()))
                     exec_steps += 1
+                    # A usable answer plus its executed command is progress, not a retry.
+                    holder["_attempt_budget"].new_step()
                     log("exec.result", "Команда завершилась с кодом %s" % code,
                         "success" if code == 0 else "warn" if code == 126 else "error",
                         command=redact(command)[:2000], exit=code, output=(output or "")[:1500],

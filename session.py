@@ -954,7 +954,9 @@ class SessionPool:
         ttl = self.cfg.get("conversation_idle_timeout", 900)
         capacity = max(1, self.cfg.get("max_conversations", 128))
         idle = sorted((key for key in self._conversation_locks
-                       if not self._conversation_refs.get(key)), key=lambda key: self._last_used.get(key, 0))
+                       if not self._conversation_refs.get(key)
+                       and not getattr(self._conversations.get(key), "_cache_dependents", 0)),
+                      key=lambda key: self._last_used.get(key, 0))
         closing = []
         for key in idle:
             expired = ttl > 0 and now - self._last_used.get(key, now) >= ttl
@@ -978,8 +980,37 @@ class SessionPool:
         maker = getattr(b, "new_thread_id", None)
         return await maker() if maker is not None else await b.create_thread()
 
+    def _cache_parents(self, parent_key):
+        """Pin only existing ancestors; never create a conversation for a label."""
+        parents, seen = [], set()
+        pending = [parent_key] if parent_key else []
+        while pending:
+            parent = pending.pop()
+            candidates = [(k, s) for k, s in self._conversations.items()
+                          if getattr(s, "_client_key", k) == parent]
+            if self._shared is not None and getattr(self._shared, "_client_key", None) == parent:
+                candidates.append((None, self._shared))
+            for key, session in candidates:
+                if id(session) in seen:
+                    continue
+                seen.add(id(session))
+                parents.append((key, session))
+                ancestor = getattr(session, "_parent_key", None)
+                if ancestor:
+                    pending.append(ancestor)
+        return parents
+
+    def _touch_cache_parents(self, parents, delta):
+        for key, session in parents:
+            session._cache_dependents = getattr(session, "_cache_dependents", 0) + delta
+            session._last_request_at = time.time()
+            if key in self._conversations:
+                self._last_used[key] = time.monotonic()
+            if session._warm_body and self._usable(session.backend):
+                direct._ensure_keepwarm(session, session.cfg)
+
     async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None, context_scope=None,
-                      exclude=()) -> SessionLease:
+                      exclude=(), parent_key=None) -> SessionLease:
         """Take one slot and return an independently releasable request handle.
 
         `exclude` lists accounts that already failed this request (failover).
@@ -990,6 +1021,9 @@ class SessionPool:
         key = None
         referenced = False
         keep = False
+        parents = self._cache_parents(parent_key) if parent_key != conversation_key else []
+        self._touch_cache_parents(parents, 1)
+        client_key = conversation_key
         try:
             affinity_parent = (self._shared if self.mode == "shared" else
                                self._conversations.get(conversation_key) or
@@ -1088,11 +1122,15 @@ class SessionPool:
                            else self._next_backend(model_entry, exclude))
                 self._check_route(backend, model_entry)
                 session = RelaySession(backend, await self._new_thread_id(backend))
+            session._client_key = client_key
+            session._parent_key = parent_key
             session.begin_request()
             lease = SessionLease(session)
+            lease._cache_parents = parents
             self._active[lease] = (session, key, lock, keep)
             return lease
         except BaseException:
+            self._touch_cache_parents(parents, -1)
             if locked:
                 lock.release()
             if referenced:
@@ -1126,6 +1164,7 @@ class SessionPool:
             if not keep or session._needs_drain or session._cancelled:
                 await session.aclose()
         finally:
+            self._touch_cache_parents(getattr(lease, "_cache_parents", []), -1)
             if key is not None:
                 self._conversation_refs[key] -= 1
                 self._last_used[key] = time.monotonic()

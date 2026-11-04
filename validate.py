@@ -543,6 +543,28 @@ def _tool_choice(value):
     raise unprocessable("'tool_choice' must be a string or function object", param="tool_choice")
 
 
+def conversation_affinity(data, headers, identity=None):
+    """Use the calling session's ID before a shared parent affinity header."""
+    headers = {str(k).lower(): v.strip() for k, v in headers.items() if isinstance(v, str) and v.strip()}
+    explicit = (headers.get("x-proxi-session-id") or headers.get("x-opencode-session-id")
+                or headers.get("x-claude-code-session-id"))
+    affinity = explicit or next((headers.get(k) for k in (
+        "x-session-affinity", "x-session-id", "x-opencode-session", "x-conversation-id",
+        "session-id", "conversation-id") if headers.get(k)), None)
+    key = conversation_key(data, affinity)
+    parent_id = ((identity or {}).get("parent_session_id") or headers.get("x-proxi-parent-session-id")
+                 or headers.get("x-opencode-parent-session-id"))
+    parent = key.split(":", 1)[0] + ":" + parent_id if key and parent_id else None
+    # Claude subagents can share a session ID but advertise a distinct agent ID.
+    # Agent display names (build/explore) are deliberately not identities.
+    agent = headers.get("x-claude-code-agent-id")
+    if key and isinstance(agent, str) and agent.strip():
+        parent = parent or key
+        digest = hashlib.sha256(json.dumps([key, agent.strip()]).encode()).hexdigest()
+        key = "agent:" + digest
+    return key, parent if parent != key else None
+
+
 def conversation_key(data, header_value=None, allow_content_fallback=False):
     """Return a stable affinity key for one client dialogue.
 

@@ -91,7 +91,7 @@ def test_isolated_tool_less_request_context_alignment(tmp_path, monkeypatch):
     # Verify main session established direct cached head and registered tools
     cached_head = main_session._cached_head
     assert cached_head is not None
-    assert "[ROLE]" in cached_head
+    assert cached_head == "Client custom system prompt"
     assert "Client custom system prompt" in cached_head
     # Must NOT have 30k project context in native client head
     assert "[PROJECT CONTEXT]" not in cached_head

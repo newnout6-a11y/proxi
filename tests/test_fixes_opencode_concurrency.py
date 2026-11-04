@@ -393,8 +393,10 @@ async def test_branched_session_syncs_registered_tools_to_parent():
 
 
 @pytest.mark.asyncio
-async def test_direct_retry_clears_client_context_pending():
+async def test_direct_retry_clears_client_context_pending(monkeypatch):
     from types import SimpleNamespace
+    import io
+    import direct
     cfg = {
         "transport": "direct",
         "session_mode": "per_conversation",
@@ -414,20 +416,24 @@ async def test_direct_retry_clears_client_context_pending():
         "provider_resource_name": "p1",
     }
     backend = DummyBackend(cfg)
+    backend.headers = lambda: {}
     pool = session_mod.SessionPool(backend)
     runner = TurnRunner(cfg, SimpleNamespace(record_turn=lambda *_: None), pool)
 
     attempts = 0
-    class DirectMockSession(session_mod.RelaySession):
-        async def stream(self, prompt, model_provider, tool_names=None):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                # Empty turn triggers retry
-                yield {"type": "end", "reason": "stop"}
-            else:
-                yield {"type": "text", "delta": "Successful recovery"}
-                yield {"type": "end", "reason": "stop"}
+    bodies = []
+    def opener(req, **kw):
+        nonlocal attempts
+        attempts += 1
+        bodies.append(req.data)
+        events = ([] if attempts == 1 else [
+            {"event": "content_block_delta", "type": "text", "partialText": "Successful recovery"}])
+        events.append({"event": "end_of_stream"})
+        result = io.BytesIO(b"\n".join(json.dumps(e).encode() for e in events) + b"\n")
+        result.status = 200
+        result.headers = {}
+        return result
+    monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
 
     backend.create_thread = lambda: asyncio.sleep(0, result="t1")
     backend.new_thread_id = lambda: asyncio.sleep(0, result="t1")
@@ -438,9 +444,6 @@ async def test_direct_retry_clears_client_context_pending():
     }, {"strict_models": False, "model": "claude-opus-5-5"})
     parsed.conversation_key = "conv-direct-retry"
 
-    import session as session_module
-    orig_session = session_module.RelaySession
-    session_module.RelaySession = DirectMockSession
     try:
         out = queue.Queue()
         holder = {}
@@ -448,8 +451,11 @@ async def test_direct_retry_clears_client_context_pending():
         
         session = pool._conversations["conv-direct-retry"]
         assert getattr(session, "_client_context_pending", None) is False
+        assert attempts == 2 and bodies[0] == bodies[1]
+        assert any(e.get("delta") == "Successful recovery" for e in list(out.queue) if e)
     finally:
-        session_module.RelaySession = orig_session
+        for session in pool._conversations.values():
+            await session.aclose()
 
 
 

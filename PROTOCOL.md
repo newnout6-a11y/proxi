@@ -27,12 +27,13 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 {
   "model": "claude-opus-5-5",
   "rit": "99a368f5194fc7ea",
-  "providerResourceName": "ffd4d570-7c6b-414f-b95a-1a695676d0a8",
+  "providerResourceName": "<PROVIDER-RESOURCE-UUID>",
   "messages": [
     {
       "role": "system",
-      "content": "Инструкции и контекст проекта...",
-      "cache": true
+      "content": [
+        {"type": "text", "text": "Инструкции и контекст проекта...", "cache": true}
+      ]
     },
     {
       "role": "user",
@@ -44,19 +45,36 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
   ],
   "tools": [
     {
-      "name": "exec_command",
+      "name": "shell",
       "description": "...",
-      "parameters": { ... }
+      "params": {
+        "command": {"type": "string", "description": "...", "required": true}
+      },
+      "strict": true
     }
   ],
   "reasoningEffort": "high",
-  "openAICacheKey": "<uuid-хеш от head>",
+  "maxCompletionTokens": 4096,
+  "toolChoice": "required",
+  "openAICacheKey": "<первые 24 hex-символа sha256(model + tools + head)>",
   "metadata": {
-    "sandpackAgent": true,
-    "environmentName": "production"
+    "sandpackAgent": true
   }
 }
 ```
+
+Состав тела, как его формирует `direct.build_body`:
+- `content` системного и пользовательских сообщений — массив блоков; `cache: true`
+  ставится на текстовый блок. Строка допустима только для одиночного prompt без истории.
+- Каждый tool — `name`, `description`, `params` (типизированные параметры с `required`)
+  и `strict: true`; JSON Schema клиента преобразуется в этот вид.
+- `toolChoice` отправляется только если клиент задал не `auto` (`required` или имя инструмента);
+  `maxCompletionTokens` — только если клиент задал лимит, не меньше 16.
+- `openAICacheKey` — `sha256(model, 0x00, tools JSON, 0x00, head)[:24]`; `rit` — не криптографический
+  hint целостности от длины `messages` и `tools`.
+- `metadata` содержит только `sandpackAgent`; для моделей из списка Assist поле не отправляется
+  (relay убирает его и при повторе после ответа «not available right now»).
+- `providerResourceName` не отправляется, если ресурс не задан (`__managed__`).
 
 ### Поля и валидация upstream (Zod-схема Retool):
 - `model`: идентификатор модели (например `claude-opus-5-5`, `gpt-5.5`).
@@ -69,14 +87,20 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 
 ### Формат ответа: NDJSON (Newline Delimited JSON stream):
 Каждая строка — отдельный JSON-объект:
-- `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
-- `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"..."}}`
-- `{"type":"content_block_start","index":1,"content_block":{"type":"tool_call","id":"...","name":"exec_command"}}`
-- `{"type":"content_block_delta","index":1,"delta":{"type":"partialInputs","partialInputs":"{\"cmd\":...}"}}`
-- `{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":"..."}}` (для моделей 5.x)
-- `{"type":"usage","usage":{"input_tokens":...,"cache_read_input_tokens":52509,"cache_creation_input_tokens":0,"output_tokens":...}}`
-- `{"type":"turn_credits_persisted","credits":0.015}`
-- `{"type":"end_of_stream"}`
+- `{"event":"content_block_start","type":"text"}`
+- `{"event":"content_block_delta","type":"text","partialText":"..."}`
+- `{"event":"content_block_start","type":"tool_call","toolCallId":"...","toolName":"shell"}`
+- `{"event":"content_block_delta","type":"tool_call","partialInputs":"{\"command\":...}"}`
+- `{"event":"content_block_start","type":"thinking"}`
+- `{"event":"content_block_delta","type":"signature","partialSignature":"..."}`
+- `{"event":"metadata","usage":{"inputTokens":4,"promptTokensReadFromCache":52509,"outputTokens":100,"creditsUsed":0.015}}`
+- `{"event":"end_of_stream"}` (также распознаётся `type: end_of_stream`)
+
+Это формат текущего direct-парсера. Ранее приведённая здесь форма
+`type: content_block_delta` с вложенным `delta` не поддерживается этим парсером;
+сводки `*-response.json` фиксируют её в `unsupported_event_shapes`, если она
+встретится. Наличие такой формы в диагностике требует отдельного исправления
+декодера, а не вывода, что модель ничего не сгенерировала.
 
 ---
 
