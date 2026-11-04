@@ -645,20 +645,23 @@ class TurnRunner:
                             elif event["type"] == "final_text":
                                 if event.get("text"):
                                     final_text = event["text"]
-                            elif event["type"] == "thinking_start":
-                                think_started = time.time()
-                                ms = round((think_started - holder["upstream_started_at"]) * 1000)
-                                log("upstream.thinking_start", "Модель начала думать через %d мс" % ms, "info",
-                                    ms=ms)
+                            elif event["type"] in ("thinking_status", "thinking_start"):
+                                if think_started is None:
+                                    think_started = time.time()
+                                    ms = round((think_started - holder["upstream_started_at"]) * 1000)
+                                    log("upstream.thinking_start", "Upstream сообщил начало thinking через %d мс" % ms,
+                                        "info", ms=ms)
                                 out.put(event)
                             elif event["type"] in ("thinking", "thinking_signature"):
-                                if event["type"] == "thinking_signature" and think_started:
+                                if event["type"] == "thinking_signature" and think_started is not None:
                                     span = round((time.time() - think_started) * 1000)
                                     log("upstream.thinking_end", "Мышление заняло %d мс" % span, "info",
                                         thinking_ms=span)
                                     think_started = None
                                 out.put(event)
                             elif event["type"] in ("thinking_heartbeat", "usage_start"):
+                                if event["type"] == "usage_start":
+                                    think_started = None
                                 out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 if not event.get("partial"):

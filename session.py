@@ -291,6 +291,7 @@ class RelaySession:
         self._warm_task = None
         self._last_request_at = time.time()
         self._active_direct_abort = None
+        self._active_warm_abort = None
         self._cached_turn_ends = []
 
     def set_direct(self, head, tools, tool_choice, max_tokens, chunks=None):
@@ -340,6 +341,12 @@ class RelaySession:
         if callable(abort):
             try:
                 abort()
+            except Exception:
+                pass
+        warm_abort = getattr(self, "_active_warm_abort", None)
+        if callable(warm_abort):
+            try:
+                warm_abort()
             except Exception:
                 pass
         loop = self._loop
@@ -397,9 +404,16 @@ class RelaySession:
                 abort()
             except Exception:
                 pass
+        warm_abort = getattr(self, "_active_warm_abort", None)
+        if callable(warm_abort):
+            try:
+                warm_abort()
+            except Exception:
+                pass
         task, self._warm_task = getattr(self, "_warm_task", None), None
-        if task is not None and not task.done():
+        if task is not None and task is not asyncio.current_task():
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         ws, self.ws = self.ws, None
         reader, self._reader = self._reader, None
         if reader is not None:

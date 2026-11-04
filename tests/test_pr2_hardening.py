@@ -133,6 +133,28 @@ def test_image_only_history_preserves_images_without_invalid_cache_flags():
                for block in message["content"]) == 1
 
 
+@pytest.mark.parametrize("image_tail", [False, True])
+def test_large_tool_result_batch_preserves_the_previous_cache_endpoint(image_tail):
+    session = SimpleNamespace(_cached_turn_ends=[])
+    tools = [{"name": "inspect", "params": {}, "strict": True}]
+    prefix = ["User: start"] + ["[tool result id=%d] ok" % i for i in range(40)]
+    prefix.append("Assistant: the last status text")
+    if image_tail:
+        prefix.append([{"type": "image", "imageData": "fixture", "mimeType": "image/png"}])
+    first = direct.build_body({}, {"model": "claude-opus-5-5"}, "stable head", "", tools,
+                              "auto", 32, chunks=prefix, session=session)
+    extended = prefix + ["[tool result id=new-%d] ok" % i for i in range(25)]
+    second = direct.build_body({}, {"model": "claude-opus-5-5"}, "stable head", "", tools,
+                               "auto", 32, chunks=extended, session=session)
+    previous_endpoint = max(i for i, message in enumerate(first["messages"])
+                            if any(block.get("cache") for block in message["content"]))
+    assert second["messages"][previous_endpoint]["content"][-1].get("cache") is True
+    assert second["messages"][-1]["content"][-1].get("cache") is True
+    assert sum(bool(block.get("cache")) for message in second["messages"]
+               for block in message["content"]) == 3
+    assert len(second["messages"]) == len(extended) + 1
+
+
 def test_client_text_suppresses_incomplete_tool_envelopes():
     """Verify _ClientText suppresses incomplete tool envelopes on final flush
     while preserving ordinary markdown backtick markup."""

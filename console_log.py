@@ -15,7 +15,7 @@ LARGE_INPUT = 50_000
 WRITE_JUMP = 8_192
 _LOCK = threading.Lock()
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-_FIELDS = re.compile(r"\b(in|read|write|credits|balance|limit|spent)=([^\s]+)")
+_FIELDS = re.compile(r"\b(in|out|read|write|credits|balance|limit|spent)=([^\s]+)")
 
 
 def number(value, *, signed=False):
@@ -131,9 +131,11 @@ class CacheMonitor:
         uncached = number(usage.get("inputTokens"))
         if uncached is not None and uncached >= LARGE_INPUT:
             marker += " [INPUT HIGH]"
-        return "[%s] [cache] in=%s read=%s write=%s credits=%s%s" % (
+        output = number(usage.get("outputTokens"))
+        output_note = " out=%s" % amount(output, tokens=True) if output is not None else ""
+        return "[%s] [cache] in=%s read=%s write=%s credits=%s%s%s" % (
             request_id, amount(usage.get("inputTokens"), tokens=True), amount(read, tokens=True),
-            amount(written, tokens=True), amount(usage.get("creditsUsed")), marker)
+            amount(written, tokens=True), amount(usage.get("creditsUsed")), output_note, marker)
 
 
 def balance_line(request_id, snapshot, spent=None, account=None):

@@ -65,6 +65,14 @@ def test_uncached_input_alert_has_a_floor_and_can_coexist_with_write_alerts():
     assert "[INPUT HIGH]" in line and "[WRITE HIGH]" in line
 
 
+def test_cache_line_exposes_billed_output_tokens_including_hidden_reasoning():
+    line = console_log.CacheMonitor().line("reasoning", {
+        "inputTokens": 4, "outputTokens": 30703, "promptTokensReadFromCache": 120365,
+        "promptTokensWrittenToCache": 1558, "creditsUsed": 12.91878})
+    assert "credits=12.9188 out=30,703" in line
+    assert "out=30,703" in console_log.render(line, color=True)
+
+
 def test_write_jump_compares_previous_request_not_metadata_in_same_request():
     monitor = console_log.CacheMonitor()
     monitor.line("req-A", usage(write=100), scope=("opus", "key"))

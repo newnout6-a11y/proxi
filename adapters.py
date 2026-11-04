@@ -57,6 +57,9 @@ class _Base:
         elif kind == "thinking_start":
             if self.parsed.show_thinking:
                 self._think_start()
+        elif kind == "thinking_status":
+            if self.parsed.show_thinking:
+                self._think_status()
         elif kind == "thinking_signature":
             if self.parsed.show_thinking:
                 self._signature(event.get("signature", ""))
@@ -125,6 +128,9 @@ class _Base:
     def _think_start(self):
         pass
 
+    def _think_status(self):
+        pass
+
     def _signature(self, signature):
         pass
 
@@ -169,6 +175,7 @@ class ChatAdapter(_Base):
         super().__init__(parsed, writer)
         self.id = "chatcmpl-" + uuid.uuid4().hex[:20]
         self.created = int(time.time())
+        self._thinking_indicated = False
 
     def _chunk(self, delta, finish=None):
         return {"id": self.id, "object": "chat.completion.chunk", "created": self.created,
@@ -190,8 +197,15 @@ class ChatAdapter(_Base):
     def _think_start(self):
         # Display-only label: it is streamed but never stored in self.thinking.
         label = getattr(self.parsed, "thinking_placeholder", "")
-        if label and self.writer:
+        if label and self.writer and not self._thinking_indicated:
             self.writer.data(self._chunk({"reasoning_content": label}))
+            self._thinking_indicated = True
+
+    def _think_status(self):
+        self._think_start()
+
+    def _usage_boundary(self):
+        self._thinking_indicated = False
 
     def _tool_call(self, index, call, delta, new=False):
         if not self.writer:
