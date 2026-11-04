@@ -34,7 +34,6 @@ function Field({ name, field, value, onChange, pending, dirty }) {
       </label>
       <div className="setting-control">
         {pending && <Tag tone="warn" title="Сохранено, применится после перезапуска">после перезапуска</Tag>}
-        {!field.restart_required && !pending && <Tag>сразу</Tag>}
         {control}
       </div>
     </div>

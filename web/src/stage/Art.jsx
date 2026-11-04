@@ -25,8 +25,8 @@ export function JournalArt() {
         <div className="art-rows">
           <div className="art-row art-focal">
             <span className="art-time">22:41:07</span>
-            <span className="art-msg">POST /v1/messages → 200</span>
-            <span className="art-tag">ok</span>
+            <span className="art-msg">POST /v1/messages</span>
+            <span className="art-tag">200</span>
           </div>
           {[120, 96, 132, 84].map((w, i) => (
             <div className="art-row" key={i}>

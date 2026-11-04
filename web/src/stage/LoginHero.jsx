@@ -22,8 +22,8 @@ const BALANCE = 1479.89;
 const COST = 0.84;
 const COMMAND = 'исправь падающий тест';
 
-const initial = { typed: '', sent: false, row: false, phase: 0, credits: BALANCE, done: false };
-const POSTER = { typed: COMMAND, sent: true, row: true, phase: 4, credits: BALANCE - COST, done: true };
+const initial = { typed: '', sent: false, row: false, phase: 0, credits: BALANCE, done: false, fade: false };
+const POSTER = { typed: COMMAND, sent: true, row: true, phase: 4, credits: BALANCE - COST, done: true, fade: false };
 
 async function script(a) {
   await a.wait(700);
@@ -45,9 +45,13 @@ async function script(a) {
   // The next request starts: the terminal clears first, then the scene resets out of view
   await a.set({ typed: '', sent: false, done: false });
   await a.wait(500);
-  await a.set({ row: false, phase: 0 });
+  await a.set({ row: false, phase: 0, fade: true });
   await a.wait(700);
-  await a.snap({ ...initial });
+  // The balance changes back only while it is faded out, so it never rolls up in view
+  await a.snap({ ...initial, fade: true });
+  await a.wait(100);
+  await a.set({ fade: false });
+  await a.wait(400);
 }
 
 const fmt = (n) => new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
@@ -91,7 +95,7 @@ export function LoginHero() {
               <div className="lh-main">
                 <div className="lh-head">
                   <Text className="lh-title">Журнал событий</Text>
-                  <span className="lh-credits">
+                  <span className="lh-credits" data-hidden={s.fade || undefined}>
                     <span className="lh-credits-label">кредиты</span>
                     <Count value={s.credits} format={fmt} className="lh-credits-value" />
                   </span>

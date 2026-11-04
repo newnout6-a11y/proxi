@@ -133,20 +133,22 @@ class Admin:
                         if cfg.get(key) and len(str(cfg[key])) >= 5]
         return sorted(set(secrets), key=len, reverse=True)
 
-    def _safe(self, value):
-        if isinstance(value, str):
-            value = redact(value, cookie_values=self.cfg.get("cookie_values", []))
+    def _safe(self, value, secrets=None):
+        # Collected once per response, not once per string in it.
+        if secrets is None:
             secrets = [self.cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf")]
             secrets += self.cfg.get("cookie_values", [])
             secrets += self._account_secrets()
+            secrets = [secret for secret in secrets if secret]
+        if isinstance(value, str):
+            value = redact(value, cookie_values=self.cfg.get("cookie_values", []))
             for secret in secrets:
-                if secret:
-                    value = value.replace(secret, "[redacted]")
+                value = value.replace(secret, "[redacted]")
             return value
         if isinstance(value, dict):
-            return {key: self._safe(item) for key, item in value.items()}
+            return {key: self._safe(item, secrets) for key, item in value.items()}
         if isinstance(value, list):
-            return [self._safe(item) for item in value]
+            return [self._safe(item, secrets) for item in value]
         return value
 
     def _saved(self):

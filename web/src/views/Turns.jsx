@@ -74,7 +74,7 @@ export default function Turns({ journal, overview }) {
                 </span>
                 <span className="trace-num">{fmtMs(trace.ttft)}</span>
                 <span className="trace-num">{fmtTokens(trace.cacheRead)}{hit !== null && <small> · {Math.round(hit * 100)}%</small>}</span>
-                <span className="trace-num">{fmtFixed(trace.credits, 3)}</span>
+                <span className="trace-num">{fmtFixed(trace.credits, 2)}</span>
                 <time className="trace-when" title={fmtClock(trace.started)}>
                   {fmtAgo(trace.started)}
                   {(trace.tools > 0 || trace.commands > 0 || trace.errors > 0) && (

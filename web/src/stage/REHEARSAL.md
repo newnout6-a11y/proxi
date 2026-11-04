@@ -34,8 +34,17 @@ caret touching the typed text, typed text not marked `data-typing`, credits figu
 popping in, uneven compact gutters, compact window narrower than tall, terminal
 covering the focal row's tape on 390 px.
 
-## Not checked
+Fixed after the independent review: the balance no longer rolls back up in view
+at the loop seam (it fades out, is reset while hidden, and fades back in).
 
-- Film reports coverage as `inconclusive` (sampling gaps on this machine); the gate
-  lines themselves are at zero.
+## Not checked / remaining warnings
+
+- `rehearsal passed` means the never-intentional lines are at zero. Film still
+  reports `inconclusive` coverage (sampling gaps on this machine) and these
+  non-gate warnings, which are not zero:
+  - `appears with no entrance` and `settle snap` on `.ss-count` / its digits: the
+    kit's own digit strips homing back to the middle decade after a roll;
+  - `settle snap` on `.ss-term__caret` (6.6 px): the block caret stepping with the
+    last typed letter;
+  - at 390 px, `near-empty frames` for about 0.8 s at the loop reset.
 - Empty-state stills were checked by screenshots, not by film.

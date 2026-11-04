@@ -77,7 +77,9 @@ export function CacheChart({ buckets, windowSec }) {
   }));
   const readTicks = [model.readMax / 2, model.readMax].filter((v) => v * k <= readH + 1);
   const writeTicks = [model.writeMax].filter((v) => v * k <= writeH + 1 && v * k >= 14);
-  const labelIdx = n ? [0, 0.25, 0.5, 0.75, 1].map((f) => Math.min(n - 1, Math.round(f * (n - 1)))) : [];
+  // Fewer time labels on narrow charts, so neighbours never touch.
+  const fractions = plotW < 420 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
+  const labelIdx = n ? fractions.map((f) => Math.min(n - 1, Math.round(f * (n - 1)))) : [];
   const active = hover !== null && buckets[hover] ? hover : null;
   const bucket = active !== null ? buckets[active] : null;
 
@@ -113,11 +115,6 @@ export function CacheChart({ buckets, windowSec }) {
           </g>
         ))}
         <text className="c-label" x={PAD.l - 8} y={axisY + 4} textAnchor="end">0</text>
-        {!empty && (
-          <text className="c-label c-label-accent" x={W - PAD.r} y={Math.max(PAD.t + 10, creditPts[n - 1].y - 8)} textAnchor="end">
-            {fmtFixed(model.total, 2)}
-          </text>
-        )}
         {!empty && buckets.map((b, i) => {
           const r = (b.cache_read || 0) * k;
           const w = (b.cache_write || 0) * k;
@@ -146,10 +143,10 @@ export function CacheChart({ buckets, windowSec }) {
       {empty && <p className="chart-empty">Нет данных за окно</p>}
       {bucket && (
         <dl className="chart-tip" style={flip ? { right: W - tipLeft + 12 } : { left: tipLeft + 12 }}>
-          <dt className="mono">{fmtShortTime(bucket.t - windowSec / n)}–{fmtShortTime(bucket.t)}</dt>
+          <dt className="mono">{fmtShortTime(bucket.t)}–{fmtShortTime(bucket.t + windowSec / n)}</dt>
           <dd><span>чтение кэша</span><b className="num">{fmtTokens(bucket.cache_read)}</b></dd>
           <dd><span>запись кэша</span><b className="num">{fmtTokens(bucket.cache_write)}</b></dd>
-          <dd><span>кредиты</span><b className="num">{fmtFixed(bucket.credits, 3)}</b></dd>
+          <dd><span>кредиты</span><b className="num">{fmtFixed(bucket.credits, 2)}</b></dd>
           <dd><span>с начала окна</span><b className="num">{fmtFixed(model.cumulative[active], 2)}</b></dd>
           <dd><span>запросы</span><b className="num">{fmtInt(bucket.requests)}</b></dd>
         </dl>

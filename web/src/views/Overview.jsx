@@ -18,6 +18,8 @@ export const WINDOWS = [
   { id: 86400, label: '24 ч', long: 'последние сутки' },
 ];
 
+const SESSION_MODE = { per_conversation: 'сессия на каждый диалог', shared: 'одна общая сессия' };
+
 const pct = (share) => `${Math.max(0, Math.min(1, share)) * 100}%`;
 
 function Segmented({ value, onChange, label }) {
@@ -53,7 +55,7 @@ function Balance({ balance, metrics, windowSec, overview }) {
   else {
     forecast = (
       <span>
-        При темпе <b className="num">{fmtNum(perDay, 1)}</b> в сутки хватит примерно на <b className="num">{fmtDuration(lasts)}</b>
+        При темпе <b className="num">{fmtFixed(perDay, 2)}</b> в сутки хватит примерно на <b className="num">{fmtDuration(lasts)}</b>
         {daysLeft !== null && lasts > daysLeft ? ', дольше чем до сброса' : ''}
       </span>
     );
@@ -63,7 +65,7 @@ function Balance({ balance, metrics, windowSec, overview }) {
     <section className="panel instrument" aria-label="Баланс">
       <div className="instrument-head">
         <span className="instrument-label">Доступно кредитов</span>
-        {balance?.stale ? <Tag tone="warn">данные устарели</Tag> : <Tag>обновлено {fmtAgo(overview?.session?.last_success_at)}</Tag>}
+        {balance?.stale && <Tag tone="warn">данные устарели</Tag>}
       </div>
       <p className="figure-xl">
         <AnimatedNumber value={available} format={(v) => fmtFixed(v, 2)} />
@@ -83,8 +85,8 @@ function Balance({ balance, metrics, windowSec, overview }) {
       </div>
       <p className="forecast">{forecast}</p>
       <div className="instrument-foot">
-        <span>с запуска <b className="num">{fmtFixed(overview?.usage?.session_used, 2)}</b></span>
-        <span>ходов <b className="num">{fmtInt(overview?.usage?.turns)}</b></span>
+        <span>потрачено с запуска <b className="num">{fmtFixed(overview?.usage?.session_used, 2)}</b></span>
+        <span>ходов с запуска <b className="num">{fmtInt(overview?.usage?.turns)}</b></span>
         <span>аптайм <b className="num">{fmtUptime(overview?.uptime_seconds)}</b></span>
       </div>
     </section>
@@ -222,13 +224,15 @@ function Connection({ overview }) {
 
 export default function Overview({ apiKey, journal, overview, overviewError, refreshOverview, onUnauthorized, go }) {
   const [windowSec, setWindowSec] = useState(3600);
-  const [metrics, setMetrics] = useState(null);
+  // Keyed by window: a late answer for the previous window can never overwrite the current one.
+  const [metrics, setMetrics] = useState({});
   const [error, setError] = useState('');
 
   async function loadMetrics() {
+    const requested = windowSec;
     try {
-      const data = await api(apiKey, `metrics?window=${windowSec}`);
-      setMetrics({ ...data, windowSec });
+      const data = await api(apiKey, `metrics?window=${requested}`);
+      setMetrics((previous) => ({ ...previous, [requested]: data }));
       setError('');
     } catch (failure) {
       if (failure.status === 401) onUnauthorized();
@@ -237,7 +241,7 @@ export default function Overview({ apiKey, journal, overview, overviewError, ref
   }
   usePolling(loadMetrics, 8000, [apiKey, windowSec]);
 
-  const current = metrics?.windowSec === windowSec ? metrics : null;
+  const current = metrics[windowSec] || null;
   const totals = current?.totals || {};
   const buckets = current?.buckets || [];
   const models = Object.entries(current?.models || {}).map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value);
@@ -251,7 +255,9 @@ export default function Overview({ apiKey, journal, overview, overviewError, ref
       <header className="page-head">
         <div>
           <h1>Обзор</h1>
-          <p className="page-meta">{label} · режим {overview?.sessions?.mode || '—'} · активных сессий {fmtInt(overview?.sessions?.active)}</p>
+          <p className="page-meta">
+            {label} · {SESSION_MODE[overview?.sessions?.mode] || 'режим сессий неизвестен'} · активных запросов {fmtInt(overview?.sessions?.active)} · диалогов {fmtInt(overview?.sessions?.cached)}
+          </p>
         </div>
         <div className="head-actions">
           {overview && (
@@ -271,13 +277,14 @@ export default function Overview({ apiKey, journal, overview, overviewError, ref
             note={totals.errors ? `${fmtInt(totals.errors)} ${plural(totals.errors, ['ошибка', 'ошибки', 'ошибок'])}` : 'без ошибок'}
             tone={totals.errors ? 'neg' : undefined} />
           <Stat label="Попадание в кэш" value={fmtPercent(totals.cache_hit_ratio)}
-            note={`чтение ${fmtTokens(totals.cache_read)} · запись ${fmtTokens(totals.cache_write)}`} />
+            note={`чтение ${fmtTokens(totals.cache_read)} · запись ${fmtTokens(totals.cache_write)} · без кэша ${fmtTokens(totals.input_tokens)}`} />
           <Stat label="Первый токен, p50" value={fmtMs(totals.ttft_p50)} note={`p95 ${fmtMs(totals.ttft_p95)}`} />
+          <Stat label="Ответ целиком, p50" value={fmtMs(totals.latency_p50)} note={`p95 ${fmtMs(totals.latency_p95)}`} />
         </section>
       </div>
 
       <div className="ov-main">
-        <section className="panel" aria-label="Кэш промпта и кредиты">
+        <section className="panel chart-panel" aria-label="Кэш промпта и кредиты">
           <div className="panel-head">
             <h2>Кэш промпта и кредиты</h2>
             <ul className="legend">
@@ -292,7 +299,7 @@ export default function Overview({ apiKey, journal, overview, overviewError, ref
           <section className="panel" aria-label="Модели">
             <div className="panel-head">
               <h2>Модели</h2>
-              <span className="panel-meta">ходов {fmtInt(totals.turns)}</span>
+              <span className="panel-meta">ходов {fmtInt(totals.turns)} · инструментов {fmtInt(totals.tools)}</span>
             </div>
             <RankedList items={models} empty="За окно ходов не было" />
           </section>

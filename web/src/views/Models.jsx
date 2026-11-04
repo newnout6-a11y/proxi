@@ -64,7 +64,7 @@ export default function Models({ apiKey, onUnauthorized }) {
             <span className="num">{fmtTokens(model.max_output)}</span>
             <span className="model-effort">
               {model.reasoning ? (model.reasoning_effort_levels || []).join(' · ') || 'есть' : 'нет'}
-              {model.tools && <Tag>tools</Tag>}
+              {model.tools && <Tag>инструменты</Tag>}
             </span>
             <span className="model-route">
               <Dot tone={model.routable ? 'pos' : 'muted'} />
