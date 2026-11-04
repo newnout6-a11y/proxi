@@ -137,7 +137,10 @@ def _js_length(value):
 
 
 def _hash32(length):
-    return format((length * 2654435761) & 0xFFFFFFFF, "08x")
+    # Match JavaScript Number multiplication before >>> 0. The product exceeds
+    # 2**53 around 3.4M UTF-16 units; exact Python integers then produce a different
+    # hint for some lengths, so otherwise valid large requests are rejected.
+    return format(int(length * 2654435761.0) & 0xFFFFFFFF, "08x")
 
 
 def make_rit(messages, tools=None):

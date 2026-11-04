@@ -72,6 +72,11 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
   `maxCompletionTokens` — только если клиент задал лимит, не меньше 16.
 - `openAICacheKey` — `sha256(model, 0x00, tools JSON, 0x00, head)[:24]`; `rit` — не криптографический
   hint целостности от длины `messages` и `tools`.
+- Для каждой части `rit` длина — `JSON.stringify(value).length` в единицах UTF-16;
+  хэш — `((length * 2654435761) >>> 0).toString(16).padStart(8, "0")`.
+  Умножение выполняется с округлением JavaScript Number (IEEE 754 binary64) до
+  приведения к uint32. При длинах около 3,4 млн единиц и выше точное целочисленное
+  умножение Python может дать другой результат и привести к `400 Invalid request format`.
 - `metadata` содержит только `sandpackAgent`; для моделей из списка Assist поле не отправляется
   (relay убирает его и при повторе после ответа «not available right now»).
 - `providerResourceName` не отправляется, если ресурс не задан (`__managed__`).

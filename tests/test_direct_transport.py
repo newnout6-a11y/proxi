@@ -2,6 +2,8 @@
 import asyncio
 import json
 
+import pytest
+
 import config
 import direct
 import validate
@@ -26,6 +28,47 @@ def test_rit_counts_astral_characters_as_two_units():
     astral = [{"role": "user", "content": "x\U0001F600"}]
     # A surrogate pair is two UTF-16 units in JavaScript, one code point in Python.
     assert direct._js_length(astral) - direct._js_length(plain) == 2
+
+
+@pytest.mark.parametrize(("length", "expected"), [
+    (0, "00000000"),
+    (1, "9e3779b1"),
+    (2, "3c6ef362"),
+    (3_393_262, "3df5088e"),
+    (3_393_263, "dc2c823f"),
+    (3_393_264, "7a63fbf0"),
+    (3_393_265, "189b75a0"),
+    (3_394_410, "bebabe4a"),
+    (3_749_929, "91ea3558"),
+    (3_750_726, "24a01166"),
+    (3_754_257, "6bcb8dc0"),
+    (32_000_001, "31d941b0"),
+])
+def test_hash32_matches_javascript_number_rounding(length, expected):
+    # Golden values from ((length * 2654435761) >>> 0).toString(16).
+    # Cover the Number precision boundary and lengths of rejected/successful turns.
+    assert direct._hash32(length) == expected
+
+
+@pytest.mark.parametrize(("length", "expected"), [
+    (3_394_410, "bebabe4a3d1241f7"),
+    (3_749_929, "91ea35583d1241f7"),
+    (3_750_726, "24a011663d1241f7"),
+    (3_754_257, "6bcb8dc03d1241f7"),
+])
+def test_large_body_rit_matches_browser_without_changing_the_prompt(length, expected):
+    # Synthetic content with the same serialized lengths as incident requests;
+    # no private conversation, image or tool definitions belong in a fixture.
+    compact = lambda value: json.dumps(value, separators=(",", ":"))
+    tools = [{"name": "inspect", "description": "", "params": {}, "strict": True}]
+    tools[0]["description"] = "x" * (14_375 - len(compact(tools)))
+    prompt = "x" * (length - len(compact([{"role": "user", "content": ""}])))
+    body = direct.build_body({"direct_cache": False}, {"model": "claude-opus-5-5"},
+                             "", prompt, tools, "auto", 16)
+    assert len(compact(body["messages"])) == length
+    assert body["messages"] == [{"role": "user", "content": prompt}]
+    assert body["tools"] == tools
+    assert body["rit"] == expected
 
 
 def test_tools_are_converted_to_the_retool_param_shape():
