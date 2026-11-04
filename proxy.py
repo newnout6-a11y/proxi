@@ -579,6 +579,14 @@ def make_handler(runtime: Runtime):
                 parsed.entry.get("reasoning_effort_control") == "provider-managed" else "none")
 
             parsed.request_purpose = client_context.request_kind(parsed)
+            compatibility_headers = {}
+            if parsed.system_messages_normalized:
+                compatibility_headers['x-proxi-system-messages'] = 'merged-into-head'
+                journal.emit('request.compatibility',
+                             'Системные напоминания объединены в один head: Retool не принимает несколько system. '
+                             'Изменение head сбрасывает прежний подписанный префикс.', 'warn',
+                             request_id=self.request_id, control='mid_conversation_system',
+                             handling='merged_into_head')
             if self._client_trace:
                 self._client_trace.event("validated_request", parsed=vars(parsed), effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
@@ -601,13 +609,14 @@ def make_handler(runtime: Runtime):
                 adapter = adapters.for_dialect(dialect, parsed)
                 reason = self._collect(fut, events, adapter, prompt_text, holder)
                 payload = adapter.end(reason, prompt_text)
-                self._json(200, payload)
+                self._json(200, payload, compatibility_headers)
                 return
 
             writer = sse.StreamWriter(self)
             self._writer = writer
             self._streaming = True
-            writer.start({"x-request-id": self.request_id, "request-id": self.request_id})
+            writer.start({"x-request-id": self.request_id, "request-id": self.request_id,
+                          **compatibility_headers})
             self._response_started = True
             self._model = parsed.model
             self._stream_status = 200

@@ -270,6 +270,7 @@ class TurnRunner:
             enable_local_exec=self.cfg["exec_policy"] != "off",
             limit=self.cfg["context_max_bytes"],
             cookie_values=self.cfg.get("cookie_values", ()),
+            system_prompt=self.cfg.get('relay_system_prompt'),
             exec_policy=self.cfg["exec_policy"],
         )
 
@@ -422,7 +423,7 @@ class TurnRunner:
             is_native = bool(native_tools)
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
-            client_owns_instructions = client_text or (direct_mode and is_native and bool(parsed.system))
+            client_owns_instructions = client_text or (direct_mode and bool(parsed.system))
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
@@ -435,7 +436,7 @@ class TurnRunner:
             reminder = ""
             if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif not native_tools and not client_text and self.cfg["exec_policy"] != "off":
+            elif not native_tools and not client_owns_instructions and self.cfg["exec_policy"] != "off":
                 reminder = (
                     "\n\n[LOCAL EXEC REMINDER]\n"
                     "To run anything on the user's machine you MUST output "
@@ -491,7 +492,7 @@ class TurnRunner:
             try:
                 key = getattr(parsed, "conversation_key", None)
                 parent_key = getattr(parsed, "parent_conversation_key", None)
-                can_exec = self._can_exec(0) and not native_tools and not client_text
+                can_exec = self._can_exec(0) and not native_tools and not client_owns_instructions
                 persistent_text = (direct_mode and not native_tools
                                    and self.cfg.get("session_mode") != "per_request"
                                    and purpose not in client_context.SERVICE_KINDS
@@ -794,7 +795,7 @@ class TurnRunner:
                             "upstream did not honor the required client tool choice")
 
                     # Once the summary turn is requested, nothing is executed any more.
-                    can_exec = self._can_exec(exec_steps) and not final_summary and not client_text
+                    can_exec = self._can_exec(exec_steps) and not final_summary and not client_owns_instructions
                     command = executor.extract_command(final_text) if can_exec and not native_tools else None
 
                     if not final_summary and exec_steps and not self._can_exec(exec_steps):

@@ -78,6 +78,7 @@ class Parsed:
         self.temperature = None
         self.system = ""
         self.declared_ignored = []
+        self.system_messages_normalized = False
         self.wants_usage = False
         self.show_thinking = True
         self.tools = []
@@ -416,6 +417,16 @@ def _messages(data, *, min_items=1):
 
 
 def _finish(data, parsed):
+    source_messages = data.get('messages', data.get('input'))
+    history_started = False
+    if isinstance(source_messages, list):
+        for message in source_messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get('role') in ('system', 'developer'):
+                parsed.system_messages_normalized |= history_started
+            else:
+                history_started = True
     parsed.requested_effort = _effort(data)
     if parsed.requested_effort is None:
         for separator in ("#", ":"):
@@ -683,12 +694,15 @@ def parse_anthropic(data, cfg):
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     _reject_images_unsupported(entry, data)
     messages = _messages(data)
-    system, chunks = _render_chunks(messages, allow_system=False)
+    # Retool currently rejects multiple native system messages. Normalize all
+    # instruction text into its single head so native continuation cannot drop it.
+    # A changed head invalidates the old signed prefix, deliberately and visibly.
+    system, chunks = _render_chunks(messages)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     declared_system = data.get("system")
-    if declared_system:
-        parsed.system = _blocks_to_text(declared_system, 0, "system")
+    declared_text = _blocks_to_text(declared_system, 0, 'system') if declared_system else ''
+    parsed.system = '\n\n'.join(part for part in (declared_text, system) if part)
     parsed.message_fingerprints = _message_fingerprints(messages)
     parsed.native_messages = native_history.client_messages(messages, _extract_image_data)
     parsed.stream = _opt_bool(data, "stream")
@@ -755,7 +769,35 @@ def _effort(data):
     selected = [value.lower() for value in selected]
     if len(set(selected)) > 1:
         raise unprocessable("conflicting reasoning effort controls", param="reasoning_effort")
-    return selected[0] if selected else None
+    # Current Claude clients can place effort updates in system entries, including
+    # empty ones. The latest update supersedes the request-wide default. Retool's
+    # equivalent control is its top-level reasoningEffort for this response.
+    latest = None
+    messages = data.get('messages', data.get('input'))
+    if isinstance(messages, list):
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict) or message.get('role') not in ('system', 'developer'):
+                continue
+            if message.get('clear_at') is not None:
+                raise unprocessable('turn-scoped system clear_at is not supported by the Retool route',
+                                    param=f'messages[{index}].clear_at')
+            output = message.get('output_config')
+            if output is None:
+                continue
+            if not isinstance(output, dict):
+                raise unprocessable('system output_config must be an object',
+                                    param=f'messages[{index}].output_config')
+            if output.get('effort') is not None:
+                latest = _opt_str(output, 'effort').lower()
+    if latest is not None and isinstance(thinking, dict):
+        kind = thinking.get('type')
+        explicit = thinking.get('effort')
+        if thinking.get('budget_tokens') is not None:
+            explicit = model_catalog.effort_from_budget(thinking['budget_tokens'])
+        if ((isinstance(kind, str) and kind.lower() == 'disabled' and latest != 'none')
+                or (explicit is not None and str(explicit).lower() != latest)):
+            raise unprocessable('conflicting reasoning effort controls', param='reasoning_effort')
+    return latest if latest is not None else (selected[0] if selected else None)
 
 
 def _show_thinking(data, cfg):

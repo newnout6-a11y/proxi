@@ -110,3 +110,48 @@ catalog/review suite passed **129 tests in 8.89 seconds**. Independent review
 passed **84 post-correction tests** and approved the stage. The repeated image
 probe saves the sent synthetic bodies, PNGs and SHA-256 hashes under
 `.agents/model-audit-20261104/vision-captures/` for independent verification.
+
+## Stage 3: system instructions and gateway quality
+
+The requested quality comparison, exact default prompt, Retool-specific
+capabilities, sources and evidence limits are recorded in
+[relay-quality-and-prompts.md](relay-quality-and-prompts.md).
+
+Explicit instructions now belong to every client, including unknown tool-less
+IDEs. They do not receive the relay's host context/execution instructions, and
+their text cannot trigger relay shell execution. Standalone requests retain a
+separate configurable `relay_system_prompt`, project context and execution
+policy. The default is concise enough to preserve tested 1500-byte follow-up
+budgets and does not claim commands succeeded before seeing results.
+
+Anthropic inline system guidance previously disappeared during native tool
+continuation. A live raw request proved that Retool rejects multiple system
+messages despite its public schema. Guidance is therefore explicitly normalized
+into one head, in order, with `x-proxi-system-messages: merged-into-head` and a
+compatibility journal warning. A changed head invalidates its previous signed
+prefix; the following unchanged tool round trip preserves the new prefix again.
+Latest inline effort updates are retained. Conflicting thinking controls and
+unsupported turn-scoped `clear_at` are rejected before inference.
+
+Three isolated live gateway checks returned the expected markers for standalone
+custom policy (Chat), unknown-client instructions (Responses), and inline system
+guidance (Messages). All three HTTP 200; reported total 0.02656 credits. The real
+user configuration hash stayed unchanged. Private evidence:
+`.agents/model-audit-20261104/prompt-live/manifest.json` and its wire captures.
+
+Independent review found two control-edge cases, which gained nine failing
+regressions before correction. Final independent scoped review: **248 passed
+in 37.37 seconds** plus **3 prompt-budget tests in 0.55 seconds**. Full validation:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests -o addopts= -q --tb=short
+```
+
+**1606 passed in 203.69 seconds.** `git diff --check`: clean.
+
+Fable retention was explicitly approved for all five supplied tenants. The
+normal resource-edit API, with each owned resource's existing options preserved,
+returned HTTP 403 for every tenant: `Data retention enabled Anthropic models are
+not enabled for your organization.` No feature flag or access restriction was
+changed. Fable 5 and 5.1 remain blocked by this organization prerequisite; Google
+and Astra separately require suitable BYOK resources.

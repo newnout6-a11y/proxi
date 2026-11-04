@@ -43,6 +43,8 @@
   "provider_resource_name": "<YOUR-ANTHROPIC-PROVIDER-RESOURCE-UUID>",
   "openai_provider_resource_name": "<YOUR-OPENAI-PROVIDER-RESOURCE-UUID>",
   "reasoning_effort": "auto",
+  "relay_system_prompt": null,
+  "relay_system_prompt_note": "null использует стандартный промпт relay; строка заменяет его для самостоятельных запросов. Явные system/instructions клиентов IDE передаются без добавления этого промпта и локального shell.",
   "allow_effort_downgrade": false,
   "exec_policy": "allowlist",
   "exec_policy_note": "allowlist режет команду по \\n и \\u0026\\u0026 || | ; \\u0026 вне кавычек; тело powershell/cmd после -Command/-c проверяется рекурсивно",

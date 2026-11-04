@@ -26,6 +26,7 @@ DEFAULTS = {
     "session_mode": "per_conversation",
     "strict_models": True,
     "show_unrouted_models": False,
+    "relay_system_prompt": None,  # standalone requests only; explicit client instructions take precedence
     "max_body_bytes": 32 * 1024 * 1024,
     "max_frame_bytes": 16 * 1024 * 1024,
     "max_workers": 32,
@@ -333,6 +334,8 @@ def _load(path):
     cfg = dict(DEFAULTS)
     saved = _read_file(path)
     cfg.update(saved)
+    if cfg.get('relay_system_prompt') is not None and not isinstance(cfg['relay_system_prompt'], str):
+        raise service_unavailable("relay_system_prompt must be a string or null")
     cfg["_config_path"] = os.path.abspath(path)
     cfg["_persist_auth"] = not (os.environ.get("RETOOL_COOKIE") or os.environ.get("RETOOL_XSRF"))
 
