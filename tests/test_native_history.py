@@ -167,6 +167,33 @@ def test_discarded_thinking_attempt_never_becomes_a_replay_snapshot(tmp_path, mo
     assert "accepted" in json.dumps(sent[-1])
 
 
+@pytest.mark.parametrize("limits", [(128000, None), (None, 128000), (4096, 8192), (8192, 4096)])
+def test_output_limit_changes_keep_signed_history_and_forward_the_new_limit(tmp_path, monkeypatch, limits):
+    pool, runner, sent = harness(tmp_path, monkeypatch, [tool_reply(), [text("done"), *END]])
+    previous_limit, next_limit = limits
+
+    async def scenario():
+        try:
+            p = parsed(FIRST)
+            p.max_tokens = previous_limit
+            messages = append_result(copy.deepcopy(FIRST), p, await run(runner, p), "chat")
+            following = parsed(messages)
+            following.max_tokens = next_limit
+            await run(runner, following)
+            assert len(pool._conversations["header:client-a"]._native_history.branches) == 1
+        finally:
+            await close(pool)
+
+    asyncio.run(scenario())
+    assert len(sent) == 2
+    assert sent[0].get("maxCompletionTokens") == previous_limit
+    assert sent[1].get("maxCompletionTokens") == next_limit
+    assert "opaque-one" in json.dumps(sent[1])
+    assert sent[1]["messages"][-1]["role"] == "tool"
+    assert strip_cache(sent[1]["messages"][:len(sent[0]["messages"])]) == strip_cache(sent[0]["messages"])
+    assert sent[0]["openAICacheKey"] == sent[1]["openAICacheKey"]
+
+
 def test_hidden_thinking_is_still_saved_and_restored_server_side(tmp_path, monkeypatch, capsys):
     pool, runner, sent = harness(tmp_path, monkeypatch, [tool_reply(), [text("done"), *END]])
 

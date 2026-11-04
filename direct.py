@@ -846,8 +846,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     """Yield normalised relay events from the direct NDJSON stream."""
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
+    # Output caps control the next generation, not the signed input prefix.
+    # OpenCode legitimately omits or changes them between tool follow-ups.
     scope = json.dumps([getattr(session, "_native_conversation_key", None), model_provider,
-                        head, tools, tool_choice, max_tokens], sort_keys=True, ensure_ascii=True)
+                        head, tools, tool_choice], sort_keys=True, ensure_ascii=True)
     parent, messages = history.resume(scope, client) if history is not None and client is not None else (None, None)
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
