@@ -1,120 +1,20 @@
 import { test, expect } from '@playwright/test';
-
-// All administration traffic is intercepted: these values never reach a relay or a model.
-const API_KEY = 'relay-e2e-placeholder-key';
-const MEMORY_KEY = 'relay.admin.key.v1';
-const NOW = Math.floor(Date.now() / 1000);
-
-const catalog = [
-  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', provider: 'anthropic', context: 1000000, max_output: 128000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high', 'max'], routable: true,
-    metadata_status: 'verified' },
-  { id: 'gpt-5.5', label: 'GPT 5.5', provider: 'openai', context: 1050000, max_output: 128000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], routable: false,
-    metadata_status: 'verified' },
-];
-
-const schema = {
-  model: { type: 'string', label: 'Модель по умолчанию', enum: catalog.map(({ id }) => id), restart_required: true, description: 'После перезапуска.' },
-  show_thinking: { type: 'boolean', label: 'Передавать мышление модели', restart_required: true, description: 'После перезапуска.' },
-  max_workers: { type: 'integer', label: 'Параллельные запросы', min: 1, restart_required: true, description: 'После перезапуска.' },
-  rate_limit_rps: { type: 'number', label: 'Запросов в секунду (0 — без лимита)', min: 0, restart_required: false, description: 'Сразу.' },
-};
-
-function ev(seq, kind, message, level = 'info', extra = {}) {
-  return { seq, ts: NOW - 60 + seq, kind, category: kind.split('.')[0], level, message, data: {}, ...extra };
-}
-
-const journal = [
-  ev(1, 'relay.start', 'Relay запущен на 127.0.0.1:8787', 'success'),
-  ev(2, 'turn.begin', 'Ход claude-opus-5-5 · effort high · direct', 'info',
-    { turn_id: 'turn-alpha-1', data: { model: 'claude-opus-5-5', effort: 'high', transport: 'direct', dialect: 'anthropic' } }),
-  ev(3, 'upstream.first_token', 'Первый токен через 2100 мс', 'success', { turn_id: 'turn-alpha-1', data: { ttft_ms: 2100 } }),
-  ev(4, 'upstream.usage', 'Кредиты 0.25 · кэш read 900 / write 100', 'info',
-    { turn_id: 'turn-alpha-1', data: { credits: 0.25, cache_read: 900, cache_write: 100 } }),
-  ev(5, 'exec.result', 'Команда завершилась с кодом 1', 'error', { turn_id: 'turn-alpha-1', data: { command: 'dir', exit: 1 } }),
-  ev(6, 'turn.end', 'Ход завершён: stop за 3.4 с', 'success', { turn_id: 'turn-alpha-1', data: { reason: 'stop', duration_ms: 3400 } }),
-  ev(7, 'http.request', 'POST /v1/messages → 200', 'success', { request_id: 'req-1', data: { status: 200, route: 'anthropic' } }),
-];
-
-function settingsResponse(settings, effective) {
-  const pending = Object.keys(settings).filter((key) => settings[key] !== effective[key]);
-  return { settings, effective, schema, pending_restart: pending, restart_required: pending.length > 0, writable: true };
-}
-
-async function mockAdmin(page) {
-  const initial = { model: 'claude-opus-5-5', show_thinking: true, max_workers: 4, rate_limit_rps: 0 };
-  const state = { settings: { ...initial }, effective: { ...initial }, requests: [], patches: [], sessions: [],
-    stream: [], streamRequests: 0, cleared: false };
-  const overview = {
-    health: { ok: true, upstream: 'ok', error: null }, uptime_seconds: 5432,
-    balance: { available: 874.25, monthly_allocation: 1000, reset_date: '2026-11-01', stale: false },
-    usage: { session_used: 2.75, turns: 2 },
-    session: { keepalive: true, last_success_at: NOW - 30, error: null },
-    sessions: { active: 1, cached: 3, mode: 'per_conversation' },
-    models: { total: 2, routable: 1, default: 'claude-opus-5-5' },
-    connection: { openai_base_url: 'http://127.0.0.1:8787/v1', anthropic_base_url: 'http://127.0.0.1:8787' },
-  };
-  const metrics = {
-    buckets: Array.from({ length: 60 }, (_, i) => ({ t: NOW - 3600 + i * 60, requests: i % 7, ttft: i % 5 ? 1800 + i * 10 : null, credits: i % 3 ? 0.1 : 0 })),
-    totals: { requests: 41, errors: 3, turns: 12, tools: 5, commands: 2, credits: 1.234, cache_read: 900, cache_write: 100,
-      input_tokens: 0, cache_hit_ratio: 0.9, latency_p50: 3500, latency_p95: 7000, ttft_p50: 2100, ttft_p95: 4000 },
-    models: { 'claude-opus-5-5': 9, 'gpt-5.5': 3 }, buffered: journal.length, last_seq: journal.length,
-  };
-
-  await page.route('**/admin/api/**', async (route) => {
-    const request = route.request();
-    const url = new URL(request.url());
-    const { pathname: path } = url;
-    const headers = request.headers();
-    state.requests.push({ path, method: request.method(), headers, url: request.url() });
-    const reply = (status, json) => route.fulfill({ status, json });
-    if (headers.authorization !== `Bearer ${API_KEY}`) {
-      return reply(401, { error: { message: 'invalid relay API key', code: 'unauthorized' } });
-    }
-    const method = request.method();
-    if (path === '/admin/api/overview') return reply(200, overview);
-    if (path === '/admin/api/metrics') return reply(200, metrics);
-    if (path === '/admin/api/models') return reply(200, { data: catalog, default_model: 'claude-opus-5-5' });
-    if (path === '/admin/api/events') return reply(200, { data: state.cleared ? [] : journal, last_seq: journal.length });
-    if (path === '/admin/api/events/stream') {
-      state.streamRequests += 1;
-      const items = state.stream.splice(0);
-      const body = `event: hello\ndata: ${JSON.stringify({ last_seq: journal.length })}\n\n`
-        + items.map((item) => `event: journal\ndata: ${JSON.stringify(item)}\n\n`).join('');
-      return route.fulfill({ status: 200, headers: { 'content-type': 'text/event-stream' }, body });
-    }
-    if (path === '/admin/api/session' && method === 'POST') {
-      state.sessions.push({ body: request.postDataJSON(), headers });
-      return reply(200, { ok: true });
-    }
-    if (path === '/admin/api/events/clear' && method === 'POST') {
-      state.cleared = true;
-      return reply(200, { ok: true, last_seq: 0 });
-    }
-    if (path === '/admin/api/settings' && method === 'GET') return reply(200, settingsResponse(state.settings, state.effective));
-    if (path === '/admin/api/settings' && method === 'PATCH') {
-      const body = request.postDataJSON();
-      state.patches.push({ body, headers });
-      state.settings = { ...state.settings, ...body.settings };
-      const applied = Object.keys(body.settings).filter((key) => !schema[key].restart_required);
-      for (const key of applied) state.effective[key] = body.settings[key];
-      return reply(200, { ...settingsResponse(state.settings, state.effective), saved: true, changed: Object.keys(body.settings), applied });
-    }
-    return reply(404, { error: { message: 'Unknown admin endpoint' } });
-  });
-  return state;
-}
+import { API_KEY, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
 
 async function login(page, { remember = false } = {}) {
   await page.goto('./');
   await page.getByLabel('Relay key').fill(API_KEY);
   await page.getByLabel('Запомнить до закрытия вкладки').setChecked(remember);
   await page.getByRole('button', { name: 'Войти' }).click();
-  await expect(page.getByRole('heading', { name: 'Всё под контролем.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Сводка' })).toBeVisible();
 }
 
 const nav = (page, name) => page.getByRole('navigation').getByRole('button', { name: new RegExp(name) }).click();
+
+async function openEvents(page) {
+  await nav(page, 'Активность');
+  await page.getByRole('tab', { name: /Все события/ }).click();
+}
 
 test.beforeEach(async ({ page }) => {
   page.on('pageerror', (error) => { throw error; });
@@ -132,7 +32,7 @@ test('rejects an invalid key, then logs in and announces the session', async ({ 
   await expect(page.getByRole('alert')).toContainText('Неверный ключ');
   await page.getByLabel('Relay key').fill(API_KEY);
   await page.getByRole('button', { name: 'Войти' }).click();
-  await expect(page.getByRole('heading', { name: 'Всё под контролем.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Сводка' })).toBeVisible();
   await expect.poll(() => state.sessions.length).toBe(1);
   expect(state.sessions[0].body).toEqual({ action: 'login' });
   expect(state.sessions[0].headers['x-admin-request']).toBe('1');
@@ -149,28 +49,167 @@ test('keeps the key in memory unless tab storage is chosen, and logs out', async
   await login(page, { remember: true });
   expect(await page.evaluate((key) => sessionStorage.getItem(key), MEMORY_KEY)).toBe(API_KEY);
   await page.reload();
-  await expect(page.getByRole('heading', { name: 'Всё под контролем.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Сводка' })).toBeVisible();
   await page.getByRole('button', { name: 'Выйти' }).click();
   await expect(page.getByLabel('Relay key')).toBeVisible();
   expect(await page.evaluate((key) => sessionStorage.getItem(key), MEMORY_KEY)).toBeNull();
 });
 
-test('overview shows balance, metrics and the live feed', async ({ page }) => {
+test('login hero is a stageshow scene and shows its payoff poster under reduced motion', async ({ browser }) => {
+  const context = await browser.newContext({ reducedMotion: 'reduce' });
+  const page = await context.newPage();
+  await mockAdmin(page);
+  await page.goto('./');
+  const hero = page.locator('.login-hero .ss-stage');
+  await expect(hero).toBeVisible();
+  await expect(hero).toContainText('claude-opus-5-5');
+  await expect(hero).toContainText('ответ получен');
+  await context.close();
+});
+
+test('summary shows the pool balance, forecast, spend per bucket, cache and models', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
-  await expect(page.getByText('874,25')).toBeVisible();
-  await expect(page.getByText('90%')).toBeVisible();
-  await expect(page.getByText('upstream ok')).toBeVisible();
-  await expect(page.locator('.feed-row', { hasText: 'POST /v1/messages → 200' })).toBeVisible();
-  await expect(page.locator('.bars li')).toHaveCount(2);
-  await expect(page.locator('code', { hasText: 'http://127.0.0.1:8787/v1' })).toBeVisible();
+  await expect(page.locator('.figure-xl')).toContainText('495,09');
+  await expect(page.locator('.instrument-label')).toContainText('2 аккаунта');
+  await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+  await expect(page.getByText('Retool отвечает')).toBeVisible();
+  await expect(page.locator('.stat', { hasText: 'Потрачено за окно' })).toBeVisible();
+  await expect(page.locator('.cache-facts .figure')).toContainText('%');
+  await expect(page.locator('.chart')).toHaveCount(2);
+  await expect(page.locator('.legend', { hasText: 'за каждые 1 мин' })).toBeVisible();
+  await expect(page.locator('.rank li')).toHaveCount(2);
+  // The summary no longer repeats the journal, recent turns or IDE connection.
+  await expect(page.locator('.feed-row')).toHaveCount(0);
+  await expect(page.locator('.recent-row')).toHaveCount(0);
+});
+
+test('spend is a line per bucket that falls back after its peak, and cache write spikes are marked', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  // The line's points are the bucket ends of each curve segment: y grows downwards in SVG
+  const ys = await page.locator('.c-spend-line').evaluate((path) =>
+    [...path.getAttribute('d').matchAll(/(?:M|\s)(-?[\d.]+),(-?[\d.]+)(?=C|$)/g)].map((m) => Number(m[2])));
+  expect(ys.length).toBeGreaterThan(50);
+  const peak = ys.indexOf(Math.min(...ys));
+  expect(ys.slice(peak + 1).some((y) => y > ys[peak])).toBe(true);
+  await expect(page.locator('.c-peak')).toHaveCount(1);
+  await expect(page.locator('.c-spend-area')).toHaveCount(1);
+  // Reads and writes run on their own lanes; the cold-cache rewrites get the accent
+  await expect(page.locator('.c-read-line')).toHaveCount(1);
+  await expect(page.locator('.c-write-line')).toHaveCount(1);
+  await expect(page.locator('.c-spike')).toHaveCount(2);
+  await expect(page.locator('.c-spike').first()).toContainText('+');
+  // Spike labels never overlap each other or another spike's dot, on a desktop or a phone
+  const overlapping = () => page.evaluate(() => {
+    const labels = [...document.querySelectorAll('.c-spike text')].map((t) => t.getBoundingClientRect());
+    const dots = [...document.querySelectorAll('.c-spike circle')].map((c) => c.getBoundingClientRect());
+    return labels.some((a, i) => labels.some((b, j) => i !== j && a.left < b.right && b.left < a.right))
+      || labels.some((a) => dots.filter((d) => d.left < a.right && a.left < d.right && d.top < a.bottom && a.top < d.bottom).length > 0);
+  });
+  expect(await overlapping()).toBe(false);
+  await page.setViewportSize({ width: 390, height: 900 });
+  await expect.poll(overlapping).toBe(false);
+  await expect(page.locator('.c-spike text')).not.toHaveCount(0);
+});
+
+test('metrics window switcher requests a 6 hour window', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await page.getByRole('group', { name: 'Окно метрик' }).getByRole('button', { name: '6 ч' }).click();
+  await expect.poll(() => state.requests.some(({ url }) => url.includes('metrics?window=21600'))).toBe(true);
+  await expect(page.locator('.page-meta')).toContainText('последние 6 часов');
+  await expect(page.locator('.forecast')).toContainText('последние 6 часов');
+});
+
+test('accounts page lists the pool and marks the reserve', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  const rows = page.locator('.pool-row');
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toContainText('основной');
+  await expect(rows.nth(0)).toContainText('pro-main');
+  await expect(rows.nth(1)).toContainText('резерв');
+});
+
+test('accounts can be disabled, reprioritised, checked and renewed with the CSRF header', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('switch', { name: 'Аккаунт запасной в маршрутизации' }).click();
+  await expect.poll(() => state.accountRequests.find((r) => r.method === 'PATCH')?.body).toEqual({ enabled: false });
+  await expect(page.locator('.pool-row').nth(1)).toContainText('выключен');
+
+  const priority = page.locator('.pool-row').nth(0).getByLabel('Приоритет: меньше — раньше');
+  await priority.fill('5');
+  await priority.press('Enter');
+  await expect.poll(() => state.accountRequests.some((r) => r.method === 'PATCH' && r.body?.priority === 5)).toBe(true);
+
+  await page.locator('.pool-row').nth(0).getByRole('button', { name: 'Баланс' }).click();
+  await expect(page.getByText('Баланс обновлён')).toBeVisible();
+  await page.locator('.pool-row').nth(0).getByRole('button', { name: 'Продлить' }).click();
+  await expect(page.getByText('Сессия продлена').first()).toBeVisible();
+  expect(state.accountRequests.map((r) => r.path)).toEqual(expect.arrayContaining([
+    '/admin/api/accounts/pro-main/balance', '/admin/api/accounts/pro-main/renew']));
+  expect(state.accountRequests.every((r) => r.headers['x-admin-request'] === '1')).toBe(true);
+});
+
+test('a failed renewal shows the redacted reason from the relay', async ({ page }) => {
+  const state = await mockAdmin(page);
+  state.renewFails = true;
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.locator('.pool-row').nth(0).getByRole('button', { name: 'Продлить' }).click();
+  await expect(page.getByText('Сессия не продлена')).toBeVisible();
+  await expect(page.getByText('session renewal failed: HTTP 401')).toBeVisible();
+});
+
+test('the last enabled account cannot be switched off', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('switch', { name: 'Аккаунт запасной в маршрутизации' }).click();
+  await expect(page.locator('.pool-row').nth(1)).toContainText('выключен');
+  const main = page.getByRole('switch', { name: 'Аккаунт основной в маршрутизации' });
+  await expect(main).toBeDisabled();
+  await expect(main).toHaveAttribute('title', /последний включённый/);
+  expect(state.accountRequests.filter((r) => r.method === 'PATCH' && r.body?.enabled === false)).toHaveLength(1);
+});
+
+test('accounts can be added and removed; both wait for a restart', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByLabel('Название').fill('третий');
+  await page.getByLabel('Адрес Retool').fill('https://tenant.retool.com');
+  await page.getByLabel('page_uuid приложения').fill('11111111-2222-3333-4444-555555555555');
+  await page.getByLabel('xsrf').fill('xsrf-value');
+  await page.getByLabel('Cookie').fill('accessToken=abc');
+  await page.getByLabel('Ресурс Anthropic (необязательно)').fill('anthropic-res');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect(page.getByText('Аккаунт добавлен')).toBeVisible();
+  const post = state.accountRequests.find((r) => r.method === 'POST' && r.path === '/admin/api/accounts');
+  // Empty optional fields are not sent.
+  expect(post.body).toEqual({ label: 'третий', base: 'https://tenant.retool.com',
+    page_uuid: '11111111-2222-3333-4444-555555555555', cookie: 'accessToken=abc', xsrf: 'xsrf-value',
+    provider_resource_name: 'anthropic-res' });
+  const added = page.locator('.pool-row', { hasText: 'третий' });
+  await expect(added).toContainText('подключится после перезапуска');
+  await expect(added).toContainText('не подключён');
+  await expect(added.getByRole('button', { name: 'Баланс' })).toBeDisabled();
+  await expect(page.getByText(/вступят в силу после перезапуска/)).toBeVisible();
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Удалить аккаунт запасной' }).click();
+  await expect(page.locator('.pool-row', { hasText: 'запасной' })).toContainText('удалён');
 });
 
 test('journal streams new events, filters, searches and expands details', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
-  await nav(page, 'Журнал');
-  await expect(page.getByRole('heading', { name: 'Журнал событий' })).toBeVisible();
+  await openEvents(page);
   await expect(page.locator('.log-row')).toHaveCount(journal.length);
 
   state.stream.push(ev(8, 'tool.call', 'Инструмент клиента: live-marker', 'info', { turn_id: 'turn-alpha-1' }));
@@ -196,34 +235,36 @@ test('journal streams new events, filters, searches and expands details', async 
   await expect(page.locator('.log-row', { hasText: 'paused-marker' })).toBeVisible();
 });
 
-test('journal clear asks for confirmation and empties the buffer', async ({ page }) => {
+test('journal clear asks for confirmation and empties the buffer into the illustrated empty state', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
-  await nav(page, 'Журнал');
+  await openEvents(page);
   page.once('dialog', (dialog) => dialog.accept());
   await page.getByRole('button', { name: 'Очистить' }).click();
   await expect(page.getByText('Журнал пуст')).toBeVisible();
+  await expect(page.locator('.empty .art .ss-stage')).toBeVisible();
   expect(state.requests.some(({ path, headers }) => path === '/admin/api/events/clear' && headers['x-admin-request'] === '1')).toBe(true);
 });
 
-test('turn traces aggregate journal events into a timeline', async ({ page }) => {
+test('activity opens on turns, aggregated into a turn tape and steps', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
-  await nav(page, 'Ходы');
+  await nav(page, 'Активность');
+  await expect(page.getByRole('tab', { name: /Ходы моделей/ })).toHaveAttribute('aria-selected', 'true');
   const trace = page.locator('.trace').first();
   await expect(trace).toContainText('claude-opus-5-5');
   await expect(trace).toContainText('effort high');
   await expect(trace).toContainText('2,10 с');
   await expect(trace).toContainText('готово');
+  await expect(trace.locator('.tape')).toBeVisible();
   await trace.locator('.trace-head').click();
   await expect(trace.locator('.step')).toHaveCount(5);
-  await expect(trace.locator('.timeline-dot')).toHaveCount(5);
 });
 
 test('turn traces show hidden thinking and tool argument time', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
-  await nav(page, 'Ходы');
+  await nav(page, 'Активность');
   state.stream.push(
     ev(20, 'turn.begin', 'Ход', 'info', { turn_id: 'turn-beta-2', data: { model: 'claude-opus-5-5', effort: 'high' } }),
     ev(21, 'upstream.thinking_end', 'Мышление заняло 6400 мс', 'info', { turn_id: 'turn-beta-2', data: { thinking_ms: 6400 } }),
@@ -234,10 +275,21 @@ test('turn traces show hidden thinking and tool argument time', async ({ page })
   await expect(trace.locator('[title="Генерация аргументов инструментов"]')).toContainText('7,10 с');
 });
 
-test('models can be searched and filtered by route', async ({ page }) => {
+test('turns empty state shows the stageshow illustration', async ({ page }) => {
+  await mockAdmin(page, { empty: true });
+  await login(page);
+  await nav(page, 'Активность');
+  await expect(page.getByText('Ходов пока нет')).toBeVisible();
+  await expect(page.locator('.empty .art .ss-stage')).toBeVisible();
+});
+
+test('settings group fields by purpose and hold the model catalog and IDE connection', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
-  await nav(page, 'Модели');
+  await nav(page, 'Настройки');
+  await expect(page.getByRole('region', { name: 'Модель и мышление' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Лимиты и таймауты' })).toBeVisible();
+  await expect(page.locator('code', { hasText: 'http://127.0.0.1:8787/v1' })).toBeVisible();
   await expect(page.locator('.model-card')).toHaveCount(2);
   await page.getByLabel('Поиск модели').fill('gpt');
   await expect(page.locator('.model-card')).toHaveCount(1);
@@ -245,6 +297,21 @@ test('models can be searched and filtered by route', async ({ page }) => {
   await page.getByLabel('Только с маршрутом').check();
   await expect(page.locator('.model-card')).toHaveCount(1);
   await expect(page.locator('.model-card')).toContainText('Claude Opus 5.5');
+});
+
+test('settings show backend groups, real descriptions and units', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  for (const title of ['Аккаунты и маршрутизация', 'Модель и мышление', 'Повторы и диагностика', 'Кэш промпта', 'Лимиты и таймауты', 'API для клиентов']) {
+    await expect(page.getByRole('region', { name: title })).toBeVisible();
+  }
+  const reserve = page.getByRole('region', { name: 'Аккаунты и маршрутизация' }).locator('.setting', { hasText: 'Порог резерва' });
+  await expect(reserve).toContainText('уходит в резерв');
+  await expect(reserve).toContainText('сразу');
+  await expect(page.getByRole('region', { name: 'Кэш промпта' }).locator('.setting-when')).toHaveCount(0);
+  await expect(reserve.locator('.unit')).toHaveText('кредитов');
+  await expect(page.locator('#setting-session_mode option', { hasText: 'сессия на каждый диалог' })).toHaveCount(1);
 });
 
 test('settings save only changed values with the CSRF header', async ({ page }) => {
@@ -267,25 +334,55 @@ test('keyboard shortcuts switch sections and the theme toggles', async ({ page }
   await mockAdmin(page);
   await login(page);
   await page.keyboard.press('2');
-  await expect(page.getByRole('heading', { name: 'Журнал событий' })).toBeVisible();
-  await page.keyboard.press('5');
+  await expect(page.getByRole('heading', { name: 'Активность' })).toBeVisible();
+  await page.keyboard.press('3');
+  await expect(page.getByRole('heading', { name: 'Аккаунты' })).toBeVisible();
+  await page.keyboard.press('4');
   await expect(page.getByRole('heading', { name: 'Настройки' })).toBeVisible();
   const before = await page.evaluate(() => document.documentElement.dataset.theme);
   await page.getByRole('button', { name: 'Сменить тему' }).click();
   expect(await page.evaluate(() => document.documentElement.dataset.theme)).not.toBe(before);
 });
 
+test('no glow, gradient, uppercase or heavy weight in any section', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  const scan = () => page.evaluate(() => {
+    const bad = [];
+    for (const el of document.querySelectorAll('.shell *')) {
+      if (el.closest('.ss-stage')) continue;
+      const s = getComputedStyle(el);
+      if (s.backgroundImage.includes('gradient')) bad.push(`gradient ${el.className}`);
+      if (s.backdropFilter && s.backdropFilter !== 'none') bad.push(`blur ${el.className}`);
+      if (Number(s.fontWeight) >= 700) bad.push(`weight ${el.className}`);
+      if (s.textTransform === 'uppercase') bad.push(`upper ${el.className}`);
+    }
+    return bad;
+  });
+  const found = { overview: await scan() };
+  for (const name of ['Активность', 'Аккаунты', 'Настройки']) {
+    await nav(page, name);
+    if (name === 'Аккаунты') await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+    found[name] = await scan();
+  }
+  expect(found).toEqual({ overview: [], Активность: [], Аккаунты: [], Настройки: [] });
+});
+
 for (const width of [320, 414]) {
   test(`has no horizontal overflow at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 850 });
     await mockAdmin(page);
-    await login(page);
+    await page.goto('./');
     const noOverflow = () => expect.poll(() => page.evaluate(() =>
       document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+    await expect(page.locator('.login-hero .ss-stage')).toBeVisible();
     await noOverflow();
-    for (const name of ['Журнал', 'Ходы', 'Модели', 'Настройки']) {
+    await login(page);
+    await noOverflow();
+    for (const name of ['Активность', 'Аккаунты', 'Настройки']) {
       await nav(page, name);
       await noOverflow();
     }
+    await page.getByRole('tab', { name: /Все события/ }).count();
   });
 }

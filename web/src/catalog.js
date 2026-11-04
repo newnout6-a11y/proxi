@@ -1,18 +1,14 @@
-import {
-  Network, Sparkles, Zap, Wrench, Terminal, Layers, KeyRound, Database, ShieldCheck, Server, CircleDot,
-} from 'lucide-react';
-
 export const CATEGORIES = {
-  http: { label: 'HTTP', icon: Network },
-  turn: { label: 'Ход', icon: Sparkles },
-  upstream: { label: 'Upstream', icon: Zap },
-  tool: { label: 'Инструмент', icon: Wrench },
-  exec: { label: 'Команда', icon: Terminal },
-  session: { label: 'Сессия', icon: Layers },
-  auth: { label: 'Авторизация', icon: KeyRound },
-  cache: { label: 'Кэш', icon: Database },
-  admin: { label: 'Админ', icon: ShieldCheck },
-  relay: { label: 'Relay', icon: Server },
+  http: { label: 'HTTP' },
+  turn: { label: 'Ход' },
+  upstream: { label: 'Upstream' },
+  tool: { label: 'Инструмент' },
+  exec: { label: 'Команда' },
+  session: { label: 'Сессия' },
+  auth: { label: 'Авторизация' },
+  cache: { label: 'Кэш' },
+  admin: { label: 'Админ' },
+  relay: { label: 'Relay' },
 };
 
 export const LEVELS = {
@@ -24,7 +20,7 @@ export const LEVELS = {
 };
 
 export function category(name) {
-  return CATEGORIES[name] || { label: name || 'прочее', icon: CircleDot };
+  return CATEGORIES[name] || { label: name || 'прочее' };
 }
 
 export const TURN_STATUS = {
@@ -34,4 +30,13 @@ export const TURN_STATUS = {
   cancelled: 'отменён',
   timeout: 'таймаут',
   error: 'ошибка',
+};
+
+export const STATUS_TONE = { running: 'accent', stop: 'pos', tool_calls: 'muted', cancelled: 'warn', timeout: 'warn', error: 'neg' };
+
+export const ACCOUNT_STATE = {
+  active: { label: 'в работе', tone: 'pos' },
+  exhausted: { label: 'исчерпан', tone: 'warn' },
+  auth_dead: { label: 'нет доступа', tone: 'neg' },
+  pending: { label: 'не подключён', tone: 'muted' },
 };

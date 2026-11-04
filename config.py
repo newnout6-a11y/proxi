@@ -310,6 +310,16 @@ def reload_auth(cfg):
         return True
 
 
+def _check_pool_fields(record, name):
+    """Admin pool controls: enabled (bool), priority (0..99, lower first), label (short text)."""
+    if "enabled" in record and type(record["enabled"]) is not bool:
+        raise service_unavailable(f"{name}: 'enabled' must be a boolean")
+    if "priority" in record and (type(record["priority"]) is not int or not 0 <= record["priority"] <= 99):
+        raise service_unavailable(f"{name}: 'priority' must be an integer from 0 to 99")
+    if "label" in record and (not isinstance(record["label"], str) or len(record["label"]) > 40):
+        raise service_unavailable(f"{name}: 'label' must be text of at most 40 characters")
+
+
 def load(path=CONFIG_PATH):
     """Load config, apply env overrides, fill defaults, validate."""
     if not os.path.isfile(path):
@@ -400,6 +410,7 @@ def _load(path):
             acc_missing = [k for k in ("cookie", "xsrf", "base", "page_uuid") if not acc.get(k)]
             if acc_missing:
                 raise service_unavailable(f"account #{i} is missing required credentials: " + ", ".join(acc_missing))
+            _check_pool_fields(acc, f"account #{i}")
         if not cfg.get("base") and accounts:
             cfg["base"] = accounts[0]["base"]
         if not cfg.get("page_uuid") and accounts:
@@ -408,6 +419,8 @@ def _load(path):
             cfg["cookie"] = accounts[0]["cookie"]
         if not cfg.get("xsrf") and accounts:
             cfg["xsrf"] = accounts[0]["xsrf"]
+    else:
+        _check_pool_fields(cfg, "the account")
 
     missing = [k for k in REQUIRED if not cfg.get(k)]
     if missing:

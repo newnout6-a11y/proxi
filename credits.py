@@ -52,6 +52,7 @@ class CreditsManager:
         self._unreported_usage = False
         self._usage_revision = 0
         self._refresh_raced = False
+        self.last_fetched_at = None  # wall clock of the last successful server balance
 
     def get_balance(self, force_refresh=False):
         # Coalesce simultaneous cache misses, including a failed auth refresh.
@@ -111,6 +112,7 @@ class CreditsManager:
             info["session_used"] = round(self.session_used, 4)
             self._balance = dict(info)
             self._cached_at = time.monotonic()
+            self.last_fetched_at = time.time()
             self.last_error = None
             self._balance_estimated = False
             return dict(info, stale=self._refresh_raced or self._unreported_usage,

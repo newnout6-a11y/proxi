@@ -1,209 +1,222 @@
 import { useState } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
-import { Activity, Coins, Cpu, Database, Layers, RefreshCw, Server, Timer, TriangleAlert, Wifi, WifiOff, Zap } from 'lucide-react';
+import { RefreshCw, TriangleAlert } from 'lucide-react';
 import { api } from '../api.js';
 import { usePolling } from '../useJournal.js';
-import { AnimatedNumber, Page, PulseDot, Reveal, spring } from '../motion.jsx';
-import { AreaChart, Bars, Ring } from '../charts.jsx';
-import { Badge, Button, CopyButton } from '../ui.jsx';
-import { category } from '../catalog.js';
-import { fmtAgo, fmtClock, fmtInt, fmtMs, fmtNum, fmtPercent, fmtTokens, fmtUptime, isNum } from '../format.js';
+import { AnimatedNumber, Dot, Page } from '../motion.jsx';
+import { CacheChart, RankedList, SpendChart, bucketLabel } from '../charts.jsx';
+import { Button, Tag } from '../ui.jsx';
+import {
+  fmtDay, fmtDuration, fmtFixed, fmtInt, fmtMs, fmtPercent, fmtTokens, fmtUptime, isNum, parseDay, plural,
+} from '../format.js';
 
-function Kpi({ icon: Icon, label, value, format, hint, tone = 'neutral' }) {
+export const WINDOWS = [
+  { id: 3600, label: '1 ч', long: 'последний час' },
+  { id: 21600, label: '6 ч', long: 'последние 6 часов' },
+  { id: 86400, label: '24 ч', long: 'последние сутки' },
+];
+
+const pct = (share) => `${Math.max(0, Math.min(1, share)) * 100}%`;
+
+function Segmented({ value, onChange, label }) {
   return (
-    <Reveal className={`kpi tone-${tone}`} whileHover={{ y: -4 }} transition={spring}>
-      <span className="kpi-icon"><Icon size={18} /></span>
-      <span className="kpi-label">{label}</span>
-      <AnimatedNumber value={value} format={format} className="kpi-value" />
-      {hint && <span className="kpi-hint">{hint}</span>}
-    </Reveal>
+    <div className="segmented" role="group" aria-label={label}>
+      {WINDOWS.map((item) => (
+        <button key={item.id} type="button" aria-pressed={value === item.id} onClick={() => onChange(item.id)}>
+          {item.label}
+        </button>
+      ))}
+    </div>
   );
 }
 
-export default function Overview({ apiKey, journal, onUnauthorized, go }) {
-  const [overview, setOverview] = useState(null);
-  const [metrics, setMetrics] = useState(null);
-  const [error, setError] = useState('');
-  const [spin, setSpin] = useState(0);
+/** The pool balance as an instrument: figure, month scale with a today marker, and a burn-rate forecast. */
+function Balance({ overview, metrics, windowSec, go }) {
+  const balance = overview?.balance;
+  const summary = overview?.accounts_summary;
+  const available = balance?.available;
+  const allocation = balance?.monthly_allocation;
+  const used = isNum(balance?.used_month) ? balance.used_month
+    : isNum(allocation) && isNum(available) ? allocation - available : null;
+  const reset = parseDay(balance?.reset_date);
+  const daysLeft = reset ? Math.max(0, (reset.getTime() - Date.now()) / 86400000) : null;
+  const elapsed = daysLeft !== null ? Math.max(0, Math.min(1, 1 - daysLeft / 30)) : null;
+  const usedShare = isNum(used) && allocation ? used / allocation : null;
+  const credits = metrics?.totals?.credits;
+  const perDay = isNum(credits) && credits > 0 ? (credits * 86400) / windowSec : null;
+  const lasts = perDay && isNum(available) ? available / perDay : null;
+  const window = WINDOWS.find((w) => w.id === windowSec)?.long || 'окно';
 
-  async function load() {
+  let forecast;
+  if (!metrics) forecast = 'Прогноз появится после загрузки метрик';
+  else if (!perDay) forecast = `За ${window} кредиты не тратились, прогноза нет`;
+  else {
+    forecast = (
+      <>
+        При темпе за {window} (<b className="num">{fmtFixed(perDay, 2)}</b> в сутки) хватит примерно на <b className="num">{fmtDuration(lasts)}</b>
+        {daysLeft !== null && lasts > daysLeft ? ', дольше чем до сброса' : ''}
+      </>
+    );
+  }
+
+  return (
+    <section className="panel instrument" aria-label="Баланс пула">
+      <div className="instrument-head">
+        <span className="instrument-label">
+          Доступно в пуле
+          {summary && ` · ${fmtInt(summary.total)} ${plural(summary.total, ['аккаунт', 'аккаунта', 'аккаунтов'])}`}
+        </span>
+        {balance?.stale && <Tag tone="warn">данные устарели</Tag>}
+      </div>
+      <p className="figure-xl">
+        <AnimatedNumber value={available} format={(v) => fmtFixed(v, 2)} />
+        {isNum(allocation) && <span className="figure-unit">из {fmtInt(allocation)}</span>}
+      </p>
+      <div className="scale" role="img"
+        aria-label={`Израсходовано ${fmtPercent(usedShare)} лимита месяца, прошло ${fmtPercent(elapsed)} периода`}>
+        {usedShare !== null && <span className="scale-used" style={{ width: pct(usedShare) }} />}
+        {elapsed !== null && <span className="scale-now" style={{ left: pct(elapsed) }} title="Сегодня" />}
+      </div>
+      <div className="scale-legend">
+        <span>израсходовано {fmtFixed(used, 2)} · {fmtPercent(usedShare)}</span>
+        <span>
+          сброс {fmtDay(balance?.reset_date)}
+          {daysLeft !== null && ` · через ${Math.ceil(daysLeft)} ${plural(Math.ceil(daysLeft), ['день', 'дня', 'дней'])}`}
+        </span>
+      </div>
+      <p className="forecast">{forecast}</p>
+      <div className="instrument-foot">
+        {summary && (
+          <button type="button" className="link-button" onClick={() => go('accounts')}>
+            в работе {fmtInt(summary.routable)} из {fmtInt(summary.total)}
+            {summary.reserve > 0 && ` · резерв ${fmtInt(summary.reserve)}`}
+          </button>
+        )}
+        <span>с запуска relay <b className="num">{fmtFixed(overview?.usage?.session_used, 2)}</b></span>
+        <span>аптайм <b className="num">{fmtUptime(overview?.uptime_seconds)}</b></span>
+      </div>
+    </section>
+  );
+}
+
+function CacheFacts({ totals }) {
+  return (
+    <section className="panel cache-facts" aria-label="Попадание в кэш">
+      <div className="panel-head"><h2>Попадание в кэш</h2><span className="figure">{fmtPercent(totals.cache_hit_ratio)}</span></div>
+      <dl className="facts">
+        <div><dt>прочитано из кэша</dt><dd className="num">{fmtTokens(totals.cache_read)}</dd></div>
+        <div><dt>записано в кэш</dt><dd className="num">{fmtTokens(totals.cache_write)}</dd></div>
+        <div><dt>без кэша</dt><dd className="num">{fmtTokens(totals.input_tokens)}</dd></div>
+      </dl>
+      <p className="muted small">Чтение из кэша стоит в разы дешевле записи. Высокая запись после паузы значит, что кэш успел остыть</p>
+    </section>
+  );
+}
+
+function Stat({ label, value, note, tone }) {
+  return (
+    <div className="stat">
+      <span className="stat-label">{label}</span>
+      <span className="stat-value num">{value}</span>
+      <span className={`stat-note${tone ? ` tone-${tone}` : ''}`}>{note}</span>
+    </div>
+  );
+}
+
+export default function Overview({ apiKey, overview, overviewError, refreshOverview, onUnauthorized, go }) {
+  const [windowSec, setWindowSec] = useState(3600);
+  // Keyed by window: a late answer for the previous window can never overwrite the current one.
+  const [metrics, setMetrics] = useState({});
+  const [error, setError] = useState('');
+
+  async function loadMetrics() {
+    const requested = windowSec;
     try {
-      const [o, m] = await Promise.all([api(apiKey, 'overview'), api(apiKey, 'metrics?window=3600')]);
-      setOverview(o);
-      setMetrics(m);
+      const data = await api(apiKey, `metrics?window=${requested}`);
+      setMetrics((previous) => ({ ...previous, [requested]: data }));
       setError('');
     } catch (failure) {
       if (failure.status === 401) onUnauthorized();
       else setError(failure.message);
     }
   }
-  usePolling(load, 8000, [apiKey]);
+  usePolling(loadMetrics, 8000, [apiKey, windowSec]);
 
-  const totals = metrics?.totals || {};
-  const buckets = metrics?.buckets || [];
-  const balance = overview?.balance || {};
+  const current = metrics[windowSec] || null;
+  const totals = current?.totals || {};
+  const buckets = current?.buckets || [];
+  const models = Object.entries(current?.models || {}).map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value);
   const ok = overview?.health?.ok;
-  const recent = journal.events.slice(-9).reverse();
-  const allocation = balance.monthly_allocation;
-  const left = isNum(balance.available) && allocation ? balance.available / allocation : null;
-  const models = Object.entries(metrics?.models || {}).map(([label, value]) => ({ label, value }));
+  const problem = error || overviewError || overview?.health?.error;
+  const label = WINDOWS.find((w) => w.id === windowSec).long;
+  const span = bucketLabel(windowSec, buckets.length);
+  const busy = buckets.filter((b) => (b.credits || 0) > 0).length;
 
   return (
     <Page className="overview">
-      <Reveal as="header" className="page-head">
+      <header className="page-head">
         <div>
-          <p className="eyebrow">Обзор · последний час</p>
-          <h1>Всё под контролем.</h1>
+          <h1>Сводка</h1>
+          <p className="page-meta">{label} · сколько тратится, на что и на сколько хватит</p>
         </div>
         <div className="head-actions">
           {overview && (
-            <Badge tone={ok ? 'success' : 'danger'}>
-              {ok ? <Wifi size={13} /> : <WifiOff size={13} />} upstream {ok ? 'ok' : 'degraded'}
-            </Badge>
+            <span className="status"><Dot tone={ok ? 'pos' : 'neg'} live={ok} />{ok ? 'Retool отвечает' : 'Retool недоступен'}</span>
           )}
-          <Button onClick={() => { setSpin((n) => n + 1); load(); }} aria-label="Обновить обзор">
-            <motion.span key={spin} className="icon-swap" initial={{ rotate: 0 }} animate={{ rotate: spin ? 360 : 0 }}
-              transition={{ duration: 0.7, ease: [0.22, 1, 0.36, 1] }}>
-              <RefreshCw size={16} aria-hidden="true" />
-            </motion.span>
-            Обновить
-          </Button>
+          <Segmented value={windowSec} onChange={setWindowSec} label="Окно метрик" />
+          <Button icon={RefreshCw} onClick={() => { refreshOverview(); loadMetrics(); }} aria-label="Обновить сводку">Обновить</Button>
         </div>
-      </Reveal>
+      </header>
 
-      <AnimatePresence>
-        {(error || overview?.health?.error) && (
-          <motion.div className="banner tone-danger" initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}>
-            <TriangleAlert size={16} /> {error || overview.health.error}
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {problem && <div className="banner tone-neg" role="alert"><TriangleAlert size={16} strokeWidth={1.5} /> {problem}</div>}
 
-      <section className="hero-grid">
-        <Reveal className="hero-card balance-card">
-          <div className="hero-glow" aria-hidden="true" />
-          <p className="eyebrow">Доступно кредитов</p>
-          <AnimatedNumber value={balance.available} format={(v) => fmtNum(v, 2)} className="metric" />
-          <p className="muted">
-            из {fmtNum(allocation, 0)} в месяц · сброс {balance.reset_date || '—'}
-            {balance.stale && <Badge tone="warn">устарело</Badge>}
-          </p>
-          <div className="meter" aria-label="Остаток месячного лимита">
-            <motion.span initial={{ scaleX: 0 }} animate={{ scaleX: left ?? 0 }} transition={{ duration: 1.3, ease: [0.22, 1, 0.36, 1] }} />
-          </div>
-          <div className="hero-foot">
-            <span><b className="num">{fmtNum(overview?.usage?.session_used, 3)}</b> потрачено с запуска</span>
-            <span><b className="num">{fmtUptime(overview?.uptime_seconds)}</b> аптайм</span>
-          </div>
-        </Reveal>
+      <div className="ov-top">
+        <Balance overview={overview} metrics={current} windowSec={windowSec} go={go} />
+        <section className="panel stats" aria-label="Показатели за окно">
+          <Stat label="Потрачено за окно" value={fmtFixed(totals.credits, 2)}
+            note={busy ? `в среднем ${fmtFixed(totals.credits / busy, 2)} за активные ${span}` : 'расхода не было'} />
+          <Stat label="Запросы" value={fmtInt(totals.requests)}
+            note={totals.errors ? `${fmtInt(totals.errors)} ${plural(totals.errors, ['ошибка', 'ошибки', 'ошибок'])}` : 'без ошибок'}
+            tone={totals.errors ? 'neg' : undefined} />
+          <Stat label="Первый токен, p50" value={fmtMs(totals.ttft_p50)} note={`p95 ${fmtMs(totals.ttft_p95)}`} />
+          <Stat label="Ответ целиком, p50" value={fmtMs(totals.latency_p50)} note={`p95 ${fmtMs(totals.latency_p95)}`} />
+        </section>
+      </div>
 
-        <Reveal className="hero-card cache-card">
-          <p className="eyebrow">Попадание в кэш промпта</p>
-          <Ring value={totals.cache_hit_ratio} label={fmtPercent(totals.cache_hit_ratio)} caption="за час" />
-          <dl className="mini-stats">
-            <div><dt>прочитано</dt><dd className="num">{fmtTokens(totals.cache_read)}</dd></div>
-            <div><dt>записано</dt><dd className="num">{fmtTokens(totals.cache_write)}</dd></div>
-            <div><dt>без кэша</dt><dd className="num">{fmtTokens(totals.input_tokens)}</dd></div>
-          </dl>
-        </Reveal>
-
-        <Reveal className="hero-card route-card">
-          <p className="eyebrow">Маршрут</p>
-          <div className="route">
-            {[{ icon: Cpu, label: 'Клиенты IDE' }, { icon: Server, label: 'relay :8787' }, { icon: Zap, label: 'Retool' }].map((node, index) => (
-              <div className="route-node" key={node.label}>
-                <motion.span className="route-icon" initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ ...spring, delay: 0.2 + index * 0.12 }}>
-                  <node.icon size={18} />
-                </motion.span>
-                <span>{node.label}</span>
-                {index < 2 && (
-                  <span className="route-wire" aria-hidden="true">
-                    <motion.i animate={{ x: ['-10%', '110%'] }} transition={{ duration: 1.6, repeat: Infinity, ease: 'easeInOut', delay: index * 0.4 }} />
-                  </span>
-                )}
-              </div>
-            ))}
-          </div>
-          <dl className="mini-stats">
-            <div><dt>активно</dt><dd className="num">{fmtInt(overview?.sessions?.active)}</dd></div>
-            <div><dt>диалогов</dt><dd className="num">{fmtInt(overview?.sessions?.cached)}</dd></div>
-            <div><dt>режим</dt><dd>{overview?.sessions?.mode || '—'}</dd></div>
-          </dl>
-        </Reveal>
-      </section>
-
-      <section className="kpis">
-        <Kpi icon={Activity} label="Запросов" value={totals.requests} format={fmtInt} hint={`${fmtInt(totals.errors)} ошибок`} tone={totals.errors ? 'warn' : 'neutral'} />
-        <Kpi icon={Layers} label="Ходов модели" value={totals.turns} format={fmtInt} hint={`${fmtInt(totals.tools)} вызовов инструментов`} />
-        <Kpi icon={Timer} label="TTFT p50" value={totals.ttft_p50} format={fmtMs} hint={`p95 ${fmtMs(totals.ttft_p95)}`} tone="accent" />
-        <Kpi icon={Zap} label="Ответ p50" value={totals.latency_p50} format={fmtMs} hint={`p95 ${fmtMs(totals.latency_p95)}`} />
-        <Kpi icon={Coins} label="Кредиты за час" value={totals.credits} format={(v) => fmtNum(v, 3)} />
-        <Kpi icon={Database} label="Событий в буфере" value={metrics?.buffered} format={fmtInt} hint={`последнее #${fmtInt(metrics?.last_seq)}`} />
-      </section>
-
-      <section className="charts-grid">
-        <Reveal className="panel">
-          <div className="panel-head"><h2>Запросы в минуту</h2><Badge>{fmtInt(totals.requests)}</Badge></div>
-          <AreaChart label="Запросы в минуту" points={buckets.map((b) => ({ t: b.t, v: b.requests }))} format={(v) => `${fmtInt(v)} запр.`} />
-        </Reveal>
-        <Reveal className="panel">
-          <div className="panel-head"><h2>Время до первого токена</h2><Badge tone="accent">{fmtMs(totals.ttft_p50)}</Badge></div>
-          <AreaChart label="Время до первого токена" tone="info" points={buckets.map((b) => ({ t: b.t, v: b.ttft }))} format={fmtMs} />
-        </Reveal>
-        <Reveal className="panel">
-          <div className="panel-head"><h2>Кредиты</h2><Badge>{fmtNum(totals.credits, 3)}</Badge></div>
-          <AreaChart label="Кредиты в минуту" tone="warn" points={buckets.map((b) => ({ t: b.t, v: b.credits }))} format={(v) => fmtNum(v, 4)} />
-        </Reveal>
-        <Reveal className="panel">
-          <div className="panel-head"><h2>Модели</h2><Badge>{models.length}</Badge></div>
-          <Bars items={models} format={fmtInt} empty="Ходов за час не было" />
-        </Reveal>
-      </section>
-
-      <section className="split">
-        <Reveal className="panel live-feed">
+      <div className="ov-main">
+        <section className="panel chart-panel" aria-label="Расход кредитов">
           <div className="panel-head">
-            <h2><PulseDot tone={journal.status === 'live' ? 'success' : 'warn'} live={journal.status === 'live'} /> Прямо сейчас</h2>
-            <Button onClick={() => go('journal')}>Весь журнал</Button>
+            <h2>Расход кредитов</h2>
+            <ul className="legend">
+              <li><i className="lg-spend" />за каждые {span || '—'}</li>
+              <li><i className="lg-peak" />пик</li>
+              <li><i className="lg-average" />среднее по активным</li>
+            </ul>
           </div>
-          <ul className="feed">
-            <AnimatePresence initial={false}>
-              {recent.map((event) => {
-                const Icon = category(event.category).icon;
-                return (
-                  <motion.li key={event.seq} layout className={`feed-row level-${event.level}`}
-                    initial={{ opacity: 0, x: -24, height: 0 }} animate={{ opacity: 1, x: 0, height: 'auto' }}
-                    exit={{ opacity: 0, height: 0 }} transition={spring}>
-                    <span className="feed-icon"><Icon size={14} /></span>
-                    <span className="feed-msg">{event.message}</span>
-                    <time className="mono muted" title={fmtClock(event.ts)}>{fmtAgo(event.ts)}</time>
-                  </motion.li>
-                );
-              })}
-            </AnimatePresence>
-            {!recent.length && <li className="muted small">Событий пока нет — отправьте запрос в relay.</li>}
-          </ul>
-        </Reveal>
-        <Reveal className="panel connect">
-          <div className="panel-head"><h2>Подключение IDE</h2></div>
-          {[['OpenAI base URL', overview?.connection?.openai_base_url], ['Anthropic base URL', overview?.connection?.anthropic_base_url]].map(([label, value]) => (
-            <div className="connect-row" key={label}>
-              <span className="muted small">{label}</span>
-              <code>{value || '—'}</code>
-              {value && <CopyButton value={value} label={`Копировать ${label}`} />}
+          <SpendChart buckets={buckets} windowSec={windowSec} />
+        </section>
+        <div className="ov-side">
+          <section className="panel" aria-label="Модели">
+            <div className="panel-head">
+              <h2>Модели</h2>
+              <span className="panel-meta">ходов {fmtInt(totals.turns)} · инструментов {fmtInt(totals.tools)}</span>
             </div>
-          ))}
-          <div className="connect-row">
-            <span className="muted small">Модель по умолчанию</span>
-            <code>{overview?.models?.default || '—'}</code>
+            <RankedList items={models} empty="За окно ходов не было" />
+          </section>
+          <CacheFacts totals={totals} />
+        </div>
+      </div>
+
+      <section className="panel" aria-label="Кэш промпта">
+          <div className="panel-head">
+            <h2>Кэш промпта</h2>
+            <ul className="legend">
+              <li><i className="lg-read-line" />чтение</li>
+              <li><i className="lg-write-line" />запись</li>
+              <li><i className="lg-spike" />всплеск записи: кэш остыл и записан заново</li>
+            </ul>
           </div>
-          <p className="muted small">Ключ — тот же relay key: <code>Authorization: Bearer</code> или <code>x-api-key</code>.</p>
-          <div className="session-state">
-            <PulseDot tone={overview?.session?.error ? 'danger' : 'success'} live={!!overview?.session?.keepalive} />
-            <span>Сессия Retool: {overview?.session?.error ? overview.session.error : `продлена ${fmtAgo(overview?.session?.last_success_at)}`}</span>
-          </div>
-        </Reveal>
-      </section>
+          <CacheChart buckets={buckets} windowSec={windowSec} />
+        </section>
     </Page>
   );
 }
