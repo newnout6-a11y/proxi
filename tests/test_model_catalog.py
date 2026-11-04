@@ -51,13 +51,14 @@ def test_unverified_legacy_route_uses_explicit_provisional_limits(model, output)
     assert 'pending route verification' in entry['metadata_notes']
 
 
-def test_glm_reasoning_capability_does_not_invent_selectable_route_effort():
+def test_glm_reasoning_capability_uses_live_verified_retool_route_efforts():
     entry, _ = models.resolve('zai-org/GLM-5.3')
     assert (entry['context'], entry['max_output']) == (1000000, 128000)
-    assert entry['reasoning'] is True and entry['vision'] is False
-    assert entry['reasoning_effort_levels'] == []
-    assert entry['default_reasoning_effort'] is None
-    assert entry['reasoning_effort_control'] == 'provider-managed'
+    assert entry['reasoning'] is True and entry['vision'] is True
+    assert entry['reasoning_effort_levels'] == ['low', 'medium', 'high', 'max']
+    assert entry['default_reasoning_effort'] == 'medium'
+    assert entry['reasoning_effort_control'] == 'selectable'
+    assert entry['reasoning_effort_checked_at'] == '2026-11-04'
     assert entry['metadata_status'] == 'partial'
 
 
@@ -90,7 +91,7 @@ def test_codex_uses_the_same_recommended_default_as_the_relay(model, default):
 def test_unrouted_unverified_models_do_not_acquire_verified_metadata_by_family():
     entry, _ = models.resolve('zai-org/GLM-5.3-Flash')
     assert entry['metadata_status'] == 'provisional'
-    assert 'not independently verified' in entry['metadata_notes']
+    assert 'not stress-tested' in entry['metadata_notes']
     assert models.resolve('gemini-2.5-pro')[0]['metadata_status'] == 'provisional'
     assert models.resolve('gpt-5-mini')[0]['metadata_status'] == 'partial'
 

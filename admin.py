@@ -255,17 +255,9 @@ class Admin:
                 "writable": bool(self.cfg.get("_config_path"))}
 
     def _routable(self, entry):
-        # Mirror proxy._model_routable so the admin catalog cannot disagree with
-        # /v1/models (previously: empty configuration rendered every model as
-        # "no resource", and show_unrouted_models / the default model were ignored).
-        if self.cfg.get("show_unrouted_models"):
-            return True
-        if not any(self.cfg.get(key) for key in models.PROVIDER_RESOURCE_KEY.values()):
-            return True  # calls would fail with a clear 503; still show the catalog
-        if entry["id"] == self.cfg.get("model"):
-            return True  # the configured default stays visible
-        key = models.PROVIDER_RESOURCE_KEY.get(entry["provider"])
-        return bool(key and self.cfg.get(key))
+        runtime = getattr(self, 'runtime', None)
+        backends = getattr(getattr(runtime, 'accounts', None), 'backends', None)
+        return models.catalog_routable(entry, self.cfg, backends)
 
     def _models(self):
         return {"data": [{**entry, "routable": self._routable(entry), "available_verified": None}

@@ -4,11 +4,14 @@ Effort capabilities describe the Retool route rather than the provider-wide unio
 """
 from apierr import ApiError, bad_request, not_found, service_unavailable
 
-# Accepted reasoning effort values per provider (from the same bundle).
+# Accepted reasoning effort values per Retool route (bundle plus dated live probes).
 EFFORTS_BY_PROVIDER = {
     "openai": ("minimal", "low", "medium", "high", "xhigh", "max", "none"),
     "anthropic": ("low", "medium", "high", "max"),
     "google": ("low", "medium", "high"),
+    # Both GLM routes accepted and answered low/medium/high/max on 2026-11-04.
+    # This is Retool's control surface; public Z.ai has a narrower native list.
+    "retool-fast": ("low", "medium", "high", "max"),
 }
 
 # Per-model route capabilities. Live 2026-11-03 supersedes the bundle's GPT-6
@@ -76,8 +79,8 @@ CATALOG = [
     {"id": "gemini-3.1-flash-lite-preview", "label": "Gemini 3.1 Flash-Lite (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
-    {"id": "zai-org/GLM-5.3", "label": "Retool Power", "provider": "retool-fast", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": False},
-    {"id": "zai-org/GLM-5.3-Flash", "label": "Retool Mini", "provider": "retool-fast", "context": 984576, "max_output": 32768, "reasoning": False, "tools": True, "vision": True},
+    {"id": "zai-org/GLM-5.3", "label": "Retool Power (GLM 5.3)", "provider": "retool-fast", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "zai-org/GLM-5.3-Flash", "label": "Retool Mini (GLM 5.3 Flash)", "provider": "retool-fast", "context": 984576, "max_output": 32768, "reasoning": True, "tools": True, "vision": True},
 ]
 
 _BY_ID = {m['id']: m for m in CATALOG}
@@ -143,10 +146,55 @@ for _name in ('gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'):
         _entry['metadata_status'] = 'partial'
         _entry['metadata_notes'] += ' This account also rejected max as model unavailable; availability is not verified.'
 
+for _name in ('zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash'):
+    _entry = _BY_ID[_name]
+    _entry['reasoning_effort_checked_at'] = '2026-11-04'
+    _entry['metadata_notes'] = ('Live Retool route accepted low/medium/high/max and emitted reasoning on '
+                                '2026-11-04. This does not establish distinct provider budget values. '
+                                'Retool image inputs passed two randomized quadrant-color tests per route; '
+                                'this does not establish the underlying provider vision implementation. '
+                                'Maximum context/output sizes were not stress-tested.')
+    _entry['metadata_source'].append('https://docs.z.ai/guides/capabilities/thinking')
+
 _BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))
 
 def catalog():
     return CATALOG
+
+
+def catalog_routable(entry, cfg, backends=None):
+    """Discovery uses enabled tenants' resources, as the actual pool does.
+
+    Resource configuration is separate from model availability or account health:
+    a temporarily empty balance does not erase an installed model's metadata.
+    """
+    if cfg.get('show_unrouted_models'):
+        return True
+    if backends is None:
+        configs = [item for item in (cfg.get('accounts') or [cfg]) if item.get('enabled', True)]
+    else:
+        configs = [backend.cfg for backend in backends if backend.cfg.get('enabled', True)]
+    if not configs:
+        return False
+    if not any(item.get(key) for item in configs for key in PROVIDER_RESOURCE_KEY.values()):
+        return True  # Unconfigured setup still exposes metadata; requests explain missing resources.
+    key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
+    return bool(key and any(item.get(key) for item in configs))
+
+
+def desktop_metadata(entry, entries):
+    """Additional Anthropic Desktop discovery fields; IDs stay canonical."""
+    result = {'display_name': entry['label'], 'description': 'Retool relay: ' + entry['label'],
+              'max_input_tokens': entry['context'], 'supports_1m': entry['context'] >= 1000000}
+    if entry['provider'] == 'anthropic':
+        family = entry['id'].removeprefix('claude-').split('-', 1)[0]
+        if family not in {'opus', 'sonnet', 'haiku'}:
+            return result  # Desktop's documented tier enum does not establish Fable.
+        result['anthropic_family_tier'] = family
+        first = next(item['id'] for item in entries
+                     if item['provider'] == 'anthropic' and item['id'].startswith('claude-' + family + '-'))
+        result['is_family_default'] = entry['id'] == first
+    return result
 
 
 def codex_catalog(entries=None):

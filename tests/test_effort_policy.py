@@ -55,8 +55,8 @@ def test_supported_effort_is_preserved(effort):
                                          ("responses", "/v1/responses"),
                                          ("anthropic", "/v1/messages")])
 @pytest.mark.parametrize("model,configured,expected", [
-    ("zai-org/GLM-5.3", "auto", "provider"),
-    ("zai-org/GLM-5.3", "max", "provider"),
+    ("zai-org/GLM-5.3", "auto", "medium"),
+    ("zai-org/GLM-5.3", "max", "max"),
     ("gpt-5", "max", "high"),
     ("gpt-5", "MAX", "high"),
     ("gemini-3.5-flash", "max", "high"),
@@ -73,8 +73,8 @@ def test_implicit_gateway_default_adapts_to_the_requested_model(relay, capsys, d
 
 @pytest.mark.parametrize("dialect", ["chat", "responses", "anthropic"])
 @pytest.mark.parametrize("model,configured,expected", [
-    ("zai-org/GLM-5.3", "auto", None),
-    ("zai-org/GLM-5.3", "max", None),
+    ("zai-org/GLM-5.3", "auto", "medium"),
+    ("zai-org/GLM-5.3", "max", "max"),
     ("gpt-5", "max", "high"),
     ("gpt-5", "MAX", "high"),
     ("gemini-3.5-flash", "max", "high"),
@@ -100,7 +100,7 @@ def test_runner_sends_the_same_model_aware_default(tmp_path, monkeypatch, dialec
     assert begun["data"]["effective_effort"] == expected
 
 
-@pytest.mark.parametrize("model,explicit", [("zai-org/GLM-5.3", "medium"),
+@pytest.mark.parametrize("model,explicit", [("zai-org/GLM-5.3", "xhigh"),
                                            ("gemini-3.5-flash", "max"),
                                            ("gpt-5", "max")])
 def test_implicit_fallback_does_not_weaken_explicit_effort_validation(relay, model, explicit):
