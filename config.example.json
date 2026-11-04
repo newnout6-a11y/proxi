@@ -33,6 +33,7 @@
   "min_account_balance": 20,
   "account_balance_interval": 300,
   "account_refresh_parallel": 3,
+  "upstream_error_max_dumps": 50,
   "model": "claude-opus-5-5",
   "provider_resource_name": "<YOUR-ANTHROPIC-PROVIDER-RESOURCE-UUID>",
   "openai_provider_resource_name": "<YOUR-OPENAI-PROVIDER-RESOURCE-UUID>",

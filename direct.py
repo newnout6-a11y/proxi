@@ -9,7 +9,9 @@ import contextvars
 import hashlib
 import json
 import pathlib
+import re
 import socket
+import threading
 import time
 import uuid
 import urllib.error
@@ -715,7 +717,10 @@ async def _keepwarm(session, cfg):
                 due = max(next_turn_ping, retry_at)
             else:
                 due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
-            if not body or now < due:
+            if not body:
+                await asyncio.sleep(0.95)
+                continue
+            if now < due:
                 await asyncio.sleep(min(0.95, max(0.05, due - now)))
                 continue
             # The scheduler spans turns: bind the owner of this exact body,
@@ -847,23 +852,72 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
 
     A 400 from the route validator ("Invalid request format") carries no field
     detail, and client history only grows — every later retry re-sends the same
-    poison. The dump is local-only and holds the user's own conversation text.
+    poison. The dump is local-only and holds the user's own conversation text,
+    so a repeated identical body reuses its saved set and only the newest
+    `upstream_error_max_dumps` sets are kept.
     """
     try:
-        folder = pathlib.Path((cfg or {}).get("upstream_error_dir") or "logs/upstream-400")
+        cfg = cfg or {}
+        folder = pathlib.Path(cfg.get("upstream_error_dir") or "logs/upstream-400")
         folder.mkdir(parents=True, exist_ok=True)
-        request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
-        stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
-        (folder / ("%s-body.json" % stamp)).write_bytes(payload)
-        (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
-        metadata = {**client_context.current(), "request_id": request_id,
-                    "upstream_status": status, "diagnostic_id": stamp,
-                    "body_sha256": hashlib.sha256(payload).hexdigest()}
-        (folder / ("%s-metadata.json" % stamp)).write_text(
-            json.dumps(journal.scrub(metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        key = (str(folder.resolve()), digest)
+        with _DUMP_LOCK:
+            known = _DUMP_RECENT.get(key)
+            if known and (folder / ("%s-body.json" % known)).exists():
+                print("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known), flush=True)
+                return known
+            request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
+            stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
+            (folder / ("%s-body.json" % stamp)).write_bytes(payload)
+            (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
+            metadata = {**client_context.current(), "request_id": request_id,
+                        "upstream_status": status, "diagnostic_id": stamp,
+                        "body_sha256": digest}
+            (folder / ("%s-metadata.json" % stamp)).write_text(
+                json.dumps(journal.scrub(metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+            _DUMP_RECENT.pop(key, None)
+            _DUMP_RECENT[key] = stamp
+            while len(_DUMP_RECENT) > 256:
+                del _DUMP_RECENT[next(iter(_DUMP_RECENT))]
+            _prune_dumps(folder, cfg.get("upstream_error_max_dumps", 50), stamp)
         print("[debug] upstream %s diagnostic: %s" % (status, stamp), flush=True)
         return stamp
     except Exception:  # noqa: BLE001 - diagnostics must never break the turn
+        pass
+
+
+_DUMP_NAME = re.compile(r"^(\d{8}-\d{6}-[^\W_]*-[0-9a-f]{12})-(?:body\.json|error\.txt|metadata\.json)$")
+_DUMP_RECENT = {}
+_DUMP_LOCK = threading.Lock()
+
+
+def _prune_dumps(folder, keep, spare):
+    """Delete the oldest dump sets (all files of a stem together) beyond `keep`.
+
+    Only names matching the dump pattern are ever touched.
+    """
+    try:
+        keep = int(keep)
+        if keep <= 0:
+            return
+        sets = {}
+        for entry in folder.iterdir():
+            match = _DUMP_NAME.match(entry.name)
+            if match and entry.is_file():
+                sets.setdefault(match.group(1), []).append(entry)
+        excess = len(sets) - keep
+        if excess <= 0:
+            return
+        oldest = sorted((stem for stem in sets if stem != spare),
+                        key=lambda stem: (max(path.stat().st_mtime_ns for path in sets[stem]), stem))
+        for stem in oldest[:excess]:
+            for path in sets[stem]:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 - retention is best effort
         pass
 
 
@@ -876,12 +930,13 @@ def _dump_empty_once(payload, flags, cfg, session, model=None):
     kind = (client_context.current().get("request_purpose") or "generation", model)
     if kind in _EMPTY_DUMPED:
         return
-    _EMPTY_DUMPED.add(kind)
     detail = json.dumps({"reason": "empty turn: end_of_stream without content blocks",
                          "usage": flags.get("last_usage")}, ensure_ascii=False)
     stamp = _dump_rejected_body(payload, detail, cfg=cfg, status="empty",
                                 request_id=client_context.current().get("request_id")
                                 or getattr(session, "_request_tag", None))
+    if stamp is not None:
+        _EMPTY_DUMPED.add(kind)
     journal.emit("upstream.empty_turn", "Пустой ответ upstream сохранён для диагностики", "warn",
                  diagnostic_id=stamp)
 

@@ -17,6 +17,23 @@ test("Unicode titles, renames and parent links are labels only", async () => {
   assert.equal(decodeURIComponent(output.headers["X-Proxi-Chat-Title"]), title)
 })
 
+test("A title cut inside an emoji keeps the whole title and the parent link", async () => {
+  const title = "x".repeat(239) + "😀" + "tail"
+  const hooks = await ProxiSessionLabels({ client: { session: { get: async () => ({ data: { title, parentID: "ses_parent" } }) } } })
+  const output = { headers: {} }
+  await hooks["chat.headers"]({ model: { providerID: "retool-relay" }, sessionID: "ses_child", agent: "build" }, output)
+  assert.equal(decodeURIComponent(output.headers["X-Proxi-Chat-Title"]), "x".repeat(239) + "😀")
+  assert.equal(output.headers["X-Proxi-Parent-Session-Id"], "ses_parent")
+})
+
+test("An unencodable title does not lose the parent link", async () => {
+  const hooks = await ProxiSessionLabels({ client: { session: { get: async () => ({ data: { title: "ok\ud800", parentID: "ses_parent" } }) } } })
+  const output = { headers: {} }
+  await hooks["chat.headers"]({ model: { providerID: "retool-relay" }, sessionID: "ses_child", agent: "build" }, output)
+  assert.equal(output.headers["X-Proxi-Parent-Session-Id"], "ses_parent")
+  assert.equal(output.headers["X-Proxi-Chat-Title"], undefined)
+})
+
 test("Other providers are untouched; failed lookups keep request working", async () => {
   const hooks = await ProxiSessionLabels({ client: { session: { get: async () => { throw Error("offline") } } } })
   const output = { headers: {} }

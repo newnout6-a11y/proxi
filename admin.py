@@ -241,7 +241,10 @@ class Admin:
             for refresher_lock in {id(r._lock): r._lock for r in
                                    (getattr(b, "refresher", None) for b in backends) if r}.values():
                 locks.enter_context(refresher_lock)
-            locks.enter_context(config.storage_lock(path))
+            try:
+                locks.enter_context(config.storage_lock(path))
+            except TimeoutError:
+                raise apierr.service_unavailable("Relay settings are busy: configuration storage is locked")
             saved = self._saved()
             desired = self._settings(saved)["settings"]
             candidate = {**desired, **changes}
