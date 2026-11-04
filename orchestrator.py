@@ -138,7 +138,7 @@ class _FailoverOut:
         if event.get("type") == "error":
             self.error = event["error"]
             return
-        if event.get("type") not in ("credits", "usage_start"):
+        if event.get("type") not in ("credits", "usage", "usage_start"):
             self.started = True
         self.out.put(event)
 
@@ -312,6 +312,18 @@ class TurnRunner:
         if mode == 'replace':
             return policy
         return '\n\n'.join(part for part in (instructions, policy) if part)
+
+    @staticmethod
+    def _usage_update(holder, event):
+        """Keep the attempt snapshot; journal additive deltas exactly once."""
+        snapshot = holder.setdefault('_attempt_usage', {})
+        delta = {}
+        for key in ('input_tokens', 'output_tokens', 'cache_read', 'cache_write'):
+            value = credits.token_counter((event.get('usage') or {}).get(key))
+            if value is not None:
+                delta[key] = value - snapshot.get(key, 0)
+                snapshot[key] = value
+        return snapshot, delta
 
     @staticmethod
     def _tool_prompt(parsed):
@@ -710,6 +722,8 @@ class TurnRunner:
                             elif event["type"] in ("thinking_heartbeat", "usage_start"):
                                 if event["type"] == "usage_start":
                                     think_started = None
+                                    holder['_attempt_usage'] = {}
+                                    holder['_attempt_credited'] = False
                                 out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 if not event.get("partial"):
@@ -729,6 +743,17 @@ class TurnRunner:
                                         args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
                                 out.put({key: value for key, value in event.items() if key != "partial"}
                                         | {"tool_type": definition.get("x-client-type", "function")})
+                            elif event['type'] == 'usage':
+                                usage, delta = self._usage_update(holder, event)
+                                breakdown = credits.cost_breakdown(usage)
+                                known = holder.get('_attempt_credited') or event.get('credits_reported')
+                                log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
+                                                      'Токены получены; стоимость upstream не сообщена'),
+                                    'info' if known else 'warn', credits=None, **delta,
+                                    **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
+                                if session is not None:
+                                    acquired._last_prefix_tokens = breakdown['prompt_tokens']
+                                out.put(event)
                             elif event["type"] == "credits":
                                 # Each upstream attempt (retry, exec follow-up) is billed
                                 # separately: a per-turn dedup key dropped all but the first.
@@ -737,13 +762,15 @@ class TurnRunner:
                                 account_credits.record_turn(
                                     turn_id if credit_events == 1 else "%s#%d" % (turn_id, credit_events),
                                     event["value"])
-                                usage = event.get("usage") or {}
+                                holder['_attempt_credited'] = True
+                                usage, delta = self._usage_update(holder, event)
                                 breakdown = credits.cost_breakdown(usage)
                                 hit = breakdown["cache_hit_ratio"]
                                 log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
                                     event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
                                     "%d%%" % round(hit * 100) if hit is not None else "—"),
-                                    "info", credits=event["value"], **usage, **breakdown)
+                                    "info", credits=event["value"], **delta,
+                                    **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
                                 if session is not None:
                                     # Write through the lease: SessionLease only proxies
                                     # reads, so keepwarm (which holds the real session)

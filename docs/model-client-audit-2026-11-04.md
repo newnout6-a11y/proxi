@@ -220,3 +220,42 @@ Final stage 3 extension full validation: **1664 passed in 214.04 seconds** using
 the full Python command above. Independent final scoped run: **253 passed in
 6.54 seconds**, plus eight direct boundary probes including three commands in
 sequence. `git diff --check`: clean. No unresolved stage 3 findings remain.
+
+## Stage 4A: usage fidelity
+
+Provider-style `reasoning_tokens` is no longer inferred from visible summaries
+or an output-minus-character estimate. Only explicitly reported nonnegative
+integer counters, bounded by reported inclusive output when present, are used;
+actual zero is preserved. Current Retool captures normally do not provide this
+optional counter. Output totals remain authoritative.
+
+Token metadata without a price now reaches every adapter as usage, rather than
+being dropped or converted into a free zero-credit request. API cost fields
+separate `credits_used` (null when incomplete), `reported_credits_used` (known
+subtotal) and `credits_complete`. Anthropic terminal streaming usage preserves
+the same price fields as non-stream payloads. A possibly billed truncated/error
+attempt remains unknown even after confirmed account failover succeeds.
+
+Within one HTTP attempt, repeated cumulative cost snapshots debit only their
+positive increases; different HTTP attempts remain separately billable. Partial
+token snapshots merge fields that are actually present and preserve actual zero.
+Attempt boundaries clear the previous token context. Journal token updates are
+additive deltas with a separate full `usage_snapshot`, preventing duplicate
+counts in metrics and the admin turn aggregation. Prefix sizing uses the merged
+snapshot; later token-only reports do not falsely erase a previously known price.
+
+The first focused extensions reproduced eleven failures for repeated prices,
+partial fields and Anthropic streaming parity. Independent review then found
+two additional gaps: journal token duplication and unknown truncated attempts
+lost during failover. Six new regressions cover those cases across all dialects.
+The post-correction scoped suite passed **243 tests in 15.18 seconds**:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests/test_usage_truth.py tests/test_usage_consistency.py tests/test_console_log.py tests/test_cache_observability.py tests/test_keepwarm_accounting.py tests/test_native_history.py tests/test_review_fixes_pr19.py tests/test_account_dispatcher.py -o addopts= -q --tb=short
+```
+
+Final full Python command above: **1716 passed in 215.45 seconds**. Independent
+expanded scoped review: **319 passed in 18.47 seconds**, plus nine no-charge,
+partial/corrected-snapshot, retry, failure and cleanup probes. Both follow-up
+findings are closed. `git diff --check`: clean. Stage 4B generation controls
+remain the next substage; no design changes are included.

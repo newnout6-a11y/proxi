@@ -187,7 +187,7 @@ def test_cache_rendering_does_not_change_credit_events(capsys, monkeypatch):
 
     events = asyncio.run(run())
     assert events == [{"type": "credits", "value": 0.25, "usage": {
-        "input_tokens": 4, "output_tokens": None, "cache_read": 0, "cache_write": 190000}}]
+        "input_tokens": 4, "cache_read": 0, "cache_write": 190000}}]
     assert "write=190,000" in capsys.readouterr().out
 
 

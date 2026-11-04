@@ -31,7 +31,7 @@ from upstream_diagnostics import AttemptTrace, prune_diagnostics
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
 # Billing and keep-alive events describe the attempt, not its content: never held back.
-_LIVE_EVENTS = frozenset({"credits", "thinking_heartbeat", "end"})
+_LIVE_EVENTS = frozenset({"credits", "usage", "thinking_heartbeat", "end"})
 _EMPTY_DUMPED = set()  # (request_purpose, model) pairs whose empty answer is already saved this run
 
 
@@ -1219,12 +1219,14 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         held.append(event)
             except BaseException as exc:
                 failure = exc
-                raise
+                if not isinstance(exc, Exception):
+                    raise
             finally:
                 current_trace = holder.get("trace")
                 possibly_billed = (current_trace is not None and
                                    (current_trace.http_status is None or 200 <= current_trace.http_status < 300))
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
+                    flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
                     if mark_unknown:
                         mark_unknown()
@@ -1242,10 +1244,19 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     trace.finish(outcome)
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)
+            if flags.get('cost_unknown') and not flags.get('usage_seen'):
+                # Include possibly billed failures/truncations before failover.
+                yield {'type': 'usage', 'usage': {}}
+            if failure is not None:
+                raise failure
             saw_end = bool(flags.get("end"))
             if is_cancelled():
                 yield {"type": "end", "reason": "cancelled"}
                 return
+            if saw_end and not flags.get('usage_seen') and not flags.get('cost_unknown'):
+                # An empty/no-telemetry attempt can still have been billed. Keep
+                # its unknown price visible when a later retry reports a cost.
+                yield {'type': 'usage', 'usage': {}}
             if not usable and saw_end:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if (usable or not saw_end or service_request or not budget.remaining
@@ -1450,18 +1461,36 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             if usage:
                 flags["usage_seen"] = True
-                flags["last_usage"] = usage
+                flags.setdefault("last_usage", {}).update(usage)
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
                                   (" " + client_context.label() if client_context.label() else ""))
             credits_value = console_log.number(usage.get("creditsUsed"))
+            normalized = {target: usage[source] for source, target in (
+                ('inputTokens', 'input_tokens'), ('outputTokens', 'output_tokens'),
+                ('promptTokensReadFromCache', 'cache_read'), ('promptTokensWrittenToCache', 'cache_write'))
+                if source in usage}
+            # Preserve a genuine provider counter if a route explicitly supplies
+            # it; current Retool captures normally omit this optional information.
+            reported_reasoning = usage.get('reasoningTokens')
+            details = usage.get('output_tokens_details')
+            if reported_reasoning is None and isinstance(details, dict):
+                reported_reasoning = details.get('reasoning_tokens', details.get('thinking_tokens'))
+            if reported_reasoning is not None:
+                normalized['reasoning_tokens'] = reported_reasoning
             if credits_value is not None:
+                # Metadata reports cumulative snapshots for ONE HTTP attempt.
+                # Emit only new cost, keeping distinct retries separately billed.
+                previous = flags.get('credits_snapshot')
+                flags['credits_snapshot'] = max(previous or 0, credits_value)
+                delta = credits_value - (previous or 0)
                 flags["credits_reported"] = True
-                yield {"type": "credits", "value": credits_value,
-                       "usage": {"input_tokens": usage.get("inputTokens"),
-                                 "output_tokens": usage.get("outputTokens"),
-                                 "cache_read": usage.get("promptTokensReadFromCache"),
-                                 "cache_write": usage.get("promptTokensWrittenToCache")}}
+                if previous is None or delta > 0:
+                    yield {"type": "credits", "value": max(0, delta), "usage": normalized}
+                elif normalized:
+                    yield {"type": "usage", "usage": normalized, "credits_reported": True}
+            elif usage:
+                yield {"type": "usage", "usage": normalized}
         elif kind == "error":
             raise _error_from_event(event)
 
