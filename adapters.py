@@ -475,7 +475,7 @@ class ResponsesAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
-        reasoning = self._reasoning_usage()
+        reasoning_details = self._reasoning_details()
         if not self._items:
             self._ensure_item("message", self.item_id)
         status = "incomplete" if reason == "timeout" else "completed"
@@ -487,9 +487,12 @@ class ResponsesAdapter(_Base):
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "total_tokens": prompt + completion,
                           "input_token_details": {"cached_tokens": self.cache_read},
-                          "output_token_details": self._reasoning_details(),
                           "input_tokens_details": {"cached_tokens": self.cache_read},
-                          "output_tokens_details": self._reasoning_details(),
+                          # The details object is optional, but reasoning_tokens
+                          # is required when it exists in strict Responses clients.
+                          # Omit unknown details instead of {} or an invented zero.
+                          **({"output_token_details": reasoning_details,
+                              "output_tokens_details": reasoning_details} if reasoning_details else {}),
                           **self._price_usage(), "estimated": True}}
 
 

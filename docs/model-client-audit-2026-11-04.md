@@ -393,3 +393,64 @@ Results: **1850 Python tests passed in 216.13 seconds**, **4 Node tests passed**
 and no whitespace errors. Stage 5 code received the independent review above;
 stage 6 adds acceptance evidence without further source changes. Design/admin
 UI changes remain deferred.
+
+### Stage 6 follow-up: actual installed Codex and parser regression
+
+A fresh installed Codex CLI 0.164.0 run against an isolated current-source relay
+exposed a regression missed by the contract suite: unknown reasoning usage was
+serialized as `output_tokens_details: {}`. Codex rejected ResponseCompleted with
+`missing field reasoning_tokens`, then issued five additional sampling requests.
+The failure, rather than only its eventual fix, is retained in private evidence.
+
+An offline four-shape probe using the real installed Codex parser showed that
+an empty details object fails, while omission, null, and a complete known-zero
+object each finish with one HTTP request. The adapter now omits the optional
+details object when the count is unknown or invalid; actual zero and positive
+counts retain the complete object. It does not manufacture a zero reasoning
+count to satisfy the client. Nine new regression cases failed before the fix.
+
+The same run exposed a second issue: the client sent `strict: false` for
+`exec_command` with optional non-nullable booleans, but the relay sent
+`strict: true`. The provider returned optional arguments as null, which Codex
+could not parse. Explicit client strict mode is now preserved; the previous
+default remains when the client does not specify it. Three cross-dialect
+regressions failed before correction, while strict-true and default cases passed.
+
+The reproducible installed-parser check is:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/probe_codex_responses.py
+```
+
+Unknown, zero and seven reasoning tokens each completed with exit code 0,
+exactly one local request, and no parse error. The probe uses no provider
+inference, emits no tool calls and does not write provider/auth configuration.
+
+A real installed Codex run then read two synthetic Python files, patched the
+implementation and ran the three existing unittest cases successfully. A
+separate verifier repeated those tests successfully. It completed one turn
+through five upstream POSTs in **13.094 seconds**, with **0.47460 reported
+credits**, no ResponseCompleted errors and no null-boolean errors. The file
+reads, patch and test result appear in the actual CLI output.
+The relay account configuration was byte-identical before and after the probe.
+
+The fixture run used an explicit isolated provider, temporary local endpoint,
+user-config exclusion and a fixture-only task; it did not change the user's
+active Codex provider. The initial workspace-write attempt separately hit the
+local command policy; the successful synthetic execution run explicitly used
+the user-authorized unsandboxed CLI mode. Plugin-catalog authentication and
+PowerShell shell-snapshot warnings remain client warnings, not relay failures.
+The production relay on 8787 was left running without a restart.
+
+Independent review: **179 tests passed in 10.16 seconds**:
+
+```powershell
+python -B -m pytest -p no:cacheprovider tests/test_responses_usage_contract.py tests/test_tool_strict_mode.py tests/test_codex_probe.py tests/test_usage_truth.py tests/test_usage_consistency.py tests/test_responses_items.py tests/test_native_tools.py tests/test_direct_transport.py tests/test_tool_arg_streaming.py
+```
+
+The full Python suite command above subsequently passed **1881 tests in 210.07
+seconds**. Private evidence: `stage6-codex-live` (failed reproduction),
+`codex-usage-shapes`, `codex-parser-final.json`, `stage6-codex-live-fixed` and
+`stage6-codex-live-strict`, all under `.agents/model-audit-20261104/`.
+Claude Desktop GUI acceptance and the remaining related-client inventory are
+still separate requirements; a Codex CLI pass does not establish those.

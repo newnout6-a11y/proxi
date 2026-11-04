@@ -207,7 +207,7 @@ def tools_to_retool(tools):
             params[name] = _param_schema(properties[name], name in required)
         converted.append({"name": function["name"],
                           "description": function.get("description") or "",
-                          "params": params, "strict": True})
+                          "params": params, "strict": function.get("strict", True)})
     return converted
 
 

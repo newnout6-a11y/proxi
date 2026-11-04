@@ -10,7 +10,7 @@ from test_usage_consistency import Writer, parsed, stream_usages
 
 
 def details(dialect, usage):
-    return usage['completion_tokens_details' if dialect == 'chat' else 'output_tokens_details']
+    return usage.get('completion_tokens_details' if dialect == 'chat' else 'output_tokens_details', {})
 
 
 @pytest.mark.parametrize('dialect', ['chat', 'responses'])

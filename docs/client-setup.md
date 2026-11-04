@@ -1,5 +1,10 @@
 # Coding clients
 
+Current route availability and installed-client evidence are recorded in
+[the model/client audit](model-client-audit-2026-11-04.md). A previous client
+setup or historical benchmark below does not establish that today's installed
+profile contains the same provider or that an old model/effort is still accepted.
+
 ## OpenCode
 
 OpenCode Desktop and CLI configure custom providers via `~/.config/opencode/opencode.jsonc` (or project-level `opencode.json`).
@@ -36,8 +41,8 @@ Example provider configuration with custom reasoning effort variants:
             "max": { "name": "Max", "reasoningEffort": "max", "settings": { "reasoningEffort": "max" } }
           }
         },
-        "gpt-6.1": {
-          "name": "GPT 6.1",
+        "gpt-6.1-sol": {
+          "name": "GPT 6.1 Sol",
           "limit": {
             "context": 1050000,
             "output": 128000
@@ -49,7 +54,6 @@ Example provider configuration with custom reasoning effort variants:
             "low": { "name": "Low", "reasoningEffort": "low", "settings": { "reasoningEffort": "low" } },
             "medium": { "name": "Medium", "reasoningEffort": "medium", "settings": { "reasoningEffort": "medium" } },
             "high": { "name": "High", "reasoningEffort": "high", "settings": { "reasoningEffort": "high" } },
-            "xhigh": { "name": "Extra High", "reasoningEffort": "xhigh", "settings": { "reasoningEffort": "xhigh" } },
             "max": { "name": "Max", "reasoningEffort": "max", "settings": { "reasoningEffort": "max" } }
           }
         }
@@ -63,22 +67,29 @@ Example provider configuration with custom reasoning effort variants:
 > [!NOTE]
 > OpenCode requires the `variants` field to be a dictionary/object mapping variant IDs to their configuration (`{ "id": { ... } }`). Passing an array (`[ ... ]`) causes schema validation failure and skips loading the provider.
 
+For an existing relay provider, `scripts/sync_opencode_catalog.py` builds the
+canonical catalog from the enabled account resources. Preview with `--output`
+first; writing requires `--write --backup-dir`. The current configured pool
+publishes 27 verified routes. Its effort lists, including GPT-6's lack of xhigh,
+come from the dated route checks rather than the native provider's larger list.
+
 ## DeepSeek Harness
 
-The Desktop shortcut `DeepSeek Harness.lnk` launches the installed
-`@deepseek-ai/dsh` Web UI. Its multi-provider adapter is `llm-pi-ai`; use an
+The earlier installed `DeepSeek Harness.lnk` setup launched the
+`@deepseek-ai/dsh` Web UI. Its multi-provider adapter was `llm-pi-ai`; use an
 OpenAI Chat Completions route for this relay. The same relay key also works
 with the OpenAI Responses and Anthropic Messages endpoints.
 
-The local setup adds `llm-pi-ai.providers.retool` to
+That local setup added `llm-pi-ai.providers.retool` to
 `%USERPROFILE%\.dsh\settings.yaml` and the credential reference
 `RETOOL_RELAY_API_KEY` to `%USERPROFILE%\.dsh\.credentials.yaml`.
 These files are outside this repository. Existing providers, comments, and the
 selected provider are preserved. Both documents are watched, so the running
 Harness picks up the added route without restarting existing chats.
 
-The installed route contains all 29 currently routed models. This abbreviated
-example shows the exact provider fields and two model configurations:
+This abbreviated configuration shows two models. Generate the complete list
+and valid efforts from the current `/v1/models` response; this example is not
+a claim about today's installed Harness profile or catalog size:
 
 ```yaml
 llm-pi-ai:
@@ -108,7 +119,6 @@ llm-pi-ai:
             low: low
             medium: medium
             high: high
-            xhigh: xhigh
             max: max
         - id: claude-opus-5-5
           name: Claude Opus 5.5
@@ -151,8 +161,8 @@ upstream response supplied no visible thinking text.
 
 ### Keep the upstream conversation warm
 
-The relay needs the client's stable dialogue identity to reuse a thread and
-WebSocket. It accepts `x-session-affinity`, `x-session-id`, `x-opencode-session`,
+The direct transport uses the client's stable dialogue identity to reuse its
+native history and cache context. It accepts `x-session-affinity`, `x-session-id`, `x-opencode-session`,
 or explicit request fields `conversation`, `conversation_id`, and `session_id`.
 Parent agents and subagents must use different identities. A single static
 provider-wide header would mix their conversations and must not be used.
@@ -162,8 +172,8 @@ installed 2.1.310 does not include its internal agent ID in the normal metadata
 identity. Recognizing that metadata fixes the main conversation; it does not
 prove separate warm channels for every in-process child. Changed client
 histories still rotate their upstream context, and distinct supplied session
-IDs are isolated. Stateless direct inference would avoid this conversation-ID
-dependency; it is not enabled by the current agent transport fixes.
+IDs are isolated. Direct inference is the current transport; that does not
+eliminate the stable identity needed for signed tool-history continuation.
 
 Claude Code 2.1.310 supplies its current `session_id` inside the JSON string
 `metadata.user_id`. The relay recognizes that explicit session identity too;
@@ -185,21 +195,18 @@ Keep the SDK cache retention at its default or `short`: `none` also suppresses
 session affinity. Restart the Harness host after updating its adapter bundle;
 settings-file watching alone cannot replace already loaded JavaScript.
 
-The relay keeps receiving control frames while a persistent socket is idle,
-answers upstream ping and acknowledgement requests, and uses one ordered
-receiver. Its application buffer is bounded by `max_frame_bytes` in total and
-256 frames; overflow is an explicit upstream error. A dead idle socket is
-reconnected before the next prompt. This does not implement the native web's
-proactive sandbox-token refresh; disconnected sockets still reconnect normally.
+The direct route replays the accepted raw assistant blocks, including opaque
+thinking signatures, when client tool results strictly continue the same
+history. It keeps stable cache markers and a provider cache key. Changed
+instructions, tools, model or resource invalidate the old signed prefix;
+unchanged output-only verbosity does not. Unknown requests keep independent
+context. Cache lifetime and a hit still require upstream telemetry.
 
-For native client tools, a successful conversation caches the exact normalized
-client history and instruction/tool fingerprint in its upstream session. A
-strict append sends the new history suffix. Edited or compacted history and
-changed instructions/tools start a fresh upstream thread with the complete
-current context. Anonymous requests retain independent full-context threads.
-Message fingerprints use the same model-visible rendering as the bridge:
-moving SDK `cache_control` markers is not a content edit. Actual changes to
-text, tool calls/results and identifiers still invalidate the cached prefix.
+### Historical agent/WebSocket measurements — 2026-10-29
+
+The measurements below describe the former agent/WebSocket transport and an
+earlier installed Harness adapter. They do not describe the current direct
+request path or establish its present latency.
 
 A bounded live Opus 5.5 `max` comparison on 2026-10-29 used two short plain
 prompts on the same thread/socket. Cold setup took 0.589s to create the thread,
