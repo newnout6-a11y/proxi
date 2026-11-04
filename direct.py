@@ -11,6 +11,7 @@ import http.client
 import json
 import pathlib
 import socket
+import threading
 import time
 import uuid
 import urllib.error
@@ -23,10 +24,20 @@ import client_context
 import console_log
 import models as model_catalog
 from upstream_attempts import AttemptBudget
-from upstream_diagnostics import AttemptTrace
+from upstream_diagnostics import AttemptTrace, prune_diagnostics
 
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
+# Billing and keep-alive events describe the attempt, not its content: never held back.
+_LIVE_EVENTS = frozenset({"credits", "thinking_heartbeat", "end"})
+_EMPTY_DUMPED = set()  # (request_purpose, model) pairs whose empty answer is already saved this run
+
+
+def _int_setting(cfg, key, default):
+    try:
+        return max(0, int(cfg.get(key, default)))
+    except (TypeError, ValueError, OverflowError):
+        return default
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
 
@@ -718,7 +729,10 @@ async def _keepwarm(session, cfg):
                 due = max(next_turn_ping, retry_at)
             else:
                 due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
-            if not body or now < due:
+            if not body:
+                await asyncio.sleep(0.95)
+                continue
+            if now < due:
                 await asyncio.sleep(min(0.95, max(0.05, due - now)))
                 continue
             # The scheduler spans turns: bind the owner of this exact body,
@@ -850,37 +864,63 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
 
     A 400 from the route validator ("Invalid request format") carries no field
     detail, and client history only grows — every later retry re-sends the same
-    poison. The dump is local-only and holds the user's own conversation text.
+    poison. The dump is local-only and holds the user's own conversation text,
+    so a repeated identical body reuses its saved set and only the newest
+    `upstream_error_max_dumps` sets are kept.
     """
     try:
-        folder = pathlib.Path((cfg or {}).get("upstream_error_dir") or "logs/upstream-400")
+        cfg = cfg or {}
+        folder = pathlib.Path(cfg.get("upstream_error_dir") or "logs/upstream-400")
         folder.mkdir(parents=True, exist_ok=True)
-        request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
-        stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
-        (folder / ("%s-body.json" % stamp)).write_bytes(payload)
-        (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
-        metadata = {**client_context.current(), "request_id": request_id,
-                    "upstream_status": status, "diagnostic_id": stamp,
-                    "body_sha256": hashlib.sha256(payload).hexdigest()}
-        (folder / ("%s-metadata.json" % stamp)).write_text(
-            json.dumps(journal.scrub(metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        key = (str(folder.resolve()), digest)
+        with _DUMP_LOCK:
+            known = _DUMP_RECENT.get(key)
+            if known and (folder / ("%s-body.json" % known)).exists():
+                print("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known), flush=True)
+                return known
+            request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
+            stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
+            (folder / ("%s-body.json" % stamp)).write_bytes(payload)
+            (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
+            metadata = {**client_context.current(), "request_id": request_id,
+                        "upstream_status": status, "diagnostic_id": stamp,
+                        "body_sha256": digest}
+            (folder / ("%s-metadata.json" % stamp)).write_text(
+                json.dumps(journal.scrub(metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+            _DUMP_RECENT.pop(key, None)
+            _DUMP_RECENT[key] = stamp
+            while len(_DUMP_RECENT) > 256:
+                del _DUMP_RECENT[next(iter(_DUMP_RECENT))]
+            prune_diagnostics(cfg, folder, keep=stamp)
         print("[debug] upstream %s diagnostic: %s" % (status, stamp), flush=True)
         return stamp
     except Exception:  # noqa: BLE001 - diagnostics must never break the turn
         pass
 
 
+_DUMP_RECENT = {}
+_DUMP_LOCK = threading.Lock()
+
+
 def _dump_empty_once(payload, flags, cfg, session, model=None):
-    """Keep one private request body per client request, with per-attempt summaries."""
+    """Keep one sample per request kind and model per relay run: each dump holds
+    conversation text, so repeated empty answers must not pile up on disk."""
     budget = flags["budget"]
     if budget.empty_dump_attempted:
         return budget.empty_dump_id
+    kind = (client_context.current().get("request_purpose") or "generation", model)
+    if kind in _EMPTY_DUMPED:
+        return None
     budget.empty_dump_attempted = True
     detail = json.dumps({"reason": "empty turn: end_of_stream without content blocks",
                          "usage": budget.last.get("usage")}, ensure_ascii=False)
     stamp = _dump_rejected_body(payload, detail, cfg=cfg, status="empty",
                                 request_id=client_context.current().get("request_id")
                                 or getattr(session, "_request_tag", None))
+    if stamp:
+        # Marked only after a successful write, so a failed write is retried later.
+        _EMPTY_DUMPED.add(kind)
     journal.emit("upstream.empty_turn", "Пустой ответ upstream сохранён для диагностики", "warn",
                  diagnostic_id=stamp)
     budget.empty_dump_id = stamp
@@ -1019,7 +1059,8 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             if trace:
                 trace.wire.event("reader_error", exception_type=type(exc).__name__)
             if not is_cancelled():
-                if isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException)):
+                if isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException,
+                                    OSError)):  # OSError covers ssl.SSLError (TLS drops mid-stream)
                     timed_out = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
                     exc = (apierr.upstream_timeout("Retool response timed out") if timed_out else
                            apierr.upstream_error("Retool connection failed: %s" % type(exc).__name__))
@@ -1034,9 +1075,15 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     # re-sending the same body only pays for the same empty answer again.
     service_request = client_context.current().get("request_purpose") in client_context.SERVICE_KINDS
     try:
+        max_empty_retries = _int_setting(cfg, "upstream_empty_retries", 1)
+        empty_retries = 0
         while True:
             usable = False
             thinking_seen = False
+            # Events of an attempt are held back until it proves usable, so a retried
+            # attempt can never leak thinking blocks, signatures or blank text.
+            held = []
+            may_retry = (not service_request and empty_retries < max_empty_retries and budget.remaining > 1)
             yield {"type": "usage_start"}
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
@@ -1049,12 +1096,20 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     trace = holder.get("trace")
                     if trace:
                         trace.wire.event("parser_event", event=event)
-                    if (event.get("type") == "tool_call"
-                            or (event.get("type") == "text" and event.get("delta", "").strip())):
+                    kind = event.get("type")
+                    if kind == "tool_call" or (kind == "text" and event.get("delta", "").strip()):
                         usable = True
-                    if event.get("type") in ("thinking", "thinking_start", "thinking_signature", "thinking_heartbeat"):
+                    if kind in ("thinking", "thinking_start", "thinking_signature", "thinking_heartbeat"):
                         thinking_seen = True
-                    yield event
+                    if usable:
+                        for pending in held:
+                            yield pending
+                        held.clear()
+                        yield event
+                    elif kind in _LIVE_EVENTS or not may_retry:
+                        yield event
+                    else:
+                        held.append(event)
             except BaseException as exc:
                 failure = exc
                 raise
@@ -1083,8 +1138,14 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 return
             if not usable and saw_end:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
-            if usable or not saw_end or service_request or not budget.remaining:
+            if (usable or not saw_end or service_request or not budget.remaining
+                    or empty_retries >= max_empty_retries):
+                # This attempt is the final one: whatever it produced is the answer.
+                for pending in held:
+                    yield pending
+                held.clear()
                 break
+            empty_retries += 1
             # Retry the same request, including instructions, tool choice and
             # full history. Never turn the user's task into a status-only job.
             text.clear()

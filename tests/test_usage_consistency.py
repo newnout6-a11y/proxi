@@ -211,7 +211,7 @@ def test_real_direct_and_orchestrator_retries_keep_one_context_and_bill_every_at
 
     backend, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[],
                                base="https://example.invalid", cache_keepwarm_seconds=0,
-                               upstream_error_dir=str(tmp_path))
+                               upstream_error_dir=str(tmp_path), upstream_empty_retries=3)
     backend.headers = lambda: {}
     paid, bodies = [], []
     runner.credits = SimpleNamespace(record_turn=lambda key, cost: paid.append((key, cost)))

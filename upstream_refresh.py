@@ -12,6 +12,11 @@ import journal
 from redact import redact
 
 MIN_INTERVAL = 20.0
+REJECTED = "Retool rejected session renewal"
+
+
+class RenewalRejected(ValueError):
+    """Retool answered the renewal with success:false or an error body."""
 
 
 class Refresher:
@@ -45,7 +50,7 @@ class Refresher:
             if not isinstance(body, dict):
                 body = {}
             if body.get("error") or body.get("success") is False:
-                raise ValueError("Retool rejected session renewal")
+                raise RenewalRejected(REJECTED)
             return resp.headers.get_all("set-cookie") or []
 
     def _persist(self):
@@ -57,16 +62,29 @@ class Refresher:
             self.persistence_error = "cannot save renewed session: " + type(exc).__name__
 
     def refresh(self, force=False, *, rejected_cookie=None) -> bool:
+        return self.refresh_detailed(force, rejected_cookie=rejected_cookie)[0]
+
+    def refresh_detailed(self, force=False, *, rejected_cookie=None):
+        """Returns (ok, failure_kind, error) captured together under the refresher lock."""
         try:
             with renewal_lock(self.cfg):
                 return self._refresh_locked(force, rejected_cookie=rejected_cookie)
         except OSError as exc:
-            self.last_error = "cannot coordinate session renewal: " + type(exc).__name__
-            self.last_failure_kind = "local"
-            self._last_result = False
-            return False
+            with self._lock:
+                self.last_error = "cannot coordinate session renewal: " + type(exc).__name__
+                self.last_failure_kind = "local"
+                self._last_result = False
+                return False, self.last_failure_kind, self.last_error
 
-    def _refresh_locked(self, force=False, *, rejected_cookie=None) -> bool:
+    def _mark_adopted(self):
+        # Credentials renewed elsewhere (another request, an external sign-in) prove the session lives.
+        self.last_success_at = time.time()
+        self.last_error = None
+        self.last_failure_kind = None
+        self._last_result = True
+        return True, None, None
+
+    def _refresh_locked(self, force=False, *, rejected_cookie=None):
         """Single-flight renewal. A concurrent caller reuses the new credentials."""
         # Multi-account: journal events must say WHICH tenant renewed/failed.
         account_tag = journal.tag(self.cfg.get("account_id") or self.cfg.get("page_uuid"))
@@ -75,16 +93,15 @@ class Refresher:
         tenant = (urllib.parse.urlsplit(base).hostname or "") if isinstance(base, str) else ""
         with self._lock:
             if rejected_cookie is not None and self.cfg["cookie"] != rejected_cookie:
-                return True
+                return self._mark_adopted()
             try:
                 if reload_auth(self.cfg):
-                    self._last_result = True
-                    return True
+                    return self._mark_adopted()
             except Exception as exc:
                 self.persistence_error = "cannot read session configuration: " + type(exc).__name__
             now = time.monotonic()
             if not force and now - self._last < MIN_INTERVAL:
-                return self._last_result if rejected_cookie is not None else False
+                return (self._last_result if rejected_cookie is not None else False), self.last_failure_kind, self.last_error
             self._last = now
             try:
                 headers = self._http_refresh()
@@ -96,16 +113,20 @@ class Refresher:
                 journal.emit("auth.refresh", "Продление сессии Retool не удалось: HTTP %s" % exc.code, "error",
                              ok=False, status=exc.code, forced=force,
                              account=account_tag, tenant=tenant)
-                return False
+                return False, self.last_failure_kind, self.last_error
             except Exception as exc:
                 self.last_error = redact(str(exc), cookie_values=self.cfg.get("cookie_values", []))
-                self.last_failure_kind = ("network" if isinstance(exc, (urllib.error.URLError, OSError))
-                                          else "upstream")
+                if isinstance(exc, RenewalRejected) or (isinstance(exc, ValueError) and str(exc) == REJECTED):
+                    # Retool answered but refused this session: it needs a new sign-in.
+                    self.last_failure_kind = "auth"
+                else:
+                    self.last_failure_kind = ("network" if isinstance(exc, (urllib.error.URLError, OSError))
+                                              else "upstream")
                 self._last_result = False
                 journal.emit("auth.refresh", "Продление сессии Retool не удалось", "error",
                              ok=False, error=self.last_error, forced=force,
                              account=account_tag, tenant=tenant)
-                return False
+                return False, self.last_failure_kind, self.last_error
             merge_set_cookie(self.cfg, headers)
             if "_account_ref" in self.cfg and isinstance(self.cfg["_account_ref"], dict):
                 self.cfg["_account_ref"]["cookie"] = self.cfg["cookie"]
@@ -129,7 +150,7 @@ class Refresher:
             self._last_result = True
             # Retool may say "Authenticated, but token was not refreshed" until
             # rotation is due. This is still a successful authentication check.
-            return True
+            return True, None, None
 
     def call(self, request):
         """Run an HTTP operation and replay once after recovering 401/403."""

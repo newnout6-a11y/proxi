@@ -28,7 +28,7 @@ def test_credit_error_from_newest_first_messages():
     runner = build([USER_MSG, ERROR_MSG, TEXT_MSG])
     err = asyncio.run(runner._explain_empty({"session": Session()}))
     assert isinstance(err, apierr.ApiError)
-    assert err.status == 429 and err.code == "insufficient_credits"
+    assert err.status == 402 and err.code == "insufficient_credits"
 
 
 def test_newer_text_wins_over_older_error():

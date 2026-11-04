@@ -230,7 +230,7 @@ def test_real_local_http_thinking_gap_and_read_timeout(upstream_blank_heartbeats
             self.send_response(200)
             self.send_header("Connection", "close")
             self.end_headers()
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            with contextlib.suppress(ConnectionError, OSError):
                 self.wfile.write(b'{"event":"content_block_start","type":"thinking"}\n')
                 self.wfile.flush()
                 for _ in range(10):
@@ -242,7 +242,11 @@ def test_real_local_http_thinking_gap_and_read_timeout(upstream_blank_heartbeats
                 self.wfile.write(b'{"event":"end_of_stream"}\n')
                 self.wfile.flush()
 
-    httpd = ThreadingHTTPServer(("127.0.0.1",0), Handler)
+    class QuietServer(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            pass  # the client deliberately drops the connection; socketserver would print a traceback
+
+    httpd = QuietServer(("127.0.0.1",0), Handler)
     thread = threading.Thread(target=httpd.serve_forever,daemon=True)
     thread.start()
     session = SimpleNamespace(_cancelled=False, thread_id="fixture",

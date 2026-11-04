@@ -6,6 +6,8 @@ import math
 import os
 import re
 import secrets
+import stat
+import sys
 import tempfile
 import threading
 import time
@@ -62,6 +64,9 @@ DEFAULTS = {
     "transport": "direct",
     "direct_cache": True,
     "upstream_trace_dir": "",  # explicit private raw request/response traces; disabled by default
+    "upstream_empty_retries": 1,           # extra identical POSTs after an empty/thinking-only answer (paid)
+    "upstream_error_max_dumps": 50,        # newest private request-body dump sets kept; 0 = unlimited
+    "upstream_attempt_summaries_max": 200,  # newest per-attempt *-response.json kept; 0 = unlimited
     "client_trace_dir": "",    # explicit private client request/response traces; disabled by default
     # Provider caches expire in minutes; re-read the prefix to hold it open.
     "cache_keepwarm_seconds": 240,
@@ -89,11 +94,13 @@ _STORAGE_LOCAL = threading.local()
 
 
 @contextmanager
-def storage_lock(path, timeout=30):
+def storage_lock(path, timeout=30, best_effort=False):
     """Serialize the entire config transaction across threads and processes.
 
     Keep the sidecar: deleting it after unlock can split concurrent writers
     between different inodes. OS locks are released if the process exits.
+    `best_effort` runs without the OS lock when the sidecar cannot be created
+    (read-only directory); the in-process lock is still held.
     """
     path = os.path.normcase(os.path.realpath(os.fspath(path)))
     with _STORAGE_GUARD:
@@ -103,7 +110,16 @@ def storage_lock(path, timeout=30):
         if path in held:
             yield
             return
-        with open(path + ".lock", "a+b") as handle:
+        try:
+            sidecar = open(path + ".lock", "a+b")
+        except OSError:
+            if not best_effort:
+                raise
+            sidecar = None
+        if sidecar is None:
+            yield
+            return
+        with sidecar as handle:
             handle.seek(0, os.SEEK_END)
             if not handle.tell():
                 handle.write(b"\0")
@@ -142,15 +158,22 @@ def _write_file(path, saved):
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
                                          prefix=".session-", suffix=".tmp", delete=False) as fh:
             temporary = fh.name
-            json.dump(saved, fh, ensure_ascii=False, indent=2, allow_nan=False)
+            try:
+                json.dump(saved, fh, ensure_ascii=False, indent=2, allow_nan=False)
+            except ValueError as exc:
+                raise service_unavailable("config contains values that cannot be saved as JSON: %s" % exc)
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
-        import stat
         os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
         os.replace(temporary, path)
     finally:
         if temporary and os.path.exists(temporary):
+            # A read-only temp (copied from a read-only target) cannot be unlinked on Windows.
+            try:
+                os.chmod(temporary, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
             os.unlink(temporary)
 
 
@@ -163,6 +186,17 @@ def renewal_lock(cfg):
     tag = hashlib.sha256(identity.encode()).hexdigest()[:24]
     return storage_lock(os.fspath(path) + ".auth-" + tag,
                         timeout=max(30, cfg.get("upstream_timeout", 120) + 5))
+
+
+def _legacy_match(records, cfg):
+    """A record an external sign-in rewrote without account_id: accepted only when it is the
+    single record for this tenant/page. Another account on the same page makes it ambiguous."""
+    same_page = [item for item in records
+                 if str(item.get("base", "")).rstrip("/") == cfg["base"].rstrip("/")
+                 and item.get("page_uuid") == cfg.get("page_uuid")]
+    if len(same_page) == 1 and not same_page[0].get("account_id"):
+        return same_page[0]
+    return None
 
 
 def _account_record(saved, cfg):
@@ -179,10 +213,12 @@ def _account_record(saved, cfg):
         if len(matches) > 1:
             raise ValueError("ambiguous account identity; reload configuration to assign account_id")
         record = matches[0] if matches else None
+        if record is None and cfg.get("account_id"):
+            record = _legacy_match(records, cfg)
     else:
         record = saved
         if cfg.get("account_id") and record.get("account_id") != cfg["account_id"]:
-            return None
+            record = _legacy_match([record], cfg)
     if record is None or (record.get("base") or saved.get("base", "")).rstrip("/") != cfg["base"].rstrip("/"):
         return None
     return record
@@ -249,6 +285,8 @@ def persist_auth(cfg):
         if disk_auth != cfg.get("_disk_auth", disk_auth) and disk_auth != (cfg["cookie"], cfg["xsrf"]):
             raise ValueError("session configuration changed during renewal")
         record.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
+        if cfg.get("account_id") and not record.get("account_id"):
+            record["account_id"] = cfg["account_id"]
         _write_file(path, saved)
         cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
 
@@ -274,7 +312,10 @@ def reload_auth(cfg):
 
 def load(path=CONFIG_PATH):
     """Load config, apply env overrides, fill defaults, validate."""
-    with storage_lock(path):
+    if not os.path.isfile(path):
+        # Fail before storage_lock: it would create a stray .lock next to a missing file.
+        _read_file(path)
+    with storage_lock(path, best_effort=True):
         return _load(path)
 
 
@@ -307,7 +348,8 @@ def _load(path):
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
-                    "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel"):
+                    "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
+                    "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -325,7 +367,8 @@ def _load(path):
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
-    for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit"):
+    for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
+                "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
         if cfg[key] < 0:
             raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
     for key in ("turn_timeout", "recv_timeout", "upstream_timeout", "command_timeout", "max_workers",
@@ -416,5 +459,10 @@ def _load(path):
     if not isinstance(saved.get("accounts"), list):
         cfg["account_id"] = saved["account_id"]
     if changed and cfg["_persist_auth"]:
-        _write_file(path, saved)
+        try:
+            _write_file(path, saved)
+        except OSError as exc:
+            # Read-only config: the generated ids live in memory until the next writable start.
+            print("warning: cannot save account_id to %s (%s); ids are kept in memory" % (
+                path, type(exc).__name__), file=sys.stderr)
     return cfg

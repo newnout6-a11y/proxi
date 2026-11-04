@@ -21,7 +21,7 @@ import models as model_catalog
 from context import build_system_instructions
 from redact import redact
 from session import SessionLease
-from upstream_attempts import AttemptBudget
+from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
 
 
 _CONV_HEADER = "\n\n[CLIENT CONVERSATION — chronological]\n"
@@ -141,6 +141,15 @@ class _FailoverOut:
         if event.get("type") not in ("credits", "usage_start"):
             self.started = True
         self.out.put(event)
+
+
+def _may_be_balance_related(error):
+    """Rate limits, timeouts and client errors never justify a balance fetch."""
+    status = getattr(error, "status", 0) or 0
+    code = getattr(error, "code", None)
+    if status == 402 or (status == 429 and code == "insufficient_credits"):
+        return True
+    return status >= 500 and code != "upstream_timeout"
 
 
 class TurnRunner:
@@ -313,7 +322,7 @@ class TurnRunner:
             if message.get("senderRole") == "sandpack" and content.get("type") == "error":
                 text = str(content.get("error") or "").strip()
                 if "credit" in text.lower():
-                    return apierr.ApiError(429, "insufficient_credits", text or "Retool credits exhausted")
+                    return apierr.ApiError(402, "insufficient_credits", text or "Retool credits exhausted")
                 return apierr.upstream_error(text or "upstream returned an error message")
             if message.get("senderRole") == "sandpack" and content.get("type") in ("text", "tool_call"):
                 return None
@@ -330,7 +339,11 @@ class TurnRunner:
         exclude = []
         rechecked = False
         cancelled = holder.setdefault("cancel_event", threading.Event())
-        holder["_attempt_budget"] = AttemptBudget(cancelled)
+        max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
+        # Exec steps are bounded only by max_exec_turns; each step (plus the summary
+        # step) may spend up to MAX_ATTEMPTS POSTs, which is the hard cap per request.
+        holder["_attempt_budget"] = AttemptBudget(
+            cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None)
         while True:
             relay = _FailoverOut(out)
             holder.pop("session", None)
@@ -357,7 +370,7 @@ class TurnRunner:
                     if await asyncio.to_thread(accounts.recheck_exhausted):
                         continue
                 if (retryable and backend is not None and backend not in exclude
-                        and error.status not in (400, 413, 422)):
+                        and _may_be_balance_related(error)):
                     # With no account left, the next acquire raises a clear 402.
                     exhausted = await asyncio.to_thread(accounts.check_balance_now, backend)
             except BaseException:
@@ -466,6 +479,7 @@ class TurnRunner:
                 requested_effort=requested_effort, effective_effort=effort,
                 effort_source=effort_source,
                 effort_resolution=("model_default" if requested_effort in (None, "auto") else
+                                   "provider_managed" if effort is None else
                                    "exact" if requested_effort == effort else "compatibility"),
                 dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
                 tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
@@ -768,7 +782,10 @@ class TurnRunner:
                                   "For this requested task, issue the appropriate client tool call now.")
                         continue
                     if tool_names and (choice == "required" or isinstance(choice, dict)):
-                        raise apierr.upstream_error("upstream did not honor the required client tool choice")
+                        # Same error shape as an empty turn: diagnostic_id and attempt count.
+                        raise holder["_attempt_budget"].error(
+                            "upstream_tool_choice_ignored" if final_text.strip() else "upstream_empty_turn",
+                            "upstream did not honor the required client tool choice")
 
                     # Once the summary turn is requested, nothing is executed any more.
                     can_exec = self._can_exec(exec_steps) and not final_summary and not client_text
@@ -858,6 +875,8 @@ class TurnRunner:
                         raise asyncio.CancelledError()
                     output = redact(output, cookie_values=self.cfg.get("cookie_values", ()))
                     exec_steps += 1
+                    # A usable answer plus its executed command is progress, not a retry.
+                    holder["_attempt_budget"].new_step()
                     log("exec.result", "Команда завершилась с кодом %s" % code,
                         "success" if code == 0 else "warn" if code == 126 else "error",
                         command=redact(command)[:2000], exit=code, output=(output or "")[:1500],

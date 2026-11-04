@@ -12,6 +12,7 @@ import credits
 import direct
 import journal
 from scripts import watch_relay
+from test_review_fixes_proxy import multi  # noqa: F401 - two-account relay fixture
 
 
 def usage(read=0, write=0):
@@ -121,25 +122,25 @@ def test_balance_unknown_negative_and_expired_are_not_misrepresented():
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_request_completion_prints_total_balance_and_summed_cost(relay, capsys, monkeypatch, stream):
+@pytest.mark.parametrize("serving", [0, 1])
+def test_request_completion_prints_serving_account_balance_and_summed_cost(multi, capsys, monkeypatch,
+                                                                         stream, serving):
     monkeypatch.setenv("NO_COLOR", "1")
-    monkeypatch.setattr(relay.credits, "balance_snapshot", lambda: {
-        "available": 100 - sum(cost for _, cost in relay.credits.used), "estimated": True}, raising=False)
-    relay.fake.script = [{"type": "credits", "value": 0.25}, {"type": "credits", "value": 0.75},
-                         {"type": "text", "delta": "ok"}, {"type": "end", "reason": "stop"}]
+    multi.runner_.serving = serving
     before = journal.JOURNAL.last_seq
     payload = {"model": "claude-opus-5-5", "max_tokens": 64, "stream": stream,
                "messages": [{"role": "user", "content": "hi"}]}
-    with relay.request("/v1/messages", payload) as response:
-        response.read()
-        request_id = response.headers["request-id"]
+    status, _body, headers = multi.call("/v1/messages", payload)
+    assert status == 200
+    request_id = headers["request-id"]
     deadline = time.monotonic() + 2
     while not any(event["kind"] == "http.request" and event.get("request_id") == request_id
                   for event in journal.JOURNAL.query(since=before)):
         assert time.monotonic() < deadline
         time.sleep(0.01)
     output = capsys.readouterr().out
-    assert "[%s] [balance] balance=99.0000" % request_id in output
+    balance = {0: "99.0000", 1: "6.0000"}[serving]
+    assert "[%s] [balance] account=%s balance=%s" % (request_id, multi.tags[serving], balance) in output
     assert "spent=1.0000" in output and "\x1b" not in output
 
 

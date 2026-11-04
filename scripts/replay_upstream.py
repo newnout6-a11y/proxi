@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -15,8 +17,24 @@ from auth import upstream_headers
 import config
 import direct
 import journal
-from upstream_attempts import AttemptBudget
+from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
 from upstream_refresh import Refresher
+
+
+def load_config_readonly(path):
+    """Load a config for replay without ever touching the original file.
+
+    config.load() may migrate account_id into the file and the Refresher may persist a
+    rotated cookie. A throwaway copy absorbs the former; _persist_auth=False stops the latter.
+    """
+    source = Path(path).resolve()
+    with tempfile.TemporaryDirectory(prefix="replay-config-") as folder:
+        copy = Path(folder) / source.name
+        shutil.copyfile(source, copy)
+        cfg = config.load(str(copy))
+    cfg.pop("_config_path", None)
+    cfg["_persist_auth"] = False
+    return cfg
 
 
 async def replay(cfg, source, output):
@@ -26,7 +44,8 @@ async def replay(cfg, source, output):
         raise ValueError("this incident replay requires the frozen claude-opus-5-5 body")
     output.mkdir(parents=True, exist_ok=False)
     cfg = dict(cfg, upstream_trace_dir=str(output / "wire"), upstream_error_dir=str(output / "summaries"),
-               cache_keepwarm_seconds=0, session_refresh_interval=0, direct_debug=False)
+               cache_keepwarm_seconds=0, session_refresh_interval=0, direct_debug=False,
+               _persist_auth=False, upstream_empty_retries=MAX_ATTEMPTS - 1)
     journal.JOURNAL.configure(cfg, str(output / "journal.jsonl"))
     backend = SimpleNamespace(cfg=cfg, headers=lambda: upstream_headers(cfg), refresher=Refresher(cfg))
     session = SimpleNamespace(backend=backend, _cancelled=False, _request_tag="exact-replay",
@@ -75,7 +94,7 @@ def main():
         parser.error("--allow-paid is required: replay can spend credits on up to five attempts")
     if args.output.exists():
         parser.error("--output must be a new directory to avoid overwriting previous evidence")
-    cfg = config.load(str(args.config.resolve()))
+    cfg = load_config_readonly(args.config)
     asyncio.run(replay(cfg, args.body, args.output))
 
 

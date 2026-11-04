@@ -29,7 +29,8 @@ def response(*events):
 def harness(tmp_path, monkeypatch):
     backend, pool, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[],
                                    base="https://example.invalid", cache_keepwarm_seconds=0,
-                                   upstream_error_dir=str(tmp_path))
+                                   upstream_error_dir=str(tmp_path), upstream_empty_retries=4)
+    monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
     backend.headers = lambda: {"cookie": "never-store-cookie"}
     calls, paid, traces, waits = [], [], [], []
     runner.credits = SimpleNamespace(record_turn=lambda key, cost: paid.append((key, cost)))
@@ -200,7 +201,7 @@ def test_budget_and_dump_are_new_for_each_request_on_same_session(harness, tmp_p
     assert len(harness.calls) == 10
     assert first.upstream_attempts == second.upstream_attempts == 5
     assert first.diagnostic_id != second.diagnostic_id
-    assert len(list(tmp_path.glob("*-body.json"))) == 2
+    assert len(list(tmp_path.glob("*-body.json"))) == 1  # one sample per kind+model per run
 
 
 def test_cancel_during_backoff_never_sends_another_post(harness, monkeypatch):
