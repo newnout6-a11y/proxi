@@ -188,7 +188,9 @@ nav { display: grid; gap: var(--space-6); }
 .lg-credits { height: 2px !important; background: var(--accent); }
 
 .chart-frame { position: relative; height: 340px; min-width: 0; }
-.chart { display: block; width: 100%; height: 100%; overflow: visible; touch-action: pan-y; }
+/* The SVG never takes part in layout: the frame's height comes from CSS only, so it
+   cannot grow from its own previous size when the window is resized. */
+.chart { position: absolute; inset: 0; display: block; width: 100%; height: 100%; overflow: visible; touch-action: pan-y; }
 .c-grid { stroke: var(--chart-grid); stroke-width: 1; }
 .c-axis { stroke: var(--line-strong); stroke-width: 1; }
 .c-label { fill: var(--muted); font-family: var(--mono); font-size: 11px; }
@@ -362,6 +364,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 .model-name strong { color: var(--ink); font-weight: 500; }
 .model-name code { justify-self: start; background: none; padding: 0; color: var(--muted); }
 .model-provider { font-family: var(--mono); font-size: var(--text-xs); }
+.model-effort { flex-wrap: nowrap !important; overflow: hidden; white-space: nowrap; }
 .model-effort, .model-route { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); font-family: var(--mono); font-size: var(--text-xs); }
 
 /* --- settings -------------------------------------------------------------- */
@@ -422,8 +425,10 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 }
 @media (max-width: 1024px) {
   .ov-top { grid-template-columns: minmax(0, 1fr); }
-  .stats { grid-template-rows: none; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .stat + .stat { border-top: 0; border-left: 1px solid var(--line); }
+  .stats { grid-template-rows: none; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat + .stat { border-top: 0; }
+  .stat:nth-child(even) { border-left: 1px solid var(--line); }
+  .stat:nth-child(n+3) { border-top: 1px solid var(--line); }
   .stat { grid-template-columns: minmax(0, 1fr); row-gap: var(--space-1); }
   .stat-value { grid-row: auto; }
   .acc { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); row-gap: var(--space-2); }
@@ -467,6 +472,9 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
   .setting-control { flex-wrap: wrap; }
   .setting-control select, .setting-control input[type="number"] { min-width: 0; width: 100%; }
 }
+@media (max-width: 360px) {
+  .nav-item { font-size: 10px; }
+}
 @media (max-width: 560px) {
   .page-head { align-items: flex-start; }
   h1 { font-size: 1.5rem; }
@@ -479,7 +487,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
   .connect-row { grid-template-columns: minmax(0, 1fr) auto; }
   .connect-row > span { grid-column: 1 / -1; }
   .search.compact { width: 100%; }
-  .chart-frame { height: 240px; }
+  .chart-frame, .chart-panel .chart-frame { height: 240px; min-height: 240px; }
   .model-card { grid-template-columns: minmax(0, 1fr) auto; }
   .model-card > .num { display: none; }
   .rail-actions .button { padding: 0 var(--space-2); }

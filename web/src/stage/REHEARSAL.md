@@ -44,7 +44,7 @@ at the loop seam (it fades out, is reset while hidden, and fades back in).
   non-gate warnings, which are not zero:
   - `appears with no entrance` and `settle snap` on `.ss-count` / its digits: the
     kit's own digit strips homing back to the middle decade after a roll;
-  - `settle snap` on `.ss-term__caret` (6.6 px): the block caret stepping with the
-    last typed letter;
+  - `settle snap` on `.ss-term__caret` (6.6 px at 1440, 15.8 px at 390, the stage
+    is scaled there): the block caret stepping with the last typed letter;
   - at 390 px, `near-empty frames` for about 0.8 s at the loop reset.
 - Empty-state stills were checked by screenshots, not by film.

@@ -18,7 +18,7 @@ export const WINDOWS = [
   { id: 86400, label: '24 ч', long: 'последние сутки' },
 ];
 
-const SESSION_MODE = { per_conversation: 'сессия на каждый диалог', shared: 'одна общая сессия' };
+const SESSION_MODE = { per_conversation: 'сессия на каждый диалог', per_request: 'сессия на каждый запрос', shared: 'одна общая сессия' };
 
 const pct = (share) => `${Math.max(0, Math.min(1, share)) * 100}%`;
 
@@ -77,7 +77,7 @@ function Balance({ balance, metrics, windowSec, overview }) {
         {elapsed !== null && <span className="scale-now" style={{ left: pct(elapsed) }} title="Сегодня" />}
       </div>
       <div className="scale-legend">
-        <span>израсходовано {fmtNum(used, 2)} · {fmtPercent(usedShare)}</span>
+        <span>израсходовано {fmtFixed(used, 2)} · {fmtPercent(usedShare)}</span>
         <span>
           сброс {fmtDay(balance?.reset_date)}
           {daysLeft !== null && ` · через ${Math.ceil(daysLeft)} ${plural(Math.ceil(daysLeft), ['день', 'дня', 'дней'])}`}
@@ -277,7 +277,7 @@ export default function Overview({ apiKey, journal, overview, overviewError, ref
             note={totals.errors ? `${fmtInt(totals.errors)} ${plural(totals.errors, ['ошибка', 'ошибки', 'ошибок'])}` : 'без ошибок'}
             tone={totals.errors ? 'neg' : undefined} />
           <Stat label="Попадание в кэш" value={fmtPercent(totals.cache_hit_ratio)}
-            note={`чтение ${fmtTokens(totals.cache_read)} · запись ${fmtTokens(totals.cache_write)} · без кэша ${fmtTokens(totals.input_tokens)}`} />
+            note={`чтение ${fmtTokens(totals.cache_read)} · запись ${fmtTokens(totals.cache_write)} · без\u00a0кэша\u00a0${fmtTokens(totals.input_tokens)}`} />
           <Stat label="Первый токен, p50" value={fmtMs(totals.ttft_p50)} note={`p95 ${fmtMs(totals.ttft_p95)}`} />
           <Stat label="Ответ целиком, p50" value={fmtMs(totals.latency_p50)} note={`p95 ${fmtMs(totals.latency_p95)}`} />
         </section>

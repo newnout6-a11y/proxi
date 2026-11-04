@@ -86,7 +86,7 @@ export function CacheChart({ buckets, windowSec }) {
   const summary = empty ? 'Нет данных за окно'
     : `Кэш за окно: прочитано ${fmtTokens(buckets.reduce((s, b) => s + (b.cache_read || 0), 0))}, `
       + `записано ${fmtTokens(buckets.reduce((s, b) => s + (b.cache_write || 0), 0))}, `
-      + `кредитов ${fmtNum(buckets.reduce((s, b) => s + (b.credits || 0), 0), 2)}`;
+      + `кредитов ${fmtFixed(buckets.reduce((s, b) => s + (b.credits || 0), 0), 2)}`;
 
   function onMove(event) {
     if (!n) return;
