@@ -18,20 +18,7 @@ export const GROUPS = [
   { id: 'api', title: 'API для клиентов', hint: 'Какие протоколы relay принимает от IDE' },
 ];
 
-// Used only while the backend schema has no `group` yet.
-const FALLBACK = {
-  min_account_balance: 'routing', account_balance_interval: 'routing', account_refresh_parallel: 'routing',
-  session_refresh_interval: 'routing', session_mode: 'routing', max_conversations: 'routing', conversation_idle_timeout: 'routing',
-  model: 'model', reasoning_effort: 'model', allow_effort_downgrade: 'model', show_thinking: 'model', strict_models: 'model',
-  show_unrouted_models: 'model', project_context: 'model', context_max_bytes: 'model',
-  upstream_empty_retries: 'retries', upstream_error_max_dumps: 'retries', upstream_attempt_summaries_max: 'retries',
-  cache_keepwarm_seconds: 'cache', cache_keepwarm_idle: 'cache', cache_keepwarm_during_turns: 'cache', cache_keepwarm_turn_offset: 'cache',
-  exec_policy: 'exec', show_exec_output: 'exec', command_timeout: 'exec', command_output_limit: 'exec', max_exec_turns: 'exec',
-  enable_chat: 'api', enable_responses: 'api', enable_anthropic: 'api',
-};
-const groupOf = (key, field) => field.group || FALLBACK[key] || 'limits';
-// Descriptions that only restate when a value applies: that is shown separately.
-const GENERIC = /Сохраняется в конфигурации|Применяется к новым запросам сразу|^(После перезапуска|Сразу)\.?$/;
+const groupOf = (field) => field.group || 'limits';
 const OPTION_LABELS = {
   session_mode: { per_conversation: 'сессия на каждый диалог', per_request: 'сессия на каждый запрос', shared: 'одна общая сессия' },
   exec_policy: { off: 'выключены', allowlist: 'только из списка разрешённых', allow_all: 'любые команды' },
@@ -61,7 +48,7 @@ function Field({ name, field, value, onChange, pending, dirty }) {
       </span>
     );
   }
-  const description = field.description && !GENERIC.test(field.description) ? field.description : null;
+  const description = field.description || null;
   return (
     <div className={`setting ${pending ? 'pending' : ''} ${dirty ? 'dirty' : ''}`}>
       <label htmlFor={id}>
@@ -181,7 +168,7 @@ export default function SettingsView({ apiKey, overview, onUnauthorized }) {
 
   const schema = state?.schema || {};
   const byGroup = {};
-  for (const [key, field] of Object.entries(schema)) (byGroup[groupOf(key, field)] ||= []).push(key);
+  for (const [key, field] of Object.entries(schema)) (byGroup[groupOf(field)] ||= []).push(key);
 
   return (
     <Page className="settings">

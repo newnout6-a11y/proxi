@@ -136,6 +136,16 @@ test('accounts can be disabled, reprioritised, checked and renewed with the CSRF
   expect(state.accountRequests.every((r) => r.headers['x-admin-request'] === '1')).toBe(true);
 });
 
+test('a failed renewal shows the redacted reason from the relay', async ({ page }) => {
+  const state = await mockAdmin(page);
+  state.renewFails = true;
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.locator('.pool-row').nth(0).getByRole('button', { name: 'Продлить' }).click();
+  await expect(page.getByText('Сессия не продлена')).toBeVisible();
+  await expect(page.getByText('session renewal failed: HTTP 401')).toBeVisible();
+});
+
 test('the last enabled account cannot be switched off', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
@@ -156,12 +166,18 @@ test('accounts can be added and removed; both wait for a restart', async ({ page
   await page.getByLabel('page_uuid приложения').fill('11111111-2222-3333-4444-555555555555');
   await page.getByLabel('xsrf').fill('xsrf-value');
   await page.getByLabel('Cookie').fill('accessToken=abc');
+  await page.getByLabel('Ресурс Anthropic (необязательно)').fill('anthropic-res');
   await page.getByRole('button', { name: 'Добавить', exact: true }).click();
   await expect(page.getByText('Аккаунт добавлен')).toBeVisible();
   const post = state.accountRequests.find((r) => r.method === 'POST' && r.path === '/admin/api/accounts');
+  // Empty optional fields are not sent.
   expect(post.body).toEqual({ label: 'третий', base: 'https://tenant.retool.com',
-    page_uuid: '11111111-2222-3333-4444-555555555555', cookie: 'accessToken=abc', xsrf: 'xsrf-value' });
-  await expect(page.locator('.pool-row', { hasText: 'третий' })).toContainText('подключится после перезапуска');
+    page_uuid: '11111111-2222-3333-4444-555555555555', cookie: 'accessToken=abc', xsrf: 'xsrf-value',
+    provider_resource_name: 'anthropic-res' });
+  const added = page.locator('.pool-row', { hasText: 'третий' });
+  await expect(added).toContainText('подключится после перезапуска');
+  await expect(added).toContainText('не подключён');
+  await expect(added.getByRole('button', { name: 'Баланс' })).toBeDisabled();
   await expect(page.getByText(/вступят в силу после перезапуска/)).toBeVisible();
 
   page.once('dialog', (dialog) => dialog.accept());
@@ -260,6 +276,20 @@ test('settings group fields by purpose and hold the model catalog and IDE connec
   await page.getByLabel('Только с маршрутом').check();
   await expect(page.locator('.model-card')).toHaveCount(1);
   await expect(page.locator('.model-card')).toContainText('Claude Opus 5.5');
+});
+
+test('settings show backend groups, real descriptions and units', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  for (const title of ['Аккаунты и маршрутизация', 'Модель и мышление', 'Повторы и диагностика', 'Кэш промпта', 'Лимиты и таймауты', 'API для клиентов']) {
+    await expect(page.getByRole('region', { name: title })).toBeVisible();
+  }
+  const reserve = page.getByRole('region', { name: 'Аккаунты и маршрутизация' }).locator('.setting', { hasText: 'Порог резерва' });
+  await expect(reserve).toContainText('уходит в резерв');
+  await expect(reserve).toContainText('применяется сразу');
+  await expect(reserve.locator('.unit')).toHaveText('кредитов');
+  await expect(page.locator('#setting-session_mode option', { hasText: 'сессия на каждый диалог' })).toHaveCount(1);
 });
 
 test('settings save only changed values with the CSRF header', async ({ page }) => {

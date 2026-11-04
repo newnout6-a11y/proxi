@@ -23,20 +23,36 @@ const extraCatalog = [
     reasoning: true, tools: true, reasoning_effort_levels: ['low', 'high'], routable: false, metadata_status: 'estimated' },
 ];
 
+// Mirrors admin._schema: every field has a group, a real description and, where it applies, a unit.
 export const baseSchema = {
-  model: { type: 'string', label: 'Модель по умолчанию', enum: catalog.map(({ id }) => id), restart_required: true, description: 'После перезапуска.' },
-  show_thinking: { type: 'boolean', label: 'Передавать мышление модели', restart_required: true, description: 'После перезапуска.' },
-  max_workers: { type: 'integer', label: 'Параллельные запросы', min: 1, restart_required: true, description: 'После перезапуска.' },
-  rate_limit_rps: { type: 'number', label: 'Запросов в секунду (0 — без лимита)', min: 0, restart_required: false, description: 'Сразу.' },
+  model: { type: 'string', label: 'Модель по умолчанию', group: 'model', enum: catalog.map(({ id }) => id), restart_required: true,
+    description: 'Модель для запросов, в которых клиент не указал свою' },
+  show_thinking: { type: 'boolean', label: 'Передавать мышление модели', group: 'model', restart_required: true,
+    description: 'Отдавать клиенту блоки мышления модели, когда Retool их присылает' },
+  max_workers: { type: 'integer', label: 'Параллельные запросы', group: 'limits', min: 1, max: 512, restart_required: true,
+    description: 'Сколько запросов relay обслуживает одновременно; остальные ждут' },
+  rate_limit_rps: { type: 'number', label: 'Запросов в секунду', group: 'limits', min: 0, max: 10000, restart_required: false,
+    description: 'Сколько запросов в секунду принимать от клиентов; 0 — без ограничения' },
 };
 
 const richSchema = {
   ...baseSchema,
-  reasoning_effort: { type: 'string', label: 'Уровень рассуждений', enum: ['low', 'medium', 'high', 'max'], restart_required: false, description: 'Применяется к новым ходам.' },
-  session_mode: { type: 'string', label: 'Режим сессий', enum: ['per_conversation', 'shared'], restart_required: true, description: 'После перезапуска.' },
-  enable_anthropic: { type: 'boolean', label: 'Anthropic Messages API', restart_required: true, description: 'После перезапуска.' },
-  enable_chat: { type: 'boolean', label: 'OpenAI Chat Completions', restart_required: true, description: 'После перезапуска.' },
-  request_timeout: { type: 'number', label: 'Таймаут запроса, с', min: 1, restart_required: false, description: 'Сразу.' },
+  reasoning_effort: { type: 'string', label: 'Уровень мышления', group: 'model', enum: ['auto', 'low', 'medium', 'high', 'max'], restart_required: true,
+    description: 'Уровень мышления, если клиент его не передал; auto оставляет выбор модели' },
+  session_mode: { type: 'string', label: 'Режим сессий', group: 'routing', enum: ['per_conversation', 'per_request', 'shared'], restart_required: true,
+    description: 'Как диалоги клиентов привязываются к тредам Retool: свой тред на диалог, новый на каждый запрос или один общий' },
+  min_account_balance: { type: 'number', label: 'Порог резерва', group: 'routing', unit: 'кредитов', min: 0, max: 1000000, restart_required: false,
+    description: 'Аккаунт с балансом ниже порога уходит в резерв и получает запросы, только когда ниже порога все' },
+  cache_keepwarm_seconds: { type: 'integer', label: 'Интервал прогрева', group: 'cache', unit: 'с', min: 0, max: 3600, restart_required: true,
+    description: 'Как часто перечитывать начало диалога, чтобы кэш промпта не остыл; 0 — прогрев выключен' },
+  upstream_empty_retries: { type: 'integer', label: 'Повторы пустого ответа', group: 'retries', min: 0, max: 4, restart_required: true,
+    description: 'Сколько раз повторить запрос, если Retool вернул пустой ответ или одно мышление; каждый повтор платный' },
+  enable_anthropic: { type: 'boolean', label: 'Anthropic API', group: 'api', restart_required: true,
+    description: 'Принимать запросы Anthropic Messages на /v1/messages' },
+  enable_chat: { type: 'boolean', label: 'Chat Completions API', group: 'api', restart_required: true,
+    description: 'Принимать запросы OpenAI Chat Completions на /v1/chat/completions' },
+  turn_timeout: { type: 'integer', label: 'Ожидание ответа', group: 'limits', unit: 'с', min: 1, max: 86400, restart_required: true,
+    description: 'Максимальная длительность одного хода модели' },
 };
 
 export function ev(seq, kind, message, level = 'info', extra = {}) {
@@ -170,7 +186,8 @@ export function settingsResponse(settings, effective, schema) {
 export async function mockAdmin(page, { rich = false, empty = false, overviewPatch = {} } = {}) {
   const schema = rich ? richSchema : baseSchema;
   const initial = { model: 'claude-opus-5-5', show_thinking: true, max_workers: 4, rate_limit_rps: 0,
-    ...(rich ? { reasoning_effort: 'high', session_mode: 'per_conversation', enable_anthropic: true, enable_chat: true, request_timeout: 120 } : {}) };
+    ...(rich ? { reasoning_effort: 'high', session_mode: 'per_conversation', enable_anthropic: true, enable_chat: true,
+      min_account_balance: 20, cache_keepwarm_seconds: 240, upstream_empty_retries: 1, turn_timeout: 900 } : {}) };
   const events = empty ? [] : rich ? richJournal() : journal;
   const models = rich ? [...catalog, ...extraCatalog] : catalog;
   const state = { settings: { ...initial }, effective: { ...initial }, requests: [], patches: [], sessions: [],
@@ -229,7 +246,8 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     if (path === '/admin/api/accounts' && method === 'POST') {
       const body = request.postDataJSON();
       state.accountRequests.push({ method, path, body, headers });
-      const added = { ...poolAccount('acc-new', body.label || '', 1), available: null, monthly_allocation: null, pending: 'added', state: 'active' };
+      const added = { ...poolAccount('acc-new', body.label || '', 0), available: null, monthly_allocation: null, used_month: null,
+        reset_date: null, last_renewed_at: null, last_balance_at: null, pending: 'added', state: 'pending', routable: false };
       state.pool.push(added);
       return reply(200, { account: added, restart_required: true });
     }
@@ -240,7 +258,11 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
       if (!account) return reply(404, { error: { message: 'Unknown account' } });
       state.accountRequests.push({ method, path, body: request.postData() ? request.postDataJSON() : null, headers });
       if (action === 'balance' && method === 'POST') { account.last_balance_at = NOW; return reply(200, { account }); }
-      if (action === 'renew' && method === 'POST') { account.last_renewed_at = NOW; return reply(200, { ok: true, account }); }
+      if (action === 'renew' && method === 'POST') {
+        if (state.renewFails) return reply(200, { ok: false, error: 'session renewal failed: HTTP 401', account });
+        account.last_renewed_at = NOW;
+        return reply(200, { ok: true, error: null, account });
+      }
       if (!action && method === 'PATCH') { Object.assign(account, request.postDataJSON()); return reply(200, { account }); }
       if (!action && method === 'DELETE') { account.pending = 'removed'; return reply(200, { ok: true, pending: 'removed', restart_required: true }); }
       return reply(405, { error: { message: 'Method not allowed' } });

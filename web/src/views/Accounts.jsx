@@ -82,7 +82,8 @@ function AccountRow({ account, busy, onAction, onPatch, onDelete, lastEnabled })
   );
 }
 
-const EMPTY_FORM = { label: '', base: '', page_uuid: '', cookie: '', xsrf: '' };
+const EMPTY_FORM = { label: '', base: '', page_uuid: '', cookie: '', xsrf: '', provider_resource_name: '', openai_provider_resource_name: '' };
+const REQUIRED = ['base', 'page_uuid', 'cookie', 'xsrf'];
 
 function AddForm({ onCancel, onSubmit, busy }) {
   const [form, setForm] = useState(EMPTY_FORM);
@@ -105,8 +106,15 @@ function AddForm({ onCancel, onSubmit, busy }) {
           <input value={form.xsrf} onChange={set('xsrf')} type="password" spellCheck={false} autoComplete="off" /></label>
         <label className="field field-wide"><span>Cookie</span>
           <textarea value={form.cookie} onChange={set('cookie')} rows={3} spellCheck={false} autoComplete="off" /></label>
+        <label className="field"><span>Ресурс Anthropic (необязательно)</span>
+          <input value={form.provider_resource_name} onChange={set('provider_resource_name')} spellCheck={false} /></label>
+        <label className="field"><span>Ресурс OpenAI (необязательно)</span>
+          <input value={form.openai_provider_resource_name} onChange={set('openai_provider_resource_name')} spellCheck={false} /></label>
       </div>
-      <p className="muted small">Cookie и xsrf сохраняются только в config.json рядом с relay. Аккаунт подключится после перезапуска</p>
+      <p className="muted small">
+        Cookie и xsrf сохраняются только в config.json рядом с relay. Аккаунт подключится после перезапуска.
+        Ресурсы нужны, если у аккаунта другой адрес Retool: без них у него не будет маршрута к моделям
+      </p>
       <div className="form-actions">
         <Button onClick={onCancel}>Отмена</Button>
         <Button tone="primary" type="submit" disabled={!ready || busy}>{busy ? 'Сохранение' : 'Добавить'}</Button>
@@ -156,16 +164,20 @@ export default function Accounts({ apiKey, onUnauthorized }) {
     (result) => (kind === 'balance'
       ? { tone: 'success', title: 'Баланс обновлён', text: `${account.label || account.account}: ${fmtFixed(result?.account?.available, 2)}` }
       : result?.ok ? { tone: 'success', title: 'Сессия продлена', text: account.label || account.account }
-        : { tone: 'error', title: 'Сессия не продлена', text: result?.account?.error || 'Retool отклонил продление' }));
+        : { tone: 'error', title: 'Сессия не продлена', text: result?.error || result?.account?.error || 'Retool отклонил продление' }));
   const patch = (account) => (body) => run(account.account, 'Не сохранено',
     () => api(apiKey, `accounts/${account.account}`, { method: 'PATCH', body }), () => null);
   const remove = (account) => () => {
     if (!window.confirm(`Удалить аккаунт ${account.label || account.account} из config.json? Его cookie будут стёрты`)) return;
     run(account.account, 'Не удалено', () => api(apiKey, `accounts/${account.account}`, { method: 'DELETE', body: {} }),
-      () => ({ tone: 'warn', title: 'Аккаунт удалён', text: 'Исчезнет из пула после перезапуска relay' }));
+      (result) => (result?.pending === 'removed'
+        ? { tone: 'warn', title: 'Аккаунт удалён', text: 'Исчезнет из пула после перезапуска relay' }
+        : { tone: 'success', title: 'Аккаунт удалён', text: 'Он ещё не был подключён, перезапуск не нужен' }));
   };
   const add = (form) => run('_new', 'Не добавлено',
-    () => api(apiKey, 'accounts', { method: 'POST', body: Object.fromEntries(Object.entries(form).map(([k, v]) => [k, v.trim()])) }),
+    () => api(apiKey, 'accounts', { method: 'POST',
+      // Optional resource names are sent only when filled in.
+      body: Object.fromEntries(Object.entries(form).map(([k, v]) => [k, v.trim()]).filter(([k, v]) => v || REQUIRED.includes(k))) }),
     () => { setAdding(false); return { tone: 'success', title: 'Аккаунт добавлен', text: 'Подключится после перезапуска relay' }; });
 
   return (
