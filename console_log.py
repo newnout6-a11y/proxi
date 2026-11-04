@@ -11,10 +11,11 @@ import journal
 PALETTE = {"read": "36", "write": "33", "alert": "1;91", "success": "32",
            "request": "34", "model": "92", "balance": "32", "muted": "90"}
 LARGE_WRITE = 50_000
+LARGE_INPUT = 50_000
 WRITE_JUMP = 8_192
 _LOCK = threading.Lock()
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-_FIELDS = re.compile(r"\b(in|read|write|credits|balance|limit|spent)=([^\s]+)")
+_FIELDS = re.compile(r"\b(in|out|read|write|credits|balance|limit|spent)=([^\s]+)")
 
 
 def number(value, *, signed=False):
@@ -68,12 +69,15 @@ def render(line, *, color=None):
         return line
     if line.startswith("[err]") or " EXC " in line:
         return _paint(line, "alert", True)
-    alert = "[WRITE SPIKE" in line or "[WRITE HIGH" in line
+    write_alert = "[WRITE SPIKE" in line or "[WRITE HIGH" in line
+    input_alert = "[INPUT HIGH]" in line
 
     def field(match):
         key = match[1]
-        role = {"read": "read", "write": "alert" if alert else "write",
-                "credits": "model", "balance": "balance", "spent": "model"}.get(key, "muted")
+        role = {"read": "read", "write": "alert" if write_alert else "write",
+                "in": "alert" if input_alert else "muted",
+                "credits": "alert" if input_alert else "model",
+                "balance": "balance", "spent": "model"}.get(key, "muted")
         if match[2] == "?":
             role = "muted"
         elif key == "balance" and match[2].startswith("-"):
@@ -81,7 +85,8 @@ def render(line, *, color=None):
         return _paint(match[0], role, True)
 
     line = _FIELDS.sub(field, line)
-    line = re.sub(r"\[WRITE (?:SPIKE|HIGH)[^\]]*\]", lambda m: _paint(m[0], "alert", True), line)
+    line = re.sub(r"\[(?:WRITE (?:SPIKE|HIGH)|INPUT HIGH)[^\]]*\]",
+                  lambda m: _paint(m[0], "alert", True), line)
     line = re.sub(r"\b(?:MODEL|EFFORT):\s*\S+", lambda m: _paint(m[0], "model", True), line)
     line = re.sub(r"^\[([^\]]+)\]", lambda m: _paint(m[0], "request", True), line)
     match = re.match(r"(relay \S+ \S+ \S+ )(\d+)(.*)", line)
@@ -123,9 +128,14 @@ class CacheMonitor:
             elif written >= LARGE_WRITE:
                 marker = " [WRITE HIGH]"
             self.last_write = written
-        return "[%s] [cache] in=%s read=%s write=%s credits=%s%s" % (
+        uncached = number(usage.get("inputTokens"))
+        if uncached is not None and uncached >= LARGE_INPUT:
+            marker += " [INPUT HIGH]"
+        output = number(usage.get("outputTokens"))
+        output_note = " out=%s" % amount(output, tokens=True) if output is not None else ""
+        return "[%s] [cache] in=%s read=%s write=%s credits=%s%s%s" % (
             request_id, amount(usage.get("inputTokens"), tokens=True), amount(read, tokens=True),
-            amount(written, tokens=True), amount(usage.get("creditsUsed")), marker)
+            amount(written, tokens=True), amount(usage.get("creditsUsed")), output_note, marker)
 
 
 def balance_line(request_id, snapshot, spent=None, account=None):

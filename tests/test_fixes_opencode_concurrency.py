@@ -172,7 +172,7 @@ async def test_subagent_concurrent_branched_session_lease():
 # --- 3. Thinking Heartbeat in Direct Transport ---
 
 @pytest.mark.asyncio
-async def test_thinking_heartbeat_emitted_during_long_reasoning(monkeypatch):
+async def test_thinking_heartbeat_emitted_during_long_reasoning(monkeypatch, capsys):
     q = asyncio.Queue()
     # Feed start of thinking
     q.put_nowait('{"event":"content_block_start","type":"thinking"}')
@@ -200,6 +200,33 @@ async def test_thinking_heartbeat_emitted_during_long_reasoning(monkeypatch):
     types = [e.get("type") for e in events]
     assert "thinking_start" in types
     assert "thinking_heartbeat" in types
+    output = capsys.readouterr().out
+    assert "Waiting for upstream reasoning output" in output
+    assert "[thinking] started source=upstream event=content_block_start" in output
+    assert "actively reasoning" not in output
+
+
+@pytest.mark.asyncio
+async def test_no_thinking_indicator_before_an_upstream_thinking_signal(monkeypatch, capsys):
+    queue = asyncio.Queue()
+    queue.put_nowait('{"event":"ping"}')
+    session = type("S", (), {"thread_id": "not-thinking", "_cancelled": False})()
+    original_wait_for = asyncio.wait_for
+
+    async def short_wait_for(coroutine, timeout):
+        return await original_wait_for(coroutine, timeout=0.02)
+
+    async def finish():
+        await asyncio.sleep(0.08)
+        queue.put_nowait('{"event":"end_of_stream"}')
+
+    monkeypatch.setattr(asyncio, "wait_for", short_wait_for)
+    producer = asyncio.create_task(finish())
+    events = [event async for event in direct._drain({}, session, queue, [], [])]
+    await producer
+    assert not any(event.get("type") in ("thinking_start", "thinking_heartbeat") for event in events)
+    output = capsys.readouterr().out
+    assert "[thinking]" not in output and "reasoning output" not in output
 
 
 # --- 4. Multi-Account Pool & Balancing ---

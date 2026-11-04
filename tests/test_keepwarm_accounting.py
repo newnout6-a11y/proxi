@@ -68,6 +68,59 @@ def test_truncated_keepwarm_without_usage_cannot_be_assumed_free(monkeypatch):
     assert value.balance_snapshot()["unreported_usage"] is True and value.session_used == 0
 
 
+def test_keepwarm_reads_late_usage_after_a_long_thinking_stream(monkeypatch):
+    value = manager()
+    events = [{"event": "content_block_delta", "type": "thinking", "partialThinking": "x"}] * 300
+    events += [{"event": "metadata", "usage": {"creditsUsed": 0.25, "promptTokensReadFromCache": 700000}},
+               {"event": "end_of_stream"}]
+    monkeypatch.setattr(direct.urllib.request, "urlopen", lambda *_a, **_kw: response(events))
+    assert direct._ping(session(value), {"model": "claude-opus-5-5"}) == 0.25
+    assert value.session_used == 0.25
+    assert not value.balance_snapshot().get("unreported_usage")
+
+
+def test_cancelled_generation_before_usage_marks_billing_unknown(monkeypatch):
+    value = manager()
+    target = session(value)
+    entered, release = threading.Event(), threading.Event()
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def __iter__(self):
+            entered.set()
+            assert release.wait(3)
+            return iter(())
+
+        def close(self):
+            release.set()
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", lambda *_a, **_kw: Response())
+
+    async def consume():
+        async def stream():
+            return [event async for event in direct._stream_body({}, target, {"model": "claude-opus-5-5"})]
+
+        task = asyncio.create_task(stream())
+        try:
+            deadline = time.monotonic() + 2
+            while not entered.is_set():
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+            target._cancelled = True
+            target._active_direct_abort()
+            await asyncio.wait_for(task, 2)
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(consume())
+    assert value.session_used == 0
+    assert value.balance_snapshot()["unreported_usage"] is True
+
+
 @pytest.mark.parametrize("cost", [None, True, -1, "NaN", "Infinity", "invalid"])
 def test_unreported_or_invalid_keepwarm_cost_is_unknown_and_never_debited(monkeypatch, cost):
     value = manager()

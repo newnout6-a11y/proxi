@@ -3,6 +3,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import native_history
 import math
 import socket
 import urllib.parse
@@ -67,6 +68,7 @@ class Parsed:
         self.prompt = ""
         self.message_chunks = []
         self.message_fingerprints = None
+        self.native_messages = None
         self.model = ""
         self.entry = {}
         self.effort = None
@@ -629,6 +631,7 @@ def parse_chat(data, cfg):
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.system, parsed.prompt, parsed.message_chunks = system, "\n\n".join(text_chunks), chunks
     parsed.message_fingerprints = _message_fingerprints(messages)
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
                          or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
@@ -660,6 +663,10 @@ def parse_responses(data, cfg):
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     parsed.message_fingerprints = _message_fingerprints(messages)
+    native_input = ([message for item, message in zip(raw_input, messages)
+                     if item.get("type") != "reasoning" or "role" in item]
+                    if isinstance(raw_input, list) else messages)
+    parsed.native_messages = native_history.client_messages(native_input, _extract_image_data)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
@@ -683,6 +690,7 @@ def parse_anthropic(data, cfg):
     if declared_system:
         parsed.system = _blocks_to_text(declared_system, 0, "system")
     parsed.message_fingerprints = _message_fingerprints(messages)
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data)
     parsed.stream = _opt_bool(data, "stream")
     if data.get("max_tokens") is None:
         raise bad_request("'max_tokens' is required for the Anthropic dialect", param="max_tokens")
