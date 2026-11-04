@@ -6,6 +6,8 @@ import { Dot, Page } from '../motion.jsx';
 import { Button, Empty, Tag, Toggle, useToast } from '../ui.jsx';
 import { ACCOUNT_STATE } from '../catalog.js';
 import { fmtAgo, fmtDay, fmtFixed, fmtInt, isNum, plural } from '../format.js';
+import { PoolScene } from '../stage/PoolScene.jsx';
+import { AddGuide, GuideNum } from '../stage/AddGuide.jsx';
 
 const pct = (share) => `${Math.max(0, Math.min(1, share)) * 100}%`;
 
@@ -95,21 +97,27 @@ function AddForm({ onCancel, onSubmit, busy }) {
         <h2>Новый аккаунт</h2>
         <button type="button" className="icon-button ghost" aria-label="Закрыть форму" onClick={onCancel}><X size={16} strokeWidth={1.5} /></button>
       </div>
-      <div className="form-grid">
-        <label className="field"><span>Название</span>
-          <input value={form.label} onChange={set('label')} maxLength={40} placeholder="например, запасной" /></label>
-        <label className="field"><span>Адрес Retool</span>
-          <input value={form.base} onChange={set('base')} placeholder="https://<tenant>.retool.com" spellCheck={false} /></label>
-        <label className="field"><span>page_uuid приложения</span>
-          <input value={form.page_uuid} onChange={set('page_uuid')} spellCheck={false} /></label>
-        <label className="field"><span>xsrf</span>
-          <input value={form.xsrf} onChange={set('xsrf')} type="password" spellCheck={false} autoComplete="off" /></label>
-        <label className="field field-wide"><span>Cookie</span>
-          <textarea value={form.cookie} onChange={set('cookie')} rows={3} spellCheck={false} autoComplete="off" /></label>
-        <label className="field"><span>Ресурс Anthropic (необязательно)</span>
-          <input value={form.provider_resource_name} onChange={set('provider_resource_name')} spellCheck={false} /></label>
-        <label className="field"><span>Ресурс OpenAI (необязательно)</span>
-          <input value={form.openai_provider_resource_name} onChange={set('openai_provider_resource_name')} spellCheck={false} /></label>
+      <div className="add-layout">
+        <div className="form-grid">
+          <label className="field"><span><GuideNum n={1} />Адрес Retool</span>
+            <input value={form.base} onChange={set('base')} placeholder="https://<tenant>.retool.com" spellCheck={false} /></label>
+          <label className="field"><span><GuideNum n={2} />page_uuid приложения</span>
+            <input value={form.page_uuid} onChange={set('page_uuid')} spellCheck={false} /></label>
+          <label className="field field-wide"><span><GuideNum n={3} />Cookie</span>
+            <textarea value={form.cookie} onChange={set('cookie')} rows={3} spellCheck={false} autoComplete="off" /></label>
+          <label className="field"><span><GuideNum n={4} />xsrf</span>
+            <input value={form.xsrf} onChange={set('xsrf')} type="password" spellCheck={false} autoComplete="off" /></label>
+          <label className="field"><span>Название</span>
+            <input value={form.label} onChange={set('label')} maxLength={40} placeholder="например, запасной" /></label>
+          <label className="field"><span>Ресурс Anthropic (необязательно)</span>
+            <input value={form.provider_resource_name} onChange={set('provider_resource_name')} spellCheck={false} /></label>
+          <label className="field"><span>Ресурс OpenAI (необязательно)</span>
+            <input value={form.openai_provider_resource_name} onChange={set('openai_provider_resource_name')} spellCheck={false} /></label>
+        </div>
+        <figure className="add-guide-figure">
+          <AddGuide />
+          <figcaption className="muted small">Откройте приложение в редакторе Retool, затем DevTools → Network и любой запрос к Retool</figcaption>
+        </figure>
       </div>
       <p className="muted small">
         Cookie и xsrf сохраняются только в config.json рядом с relay. Аккаунт подключится после перезапуска.
@@ -202,10 +210,12 @@ export default function Accounts({ apiKey, onUnauthorized }) {
       {adding && <AddForm busy={!!busy._new} onCancel={() => setAdding(false)} onSubmit={add} />}
       <section className="panel pool">
         <div className="pool-help">
-          <p className="muted small">
-            Новые диалоги идут на включённый аккаунт с наименьшим приоритетом, при равенстве — на менее загруженный.
-            Аккаунт ниже порога резерва получает запросы, только когда все ниже порога
-          </p>
+          <PoolScene />
+          <dl className="pool-rules">
+            <div><dt>Порядок</dt><dd>Новый диалог получает включённый аккаунт с наименьшим приоритетом, при равенстве — менее загруженный. Начатый диалог остаётся на своём аккаунте</dd></div>
+            <div><dt>Резерв</dt><dd>Аккаунт с балансом ниже {isNum(data?.limits?.min_account_balance) ? fmtInt(data.limits.min_account_balance) : 'порога'} кредитов отходит в резерв и получает запросы, только когда ниже порога все</dd></div>
+            <div><dt>Выключен</dt><dd>Не получает запросов, не продлевается и не прогревает кэш. Его диалоги переезжают на другие аккаунты</dd></div>
+          </dl>
         </div>
         {accounts.length > 0 && (
           <ul className="pool-list">

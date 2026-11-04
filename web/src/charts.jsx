@@ -40,12 +40,12 @@ function timeLabels(buckets, plotW) {
   return n ? fractions.map((f) => Math.min(n - 1, Math.round(f * (n - 1)))) : [];
 }
 
-function useHover(n, step) {
+function useHover(n, plotW) {
   const [hover, setHover] = useState(null);
   const onMove = (event) => {
     if (!n) return;
     const box = event.currentTarget.getBoundingClientRect();
-    const i = Math.floor((event.clientX - box.left - PAD.l) / step);
+    const i = Math.round(((event.clientX - box.left - PAD.l) / plotW) * (n - 1));
     setHover(i < 0 || i >= n ? null : i);
   };
   return [hover, onMove, () => setHover(null)];
@@ -56,7 +56,40 @@ function Tip({ W, x, children }) {
   return <dl className="chart-tip" style={flip ? { right: W - x + 12 } : { left: x + 12 }}>{children}</dl>;
 }
 
-/** Credits spent in each bucket: bars rise with a heavy turn and fall back with a light one. */
+/**
+ * Monotone cubic through the points (Fritsch–Carlson): smooth, but it never
+ * overshoots, so a quiet minute stays at zero instead of dipping below the axis.
+ */
+function smooth(points) {
+  const n = points.length;
+  if (!n) return '';
+  if (n === 1) return `M${points[0][0]},${points[0][1]}`;
+  const dx = [], slope = [];
+  for (let i = 0; i < n - 1; i += 1) {
+    dx.push(points[i + 1][0] - points[i][0]);
+    slope.push((points[i + 1][1] - points[i][1]) / (dx[i] || 1));
+  }
+  const t = [slope[0]];
+  for (let i = 1; i < n - 1; i += 1) t.push(slope[i - 1] * slope[i] <= 0 ? 0 : (slope[i - 1] + slope[i]) / 2);
+  t.push(slope[n - 2]);
+  for (let i = 0; i < n - 1; i += 1) {
+    if (slope[i] === 0) { t[i] = 0; t[i + 1] = 0; continue; }
+    const a = t[i] / slope[i], b = t[i + 1] / slope[i];
+    const h = a * a + b * b;
+    if (h > 9) { const k = 3 / Math.sqrt(h); t[i] = k * a * slope[i]; t[i + 1] = k * b * slope[i]; }
+  }
+  let d = `M${points[0][0].toFixed(1)},${points[0][1].toFixed(1)}`;
+  for (let i = 0; i < n - 1; i += 1) {
+    const [x0, y0] = points[i], [x1, y1] = points[i + 1], h = dx[i] / 3;
+    d += `C${(x0 + h).toFixed(1)},${(y0 + t[i] * h).toFixed(1)} ${(x1 - h).toFixed(1)},${(y1 - t[i + 1] * h).toFixed(1)} ${x1.toFixed(1)},${y1.toFixed(1)}`;
+  }
+  return d;
+}
+
+const areaUnder = (line, points, baseY) => (points.length
+  ? `${line}L${points[points.length - 1][0].toFixed(1)},${baseY}L${points[0][0].toFixed(1)},${baseY}Z` : '');
+
+/** Credits spent per bucket as a line: it climbs with a heavy turn and falls back with a light one. */
 export function SpendChart({ buckets, windowSec }) {
   const [ref, size] = useSize();
   const n = buckets.length;
@@ -64,8 +97,7 @@ export function SpendChart({ buckets, windowSec }) {
   const H = Math.max(size.h, 200);
   const plotW = Math.max(10, W - PAD.l - PAD.r);
   const plotH = H - PAD.t - PAD.b;
-  const step = n ? plotW / n : plotW;
-  const [hover, onMove, onLeave] = useHover(n, step);
+  const [hover, onMove, onLeave] = useHover(n, plotW);
 
   const model = useMemo(() => {
     const values = buckets.map((b) => Number(b.credits) || 0);
@@ -78,13 +110,15 @@ export function SpendChart({ buckets, windowSec }) {
   const empty = !n || !model.total;
   const baseY = PAD.t + plotH + 0.5;
   const yAt = (v) => baseY - (v / model.max) * plotH;
-  const barW = Math.max(1, step * 0.7);
-  const xAt = (i) => PAD.l + (i + 0.5) * step;
+  const xAt = (i) => PAD.l + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2);
+  const points = model.values.map((v, i) => [xAt(i), yAt(v)]);
+  const line = smooth(points);
   const ticks = [model.max / 2, model.max];
   const labels = timeLabels(buckets, plotW);
   const active = hover !== null && buckets[hover] ? hover : null;
   const bucket = active !== null ? buckets[active] : null;
   const span = bucketLabel(windowSec, n);
+  const peakRight = !empty && xAt(model.peakIndex) > W - 120;
   const summary = empty ? 'Расхода за окно не было'
     : `Расход кредитов за каждые ${span}: всего ${fmtFixed(model.total, 2)}, максимум ${fmtFixed(model.peak, 2)}`;
 
@@ -98,21 +132,29 @@ export function SpendChart({ buckets, windowSec }) {
           </g>
         ))}
         <text className="c-label" x={PAD.l - 8} y={baseY + 4} textAnchor="end">0</text>
-        {!empty && model.values.map((v, i) => (v > 0 ? (
-          <rect key={buckets[i].t} className={`c-spend${i === model.peakIndex ? ' peak' : ''}${i === active ? ' on' : ''}`}
-            x={xAt(i) - barW / 2} y={yAt(v)} width={barW} height={Math.max(1, baseY - yAt(v))} />
-        ) : null))}
-        {!empty && model.average > 0 && (
-          <g>
-            <line className="c-average" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(model.average)) + 0.5} y2={Math.round(yAt(model.average)) + 0.5} />
-          </g>
+        {!empty && (
+          <>
+            <path className="c-spend-area" d={areaUnder(line, points, baseY)} />
+            <path className="c-spend-line" d={line} />
+            {model.average > 0 && (
+              <line className="c-average" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(model.average)) + 0.5} y2={Math.round(yAt(model.average)) + 0.5} />
+            )}
+            <circle className="c-peak" cx={xAt(model.peakIndex)} cy={yAt(model.peak)} r={4} />
+            <text className="c-label c-label-accent" x={xAt(model.peakIndex) + (peakRight ? -8 : 8)} y={yAt(model.peak) - 8}
+              textAnchor={peakRight ? 'end' : 'start'}>{fmtFixed(model.peak, 2)}</text>
+          </>
         )}
         <line className="c-axis" x1={PAD.l} x2={W - PAD.r} y1={baseY} y2={baseY} />
         {labels.map((i, j) => (
           <text key={`t${i}${j}`} className="c-label" x={xAt(i)} y={H - 8}
             textAnchor={j === 0 ? 'start' : j === labels.length - 1 ? 'end' : 'middle'}>{fmtShortTime(buckets[i].t)}</text>
         ))}
-        {bucket && <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={baseY} />}
+        {bucket && (
+          <g>
+            <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={baseY} />
+            <circle className="c-hover-dot" cx={xAt(active)} cy={yAt(model.values[active])} r={3.5} />
+          </g>
+        )}
       </svg>
       {empty && <p className="chart-empty">Расхода за окно не было</p>}
       {bucket && (
@@ -128,66 +170,91 @@ export function SpendChart({ buckets, windowSec }) {
   );
 }
 
-/** Prompt cache per bucket: read above the axis, write below, on one token scale. */
+/** A write is a spike when it is several times the window's usual write: the cache went cold and was rebuilt. */
+export function writeSpikes(buckets) {
+  const writes = buckets.map((b) => b.cache_write || 0);
+  const busy = writes.filter((w) => w > 0).sort((a, b) => a - b);
+  if (!busy.length) return new Set();
+  const median = busy[Math.floor(busy.length / 2)];
+  const threshold = Math.max(median * 4, 20000);
+  return new Set(writes.flatMap((w, i) => (w >= threshold ? [i] : [])));
+}
+
+/**
+ * Prompt cache as two lanes on one time axis: reads on top, writes below, each
+ * on its own scale. On a shared scale reads (millions) flatten writes to the
+ * axis; here a sudden write, the expensive moment, stands out and is marked.
+ */
 export function CacheChart({ buckets, windowSec }) {
   const [ref, size] = useSize();
   const n = buckets.length;
   const W = size.w;
-  const H = Math.max(size.h, 160);
+  const H = Math.max(size.h, 200);
   const plotW = Math.max(10, W - PAD.l - PAD.r);
-  const plotH = H - PAD.t - PAD.b;
-  const step = n ? plotW / n : plotW;
-  const [hover, onMove, onLeave] = useHover(n, step);
+  const gap = 20;
+  const laneH = (H - PAD.t - PAD.b - gap) / 2;
+  const [hover, onMove, onLeave] = useHover(n, plotW);
 
   const model = useMemo(() => {
-    const maxRead = Math.max(0, ...buckets.map((b) => b.cache_read || 0));
-    const maxWrite = Math.max(0, ...buckets.map((b) => b.cache_write || 0));
-    const readMax = niceMax(maxRead);
-    const writeMax = niceMax(maxWrite);
-    const split = Math.max(0.6, Math.min(0.86, readMax / (readMax + writeMax)));
-    return { maxRead, maxWrite, readMax, writeMax, split };
+    const reads = buckets.map((b) => b.cache_read || 0);
+    const writes = buckets.map((b) => b.cache_write || 0);
+    return { reads, writes, readMax: niceMax(Math.max(0, ...reads)), writeMax: niceMax(Math.max(0, ...writes)), spikes: writeSpikes(buckets) };
   }, [buckets]);
 
-  const axisY = Math.round(PAD.t + plotH * model.split) + 0.5;
-  const readH = axisY - PAD.t;
-  const writeH = PAD.t + plotH - axisY;
-  const k = Math.min(readH / model.readMax, writeH / model.writeMax);
-  const empty = !n || (!model.maxRead && !model.maxWrite);
-  const barW = Math.max(1, step * 0.7);
-  const xAt = (i) => PAD.l + (i + 0.5) * step;
+  const readBase = PAD.t + laneH + 0.5;
+  const writeTop = PAD.t + laneH + gap;
+  const writeBase = writeTop + laneH + 0.5;
+  const xAt = (i) => PAD.l + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2);
+  const readY = (v) => readBase - (v / model.readMax) * (laneH - 4);
+  const writeY = (v) => writeBase - (v / model.writeMax) * (laneH - 4);
+  const readPts = model.reads.map((v, i) => [xAt(i), readY(v)]);
+  const writePts = model.writes.map((v, i) => [xAt(i), writeY(v)]);
+  const readLine = smooth(readPts);
+  const writeLine = smooth(writePts);
+  const empty = !n || (!Math.max(0, ...model.reads) && !Math.max(0, ...model.writes));
   const labels = timeLabels(buckets, plotW);
   const active = hover !== null && buckets[hover] ? hover : null;
   const bucket = active !== null ? buckets[active] : null;
+  const spikes = [...model.spikes];
   const summary = empty ? 'Обращений к кэшу за окно не было'
-    : `Кэш за окно: прочитано ${fmtTokens(buckets.reduce((s, b) => s + (b.cache_read || 0), 0))}, `
-      + `записано ${fmtTokens(buckets.reduce((s, b) => s + (b.cache_write || 0), 0))}`;
+    : `Кэш за окно: прочитано ${fmtTokens(model.reads.reduce((s, v) => s + v, 0))}, записано ${fmtTokens(model.writes.reduce((s, v) => s + v, 0))}`
+      + (spikes.length ? `, всплесков записи: ${spikes.length}` : '');
 
   return (
-    <div className="chart-frame chart-frame-small" ref={ref}>
+    <div className="chart-frame chart-frame-cache" ref={ref}>
       <svg className="chart" width={W} height={H} role="img" aria-label={summary} onPointerMove={onMove} onPointerLeave={onLeave}>
-        {model.readMax * k <= readH + 1 && (
-          <g>
-            <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(axisY - model.readMax * k) + 0.5} y2={Math.round(axisY - model.readMax * k) + 0.5} />
-            <text className="c-label" x={PAD.l - 8} y={axisY - model.readMax * k + 4} textAnchor="end">{fmtTokens(model.readMax)}</text>
-          </g>
+        <text className="c-label" x={PAD.l - 8} y={PAD.t + 8} textAnchor="end">{fmtTokens(model.readMax)}</text>
+        <text className="c-label" x={PAD.l - 8} y={writeTop + 8} textAnchor="end">{fmtTokens(model.writeMax)}</text>
+        <text className="c-lane" x={PAD.l + 4} y={PAD.t + 10}>чтение</text>
+        <text className="c-lane" x={PAD.l + 4} y={writeTop + 10}>запись</text>
+        {!empty && (
+          <>
+            <path className="c-read-area" d={areaUnder(readLine, readPts, readBase)} />
+            <path className="c-read-line" d={readLine} />
+            <path className="c-write-area" d={areaUnder(writeLine, writePts, writeBase)} />
+            <path className="c-write-line" d={writeLine} />
+            {spikes.map((i) => (
+              <g key={`s${i}`} className="c-spike">
+                <circle cx={xAt(i)} cy={writeY(model.writes[i])} r={4} />
+                <text className="c-label c-label-accent" x={xAt(i) + (xAt(i) > W - 120 ? -8 : 8)} y={writeY(model.writes[i]) + 4}
+                  textAnchor={xAt(i) > W - 120 ? 'end' : 'start'}>+{fmtTokens(model.writes[i])}</text>
+              </g>
+            ))}
+          </>
         )}
-        <text className="c-label" x={PAD.l - 8} y={axisY + 4} textAnchor="end">0</text>
-        {!empty && buckets.map((b, i) => {
-          const r = (b.cache_read || 0) * k;
-          const w = (b.cache_write || 0) * k;
-          return (
-            <g key={b.t} className={i === active ? 'on' : undefined}>
-              {r > 0 && <rect className="c-read" x={xAt(i) - barW / 2} y={axisY - r} width={barW} height={r} />}
-              {w > 0 && <rect className="c-write" x={xAt(i) - barW / 2} y={axisY + 1} width={barW} height={w} />}
-            </g>
-          );
-        })}
-        <line className="c-axis" x1={PAD.l} x2={W - PAD.r} y1={axisY} y2={axisY} />
+        <line className="c-axis" x1={PAD.l} x2={W - PAD.r} y1={readBase} y2={readBase} />
+        <line className="c-axis" x1={PAD.l} x2={W - PAD.r} y1={writeBase} y2={writeBase} />
         {labels.map((i, j) => (
           <text key={`t${i}${j}`} className="c-label" x={xAt(i)} y={H - 8}
             textAnchor={j === 0 ? 'start' : j === labels.length - 1 ? 'end' : 'middle'}>{fmtShortTime(buckets[i].t)}</text>
         ))}
-        {bucket && <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={PAD.t + plotH} />}
+        {bucket && (
+          <g>
+            <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={writeBase} />
+            <circle className="c-hover-dot" cx={xAt(active)} cy={readY(model.reads[active])} r={3.5} />
+            <circle className="c-hover-dot" cx={xAt(active)} cy={writeY(model.writes[active])} r={3.5} />
+          </g>
+        )}
       </svg>
       {empty && <p className="chart-empty">Обращений к кэшу за окно не было</p>}
       {bucket && (
@@ -196,6 +263,7 @@ export function CacheChart({ buckets, windowSec }) {
           <dd><span>прочитано</span><b className="num">{fmtTokens(bucket.cache_read)}</b></dd>
           <dd><span>записано</span><b className="num">{fmtTokens(bucket.cache_write)}</b></dd>
           <dd><span>без кэша</span><b className="num">{fmtTokens(bucket.input)}</b></dd>
+          {model.spikes.has(active) && <dd className="tip-note">кэш записан заново</dd>}
         </Tip>
       )}
     </div>

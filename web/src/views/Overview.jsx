@@ -210,8 +210,9 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
           <div className="panel-head">
             <h2>Кэш промпта</h2>
             <ul className="legend">
-              <li><i className="lg-read" />чтение над осью</li>
-              <li><i className="lg-write" />запись под осью</li>
+              <li><i className="lg-read-line" />чтение</li>
+              <li><i className="lg-write-line" />запись</li>
+              <li><i className="lg-spike" />всплеск записи: кэш остыл и записан заново</li>
             </ul>
           </div>
           <CacheChart buckets={buckets} windowSec={windowSec} />

@@ -1,7 +1,7 @@
 import { Stage } from './kit/stage.tsx';
 import { Bar, Text, Window } from './kit/window.tsx';
 import { useTheme } from '../theme.js';
-import { STAGE_TOKENS } from './LoginHero.jsx';
+import { stageTokens } from './LoginHero.jsx';
 
 // Card-size stills for empty states (stageshow static-card pattern): a window pinned
 // top-left, running off the right and bottom, real words only on the focal row.
@@ -11,7 +11,7 @@ function Still({ children, label }) {
   return (
     <div className="art" role="img" aria-label={label}>
       <Stage width={400} height={220} compact={{ below: 400, width: 320, height: 200 }}
-        theme={theme === 'light' ? 'light' : 'dark'} tokens={STAGE_TOKENS} className="art-stage">
+        theme={theme === 'light' ? 'light' : 'dark'} tokens={stageTokens(theme)} className="art-stage">
         {() => children}
       </Stage>
     </div>

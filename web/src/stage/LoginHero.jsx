@@ -18,6 +18,11 @@ export const STAGE_TOKENS = {
   '--ss-mono': "'IBM Plex Mono', Consolas, monospace",
 };
 
+// On a light ground the amber reads as text only in its dark shade (the app's --accent-text).
+export const stageTokens = (theme) => (theme === 'light'
+  ? { ...STAGE_TOKENS, '--ss-accent-text': '#8f5400', '--ss-accent-soft': 'rgba(245, 165, 36, 0.16)' }
+  : STAGE_TOKENS);
+
 const BALANCE = 1479.89;
 const COST = 0.84;
 const COMMAND = 'исправь падающий тест';
@@ -79,7 +84,7 @@ export function LoginHero() {
   const theme = useTheme();
   return (
     <Stage width={720} height={340} compact={{ below: 560, width: 358, height: 340 }} initial={initial} poster={POSTER}
-      script={script} theme={theme === 'light' ? 'light' : 'dark'} tokens={STAGE_TOKENS} className="lh">
+      script={script} theme={theme === 'light' ? 'light' : 'dark'} tokens={stageTokens(theme)} className="lh">
       {(s) => (
         <>
           <Window title="relay · журнал" className="lh-journal">

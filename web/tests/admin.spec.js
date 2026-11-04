@@ -84,14 +84,22 @@ test('summary shows the pool balance, forecast, spend per bucket, cache and mode
   await expect(page.locator('.recent-row')).toHaveCount(0);
 });
 
-test('spend chart draws one bar per busy bucket, so spend falls back after a peak', async ({ page }) => {
+test('spend is a line per bucket that falls back after its peak, and cache write spikes are marked', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
-  const heights = await page.locator('.c-spend').evaluateAll((bars) => bars.map((b) => Number(b.getAttribute('height'))));
-  expect(heights.length).toBeGreaterThan(10);
-  const peak = heights.indexOf(Math.max(...heights));
-  expect(heights.slice(peak + 1).some((h) => h < heights[peak])).toBe(true);
-  await expect(page.locator('.c-spend.peak')).toHaveCount(1);
+  // The line's points are the bucket ends of each curve segment: y grows downwards in SVG
+  const ys = await page.locator('.c-spend-line').evaluate((path) =>
+    [...path.getAttribute('d').matchAll(/(?:M|\s)(-?[\d.]+),(-?[\d.]+)(?=C|$)/g)].map((m) => Number(m[2])));
+  expect(ys.length).toBeGreaterThan(50);
+  const peak = ys.indexOf(Math.min(...ys));
+  expect(ys.slice(peak + 1).some((y) => y > ys[peak])).toBe(true);
+  await expect(page.locator('.c-peak')).toHaveCount(1);
+  await expect(page.locator('.c-spend-area')).toHaveCount(1);
+  // Reads and writes run on their own lanes; the cold-cache rewrites get the accent
+  await expect(page.locator('.c-read-line')).toHaveCount(1);
+  await expect(page.locator('.c-write-line')).toHaveCount(1);
+  await expect(page.locator('.c-spike')).toHaveCount(2);
+  await expect(page.locator('.c-spike').first()).toContainText('+');
 });
 
 test('metrics window switcher requests a 6 hour window', async ({ page }) => {

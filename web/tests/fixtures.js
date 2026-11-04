@@ -132,7 +132,10 @@ export function metricsFor(windowSec) {
       t, requests,
       credits: Number((load * 0.075 * (step / 60)).toFixed(4)),
       cache_read: Math.round(load * 4200 * (step / 60)),
-      cache_write: Math.round(load * pseudo(i + 40) * 520 * (step / 60)),
+      cache_write: (i === Math.floor(count * 0.55) || i === Math.floor(count * 0.82)) && !idle
+        // The cache went cold: the whole prefix is written again
+        ? Math.round(64000 * (step / 60))
+        : Math.round(load * pseudo(i + 40) * 520 * (step / 60)),
       input: Math.round(load * pseudo(i + 80) * 90 * (step / 60)),
       ttft: requests ? Math.round(1300 + pseudo(i + 7) * 2400) : null,
     };
