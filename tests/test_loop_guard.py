@@ -25,7 +25,7 @@ class Pool:
     def __init__(self, session):
         self.session = session
 
-    async def acquire(self):
+    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None, context_scope=None):
         return self.session
 
     async def release(self, session):

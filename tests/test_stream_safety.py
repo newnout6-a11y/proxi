@@ -270,7 +270,7 @@ def test_rejected_body_dump_lands_files_and_never_raises(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     direct._dump_rejected_body(b'{"messages": []}', '{"statusCode":400,"message":"Invalid request format"}')
     files = sorted(p.name for p in (tmp_path / "logs" / "upstream-400").iterdir())
-    assert len(files) == 2
+    assert len(files) == 3  # exact body, upstream detail, correlated client metadata
     body_file = tmp_path / "logs" / "upstream-400" / files[0]
     assert body_file.read_bytes() == b'{"messages": []}'
 

@@ -1,10 +1,16 @@
 """Configuration loading, environment overrides and validation."""
 import json
+from contextlib import contextmanager, nullcontext
+import hashlib
 import math
 import os
 import re
 import secrets
+import stat
+import sys
 import tempfile
+import threading
+import time
 
 from apierr import service_unavailable
 
@@ -53,6 +59,7 @@ DEFAULTS = {
     "thinking_placeholder": "Модель думает…\n",
     "enable_responses": True,
     "reasoning_effort": "auto",
+    "allow_effort_downgrade": False,
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
     "transport": "direct",
     "direct_cache": True,
@@ -61,6 +68,10 @@ DEFAULTS = {
     "cache_keepwarm_idle": 1800,
     "cache_keepwarm_during_turns": True,
     "cache_keepwarm_turn_offset": 200,
+    # Accounts below this confirmed balance leave the routing pool.
+    "min_account_balance": 20,
+    "account_balance_interval": 300,
+    "account_refresh_parallel": 3,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -71,6 +82,162 @@ REQUIRED = ("base", "page_uuid", "ua")
 
 # Cookie values that are just host names are not secrets.
 HOSTNAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
+
+_STORAGE_GUARD = threading.Lock()
+_STORAGE_LOCKS = {}
+_STORAGE_LOCAL = threading.local()
+
+
+@contextmanager
+def storage_lock(path, timeout=30, best_effort=False):
+    """Serialize the entire config transaction across threads and processes.
+
+    Keep the sidecar: deleting it after unlock can split concurrent writers
+    between different inodes. OS locks are released if the process exits.
+    `best_effort` runs without the OS lock when the sidecar cannot be created
+    (read-only directory); the in-process lock is still held.
+    """
+    path = os.path.normcase(os.path.realpath(os.fspath(path)))
+    with _STORAGE_GUARD:
+        lock = _STORAGE_LOCKS.setdefault(path, threading.RLock())
+    with lock:
+        held = getattr(_STORAGE_LOCAL, "held", set())
+        if path in held:
+            yield
+            return
+        try:
+            sidecar = open(path + ".lock", "a+b")
+        except OSError:
+            if not best_effort:
+                raise
+            sidecar = None
+        if sidecar is None:
+            yield
+            return
+        with sidecar as handle:
+            handle.seek(0, os.SEEK_END)
+            if not handle.tell():
+                handle.write(b"\0")
+                handle.flush()
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("configuration storage is busy") from None
+                    time.sleep(0.01)
+            _STORAGE_LOCAL.held = held | {path}
+            try:
+                yield
+            finally:
+                _STORAGE_LOCAL.held = held
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_file(path, saved):
+    """Atomic replace; callers hold storage_lock around read/merge/write."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                         prefix=".session-", suffix=".tmp", delete=False) as fh:
+            temporary = fh.name
+            try:
+                json.dump(saved, fh, ensure_ascii=False, indent=2, allow_nan=False)
+            except ValueError as exc:
+                raise service_unavailable("config contains values that cannot be saved as JSON: %s" % exc)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            # A read-only temp (copied from a read-only target) cannot be unlinked on Windows.
+            try:
+                os.chmod(temporary, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+            os.unlink(temporary)
+
+
+def renewal_lock(cfg):
+    """One renewal owner per persisted account, without locking other accounts' IO."""
+    path = cfg.get("_config_path")
+    if not path or not cfg.get("_persist_auth", False):
+        return nullcontext()
+    identity = cfg.get("account_id") or (cfg.get("base", "") + "/" + cfg.get("page_uuid", ""))
+    tag = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    return storage_lock(os.fspath(path) + ".auth-" + tag,
+                        timeout=max(30, cfg.get("upstream_timeout", 120) + 5))
+
+
+def _legacy_match(records, cfg):
+    """A record an external sign-in rewrote without account_id: accepted only when it is the
+    single record for this tenant/page. Another account on the same page makes it ambiguous."""
+    same_page = [item for item in records
+                 if str(item.get("base", "")).rstrip("/") == cfg["base"].rstrip("/")
+                 and item.get("page_uuid") == cfg.get("page_uuid")]
+    if len(same_page) == 1 and not same_page[0].get("account_id"):
+        return same_page[0]
+    return None
+
+
+def _account_record(saved, cfg):
+    """Exact stable ID, or an unambiguous legacy tenant/page. Never fall back."""
+    records = saved.get("accounts")
+    if isinstance(records, list):
+        records = [item for item in records if isinstance(item, dict)]
+        if cfg.get("account_id"):
+            matches = [item for item in records if item.get("account_id") == cfg["account_id"]]
+        else:
+            matches = [item for item in records
+                       if item.get("base", "").rstrip("/") == cfg["base"].rstrip("/")
+                       and item.get("page_uuid") == cfg.get("page_uuid")]
+        if len(matches) > 1:
+            raise ValueError("ambiguous account identity; reload configuration to assign account_id")
+        record = matches[0] if matches else None
+        if record is None and cfg.get("account_id"):
+            record = _legacy_match(records, cfg)
+    else:
+        record = saved
+        if cfg.get("account_id") and record.get("account_id") != cfg["account_id"]:
+            record = _legacy_match([record], cfg)
+    if record is None or (record.get("base") or saved.get("base", "")).rstrip("/") != cfg["base"].rstrip("/"):
+        return None
+    return record
+
+
+def _assign_account_ids(saved):
+    records = saved.get("accounts") if isinstance(saved.get("accounts"), list) else [saved]
+    seen = set()
+    changed = False
+    for record in records:
+        value = record.get("account_id")
+        if value is not None:
+            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) or value in seen:
+                raise service_unavailable("account_id must be a unique, nonempty identifier")
+            seen.add(value)
+    for record in records:
+        if not record.get("account_id"):
+            value = secrets.token_hex(16)
+            while value in seen:
+                value = secrets.token_hex(16)
+            record["account_id"] = value
+            seen.add(value)
+            changed = True
+    return changed
 
 
 def _read_file(path):
@@ -87,105 +254,70 @@ def _ensure_relay_key(cfg):
     key = os.environ.get("RELAY_API_KEY") or cfg.get("relay_api_key")
     if key:
         return key
-    if os.path.exists(KEY_PATH):
-        with open(KEY_PATH, encoding="utf-8") as fh:
+    key_path = os.path.join(os.path.dirname(cfg["_config_path"]), "relay_key.txt") if cfg.get("_config_path") else KEY_PATH
+    if os.path.exists(key_path):
+        with open(key_path, encoding="utf-8") as fh:
             key = fh.read().strip()
         if key:
             return key
     key = "relay-" + secrets.token_urlsafe(24)
-    with open(KEY_PATH, "w", encoding="utf-8") as fh:
+    with open(key_path, "w", encoding="utf-8") as fh:
         fh.write(key + "\n")
     return key
 
 
 def persist_auth(cfg):
-    """Atomically save rotated credentials without writing runtime defaults/secrets."""
+    """Merge only this account's rotation under a shared storage transaction."""
     path = cfg.get("_config_path")
     if not path or not cfg.get("_persist_auth", False):
         return
-    saved = _read_file(path)
-    acc_match = None
-    if isinstance(saved.get("accounts"), list):
-        for acc in saved["accounts"]:
-            if isinstance(acc, dict):
-                if cfg.get("page_uuid") and acc.get("page_uuid") == cfg.get("page_uuid"):
-                    acc_match = acc
-                    break
-                elif not cfg.get("page_uuid") and acc.get("base", "").rstrip("/") == cfg["base"].rstrip("/"):
-                    acc_match = acc
-                    break
-    expected_base = (acc_match.get("base") if acc_match and acc_match.get("base") else saved.get("base", "")).rstrip("/")
-    if expected_base != cfg["base"].rstrip("/"):
-        raise ValueError("session configuration origin changed")
-    disk_auth = (acc_match.get("cookie"), acc_match.get("xsrf")) if acc_match else (saved.get("cookie"), saved.get("xsrf"))
-    if disk_auth != cfg.get("_disk_auth", disk_auth):
-        raise ValueError("session configuration changed during renewal")
-    if not saved.get("accounts") or (not acc_match and cfg.get("page_uuid") == saved.get("page_uuid")):
-        saved.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
-    if isinstance(saved.get("accounts"), list):
-        for acc in saved["accounts"]:
-            if isinstance(acc, dict):
-                if cfg.get("page_uuid") and acc.get("page_uuid") == cfg.get("page_uuid"):
-                    acc["cookie"] = cfg["cookie"]
-                    acc["xsrf"] = cfg["xsrf"]
-                    break
-                elif not cfg.get("page_uuid") and acc.get("base", "").rstrip("/") == cfg["base"].rstrip("/"):
-                    acc["cookie"] = cfg["cookie"]
-                    acc["xsrf"] = cfg["xsrf"]
-                    break
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
-                                         prefix=".session-", suffix=".tmp", delete=False) as fh:
-            temporary = fh.name
-            json.dump(saved, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        try:
-            import stat as stat_module
-            os.chmod(temporary, stat_module.S_IMODE(os.stat(path).st_mode))
-        except OSError:
-            pass
-        os.replace(temporary, path)
+    with storage_lock(path):
+        saved = _read_file(path)
+        record = _account_record(saved, cfg)
+        if record is None:
+            raise ValueError("session account or origin changed")
+        disk_auth = (record.get("cookie"), record.get("xsrf"))
+        if disk_auth != cfg.get("_disk_auth", disk_auth) and disk_auth != (cfg["cookie"], cfg["xsrf"]):
+            raise ValueError("session configuration changed during renewal")
+        record.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
+        if cfg.get("account_id") and not record.get("account_id"):
+            record["account_id"] = cfg["account_id"]
+        _write_file(path, saved)
         cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
-    finally:
-        if temporary and os.path.exists(temporary):
-            os.unlink(temporary)
 
 
 def reload_auth(cfg):
     """Adopt a newer local session, including an externally completed sign-in."""
     if not cfg.get("_config_path") or not cfg.get("_persist_auth", False):
         return False
-    saved = _read_file(cfg["_config_path"])
-    acc_match = None
-    if isinstance(saved.get("accounts"), list):
-        for acc in saved["accounts"]:
-            if isinstance(acc, dict):
-                if cfg.get("page_uuid") and acc.get("page_uuid") == cfg.get("page_uuid"):
-                    acc_match = acc
-                    break
-                elif not cfg.get("page_uuid") and acc.get("base", "").rstrip("/") == cfg["base"].rstrip("/"):
-                    acc_match = acc
-                    break
-    target = acc_match if acc_match is not None else saved
-    base = target.get("base") or saved.get("base", "")
-    cookie = target.get("cookie")
-    xsrf = target.get("xsrf")
-    if (base.rstrip("/") != cfg["base"].rstrip("/")
-            or not cookie or not xsrf
-            or (cookie, xsrf) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"]))):
-        return False
-    cfg.update(cookie=cookie, xsrf=xsrf, _disk_auth=(cookie, xsrf),
-               cookie_values=[p.strip().split("=", 1)[1] for p in cookie.split(";") if "=" in p])
-    return True
+    with storage_lock(cfg["_config_path"]):
+        saved = _read_file(cfg["_config_path"])
+        target = _account_record(saved, cfg)
+        if target is None:
+            return False
+        cookie, xsrf = target.get("cookie"), target.get("xsrf")
+        if not cookie or not xsrf or (cookie, xsrf) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"])):
+            return False
+        cfg.update(cookie=cookie, xsrf=xsrf, _disk_auth=(cookie, xsrf),
+                   cookie_values=[p.strip().split("=", 1)[1] for p in cookie.split(";") if "=" in p])
+        if isinstance(cfg.get("_account_ref"), dict):
+            cfg["_account_ref"].update(cookie=cookie, xsrf=xsrf)
+        return True
 
 
 def load(path=CONFIG_PATH):
     """Load config, apply env overrides, fill defaults, validate."""
+    if not os.path.isfile(path):
+        # Fail before storage_lock: it would create a stray .lock next to a missing file.
+        _read_file(path)
+    with storage_lock(path, best_effort=True):
+        return _load(path)
+
+
+def _load(path):
     cfg = dict(DEFAULTS)
-    cfg.update(_read_file(path))
+    saved = _read_file(path)
+    cfg.update(saved)
     cfg["_config_path"] = os.path.abspath(path)
     cfg["_persist_auth"] = not (os.environ.get("RETOOL_COOKIE") or os.environ.get("RETOOL_XSRF"))
 
@@ -211,7 +343,7 @@ def load(path=CONFIG_PATH):
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
-                    "cache_keepwarm_turn_offset"):
+                    "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -219,6 +351,16 @@ def load(path=CONFIG_PATH):
 
     if cfg["session_refresh_interval"] < 0:
         raise service_unavailable("session_refresh_interval must be non-negative (0 disables keepalive)")
+    try:
+        cfg["min_account_balance"] = float(cfg["min_account_balance"])
+    except (TypeError, ValueError):
+        raise service_unavailable("min_account_balance must be a number")
+    if not math.isfinite(cfg["min_account_balance"]) or cfg["min_account_balance"] < 0:
+        raise service_unavailable("min_account_balance must be a finite non-negative number")
+    if cfg["account_balance_interval"] < 0 or cfg["account_refresh_parallel"] < 1:
+        raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
+    if type(cfg["allow_effort_downgrade"]) is not bool:
+        raise service_unavailable("allow_effort_downgrade must be a boolean")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit"):
         if cfg[key] < 0:
             raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
@@ -277,6 +419,10 @@ def load(path=CONFIG_PATH):
         raise service_unavailable("transport must be 'direct' (the legacy 'agent' WebSocket transport is disabled)")
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
         raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
+    if cfg.get("reasoning_effort") not in (None, "auto"):
+        import models
+        models.resolve_tolerant(cfg["model"], cfg["reasoning_effort"],
+                                strict=cfg["strict_models"], allow_downgrade=cfg["allow_effort_downgrade"])
 
     workspace = cfg.get("workspace_root") or os.getcwd()
     # Resolve symlinks/junctions so escapes are visible.
@@ -302,4 +448,14 @@ def load(path=CONFIG_PATH):
                     cookie_vals.append(val)
     cfg["cookie_values"] = cookie_vals
     cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
+    changed = _assign_account_ids(saved)
+    if not isinstance(saved.get("accounts"), list):
+        cfg["account_id"] = saved["account_id"]
+    if changed and cfg["_persist_auth"]:
+        try:
+            _write_file(path, saved)
+        except OSError as exc:
+            # Read-only config: the generated ids live in memory until the next writable start.
+            print("warning: cannot save account_id to %s (%s); ids are kept in memory" % (
+                path, type(exc).__name__), file=sys.stderr)
     return cfg

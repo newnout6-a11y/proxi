@@ -61,6 +61,7 @@ def _schema():
         "show_thinking": "Передавать мышление модели", "project_context": "Контекст проекта",
         "show_exec_output": "Вывод локальных команд",
         "cache_keepwarm_during_turns": "Прогрев кэша во время длинных ходов",
+        "allow_effort_downgrade": "Разрешать приближение неподдерживаемого effort",
     }.items():
         fields[key] = {"type": "boolean", "label": label}
     for key, label, minimum, maximum in [
@@ -240,13 +241,18 @@ class Admin:
             for refresher_lock in {id(r._lock): r._lock for r in
                                    (getattr(b, "refresher", None) for b in backends) if r}.values():
                 locks.enter_context(refresher_lock)
+            try:
+                locks.enter_context(config.storage_lock(path))
+            except TimeoutError:
+                raise apierr.service_unavailable("Relay settings are busy: configuration storage is locked")
             saved = self._saved()
             desired = self._settings(saved)["settings"]
             candidate = {**desired, **changes}
             if candidate["session_mode"] == "shared" and not (saved.get("thread_id") or self.cfg.get("thread_id")):
                 raise apierr.bad_request("shared mode requires a configured thread_id", param="session_mode")
             if candidate["reasoning_effort"] != "auto":
-                models.resolve(candidate["model"], candidate["reasoning_effort"], strict=True)
+                models.resolve_tolerant(candidate["model"], candidate["reasoning_effort"], strict=True,
+                                        allow_downgrade=candidate["allow_effort_downgrade"])
             changed = [key for key, value in changes.items() if desired[key] != value]
             temporary = None
             try:

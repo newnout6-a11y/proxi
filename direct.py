@@ -5,17 +5,23 @@ plain HTTP POST. The stable system head is sent as a cached block so a large pro
 context is billed once and reused, keeping time-to-first-token flat.
 """
 import asyncio
+import contextvars
 import hashlib
 import json
 import pathlib
+import re
 import socket
+import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 
 import apierr
 import credits
 import journal
+import client_context
+import console_log
 import models as model_catalog
 
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
@@ -592,18 +598,18 @@ def _ping(session, body):
     metadata event), or None when the stream ended without reporting them."""
     payload = dict(body)
     payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
-    model_name = payload.get("model")
-    entry = model_catalog._BY_ID.get(model_name)
-    levels = entry.get("reasoning_effort_levels") or () if entry else ()
-    if levels:
-        payload["reasoningEffort"] = "low" if "low" in levels else levels[0]
-    else:
-        payload["reasoningEffort"] = "low"
+    # Effort can be part of the provider cache scope. Preserve the exact request
+    # settings rather than replacing max with low during a cache refresh.
+    headers = session.backend.headers()
+    headers["content-type"] = "application/json"
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                      data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
-                                     headers=session.backend.headers(), method="POST")
+                                     headers=headers, method="POST")
     response = urllib.request.urlopen(request, timeout=120)
     actual_credits = None
+    complete = False
+    billing_id = "keepwarm:" + uuid.uuid4().hex
+    warm_usage = {}
     try:
         for index, raw in enumerate(response):
             line = raw.strip()
@@ -615,117 +621,151 @@ def _ping(session, body):
                 continue
             if not isinstance(event, dict):
                 continue
-            if event.get("event") == "error":
-                # A failed ping must not be reported as a refreshed TTL.
-                raise _error_from_event(event)
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            warm_usage.update(usage)
             if usage.get("creditsUsed") is not None:
-                actual_credits = float(usage["creditsUsed"])
+                reported = console_log.number(usage["creditsUsed"])
+                if reported is not None:
+                    actual_credits = reported
+            if event.get("event") == "error":
+                # Preserve any billed usage attached to the error, without claiming a refreshed TTL.
+                raise _error_from_event(event)
             if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
+                complete = True
                 break
             if index >= 200:
                 break
     finally:
-        response.close()
+        try:
+            response.close()
+        finally:
+            session._last_warm_usage = warm_usage
+            # Run in the worker, which can outlive a cancelled scheduler/lease.
+            # Multiple metadata snapshots belong to this ONE billed ping.
+            manager = getattr(session, "_credits_manager", None)
+            if actual_credits is not None:
+                session._keepwarm_cost = getattr(session, "_keepwarm_cost", 0.0) + actual_credits
+                if manager is not None:
+                    manager.record_turn(billing_id, actual_credits)
+            else:
+                mark_unknown = getattr(manager, "mark_usage_unknown", None)
+                if mark_unknown:
+                    mark_unknown()
+            try:
+                request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "keepwarm"
+                monitor = getattr(session, "_console_warm_cache_monitor", None)
+                if monitor is None:
+                    monitor = session._console_warm_cache_monitor = console_log.CacheMonitor()
+                console_log.write(monitor.line(request_id, warm_usage, sample_id=billing_id,
+                                              scope=(body.get("model"), body.get("openAICacheKey")))
+                                  + " [keepwarm] " + client_context.label())
+                snapshot = getattr(manager, "balance_snapshot", None)
+                if snapshot:
+                    console_log.write(console_log.balance_line(request_id, snapshot(), actual_credits) + " [keepwarm]")
+                journal.emit("cache.keepwarm_usage", "Стоимость запроса прогрева", "info",
+                             billing_id=billing_id, model=body.get("model"), source="relay",
+                             request_purpose="cache-keepwarm", actual_credits=actual_credits,
+                             complete=complete, usage=warm_usage)
+            except Exception:  # noqa: BLE001 - reporting must not mask the ping's own outcome
+                pass
+    if not complete:
+        raise apierr.upstream_error("cache refresh ended without end_of_stream")
     return actual_credits
 
 
 async def _keepwarm(session, cfg):
-    """Hold the provider cache open while a conversation is in use.
+    """Refresh active and idle prefixes, scheduling from request starts.
 
-    Two refresh modes. Between turns: a ping every `cache_keepwarm_seconds`.
-    During a long turn (opt-out via `cache_keepwarm_during_turns=false`): one
-    anchored ping at `turn_start + cache_keepwarm_turn_offset` seconds — the
-    upstream KV TTL is 5 minutes measured from the start of the request, so a
-    310s+ generation would otherwise expire the prefix mid-turn and the next
-    turn would rewrite the whole context (30+ credits). A ping reads the still-
-    alive prefix (~0.05x price), which refreshes the TTL for the next turn."""
+    Only one ping runs per session. Active turns get their first refresh at
+    the configured offset, then at most every 240s (inside the 5-minute TTL).
+    Failures back off; an unknown cache result is never reported as a hit.
+    """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
     if interval <= 0:
         return
     idle = float(cfg.get("cache_keepwarm_idle", 1800) or 1800)
     during_turns = bool(cfg.get("cache_keepwarm_during_turns", True))
     turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), 285.0)
-    turn_seq = 0
-    during = False
+    active_interval = min(interval, 240.0)
+    scheduled_seq = None
+    next_turn_ping = 0.0
+    retry_at = 0.0
     while True:
+        context_token = client_context.bind({})
         try:
+            await asyncio.sleep(0.05)
+            now = time.time()
             busy = bool(getattr(session, "_busy", False))
-            turn_started = getattr(session, "_turn_started_at", 0) or 0
-            pinged = bool(getattr(session, "_turn_pinged", False))
-            during = (during_turns and busy and turn_started and not pinged
-                      and 0.0 <= time.time() - turn_started <= 285.0)
-            if during:
-                # Anchored to the turn start: sleep out the rest of the offset.
-                await asyncio.sleep(max(0.05, turn_started + turn_offset - time.time()))
-            else:
-                await asyncio.sleep(1.0)
-            busy = bool(getattr(session, "_busy", False))
-            turn_started = getattr(session, "_turn_started_at", 0) or 0
-            during = (during_turns and busy and turn_started and not pinged
-                      and turn_offset <= time.time() - turn_started <= 285.0)
+            started = getattr(session, "_turn_started_at", 0) or 0
+            seq = getattr(session, "_turn_seq", 0)
+            if seq != scheduled_seq:
+                scheduled_seq = seq
+                next_turn_ping = started + turn_offset
             last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
-            if time.time() - last_req > idle:
+            if not busy and now - last_req > idle:
                 return
             body = getattr(session, "_warm_body", None)
-            if during and getattr(session, "_turn_body", None):
-                # Ping the ACTIVE turn's body: it carries this turn's newest cache
-                # breakpoint and exists on a session's very first turn.
-                body = session._turn_body
-            if not body:
-                continue
-            if not during:
-                if busy or getattr(session, "_warm_at", 0) and time.time() - getattr(session, "_warm_at", 0) < interval:
+            identity = getattr(session, "_warm_identity", None) or {}
+            if busy:
+                if not during_turns or not started:
+                    await asyncio.sleep(0.95)
                     continue
-            was_during = during
-            turn_seq = getattr(session, "_turn_seq", 0)
-            actual = await asyncio.to_thread(_ping, session, body)
-            if was_during and getattr(session, "_turn_seq", 0) == turn_seq:
-                # A late ping must not mark a NEWER turn as already pinged.
-                session._turn_pinged = True
-            session._warm_at = time.time()
-            session._warm_failures = 0
-            prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
-            est_credits = prefix_tokens * credits.RATE_CACHE_READ
-            session._keepwarm_cost = round(getattr(session, "_keepwarm_cost", 0.0)
-                                           + (actual if actual is not None else est_credits), 4)
-            if during:
-                # The user asked to SEE the mid-turn TTL refresh: console always,
-                # journal at info level (idle pings stay debug).
-                turn_age = round(time.time() - turn_started)
-                paid = actual if actual is not None else round(est_credits, 2)
-                print(f"[warm] TTL продлён во время хода: +{turn_age}s от начала, "
-                      f"кэш-чтение {paid} credits, всего {session._keepwarm_cost}", flush=True)
-                journal.emit("cache.keepwarm", "Прогрев кэша во время хода: TTL продлён", "info",
-                             model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
-                             during_turn=True, turn_age_seconds=turn_age,
-                             prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
-                             actual_credits=actual, credits_total=session._keepwarm_cost)
+                turn_body = getattr(session, "_turn_body", None)
+                if turn_body:
+                    body = turn_body
+                    identity = getattr(session, "_turn_identity", None) or {}
+                due = max(next_turn_ping, retry_at)
             else:
-                journal.emit("cache.keepwarm", "Префикс кэша прогрет", "debug", model=body.get("model"),
-                             thread=journal.tag(getattr(session, "thread_id", None)),
-                             prefix_tokens=prefix_tokens, est_credits=round(est_credits, 4),
-                             actual_credits=actual, credits_total=session._keepwarm_cost)
-            if cfg.get("direct_debug"):
-                print("[warm] prefix refreshed", flush=True)
+                due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
+            if not body:
+                await asyncio.sleep(0.95)
+                continue
+            if now < due:
+                await asyncio.sleep(min(0.95, max(0.05, due - now)))
+                continue
+            # The scheduler spans turns: bind the owner of this exact body,
+            # snapshotting before to_thread so a following turn cannot relabel it.
+            client_context.bind(identity)
+            ping_started = now
+            actual = await asyncio.to_thread(_ping, session, body)
+            if busy and getattr(session, "_turn_seq", 0) == seq:
+                session._turn_pinged = True
+                next_turn_ping = ping_started + active_interval
+            session._warm_at = ping_started
+            session._warm_failures = 0
+            retry_at = 0.0
+            prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
+            estimate = prefix_tokens * credits.RATE_CACHE_READ
+            if actual is None:
+                session._keepwarm_estimated_cost = round(
+                    getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
+            usage = getattr(session, "_last_warm_usage", {})
+            touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
+                "promptTokensReadFromCache", "promptTokensWrittenToCache"))
+            journal.emit("cache.keepwarm",
+                         "Кэш прочитан или записан при прогреве" if touched else
+                         "Запрос прогрева завершён; использование кэша не подтверждено",
+                         "info" if busy else "debug",
+                         model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
+                         during_turn=busy, turn_age_seconds=round(ping_started - started) if busy else None,
+                         prefix_tokens=prefix_tokens, est_credits=round(estimate, 4),
+                         actual_credits=actual, credits_total=getattr(session, "_keepwarm_cost", 0.0),
+                         cache_verified=touched, usage=usage)
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            # A transient upstream/network error must not kill the warm cycle for
-            # the rest of the idle window. A persistent failure (e.g. revoked
-            # session) stops the cycle after several attempts — the next real
-            # request recreates it. A failed during-turn ping is not retried
-            # inside the same turn (one upstream request per turn, no 429 feed).
-            if during and getattr(session, "_turn_seq", 0) == turn_seq:
+            if busy and getattr(session, "_turn_seq", 0) == seq:
                 session._turn_pinged = True
             failures = getattr(session, "_warm_failures", 0) + 1
             session._warm_failures = failures
             if failures >= 5:
-                journal.emit("cache.keepwarm",
-                             "Прогрев остановлен после %d неудач подряд: %s" % (failures, str(exc)[:200]), "warn")
+                journal.emit("cache.keepwarm", "Прогрев остановлен после пяти неудач", "warn")
                 return
-            journal.emit("cache.keepwarm",
-                         "Прогрев не удался, повтор на следующем интервале: %s" % str(exc)[:200], "warn")
+            retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
+            next_turn_ping = retry_at
+            journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn")
+        finally:
+            client_context.reset(context_token)
 
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
@@ -735,7 +775,9 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
         body = {key: value for key, value in body.items() if key != "metadata"}
+    identity = client_context.current()
     session._busy = True
+    session._turn_identity = identity
     session._turn_started_at = time.time()
     session._turn_pinged = False
     session._turn_seq = getattr(session, "_turn_seq", 0) + 1
@@ -776,6 +818,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     finally:
         session._busy = False
         session._turn_body = None
+        session._turn_identity = None
         if body.get("openAICacheKey") and not rejected:
             prior_key = getattr(session, "_last_cache_key", None)
             if prior_key and prior_key != body["openAICacheKey"]:
@@ -787,6 +830,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                              thread=journal.tag(getattr(session, "thread_id", None)))
             session._last_cache_key = body["openAICacheKey"]
             session._warm_body = body
+            session._warm_identity = identity
             # The TTL counts from the last cache touch: this request's start or a
             # later during-turn ping, NOT the turn's end; otherwise a pause after
             # a long turn outlives the 5-minute entry before the next idle ping.
@@ -800,25 +844,101 @@ def _ensure_keepwarm(session, cfg):
     if task is None or task.done():
         # A fresh cycle gets a fresh failure budget.
         session._warm_failures = 0
-        session._warm_task = asyncio.create_task(_keepwarm(session, cfg))
+        session._warm_task = asyncio.create_task(_keepwarm(session, cfg), context=contextvars.Context())
 
 
-def _dump_rejected_body(payload, detail):
+def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=None):
     """Land the exact upstream-rejected body on disk for offline bisection.
 
     A 400 from the route validator ("Invalid request format") carries no field
     detail, and client history only grows — every later retry re-sends the same
-    poison. The dump is local-only and holds the user's own conversation text.
+    poison. The dump is local-only and holds the user's own conversation text,
+    so a repeated identical body reuses its saved set and only the newest
+    `upstream_error_max_dumps` sets are kept.
     """
     try:
-        folder = pathlib.Path("logs/upstream-400")
+        cfg = cfg or {}
+        folder = pathlib.Path(cfg.get("upstream_error_dir") or "logs/upstream-400")
         folder.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        (folder / ("%s-body.json" % stamp)).write_bytes(payload)
-        (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
-        print("[debug] upstream 400 body captured: logs/upstream-400/%s-body.json" % stamp, flush=True)
+        digest = hashlib.sha256(payload).hexdigest()
+        key = (str(folder.resolve()), digest)
+        with _DUMP_LOCK:
+            known = _DUMP_RECENT.get(key)
+            if known and (folder / ("%s-body.json" % known)).exists():
+                print("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known), flush=True)
+                return known
+            request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
+            stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
+            (folder / ("%s-body.json" % stamp)).write_bytes(payload)
+            (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
+            metadata = {**client_context.current(), "request_id": request_id,
+                        "upstream_status": status, "diagnostic_id": stamp,
+                        "body_sha256": digest}
+            (folder / ("%s-metadata.json" % stamp)).write_text(
+                json.dumps(journal.scrub(metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+            _DUMP_RECENT.pop(key, None)
+            _DUMP_RECENT[key] = stamp
+            while len(_DUMP_RECENT) > 256:
+                del _DUMP_RECENT[next(iter(_DUMP_RECENT))]
+            _prune_dumps(folder, cfg.get("upstream_error_max_dumps", 50), stamp)
+        print("[debug] upstream %s diagnostic: %s" % (status, stamp), flush=True)
+        return stamp
     except Exception:  # noqa: BLE001 - diagnostics must never break the turn
         pass
+
+
+_DUMP_NAME = re.compile(r"^(\d{8}-\d{6}-[^\W_]*-[0-9a-f]{12})-(?:body\.json|error\.txt|metadata\.json)$")
+_DUMP_RECENT = {}
+_DUMP_LOCK = threading.Lock()
+
+
+def _prune_dumps(folder, keep, spare):
+    """Delete the oldest dump sets (all files of a stem together) beyond `keep`.
+
+    Only names matching the dump pattern are ever touched.
+    """
+    try:
+        keep = int(keep)
+        if keep <= 0:
+            return
+        sets = {}
+        for entry in folder.iterdir():
+            match = _DUMP_NAME.match(entry.name)
+            if match and entry.is_file():
+                sets.setdefault(match.group(1), []).append(entry)
+        excess = len(sets) - keep
+        if excess <= 0:
+            return
+        oldest = sorted((stem for stem in sets if stem != spare),
+                        key=lambda stem: (max(path.stat().st_mtime_ns for path in sets[stem]), stem))
+        for stem in oldest[:excess]:
+            for path in sets[stem]:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 - retention is best effort
+        pass
+
+
+_EMPTY_DUMPED = set()
+
+
+def _dump_empty_once(payload, flags, cfg, session, model=None):
+    """Keep one sample per request kind and model per relay run: each dump
+    holds conversation text, so distinct bodies must not pile up on disk."""
+    kind = (client_context.current().get("request_purpose") or "generation", model)
+    if kind in _EMPTY_DUMPED:
+        return
+    detail = json.dumps({"reason": "empty turn: end_of_stream without content blocks",
+                         "usage": flags.get("last_usage")}, ensure_ascii=False)
+    stamp = _dump_rejected_body(payload, detail, cfg=cfg, status="empty",
+                                request_id=client_context.current().get("request_id")
+                                or getattr(session, "_request_tag", None))
+    if stamp is not None:
+        _EMPTY_DUMPED.add(kind)
+    journal.emit("upstream.empty_turn", "Пустой ответ upstream сохранён для диагностики", "warn",
+                 diagnostic_id=stamp)
 
 
 async def _stream_body(cfg, session, body, param_types=None):
@@ -880,9 +1000,16 @@ async def _stream_body(cfg, session, body, param_types=None):
                     response = urllib.request.urlopen(request, timeout=timeout)
                     break
                 except urllib.error.HTTPError as exc:
-                    detail = exc.read()[:400].decode("utf-8", "replace")
-                    if exc.code == 400:
-                        _dump_rejected_body(payload, detail)
+                    detail = exc.read(16384).decode("utf-8", "replace")
+                    diagnostic = None
+                    if exc.code in (400, 422):
+                        diagnostic = _dump_rejected_body(
+                            payload, detail, cfg=cfg, status=exc.code,
+                            request_id=client_context.current().get("request_id") or getattr(session, "_request_tag", None))
+                        journal.emit("upstream.rejected", detail[:1000], "warn", upstream_status=exc.code,
+                                     diagnostic_id=diagnostic, model=body.get("model"),
+                                     effort=body.get("reasoningEffort"),
+                                     upstream_request_id=exc.headers.get("request-id") or exc.headers.get("x-request-id"))
                     if exc.code in (401, 403) and attempt == 0:
                         attempt = 1
                         # The 401 may come from a header snapshot taken just before
@@ -892,9 +1019,12 @@ async def _stream_body(cfg, session, body, param_types=None):
                         if session.backend.refresher.refresh(rejected_cookie=headers.get("cookie")):
                             headers.update(session.backend.headers())
                             continue
-                        raise apierr.upstream_auth_failed(detail)
+                        raise apierr.upstream_auth_failed(detail[:400])
                     holder["response"] = exc
-                    raise apierr.ApiError(*_http_error(exc.code, detail))
+                    error = apierr.ApiError(*_http_error(exc.code, detail))
+                    error.upstream_status = exc.code
+                    error.diagnostic_id = diagnostic
+                    raise error
             holder["response"] = response
             if session._cancelled:
                 _force_close_response(response)
@@ -921,21 +1051,28 @@ async def _stream_body(cfg, session, body, param_types=None):
     text, thinking = [], []
     produced = False
     saw_end = False
-    attempts_left = 2
+    # Client service checks (Auto mode, titles) fail deterministically when empty:
+    # re-sending the same body only pays for the same empty answer again.
+    attempts_left = 0 if client_context.current().get("request_purpose") in client_context.SERVICE_KINDS else 2
     try:
         while True:
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
-            task = loop.run_in_executor(None, worker, queue)
+            task = loop.run_in_executor(None, contextvars.copy_context().run, worker, queue)
+            flags = {}
             try:
-                flags = {}
-                async for event in _drain(cfg, session, queue, text, thinking, param_types, flags):
+                async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
+                                          cache_scope=(body.get("model"), body.get("openAICacheKey"))):
                     if event.get("type") not in ("credits", "thinking_heartbeat"):
                         # A metadata-only reply (credits + end_of_stream) is still
                         # an empty attempt and must get its retry.
                         produced = True
                     yield event
             finally:
+                if flags.get("usage_seen") and not flags.get("credits_reported"):
+                    mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
+                    if mark_unknown:
+                        mark_unknown()
                 if not task.done():
                     _force_close_response(holder.get("response"))
                 try:
@@ -946,6 +1083,8 @@ async def _stream_body(cfg, session, body, param_types=None):
             if session._cancelled:
                 yield {"type": "end", "reason": "cancelled"}
                 return
+            if not produced and saw_end:
+                _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if produced or attempts_left <= 0:
                 break
             # Copilot occasionally returns metadata+end_of_stream with no blocks at all.
@@ -968,7 +1107,7 @@ async def _stream_body(cfg, session, body, param_types=None):
         session._active_direct_abort = None
 
 
-async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None):
+async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None, *, cache_scope=None):
     started = loop_now()
     think_started = None
     flags = {} if flags is None else flags
@@ -984,6 +1123,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
     # The relay request id matches the `relay <id> POST ...` console lines:
     # concurrent requests of one conversation interleave in the same console.
     req_id = getattr(session, "_request_tag", None) or getattr(session, "thread_id", None) or "req"
+    monitor = getattr(session, "_console_cache_monitor", None)
+    if monitor is None:
+        monitor = session._console_cache_monitor = console_log.CacheMonitor()
 
     def _final_call_event(key):
         call = calls.pop(key, None)
@@ -1007,7 +1149,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         except asyncio.TimeoutError:
             if think_started is not None and not text and not stack and not calls:
                 elapsed = loop_now() - think_started
-                print(f"[{req_id}] Model is actively reasoning... ({round(elapsed)}s elapsed)", flush=True)
+                console_log.write(f"[{req_id}] Model is actively reasoning... ({round(elapsed)}s elapsed)")
                 journal.emit("upstream.thinking_heartbeat",
                              f"Модель активно думает ({round(elapsed)} с)",
                              "debug", elapsed=round(elapsed, 1), thread=journal.tag(req_id))
@@ -1116,16 +1258,15 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             current = stack[-1] if stack else None
         elif kind == "metadata":
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            if usage:
+                flags["usage_seen"] = True
+                flags["last_usage"] = usage
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
-                print("[%s] [cache] in=%s read=%s write=%s credits=%s" % (
-                    req_id, usage.get("inputTokens"), usage.get("promptTokensReadFromCache"),
-                    usage.get("promptTokensWrittenToCache"), usage.get("creditsUsed")), flush=True)
-            credits_used = usage.get("creditsUsed")
-            try:
-                credits_value = float(credits_used) if credits_used is not None else None
-            except (TypeError, ValueError):
-                credits_value = None
+                console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
+                                  (" " + client_context.label() if client_context.label() else ""))
+            credits_value = console_log.number(usage.get("creditsUsed"))
             if credits_value is not None:
+                flags["credits_reported"] = True
                 yield {"type": "credits", "value": credits_value,
                        "usage": {"input_tokens": usage.get("inputTokens"),
                                  "output_tokens": usage.get("outputTokens"),
@@ -1139,7 +1280,7 @@ def _http_error(status, detail):
     text = detail[:300]
     try:
         parsed = json.loads(detail)
-        text = parsed.get("message") or text
+        text = str(parsed.get("message") or text)[:300]
     except Exception:
         pass
     if status == 429:

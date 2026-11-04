@@ -16,6 +16,7 @@ import websockets
 
 import apierr
 import journal
+import models as model_catalog
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -846,6 +847,10 @@ class SessionPool:
                 custom_ws = None
             for acc in self.cfg["accounts"]:
                 acc_cfg = dict(self.cfg)
+                if acc.get("base", self.cfg.get("base", "")).rstrip("/") != self.cfg.get("base", "").rstrip("/"):
+                    for resource_key in model_catalog.PROVIDER_RESOURCE_KEY.values():
+                        if resource_key not in acc:
+                            acc_cfg.pop(resource_key, None)
                 acc_cfg.update(acc)
                 acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
                 acc_cfg["_account_ref"] = acc
@@ -863,9 +868,72 @@ class SessionPool:
         self._slots = asyncio.BoundedSemaphore(max(1, self.cfg["max_workers"]))
         self._active = {}
 
-    def _next_backend(self) -> Backend:
-        if len(self.backends) <= 1:
-            return self.backend
+    @staticmethod
+    def _check_route(backend, model_entry):
+        if model_entry is not None:
+            model_catalog.provider_resource(backend.cfg, model_entry)
+
+    @staticmethod
+    def _routable(backend, model_entry):
+        try:
+            SessionPool._check_route(backend, model_entry)
+        except apierr.ApiError:
+            return False
+        return True
+
+    @staticmethod
+    def _usable(backend, exclude=()):
+        """The dispatcher marks exhausted or signed-out accounts unavailable."""
+        return backend not in exclude and getattr(backend, "unavailable", None) is None
+
+    @staticmethod
+    def _reserve(backends, exclude=()):
+        """min_account_balance is a failover reserve: accounts below it still serve
+        while their confirmed balance is positive (unknown counts as usable)."""
+        spare = []
+        for backend in backends:
+            reason = getattr(backend, "unavailable", None) or {}
+            if backend in exclude or reason.get("reason") != "exhausted":
+                continue
+            available = reason.get("available")
+            if available is None or available > 0:
+                spare.append(backend)
+        return spare
+
+    @staticmethod
+    def _unusable_error(backends):
+        reasons = [getattr(b, "unavailable", None) or {} for b in backends]
+        exhausted = [(journal.tag(b.cfg.get("account_id") or b.cfg.get("page_uuid")), r.get("available"))
+                     for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
+        if exhausted:
+            threshold = next(r.get("threshold") for r in reasons if r.get("reason") == "exhausted")
+            return apierr.insufficient_credits(threshold or 0, exhausted)
+        return apierr.service_unavailable("no usable account: Retool sessions need a new sign-in")
+
+    def _next_backend(self, model_entry=None, exclude=()) -> Backend:
+        routable = []
+        for backend in self.backends:
+            try:
+                self._check_route(backend, model_entry)
+            except apierr.ApiError:
+                continue
+            routable.append(backend)
+        if not routable:
+            raise apierr.service_unavailable("no account has a route for the requested model")
+        eligible = [backend for backend in routable if self._usable(backend, exclude)]
+        if not eligible:
+            spare = self._reserve(routable, exclude)
+            if spare:
+                # Every account is below the reserve: spend the richest one down to zero.
+                return max(spare, key=lambda b: float("inf") if b.unavailable.get("available") is None
+                           else b.unavailable["available"])
+        if not eligible:
+            # A signed-out account is still better than no account: its 401 makes the
+            # refresher re-read config.json, so a fresh sign-in is adopted at once.
+            eligible = [backend for backend in routable if backend not in exclude
+                        and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"]
+        if not eligible:
+            raise self._unusable_error(routable)
         counts = {b: 0 for b in self.backends}
         for s in self._conversations.values():
             if getattr(s, "backend", None) in counts:
@@ -875,7 +943,7 @@ class SessionPool:
                 counts[session.backend] += 2
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % len(self.backends)
-        return min(self.backends, key=lambda b: (counts[b], (self.backends.index(b) - idx) % len(self.backends)))
+        return min(eligible, key=lambda b: (counts[b], (self.backends.index(b) - idx) % len(self.backends)))
 
     @property
     def mode(self):
@@ -910,8 +978,12 @@ class SessionPool:
         maker = getattr(b, "new_thread_id", None)
         return await maker() if maker is not None else await b.create_thread()
 
-    async def acquire(self, conversation_key=None, *, isolated=False) -> SessionLease:
-        """Take one slot and return an independently releasable request handle."""
+    async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None, context_scope=None,
+                      exclude=()) -> SessionLease:
+        """Take one slot and return an independently releasable request handle.
+
+        `exclude` lists accounts that already failed this request (failover).
+        """
         await self._slots.acquire()
         lock = None
         locked = False
@@ -919,7 +991,23 @@ class SessionPool:
         referenced = False
         keep = False
         try:
-            if not isolated and self.mode == "shared":
+            affinity_parent = (self._shared if self.mode == "shared" else
+                               self._conversations.get(conversation_key) or
+                               self._conversations.get((conversation_key, "text")))
+            affinity_backend = (self.backend if self.mode == "shared" else
+                                affinity_parent.backend if affinity_parent is not None else None)
+            if affinity_backend is not None and not (self._usable(affinity_backend, exclude)
+                                                     and self._routable(affinity_backend, model_entry)):
+                # Affinity is strict only while the account can still serve this model.
+                affinity_backend = None
+            if context_scope and (conversation_key or self.mode == "shared"):
+                conversation_key = (None if self.mode == "shared" else conversation_key, context_scope)
+            if not isolated and self.mode == "shared" and not context_scope:
+                self._check_route(self.backend, model_entry)
+                if (self.backend in exclude or
+                        ((getattr(self.backend, "unavailable", None) or {}).get("reason") == "exhausted"
+                         and not self._reserve([self.backend], exclude))):
+                    raise self._unusable_error([self.backend])
                 lock = self._lock
                 await lock.acquire()
                 locked = True
@@ -927,7 +1015,8 @@ class SessionPool:
                     self._shared = RelaySession(self.backend, self.cfg["thread_id"])
                 session = self._shared
                 keep = True
-            elif not isolated and self.mode == "per_conversation" and conversation_key:
+            elif not isolated and conversation_key and (self.mode == "per_conversation" or
+                                                        (self.mode == "shared" and context_scope)):
                 key = conversation_key
                 await self._evict_idle(make_room=key not in self._conversation_locks)
                 capacity = max(1, self.cfg.get("max_conversations", 128))
@@ -940,9 +1029,12 @@ class SessionPool:
                                       or getattr(self._conversations.get(key), "_cached_head", None)
                                       or self.cfg.get("transport") == "direct"
                                       or len(self.backends) > 1):
-                    backend = self._next_backend()
-                    session = RelaySession(backend, await self._new_thread_id(backend))
                     parent = self._conversations.get(key)
+                    backend = (parent.backend if parent is not None and self._usable(parent.backend, exclude)
+                               and self._routable(parent.backend, model_entry)
+                               else affinity_backend or self._next_backend(model_entry, exclude))
+                    self._check_route(backend, model_entry)
+                    session = RelaySession(backend, await self._new_thread_id(backend))
                     if parent is not None:
                         if getattr(parent, "_cached_head", None):
                             session._cached_head = parent._cached_head
@@ -962,16 +1054,39 @@ class SessionPool:
                     await lock.acquire()
                     locked = True
                     session = self._conversations.get(key)
+                    if session is not None and not (self._usable(session.backend, exclude)
+                                                    and self._routable(session.backend, model_entry)):
+                        # The account ran out, was signed out or has no route for this
+                        # model: move the conversation.
+                        # Resolve the replacement first, so a 402/503 keeps the old state;
+                        # a lone fallback account is the same backend and is kept as is.
+                        replacement = affinity_backend or self._next_backend(model_entry, exclude)
+                        if replacement is not session.backend:
+                            self._check_route(replacement, model_entry)
+                            old = session
+                            session = RelaySession(replacement, await self._new_thread_id(replacement))
+                            self._conversations[key] = session
+                            await old.aclose()
+                            # The new account must write the prefix cache once.
+                            journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
+                                         conversation=journal.tag(key),
+                                         reason=(getattr(old.backend, "unavailable", None) or {}).get(
+                                             "reason", "failover" if self._routable(old.backend, model_entry)
+                                             else "no_route"))
                     if session is None:
-                        backend = self._next_backend()
+                        backend = affinity_backend or self._next_backend(model_entry, exclude)
+                        self._check_route(backend, model_entry)
                         session = RelaySession(backend, await self._new_thread_id(backend))
                         self._conversations[key] = session
                         journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),
                                      pool=len(self._conversations))
                     keep = True
+                    self._check_route(session.backend, model_entry)
             else:
-                backend = self._next_backend()
+                backend = (affinity_backend if isolated and affinity_backend is not None
+                           else self._next_backend(model_entry, exclude))
+                self._check_route(backend, model_entry)
                 session = RelaySession(backend, await self._new_thread_id(backend))
             session.begin_request()
             lease = SessionLease(session)

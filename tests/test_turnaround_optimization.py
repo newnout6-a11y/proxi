@@ -54,15 +54,20 @@ def test_varying_tool_declarations_preserve_normalized_superset():
     assert [t["name"] for t in canonical] == [t["name"] for t in sorted(tools_15, key=lambda x: x["name"])]
 
 
-def test_isolated_tool_less_request_context_alignment(tmp_path):
-    """Verify tool-less requests (/compact, /goal, title generation) inherit the cached head
-    and tool schema with tool_choice='none', preventing divergent 30k byte project context."""
+def test_isolated_tool_less_request_context_alignment(tmp_path, monkeypatch):
+    """A tool-less client job leaves the main cache intact without inheriting its context."""
     cfg = dict(config.DEFAULTS, workspace_root=str(tmp_path), cookie_values=[],
                transport="direct", project_context=True, context_max_bytes=30000,
                provider_resource_name="a", openai_provider_resource_name="o")
 
     pool = SessionPool(Backend(cfg))
     runner = TurnRunner(cfg, type("C", (), {"record_turn": lambda *_: None})(), pool)
+
+    async def stream(_session, *_args, **_kwargs):
+        yield {"type": "text", "delta": "ok"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(RelaySession, "stream", stream)
 
     # 1. Main turn with native tools and session affinity
     tools = [
@@ -104,17 +109,20 @@ def test_isolated_tool_less_request_context_alignment(tmp_path):
         ],
     }, cfg)
     parsed_aux.conversation_key = "claude-metadata:session-abc-123"
+    parsed_aux.request_purpose = "client-text"
 
     holder_aux = {}
     asyncio.run(runner.run(parsed_aux, out, holder_aux))
     aux_session = holder_aux["session"].session
 
-    # The auxiliary tool-less session must inherit the EXACT same cached head and tools
-    assert aux_session._direct["head"] == cached_head
+    assert aux_session is not main_session
+    assert main_session._cached_head == cached_head and len(main_session.get_canonical_tools()) == 2
+    assert aux_session._direct["head"] == ""
     assert "[PROJECT CONTEXT]" not in aux_session._direct["head"]
     assert "[LOCAL EXEC REMINDER]" not in aux_session._direct["head"]
     assert aux_session._direct["tool_choice"] == "none"
-    assert len(aux_session._direct["tools"]) == 2
+    assert aux_session._direct["tools"] is None and not aux_session.has_tools()
+    assert len(aux_session._direct["chunks"]) == 3
 
 
 def test_short_head_prompt_caching_without_char_threshold():
@@ -142,11 +150,11 @@ def test_reasoning_effort_clamping_and_preservation():
     assert effort_sonnet == "high"
 
     # 3. Haiku only accepts low, medium, high, max: 'xhigh' clamps to 'high'
-    entry_haiku, effort_haiku = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh")
+    entry_haiku, effort_haiku = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh", allow_downgrade=True)
     assert effort_haiku == "high"
 
     # 4. Non-reasoning model safely clamps effort to None without 400 error
-    entry_glm, effort_glm = models.resolve_tolerant("zai-org/GLM-5.3-Flash", "high")
+    entry_glm, effort_glm = models.resolve_tolerant("zai-org/GLM-5.3-Flash", "high", allow_downgrade=True)
     assert effort_glm is None
 
 

@@ -78,6 +78,7 @@ def relay(monkeypatch, tmp_path):
         key = KEY
         fake = runner
         credits = runtime.credits
+        cfg = runtime.cfg
         workspace = tmp_path
 
         def request(self, path, payload=None, *, key=KEY, method=None, headers=None, raw=None):

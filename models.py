@@ -11,17 +11,17 @@ EFFORTS_BY_PROVIDER = {
     "google": ("low", "medium", "high"),
 }
 
-# Per-model route capabilities from the Retool bundle. Provider-wide unions
-# advertise levels that individual models reject (for example GPT-5.5 xhigh).
+# Per-model route capabilities. Live 2026-11-03 supersedes the bundle's GPT-6
+# xhigh entries: copilotStreamGPT rejects that value with HTTP 422.
 _BASE_EFFORTS = ("low", "medium", "high")
 _EFFORTS_BY_MODEL = {
     "gpt-5": _BASE_EFFORTS + ("minimal",),
     "gpt-5.1": ("none",) + _BASE_EFFORTS,
     "gpt-5.2": ("none",) + _BASE_EFFORTS,
-    "gpt-6-astra": _BASE_EFFORTS + ("xhigh", "max"),
-    "gpt-6.1-sol": _BASE_EFFORTS + ("xhigh", "max"),
-    "gpt-6-sol": ("none",) + _BASE_EFFORTS + ("xhigh", "max"),
-    "gpt-6-luna": ("none",) + _BASE_EFFORTS + ("xhigh", "max"),
+    "gpt-6-astra": _BASE_EFFORTS + ("max",),
+    "gpt-6.1-sol": _BASE_EFFORTS + ("max",),
+    "gpt-6-sol": ("none",) + _BASE_EFFORTS + ("max",),
+    "gpt-6-luna": ("none",) + _BASE_EFFORTS + ("max",),
 }
 
 # Which config key holds the providerResourceName for each provider.
@@ -135,6 +135,14 @@ for _model in CATALOG:
         _model['metadata_status'] = 'provisional'
         _model['metadata_notes'] = 'Context is the Retool input reservation; full model limits and relay capabilities not independently verified.'
 
+for _name in ('gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'):
+    _entry = _BY_ID[_name]
+    _entry['reasoning_effort_checked_at'] = '2026-11-03'
+    _entry['metadata_notes'] = 'Live Retool managed route rejected xhigh with HTTP 422 on 2026-11-03.'
+    if _name in ('gpt-6-astra', 'gpt-6-luna'):
+        _entry['metadata_status'] = 'partial'
+        _entry['metadata_notes'] += ' This account also rejected max as model unavailable; availability is not verified.'
+
 _BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))
 
 def catalog():
@@ -204,10 +212,26 @@ def nearest_effort(levels, requested):
                                           _EFFORT_RANK.get(level, wanted)))
 
 
-def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
-    """Like resolve(), but an unsupported known effort is clamped instead of rejected.
+def effective_effort(entry, effort=None, configured=None):
+    """A global default is a preference; explicit client controls were validated by resolve."""
+    if effort is not None or not configured or not entry.get("reasoning", True):
+        return effort
+    configured = configured.lower() if isinstance(configured, str) else configured
+    if configured != "auto" and configured not in EFFORT_ORDER:
+        raise bad_request("invalid configured reasoning effort", param="reasoning_effort")
+    levels = entry.get("reasoning_effort_levels", EFFORTS_BY_PROVIDER.get(entry["provider"], ()))
+    if entry.get("reasoning_effort_control") == "provider-managed" or not levels:
+        return None
+    if configured == "auto":
+        preferred = entry.get("default_reasoning_effort")
+        return preferred if preferred in levels else ("medium" if "medium" in levels else levels[0])
+    return configured if configured in levels else nearest_effort(levels, configured)
 
-    Clients copy one effort across models, so e.g. xhigh legitimately reaches
+
+def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False):
+    """Resolve exactly; explicit compatibility permits known-level mapping.
+
+    Compatibility mapping is opt-in. Clients copy one effort across models, so e.g. xhigh reaches
     Haiku, which only understands low/medium/high/max. A value no provider
     defines at all ("extra", "ultra", typos) is still rejected with a 400:
     clamping it to medium would silently downgrade a client that asked for
@@ -229,6 +253,8 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None):
     try:
         return resolve(base_name, extracted_effort, strict=strict, default_model=default_model)
     except ApiError as error:
+        if not allow_downgrade:
+            raise
         if error.status != 400:
             raise
         if extracted_effort is None or str(extracted_effort).lower() not in EFFORT_ORDER:
@@ -265,7 +291,6 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
             entry = _BY_ID.get(name)
     if entry is None:
         if strict:
-            print("[unknown-model]", repr(model), '->', repr(name), flush=True)
             raise not_found(f"unknown model '{name}'; see GET /v1/models")
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name,
                  'context': 200000, 'max_output': 128000}

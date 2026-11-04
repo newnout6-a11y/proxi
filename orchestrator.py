@@ -15,6 +15,8 @@ import apierr
 import executor
 import credits
 import journal
+import client_context
+import console_log
 import models as model_catalog
 from context import build_system_instructions
 from redact import redact
@@ -120,11 +122,42 @@ class _ClientText:
         return text
 
 
+class _FailoverOut:
+    """Forwards turn events, holding back the error and end sentinel so the
+    runner can retry on another account before the client sees anything."""
+
+    def __init__(self, out):
+        self.out = out
+        self.error = None
+        self.started = False
+
+    def put(self, event):
+        if event is None:
+            return
+        if event.get("type") == "error":
+            self.error = event["error"]
+            return
+        if event.get("type") != "credits":
+            self.started = True
+        self.out.put(event)
+
+
+def _may_be_balance_related(error):
+    """Rate limits, timeouts and client errors never justify a balance fetch."""
+    status = getattr(error, "status", 0) or 0
+    code = getattr(error, "code", None)
+    if status == 402 or (status == 429 and code == "insufficient_credits"):
+        return True
+    return status >= 500 and code != "upstream_timeout"
+
+
 class TurnRunner:
     def __init__(self, cfg, credits, pool):
         self.cfg = cfg
         self.credits = credits
         self.pool = pool
+        # AccountDispatcher; set by Runtime when it manages account health.
+        self.accounts = None
 
     def _can_exec(self, steps: int) -> bool:
         """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
@@ -281,7 +314,10 @@ class TurnRunner:
         if session is None:
             return None
         try:
-            data = await self.pool.backend.get_messages(session.thread_id)
+            backend = getattr(session, "backend", None)
+            if not hasattr(backend, "get_messages"):
+                backend = self.pool.backend
+            data = await backend.get_messages(session.thread_id)
         except Exception as exc:
             print("[explain] fetch failed:", exc, flush=True)
             return None
@@ -298,13 +334,73 @@ class TurnRunner:
             if message.get("senderRole") == "sandpack" and content.get("type") == "error":
                 text = str(content.get("error") or "").strip()
                 if "credit" in text.lower():
-                    return apierr.ApiError(429, "insufficient_credits", text or "Retool credits exhausted")
+                    return apierr.ApiError(402, "insufficient_credits", text or "Retool credits exhausted")
                 return apierr.upstream_error(text or "upstream returned an error message")
             if message.get("senderRole") == "sandpack" and content.get("type") in ("text", "tool_call"):
                 return None
         return None
 
     async def run(self, parsed, out: queue.Queue, holder: dict):
+        """Run a turn; retry on another account only after a confirmed low balance.
+
+        The retry happens only while nothing was sent to the client, and only
+        when the dispatcher's fresh balance fetch confirms the serving account
+        dropped below min_account_balance. Other failures (empty turns, 5xx)
+        are returned as before.
+        """
+        exclude = []
+        rechecked = False
+        cancelled = holder.setdefault("cancel_event", threading.Event())
+        while True:
+            relay = _FailoverOut(out)
+            holder.pop("session", None)
+            try:
+                await self._run_once(parsed, relay, holder, exclude=tuple(exclude))
+            except BaseException:
+                if relay.error is not None:
+                    out.put({"type": "error", "error": relay.error})
+                out.put(None)
+                raise
+            error = relay.error
+            lease = holder.get("session")
+            backend = getattr(getattr(lease, "session", lease), "backend", None)
+            accounts = getattr(self, "accounts", None)
+            retryable = (error is not None and not relay.started and not cancelled.is_set()
+                         and accounts is not None)
+            exhausted = False
+            try:
+                if (retryable and backend is None and error.code == "insufficient_credits"
+                        and not rechecked and hasattr(accounts, "recheck_exhausted")):
+                    # The pool refused before any upstream call: confirm the excluded
+                    # balances once, so a top-up is used without waiting for the timer.
+                    rechecked = True
+                    if await asyncio.to_thread(accounts.recheck_exhausted):
+                        continue
+                if (retryable and backend is not None and backend not in exclude
+                        and _may_be_balance_related(error)):
+                    # With no account left, the next acquire raises a clear 402.
+                    exhausted = await asyncio.to_thread(accounts.check_balance_now, backend)
+            except BaseException:
+                out.put({"type": "error", "error": error})
+                out.put(None)
+                raise
+            if exhausted:
+                exclude.append(backend)
+                cfg = getattr(backend, "cfg", None) or {}
+                tag = journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
+                journal.emit("account.failover", "Баланс аккаунта закончился — запрос повторён на другом",
+                             "warn", account=tag, request_id=getattr(parsed, "request_id", None),
+                             error=error.code)
+                console_log.write("[%s] [account] %s: баланс закончился, повтор на другом аккаунте" % (
+                    getattr(parsed, "request_id", None) or "req", tag))
+                holder["reason"] = "stop"
+                continue
+            if error is not None:
+                out.put({"type": "error", "error": error})
+            out.put(None)
+            return
+
+    async def _run_once(self, parsed, out, holder, exclude=()):
         turn_id = str(uuid.uuid4())
         holder["turn_id"] = turn_id
         # Loop detection is per client turn, never shared by concurrent chats.
@@ -331,21 +427,28 @@ class TurnRunner:
                 tool_names = [choice["function"]["name"]]
             direct_mode = self.cfg.get("transport") == "direct"
             is_native = bool(native_tools)
-            instructions = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._instructions(native_tools=is_native))
+            purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
+            client_text = purpose in client_context.CLIENT_TEXT_KINDS
+            if client_text:
+                # The client owns this job's system prompt and execution policy.
+                # A title/probe/permission check must not acquire relay project or shell instructions.
+                instructions = parsed.system or ""
+            else:
+                instructions = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
                 raise asyncio.CancelledError()
             reminder = ""
             if native_tools and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif not native_tools and self.cfg["exec_policy"] != "off":
+            elif not native_tools and not client_text and self.cfg["exec_policy"] != "off":
                 reminder = (
                     "\n\n[LOCAL EXEC REMINDER]\n"
                     "To run anything on the user's machine you MUST output "
                     "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
                     "Do not answer that you cannot run commands."
                 )
-            if parsed.system:
+            if parsed.system and not client_text:
                 instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
             if direct_mode and native_tools:
                 reminder = self._tool_prompt_native(parsed)
@@ -370,43 +473,53 @@ class TurnRunner:
             # resolved from the acquired session's backend cfg below. Resolving it
             # from the global cfg here would 503 account-only configurations.
             model_provider = {"model": parsed.model}
-            effort = parsed.effort
-            if effort is None and parsed.entry.get("reasoning") and self.cfg.get("reasoning_effort"):
-                configured = self.cfg["reasoning_effort"]
-                if configured == "auto":
-                    levels = parsed.entry.get("reasoning_effort_levels", ())
-                    if parsed.entry.get("reasoning_effort_control") == "provider-managed":
-                        configured = None
-                    else:
-                        configured = parsed.entry.get("default_reasoning_effort") or (
-                            "medium" if not levels or "medium" in levels else levels[0])
-                if configured is not None:
-                    _, effort = model_catalog.resolve_tolerant(
-                        parsed.model, configured, strict=self.cfg.get("strict_models", True),
-                        default_model=self.cfg.get("model"))
+            effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"))
+            requested_effort = getattr(parsed, "requested_effort", None) or parsed.effort
+            effort_source = "client"
+            if requested_effort is None:
+                requested_effort = self.cfg.get("reasoning_effort") if parsed.entry.get("reasoning") else None
+                effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
             log("turn.begin", "Ход %s · effort %s · %s" % (parsed.model, effort or "—",
                                                           "direct" if direct_mode else "agent"),
                 model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
+                requested_effort=requested_effort, effective_effort=effort,
+                effort_source=effort_source,
+                effort_resolution=("model_default" if requested_effort in (None, "auto") else
+                                   "provider_managed" if effort is None else
+                                   "exact" if requested_effort == effort else "compatibility"),
                 dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
                 tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
                 prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
-                messages=len(getattr(parsed, "message_chunks", None) or []))
+                messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose)
 
             base_prompt = self._check_prompt(prompt)
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
-                can_exec = self._can_exec(0) and not native_tools
-                if not direct_mode and key and not native_tools and not can_exec:
-                    # Tool-less calls in agent mode supply their complete history. Affinity alone
-                    # must not add prior standalone jobs to that client context.
-                    session = await self.pool.acquire(key, isolated=True)
+                can_exec = self._can_exec(0) and not native_tools and not client_text
+                persistent_text = (direct_mode and not native_tools
+                                   and self.cfg.get("session_mode") != "per_request"
+                                   and purpose not in client_context.SERVICE_KINDS
+                                   and (key or self.cfg.get("session_mode") == "shared"))
+                isolated = not native_tools and not persistent_text and (direct_mode or client_text or (key and not can_exec))
+                failover = {"exclude": exclude} if exclude else {}
+                if persistent_text:
+                    # Ordinary text chats retain idle keepwarm, with state separate
+                    # from native tools even when their conversation ID is the same.
+                    session = await self.pool.acquire(key, context_scope="text", model_entry=parsed.entry, **failover)
+                elif isolated:
+                    # A standalone job can share account affinity, never the main chat's
+                    # tools, head, implicit history, cache breakpoints or idle keepwarm.
+                    session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry, **failover)
                 else:
-                    session = await self.pool.acquire(key) if key else await self.pool.acquire()
+                    session = await self.pool.acquire(key, model_entry=parsed.entry, **failover)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
+                # Debit the account that actually served the turn.
+                account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
+                acquired._credits_manager = account_credits
                 # Console lines (heartbeat, [cache]) carry the relay request id so
                 # concurrent requests of one conversation can be told apart.
                 acquired._request_tag = getattr(parsed, "request_id", None)
@@ -422,7 +535,8 @@ class TurnRunner:
                     model_provider.pop("providerResourceName", None)
                 log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
                     "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
-                    isolated=bool(key and not native_tools), mode=self.cfg.get("session_mode"),
+                    isolated=bool(isolated), mode=self.cfg.get("session_mode"),
+                    context_scope="text" if persistent_text else None,
                     wait_ms=round((time.time() - turn_started) * 1000))
                 native_target, native_context = None, None
                 if native_tools:
@@ -482,23 +596,11 @@ class TurnRunner:
                             final_choice = getattr(parsed, "tool_choice", "auto")
                             final_head = instructions
                         else:
-                            # Tool-less requests (such as title generation, /compact, /goal Stop hook)
-                            cached_head = getattr(direct_target, "_cached_head", None)
-                            if cached_head:
-                                final_head = cached_head
-                                if parsed.system and cached_head != instructions:
-                                    client_sys = f"[CLIENT INSTRUCTIONS]\n{parsed.system}"
-                                    if client_sys not in stream_prompt and parsed.system not in stream_prompt:
-                                        chunks.append(client_sys)
-                            else:
-                                final_head = instructions
-
-                            if hasattr(direct_target, "has_tools") and direct_target.has_tools():
-                                final_tools = direct_target.get_canonical_tools()
-                                final_choice = "none"
-                            else:
-                                final_tools = None
-                                final_choice = "none"
+                            # Keep the stable job instructions BEFORE the changing input,
+                            # in system role. The client supplied no tools for this job.
+                            final_head = instructions
+                            final_tools = None
+                            final_choice = "none"
 
                         direct_target.set_direct(
                             final_head,
@@ -580,7 +682,7 @@ class TurnRunner:
                                 # separately: a per-turn dedup key dropped all but the first.
                                 credit_events = holder.get("_credit_events", 0) + 1
                                 holder["_credit_events"] = credit_events
-                                self.credits.record_turn(
+                                account_credits.record_turn(
                                     turn_id if credit_events == 1 else "%s#%d" % (turn_id, credit_events),
                                     event["value"])
                                 usage = event.get("usage") or {}
@@ -681,7 +783,7 @@ class TurnRunner:
                         raise apierr.upstream_error("upstream did not honor the required client tool choice")
 
                     # Once the summary turn is requested, nothing is executed any more.
-                    can_exec = self._can_exec(exec_steps) and not final_summary
+                    can_exec = self._can_exec(exec_steps) and not final_summary and not client_text
                     command = executor.extract_command(final_text) if can_exec and not native_tools else None
 
                     if not final_summary and exec_steps and not self._can_exec(exec_steps):
@@ -717,7 +819,7 @@ class TurnRunner:
                             out.put({"type": "error", "error": explained})
                             return
 
-                    if not command and not final_text.strip() and empty_retries < 1:
+                    if not command and not final_text.strip() and empty_retries < 1 and not client_text:
                         # Silent turn: insist once, keeping the full system prompt.
                         empty_retries += 1
                         log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")

@@ -12,6 +12,7 @@ import os
 import threading
 import time
 
+import client_context
 from redact import redact
 
 LEVELS = ("debug", "info", "success", "warn", "error")
@@ -145,6 +146,11 @@ class Journal:
         try:
             if level not in LEVELS:
                 level = "info"
+            identity = client_context.current()
+            fields = {**identity, **fields}
+            caption = client_context.label(identity)
+            if caption:
+                message = "[%s] %s" % (caption, message or kind)
             secrets = self._secrets()
             event = {"ts": round(time.time(), 3), "kind": kind, "category": kind.split(".", 1)[0],
                      "level": level, "message": self._clean(message or kind, secrets)}
@@ -384,6 +390,11 @@ class Journal:
 
 
 JOURNAL = Journal()
+
+
+def scrub(value):
+    """Apply the journal's configured secret redaction to console diagnostics."""
+    return JOURNAL._clean(value, JOURNAL._secrets())
 
 
 def emit(kind, message="", level="info", **fields):

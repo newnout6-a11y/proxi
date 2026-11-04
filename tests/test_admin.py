@@ -174,6 +174,19 @@ def test_settings_are_whitelisted_and_changes_wait_for_restart(admin_relay):
     assert admin_relay.request("/admin/api/settings")[1]["pending_restart"] == after["pending_restart"]
 
 
+def test_admin_effort_validation_honors_explicit_compatibility(admin_relay):
+    assert admin_relay.patch({"reasoning_effort": "xhigh"})[0] == 400
+    status, _, _ = admin_relay.patch({"allow_effort_downgrade": True, "reasoning_effort": "xhigh"})
+    assert status == 200
+    saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
+    assert saved["allow_effort_downgrade"] is True and saved["reasoning_effort"] == "xhigh"
+    before = admin_relay.path.read_bytes()
+    assert admin_relay.patch({"allow_effort_downgrade": False})[0] == 400
+    assert admin_relay.path.read_bytes() == before
+    assert admin_relay.patch({"allow_effort_downgrade": True, "reasoning_effort": "ultra"})[0] == 400
+    assert admin_relay.patch({"allow_effort_downgrade": False, "reasoning_effort": "max"})[0] == 200
+
+
 def test_rate_limit_changes_apply_to_new_admission_without_replacing_pool(admin_relay):
     pool = admin_relay.runtime.pool
     limiter = admin_relay.runtime.limiter
