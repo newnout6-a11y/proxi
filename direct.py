@@ -40,7 +40,8 @@ def _int_setting(cfg, key, default):
         return max(0, int(cfg.get(key, default)))
     except (TypeError, ValueError, OverflowError):
         return default
-_ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
+_ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku", 'gpt-4.1',
+                'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2'}
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
 
 

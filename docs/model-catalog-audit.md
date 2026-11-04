@@ -1,5 +1,14 @@
 # Model catalog audit — 2026-10-29
 
+Current route availability is superseded by
+[the 2026-11-05 live route audit](model-route-availability-2026-11-05.md).
+The registry now retains 40 metadata entries, adding verified GPT-6.1 Terra
+and GPT-4.1. The configured pool advertises 27 successful exact IDs; known
+unsupported endpoints and unmet resource prerequisites are filtered separately.
+Historical context/output metadata below is not an assertion of current model
+availability. In particular, GPT-6 xhigh was subsequently rejected by the live
+route, and GLM selectable efforts/images were subsequently verified.
+
 The catalog retains all 38 Retool model IDs: 15 OpenAI, 15 Anthropic, 6 Google and
 2 Retool-fast (claude-sonnet-5-5 was added on 2026-10-31, after this audit's date;
 its row matches the Claude 1M group: 1 000 000 / 128 000, levels low/medium/high/max). A provider deprecation does not remove a still-advertised Retool

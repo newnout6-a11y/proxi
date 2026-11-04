@@ -23,6 +23,7 @@ _EFFORTS_BY_MODEL = {
     "gpt-5.2": ("none",) + _BASE_EFFORTS,
     "gpt-6-astra": _BASE_EFFORTS + ("max",),
     "gpt-6.1-sol": _BASE_EFFORTS + ("max",),
+    "gpt-6.1-terra": ("none",) + _BASE_EFFORTS + ("max",),
     "gpt-6-sol": ("none",) + _BASE_EFFORTS + ("max",),
     "gpt-6-luna": ("none",) + _BASE_EFFORTS + ("max",),
 }
@@ -44,6 +45,7 @@ ALIASES = {"claude-opus": "claude-opus-5-5", "claude-sonnet": "claude-sonnet-5",
 
 CATALOG = [
     {"id": "gpt-6.1-sol", "label": "GPT 6.1-sol", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-6.1-terra", "label": "GPT 6.1 Terra", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gpt-6-luna", "label": "GPT 6-luna", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gpt-6-sol", "label": "GPT 6-sol", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gpt-6-astra", "label": "GPT 6-astra", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
@@ -58,6 +60,7 @@ CATALOG = [
     {"id": "gpt-5.6-sol", "label": "GPT 5.6 Sol", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gpt-5.6-terra", "label": "GPT 5.6 Terra", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "gpt-5.6-luna", "label": "GPT 5.6 Luna", "provider": "openai", "context": 1050000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "gpt-4.1", "label": "GPT 4.1", "provider": "openai", "context": 1047576, "max_output": 32768, "reasoning": False, "tools": True, "vision": True},
     {"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-opus-5", "label": "Claude Opus 5", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-opus-4-8", "label": "Claude Opus 4.8", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
@@ -169,6 +172,68 @@ for _name in ('zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash'):
 
 _BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))
 
+# Dated route facts, separate from model limits and per-account resource access.
+_UNSUPPORTED_ROUTES = {
+    'gpt-5.3-codex': 'Retool Assist uses an upstream Chat endpoint this model rejects; Responses is required.',
+    'claude-sonnet-4-20250514': 'Retool Assist returns provider 404 not_found for this model.',
+    'gpt-6-luna': 'Unavailable on the Retool React route; Assist rejects this model.',
+}
+_BYOK_ROUTES = {'gpt-6-astra', 'claude-opus-4-20250514', 'claude-opus-4-1-20250805'}
+_RETENTION_ROUTES = {'claude-fable-5'}
+_VERIFIED_ROUTES = {
+    'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-5', 'gpt-5-mini', 'gpt-5-nano',
+    'gpt-5.1', 'gpt-5.2', 'gpt-5.4', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-4.1',
+    'claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8', 'claude-opus-4-7',
+    'claude-opus-4-5-20251101', 'claude-opus-4-6', 'claude-sonnet-5-5', 'claude-sonnet-5',
+    'claude-sonnet-4-5-20250929', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001',
+    'zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash',
+}
+for _model in CATALOG:
+    _name = _model['id']
+    _model['route_checked_at'] = '2026-11-05'
+    if _name in _UNSUPPORTED_ROUTES:
+        _model.update(route_status='unsupported', route_reason=_UNSUPPORTED_ROUTES[_name])
+    elif _name in _BYOK_ROUTES or _name in _RETENTION_ROUTES:
+        _model.update(route_status='gated', route_reason=('Requires BYOK or enabled Anthropic resource data retention.'
+                      if _name in _RETENTION_ROUTES else 'Requires a suitable BYOK provider resource.'))
+    elif _model['provider'] == 'google':
+        _model.update(route_status='unverified', route_reason='Requires Google BYOK; no configured route was tested.')
+    elif _name in _VERIFIED_ROUTES:
+        _model.update(route_status='verified', route_reason='Synthetic questions answered on Retool direct/Assist route.')
+    else:
+        _model.update(route_status='unverified', route_reason='No successful route probe is recorded.')
+for _name in ('gpt-6.1-terra', 'gpt-4.1'):
+    _BY_ID[_name].update(metadata_checked_at='2026-11-05',
+                        metadata_source=['https://retool-edge.com/assets_vjs/main-DVkrwaG2.js'])
+_BY_ID['claude-opus-5']['route_reason'] = 'Low effort answered; other small-output probes sometimes returned thinking only.'
+
+
+def route_block_reason(entry, cfg):
+    name = entry['id']
+    if entry['provider'] == 'google' and cfg.get('google_provider_resource_name') == '__managed__':
+        return 'Google requires a real BYOK resource; managed Google is not supported.'
+    if name in _UNSUPPORTED_ROUTES:
+        return _UNSUPPORTED_ROUTES[name]
+    if name not in _BYOK_ROUTES | _RETENTION_ROUTES:
+        return None
+    provider = entry['provider']
+    access = cfg.get('provider_access')
+    access = access.get(provider) if isinstance(access, dict) else None
+    resource = cfg.get(PROVIDER_RESOURCE_KEY[provider])
+    if not isinstance(access, dict) or not resource or access.get('resource_name') != resource:
+        access = {}
+    byok = access.get('byok') is True and resource != '__managed__'
+    retention = access.get('data_retention_enabled') is True
+    if byok or (name in _RETENTION_ROUTES and retention):
+        return None
+    return entry.get('route_reason') or 'Required provider access is not configured.'
+
+
+def require_route(entry, cfg):
+    reason = route_block_reason(entry, cfg)
+    if reason:
+        raise service_unavailable(f"model '{entry['id']}' is unavailable on this account: {reason}")
+
 def catalog():
     return CATALOG
 
@@ -179,18 +244,21 @@ def catalog_routable(entry, cfg, backends=None):
     Resource configuration is separate from model availability or account health:
     a temporarily empty balance does not erase an installed model's metadata.
     """
-    if cfg.get('show_unrouted_models'):
-        return True
     if backends is None:
         configs = [item for item in (cfg.get('accounts') or [cfg]) if item.get('enabled', True)]
     else:
         configs = [backend.cfg for backend in backends if backend.cfg.get('enabled', True)]
     if not configs:
         return False
+    eligible = [item for item in configs if not route_block_reason(entry, item)]
+    if not eligible:
+        return False
+    if cfg.get('show_unrouted_models'):
+        return True
     if not any(item.get(key) for item in configs for key in PROVIDER_RESOURCE_KEY.values()):
         return True  # Unconfigured setup still exposes metadata; requests explain missing resources.
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
-    return bool(key and any(item.get(key) for item in configs))
+    return bool(key and any(item.get(key) for item in eligible))
 
 
 def desktop_metadata(entry, entries):
@@ -354,6 +422,8 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name,
                  'context': 200000, 'max_output': 128000}
     if effort is not None:
+        if not entry.get('reasoning', True) and isinstance(effort, str) and effort.lower() == 'none':
+            return entry, None  # An explicit disabled control is harmless; never forward it.
         allowed = entry.get('reasoning_effort_levels', EFFORTS_BY_PROVIDER.get(entry['provider'], ()))
         if not isinstance(effort, str) or effort.lower() not in allowed:
             raise bad_request(

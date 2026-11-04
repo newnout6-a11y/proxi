@@ -64,13 +64,13 @@ def test_glm_reasoning_capability_uses_live_verified_retool_route_efforts():
 
 def test_catalog_recommendations_are_valid_and_dated_without_removing_legacy_ids():
     entries = models.catalog()
-    assert len(entries) == len({entry['id'] for entry in entries}) == 38
-    assert sum(entry['provider'] == 'openai' for entry in entries) == 15
+    assert len(entries) == len({entry['id'] for entry in entries}) == 40
+    assert sum(entry['provider'] == 'openai' for entry in entries) == 17
     assert sum(entry['provider'] == 'anthropic' for entry in entries) == 15
     for entry in entries:
         levels = entry['reasoning_effort_levels']
         assert entry['default_reasoning_effort'] in levels if levels else entry['default_reasoning_effort'] is None
-        assert entry['metadata_checked_at'] == '2026-10-29'
+        assert entry['metadata_checked_at'] == ('2026-11-05' if entry['id'] in {'gpt-6.1-terra', 'gpt-4.1'} else '2026-10-29')
         assert all(source.startswith('https://') for source in entry['metadata_source'])
         assert entry['metadata_status'] in {'verified', 'partial', 'provisional'}
         if entry['metadata_status'] != 'verified':

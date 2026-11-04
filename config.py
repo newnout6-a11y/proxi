@@ -13,6 +13,7 @@ import threading
 import time
 
 from apierr import service_unavailable
+import models
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
@@ -28,6 +29,7 @@ DEFAULTS = {
     "show_unrouted_models": False,
     "relay_system_prompt": None,  # null uses the default role; a string supplies the user's policy
     "relay_system_prompt_mode": "standalone",  # standalone | append | replace client instructions
+    "provider_access": {},  # resource-bound BYOK/retention facts, scoped to each account
     "max_body_bytes": 32 * 1024 * 1024,
     "max_frame_bytes": 16 * 1024 * 1024,
     "max_workers": 32,
@@ -320,6 +322,16 @@ def _check_pool_fields(record, name):
         raise service_unavailable(f"{name}: 'priority' must be an integer from 0 to 99")
     if "label" in record and (not isinstance(record["label"], str) or len(record["label"]) > 40):
         raise service_unavailable(f"{name}: 'label' must be text of at most 40 characters")
+    access = record.get('provider_access', {})
+    if not isinstance(access, dict):
+        raise service_unavailable(f"{name}: 'provider_access' must be an object")
+    for provider, details in access.items():
+        if (provider not in models.PROVIDER_RESOURCE_KEY or not isinstance(details, dict)
+                or set(details) - {'resource_name', 'byok', 'data_retention_enabled'}
+                or not isinstance(details.get('resource_name'), str) or not details['resource_name']):
+            raise service_unavailable(f"{name}: invalid provider_access descriptor")
+        if any(key in details and type(details[key]) is not bool for key in ('byok', 'data_retention_enabled')):
+            raise service_unavailable(f"{name}: provider_access flags must be booleans")
 
 
 def load(path=CONFIG_PATH):

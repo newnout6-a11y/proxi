@@ -100,3 +100,21 @@ def test_existing_evidence_is_never_overwritten_or_replayed(tmp_path, monkeypatc
     with pytest.raises(FileExistsError):
         audit_models.main(['--allow-paid', '--models', 'claude-opus-5-5', '--output', str(evidence)])
     assert evidence.read_text() == 'existing evidence\n'
+
+
+def test_unrouted_model_is_recorded_without_aborting_other_models(tmp_path, monkeypatch):
+    evidence = tmp_path / 'audit.jsonl'
+    calls = []
+    monkeypatch.setattr(audit_models, 'load_accounts', lambda _: [account()])
+    def probe(cfg, entry, **kw):
+        calls.append(entry['id'])
+        return dict(model=entry['id'], provider=entry['provider'], http=200, success=True, usage={'creditsUsed': .1})
+    monkeypatch.setattr(audit_models, 'probe', probe)
+    result = audit_models.main(['--allow-paid', '--models', 'gemini-2.5-pro', 'claude-opus-5-5',
+                               '--output', str(evidence)])
+    rows = [json.loads(line) for line in evidence.read_text(encoding='utf-8').splitlines()]
+    assert calls == ['claude-opus-5-5']
+    assert result == 1 and len(rows) == 2
+    skipped = next(row for row in rows if row['model'] == 'gemini-2.5-pro')
+    assert skipped['skipped'] is True and skipped['http'] is None and skipped['success'] is False
+    assert 'private' not in json.dumps(rows)

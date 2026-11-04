@@ -126,12 +126,18 @@ def test_gateway_rejects_before_the_runner_is_called(relay, dialect, path, model
     assert relay.fake.seen == []
 
 
-@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"])
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra"])
 def test_codex_does_not_offer_live_rejected_effort(relay, model):
     status, response = relay.json("/codex/models")
     assert status == 200
     entry = next(item for item in response["models"] if item["slug"] == model)
     assert "xhigh" not in [item["effort"] for item in entry["supported_reasoning_levels"]]
+
+
+@pytest.mark.parametrize('model', ['gpt-6-astra', 'gpt-6-luna'])
+def test_codex_does_not_advertise_currently_blocked_routes(relay, model):
+    _, response = relay.json('/codex/models')
+    assert model not in {item['slug'] for item in response['models']}
 
 
 def test_live_probe_tests_the_raw_level_without_refreshing_or_printing_auth(monkeypatch):

@@ -42,6 +42,8 @@
   "model": "claude-opus-5-5",
   "provider_resource_name": "<YOUR-ANTHROPIC-PROVIDER-RESOURCE-UUID>",
   "openai_provider_resource_name": "<YOUR-OPENAI-PROVIDER-RESOURCE-UUID>",
+  "provider_access": {},
+  "provider_access_note": "Для BYOK/retention-моделей в записи нужного аккаунта укажите provider_access: {openai: {resource_name: UUID того же ресурса, byok: true}} или anthropic с byok/data_retention_enabled. Это описание уже настроенного ресурса, не включение прав на сервере; запись не наследуется другими аккаунтами.",
   "reasoning_effort": "auto",
   "relay_system_prompt": null,
   "relay_system_prompt_mode": "standalone",

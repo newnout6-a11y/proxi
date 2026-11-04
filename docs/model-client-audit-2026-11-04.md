@@ -307,3 +307,89 @@ names-only compatibility headers/journal for all three API dialects.
 `git diff --check`: clean. No unresolved findings remain in stages 3 or 4.
 Availability/catalog reconciliation and installed-client acceptance remain
 separate later stages; design work remains deferred.
+
+## Stage 5: verified routes and client catalog
+
+The current configured pool exposes 27 canonical models, each with a successful
+synthetic answer recorded in the final route audit. The registry retains 40
+metadata entries. Unsupported endpoints and unmet resource prerequisites are
+filtered separately from model capabilities and account balance. GPT-6.1 Terra
+and GPT-4.1 are added with exact IDs; legacy GPTs and Haiku use the verified
+Assist route. Temporary or thinking-only failures do not remove a working route.
+The dated matrix and access conditions are in
+[model-route-availability-2026-11-05.md](model-route-availability-2026-11-05.md).
+
+Resource access descriptors belong to a specific account and resource UUID;
+they are not inherited by another tenant. They describe configured BYOK or
+retention and cannot enable a server-side permission. Fable remains blocked
+by the organization prerequisite, Astra requires OpenAI BYOK, and Google
+requires a real Google BYOK resource.
+
+`scripts/sync_opencode_catalog.py` preserves other providers, authentication,
+connection settings and agent permissions, replaces only the relay catalog
+and its stale references/filters, and normalizes supported effort aliases.
+It removes the old blacklist that hid working Haiku and placeholder zero USD
+prices. Preview never changes the settings; writing requires a backup directory.
+Windows ReplaceFileW saves the actual displaced version. Late concurrent edits
+abort with recovery copies rather than being reported as a successful update;
+the documented recovery behavior does not promise a filesystem CAS lock.
+
+Independent final scoped review: **240 passed in 29.00 seconds**, plus eight
+normalization/replacement-window probes, with no unresolved findings. Exact
+review command:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests/test_sync_opencode_catalog.py tests/test_client_policy_probe.py tests/test_route_availability.py tests/test_model_audit.py tests/test_effort_policy.py tests/test_catalog_pool_discovery.py tests/test_model_catalog.py tests/test_models_hardening.py tests/test_account_dispatcher.py tests/test_review_fixes_direct.py -o addopts= -q --tb=short
+```
+
+Both installed OpenCode versions accepted the final isolated preview with
+27 configured and 27 listed models, with no unavailable models, invalid effort
+variants or catalog mismatch. The shared installed settings were then updated:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_opencode_catalog.py --write --backup-dir .agents/backups/opencode-catalog-20261105
+```
+
+The exact displaced configuration is backed up privately under that directory.
+A post-write comparison confirmed only the expected generated changes; other
+providers, relay connection/authentication and agent permissions are preserved.
+The running relay on port 8787 was not restarted; source changes take effect
+when the user next starts it.
+
+## Stage 6: installed CLI acceptance and final validation
+
+After synchronization, these commands ran the actual installed clients against
+a local deterministic model server, using separate synthetic conversations:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/probe_client_settings.py opencode --require-complete-catalog
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/probe_client_settings.py opencode2 --require-complete-catalog
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/probe_client_settings.py claude
+```
+
+OpenCode 1.19.3 and OpenCode 2.2.5 each completed three model requests,
+including a child/tool continuation. Each confirmed the full 27-model catalog
+with no unsupported choices. Claude Code 2.1.310 completed four model requests
+and confirmed one child agent completed successfully. All model requests kept
+`high` effort. Every probe returned its success marker and exit code 0.
+Private results: `.agents/model-audit-20261104/stage6-{opencode,opencode2,claude}.json`.
+These probes use no provider inference or credits and emit no host file/shell
+tool calls. They verify installed CLI settings and protocol continuation, not
+upstream model quality or cache billing. Codex and Claude Desktop discovery are
+covered by the HTTP contract/regression suite; their GUI flows were not run.
+Other related clients retain documented compatibility, without an installed
+execution claim. Earlier isolated live API checks remain separately documented
+in stages 3 and 4.
+
+Final repository checks after the stage 5 code changes:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests -o addopts= -q --tb=short
+node --test tests/test_opencode_labels.mjs
+git diff --check
+```
+
+Results: **1850 Python tests passed in 216.13 seconds**, **4 Node tests passed**,
+and no whitespace errors. Stage 5 code received the independent review above;
+stage 6 adds acceptance evidence without further source changes. Design/admin
+UI changes remain deferred.

@@ -37,6 +37,7 @@ def load_accounts(path):
             for key in models.PROVIDER_RESOURCE_KEY.values():
                 cfg.pop(key, None)
         cfg.update(record)
+        cfg['provider_access'] = record.get('provider_access', {})
         cfg.pop('accounts', None)
         cfg.pop('_config_path', None)
         cfg.update(_persist_auth=False, cache_keepwarm_seconds=0, session_refresh_interval=0,
@@ -157,7 +158,8 @@ def main(argv=None):
     for index, entry in enumerate(entries):
         candidates = [cfg for cfg in accounts if route_available(cfg, entry)]
         if not candidates:
-            parser.error('no configured account for ' + entry['id'])
+            jobs.append((None, entry, None))
+            continue
         cfg = candidates[index % len(candidates)]
         efforts = args.efforts or [('low' if 'low' in entry.get('reasoning_effort_levels', []) else None)]
         jobs.extend((cfg, entry, None if effort == 'omit' else effort) for effort in efforts)
@@ -168,7 +170,9 @@ def main(argv=None):
 
         def run(job):
             cfg, entry, effort = job
-            row = probe(cfg, entry, effort=effort, timeout=args.timeout, surface=args.surface)
+            row = (dict(model=entry['id'], provider=entry['provider'], http=None, success=False,
+                        skipped=True, reason='provider resource is not configured', usage={}) if cfg is None else
+                   probe(cfg, entry, effort=effort, timeout=args.timeout, surface=args.surface))
             line = json.dumps(row, ensure_ascii=False)
             with lock:
                 log.write(line + '\n')
@@ -179,8 +183,10 @@ def main(argv=None):
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
             rows = list(executor.map(run, jobs))
     print(json.dumps({'finished': len(rows), 'passed': sum(row['success'] for row in rows),
+                      'skipped': sum(bool(row.get('skipped')) for row in rows),
                       'credits_reported': sum(row['usage'].get('creditsUsed', 0) for row in rows),
-                      'requests_without_credit_report': sum('creditsUsed' not in row['usage'] for row in rows)}), flush=True)
+                      'requests_without_credit_report': sum('creditsUsed' not in row['usage'] for row in rows
+                                                           if not row.get('skipped'))}), flush=True)
     return 0 if all(row['success'] for row in rows) else 1
 
 

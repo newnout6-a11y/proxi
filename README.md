@@ -466,6 +466,7 @@ Windows PowerShell 5.1 через `*>>`, могут быть в UTF-16 или с
 | relay_system_prompt | null — стандартная роль; строка — полный системный текст с вашей ролью, правилами, стилем и границами; пустая строка — без собственной роли |
 | relay_system_prompt_mode | standalone — только без инструкций клиента; append — дополнить инструкции IDE; replace — заменить их. Пример и границы: [системная политика](docs/relay-quality-and-prompts.md) |
 | allow_effort_downgrade | false — неподдерживаемый уровень отклоняется; true явно разрешает совместимое приближение |
+| provider_access | В каждой записи аккаунта: подтверждённые BYOK/retention свойства, привязанные к UUID ресурса; [доступность маршрутов](docs/model-route-availability-2026-11-05.md) |
 | upstream_empty_retries | 1 — дополнительные одинаковые платные POST после пустого/thinking-only ответа (всего 2 POST); 0 отключает; не больше 5 POST на шаг |
 | upstream_error_max_dumps | 50 — сколько последних комплектов приватных тел (`body`/`error`/`metadata`) хранить в `logs/upstream-400/`; 0 — без ограничения |
 | upstream_attempt_summaries_max | 200 — сколько последних `*-response.json` хранить; 0 — без ограничения |
