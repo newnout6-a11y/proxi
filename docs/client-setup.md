@@ -324,25 +324,79 @@ Retool has redacted or omitted.
 
 ## Claude Desktop on Windows
 
-The installed 4.4212.0.0 Code-mode client reads its gateway policy from
-`HKCU\Software\Policies\Claude`. Its native discovery filters the relay's
-27 routes to 11 currently available Claude models. It does not accept GPT or
-GLM merely because those models speak the same API; do not invent Anthropic
-family tiers for them.
+The installed 4.4212.0.0 client reads its configuration from one source, chosen
+in this order ([sources](https://claude.com/docs/third-party/claude-desktop/configuration-format),
+[MDM](https://claude.com/docs/third-party/claude-desktop/mdm)):
 
-A nonempty `inferenceModels` policy is the authoritative list. Enabling
-discovery alone enriches those rows and does not add missing models. The
-maintainer `scripts/sync_claude_desktop_catalog.py` previews the compatible
-Claude subset and updates only that model-list value with `--write
---backup-dir PATH`. The endpoint, key, authentication scheme, high default and
-all other policies are preserved. The installed policy now contains all 11
-Claude routes instead of only Opus/Sonnet 5.5.
+1. machine policy `HKLM\SOFTWARE\Policies\Claude`; while any value exists there,
+   `HKCU` is ignored entirely;
+2. user policy `HKCU\SOFTWARE\Policies\Claude`;
+3. the local `%LOCALAPPDATA%\Claude-3p\configLibrary\`: `_meta.json` names the
+   applied `<id>.json`, whose `inferenceModels` is a native JSON array.
 
-Native picker levels vary by model: a max cap on older five-level rows would
-offer the route-rejected xhigh. Those rows are capped at high; Opus 4.6 and
-Sonnet 4.6 keep their valid four-level max. Unknown 5.5 rows have no built-in
-effort selector in this installed version; setting their policy does not claim
-the GUI gained one. Their gateway default remains high.
+A policy that sets any key other than the app-behavior keys (updates,
+relaunch/re-check, proxy) makes Desktop ignore the whole local configuration,
+gateway URL and key included. Registry values are `REG_SZ` strings holding JSON.
+On the audited machine neither policy key exists: `main.log` for the launches of
+2026-11-03, 2026-11-04 and 2026-11-05 02:37 reports `type: 'local'`,
+`managedKeys: []` and `picker = 3 (inferenceModels)`, so the list comes from the
+applied configLibrary file.
+
+The maintainer `scripts/sync_claude_desktop_catalog.py` detects that source the
+same way and previews or updates only its `inferenceModels` list. `--source
+auto|hkcu|local` states which source you expect (default `auto`); a mismatch is
+an error, never a silent write to a source Desktop ignores. `--write
+--backup-dir PATH` replaces a configLibrary file atomically (the backup must be
+on the same volume) or updates the existing `HKCU` value in place, after saving
+the old content. A configLibrary backup holds the gateway settings: keep it
+private. Quit Desktop first: it reads its configuration at launch. Every other
+key, the endpoint, the gateway key and the authentication scheme stay untouched.
+The script never writes `HKLM` and never creates a policy: a policy that sets any
+other key would switch Desktop away from its working local configuration, so
+with no policy the local file is the target. It also refuses to add a model list
+where none exists, because a static list replaces model discovery. A missing
+Desktop configuration, invalid JSON or a policy it must not touch end in a plain
+error message, not a traceback.
+
+A nonempty `inferenceModels` list is authoritative: enabling discovery alone
+enriches its rows and does not add missing models. The first row is Desktop's
+default model. The script keeps existing rows in order with every field it does
+not derive (`labelOverride`, `supports1m`, `behavesAs` and so on), appends new
+models at the end and moves the first row only for an explicit `--default-model`;
+a current default that is no longer available is an error, not a silent
+replacement. It owns `isFamilyDefault`, `anthropicFamilyTier` and `maxEffort`,
+and gives new rows the relay's label.
+
+Which models: the relay exposes 27 routes and the script selects the verified
+Claude ones (`provider` anthropic with a `claude-` prefix), currently 11. That is
+the script's own selection, not a subset Desktop computes; Desktop only drops
+list entries that do not name an Anthropic model. GPT and GLM are not accepted
+merely because they speak the same API; do not invent Anthropic family tiers for
+them. When Anthropic's catalog cache is readable (`--desktop-catalog PATH`,
+default `%LOCALAPPDATA%\Claude-3p\model-catalog\published.json`) only models it
+lists for Code or Cowork are included: 9 of the 11 in catalog version 4008.
+`claude-opus-4-5-20251101` appears only as a disabled chat model and
+`claude-sonnet-4-5-20250929` is absent, so Code has no metadata or effort
+selector for them. `--include-unlisted` keeps them. Without a catalog file all 11
+are listed, with a warning.
+
+`maxEffort` hides every level above it, so a cap cannot skip a level. The relay
+rejects `xhigh` unless `allow_effort_downgrade` is true in its configuration:
+
+| Model | Desktop picker | `maxEffort`, downgrade off | downgrade on |
+| --- | --- | --- | --- |
+| Opus 5.5, 5, 4.8, 4.7; Sonnet 5.5, 5 | low, medium, high, xhigh, max | `high` | `max` |
+| Opus 4.6, Sonnet 4.6 | low, medium, high, max | `max` | `max` |
+| Haiku 4.5, Opus 4.5, Sonnet 4.5 | no effort selector | not set | not set |
+
+With the setting off, five-level rows stop at `high`: Desktop does not offer `max`
+even though the relay accepts it, because a `max` cap would also expose `xhigh`.
+With it on, the script sets `max`; the relay serves `xhigh` as `high` and `max` as
+`max`. Haiku 4.5, Opus 4.5 and Sonnet 4.5 have no native effort. Claude Code's
+[effort table](https://code.claude.com/docs/en/model-config#adjust-effort-level)
+says "Models not listed here do not support effort" and Anthropic's Haiku 4.5
+page says "Default effort: Not supported". A readable catalog's effort levels
+take precedence over this table.
 
 The installed ASAR's actual discovery/filter/merge/picker functions and bundled
 Agent SDK were executed without Electron or UI input. Exact SDK wrapper

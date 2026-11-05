@@ -594,6 +594,39 @@ other registry value, including auth. Older effort pickers are capped at high
 to avoid route-invalid xhigh; Opus/Sonnet 4.6 keep their four-level max. This
 does not invent missing selectors for new 5.5 model IDs.
 
+> **Correction (2026-11-05, PR #24 review).** Three statements here and in the
+> Claude Desktop row of the client table above are withdrawn:
+>
+> - "Accepts 11 Claude models" and "reconciled to 11 Claude routes": 11 is the
+>   number of the relay's verified `claude-*` routes that the script selected
+>   (`provider` anthropic, `claude-` prefix), not a subset Desktop computed.
+>   Desktop only removes list entries that do not name an Anthropic model (its
+>   log: "is not an Anthropic model and was removed from the list"). Anthropic's
+>   cached catalog (version 4008) lists 9 of the 11 for Code and Cowork:
+>   `claude-opus-4-5-20251101` appears only as a disabled chat model and
+>   `claude-sonnet-4-5-20250929` is absent, so Code has no metadata or effort
+>   selector for them.
+> - "The applied policy": the script read and wrote only
+>   `HKCU\Software\Policies\Claude`. During the review neither that key nor
+>   `HKLM\SOFTWARE\Policies\Claude` existed on this machine. `main.log` reports
+>   `type: 'local'` and `managedKeys: []` for every launch logged since
+>   2026-10-26, and `picker = 3 (inferenceModels)` for those of 2026-11-03,
+>   2026-11-04 and 2026-11-05 02:37: the active list was the applied
+>   `%LOCALAPPDATA%\Claude-3p\configLibrary` file. A backup from 10:34 on
+>   2026-11-05 shows the script replacing a 2-model `HKCU` value, which was gone
+>   afterwards; the last logged launch predates that write.
+> - "Capped at high": that followed the relay's rejection of `xhigh` and hid
+>   `max` on five-level rows even though the relay accepts it. Haiku 4.5 also
+>   received `maxEffort`, although it has no native effort (Claude Code's effort
+>   table does not list it; Anthropic's model page says "Default effort: Not
+>   supported").
+>
+> The script now follows Desktop's source precedence (`HKLM`, `HKCU`, local
+> configLibrary), never writes `HKLM`, never creates a policy, keeps the user's
+> order, labels and default model, filters by Anthropic's catalog when it is
+> readable, and sets `max` when `allow_effort_downgrade` is on. See
+> `client-setup.md`.
+
 Exact installed SDK wrapper **0.3.309** was loaded from ASAR. Its embedded target
 runner **2.1.309** is absent on disk. Live checks explicitly used cached Desktop
 runner **2.1.295**, SHA-256
