@@ -1,6 +1,7 @@
 """Head templates: variables, escapes, one-pass substitution, tidy blank lines, I5 billing, I9 ownership, I10 structured."""
 import asyncio
 import json
+import random
 
 import pytest
 
@@ -435,3 +436,53 @@ def test_passthrough_equals_legacy_for_a_text_job_that_is_only_a_contract(tmp_pa
 def test_the_client_context_still_sees_the_request_as_before(tmp_path):
     parsed = request(FIRST, system="SYS")
     assert client_context.request_kind(parsed, {"client": "opencode"}) == "client-tools"
+
+# -- properties over random templates --------------------------------------------------------------------------------
+
+POOL = ["{{client_system}}", "{{client_system_raw}}", "{{text:a}}", "{{text:e}}", "{{role}}", "{{native_role}}",
+        "{{relay_task}}", "{{local_exec}}", "{{project_context}}", "{{exec_reminder}}", "{{structured}}", "{{model}}",
+        "\\{{", "\n", "\n\n", "\n\n\n", " ", "text", "}}", "{", "\\", "{{ client_system }}"]
+RANDOM_SYSTEMS = ["", "SYS", BILLING + "\nREST", BILLING, BILLING + "\n", "a\n\n\nb\n", "x\r\ny", "\n\nlead", "{{role}}"]
+SOURCE_TEXTS = ["", "T", "t\n\n", "\nn\n"]
+VOCABULARY = {"client", "client_edited", "literal", "billing", "relay:role", "relay:native_role", "relay:task",
+              "relay:local_exec", "relay:project_context", "relay:exec_reminder", "relay:structured", "text:a", "text:e"}
+
+
+def test_random_templates_keep_the_contract_of_compose_head(tmp_path):
+    chooser = random.Random(20261105)
+    checked = 0
+    for _ in range(600):
+        template = "".join(chooser.choice(POOL) for _ in range(chooser.randint(1, 9)))
+        doc = document(texts={"a": "A\n", "e": ""}, profiles={"p": {"head": template, "client_system": {"edits": [
+            {"op": "replace_text", "find": "SYS", "with": "sys"}]}}})
+        try:
+            snapshot = compile_doc(doc, tmp_path)
+        except pp.PromptConfigError:
+            continue
+        system = chooser.choice(RANDOM_SYSTEMS)
+        texts = {name: chooser.choice(SOURCE_TEXTS) for name in
+                 ("relay_role", "native_role", "relay_task", "local_exec", "project_context", "exec_reminder",
+                  "structured")}
+        owned = chooser.random() < 0.5
+        sources = Sources(client_owned=owned, **texts)
+        plan = pp.Plan(rev=1, profile="p", rule="r", snapshot=snapshot)
+        head, parts, warnings = plan.compose_head(system, sources)
+        checked += 1
+        assert head == "".join(part.text for part in parts), template
+        assert all(part.text for part in parts) and {part.source for part in parts} <= VOCABULARY, template
+        again = plan.compose_head(system, Sources(client_owned=owned, **texts))
+        assert again == (head, parts, warnings), template
+        spans = pp.part_spans(parts)
+        assert all(a["end"] == b["start"] for a, b in zip(spans, spans[1:])) and (not spans or spans[-1]["end"] == len(head))
+        first = system.partition("\n")[0]
+        if first.startswith("x-anthropic-billing-header:"):
+            assert head.startswith(first) and parts[0].source == "billing", template
+        else:
+            assert not any(part.source == "billing" for part in parts)
+        if not owned:
+            assert not any(line.endswith("(the relay adds no task blocks)") for line in warnings)
+        else:
+            assert not {"relay_task", "local_exec", "project_context", "exec_reminder"} & set(sources.calls), template
+        assert len(sources.calls) == len(set(sources.calls)), template
+        assert not {"relay_role", "native_role"} & set(sources.calls) or "role" in template, template
+    assert checked > 300
