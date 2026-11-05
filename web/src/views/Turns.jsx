@@ -5,9 +5,11 @@ import { Section, ease } from '../motion.jsx';
 import { Empty, Tag } from '../ui.jsx';
 import { TapeLegend, TurnTape } from '../charts.jsx';
 import { LEVELS, STATUS_TONE, TURN_STATUS } from '../catalog.js';
-import { buildTraces, phasesOf } from '../turns.js';
+import { buildTraces, costOf, phasesOf, scaleOf, statusAt } from '../turns.js';
 import { fmtAgo, fmtClock, fmtFixed, fmtInt, fmtMs, fmtTokens } from '../format.js';
 import { TurnsArt } from '../stage/Art.jsx';
+
+const LIVE_PHASE = { wait: 'ждём upstream', think: 'upstream: thinking', tools: 'аргументы инструмента', out: 'пишет ответ', exec: 'выполняет команду' };
 
 function Steps({ trace }) {
   const start = trace.started;
@@ -30,14 +32,14 @@ export default function Turns({ journal, overview, embedded }) {
   const traces = useMemo(() => buildTraces(journal.events), [journal.events]);
   const [open, setOpen] = useState(null);
   const [now, setNow] = useState(() => Date.now() / 1000);
-  const running = traces.some((trace) => trace.status === 'running');
+  const list = traces.slice(0, 120);
+  const running = list.some((trace) => statusAt(trace, now) === 'running');
   useEffect(() => {
     if (!running) return undefined;
     const timer = setInterval(() => setNow(Date.now() / 1000), 1000);
     return () => clearInterval(timer);
   }, [running]);
-  const list = traces.slice(0, 120);
-  const max = Math.max(1, ...list.map((trace) => phasesOf(trace, now).total));
+  const max = scaleOf(list, now);
 
   return (
     <Section embedded={embedded} className="turns">
@@ -57,34 +59,40 @@ export default function Turns({ journal, overview, embedded }) {
         {list.map((trace) => {
           const isOpen = open === trace.id;
           const phases = phasesOf(trace, now);
+          const { status } = phases;
+          const cost = costOf(trace, status);
           const totalIn = (trace.inputTokens || 0) + (trace.cacheRead || 0) + (trace.cacheWrite || 0);
           const hit = totalIn > 0 ? trace.cacheRead / totalIn : null;
           return (
-            <article key={trace.id} className={`trace status-${trace.status} ${isOpen ? 'open' : ''}`}>
+            <article key={trace.id} className={`trace status-${status} ${isOpen ? 'open' : ''}`}>
               <button type="button" className="trace-head" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : trace.id)}>
                 <span className="trace-status">
                   <ChevronRight className="chev" size={16} strokeWidth={1.5} aria-hidden="true" />
-                  <Tag tone={STATUS_TONE[trace.status] || 'muted'}>{TURN_STATUS[trace.status] || trace.status}</Tag>
+                  <Tag tone={STATUS_TONE[status] || 'muted'}
+                    title={status === 'interrupted' ? 'Relay перезапустился или событий давно нет: конец хода неизвестен' : undefined}>
+                    {TURN_STATUS[status] || status}
+                  </Tag>
                 </span>
                 <span className="trace-model">
                   <strong>{trace.model || '—'}</strong>
                   <small>{[trace.effort && `effort ${trace.effort}`, trace.transport, trace.dialect].filter(Boolean).join(' · ')}</small>
                 </span>
                 <span className="trace-tape">
-                  <TurnTape trace={trace} max={max} now={now} />
+                  <TurnTape trace={trace} max={max} now={now} phases={phases} />
                   <span className="trace-phases">
                     <span title="Время до первого токена">{fmtMs(trace.ttft)}</span>
                     {phases.think > 0 && <span title="По событиям thinking от upstream">мышление {fmtMs(phases.think)}</span>}
-                    {trace.status === 'running' && <span className="live-phase">{trace.phase === 'think' ? 'upstream: thinking' : trace.phase === 'out' ? 'пишет ответ' : trace.phase === 'tools' ? 'аргументы инструмента' : trace.phase === 'wait' ? 'ждём upstream' : 'ожидаем событие'}</span>}
-                    {trace.args > 0 && <span title="Генерация аргументов инструментов">инструменты {fmtMs(trace.args)}</span>}
+                    {phases.open && <span className="live-phase">{LIVE_PHASE[trace.phase] || 'ожидаем событие'}</span>}
+                    {phases.tools > 0 && <span title="Генерация аргументов инструментов">инструменты {fmtMs(phases.tools)}</span>}
+                    {phases.exec > 0 && <span title="Выполнение локальных команд relay; входит в «без детализации»">команды {fmtMs(phases.exec)}</span>}
                     <span>всего {fmtMs(phases.total)}</span>
                   </span>
                 </span>
                 <span className="trace-num">{fmtMs(trace.ttft)}</span>
                 <span className="trace-num">{fmtTokens(trace.cacheRead)}{hit !== null && <small> · {Math.round(hit * 100)}%</small>}</span>
-                <span className="trace-num trace-cost" title={trace.credits === null ? 'Стоимость не сообщена' : !trace.creditsComplete ? 'Часть стоимости не сообщена' : 'Сообщённая стоимость'}>
-                  {trace.credits !== null && !trace.creditsComplete ? '≥ ' : ''}{fmtFixed(trace.credits, 2)}
-                  <small>{trace.credits === null ? 'нет данных' : !trace.creditsComplete ? 'неполные данные' : ''}</small>
+                <span className="trace-num trace-cost" title={cost.credits === null ? cost.pending ? 'Стоимость будет известна, когда upstream ответит' : 'Стоимость не сообщена' : !cost.complete ? 'Часть стоимости не сообщена' : 'Сообщённая стоимость'}>
+                  {cost.credits !== null && !cost.complete ? '≥ ' : ''}{fmtFixed(cost.credits, 2)}
+                  <small>{cost.credits === null ? cost.pending ? 'ход идёт' : 'нет данных' : !cost.complete ? 'неполные данные' : ''}</small>
                 </span>
                 <time className="trace-when" title={fmtClock(trace.started)}>
                   {fmtAgo(trace.started)}

@@ -320,16 +320,16 @@ export function RankedList({ items, format = fmtInt, empty = 'Пока пуст�
 }
 
 /** The turn tape: a thin strip of phases (waiting, thinking, tools, output) on a shared scale. */
-export function TurnTape({ trace, max, now, className = '' }) {
-  const p = phasesOf(trace, now);
+export function TurnTape({ trace, max, now, phases, className = '' }) {
+  const p = phases || phasesOf(trace, now);
   const values = [p.wait, p.think, p.tools, p.out, p.other];
   const fill = max ? Math.max(1.5, (p.total / max) * 100) : 100;
   const label = PHASES.map((phase, i) => `${phase.label} ${fmtMs(values[i])}`).join(', ');
   return (
-    <span className={`tape ${trace.status === 'error' ? 'is-error' : ''} ${p.open ? 'is-open' : ''} ${className}`} role="img" aria-label={`Фазы хода: ${label}`}>
+    <span className={`tape ${p.status === 'error' ? 'is-error' : ''} ${p.status === 'interrupted' ? 'is-interrupted' : ''} ${p.open ? 'is-open' : ''} ${className}`} role="img" aria-label={`Фазы хода: ${label}`}>
       <span className="tape-fill" style={{ width: `${Math.min(100, fill)}%` }}>
         {values.map((ms, i) => (ms > 0 ? <i key={PHASES[i].key} className={`ph-${i + 1}`} style={{ flexGrow: ms }} title={`${PHASES[i].label} ${fmtMs(ms)}`} /> : null))}
-        {(p.open || trace.status === 'error') && <i className="tape-cap" />}
+        {(p.open || p.status === 'error' || p.status === 'interrupted') && <i className="tape-cap" />}
       </span>
     </span>
   );

@@ -1,5 +1,18 @@
 import { test, expect } from '@playwright/test';
 import { API_KEY, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
+import { NOW, metricsFor } from './fixtures.js';
+
+// Replaces the journal page the admin loads at start; the live stream stays empty.
+const serveEvents = (page, data) => page.route(/\/admin\/api\/events\?/, (route) => route.fulfill({
+  json: { data, last_seq: data.reduce((last, event) => Math.max(last, event.seq), 0) },
+}));
+
+// A turn event `seconds` from now, with the next sequence number; no turn id makes it a relay event.
+let eventSeq = 100;
+const eventAt = (turn, seconds, kind, data = {}, extra = {}) => {
+  eventSeq += 1;
+  return ev(eventSeq, kind, kind, 'info', { ...(turn && { turn_id: turn }), ts: NOW + seconds, data, ...extra });
+};
 
 async function login(page, { remember = false } = {}) {
   await page.goto('./');
@@ -273,6 +286,77 @@ test('turn traces show hidden thinking and tool argument time', async ({ page })
   const trace = page.locator('.trace', { hasText: 'effort high' }).first();
   await expect(trace.locator('[title="По событиям thinking от upstream"]')).toContainText('6,40 с', { timeout: 10000 });
   await expect(trace.locator('[title="Генерация аргументов инструментов"]')).toContainText('7,10 с');
+});
+
+test('turns left running by a restart or by silence are interrupted and never stretch the shared scale', async ({ page }) => {
+  await mockAdmin(page);
+  const day = 86400;
+  await serveEvents(page, [
+    // Restored from journal.jsonl: the process that ran this turn is gone
+    eventAt(null, -3 * day, 'relay.start', {}, { restored: true }),
+    eventAt('t-lost', -3 * day + 1, 'turn.begin', { model: 'model-lost', effort: 'high' }, { restored: true }),
+    eventAt('t-lost', -3 * day + 2, 'upstream.thinking_start', {}, { restored: true }),
+    // Ended by the next relay.start in the journal
+    eventAt(null, -4000, 'relay.start'),
+    eventAt('t-restart', -3900, 'turn.begin', { model: 'model-restart', effort: 'high' }),
+    eventAt('t-restart', -3899, 'upstream.thinking_start'),
+    eventAt(null, -3800, 'relay.start'),
+    // No restart after it, but nothing for 50 minutes
+    eventAt('t-silent', -3000, 'turn.begin', { model: 'model-silent', effort: 'high' }),
+    eventAt('t-silent', -2999, 'upstream.thinking_start'),
+    eventAt('t-done', -60, 'turn.begin', { model: 'model-done', effort: 'low' }),
+    eventAt('t-done', -58, 'turn.end', { reason: 'stop', duration_ms: 2000 }),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  for (const model of ['model-lost', 'model-restart', 'model-silent']) {
+    const row = page.locator('.trace', { hasText: model });
+    await expect(row.locator('.tag')).toHaveText('прерван');
+    await expect(row).toContainText('всего 1,00 с');
+    await expect(row.locator('.live-phase')).toHaveCount(0);
+    await expect(row.locator('.tape')).toHaveClass(/is-interrupted/);
+    // Half of the finished turn's 2 s, not a fraction of 3 days
+    await expect(row.locator('.tape-fill')).toHaveAttribute('style', /width: 50%/);
+  }
+  const done = page.locator('.trace', { hasText: 'model-done' });
+  await expect(done.locator('.tag')).toHaveText('готово');
+  await expect(done.locator('.tape-fill')).toHaveAttribute('style', /width: 100%/);
+});
+
+test('turn rows tell a turn that never reached upstream, an unpriced one and a running one apart, and keep a command out of the answer', async ({ page }) => {
+  await mockAdmin(page);
+  await serveEvents(page, [
+    eventAt('t-failed', -400, 'turn.begin', { model: 'model-failed' }),
+    eventAt('t-failed', -399, 'turn.error', {}, { level: 'error' }),
+    eventAt('t-failed', -399, 'turn.end', { reason: 'error', duration_ms: 1000 }, { level: 'error' }),
+    eventAt('t-unpriced', -300, 'turn.begin', { model: 'model-unpriced' }),
+    eventAt('t-unpriced', -300, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-unpriced', -296, 'turn.end', { reason: 'error', duration_ms: 4000 }, { level: 'error' }),
+    eventAt('t-command', -200, 'turn.begin', { model: 'model-command' }),
+    eventAt('t-command', -200, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-command', -195, 'upstream.text_start'),
+    eventAt('t-command', -193, 'exec.start'),
+    eventAt('t-command', -163, 'exec.result', { duration_ms: 30000, exit: 0 }),
+    eventAt('t-command', -163, 'upstream.usage', { credits: 0.5, attempt: 1, credits_reported: true }),
+    eventAt('t-command', -163, 'upstream.usage_start', { attempt: 2 }),
+    eventAt('t-command', -160, 'upstream.usage', { credits: 0.25, attempt: 2, credits_reported: true }),
+    eventAt('t-command', -160, 'turn.end', { reason: 'stop', duration_ms: 40000 }),
+    eventAt('t-running', -20, 'turn.begin', { model: 'model-running' }),
+    eventAt('t-running', -20, 'upstream.usage_start', { attempt: 1 }),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  const cost = (model) => page.locator('.trace', { hasText: model }).locator('.trace-cost');
+  await expect(cost('model-failed')).toContainText('0,00');
+  await expect(cost('model-failed')).not.toContainText('нет данных');
+  await expect(cost('model-unpriced')).toContainText('нет данных');
+  await expect(cost('model-running')).toContainText('ход идёт');
+  await expect(cost('model-running')).not.toContainText('нет данных');
+  const command = page.locator('.trace', { hasText: 'model-command' });
+  await expect(cost('model-command')).toContainText('0,75');
+  await expect(command.locator('.trace-phases')).toContainText('команды 30,0 с');
+  // 2 s of text, then 30 s of command: only the 2 s are the answer
+  await expect(command.locator('.tape')).toHaveAttribute('aria-label', /ответ 2,00\sс.*без детализации 30,0\sс/);
 });
 
 test('turns empty state shows the stageshow illustration', async ({ page }) => {

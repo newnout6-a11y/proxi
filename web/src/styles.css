@@ -244,6 +244,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 .ph-5 { background: var(--raised-hover); border: 1px dashed var(--muted); }
 .tape.is-open .tape-cap { flex: 0 0 2px; background: var(--accent); }
 .tape.is-error .tape-cap { flex: 0 0 2px; background: var(--neg); }
+.tape.is-interrupted .tape-cap { flex: 0 0 2px; background: var(--ink-2); }
 .tape-legend { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); margin: 0; padding: 0; list-style: none; font-size: var(--text-xs); color: var(--muted); }
 .tape-legend li { display: inline-flex; align-items: center; gap: var(--space-2); }
 .tape-legend i { display: inline-block; width: 12px; height: 8px; border-radius: 1px; }
