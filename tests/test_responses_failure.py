@@ -275,11 +275,11 @@ def test_http_chat_and_messages_streams_keep_their_error_event_alone(relay, dial
     assert status == 200 and names.count('error') == 1 and names[-1] == 'error' and 'response.failed' not in raw
     assert raw.rstrip().endswith('data: [DONE]')
     payload = dict(events)['error']
-    assert 'sequence_number' not in payload and 'relay_code' not in json.dumps(payload)
+    assert 'sequence_number' not in payload
     if dialect == 'chat':
-        assert payload['error']['code'] == 'upstream_error'
-    else:
-        assert payload['error']['type'] == 'api_error'
+        assert payload['error']['code'] == 'upstream_error' and 'relay_code' not in json.dumps(payload)
+    else:  # the Messages type is the documented one (translated by the error table), nothing else changed
+        assert payload['error'] == {'type': 'api_error', 'message': 'boom', 'relay_code': 'upstream_error'}
 
 
 def test_the_journal_still_records_a_failed_responses_stream_as_an_error(relay):

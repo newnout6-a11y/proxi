@@ -739,7 +739,10 @@ upstream/сессии, 503 upstream недоступен или нет акка�
 В диалекте Messages (JSON и SSE `event: error`) `error.type` всегда один из документированных
 типов Anthropic ([список](https://platform.claude.com/docs/en/api/errors)): собственный код
 relay переводится, и клиент не встречает тип, которого его обработчик ошибок не знает.
-Собственный код остаётся в `ApiError.code`, в журнале (`http.error`) и в диалектах OpenAI.
+Собственный код остаётся в `ApiError.code`, в журнале (`http.error`), в диалектах OpenAI и в
+самом ответе Messages: поле `error.relay_code` есть везде, где тип заменил код
+(`upstream_error` → `api_error`, `insufficient_credits` → `billing_error`), и отсутствует,
+когда они совпали (`rate_limit_error`).
 
 | код relay | тип Messages |
 | --- | --- |

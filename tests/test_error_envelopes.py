@@ -13,7 +13,8 @@ from test_client_contracts import _body
 def test_unprocessable_is_an_invalid_request_for_anthropic_clients():
     error = apierr.unprocessable("'stop' is not supported by the Retool route", param='stop')
     assert error.anthropic_envelope() == {'type': 'error', 'error': {
-        'type': 'invalid_request_error', 'message': "'stop' is not supported by the Retool route"}}
+        'type': 'invalid_request_error', 'message': "'stop' is not supported by the Retool route",
+        'relay_code': 'unprocessable_entity'}}
     # The relay's own code, status and param stay available to logs and the other dialects.
     assert (error.status, error.code, error.param) == (422, 'unprocessable_entity', 'stop')
 
@@ -33,9 +34,21 @@ def test_openai_and_responses_envelopes_are_unchanged(make):
 
 
 def test_documented_anthropic_types_pass_through_unchanged():
-    assert apierr.bad_request('x').anthropic_envelope()['error']['type'] == 'invalid_request_error'
+    assert apierr.bad_request('x').anthropic_envelope()['error'] == {'type': 'invalid_request_error', 'message': 'x'}
     assert apierr.not_found().anthropic_envelope()['error']['type'] == 'not_found_error'
     assert apierr.too_many_requests().anthropic_envelope()['error']['type'] == 'rate_limit_error'
+
+
+def test_the_relay_code_stays_visible_where_the_documented_type_replaces_it():
+    # Before the translation `upstream_error` and the like were the type itself: a client could tell them apart.
+    for make, kind in ((lambda: apierr.upstream_error('x'), 'api_error'), (lambda: apierr.upstream_timeout(), 'timeout_error'),
+                       (lambda: apierr.insufficient_credits(5), 'billing_error'),
+                       (lambda: apierr.service_unavailable('x'), 'overloaded_error')):
+        error = make()
+        shown = error.anthropic_envelope()['error']
+        assert (shown['type'], shown['relay_code']) == (kind, error.code)
+    for make in (lambda: apierr.bad_request('x'), lambda: apierr.not_found(), lambda: apierr.too_many_requests()):
+        assert 'relay_code' not in make().anthropic_envelope()['error']  # nothing was replaced
 
 
 # The closed set of error types platform.claude.com/docs/en/api/errors documents (checked 2026-11-05).
@@ -145,11 +158,12 @@ def test_messages_json_and_stream_errors_carry_the_documented_type(relay, make, 
     relay.fake.script = [make()]
     code, body = fetch(relay, '/v1/messages', _body('anthropic'))
     assert code == status and body['type'] == 'error' and body['error']['type'] == expected
+    assert body['error']['relay_code'] == make().code
     relay.fake.script = [make()]
     _, raw = relay.sse('/v1/messages', _body('anthropic', stream=True))
     payload = json.loads(next(line[6:] for line in raw.splitlines() if line.startswith('data: {"type"')
                               and '"error"' in line[:30]))
-    assert payload['error']['type'] == expected
+    assert payload['error']['type'] == expected and payload['error']['relay_code'] == make().code
     # The OpenAI dialects keep the relay's own code.
     relay.fake.script = [make()]
     code, body = fetch(relay, '/v1/chat/completions', _body('chat'))

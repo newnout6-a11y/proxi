@@ -96,9 +96,13 @@ class ApiError(Exception):
         return {"error": {"message": self.message, "type": self.code, "code": self.code, "param": self.param}}
 
     def anthropic_envelope(self) -> dict:
-        # Anthropic uses a flat type + message pair.
-        return {"type": "error", "error": {"type": anthropic_type(self.code, self.status),
-                                           "message": self.message}}
+        # Anthropic uses a flat type + message pair. The relay's own code used to show as the type of every
+        # code the translation did not know; it stays visible as relay_code wherever the type replaces it.
+        kind = anthropic_type(self.code, self.status)
+        error = {"type": kind, "message": self.message}
+        if self.code != kind:
+            error["relay_code"] = self.code
+        return {"type": "error", "error": error}
 
     def responses_envelope(self) -> dict:
         # Responses SSE errors are flat events with an explicit type; without it a
