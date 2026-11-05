@@ -146,6 +146,29 @@ def summarize_changes(changes: list[dict], indexes: int = SUMMARY_INDEXES) -> li
     return list(groups.values())
 
 
+def unmatched_edits(profile: dict, changes: list[dict]) -> list[dict]:
+    """The rules of a profile's history and tools that left no entry in changes: they found nothing to do.
+
+    [{"scope": "history" | "tools", "op", "edit": position in user_blocks / tools.edits}], and the
+    mid_system mode as {"scope": "history", "op": "mid_system", "mode"} when it is not "keep" and no system
+    message was touched. A rule that was refused or could not run has an entry (skipped), so it is not listed.
+    """
+    seen = {(c.get("scope"), c.get("edit")) for c in changes or [] if c.get("edit") is not None}
+    profile = profile if isinstance(profile, dict) else {}
+    history = profile["history"] if isinstance(profile.get("history"), dict) else {}
+    tools = profile["tools"] if isinstance(profile.get("tools"), dict) else {}
+    found = []
+    mode = history.get("mid_system")
+    if mode in ("drop", "wrap", "plain") and not any(c.get("op") == "mid_system" for c in changes or []):
+        found.append({"scope": "history", "op": "mid_system", "mode": mode})
+    for scope, rules in (("history", history.get("user_blocks")), ("tools", tools.get("edits"))):
+        for position, spec in enumerate(rules if isinstance(rules, list) else []):
+            if isinstance(spec, dict) and (scope, position) not in seen:
+                hiding = spec.get("hide") is True or spec.get("op") == "hide"
+                found.append({"scope": scope, "op": "hide" if hiding else str(spec.get("op")), "edit": position})
+    return found
+
+
 def _clone(value):
     """A deep copy of JSON-shaped data that shares the immutable leaves (several times faster than copy.deepcopy)."""
     kind = type(value)

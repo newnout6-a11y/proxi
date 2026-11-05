@@ -7,7 +7,7 @@ import pytest
 import prompt_body
 import prompt_policy
 from test_prompt_body_support import (
-    DIALECTS, REMINDER, TOOL_REMINDER, FakeSnapshot, drop_tag, dump, history_of, leaves,
+    DIALECTS, REMINDER, TOOL_REMINDER, FakeSnapshot, conversation, drop_tag, dump, history_of, leaves,
     neutral, parse, profile, rich_conversation)
 
 PROFILES = {
@@ -324,3 +324,31 @@ def test_the_same_profile_gives_the_same_bytes_from_many_threads(dialect):
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         assert set(pool.map(work, range(64))) == {expected}
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_unmatched_edits_name_the_rules_that_found_nothing_to_do(dialect):
+    rules = profile(mid_system="plain", user_blocks=[drop_tag(), {"op": "replace_text", "find": "zzz", "with": "y"},
+                                                    {"op": "remove_regex", "pattern": "Use tabs"}],
+                    tools=[{"tool": "bash", "op": "append", "text": "Note."}, {"tool": "nothing", "hide": True},
+                           {"tool": "read", "op": "replace_text", "find": "zzz", "with": "y"}])
+    _, changes = prompt_body.rewrite(rich_conversation(dialect), dialect, rules, FakeSnapshot())
+    assert prompt_body.unmatched_edits(rules, changes) == [
+        {"scope": "history", "op": "replace_text", "edit": 1},
+        {"scope": "history", "op": "remove_regex", "edit": 2},     # drop_tag took the blocks that held "Use tabs"
+        {"scope": "tools", "op": "hide", "edit": 1}, {"scope": "tools", "op": "replace_text", "edit": 2}]
+    lonely = conversation(dialect, [("user", "go"), ("assistant", "ok"), ("user", "more")])
+    _, changes = prompt_body.rewrite(lonely, dialect, profile(mid_system="drop"), FakeSnapshot())
+    assert prompt_body.unmatched_edits(profile(mid_system="drop"), changes) == [
+        {"scope": "history", "op": "mid_system", "mode": "drop"}]
+    assert prompt_body.unmatched_edits(profile(), []) == [] and prompt_body.unmatched_edits(None, None) == []
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_a_refused_or_unreadable_rule_is_not_reported_as_unmatched(dialect):
+    turns = [("user", "start"), ("assistant", "one"), ("user", REMINDER), ("assistant", "two"), ("user", "more")]
+    rules = profile(user_blocks=[drop_tag(), {"op": "bogus"}], tools=[{"tool": "bash", "op": "nonsense"}])
+    _, changes = prompt_body.rewrite(conversation(dialect, turns, tools=[("bash", "Run.")]), dialect, rules,
+                                     FakeSnapshot())
+    assert all(c.get("skipped") for c in changes) and len(changes) == 3
+    assert prompt_body.unmatched_edits(rules, changes) == []
