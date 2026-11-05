@@ -134,6 +134,18 @@ def test_an_old_over_long_role_does_not_block_other_settings(admin_relay):
     assert admin_relay.patch({"max_prompt_bytes": 1_000_000})[0] == 200
 
 
+@pytest.mark.parametrize("role", ["\ud800", "role \udfff end", "half a pair \ud83d"])
+def test_a_role_with_an_unpaired_surrogate_is_a_400_that_names_the_cause(admin_relay, role):
+    before = admin_relay.path.read_bytes()
+    status, body, _ = admin_relay.patch({"relay_system_prompt": role})  # "\ud800" is valid JSON, but not UTF-8 text
+    error = body["error"]
+    assert status == 400 and error["code"] == "invalid_request_error" and error["param"] == "relay_system_prompt"
+    assert "surrogate" in error["message"] and "codec" not in error["message"]
+    assert admin_relay.path.read_bytes() == before
+    # A complete pair (written as two escapes) is an ordinary character.
+    assert admin_relay.patch({"relay_system_prompt": "complete pair \U0001F600"})[0] == 200
+
+
 # -- journal -------------------------------------------------------------------------
 def test_journal_keeps_the_role_text_out_and_records_length_and_hash(admin_relay):
     journal.JOURNAL.reset()

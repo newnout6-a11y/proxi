@@ -794,7 +794,13 @@ class Admin:
         role, cap = candidate.get("relay_system_prompt"), candidate.get("max_prompt_bytes")
         if not isinstance(role, str) or not {"relay_system_prompt", "max_prompt_bytes"} & set(changes):
             return
-        size, limit = len(role.encode("utf-8")), _role_limit(cap)
+        try:
+            size = len(role.encode("utf-8"))
+        except UnicodeEncodeError:
+            # JSON can carry half of a surrogate pair ("\ud800"); it is not text UTF-8 can store.
+            raise apierr.bad_request("relay_system_prompt contains an unpaired surrogate (half of a Unicode pair), "
+                                     "which cannot be saved as UTF-8 text", param="relay_system_prompt")
+        limit = _role_limit(cap)
         if size > limit:
             param = "relay_system_prompt" if "relay_system_prompt" in changes else "max_prompt_bytes"
             capped = f" with max_prompt_bytes={cap}" if limit < ROLE_MAX_BYTES else ""
