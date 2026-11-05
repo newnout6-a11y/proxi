@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { API_KEY, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
+import { API_KEY, DEFAULT_ROLES, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
 
 async function login(page, { remember = false } = {}) {
   await page.goto('./');
@@ -10,6 +10,8 @@ async function login(page, { remember = false } = {}) {
 }
 
 const nav = (page, name) => page.getByRole('navigation').getByRole('button', { name: new RegExp(name) }).click();
+// Settings adds its own group index with role=navigation, so leaving it needs the section rail by name.
+const section = (page, name) => page.getByRole('navigation', { name: 'Разделы' }).getByRole('button', { name: new RegExp(name) });
 
 async function openEvents(page) {
   await nav(page, 'Активность');
@@ -368,6 +370,198 @@ test('typing during a pending save is preserved as a new draft', async ({ page }
   await expect(page.locator('.savebar')).toBeVisible();
   expect(state.settings.rate_limit_rps).toBe(2);
 });
+
+test('the standard role shows both built-in roles and the requests each one serves', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  const [relay, nativeTools] = DEFAULT_ROLES;
+  const main = page.getByLabel('Инструкции для модели', { exact: true });
+  await expect(main).toBeDisabled();
+  await expect(main).toHaveValue(relay.text);
+  await expect(page.locator('#system-instructions-hint')).toContainText(relay.applies_to);
+  const tools = page.getByLabel(nativeTools.title, { exact: true });
+  await expect(tools).toHaveValue(nativeTools.text);
+  await expect(page.locator('#system-default-native_tools-hint')).toContainText(nativeTools.applies_to);
+  // A custom role replaces both of them, so the previews give way to the editor.
+  await page.getByLabel('Стандартная роль relay').uncheck();
+  await expect(tools).toHaveCount(0);
+  await expect(main).toBeEnabled();
+});
+
+test('clearing the standard role starts from its text and an empty role is shown as disabled', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  const editor = page.getByLabel('Инструкции для модели', { exact: true });
+  const standard = page.getByLabel('Стандартная роль relay');
+  const disabled = page.getByText('Роль отключена');
+  const save = page.getByRole('button', { name: 'Сохранить', exact: true });
+  await standard.uncheck();
+  await expect(editor).toHaveValue(DEFAULT_ROLES[0].text);
+  await expect(page.locator('.savebar')).toContainText('1 несохранённых');
+  await expect(disabled).toHaveCount(0);
+  await editor.fill('');
+  await expect(disabled).toBeVisible();
+  // In "replace" mode the client's own instructions are dropped together with the role.
+  await expect(disabled).not.toContainText('инструкции IDE');
+  await page.getByRole('radio', { name: /Заменить роль клиента/ }).check();
+  await expect(disabled).toContainText('инструкции IDE тоже не будут отправлены');
+  await page.getByRole('radio', { name: /Самостоятельные запросы/ }).check();
+  await expect(disabled).not.toContainText('инструкции IDE');
+  await editor.fill('Своя роль');
+  await expect(disabled).toHaveCount(0);
+  await standard.check();
+  await expect(page.locator('.savebar')).toHaveCount(0);
+
+  // Saving right after clearing the box keeps the template, not an empty role.
+  await standard.uncheck();
+  await save.click();
+  await expect.poll(() => state.settings.relay_system_prompt).toBe(DEFAULT_ROLES[0].text);
+  await editor.fill('Сохранённая роль');
+  await save.click();
+  await expect.poll(() => state.settings.relay_system_prompt).toBe('Сохранённая роль');
+  // Toggling the box off again brings back the saved text rather than the template.
+  await standard.check();
+  await standard.uncheck();
+  await expect(editor).toHaveValue('Сохранённая роль');
+  await expect(page.locator('.savebar')).toHaveCount(0);
+});
+
+test('the role counter counts bytes against the server limit and blocks a role that cannot fit', async ({ page }) => {
+  const state = await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  await page.getByLabel('Стандартная роль relay').uncheck();
+  const editor = page.getByLabel('Инструкции для модели', { exact: true });
+  const footer = page.locator('#system-instructions-hint');
+  const save = page.getByRole('button', { name: 'Сохранить', exact: true });
+  await editor.fill('ж'.repeat(100));
+  await expect(footer).toContainText('100 симв. · 200 из 32 768 байт');
+  await expect(save).toBeEnabled();
+
+  await editor.fill('ж'.repeat(16385)); // 32 770 bytes: Cyrillic takes two per character
+  await expect(footer).toContainText('32 770 из 32 768 байт');
+  await expect(footer.getByRole('alert')).toContainText('не больше 32 768 байт');
+  await expect(save).toBeDisabled();
+
+  // With a prompt cap the role may take half of it, judged on the draft just as the server will.
+  await editor.fill('ж'.repeat(100));
+  const cap = page.locator('#setting-max_prompt_bytes');
+  await cap.fill('300');
+  await expect(footer).toContainText('200 из 150 байт');
+  await expect(footer.getByRole('alert')).toContainText('«Размер промпта»');
+  await expect(page.locator('.savebar')).toContainText('роль не помещается');
+  await expect(save).toBeDisabled();
+  await cap.fill('1000');
+  await expect(footer).toContainText('200 из 500 байт');
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect.poll(() => state.settings.max_prompt_bytes).toBe(1000);
+  expect(state.settings.relay_system_prompt).toBe('ж'.repeat(100));
+});
+
+test('an effort level the model lacks is an error only while approximation is off', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const effort = page.locator('#setting-reasoning_effort');
+  const banner = page.getByRole('status').filter({ hasText: 'не поддерживается моделью' });
+  await effort.selectOption('max');
+  await page.locator('#setting-model').selectOption('gpt-5.5'); // low, medium and high only
+  await expect(banner).toContainText('GPT 5.5');
+  await expect(effort.locator('option[value="xhigh"]')).toHaveCount(0);
+
+  const approximate = page.getByRole('switch', { name: 'Подбирать ближайший effort' });
+  await approximate.click();
+  await expect(banner).toHaveCount(0);
+  // Every level the relay knows can be chosen: it takes the nearest one the model has.
+  await expect(effort.locator('option[value="xhigh"]')).toHaveCount(1);
+  await effort.selectOption('xhigh');
+  await expect(banner).toHaveCount(0);
+  await approximate.click();
+  await expect(banner).toContainText('xhigh');
+});
+
+test('leaving the settings with unsaved edits asks first and keeps them when declined', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  const input = page.locator('#setting-rate_limit_rps');
+  await input.fill('7');
+  await expect(page.locator('.savebar')).toContainText('1 несохранённых');
+  const asked = [];
+  const decline = (dialog) => { asked.push(dialog.message()); dialog.dismiss(); };
+  page.on('dialog', decline);
+  await section(page, 'Аккаунты').click();
+  await expect.poll(() => asked.length).toBe(1);
+  expect(asked[0]).toContain('несохранённые настройки (1)');
+  await expect(page.getByRole('heading', { name: 'Настройки' })).toBeVisible();
+  await expect(input).toHaveValue('7');
+  // The keyboard shortcuts and signing out ask the same question.
+  await page.getByRole('heading', { name: 'Настройки' }).click();
+  await page.keyboard.press('2');
+  await expect.poll(() => asked.length).toBe(2);
+  await page.getByRole('button', { name: 'Выйти' }).click();
+  await expect.poll(() => asked.length).toBe(3);
+  await expect(page.getByRole('heading', { name: 'Настройки' })).toBeVisible();
+  await expect(input).toHaveValue('7');
+  await expect(page.locator('.savebar')).toBeVisible();
+
+  // Agreeing drops the draft.
+  page.off('dialog', decline);
+  page.once('dialog', (dialog) => dialog.accept());
+  await section(page, 'Аккаунты').click();
+  await expect(page.getByRole('heading', { name: 'Аккаунты' })).toBeVisible();
+  await nav(page, 'Настройки');
+  await expect(page.locator('#setting-rate_limit_rps')).toHaveValue('0');
+  await expect(page.locator('.savebar')).toHaveCount(0);
+
+  // Nothing is asked once the edits are saved.
+  const unexpected = [];
+  page.on('dialog', (dialog) => { unexpected.push(dialog.message()); dialog.dismiss(); });
+  await page.locator('#setting-rate_limit_rps').fill('3');
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(page.locator('.savebar')).toHaveCount(0);
+  await section(page, 'Аккаунты').click();
+  await expect(page.getByRole('heading', { name: 'Аккаунты' })).toBeVisible();
+  expect(unexpected).toEqual([]);
+});
+
+test('the model catalog says why a model has no route', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const route = (id) => page.locator('.model-card').filter({ has: page.getByText(id, { exact: true }) }).locator('.model-route');
+  await expect(route('claude-opus-5-5')).toContainText('маршрут есть');
+  await expect(route('gpt-5.5')).toContainText('нет ресурса');
+  await expect(route('gpt-5.5')).toHaveAttribute('title', /openai_provider_resource_name/);
+  await expect(route('gemini-3-pro')).toContainText('нужен BYOK или retention');
+  await expect(route('gemini-3-pro')).toHaveAttribute('title', /Google BYOK/);
+});
+
+// The relay summarises the enabled accounts; one failing among several must not read as "the session is down".
+const SESSION_CASES = [
+  ['all enabled accounts renew', { error: null, accounts: { enabled: 3, failing: 0 } }, 'сессия Retool активна', /tone-pos/],
+  ['one of three fails', { error: 'session renewal failed: HTTP 401', accounts: { enabled: 3, failing: 1 } },
+    'ошибка сессии: 1 из 3', /tone-warn/],
+  ['every enabled account fails', { error: 'session renewal failed: HTTP 401', accounts: { enabled: 2, failing: 2 } },
+    'сессия Retool с ошибкой', /tone-neg/],
+  ['an older relay without the summary', { error: 'session renewal failed: HTTP 401' }, 'сессия Retool с ошибкой', /tone-neg/],
+];
+for (const [name, session, text, tone] of SESSION_CASES) {
+  test(`the connection card reports the pool session: ${name}`, async ({ page }) => {
+    await mockAdmin(page, { overviewPatch: { session: { keepalive: true, last_success_at: null, persistence_error: null, ...session } } });
+    await login(page);
+    await nav(page, 'Настройки');
+    const status = page.locator('#settings-connection .status');
+    await expect(status).toContainText(text);
+    await expect(status.locator('.dot')).toHaveClass(tone);
+    if (session.accounts?.failing && session.accounts.failing < session.accounts.enabled) {
+      await expect(status).toHaveAttribute('title', /остальные работают/);
+    }
+  });
+}
 
 test('incomplete usage is not shown as free inference or a reliable forecast', async ({ page }) => {
   await mockAdmin(page, { metricsPatch: { totals: { credits: 0, credits_complete: false } },

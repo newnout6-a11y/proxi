@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Activity as ActivityIcon, Gauge, LogOut, Moon, Settings, Sun, Users } from 'lucide-react';
 import { api, clearKey, loadKey, saveKey } from './api.js';
@@ -40,6 +40,15 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
   const [view, setView] = useState(viewFromHash);
   const [overview, setOverview] = useState(null);
   const [overviewError, setOverviewError] = useState('');
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  // Settings keeps its draft in its own state and reports how many edits are unsaved: leaving drops them.
+  const unsaved = useRef(0);
+  const confirmLeave = useCallback(() => unsaved.current === 0
+    || window.confirm(`Есть несохранённые настройки (${unsaved.current}). Уйти без сохранения?`), []);
+  const go = useCallback((next) => {
+    if (next === viewRef.current || confirmLeave()) setView(next);
+  }, [confirmLeave]);
   const unauthorized = useCallback(() => {
     toast({ tone: 'error', title: 'Сессия админки закрыта', text: 'Ключ больше не принимается relay' });
     onLogout(false);
@@ -65,14 +74,21 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
     const onKey = (event) => {
       if (event.target.closest('input, textarea, select') || event.metaKey || event.ctrlKey || event.altKey) return;
       const index = Number(event.key) - 1;
-      if (index >= 0 && index < NAV.length) setView(NAV[index].id);
+      if (index >= 0 && index < NAV.length) go(NAV[index].id);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
+  }, [go]);
+  useEffect(() => {
+    const warn = (event) => {
+      if (unsaved.current) { event.preventDefault(); event.returnValue = ''; }
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
   }, []);
 
   const errors = journal.events.filter((e) => e.level === 'error' && Date.now() / 1000 - e.ts < 600).length;
-  const props = { apiKey, journal, overview, overviewError, refreshOverview: loadOverview, onUnauthorized: unauthorized, go: setView };
+  const props = { apiKey, journal, overview, overviewError, refreshOverview: loadOverview, onUnauthorized: unauthorized, go };
   const streamLabel = journal.status === 'live' ? 'Поток журнала: live' : journal.status === 'reconnecting' ? 'Переподключение' : 'Подключение';
 
   return (
@@ -89,7 +105,7 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
                 const active = view === item.id;
                 return (
                   <button key={item.id} type="button" className={`nav-item ${active ? 'active' : ''}`}
-                    aria-current={active ? 'page' : undefined} onClick={() => setView(item.id)}>
+                    aria-current={active ? 'page' : undefined} onClick={() => go(item.id)}>
                     <Icon size={16} strokeWidth={1.5} aria-hidden="true" />
                     <span className="nav-text">{item.label}</span>
                     {item.id === 'activity' && errors > 0 && <b className="nav-count num" title="Ошибки за 10 минут">{errors}</b>}
@@ -110,7 +126,7 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
             <button type="button" className="icon-button" aria-label="Сменить тему" onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}>
               {theme === 'dark' ? <Sun size={16} strokeWidth={1.5} /> : <Moon size={16} strokeWidth={1.5} />}
             </button>
-            <button type="button" className="button" onClick={() => onLogout(true)}>
+            <button type="button" className="button" onClick={() => { if (confirmLeave()) onLogout(true); }}>
               <LogOut size={16} strokeWidth={1.5} aria-hidden="true" /> Выйти
             </button>
           </div>
@@ -120,7 +136,7 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
         {view === 'overview' && <Overview key="overview" {...props} />}
         {view === 'activity' && <Activity key="activity" {...props} />}
         {view === 'accounts' && <Accounts key="accounts" {...props} />}
-        {view === 'settings' && <SettingsView key="settings" {...props} />}
+        {view === 'settings' && <SettingsView key="settings" {...props} unsaved={unsaved} />}
       </main>
     </div>
   );

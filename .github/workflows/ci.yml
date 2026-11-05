@@ -26,3 +26,51 @@ jobs:
         run: node --test tests/test_opencode_labels.mjs
       - name: Run admin trace model tests
         run: node --test web/tests/turns.test.mjs
+
+  admin-ui:
+    # web/dist is committed and served as is, so CI rebuilds it and fails on drift. The browser
+    # scenarios and the rendered design gate use synthetic API fixtures only: no relay, no Retool.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install admin UI dependencies
+        run: npm ci
+      - name: Build admin UI
+        run: npm run build
+      - name: Check web/dist is up to date
+        run: |
+          $drift = git status --porcelain -- dist
+          if ($drift) {
+            $drift | Write-Host
+            Write-Host "::error::web/dist differs from a fresh build. Run 'npm ci; npm run build' in web/ and commit web/dist."
+            exit 1
+          }
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+      # Traces and screenshots go below the temp dir; point it at a path the artifact step knows.
+      - name: Run admin UI browser tests
+        env:
+          TEMP: ${{ runner.temp }}
+        run: npx playwright test --reporter=line
+      - name: Run rendered design gate (axe and overflow)
+        env:
+          TEMP: ${{ runner.temp }}
+        run: npm run test:design
+      - name: Keep browser traces and screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-ui-evidence
+          path: |
+            ${{ runner.temp }}/relay-admin-playwright
+            ${{ runner.temp }}/proxi-design-qa
+          if-no-files-found: ignore
