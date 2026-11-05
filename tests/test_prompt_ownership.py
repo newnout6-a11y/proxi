@@ -336,6 +336,10 @@ def test_effort_only_entries_leave_the_relay_role_in_place(tmp_path, monkeypatch
     assert asyncio.run(run(runner, p))[-1] == {'type': 'end', 'reason': 'stop'}
     heads = [m for m in sent[0][1]['messages'] if m['role'] == 'system']
     assert heads == [{'role': 'system', 'content': [{'type': 'text', 'text': POLICY, 'cache': True}]}]
+    # The wire head and its cache key are byte-for-byte those of a request without the records.
+    assert asyncio.run(run(runner, request(FIRST, system='', dialect=dialect)))[-1] == {'type': 'end', 'reason': 'stop'}
+    assert sent[1][1]['messages'][0] == sent[0][1]['messages'][0]
+    assert sent[1][1]['openAICacheKey'] == sent[0][1]['openAICacheKey']
 
 
 def run_heads(tmp_path, monkeypatch, policy, mode, tools, system):
