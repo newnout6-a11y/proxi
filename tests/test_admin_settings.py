@@ -1,11 +1,14 @@
 """Admin settings and pool conversion: provider access, role budget, journal hygiene, honest route reasons."""
 import json
+from types import SimpleNamespace
 
 import pytest
 
 import admin
 import config
+import context
 import models
+import orchestrator
 from session import Backend, SessionPool
 from test_admin import admin_relay  # noqa: F401 - single-account fixture
 from test_admin_pool import NEW, pool  # noqa: F401 - two-account relay fixture
@@ -66,3 +69,24 @@ def test_deleting_the_first_account_hands_the_root_descriptor_to_the_new_first_a
     assert saved.get("provider_access") == second_gate
     assert "resource-acc-a" not in json.dumps(saved.get("provider_access"))
     assert config.load(str(pool.path))["accounts"][0].get("provider_access") == second_gate
+
+
+# -- both built-in roles -------------------------------------------------------------
+def test_settings_publish_every_built_in_role_with_the_path_it_serves(admin_relay):
+    _, body, _ = admin_relay.request("/admin/api/settings")
+    roles = {item["id"]: item for item in body["default_system_prompts"]}
+    assert set(roles) == {"relay", "native_tools"}
+    assert body["default_system_prompt"] == roles["relay"]["text"] == context.DEFAULT_RELAY_SYSTEM_PROMPT
+    assert roles["native_tools"]["text"] == orchestrator.DEFAULT_NATIVE_TOOLS_ROLE
+    assert roles["relay"]["text"] != roles["native_tools"]["text"]
+    assert all(item["title"] and item["applies_to"] for item in roles.values())
+
+
+def test_published_roles_are_the_texts_the_relay_really_sends(tmp_path):
+    texts = {item["id"]: item["text"] for item in admin._default_roles()}
+    plain = context.build_system_instructions(str(tmp_path), enable_context=False, enable_local_exec=False)
+    assert plain == texts["relay"]
+    runner = SimpleNamespace(cfg={"relay_system_prompt": None})
+    assert orchestrator.TurnRunner._instructions(runner, native_tools=True) == texts["native_tools"]
+    runner.cfg["relay_system_prompt"] = "custom role"
+    assert orchestrator.TurnRunner._instructions(runner, native_tools=True) == "custom role"

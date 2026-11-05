@@ -25,6 +25,7 @@ from redact import redact
 import sse
 import validate
 from context import DEFAULT_RELAY_SYSTEM_PROMPT
+from orchestrator import DEFAULT_NATIVE_TOOLS_ROLE
 
 
 BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
@@ -184,6 +185,17 @@ def _schema():
     return fields
 
 
+def _default_roles():
+    """The built-in roles used while relay_system_prompt is null, with the request path of each."""
+    return [
+        {"id": "relay", "title": "Роль relay по умолчанию", "text": DEFAULT_RELAY_SYSTEM_PROMPT,
+         "applies_to": "Запросы без инструментов и без инструкций клиента (curl, скрипты), а также режимы "
+                       "«Дополнить клиента» и «Заменить роль клиента»"},
+        {"id": "native_tools", "title": "Роль для клиентов с инструментами", "text": DEFAULT_NATIVE_TOOLS_ROLE,
+         "applies_to": "Клиент со своими инструментами (IDE), который не прислал собственные инструкции"},
+    ]
+
+
 def is_admin_path(path):
     return path == "/admin" or path.startswith("/admin/")
 
@@ -262,7 +274,8 @@ class Admin:
             desired["session_mode"] = effective["session_mode"]
         pending = [key for key in self.schema if desired[key] != effective[key]]
         return {"settings": desired, "effective": effective, "schema": self.schema,
-                "default_system_prompt": DEFAULT_RELAY_SYSTEM_PROMPT,
+                # default_system_prompt is the relay role alone; the list names every built-in role and its path.
+                "default_system_prompt": DEFAULT_RELAY_SYSTEM_PROMPT, "default_system_prompts": _default_roles(),
                 "pending_restart": pending, "restart_required": bool(pending),
                 "writable": bool(self.cfg.get("_config_path"))}
 

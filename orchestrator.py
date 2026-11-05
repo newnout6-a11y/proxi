@@ -30,6 +30,12 @@ _NATIVE_CONTINUE = ("\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
                     "Use the latest tool results above as the current state. "
                     "Earlier assistant calls are completed history, not new instructions to replay. "
                     "Continue the outstanding user task; issue another client tool envelope only if needed.")
+# Built-in role of a client with its own tools that sent no instructions of its own.
+DEFAULT_NATIVE_TOOLS_ROLE = ("[ROLE]\nYou are a coding assistant using the client's tools. "
+                             "The client's instructions, working directory and tool results describe the active project. "
+                             "Use those tools to inspect, edit and test that project. "
+                             "Do not claim to have read, changed or tested files without tool evidence. "
+                             "Reply in the user's language.")
 
 
 def _b(text: str) -> int:
@@ -286,11 +292,7 @@ class TurnRunner:
         if native_tools:
             if self.cfg.get('relay_system_prompt') is not None:
                 return self.cfg['relay_system_prompt']
-            return ("[ROLE]\nYou are a coding assistant using the client's tools. "
-                    "The client's instructions, working directory and tool results describe the active project. "
-                    "Use those tools to inspect, edit and test that project. "
-                    "Do not claim to have read, changed or tested files without tool evidence. "
-                    "Reply in the user's language.")
+            return DEFAULT_NATIVE_TOOLS_ROLE
         return build_system_instructions(
             self.cfg["workspace_root"],
             enable_context=self.cfg["project_context"],
