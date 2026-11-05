@@ -2351,9 +2351,10 @@ class PromptStore:
         """Keep one non-legacy request in the in-memory ring (RECENT_LIMIT entries, newest first in recent()).
 
         entry may carry "request": {"body", "dialect", "headers"} for preview without a pasted
-        body (plan 4.3); the ring keeps it only for the newest few entries and never journals it.
+        body (plan 4.3); the ring keeps it only for the newest few entries and never journals it. The body is kept
+        as given, not copied (it can be a megabyte): the caller must not change it afterwards.
         """
-        item = dict(entry)
+        item = {key: value if key == "request" else _copy(value) for key, value in entry.items()}
         item.setdefault("ts", round(time.time(), 3))
         if "request" in item and not isinstance(item["request"], dict):
             del item["request"]
