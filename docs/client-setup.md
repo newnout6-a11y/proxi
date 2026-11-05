@@ -91,6 +91,9 @@ A reference to a removed relay model is replaced instead of left dangling, in
 mini, GLM Flash), or lose the override when none is published so OpenCode chooses
 its own. Everything else gets the default model (Opus 5.5 when published). A valid
 reference keeps a `#variant` suffix only while that model still publishes it.
+Haiku's window is 200K tokens, smaller than the 1M-token models: if you compact very
+long sessions, set `agent.compaction.model` to a larger-window model yourself; the
+script touches only references to models that no longer exist.
 
 The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
 retool-relay/zai-org/GLM-5.3 --variant high`; OpenCode 2.2.5 uses `--model
@@ -99,11 +102,13 @@ model request. Both exact clients passed a real GLM high request through an
 isolated current-source relay; their timings and evidence are in the audit.
 
 `scripts/probe_client_settings.py` runs the installed clients against a local fake
-server, never the relay. It finds the newest OpenCode Desktop CLI itself (override
-any client with `--executable`) and removes credential-like variables from the child
-environment. OpenCode gets no model request until its resolved configuration shows
-the fake endpoint, and the probe fails unless the fake server received requests, so
-an ignored endpoint override cannot pass silently.
+server with a deliberately invalid key. It finds the newest OpenCode Desktop CLI
+itself (override any client with `--executable`) and removes credential-like
+variables from the child environment. OpenCode gets no model request until its
+resolved configuration shows the fake endpoint, and the probe fails unless the fake
+server received requests, so an ignored endpoint override cannot pass silently; a
+client that ignored it would still carry only the invalid key, which the real relay
+rejects.
 
 ## DeepSeek Harness
 
@@ -129,12 +134,15 @@ passed default, off, high and rejection checks with the exact generated files;
 the SDK bundles and Desktop ASAR were not modified.
 
 The `--output` preview masks credential values (`apiKey`, header and environment
-values, tokens, passwords) as `'***'` and changes no other byte; `apiKeyEnv`
+values, tokens, passwords) as `'***'` and replaces only those values; `apiKeyEnv`
 references stay visible. `--include-secrets` writes the exact bytes. A profile that
 is already current is not rewritten and gets no backup (`written: false`). A last
 provider block without a final newline is spliced correctly and keeps that ending.
 A profile that is not UTF-8 or not valid YAML is reported with its line and column,
 never its content. Catalog discovery uses the whole relay config like the relay.
+One limit remains: a comment written directly after the Proxi block, before the next
+provider, can be dropped or repeated (ruamel attaches it to the block's last key), so
+compare the preview with the profile before `--write`.
 
 ### Historical Harness setup — 0.1.5-rc.2
 
