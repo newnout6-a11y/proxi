@@ -5,8 +5,6 @@ import json
 import urllib.error
 from types import SimpleNamespace
 
-import pytest
-
 import direct
 import journal
 from keepwarm_harness import backend as warm_backend, drive, session as warm_session

@@ -886,7 +886,7 @@ async def _keepwarm(session, cfg):
                         return
                     unavailable = idle_block(getattr(session, "backend", None))
                     if unavailable:
-                        # A switched-off, exhausted or signed-out account must not keep spending credits on idle warmups.
+                        # Switched off or marked unavailable, whatever the reason: no idle warmups on this account.
                         cycle.stop("account_unavailable", account_state=unavailable)
                         return
                 body = getattr(session, "_warm_body", None)

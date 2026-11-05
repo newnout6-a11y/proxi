@@ -13,7 +13,7 @@ import journal
 from keepwarm_harness import START, drive, install, session as warm_session
 from session import _Dependent
 from test_admin import admin_relay  # noqa: F401 - the admin fixture
-from test_keepwarm_account_state import unavailable_backend
+from test_keepwarm_account_state import STATES, unavailable_backend
 from test_native_context_reuse import FIRST, request, run, setup
 
 FINAL = [{"type": "text", "delta": "done"}, {"type": "end", "reason": "stop"}]
@@ -135,7 +135,7 @@ def test_five_failed_pings_stop_the_cycle_and_say_so(monkeypatch):
     assert (stop["reason"], stop["failures"], stop["pings"], stop["level"]) == ("failures", 5, 5, "warn")
 
 
-@pytest.mark.parametrize("state", ["disabled", "exhausted", "auth_dead"])
+@pytest.mark.parametrize("state", sorted(STATES))
 def test_an_unavailable_account_stop_names_its_state(monkeypatch, state):
     mark = journal.JOURNAL.last_seq
     drive(monkeypatch, warm_session(backend=unavailable_backend(state), _warm_at=START - 100), seconds=3000)

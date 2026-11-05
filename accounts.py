@@ -48,14 +48,16 @@ def account_tag(backend):
 def idle_block(backend):
     """Why background traffic, such as idle cache warmups, must skip this account; None when it may run.
 
-    An account the operator switched off, whose balance fell below the reserve or whose
-    session needs a new sign-in only serves requests a client actually sends."""
+    Any account the operator switched off, or the dispatcher took out of routing (`backend.unavailable`
+    is set, whatever its reason), only serves requests a client actually sends. The reason is passed
+    through, never matched against a list, so a reason added later is covered without a change here."""
     if not enabled(backend):
         return "disabled"
     unavailable = getattr(backend, "unavailable", None)
     if unavailable is None:
         return None
-    return unavailable.get("reason", "unavailable") if isinstance(unavailable, dict) else "unavailable"
+    reason = unavailable.get("reason") if isinstance(unavailable, dict) else None
+    return reason or "unavailable"
 
 
 class AccountDispatcher:
