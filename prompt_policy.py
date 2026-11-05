@@ -830,7 +830,7 @@ def _op_keep_sections(text, edit, snapshot):
     return _delete_spans(text, spans), True
 
 
-@functools.lru_cache(maxsize=128)
+@functools.lru_cache(maxsize=512)
 def _tag_pattern(tag):
     return re.compile(r"<(/?)%s(?=[\s/>])[^>]*>" % re.escape(tag))
 
@@ -1463,6 +1463,7 @@ class _Compiler:
         if kind == "tag":
             if not TAG_NAME.fullmatch(value):
                 _err(path, "must be a tag name such as system-reminder")
+            _tag_pattern(value)
             return value
         return self._expand(value, path, regex_replacement=(kind == "regex_with"))
 
