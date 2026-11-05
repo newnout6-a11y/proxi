@@ -6,6 +6,10 @@ import journal
 from accounts import enabled
 from session import SessionPool
 
+# Balance lookups in flight for one report. Not account_refresh_parallel: that bounds the dispatcher's
+# background renewals, while a report is a client waiting on every account's answer.
+BALANCE_PARALLEL = 8
+
 
 def account_tag(backend):
     cfg = getattr(backend, "cfg", None) or {}
@@ -61,8 +65,7 @@ def collect(runtime, *, force_refresh=False):
     if len(rows) == 1:
         infos = [fetch(rows[0])]
     else:
-        parallel = max(1, int(getattr(runtime, 'cfg', {}).get('account_refresh_parallel', 3)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, parallel, len(rows))) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(BALANCE_PARALLEL, len(rows))) as pool:
             infos = list(pool.map(fetch, rows))
     entries = []
     for (backend, manager), info in zip(rows, infos):
