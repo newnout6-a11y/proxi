@@ -10,11 +10,10 @@ import time
 import pytest
 
 import direct
-import prompt_body
 import prompt_policy
 from prompt_bodies import CLAUDE_SDK_HEADERS, OPENCODE_TITLE_V2, service_body
-from prompt_support import (after_tool_call, client_request, head_of, prompt_relay, runner_turns,  # noqa: F401
-                            strip_cache)
+from prompt_support import (after_tool_call, client_request, head_of, prompt_relay, rewrite_ready,  # noqa: F401
+                            runner_turns, strip_cache)
 from test_native_history import tool_reply
 from test_review_fixes_pr19 import END, text
 
@@ -25,16 +24,6 @@ def engine_ready():
     except NotImplementedError:
         return False
     except Exception:  # an engine that refuses this minimal document is still an engine
-        return True
-    return True
-
-
-def rewrite_ready():
-    try:
-        prompt_body.rewrite({"messages": []}, "chat", {}, None)
-    except NotImplementedError:
-        return False
-    except Exception:
         return True
     return True
 
