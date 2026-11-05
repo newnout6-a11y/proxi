@@ -72,12 +72,43 @@ canonical catalog from the enabled account resources. Preview with `--output`
 first; writing requires `--write --backup-dir`. The current configured pool
 publishes 27 verified routes. Its effort lists, including GPT-6's lack of xhigh,
 come from the dated route checks rather than the native provider's larger list.
+Discovery reads the whole relay config as the relay does, so root options such as
+`show_unrouted_models` apply.
+
+The script reads JSONC (comments and trailing commas, as OpenCode does). When it
+writes, it keeps the file's BOM, line endings, indentation and final-newline
+state. Rewriting removes comments, so a file that has them is refused until you
+delete them or pass `--allow-reformat`; the backup keeps the original. Nothing is
+written and no backup is made when the catalog is already current: the summary
+shows `written: false`. The `--output` preview masks credentials as `***`
+(`apiKey`, header and environment values, other token/secret/password fields);
+`--include-secrets` writes it verbatim.
+
+A reference to a removed relay model is replaced instead of left dangling, in
+`model`, `small_model`, `agent.*.model`, `command.*.model` and the deprecated
+`mode.*.model`. `small_model` and the hidden background agents (`title`, `summary`,
+`compaction`) get the first published model of the small tier (Haiku, Flash, nano,
+mini, GLM Flash), or lose the override when none is published so OpenCode chooses
+its own. Everything else gets the default model (Opus 5.5 when published). A valid
+reference keeps a `#variant` suffix only while that model still publishes it.
+Haiku's window is 200K tokens, smaller than the 1M-token models: if you compact very
+long sessions, set `agent.compaction.model` to a larger-window model yourself; the
+script touches only references to models that no longer exist.
 
 The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
 retool-relay/zai-org/GLM-5.3 --variant high`; OpenCode 2.2.5 uses `--model
 retool-relay/zai-org/GLM-5.3#high`. Version 2 rejects `--variant` before sending a
 model request. Both exact clients passed a real GLM high request through an
 isolated current-source relay; their timings and evidence are in the audit.
+
+`scripts/probe_client_settings.py` runs the installed clients against a local fake
+server with a deliberately invalid key. It finds the newest OpenCode Desktop CLI
+itself (override any client with `--executable`) and removes credential-like
+variables from the child environment. OpenCode gets no model request until its
+resolved configuration shows the fake endpoint, and the probe fails unless the fake
+server received requests, so an ignored endpoint override cannot pass silently; a
+client that ignored it would still carry only the invalid key, which the real relay
+rejects.
 
 ## DeepSeek Harness
 
@@ -101,6 +132,17 @@ keeps other bytes intact, including date headers and plugin source. The active
 provider/model and credentials are preserved. Both installed SDK versions
 passed default, off, high and rejection checks with the exact generated files;
 the SDK bundles and Desktop ASAR were not modified.
+
+The `--output` preview masks credential values (`apiKey`, header and environment
+values, tokens, passwords) as `'***'` and replaces only those values; `apiKeyEnv`
+references stay visible. `--include-secrets` writes the exact bytes. A profile that
+is already current is not rewritten and gets no backup (`written: false`). A last
+provider block without a final newline is spliced correctly and keeps that ending.
+A profile that is not UTF-8 or not valid YAML is reported with its line and column,
+never its content. Catalog discovery uses the whole relay config like the relay.
+One limit remains: a comment written directly after the Proxi block, before the next
+provider, can be dropped or repeated (ruamel attaches it to the block's last key), so
+compare the preview with the profile before `--write`.
 
 ### Historical Harness setup — 0.1.5-rc.2
 
