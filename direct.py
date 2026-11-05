@@ -761,6 +761,21 @@ def _ping(session, body):
     return actual_credits
 
 
+# The provider keeps a cache entry for 5 minutes counted from the START of the request that last wrote or
+# read it (Anthropic prompt caching); only a read renews it. A ping that arrives later finds nothing to read
+# and pays to write the whole prefix again, 25 times the price of a read, for a conversation nobody asked
+# to keep warm.
+PROMPT_CACHE_TTL = 300.0
+# The scheduler's tick, the wait for a worker thread and the trip to the provider all come out of the TTL:
+# a ping may start at most TTL - margin after the last confirmed touch of the entry.
+PROMPT_CACHE_MARGIN = 20.0
+PING_DEADLINE = PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN
+# No setting may schedule a ping later than this: a few seconds of tick before the deadline.
+PING_LATEST = PING_DEADLINE - 5.0
+# A failed ping is retried this long after the failure (doubled for every further one), and only if the retry
+# still starts inside the window above.
+PING_RETRY = 10.0
+
 _STOP_TEXT = {
     "idle_limit": "Прогрев остановлен: диалог не запрашивали дольше лимита простоя",
     "subagent_done": "Прогрев остановлен: субагент ответил без вызова инструмента",
@@ -769,6 +784,7 @@ _STOP_TEXT = {
     "failures": "Прогрев остановлен после пяти неудач",
     "closed": "Прогрев остановлен: сессия закрыта",
     "last_turn_failed": "Прогрев остановлен: последний ход не дал пригодного ответа",
+    "cache_expired": "Прогрев остановлен: кэш префикса уже истёк, пинг оплатил бы его полную перезапись",
 }
 
 
@@ -851,7 +867,8 @@ async def _keepwarm(session, cfg):
 
     Only one ping runs per session. Active turns get their first refresh at
     the configured offset, then at most every 240s (inside the 5-minute TTL).
-    Failures back off; an unknown cache result is never reported as a hit.
+    Failures retry soon, but only while the retry still starts inside the cache window;
+    an unknown cache result is never reported as a hit.
 
     Idle warming ends by limits that hold whatever the pool's bookkeeping says: after
     cache_keepwarm_idle seconds without a real request (pings do not count), after
@@ -860,8 +877,12 @@ async def _keepwarm(session, cfg):
     a child request that went quiet keep nothing warm. The reason, the pings and the credits
     of the cycle are journaled as cache.keepwarm_stop.
 
-    A cycle also ends when the last turn gave no usable answer (empty, thinking only, cut off, an
-    error): last_turn_failed. The next good turn starts a new one.
+    A ping is paid for, so it is only sent while it can still read the cache. The guards:
+    - the last turn gave no usable answer (empty, thinking only, cut off, an error): last_turn_failed;
+    - the last confirmed touch of the cache, the start of a real request or of a successful ping
+      (a failed ping touches nothing: its result is unknown), is older than
+      PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN: cache_expired. This also ends a retry that no longer fits.
+    The same rules hold inside a running turn.
     """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
     if interval <= 0:
@@ -870,8 +891,9 @@ async def _keepwarm(session, cfg):
     subagent_idle = float(_int_setting(cfg, "cache_keepwarm_subagent_idle", 600))
     turn_timeout = float(_int_setting(cfg, "turn_timeout", 900) or 900)
     during_turns = bool(cfg.get("cache_keepwarm_during_turns", True))
-    turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), 285.0)
+    turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), PING_LATEST)
     active_interval = min(interval, 240.0)
+    idle_interval = min(interval, PING_LATEST)
     account = account_tag(getattr(session, "backend", None))
     cycle = _WarmCycle(session, account)
     scheduled_seq = None
@@ -879,7 +901,7 @@ async def _keepwarm(session, cfg):
     retry_at = 0.0
     try:
         while True:
-            busy, seq = False, None
+            busy, seq, touch_at = False, None, None
             context_token = client_context.bind({})
             try:
                 await asyncio.sleep(0.05)
@@ -915,6 +937,7 @@ async def _keepwarm(session, cfg):
                         return
                 body = getattr(session, "_warm_body", None)
                 identity = getattr(session, "_warm_identity", None) or {}
+                touch_at = getattr(session, "_warm_at", 0) or 0
                 if busy:
                     if not during_turns or not started:
                         await asyncio.sleep(0.95)
@@ -923,12 +946,19 @@ async def _keepwarm(session, cfg):
                     if turn_body:
                         body = turn_body
                         identity = getattr(session, "_turn_identity", None) or {}
+                        # The turn's own request read or wrote this prefix when it began.
+                        touch_at = max(touch_at, started)
                     due = max(next_turn_ping, retry_at)
                 else:
-                    due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
+                    due = max(touch_at + idle_interval, retry_at)
                 if not body:
                     await asyncio.sleep(0.95)
                     continue
+                if now - touch_at > PING_DEADLINE:
+                    # The entry is gone or about to be: a ping now writes the whole prefix again.
+                    cycle.stop("cache_expired", touch_age_seconds=round(now - touch_at), limit=PING_DEADLINE,
+                               during_turn=busy)
+                    return
                 if now < due:
                     await asyncio.sleep(min(0.95, max(0.05, due - now)))
                     continue
@@ -966,6 +996,7 @@ async def _keepwarm(session, cfg):
                              model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
                              account=account,
                              during_turn=busy, turn_age_seconds=round(ping_started - started) if busy else None,
+                             touch_age_seconds=round(ping_started - touch_at),
                              prefix_tokens=prefix_tokens, est_credits=round(estimate, 4),
                              actual_credits=actual, credits_total=getattr(session, "_keepwarm_cost", 0.0),
                              cache_verified=touched, usage=usage)
@@ -982,11 +1013,22 @@ async def _keepwarm(session, cfg):
                     console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire")
                     cycle.stop("failures", failures=failures)
                     return
-                retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
+                failed_at = time.time()
+                retry_at = failed_at + PING_RETRY * 2 ** (failures - 1)
                 next_turn_ping = retry_at
-                journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn",
-                             account=account)
+                # A failed ping touched nothing (its result is unknown): the retry has to start inside the
+                # window of the last confirmed touch, or it would pay for a cache that is gone.
+                fits = touch_at is None or retry_at - touch_at <= PING_DEADLINE
+                journal.emit("cache.keepwarm",
+                             ("Прогрев не удался; повтор через %d с: %s" % (round(retry_at - failed_at), str(exc)[:200]))
+                             if fits else
+                             "Прогрев не удался; повтор не успевает до истечения кэша: %s" % str(exc)[:200],
+                             "warn", account=account)
                 console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" % str(exc)[:200])
+                if not fits:
+                    cycle.stop("cache_expired", touch_age_seconds=round(failed_at - touch_at), limit=PING_DEADLINE,
+                               during_turn=busy, after_failure=True, failures=failures)
+                    return
             finally:
                 client_context.reset(context_token)
     finally:
@@ -1151,8 +1193,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 def _ensure_keepwarm(session, cfg):
     if getattr(session, "_cancelled", False) or getattr(asyncio.get_running_loop(), "_relay_closing", False):
         return
-    if getattr(session, "_turn_outcome", None) not in (None, "content") and not getattr(session, "_busy", False):
-        # The last turn gave nothing usable: a cycle would only announce that it has nothing to warm.
+    if not getattr(session, "_busy", False) and (
+            getattr(session, "_turn_outcome", None) not in (None, "content")
+            or time.time() - (getattr(session, "_warm_at", 0) or 0) > PING_DEADLINE):
+        # Between turns a cycle is worth starting only for a usable answer whose cache is still alive. Any other
+        # would stop at its first look, and say so again at every lease of a child that pins this conversation.
         return
     task = getattr(session, "_warm_task", None)
     if task is None or task.done():

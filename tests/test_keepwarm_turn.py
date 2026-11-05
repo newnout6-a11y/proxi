@@ -33,6 +33,8 @@ class _Session:
 @pytest.mark.parametrize("busy", [False, True])
 async def test_reused_keepwarm_labels_the_body_owner_not_the_first_request(monkeypatch, failure, busy):
     session = _Session()
+    # The cache was last touched a little over the ping interval ago: a ping is due and the entry is still alive.
+    session._warm_at = time.time() - 250
     cfg = {"cache_keepwarm_seconds": 240, "cache_keepwarm_idle": 1800}
     request_a = {"client": "opencode", "request_id": "req-A", "chat_title": "Первый чат"}
     request_b = {"client": "opencode", "request_id": "req-B", "chat_title": "Второй чат"}
@@ -135,6 +137,7 @@ async def test_during_turn_ping_fires_once_at_offset(monkeypatch):
     session = _Session()
     session._busy = True
     session._turn_started_at = time.time() - 201  # offset 200 already reached
+    session._turn_body = {"model": "claude-opus-5-5"}
     session._warm_body = {"model": "claude-opus-5-5"}
     session._last_prefix_tokens = 190000
 
@@ -189,6 +192,7 @@ async def test_during_turn_ping_failure_has_no_immediate_retry(monkeypatch):
     session = _Session()
     session._busy = True
     session._turn_started_at = time.time() - 201
+    session._turn_body = {"model": "claude-opus-5-5"}
     session._warm_body = {"model": "claude-opus-5-5"}
 
     calls = []
@@ -216,7 +220,7 @@ async def test_during_turn_ping_failure_has_no_immediate_retry(monkeypatch):
 async def test_idle_keepalive_still_pings_between_turns(monkeypatch):
     session = _Session()
     session._warm_body = {"model": "claude-opus-5-5"}
-    session._warm_at = time.time() - 300  # interval long passed
+    session._warm_at = time.time() - 250  # the interval has passed, the 5-minute entry is still alive
     session._last_request_at = time.time()
 
     calls = []

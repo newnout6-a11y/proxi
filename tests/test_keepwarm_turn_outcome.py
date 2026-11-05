@@ -216,12 +216,14 @@ def test_a_failed_turn_does_not_stop_the_pings_inside_the_next_turn(monkeypatch)
     ("empty", 100, False, False),
     ("thinking_only", 100, False, False),
     ("error", 100, False, False),
+    ("content", 400, False, False),
+    (None, 400, False, False),
     ("empty", 400, True, True),
     ("content", 400, True, True),
 ])
-def test_a_cycle_is_started_between_turns_only_for_a_conversation_whose_last_turn_was_good(
+def test_a_cycle_is_started_between_turns_only_for_a_good_conversation_with_a_live_cache(
         monkeypatch, outcome, age, busy, starts):
-    """Parents pinned by a child get their cycle restarted at every lease: a failed one must not stop and say so each time."""
+    """Parents pinned by a child get their cycle restarted at every lease: a dead one must not stop and say so each time."""
     monkeypatch.setattr(direct, "_ping", lambda *_args: pytest.fail("no ping is due within this test"))
 
     async def scenario():
