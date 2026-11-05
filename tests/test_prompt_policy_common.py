@@ -99,6 +99,7 @@ def compose(doc, tmp_path, system, sources=None, profile="p"):
 
 def write_json(path, document):
     path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
 
