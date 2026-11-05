@@ -223,8 +223,9 @@ def test_preview_masks_credentials_but_keeps_comments_and_credential_references(
     provider = YAML().load(text)[1]['config']['providers']['other']
     assert provider['apiKey'] == '***' and provider['token'] == '***'
     assert dict(provider['headers']) == {'Authorization': '***', 'X-Custom': '***'}
-    assert len(YAML().load(text)[1]['config']['providers']['retool']['models']) == 26
-    assert len(YAML().load(text)[1]['config']['providers']['retool-text']['models']) == 1
+    # 27 routes: 23 with selectable levels; GPT-4.1, Haiku 4.5 and both GLM routes publish none.
+    assert len(YAML().load(text)[1]['config']['providers']['retool']['models']) == 23
+    assert len(YAML().load(text)[1]['config']['providers']['retool-text']['models']) == 4
     code, summary, _, _ = client(tmp_path, capsys, '--output', str(full), '--include-secrets')
     assert code == 0 and summary['preview_redacted'] is False
     revealed = YAML().load(full.read_text(encoding='utf-8'))[1]['config']['providers']['other']

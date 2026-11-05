@@ -476,13 +476,17 @@ def test_command_and_deprecated_mode_models_are_updated_like_agent_models():
 def test_variant_suffix_of_a_model_reference_survives_only_while_the_model_publishes_it():
     before = source()
     before.update(model='retool-relay/gpt-6-sol#high', small_model=HAIKU + '#xhigh')
-    before['agent'] = {'reviewer': {'model': 'retool-relay/zai-org/GLM-5.3#max'}}
+    before['agent'] = {'reviewer': {'model': 'retool-relay/claude-opus-5-5#max'},
+                       'writer': {'model': 'retool-relay/zai-org/GLM-5.3#max'}}
     before['command'] = {'plain': {'template': 'x', 'model': 'retool-relay/gpt-4.1#high'}}
-    entries = [models.resolve(name)[0] for name in ('gpt-6-sol', 'claude-haiku-4-5-20251001', 'zai-org/GLM-5.3', 'gpt-4.1')]
+    entries = [models.resolve(name)[0] for name in ('gpt-6-sol', 'claude-haiku-4-5-20251001', 'claude-opus-5-5',
+                                                    'zai-org/GLM-5.3', 'gpt-4.1')]
     result = update_document(before, entries)
     assert result['model'] == 'retool-relay/gpt-6-sol#high'
     assert result['small_model'] == HAIKU
-    assert result['agent']['reviewer']['model'] == 'retool-relay/zai-org/GLM-5.3#max'
+    assert result['agent']['reviewer']['model'] == 'retool-relay/claude-opus-5-5#max'
+    # GLM accepts effort and ignores it, so it publishes no variants and no suffix survives.
+    assert result['agent']['writer']['model'] == 'retool-relay/zai-org/GLM-5.3'
     assert result['command']['plain']['model'] == 'retool-relay/gpt-4.1'
 
 
