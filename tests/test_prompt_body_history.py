@@ -1,5 +1,4 @@
 """history.mid_system: what happens to a system / developer message that arrives after the head."""
-import copy
 import json
 
 import pytest

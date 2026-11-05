@@ -13,7 +13,6 @@ import pytest
 
 import direct
 import journal
-import native_history
 import prompt_body
 import validate
 from test_native_context_reuse import PARSE_CFG, TOOLS, run

@@ -1,14 +1,13 @@
 """prompt_body.rewrite contract: pure, deterministic, idempotent, private, tolerant of odd bodies."""
 import copy
 import json
-import re
 
 import pytest
 
 import prompt_body
 import prompt_policy
 from test_prompt_body_support import (
-    DIALECTS, REMINDER, TOOL_REMINDER, FakeSnapshot, conversation, drop_tag, dump, history_of, leaves,
+    DIALECTS, REMINDER, TOOL_REMINDER, FakeSnapshot, drop_tag, dump, history_of, leaves,
     neutral, parse, profile, rich_conversation)
 
 PROFILES = {

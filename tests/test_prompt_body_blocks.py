@@ -1,7 +1,4 @@
 """history.user_blocks: text edits of user messages and tool results, and the deletion rules."""
-import copy
-import json
-
 import pytest
 
 import prompt_body
