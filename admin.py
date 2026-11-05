@@ -246,7 +246,7 @@ def _free_text(field):
 
 
 def _codex_base():
-    """The base instructions /codex/models publishes while no prompts file replaces them ('' if nothing is published)."""
+    """The base instructions /codex/models publishes unless a prompts file replaces them ('' if it publishes none)."""
     try:
         return models.codex_catalog(models.catalog()[:1])["models"][0]["base_instructions"]
     except (IndexError, KeyError, TypeError):
@@ -1128,9 +1128,9 @@ class Admin:
             before = previous.document if previous is not None and isinstance(previous.document, dict) else {}
             changed = _changed_paths(before, document)
             shown = ", ".join(changed[:5]) + (" …" if len(changed) > 5 else "")
-            journal.emit("admin.prompts", "Промпты сохранены, ревизия %s: %s" % (snapshot.rev, shown or "без изменений"),
-                         "info", rev=snapshot.rev, changed_paths=changed[:CHANGED_PATHS_LIMIT],
-                         sha8=prompt_policy.sha8(text))
+            journal.emit("admin.prompts",
+                         "Промпты сохранены, ревизия %s: %s" % (snapshot.rev, shown or "без изменений"), "info",
+                         rev=snapshot.rev, changed_paths=changed[:CHANGED_PATHS_LIMIT], sha8=prompt_policy.sha8(text))
         warnings = _document_warnings(document)
         warnings += [str(item) for item in getattr(snapshot, "warnings", None) or () if str(item) not in warnings]
         return {"rev": snapshot.rev, "warnings": warnings}

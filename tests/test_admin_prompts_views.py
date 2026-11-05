@@ -11,8 +11,8 @@ import admin
 import apierr
 import journal
 import prompt_policy
-from admin_prompts_harness import (CSRF_CASES, DOC, REQUEST, api, check_csrf, check_needs_the_key, deep, events,  # noqa: F401
-                                   get, guard, post, put, raw, real_engine_or_skip, send)
+from admin_prompts_harness import (CSRF_CASES, DOC, REQUEST, api, check_csrf, check_needs_the_key,  # noqa: F401
+                                   deep, events, get, guard, post, put, raw, real_engine_or_skip, send)
 from prompt_policy import PromptConfigError
 from test_admin import admin_relay  # noqa: F401 - the relay the api fixture builds on
 

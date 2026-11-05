@@ -1,4 +1,4 @@
-"""The prompt control admin API, part 2: PUT /admin/api/prompts (plan 4.1): revisions, limits, errors, the journal event.
+"""The prompt control admin API, part 2: PUT /admin/api/prompts (plan 4.1): revisions, limits, errors, journal.
 
 runtime.prompts is a fake that follows the PromptStore contract (admin_prompts_harness). The tests at the end use the
 real store and skip while its engine is not part of the branch.
@@ -15,8 +15,8 @@ import admin
 import apierr
 import journal
 import prompt_policy
-from admin_prompts_harness import (CSRF_CASES, DOC, KEY, MARKER, api, check_csrf, check_needs_the_key, deep, events,  # noqa: F401
-                                   get, guard, put, raw, real_engine_or_skip)
+from admin_prompts_harness import (CSRF_CASES, DOC, KEY, MARKER, api, check_csrf, check_needs_the_key,  # noqa: F401
+                                   deep, events, get, guard, put, raw, real_engine_or_skip)
 from prompt_policy import PromptConfigError
 from test_admin import admin_relay  # noqa: F401 - the relay the api fixture builds on
 
@@ -183,7 +183,8 @@ def test_text_that_utf8_cannot_store_is_a_400_naming_the_field_and_never_echoing
 
 @pytest.mark.parametrize("literal", [b"NaN", b"Infinity", b"-Infinity"])
 def test_a_number_json_cannot_carry_is_a_400(api, literal):
-    status, answer = raw(api, "PUT", "/admin/api/prompts", b'{"document": {"profiles": {"p": {"w": ' + literal + b"}}}}")
+    body = b'{"document": {"profiles": {"p": {"w": ' + literal + b"}}}}"
+    status, answer = raw(api, "PUT", "/admin/api/prompts", body)
     assert status == 400 and answer["error"]["param"] == "profiles.p.w" and "not finite" in answer["error"]["message"]
     assert api.store.called("save") == []
 

@@ -157,7 +157,7 @@ def deep(levels):
 
 
 def real_engine_or_skip():
-    """The tests of the real PromptStore wait for the engine of prompt_policy (another work package) to be in the branch."""
+    """The tests of the real PromptStore wait for the engine of prompt_policy (another package) to be in the branch."""
     try:
         prompt_policy.compile_document({"version": 1}, prompt_policy.pathlib.Path("."), rev=1)
     except NotImplementedError:
