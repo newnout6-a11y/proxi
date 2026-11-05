@@ -874,7 +874,8 @@ def banner_lines(cfg, balance, warnings=()):
               " session mode:  " + cfg["session_mode"] + " | workspace: " + cfg["workspace_root"],
               " exec policy:   " + cfg["exec_policy"] + " | max turns: " + str(cfg["max_exec_turns"])]
     if balance.get("available") is not None:
-        line = " balance:       " + str(balance["available"]) + " / " + str(balance.get("monthly_allocation"))
+        allocation = balance.get("monthly_allocation")
+        line = (" balance:       " + str(balance["available"]) + " / " + ("?" if allocation is None else str(allocation)))
         if balance.get("partial"):
             unknown = balance.get("unknown_accounts") or 0
             line += (("  (partial: %d of %d accounts unknown)" % (unknown, balance.get("accounts_total", unknown)))

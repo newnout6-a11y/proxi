@@ -201,7 +201,11 @@ ID в памяти и выведет предупреждение в stderr. О�
 если баланс части аккаунтов неизвестен, `available` и `monthly_allocation` покрывают
 только известные: `partial: true`, `unknown_accounts` — число пропущенных, `accounts_total` —
 всего. Стартовая строка `balance: X / Y` в таком случае заканчивается пометкой
-`(partial: 1 of 5 accounts unknown)`. Балансы для `/v1/balance`, `/health`, админки и
+`(partial: 1 of 5 accounts unknown)`. Месячный лимит, которого нет в ответе Retool (или он
+`null`), считается неизвестным, а не нулевым: у такого аккаунта `monthly_allocation: null`
+и `used_month: null`, сумма по пулу помечена `partial: true` (пометка в стартовой строке —
+`(partial: monthly allocation unknown for some accounts)`, а сам лимит в ней `?`). Явный
+`0` в ответе остаётся настоящим нулём. Балансы для `/v1/balance`, `/health`, админки и
 стартовой строки запрашиваются у аккаунтов параллельно, до 8 одновременно; этот предел
 отдельный и от `account_refresh_parallel` (фоновые проверки диспетчера) не зависит.
 `GET /v1/usage` суммирует расходы всех аккаунтов (`accounts[]` — по каждому).
