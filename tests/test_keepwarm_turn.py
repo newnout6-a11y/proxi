@@ -111,6 +111,7 @@ async def test_cache_body_keeps_its_request_identity_when_a_later_turn_is_reject
         if rejected:
             raise apierr.bad_request("rejected body")
         yield {"type": "text", "delta": "ok"}
+        yield {"type": "end", "reason": "stop"}
 
     monkeypatch.setattr(direct, "_stream_body", stream)
     token = client_context.bind(request_b)

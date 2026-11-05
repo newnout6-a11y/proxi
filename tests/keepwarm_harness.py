@@ -3,6 +3,7 @@ import asyncio
 from types import SimpleNamespace
 
 import direct
+import journal
 
 START = 1000.0
 REAL_SLEEP = asyncio.sleep
@@ -63,3 +64,9 @@ def drive(monkeypatch, target, cfg=None, *, seconds=3600, **options):
     clock, pings = install(monkeypatch, seconds=seconds, **options)
     asyncio.run(direct._keepwarm(target, dict(CFG, **(cfg or {}))))
     return clock, pings
+
+
+def stops(mark):
+    """The cache.keepwarm_stop events journaled after `mark`: each one's data and its level."""
+    return [dict(event["data"], level=event["level"]) for event in journal.JOURNAL.query(since=mark, limit=1000)
+            if event["kind"] == "cache.keepwarm_stop"]

@@ -31,6 +31,8 @@ ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
 # Billing and keep-alive events describe the attempt, not its content: never held back.
 _LIVE_EVENTS = frozenset({"credits", "usage", "thinking_heartbeat", "end"})
+# What an attempt that produced only reasoning looks like on the event stream (thinking_only, not content).
+_THINKING_EVENTS = frozenset({"thinking", "thinking_start", "thinking_signature", "thinking_heartbeat"})
 _EMPTY_DUMPED = set()  # (request_purpose, model) pairs whose empty answer is already saved this run
 
 
@@ -766,7 +768,18 @@ _STOP_TEXT = {
     "evicted": "Прогрев остановлен: диалог вытеснен из пула",
     "failures": "Прогрев остановлен после пяти неудач",
     "closed": "Прогрев остановлен: сессия закрыта",
+    "last_turn_failed": "Прогрев остановлен: последний ход не дал пригодного ответа",
 }
+
+
+def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen):
+    """The class of one finished upstream attempt: cancelled, error, truncated, content, thinking_only or empty.
+
+    One definition for the attempt trace (_stream_body) and for the verdict on a whole turn (iter_events).
+    Only `content`, a non-blank text or a finished tool call delivered by a stream that reached its end, is an
+    answer; every other class is a paid attempt that gave the client nothing."""
+    return ("cancelled" if cancelled else "error" if failed else "truncated" if not ended else
+            "content" if usable else "thinking_only" if thinking_seen else "empty")
 
 
 class _WarmCycle:
@@ -846,6 +859,9 @@ async def _keepwarm(session, cfg):
     for a subagent that answered without one. A turn busy for longer than turn_timeout and
     a child request that went quiet keep nothing warm. The reason, the pings and the credits
     of the cycle are journaled as cache.keepwarm_stop.
+
+    A cycle also ends when the last turn gave no usable answer (empty, thinking only, cut off, an
+    error): last_turn_failed. The next good turn starts a new one.
     """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
     if interval <= 0:
@@ -877,6 +893,12 @@ async def _keepwarm(session, cfg):
                     next_turn_ping = started + turn_offset
                 last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
                 if not busy:
+                    outcome = getattr(session, "_turn_outcome", None)
+                    if outcome not in (None, "content"):
+                        # Nothing usable came back, so there is nothing a client returns to, and the prefix
+                        # behind it is not worth a paid refresh. The next good turn starts a new cycle.
+                        cycle.stop("last_turn_failed", turn_outcome=outcome)
+                        return
                     subagent = bool(getattr(session, "_parent_key", None))
                     limit = subagent_idle if subagent else idle
                     if subagent and getattr(session, "_turn_final", False):
@@ -1027,13 +1049,23 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     rejected = False
     # A completed answer that asked for no tool is final: a subagent that gave one is done.
     asked_tool, ended = False, None
+    # What the turn delivered decides what it may become: only a usable answer is a keepwarm body.
+    wrote_text = thinking_seen = errored = False
+    failure = None
 
     def note(event):
-        nonlocal asked_tool, ended
-        if event.get("type") == "tool_call" and not event.get("partial"):
+        nonlocal asked_tool, ended, wrote_text, thinking_seen, errored
+        kind = event.get("type")
+        if kind == "tool_call" and not event.get("partial"):
             asked_tool = True
-        elif event.get("type") == "end":
+        elif kind == "end":
             ended = event.get("reason")
+        elif kind == "text":
+            wrote_text = wrote_text or bool(str(event.get("delta") or "").strip())
+        elif kind in _THINKING_EVENTS:
+            thinking_seen = True
+        elif kind == "error":
+            errored = True  # a stream that ended without end_of_stream: the consumer may stop reading here
 
     if body.get("openAICacheKey"):
         session._turn_body = body
@@ -1072,12 +1104,28 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     except apierr.ApiError as error:
         # A body upstream rejected (400/413/422) must not become the keepwarm body.
         rejected = 400 <= error.status < 500 and error.status not in (401, 403, 408, 429)
+        failure = error
+        raise
+    except BaseException as error:  # noqa: BLE001 - noted for the verdict on the turn, then raised again
+        failure = error
         raise
     finally:
         session._busy = False
         session._turn_body = None
         session._turn_identity = None
         session._turn_final = ended == "stop" and not asked_tool and not getattr(session, "_cancelled", False)
+        # The consumer may drop the generator right after an error event (a cut stream): that is not a cancel.
+        stopped_early = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) and not errored
+        outcome = "truncated" if errored else attempt_outcome(
+            cancelled=bool(getattr(session, "_cancelled", False)) or ended == "cancelled" or stopped_early,
+            failed=failure is not None, ended=ended is not None, usable=wrote_text or asked_tool,
+            thinking_seen=thinking_seen)
+        if rejected:
+            outcome = "rejected"
+        if body.get("openAICacheKey"):
+            # Only a usable answer (never an empty, thinking-only, cut off, failed or cancelled turn) may
+            # become the keepwarm body; any other verdict stops the cycle until a good turn comes.
+            session._turn_outcome = outcome
         if body.get("openAICacheKey") and not rejected:
             prior_key = getattr(session, "_last_cache_key", None)
             if prior_key and prior_key != body["openAICacheKey"]:
@@ -1088,18 +1136,23 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                              tools=len(body.get("tools") or []),
                              thread=journal.tag(getattr(session, "thread_id", None)))
             session._last_cache_key = body["openAICacheKey"]
-            session._warm_body = body
-            session._warm_identity = identity
-            # The TTL counts from the last cache touch: this request's start or a
-            # later during-turn ping, NOT the turn's end; otherwise a pause after
-            # a long turn outlives the 5-minute entry before the next idle ping.
-            session._warm_at = max(session._turn_started_at, getattr(session, "_warm_at", 0) or 0)
+            if outcome == "content":
+                session._warm_body = body
+                session._warm_identity = identity
+                # The TTL counts from the last cache touch: this request's start or a
+                # later during-turn ping, NOT the turn's end; otherwise a pause after
+                # a long turn outlives the 5-minute entry before the next idle ping.
+                session._warm_at = max(session._turn_started_at, getattr(session, "_warm_at", 0) or 0)
             session._last_request_at = time.time()
-            _ensure_keepwarm(session, cfg)
+            if outcome == "content":
+                _ensure_keepwarm(session, cfg)
 
 
 def _ensure_keepwarm(session, cfg):
     if getattr(session, "_cancelled", False) or getattr(asyncio.get_running_loop(), "_relay_closing", False):
+        return
+    if getattr(session, "_turn_outcome", None) not in (None, "content") and not getattr(session, "_busy", False):
+        # The last turn gave nothing usable: a cycle would only announce that it has nothing to warm.
         return
     task = getattr(session, "_warm_task", None)
     if task is None or task.done():
@@ -1401,9 +1454,9 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     pass
                 trace = holder.get("trace")
                 if trace is not None:
-                    outcome = ("cancelled" if is_cancelled() or isinstance(failure, asyncio.CancelledError) else
-                               "error" if failure else "truncated" if not flags.get("end") else
-                               "content" if usable else "thinking_only" if thinking_seen else "empty")
+                    outcome = attempt_outcome(
+                        cancelled=is_cancelled() or isinstance(failure, asyncio.CancelledError),
+                        failed=bool(failure), ended=flags.get("end"), usable=usable, thinking_seen=thinking_seen)
                     trace.finish(outcome)
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)
