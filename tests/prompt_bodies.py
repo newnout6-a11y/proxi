@@ -142,18 +142,29 @@ def claude_sdk_body(turns=5, model="claude-opus-5-5"):
             "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
 
 
+CODEX_BASE = "Synthetic base instructions of the client. " + filler("base", 6)
+CODEX_PERMISSIONS = "<permissions instructions>\nSynthetic sandbox rules.\n</permissions instructions>"
+CODEX_COLLABORATION = "<collaboration_mode>\nSynthetic collaboration mode.\n</collaboration_mode>"
+
+
 def codex_body(model="gpt-6-sol"):
-    """A Responses request in the form Codex sends: instructions, a developer block, AGENTS.md and environment as user items."""
+    """A Responses request in the form Codex 0.164 sends.
+
+    There is no `instructions` field: codex-rs (core/src/client.rs, context/base_instructions.rs at rust-v0.164.0) puts
+    the base instructions in front of `input` as a developer message of one input_text, and the other developer
+    messages (permissions, collaboration mode) follow it. AGENTS.md and the environment are user items after them,
+    and the relay reads the leading developer items as the client's system (validate.parse_responses joins them).
+    """
     text = lambda role, value: {"type": "message", "role": role, "content": [{"type": "input_text", "text": value}]}
     return {"model": model, "stream": True, "store": False, "parallel_tool_calls": True, "tool_choice": "auto",
-            "instructions": "Synthetic base instructions of the client. " + filler("base", 6),
             "reasoning": {"effort": "high"}, "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": "synthetic-codex-session", "client_metadata": {"synthetic": "1"},
             "tools": [{"type": "function", "name": "shell_command", "description": "Synthetic shell tool.",
                        "parameters": _schema("command")},
                       {"type": "custom", "name": "apply_patch", "description": "Synthetic patch tool.",
                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}}],
-            "input": [text("developer", "<permissions instructions>\nSynthetic sandbox rules.\n</permissions instructions>"),
+            "input": [text("developer", CODEX_BASE), text("developer", CODEX_PERMISSIONS),
+                      text("developer", CODEX_COLLABORATION),
                       text("user", "# AGENTS.md instructions for /synthetic\n\n<INSTRUCTIONS>\n" + filler("agents", 8)
                                    + "\n</INSTRUCTIONS>"),
                       text("user", "<environment_context>\n  <cwd>/synthetic</cwd>\n</environment_context>"),

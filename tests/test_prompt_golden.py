@@ -116,7 +116,7 @@ REAL = [
      dict(data=opencode_body(), dialect="chat", headers=OPENCODE_HEADERS)),
     ("R2 Claude Agent SDK runner (Desktop): 3 system blocks with a billing header, a role:system entry per turn",
      dict(data=claude_sdk_body(), dialect="anthropic", headers=CLAUDE_SDK_HEADERS)),
-    ("R3 Codex: Responses, instructions + developer block + AGENTS.md as user items, function and custom tools",
+    ("R3 Codex 0.164: Responses, no instructions field, three leading developer items, AGENTS.md as a user item",
      dict(data=codex_body(), dialect="responses", headers=CODEX_HEADERS,
           parse={"model": "gpt-6-sol"})),
     ("R4 OpenCode 2.x title agent (tool-less, own system)",
