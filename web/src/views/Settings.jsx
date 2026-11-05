@@ -118,7 +118,9 @@ function SystemInstructions({ settings, saved, roles, field, bytes, limit, onCha
         onChange={(e) => onChange(ROLE_KEY, e.target.value)} />
       {blank && (
         <div className="banner tone-warn" role="status">
-          Роль отключена: модель получит запросы без роли relay. Вернуть встроенную роль можно флажком «Стандартная роль relay»
+          Роль отключена: модель получит запросы без роли relay.
+          {settings.relay_system_prompt_mode === 'replace' ? ' В режиме «Заменить роль клиента» инструкции IDE тоже не будут отправлены.' : ''}
+          {' '}Вернуть встроенную роль можно флажком «Стандартная роль relay»
         </div>
       )}
       <div className="prompt-footer" id="system-instructions-hint">

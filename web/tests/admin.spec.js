@@ -403,6 +403,12 @@ test('clearing the standard role starts from its text and an empty role is shown
   await expect(disabled).toHaveCount(0);
   await editor.fill('');
   await expect(disabled).toBeVisible();
+  // In "replace" mode the client's own instructions are dropped together with the role.
+  await expect(disabled).not.toContainText('инструкции IDE');
+  await page.getByRole('radio', { name: /Заменить роль клиента/ }).check();
+  await expect(disabled).toContainText('инструкции IDE тоже не будут отправлены');
+  await page.getByRole('radio', { name: /Самостоятельные запросы/ }).check();
+  await expect(disabled).not.toContainText('инструкции IDE');
   await editor.fill('Своя роль');
   await expect(disabled).toHaveCount(0);
   await standard.check();
