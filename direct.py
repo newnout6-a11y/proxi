@@ -775,6 +775,13 @@ PING_LATEST = PING_DEADLINE - 5.0
 # A failed ping is retried this long after the failure (doubled for every further one), and only if the retry
 # still starts inside the window above.
 PING_RETRY = 10.0
+# A ping that WROTE the prefix instead of reading it found the entry gone. It counts as a rewrite when it wrote
+# half of the cached prefix (a miss on a small prompt) or REWRITE_TOKENS tokens: the console flags the same
+# size as [WRITE HIGH], and at the write price (1e-4 credits per token) it is 5 credits, as much as six
+# healthy pings of a 190k-token prefix (4e-6 per token). Below one cache block it is noise.
+REWRITE_SHARE = 0.5
+REWRITE_TOKENS = 50_000
+REWRITE_FLOOR = 1_024
 
 _STOP_TEXT = {
     "idle_limit": "Прогрев остановлен: диалог не запрашивали дольше лимита простоя",
@@ -785,6 +792,7 @@ _STOP_TEXT = {
     "closed": "Прогрев остановлен: сессия закрыта",
     "last_turn_failed": "Прогрев остановлен: последний ход не дал пригодного ответа",
     "cache_expired": "Прогрев остановлен: кэш префикса уже истёк, пинг оплатил бы его полную перезапись",
+    "cache_rewritten": "Прогрев остановлен: пинг перезаписал префикс вместо чтения из кэша",
 }
 
 
@@ -796,6 +804,20 @@ def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen):
     answer; every other class is a paid attempt that gave the client nothing."""
     return ("cancelled" if cancelled else "error" if failed else "truncated" if not ended else
             "content" if usable else "thinking_only" if thinking_seen else "empty")
+
+
+def _rewrite_of(usage):
+    """The size of a rewrite when a ping wrote the cached prefix again instead of reading it, else None."""
+    if not isinstance(usage, dict):
+        return None
+    written = int(console_log.number(usage.get("promptTokensWrittenToCache")) or 0)
+    if written < REWRITE_FLOOR:
+        return None
+    read = int(console_log.number(usage.get("promptTokensReadFromCache")) or 0)
+    prefix = read + written
+    if written < REWRITE_TOKENS and written < prefix * REWRITE_SHARE:
+        return None
+    return {"written_tokens": written, "read_tokens": read, "prefix_tokens": prefix}
 
 
 class _WarmCycle:
@@ -822,7 +844,7 @@ class _WarmCycle:
         try:
             last = getattr(session, "_last_request_at", None)
             spent = float(getattr(session, "_keepwarm_cost", 0.0) or 0.0) - self.cost0
-            level = ("warn" if reason == "failures" else
+            level = ("warn" if reason in ("failures", "cache_rewritten") else
                      "debug" if reason == "account_unavailable" and not self.pings else "info")
             owner = getattr(session, "_turn_identity", None) or getattr(session, "_warm_identity", None) or {}
             token = client_context.bind(owner)
@@ -881,7 +903,9 @@ async def _keepwarm(session, cfg):
     - the last turn gave no usable answer (empty, thinking only, cut off, an error): last_turn_failed;
     - the last confirmed touch of the cache, the start of a real request or of a successful ping
       (a failed ping touches nothing: its result is unknown), is older than
-      PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN: cache_expired. This also ends a retry that no longer fits.
+      PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN: cache_expired. This also ends a retry that no longer fits;
+    - a ping reported that it wrote the prefix instead of reading it: cache_rewritten, one rewrite is
+      the most the cycle ever pays for.
     The same rules hold inside a running turn.
     """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
@@ -987,12 +1011,14 @@ async def _keepwarm(session, cfg):
                     session._keepwarm_estimated_cost = round(
                         getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
                 usage = getattr(session, "_last_warm_usage", {})
+                rewrite = _rewrite_of(usage)
                 touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
                     "promptTokensReadFromCache", "promptTokensWrittenToCache"))
                 journal.emit("cache.keepwarm",
+                             "Прогрев перезаписал кэш: префикс записан заново, а не прочитан" if rewrite else
                              "Кэш прочитан или записан при прогреве" if touched else
                              "Запрос прогрева завершён; использование кэша не подтверждено",
-                             "info" if busy else "debug",
+                             "warn" if rewrite else "info" if busy else "debug",
                              model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
                              account=account,
                              during_turn=busy, turn_age_seconds=round(ping_started - started) if busy else None,
@@ -1000,6 +1026,12 @@ async def _keepwarm(session, cfg):
                              prefix_tokens=prefix_tokens, est_credits=round(estimate, 4),
                              actual_credits=actual, credits_total=getattr(session, "_keepwarm_cost", 0.0),
                              cache_verified=touched, usage=usage)
+                if rewrite:
+                    # The cache the cycle was keeping alive was gone: whatever kept it from being read
+                    # (a lapse, an eviction, another shard) can happen again, and every miss pays a full write.
+                    cycle.stop("cache_rewritten", touch_age_seconds=round(ping_started - touch_at),
+                               ping_credits=actual, **rewrite)
+                    return
             except asyncio.CancelledError:
                 cycle.cancelled()
                 return

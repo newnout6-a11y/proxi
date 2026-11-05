@@ -1,11 +1,14 @@
-"""Keepwarm pays only for a cache it can still read: the TTL window and the retries inside it."""
+"""Keepwarm pays only for a cache it can still read: the TTL window, the retries inside it, one rewrite at most."""
 import asyncio
+import io
+import json
+from types import SimpleNamespace
 
 import pytest
 
 import direct
 import journal
-from keepwarm_harness import CFG, START, drive, install, session as warm_session, stops
+from keepwarm_harness import CFG, DUE, START, drive, install, session as warm_session, stops
 
 BODY = {"model": "claude-opus-5-5"}
 
@@ -205,3 +208,126 @@ def test_a_turn_without_its_own_cached_body_pings_the_old_body_against_the_old_t
                           _warm_body=dict(BODY), _warm_at=START - 250)
     clock, pings = drive(monkeypatch, target, {"turn_timeout": 3000}, seconds=30)
     assert len(pings) == 1
+
+
+# -- a rewrite ------------------------------------------------------------------------------------
+REWRITES = [
+    (190_000, 0),        # the whole prefix written, nothing read: the entry was gone
+    (60_000, 340_000),   # a sixth of a huge prefix, but 6 credits at the write price
+    (50_000, 450_000),   # exactly the threshold
+    (6_000, 4_000),      # a miss on a small prompt: more than half written
+    (1_024, 0),          # a prompt of one cache block, missed completely
+]
+HEALTHY = [
+    (0, 190_000),        # a read, as intended
+    (40_000, 150_000),   # below both thresholds: a partial write the cycle survives
+    (49_999, 450_000),   # one token under the absolute threshold, far under half
+    (1_023, 0),          # below one cache block: noise
+    (200, 100),          # more than half but tiny
+    (0, 0),
+]
+
+
+@pytest.mark.parametrize("written,read", REWRITES)
+def test_a_ping_that_wrote_the_prefix_instead_of_reading_it_is_a_rewrite(written, read):
+    usage = {"promptTokensWrittenToCache": written, "promptTokensReadFromCache": read, "inputTokens": 12}
+    assert direct._rewrite_of(usage) == {"written_tokens": written, "read_tokens": read, "prefix_tokens": written + read}
+
+
+@pytest.mark.parametrize("written,read", HEALTHY)
+def test_a_ping_that_mostly_read_the_prefix_is_not(written, read):
+    assert direct._rewrite_of({"promptTokensWrittenToCache": written, "promptTokensReadFromCache": read}) is None
+
+
+@pytest.mark.parametrize("usage", [None, [], "usage", {}, {"promptTokensReadFromCache": 190_000},
+                                   {"promptTokensWrittenToCache": None}, {"promptTokensWrittenToCache": "lots"},
+                                   {"promptTokensWrittenToCache": True}, {"promptTokensWrittenToCache": -190_000},
+                                   {"promptTokensWrittenToCache": float("nan")},
+                                   {"promptTokensWrittenToCache": float("inf")}])
+def test_missing_or_invalid_usage_never_stops_a_cycle_as_a_rewrite(usage):
+    assert direct._rewrite_of(usage) is None
+
+
+def test_usage_is_read_like_everywhere_else_a_numeric_string_is_a_number():
+    assert direct._rewrite_of({"promptTokensWrittenToCache": "190000"})["written_tokens"] == 190_000
+
+
+def usage_ping(usage, credits=0.1):
+    def ping(_clock, owner, _body):
+        owner._last_warm_usage = dict(usage)
+        return credits
+    return ping
+
+
+def test_one_rewrite_is_the_most_a_cycle_ever_pays_for(monkeypatch):
+    mark = journal.JOURNAL.last_seq
+    usage = {"promptTokensWrittenToCache": 330_599, "promptTokensReadFromCache": 0, "creditsUsed": 34.46}
+    target = warm_session(_warm_at=START - 100)
+    clock, pings = cycle(monkeypatch, target, {"cache_keepwarm_idle": 86400}, seconds=20000,
+                         ping=usage_ping(usage, 34.46))
+    assert len(pings) == 1 and clock.now - START < 200, "the cycle ended with the first rewrite"
+    [stop] = stops(mark)
+    assert (stop["reason"], stop["level"], stop["pings"], stop["idle_pings"]) == ("cache_rewritten", "warn", 1, 1)
+    assert (stop["written_tokens"], stop["read_tokens"], stop["prefix_tokens"]) == (330_599, 0, 330_599)
+    assert stop["ping_credits"] == 34.46 and stop["credits"] == pytest.approx(34.46)
+    assert stop["touch_age_seconds"] == pytest.approx(240, abs=2)
+    [ping_event] = events(mark, "cache.keepwarm")
+    assert ping_event["level"] == "warn" and ping_event["cache_verified"] is True
+    assert ping_event["touch_age_seconds"] == pytest.approx(240, abs=2)
+    assert direct._STOP_TEXT["cache_rewritten"] in [e["message"] for e in journal.JOURNAL.query(since=mark, limit=100)]
+
+
+def test_a_healthy_cycle_is_not_cut_by_pings_that_read(monkeypatch):
+    mark = journal.JOURNAL.last_seq
+    usage = {"promptTokensWrittenToCache": 120, "promptTokensReadFromCache": 190_000}
+    clock, pings = cycle(monkeypatch, warm_session(_warm_at=START - 100), seconds=5000, ping=usage_ping(usage))
+    assert len(pings) == 4 and [s["reason"] for s in stops(mark)] == ["idle_limit"]
+    assert all(e["level"] == "debug" for e in events(mark, "cache.keepwarm"))
+
+
+def test_a_rewrite_inside_a_turn_ends_the_cycle_too(monkeypatch):
+    """The turn's own entry may not exist yet (the first response has not begun): one miss, not one per ping."""
+    mark = journal.JOURNAL.last_seq
+    usage = {"promptTokensWrittenToCache": 190_000, "promptTokensReadFromCache": 0}
+    target = warm_session(_busy=True, _turn_started_at=START, _turn_seq=1, _turn_body=dict(BODY), _warm_at=0)
+    clock, pings = cycle(monkeypatch, target, {"turn_timeout": 5000}, seconds=3000, ping=usage_ping(usage))
+    assert len(pings) == 1
+    [stop] = stops(mark)
+    assert (stop["reason"], stop["pings"], stop["idle_pings"]) == ("cache_rewritten", 1, 0)
+
+
+def test_the_rewriting_ping_still_counts_as_a_touch_of_the_entry_it_wrote(monkeypatch):
+    usage = {"promptTokensWrittenToCache": 190_000, "promptTokensReadFromCache": 0}
+    target = warm_session(_warm_at=START - 100)
+    clock, pings = cycle(monkeypatch, target, seconds=3000, ping=usage_ping(usage))
+    assert target._warm_at == pings[0], "the entry it created is as young as the ping"
+
+
+# -- the real ping --------------------------------------------------------------------------------
+def response(*events_):
+    return io.BytesIO(b"\n".join(json.dumps(event).encode() for event in events_) + b"\n")
+
+
+def test_a_real_ping_whose_usage_shows_a_rewrite_ends_the_cycle_with_its_measured_size(monkeypatch):
+    real_ping = direct._ping
+    mark = journal.JOURNAL.last_seq
+    backend = SimpleNamespace(cfg={"account_id": "acc-real", "base": "https://upstream.invalid"}, unavailable=None,
+                              headers=lambda: {})
+    target = warm_session(backend=backend, _warm_at=DUE, _cancelled=False, _credits_manager=None)
+    clock, pings = install(monkeypatch, seconds=3000)
+    monkeypatch.setattr(direct, "_ping", real_ping)
+    sent = []
+
+    def urlopen(request, **_kw):
+        sent.append(clock.now)
+        return response({"event": "metadata", "usage": {"creditsUsed": 19.2, "promptTokensWrittenToCache": 190_000,
+                                                        "promptTokensReadFromCache": 0, "inputTokens": 9}},
+                        {"event": "end_of_stream"})
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", urlopen)
+    asyncio.run(direct._keepwarm(target, dict(CFG)))
+    assert len(sent) == 1
+    [stop] = stops(mark)
+    assert (stop["reason"], stop["pings"], stop["written_tokens"], stop["prefix_tokens"]) == (
+        "cache_rewritten", 1, 190_000, 190_000)
+    assert stop["credits"] == pytest.approx(19.2) and stop["ping_credits"] == 19.2
