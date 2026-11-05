@@ -370,8 +370,10 @@ relay does not forward them; it names both, without values, in
 `x-proxi-ignored-parameters` and the `request.compatibility` journal event.
 
 Codex 0.164.0 passed real source reading, patching and testing (two tests), and a
-separate real subagent spawn/wait/result round trip. See `pr-1-review.md` for
-commands, versions and limitations.
+separate real subagent spawn/wait/result round trip. Commands, versions and
+limitations were in the review of
+[PR #1](https://github.com/newnout6-a11y/proxi/pull/1), `docs/pr-1-review.md`; the file
+was removed from the repository, its last version is `git show 60cc80f^:docs/pr-1-review.md`.
 
 ## Claude Code
 
