@@ -67,14 +67,18 @@ def _named_objects(section):
 
 def update_document(document, entries, default_model='claude-opus-5-5'):
     result = copy.deepcopy(document)
-    provider = result.get('provider', {}).get(PROVIDER)
+    providers = result.get('provider')
+    provider = providers.get(PROVIDER) if isinstance(providers, dict) else None
     if not isinstance(provider, dict):
         raise ValueError('Expected an existing retool-relay provider in the OpenCode legacy JSON schema')
     old_models = provider.get('models') or {}
+    if not isinstance(old_models, dict):
+        raise ValueError('Expected provider.retool-relay.models to be an object')
     new_models = {}
     for entry in entries:
         name = entry['id']
-        item = copy.deepcopy(old_models.get(name) or {})
+        item = copy.deepcopy(old_models.get(name))
+        item = item if isinstance(item, dict) else {}
         levels = entry.get('reasoning_effort_levels') or []
         item.update(name=entry['label'], limit={'context': entry['context'], 'output': entry['max_output']},
                     tool_call=bool(entry.get('tools')), attachment=bool(entry.get('vision')),
@@ -86,7 +90,9 @@ def update_document(document, entries, default_model='claude-opus-5-5'):
         item['variants'] = {level: {'name': level.title(), 'reasoningEffort': level,
                             'settings': {'reasoningEffort': level}, 'body': {'reasoningEffort': level}}
                             for level in levels}
-        options = item.setdefault('options', {})
+        options = item.get('options')
+        if not isinstance(options, dict):
+            options = item['options'] = {}
         previous = effort_controls(options)
         valid = [value for value in previous if isinstance(value, str) and value in levels]
         selected = valid[0] if len(set(valid)) == 1 else entry.get('default_reasoning_effort')
@@ -361,7 +367,7 @@ def run(args):
     print(json.dumps({'models': len(entries), 'written': backup is not None, 'changed': not unchanged,
                       'backup': str(backup) if backup else None, 'preview': args.output,
                       'preview_redacted': bool(args.output) and not args.include_secrets,
-                      'comments_dropped': commented and not unchanged}, ensure_ascii=False))
+                      'drops_comments': commented and not unchanged}, ensure_ascii=False))
     return 0
 
 

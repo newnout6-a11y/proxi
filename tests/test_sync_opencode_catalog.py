@@ -1,6 +1,7 @@
 """Client catalog updates preserve unrelated configuration and are recoverable."""
 import copy
 import errno
+import inspect
 import json
 import os
 from pathlib import Path
@@ -197,9 +198,9 @@ def test_write_refuses_to_remove_comments_unless_reformat_is_allowed(tmp_path, c
     assert '--allow-reformat' in error and 'comments' in error and 'relay-private' not in error
     assert settings.read_bytes() == original and not backups.exists()
     code, preview, _ = client(tmp_path, capsys, '--output', str(tmp_path / 'preview.json'))
-    assert code == 0 and preview['written'] is False and preview['comments_dropped'] is True
+    assert code == 0 and preview['written'] is False and preview['drops_comments'] is True
     code, summary, _ = client(tmp_path, capsys, '--write', '--allow-reformat', '--backup-dir', str(backups))
-    assert code == 0 and summary['written'] is True and summary['comments_dropped'] is True
+    assert code == 0 and summary['written'] is True and summary['drops_comments'] is True
     assert b'keep my note' not in settings.read_bytes()
     assert [path.read_bytes() for path in backups.iterdir()] == [original]
 
@@ -308,11 +309,11 @@ def test_replacement_that_moved_the_original_to_the_backup_restores_it(tmp_path,
 
     def failed_replace(target, replacement, backup):
         os.replace(target, backup)
-        raise OSError(None, 'The replacement file could not be renamed.', None, 1177)
+        raise OSError(1177, 'The replacement file could not be renamed.')
     monkeypatch.setattr(sync, '_replace_with_backup', failed_replace)
     with pytest.raises(OSError) as error:
         write_backed_up(path, b'original', b'generated', tmp_path / 'backups')
-    assert error.value.winerror == 1177 if os.name == 'nt' else error.value.errno is None
+    assert error.value.errno == 1177
     assert path.read_bytes() == b'original'
     assert not list(tmp_path.glob('.proxi-catalog-*.tmp'))
 
@@ -510,3 +511,43 @@ def test_relay_root_options_reach_the_catalog_filter(tmp_path, capsys):
     assert code == 0 and summary['models'] == len(hidden)
     code, summary, _ = client(tmp_path, capsys, relay=tmp_path / 'shown.json')
     assert code == 0 and summary['models'] == len(shown)
+
+
+@pytest.mark.parametrize('document', [{'provider': []}, {'provider': {'retool-relay': 'text'}},
+                                      {'provider': {'retool-relay': {'models': ['gpt-6-sol']}}}])
+def test_unexpected_provider_shapes_are_refused_with_a_message_not_an_attribute_error(document, tmp_path, capsys):
+    with pytest.raises(ValueError, match='retool-relay'):
+        update_document(document, [models.resolve('gpt-6-sol')[0]])
+    settings = installed(tmp_path, document)
+    original = settings.read_bytes()
+    code, summary, error = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'))
+    assert code == 1 and summary is None and error.startswith('error: ') and 'Traceback' not in error
+    assert settings.read_bytes() == original and not (tmp_path / 'backups').exists()
+
+
+def test_malformed_model_entries_and_options_are_rebuilt_instead_of_crashing():
+    before = {'provider': {'retool-relay': {'models': {'gpt-6-sol': 'text', 'gpt-4.1': {'options': 'text'},
+                                                       'claude-opus-5-5': {'options': ['high'], 'custom': True}}}}}
+    entries = [models.resolve(name)[0] for name in ('gpt-6-sol', 'gpt-4.1', 'claude-opus-5-5')]
+    catalog = update_document(before, entries)['provider']['retool-relay']['models']
+    assert catalog['gpt-6-sol']['options']['reasoningEffort'] == 'medium'
+    assert catalog['gpt-4.1']['options'] == {'reasoningEffort': 'none'}
+    assert catalog['claude-opus-5-5']['custom'] is True
+    assert catalog['claude-opus-5-5']['options']['reasoningEffort'] == 'medium'
+
+
+def test_write_without_a_backup_directory_is_rejected_before_the_settings_are_read(tmp_path):
+    never_read = tmp_path / 'never-read.jsonc'
+    with pytest.raises(SystemExit) as error:
+        main(['--settings', str(never_read), '--write'])
+    assert error.value.code == 2 and not never_read.exists()
+
+
+def test_write_backed_up_keeps_the_signature_and_result_other_scripts_import(tmp_path):
+    # scripts/sync_claude_desktop_catalog.py calls write_backed_up(path, original, updated, backup_dir).
+    assert list(inspect.signature(write_backed_up).parameters) == ['path', 'original', 'updated', 'backup_dir']
+    path = tmp_path / 'config.json'
+    path.write_bytes(b'old')
+    backup = write_backed_up(str(path), b'old', b'new', str(tmp_path / 'backups'))
+    assert isinstance(backup, Path) and backup.read_bytes() == b'old' and path.read_bytes() == b'new'
+    assert backup.parent == (tmp_path / 'backups').resolve()
