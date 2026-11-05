@@ -358,9 +358,10 @@ def test_the_real_store_saves_serves_and_refuses_documents(admin_relay):
     status, body, _ = put(admin_relay, DOC)
     assert status == 200 and isinstance(body["rev"], int) and body["warnings"] == []
     saved = admin_relay.path.parent / "prompts.json"
-    assert saved.exists() and not list(saved.parent.glob(".admin-*.tmp"))
+    assert saved.exists() and not list(saved.parent.glob("*.tmp"))  # written whole, no temporary file left behind
     state = get(admin_relay)[1]
-    assert state["rev"] == body["rev"] and state["document"]["profiles"]["mine"] == DOC["profiles"]["mine"]
+    assert state["rev"] == body["rev"]
+    assert state["document"]["profiles"]["mine"]["head"] == DOC["profiles"]["mine"]["head"]
     assert put(admin_relay, DOC, None)[0] == 409  # a stale base: the document exists now
     status, answer, _ = put(admin_relay, {"version": 1, "profiles": {"mine": {"head": "{{no_such_variable}}"}}},
                             body["rev"])

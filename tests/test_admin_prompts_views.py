@@ -228,6 +228,9 @@ def test_one_conversation_is_unpinned_by_the_tag_the_screen_shows(api):
     event = events("admin.prompt_pins")[0]
     assert event["level"] == "info" and event["conversation"] == "a1b2c3d4"
     assert event["data"] == {"action": "unpin", "unpinned": 2}
+    # Spaces around a pasted tag are not part of it.
+    assert post(api, "pins", {"action": "unpin", "conversation": "  a1b2c3d4 "})[1] == {"unpinned": 2}
+    assert api.store.called("unpin")[-1] == ("a1b2c3d4",)
 
 
 def test_a_store_that_knows_only_keys_is_asked_with_the_keys_of_the_open_conversations(api):
