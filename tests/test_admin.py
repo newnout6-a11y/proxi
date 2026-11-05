@@ -428,14 +428,20 @@ def test_token_snapshots_do_not_hide_or_invent_an_extra_charge(reverse):
     totals = log.metrics()['totals']
     assert totals['credits'] == 1.5 and totals['credits_complete'] is True
     log.emit('upstream.usage_start', 'next', turn_id='t1', attempt=2)
+    # An attempt that has only started has reported nothing: it is not a missing price (yet).
+    assert log.metrics()['totals']['credits_complete'] is True
+    log.emit('upstream.usage', 'marker', turn_id='t1', attempt=2, credits=None, credits_reported=False)
     assert log.metrics()['totals']['credits_complete'] is False
 
 
 def test_a_billed_turn_cannot_mask_another_turn_without_telemetry():
     log = journal.Journal()
     log.emit('turn.begin', 'first', turn_id='t1')
-    log.emit('upstream.usage', 'known', turn_id='t1', credits=1)
+    log.emit('upstream.usage_start', 'attempt', turn_id='t1', attempt=1)
+    log.emit('upstream.usage', 'known', turn_id='t1', attempt=1, credits=1)
     log.emit('turn.begin', 'second', turn_id='t2')
+    log.emit('upstream.usage_start', 'attempt', turn_id='t2', attempt=2)
+    log.emit('upstream.usage', 'usage without a price', turn_id='t2', attempt=2, credits=None)
     log.emit('turn.end', 'second ended', turn_id='t2')
     assert log.metrics()['totals']['credits_complete'] is False
 

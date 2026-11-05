@@ -4,7 +4,13 @@ Every relay action (HTTP request, model turn, upstream call, tool call, local
 command, session lifecycle, auth renewal, settings change) is recorded as one
 event. Events live in a bounded ring buffer, are optionally appended to a JSONL
 file and can be followed live by long-lived admin streams.
+
+Metrics never read that buffer. Every event is also folded into fixed-size time
+slots (``_Rollup``) that span the longest metrics window, so the turnover of raw
+events cannot shrink or silently under-count the 1 h / 6 h / 24 h figures.
+``metrics()["coverage"]`` states how much of a window the slots really cover.
 """
+import array
 import collections
 import hashlib
 import json
@@ -17,9 +23,23 @@ import client_context
 from redact import redact
 
 LEVELS = ("debug", "info", "success", "warn", "error")
-CAPACITY = 5000
+# A raw event is ~465 bytes of JSONL and ~0.8 KiB of memory. 20000 of them are about
+# one rotated file generation (10 MiB), ~16 MiB of RAM and ~40 minutes at 500 events/min.
+CAPACITY = 20000
 MAX_FILE_BYTES = 10 * 1024 * 1024
 _TOP_LEVEL = ("turn_id", "request_id", "conversation")
+# Rollups: numeric counters per FINE seconds (the smallest chart bucket), distributions per
+# COARSE seconds (window-wide figures only), both kept for the longest window plus a margin.
+FINE = 10
+COARSE = 60
+RETENTION = 24 * 3600 + 600
+MAX_SAMPLES = 1000  # latency/ttft samples kept per COARSE slot
+SAMPLE_LIMIT = 20000  # samples a percentile is computed from; a longer window is thinned evenly
+MAX_LIVE_TURNS = 4096
+LIVE_TURN_TTL = 6 * 3600
+_FINE_MAX = RETENTION // FINE + 8
+_COARSE_MAX = RETENTION // COARSE + 8
+_ROUTES = ("chat", "responses", "anthropic")
 
 
 def tag(value):
@@ -29,8 +49,298 @@ def tag(value):
     return hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()[:8]
 
 
+def _number(value):
+    """A finite int or float (never a bool), else None."""
+    return value if type(value) in (int, float) and math.isfinite(value) else None
+
+
+def _price(value):
+    """A reported price is a finite number >= 0; anything else is 'unknown'."""
+    number = _number(value)
+    return number if number is not None and number >= 0 else None
+
+
+def _whole(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _attempt_number(data):
+    value = data.get("attempt")
+    return value if type(value) is int else None
+
+
+class _Attempt:
+    """One paid upstream attempt: whether it produced usage telemetry and whether a price came with it."""
+    __slots__ = ("where", "observed", "known", "price")
+
+    def __init__(self, where):
+        self.where = where
+        self.observed = False  # any upstream.usage, including the empty marker direct.py emits
+        self.known = False  # a valid price was reported
+        self.price = 0.0
+
+    @property
+    def unknown(self):
+        return self.observed and not self.known
+
+
+class _Turn:
+    """Price bookkeeping of one relay turn, shared by the metrics rollup and the turn traces.
+
+    An attempt costs nothing until it is observed: one that only started (the upstream refused it
+    or the request never left) is free. An observed attempt without a valid price is unknown and
+    stays so; the same rule adapters.py applies when it marks a prior attempt as unpriced. An
+    attempt a client cancelled before any telemetry is treated as observed (see ``end``).
+    """
+    __slots__ = ("attempts", "current", "ended", "restored", "touched")
+
+    def __init__(self, restored=False, touched=0.0):
+        self.attempts = {}
+        self.current = None
+        self.ended = False
+        self.restored = restored
+        self.touched = touched
+
+    def start(self, number, where):
+        if number is None:
+            number = max(self.attempts, default=-1) + 1
+        self.current = number
+        return self.attempts.setdefault(number, _Attempt(where))
+
+    def usage(self, number, price, where):
+        """Apply one usage event; returns the attempt and the change in its 'unknown' state (-1, 0, +1)."""
+        if number is None:
+            number = self.current if self.current is not None else 0
+        attempt = self.attempts.get(number)
+        if attempt is None:
+            attempt = self.attempts[number] = _Attempt(where)
+        before = attempt.unknown
+        attempt.observed = True
+        if price is not None:
+            attempt.known = True
+            attempt.price += price
+        return attempt, int(attempt.unknown) - int(before)
+
+    @property
+    def pending(self):
+        """The latest attempt has started but reported nothing yet: its price may still arrive."""
+        attempt = self.attempts.get(self.current)
+        return attempt is not None and not attempt.observed
+
+    def end(self, reason):
+        """The turn is over; returns an attempt that has just become unknown, if any.
+
+        A client that cancels mid-generation does not wait for the telemetry, and direct.py cannot
+        emit its empty usage marker through a cancelled generator, yet it flags the account balance
+        as unreported (mark_usage_unknown): the silent attempt may well have been billed.
+        """
+        self.ended = True
+        attempt = self.attempts.get(self.current)
+        if reason == "cancelled" and attempt is not None and not attempt.observed:
+            attempt.observed = True
+            return attempt
+        return None
+
+    def summary(self):
+        """(sum of valid prices, priced attempts, unknown attempts)."""
+        found = self.attempts.values()
+        return (sum(item.price for item in found), sum(item.known for item in found),
+                sum(item.unknown for item in found))
+
+
+class _Fine:
+    """Numeric counters of one FINE-second interval: everything a chart bucket shows."""
+    __slots__ = ("requests", "errors", "latency_sum", "latency_n", "ttft_sum", "ttft_n", "credits", "keepwarm",
+                 "keepwarm_pings", "keepwarm_unknown", "cache_read", "cache_write", "input", "output",
+                 "turns", "tools", "commands", "unknown")
+
+    def __init__(self):
+        self.requests = self.errors = self.latency_n = self.ttft_n = 0
+        self.keepwarm_pings = self.keepwarm_unknown = self.cache_read = self.cache_write = 0
+        self.input = self.output = self.turns = self.tools = self.commands = self.unknown = 0
+        self.latency_sum = self.ttft_sum = self.credits = self.keepwarm = 0.0
+
+
+class _Coarse:
+    """Distributions of one COARSE-second interval; only whole-window figures use them."""
+    __slots__ = ("statuses", "models", "categories", "levels", "latency", "ttft")
+
+    def __init__(self):
+        self.statuses, self.models, self.categories, self.levels = {}, {}, {}, {}
+        self.latency, self.ttft = array.array("d"), array.array("d")
+
+
+def _count(counter, key):
+    counter[key] = counter.get(key, 0) + 1
+
+
+def _thinned(slots, name, limit=None):
+    """The samples of all slots, evenly thinned to about ``limit`` so a 24 h percentile stays cheap."""
+    step = max(1, -(-sum(len(getattr(slot, name)) for slot in slots) // (limit or SAMPLE_LIMIT)))
+    merged = []
+    for slot in slots:
+        merged.extend(getattr(slot, name)[::step])
+    return merged
+
+
+def _trim(slots, limit, cutoff):
+    """Drop slots older than ``cutoff``; if the bound still holds too many, drop the oldest."""
+    for index in [index for index in slots if index < cutoff]:
+        del slots[index]
+    for index in sorted(slots)[:max(0, len(slots) - limit + 1)]:
+        del slots[index]
+
+
+class _Rollup:
+    """Bounded aggregates of the event stream that do not depend on the raw ring buffer.
+
+    ``covered_from`` is the instant from which every event reached the slots: the process start,
+    pulled back by events restored from the JSONL tail and pushed forward by a clear or a
+    failed ingest. Windows that begin earlier are reported as incompletely covered.
+    """
+
+    def __init__(self, covered_from):
+        self.fine = {}
+        self.coarse = {}
+        self.turns = collections.OrderedDict()  # turns that have not ended yet
+        self.covered_from = covered_from
+        self.oldest = None
+
+    def gap(self, ts):
+        """An event was lost to the aggregates: coverage restarts after it."""
+        ts = _number(ts)
+        if ts is not None:
+            self.covered_from = max(self.covered_from, ts)
+
+    def fine_slot(self, index):
+        slot = self.fine.get(index)
+        if slot is None:
+            slot = self.fine[index] = _Fine()
+        return slot
+
+    def coarse_slot(self, now, index):
+        slot = self.coarse.get(index)
+        if slot is None:
+            if len(self.coarse) >= _COARSE_MAX:
+                self.prune(now)
+            slot = self.coarse[index] = _Coarse()
+        return slot
+
+    def prune(self, now):
+        cutoff = now - RETENTION
+        _trim(self.fine, _FINE_MAX, cutoff // FINE)
+        _trim(self.coarse, _COARSE_MAX, cutoff // COARSE)
+        for key in [key for key, turn in self.turns.items() if turn.touched < now - LIVE_TURN_TTL]:
+            del self.turns[key]
+        if self.oldest is not None and self.oldest < cutoff:
+            self.oldest = cutoff
+
+    def turn(self, key, ts, restored):
+        turn = self.turns.get(key)
+        if turn is None:
+            if len(self.turns) >= MAX_LIVE_TURNS:
+                self.turns.popitem(last=False)
+            turn = self.turns[key] = _Turn(restored)
+        else:
+            self.turns.move_to_end(key)
+        turn.touched = ts
+        return turn
+
+    def settle_restored(self):
+        """Turns replayed from a previous run without an end belonged to a process that is gone."""
+        for key in [key for key, turn in self.turns.items() if turn.restored]:
+            del self.turns[key]
+
+    def _shift_unknown(self, now, index, change):
+        # Creating the slot is right (the attempt started in an interval without numeric events),
+        # but an interval already past retention must not be resurrected.
+        if index * FINE >= now - RETENTION:
+            self.fine_slot(index).unknown += change
+
+    def ingest(self, event, now, restored=False):
+        ts = _number(event.get("ts"))
+        if ts is None or ts < now - RETENTION:
+            return
+        data = event.get("data")
+        data = data if isinstance(data, dict) else {}
+        kind = event.get("kind") if isinstance(event.get("kind"), str) else ""
+        if self.oldest is None or ts < self.oldest:
+            self.oldest = ts
+        if restored and ts < self.covered_from:
+            self.covered_from = ts
+        index = int(ts // FINE)
+        coarse = self.coarse_slot(now, int(ts // COARSE))
+        category, level = event.get("category"), event.get("level")
+        if isinstance(category, str):
+            _count(coarse.categories, category)
+        if isinstance(level, str):
+            _count(coarse.levels, level)
+        key = event.get("turn_id") or event.get("request_id") or ("event", event.get("seq"))
+        if level == "error":
+            self.fine_slot(index).errors += 1
+        if kind == "http.request":
+            fine = self.fine_slot(index)
+            fine.requests += 1
+            _count(coarse.statuses, str(data.get("status")))
+            duration = _number(data.get("duration_ms"))
+            if duration is not None and data.get("route") in _ROUTES:
+                fine.latency_sum += duration
+                fine.latency_n += 1
+                if len(coarse.latency) < MAX_SAMPLES:
+                    coarse.latency.append(duration)
+        elif kind == "turn.begin":
+            self.fine_slot(index).turns += 1
+            _count(coarse.models, str(data.get("model")))
+            self.turn(key, ts, restored)
+        elif kind == "turn.end":
+            turn = self.turns.pop(key, None)
+            attempt = turn.end(data.get("reason")) if turn is not None else None
+            if attempt is not None:
+                self._shift_unknown(now, attempt.where, 1)
+        elif kind == "upstream.first_token":
+            ttft = _number(data.get("ttft_ms"))
+            if ttft is not None:
+                fine = self.fine_slot(index)
+                fine.ttft_sum += ttft
+                fine.ttft_n += 1
+                if len(coarse.ttft) < MAX_SAMPLES:
+                    coarse.ttft.append(ttft)
+        elif kind == "upstream.usage_start":
+            self.turn(key, ts, restored).start(_attempt_number(data), index)
+        elif kind == "upstream.usage":
+            fine = self.fine_slot(index)
+            price = _price(data.get("credits"))
+            attempt, change = self.turn(key, ts, restored).usage(_attempt_number(data), price, index)
+            if price is not None:
+                fine.credits += price
+            if change:
+                self._shift_unknown(now, attempt.where, change)
+            fine.cache_read += _whole(data.get("cache_read"))
+            fine.cache_write += _whole(data.get("cache_write"))
+            fine.input += _whole(data.get("input_tokens"))
+            fine.output += _whole(data.get("output_tokens"))
+        elif kind == "cache.keepwarm_usage":
+            # One event per paid refresh ping; the sibling cache.keepwarm event repeats its price.
+            fine = self.fine_slot(index)
+            price = _price(data.get("actual_credits"))
+            fine.keepwarm_pings += 1
+            if price is None:
+                fine.keepwarm_unknown += 1
+                fine.unknown += 1
+            else:
+                fine.keepwarm += price
+                fine.credits += price
+        elif kind == "tool.call":
+            self.fine_slot(index).tools += 1
+        elif kind == "exec.result":
+            self.fine_slot(index).commands += 1
+
+
 class Journal:
-    def __init__(self, capacity=CAPACITY):
+    def __init__(self, capacity=CAPACITY, clock=None):
         self._cond = threading.Condition()
         self._events = collections.deque(maxlen=capacity)
         self._seq = 0
@@ -39,7 +349,20 @@ class Journal:
         self._file = None
         self._file_lock = threading.Lock()
         self._rotate_retry_at = 0.0
-        self.started = time.time()
+        self._clock = clock
+        self.started = self._now()
+        self._rollup = _Rollup(self.started)
+
+    def _now(self):
+        return self._clock() if self._clock else time.time()
+
+    def _ingest(self, event, now, restored=False):
+        """Fold an event into the metrics rollup; the caller holds ``self._cond``."""
+        try:
+            self._rollup.ingest(event, now, restored)
+        except Exception:  # noqa: BLE001 - metrics must never lose or block the event itself
+            # Counting stopped for this event: say so through coverage instead of under-counting silently.
+            self._rollup.gap(event.get("ts"))
 
     # -- configuration -----------------------------------------------------
     def configure(self, cfg=None, path=None, load=True):
@@ -80,17 +403,23 @@ class Journal:
             # Concurrent writers may append to the file out of seq order; sort so
             # the since/before scan in query() never truncates after a restart.
             restored.sort(key=lambda item: item["seq"])
+            now = self._now()
             for event in restored:
                 if event["seq"] <= self._seq:
                     continue  # already known (re-configure), never duplicate
                 self._events.append(event)
+                # The rollup takes every restored event, not just the few the ring buffer keeps.
+                self._ingest(event, now, restored=True)
             if restored:
                 self._seq = max(self._seq, max(event["seq"] for event in restored))
+            self._rollup.settle_restored()
 
     def reset(self):
         with self._cond:
             self._events.clear()
             self._seq = 0
+            # A cleared journal has no history: coverage starts over from this moment.
+            self._rollup = _Rollup(self._now())
             self._cond.notify_all()
         with self._file_lock:
             if self._file is not None:
@@ -153,7 +482,7 @@ class Journal:
             if caption:
                 message = "[%s] %s" % (caption, message or kind)
             secrets = self._secrets()
-            event = {"ts": round(time.time(), 3), "kind": kind, "category": kind.split(".", 1)[0],
+            event = {"ts": round(self._now(), 3), "kind": kind, "category": kind.split(".", 1)[0],
                      "level": level, "message": self._clean(message or kind, secrets)}
             for key in _TOP_LEVEL:
                 if fields.get(key):
@@ -165,6 +494,7 @@ class Journal:
                 self._seq += 1
                 event["seq"] = self._seq
                 self._events.append(event)
+                self._ingest(event, event["ts"])
                 self._cond.notify_all()
             self._write(event)
             return event
@@ -259,8 +589,15 @@ class Journal:
             return self._seq > since
 
     def turns(self, limit=60):
-        """Group turn-scoped events into compact traces, newest first."""
+        """Group turn-scoped events into compact traces, newest first.
+
+        ``credits`` is the sum of the valid prices the turn's attempts reported, or ``None`` while
+        no price is known for a turn that may have cost something. ``credits_complete`` is true
+        only for an ended turn whose every paid attempt reported a valid price;
+        ``credits_unknown`` counts the attempts that produced usage without one.
+        """
         traces = collections.OrderedDict()
+        costs = {}
         snapshot = self._snapshot()
         # http.request events carry the client user-agent; attach it to the turn
         # trace so per-client cache economics (opencode vs claude-cli) are queryable.
@@ -280,10 +617,12 @@ class Journal:
                 trace = traces[turn_id] = {"turn_id": turn_id, "started": event["ts"], "ended": None,
                                            "status": "running", "model": None, "effort": None,
                                            "transport": None, "dialect": None, "client": clients.get(str(event.get("request_id"))),
-                                           "credits": 0.0, "ttft_ms": None, "duration_ms": None,
+                                           "credits": None, "credits_complete": False, "credits_unknown": 0,
+                                           "ttft_ms": None, "duration_ms": None,
                                            "tools": 0, "commands": 0,
                                            "errors": 0, "cache_read": 0, "cache_write": 0,
                                            "events": 0, "request_id": event.get("request_id")}
+                costs[turn_id] = _Turn()
             data = event.get("data") or {}
             trace["events"] += 1
             kind = event["kind"]
@@ -294,125 +633,140 @@ class Journal:
                 trace["ended"] = event["ts"]
                 trace["duration_ms"] = data.get("duration_ms")
                 trace["status"] = "error" if data.get("reason") == "error" else (data.get("reason") or "stop")
+                costs[turn_id].end(data.get("reason"))
             elif kind == "upstream.first_token":
                 trace["ttft_ms"] = data.get("ttft_ms")
+            elif kind == "upstream.usage_start":
+                costs[turn_id].start(_attempt_number(data), None)
             elif kind == "upstream.usage":
-                trace["credits"] = round(trace["credits"] + float(data.get("credits") or 0), 5)
-                trace["cache_read"] += int(data.get("cache_read") or 0)
-                trace["cache_write"] += int(data.get("cache_write") or 0)
+                costs[turn_id].usage(_attempt_number(data), _price(data.get("credits")), None)
+                trace["cache_read"] += _whole(data.get("cache_read"))
+                trace["cache_write"] += _whole(data.get("cache_write"))
             elif kind == "tool.call":
                 trace["tools"] += 1
             elif kind == "exec.result":
                 trace["commands"] += 1
             if event["level"] == "error":
                 trace["errors"] += 1
+        for turn_id, trace in traces.items():
+            total, priced, unknown = costs[turn_id].summary()
+            ended = costs[turn_id].ended
+            trace["credits_unknown"] = unknown
+            trace["credits_complete"] = ended and not unknown
+            if priced:
+                trace["credits"] = round(total, 5)
+            elif ended and not unknown:
+                trace["credits"] = 0.0
         return list(reversed(traces.values()))[:limit]
 
     def metrics(self, window=3600, bucket=60):
-        now = time.time()
-        start = now - window
-        count = int(window // bucket)
-        buckets = [{"t": int(start + index * bucket), "requests": 0, "errors": 0, "latency": [],
-                    "ttft": [], "credits": 0.0, "cache_read": 0, "cache_write": 0, "input": 0,
-                    "output": 0, "turns": 0, "tools": 0, "commands": 0, "credits_unknown": 0} for index in range(count)]
-        totals = collections.Counter()
-        statuses = collections.Counter()
-        models = collections.Counter()
-        categories = collections.Counter()
-        levels = collections.Counter()
-        latency_all, ttft_all = [], []
-        costs = {}
-        current_attempt = {}
-        for event in self._snapshot():
-            if event["ts"] < start:
-                continue
-            categories[event["category"]] += 1
-            levels[event["level"]] += 1
-            slot = buckets[min(count - 1, int((event["ts"] - start) // bucket))]
-            data = event.get("data") or {}
-            kind = event["kind"]
-            turn = event.get('turn_id') or event.get('request_id') or ('event', event['seq'])
-            if kind == 'turn.begin':
-                costs.setdefault((turn, 0), {'known': False, 'slot': slot})
-            elif kind == 'upstream.usage_start':
-                costs.pop((turn, 0), None)
-                current_attempt[turn] = data.get('attempt', 0)
-                costs.setdefault((turn, current_attempt[turn]), {'known': False, 'slot': slot})
-            if event["level"] == "error":
-                slot["errors"] += 1
-                totals["errors"] += 1
-            if kind == "http.request":
-                slot["requests"] += 1
-                totals["requests"] += 1
-                statuses[str(data.get("status"))] += 1
-                if isinstance(data.get("duration_ms"), (int, float)) and data.get("route") in (
-                        "chat", "responses", "anthropic"):
-                    slot["latency"].append(data["duration_ms"])
-                    latency_all.append(data["duration_ms"])
-            elif kind == "turn.begin":
-                slot["turns"] += 1
-                totals["turns"] += 1
-                models[str(data.get("model"))] += 1
-            elif kind == "upstream.first_token" and isinstance(data.get("ttft_ms"), (int, float)):
-                slot["ttft"].append(data["ttft_ms"])
-                ttft_all.append(data["ttft_ms"])
-            elif kind == "upstream.usage":
-                value = data.get('credits')
-                known_cost = type(value) in (int, float) and math.isfinite(value) and value >= 0
-                attempt = data.get('attempt', current_attempt.get(turn, 0))
-                if attempt != 0:
-                    costs.pop((turn, 0), None)
-                cost = costs.setdefault((turn, attempt), {'known': False, 'slot': slot})
-                cost['known'] |= known_cost or data.get('credits_reported') is True
-                slot["credits"] += value if known_cost else 0
-                slot["cache_read"] += int(data.get("cache_read") or 0)
-                slot["cache_write"] += int(data.get("cache_write") or 0)
-                slot["input"] += int(data.get("input_tokens") or 0)
-                slot["output"] += int(data.get("output_tokens") or 0)
-                totals["output_tokens"] += int(data.get("output_tokens") or 0)
-                totals["credits"] += value if known_cost else 0
-                totals["cache_read"] += int(data.get("cache_read") or 0)
-                totals["cache_write"] += int(data.get("cache_write") or 0)
-                totals["input_tokens"] += int(data.get("input_tokens") or 0)
-            elif kind == "tool.call":
-                slot["tools"] += 1
-                totals["tools"] += 1
-            elif kind == "exec.result":
-                slot["commands"] += 1
-                totals["commands"] += 1
-        for cost in costs.values():
-            if not cost['known']:
-                cost['slot']['credits_unknown'] += 1
-                totals['credits_unknown'] += 1
-        for slot in buckets:
-            slot["latency"] = round(sum(slot["latency"]) / len(slot["latency"])) if slot["latency"] else None
-            slot["ttft"] = round(sum(slot["ttft"]) / len(slot["ttft"])) if slot["ttft"] else None
-            slot["credits"] = round(slot["credits"], 4)
-            slot['credits_complete'] = slot['credits_unknown'] == 0
+        """Counters per ``bucket`` seconds over the last ``window`` seconds, read from the rollup.
 
-        def percentile(values, share):
-            if not values:
-                return None
-            ordered = sorted(values)
-            return round(ordered[min(len(ordered) - 1, int(share * len(ordered)))])
+        The window starts on a whole minute at or before ``now - window``. Credits are the
+        valid prices of upstream attempts plus the cache refresh pings; an attempt that produced
+        usage without a valid price counts as ``credits_unknown`` (``credits_complete`` is then
+        false) and one that is still running is only listed in ``credits_in_progress``.
+        ``coverage`` reports how much of the window the aggregates can vouch for.
+        """
+        now = self._now()
+        bucket = max(1, bucket)
+        count = max(1, int(window // bucket))
+        start = math.floor((now - window) / COARSE) * COARSE
+        begin = max(start, math.floor((now - RETENTION) / COARSE) * COARSE)
+        rows = [{"t": int(start + index * bucket), "requests": 0, "errors": 0, "latency": None, "ttft": None,
+                 "credits": 0.0, "keepwarm_credits": 0.0, "cache_read": 0, "cache_write": 0, "input": 0,
+                 "output": 0, "turns": 0, "tools": 0, "commands": 0, "credits_unknown": 0}
+                for index in range(count)]
+        latency = [[0.0, 0] for _ in range(count)]
+        ttft = [[0.0, 0] for _ in range(count)]
+        pings = pings_unknown = 0
+        statuses, models, categories, levels = {}, {}, {}, {}
+        with self._cond:
+            rollup = self._rollup
+            for index, slot in rollup.fine.items():
+                moment = index * FINE
+                if moment < begin:
+                    continue
+                at = min(count - 1, int((moment - start) // bucket))
+                row = rows[at]
+                row["requests"] += slot.requests
+                row["errors"] += slot.errors
+                row["cache_read"] += slot.cache_read
+                row["cache_write"] += slot.cache_write
+                row["input"] += slot.input
+                row["output"] += slot.output
+                row["turns"] += slot.turns
+                row["tools"] += slot.tools
+                row["commands"] += slot.commands
+                row["credits"] += slot.credits
+                row["keepwarm_credits"] += slot.keepwarm
+                row["credits_unknown"] += slot.unknown
+                pings += slot.keepwarm_pings
+                pings_unknown += slot.keepwarm_unknown
+                pair = latency[at]
+                pair[0] += slot.latency_sum
+                pair[1] += slot.latency_n
+                pair = ttft[at]
+                pair[0] += slot.ttft_sum
+                pair[1] += slot.ttft_n
+            inside = [slot for index, slot in rollup.coarse.items() if index * COARSE >= begin]
+            for slot in inside:
+                for source, target in ((slot.statuses, statuses), (slot.models, models),
+                                       (slot.categories, categories), (slot.levels, levels)):
+                    for key, number in source.items():
+                        target[key] = target.get(key, 0) + number
+            latency_all, ttft_all = _thinned(inside, "latency"), _thinned(inside, "ttft")
+            in_progress = sum(1 for turn in rollup.turns.values()
+                              if turn.pending and turn.touched >= now - LIVE_TURN_TTL)
+            covered_from = max(rollup.covered_from, now - RETENTION)
+            oldest = rollup.oldest
+            buffered = len(self._events)
+            buffer_oldest = self._events[0].get("ts") if buffered else None
+            last_seq = self._seq
+        # Totals come from the unrounded rows: summing per-bucket roundings drifts by up to 5e-5 per bucket.
+        credits_sum = sum(row["credits"] for row in rows)
+        keepwarm_sum = sum(row["keepwarm_credits"] for row in rows)
+        for row, (latency_sum, latency_n), (ttft_sum, ttft_n) in zip(rows, latency, ttft):
+            row["latency"] = round(latency_sum / latency_n) if latency_n else None
+            row["ttft"] = round(ttft_sum / ttft_n) if ttft_n else None
+            row["credits"] = round(row["credits"], 4)
+            row["keepwarm_credits"] = round(row["keepwarm_credits"], 4)
+            row["credits_unknown"] = max(0, row["credits_unknown"])
+            row["credits_complete"] = row["credits_unknown"] == 0
 
-        cached = totals["cache_read"]
-        prompt = cached + totals["input_tokens"] + totals["cache_write"]
+        def total(field):
+            return sum(row[field] for row in rows)
+
+        def percentile(ordered, share):
+            return round(ordered[min(len(ordered) - 1, int(share * len(ordered)))]) if ordered else None
+
+        latency_all.sort()
+        ttft_all.sort()
+        cached = total("cache_read")
+        prompt = cached + total("input") + total("cache_write")
+        unknown = total("credits_unknown")
         return {
-            "window_seconds": window, "bucket_seconds": bucket, "buckets": buckets,
-            "totals": {"requests": totals["requests"], "errors": totals["errors"], "turns": totals["turns"],
-                       "tools": totals["tools"], "commands": totals["commands"],
-                       "credits": round(totals["credits"], 4), "cache_read": cached,
-                       "credits_complete": totals['credits_unknown'] == 0,
-                       "credits_unknown": totals['credits_unknown'],
-                       "cache_write": totals["cache_write"], "input_tokens": totals["input_tokens"],
-                       "output_tokens": totals["output_tokens"],
+            "window_seconds": window, "bucket_seconds": bucket, "buckets": rows,
+            "totals": {"requests": total("requests"), "errors": total("errors"), "turns": total("turns"),
+                       "tools": total("tools"), "commands": total("commands"),
+                       "credits": round(credits_sum, 4), "cache_read": cached,
+                       "keepwarm_credits": round(keepwarm_sum, 4),
+                       "keepwarm_pings": pings, "keepwarm_unknown": pings_unknown,
+                       "credits_complete": unknown == 0, "credits_unknown": unknown,
+                       "credits_in_progress": in_progress,
+                       "cache_write": total("cache_write"), "input_tokens": total("input"),
+                       "output_tokens": total("output"),
                        "cache_hit_ratio": round(cached / prompt, 4) if prompt else None,
                        "latency_p50": percentile(latency_all, 0.5), "latency_p95": percentile(latency_all, 0.95),
                        "ttft_p50": percentile(ttft_all, 0.5), "ttft_p95": percentile(ttft_all, 0.95)},
-            "statuses": dict(statuses), "models": dict(models.most_common(12)),
-            "categories": dict(categories), "levels": dict(levels),
-            "last_seq": self.last_seq, "buffered": len(self._events), "since": self.started,
+            "statuses": statuses, "models": dict(sorted(models.items(), key=lambda item: -item[1])[:12]),
+            "categories": categories, "levels": levels,
+            "coverage": {"complete": covered_from <= now - window, "window_start": int(start),
+                         "covered_from": round(covered_from, 3),
+                         "covered_seconds": round(max(0.0, min(window, now - covered_from)), 3),
+                         "oldest_event_ts": oldest, "buffer_oldest_ts": buffer_oldest,
+                         "buffer_events": buffered, "buffer_capacity": self._events.maxlen},
+            "last_seq": last_seq, "buffered": buffered, "since": self.started,
         }
 
 
