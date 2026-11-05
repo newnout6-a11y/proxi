@@ -329,7 +329,7 @@ export async function mockPrompts(page, options = {}) {
   const { legacy = false, errors = [], builtin = BUILTIN, previewDelay = 0, document: seed, recent, listWarnings = true } = options;
   const state = {
     doc: legacy ? null : (seed || initialDocument()), rev: legacy ? null : 3, path: 'C:\\relay\\prompts.json', errors, saves: [], previews: [],
-    pinActions: [], requests: [], saveFails: null, delays: [], previewDelay,
+    pinActions: [], requests: [], saveFails: null, previewDelay,
     recent: recent || recentRequests(),
     pins: [
       { conversation: 'c-7f2a', purpose: 'client-tools', rev: 2, profile: 'mine-first', age_s: 5400 },

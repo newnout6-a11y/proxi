@@ -1307,8 +1307,7 @@ test('the name rule, the size limits, the special targets and the relay-only var
 });
 
 test('a relay that names no limits, special targets or name rule leaves the documented ones', async ({ page }) => {
-  const { limits, special_uses, profile_name, relay_task_variables, structured_example, ...older } = BUILTIN;
-  void limits; void special_uses; void profile_name; void relay_task_variables; void structured_example;
+  const older = Object.fromEntries(Object.entries(BUILTIN).filter(([key]) => !['limits', 'special_uses', 'profile_name', 'relay_task_variables', 'structured_example'].includes(key)));
   await openPrompts(page, { builtin: older });
   await head(page).fill('ж'.repeat(10));
   await expect(page.getByText('10 симв. · 20 из 262 144 байт')).toBeVisible();

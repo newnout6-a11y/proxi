@@ -199,7 +199,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
   // The relay lists its warnings with the document in force; the answer of the last save stands in when it does not
   const docWarnings = server?.hasWarnings ? server.warnings : savedWarnings;
   const profileNames = [...(builtin?.profiles?.length ? builtin.profiles : ['passthrough']), ...Object.keys(profilesOf(draft))];
-  const counts = { profiles: Object.keys(profilesOf(draft)).length, rules: rulesOf(draft).length, texts: Object.keys(draft?.texts || {}).length, seen: recent.length };
+  const counts = { profiles: Object.keys(profilesOf(draft)).length, rules: rulesOf(draft).length, texts: Object.keys(draft?.texts || {}).length };
   const live = { sampleState, setSampleState, resolved, recent, detected: sampleState.mode === 'paste' && !sampleState.dialect ? resolved.sample?.dialect : '', refreshRecent: loadSamples };
   const legacyMode = !!server && !draft;
 
