@@ -72,6 +72,7 @@ DEFAULTS = {
     "upstream_error_max_dumps": 50,        # newest private request-body dump sets kept; 0 = unlimited
     "upstream_attempt_summaries_max": 200,  # newest per-attempt *-response.json kept; 0 = unlimited
     "client_trace_dir": "",    # explicit private client request/response traces; disabled by default
+    "trace_max_folders": 200,  # newest trace folders kept in each trace directory; 0 = unlimited
     # Provider caches expire in minutes; re-read the prefix to hold it open.
     "cache_keepwarm_seconds": 240,
     # Idle warming stops this long after a conversation's last real request. A ping reads
@@ -397,7 +398,8 @@ def _load(path):
                     "cache_keepwarm_subagent_idle",
                     "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
                     "account_rate_limit_cooldown",
-                    "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
+                    "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
+                    "trace_max_folders"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -418,7 +420,8 @@ def _load(path):
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
-                "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
+                "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
+                "trace_max_folders"):
         if cfg[key] < 0:
             raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
     if cfg["cache_keepwarm_subagent_idle"] < 0:

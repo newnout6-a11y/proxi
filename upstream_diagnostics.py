@@ -3,8 +3,10 @@ from collections import Counter
 import hashlib
 import json
 import math
+import os
 import pathlib
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -20,6 +22,22 @@ _HEADERS = ("request-id", "x-request-id", "cf-ray", "content-type", "x-retool-ap
 _SIGNALS = ("stop_reason", "stopReason", "finish_reason", "finishReason", "statusCode", "code")
 # Request-body dump sets are pruned only when their name is exactly what _dump_rejected_body writes.
 _DUMP_SET = re.compile(r"^\d{8}-\d{6}-[^\W_]*-[0-9a-f]{12}-body\.json$")
+# Wire-trace folders are named by a sortable start stamp; anything else in the root is left alone.
+_TRACE_FOLDER = re.compile(r"^\d{8}-\d{6}-")
+
+
+def prune_traces(root, keep, limit):
+    """Keep the newest `limit` trace folders under root (0 = unlimited); never the one just made."""
+    if limit <= 0:
+        return
+    try:
+        folders = sorted(entry.name for entry in os.scandir(root)
+                         if entry.is_dir(follow_symlinks=False) and _TRACE_FOLDER.match(entry.name))
+        for name in folders[:max(0, len(folders) - limit)]:
+            if name != keep:
+                shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+    except OSError:
+        pass  # housekeeping must never break a request
 
 
 def _limit(cfg, key, default):
@@ -94,6 +112,9 @@ class WireTrace:
         except (OSError, UnicodeError, TypeError, ValueError):
             self.failed = True
             self.close()
+            return
+        # Every request adds megabytes; an unbounded trace directory fills the disk.
+        prune_traces(root, trace_id, _limit(cfg, "trace_max_folders", 200))
 
     @staticmethod
     def safe_headers(headers):
