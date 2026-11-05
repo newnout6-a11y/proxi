@@ -484,3 +484,61 @@ def test_a_legacy_rule_names_itself(tmp_path):
     store = make_store(tmp_path, document(rules=[{"name": "hands off", "use": "$legacy"}]))
     result = store.preview(chat(system="CLIENT"), "chat", {})
     assert result["profile"] is None and result["rule"] == "hands off" and "hands off" in " ".join(result["warnings"])
+
+
+# -- Codex: the system is the leading developer messages --------------------------------------------------------------------
+
+CODEX_BASE = "You are Codex, a coding agent based on GPT-5."
+CODEX_PERMISSIONS = "<permissions instructions>\nFilesystem sandboxing: workspace-write.\n</permissions instructions>"
+CODEX_SKILLS = "<skills_instructions>\n## Skills\n- review\n</skills_instructions>"
+
+
+def codex_body(*developer):
+    """A Responses request as codex-rs 0.164 sends it: no `instructions`, the leading developer messages are the prompt."""
+    messages = [{"type": "message", "role": "developer", "content": [{"type": "input_text", "text": text}]}
+                for text in (developer or (CODEX_BASE, CODEX_PERMISSIONS, CODEX_SKILLS))]
+    messages += [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "<environment_context>\n  <cwd>C:\\work</cwd>\n</environment_context>"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the bug"}]}]
+    return {"model": "gpt-5.5", "stream": True, "input": messages,
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}]}
+
+
+def test_the_client_system_of_codex_is_the_join_of_its_leading_developer_messages(tmp_path):
+    store = make_store(tmp_path, document(
+        texts={"rules": "My rules."},
+        profiles={"mine": {"head": "{{text:rules}}\n\n{{client_system}}", "client_system": {"edits": [
+            {"op": "remove_tag", "tag": "skills_instructions"}]}}},
+        rules=[{"name": "codex", "if": {"client": "codex"}, "use": "mine"}]))
+    assert "instructions" not in codex_body()
+    result = store.preview(codex_body(), "responses", CODEX)
+    assert (result["client"], result["profile"], result["purpose"]) == ("codex", "mine", "client-tools")
+    assert result["head"] == "My rules.\n\n" + CODEX_BASE + "\n\n" + CODEX_PERMISSIONS
+    assert [part["source"] for part in result["parts"]] == ["text:rules", "literal", "client_edited"]
+    assert result["edits_unmatched"] == [] and not any("not part of the head" in line for line in result["warnings"])
+    raw = make_store(tmp_path / "raw", document(profiles={"p": {}}, default_profile="p"))
+    assert raw.preview(codex_body(), "responses", CODEX)["head"] == "\n\n".join(
+        [CODEX_BASE, CODEX_PERMISSIONS, CODEX_SKILLS])
+
+
+def test_a_codex_request_without_developer_messages_has_no_client_system(tmp_path):
+    store = make_store(tmp_path, document(
+        profiles={"p": {"head": "[{{client_system}}]"}},
+        rules=[{"name": "bare", "if": {"client": "codex", "has_client_system": False}, "use": "p"}]))
+    body = codex_body()
+    body["input"] = body["input"][3:]
+    assert store.preview(body, "responses", CODEX)["head"] == "[]"
+    assert store.preview(codex_body(), "responses", CODEX)["profile"] is None
+
+
+def test_edits_of_the_client_system_work_across_the_developer_messages_of_codex(tmp_path):
+    store = make_store(tmp_path, document(
+        profiles={"p": {"head": "{{client_system}}", "client_system": {"edits": [
+            {"op": "remove_section", "heading": "## Skills"}, {"op": "replace_text", "find": "workspace-write",
+                                                                "with": "read-only"}]}}},
+        default_profile="p"))
+    result = store.preview(codex_body(CODEX_BASE, CODEX_PERMISSIONS, "<skills_instructions>\n## Skills\n- review\n</skills_instructions>"),
+                           "responses", CODEX)
+    assert "read-only" in result["head"] and "workspace-write" not in result["head"]
+    assert result["head"].startswith(CODEX_BASE + "\n\n<permissions instructions>")
+    assert [e["matched"] for e in result["edits"]] == [True, True]

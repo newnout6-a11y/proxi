@@ -649,6 +649,88 @@ def test_the_params_of_every_edit_op_are_described_for_the_admin(tmp_path):
                       "tools": {"tools": {"edits": [edit]}}}[section]
             compile_doc(document(profiles={"p": holder}), tmp_path)
 
+
+PLAN_EXAMPLE = {
+    "version": 1,
+    "default_profile": None,
+    "protected": {"enabled": True},
+    "texts": {"my_rules": "Отвечай по-русски. Не трогай файлы без явной просьбы.",
+              "opus_role": {"file": "prompts/opus.md"}},
+    "relay_texts": {"role": None, "native_role": None, "structured": None, "reminder": None, "codex_base": None},
+    "profiles": {
+        "passthrough": {"head": "{{client_system}}"},
+        "mine-first": {
+            "description": "мои правила поверх OpenCode, в начале",
+            "head": "{{text:my_rules}}\n\n{{client_system}}",
+            "client_system": {"edits": [{"op": "remove_section", "heading": "# Code comments"},
+                                        {"op": "remove_tag", "tag": "available_skills"}]},
+            "history": {"mid_system": "keep", "user_blocks": [
+                {"op": "drop_tag", "tag": "system-reminder", "contains": "Plan mode"}]},
+            "tools": {"edits": [{"tool": "bash", "op": "append",
+                                 "text": "Не запускай команды, меняющие систему, без подтверждения."}]},
+            "generation": {"effort": None, "verbosity": None},
+            "publish_as_model": False},
+        "exact-opus": {"head": "{{text:opus_role}}"}},
+    "rules": [
+        {"name": "opus свой", "if": {"model": "claude-opus-*", "client": "opencode", "tools": True}, "use": "exact-opus"},
+        {"name": "по заголовку", "if": {"header_profile": "*"}, "use": "$header"},
+        {"name": "opencode", "if": {"client": "opencode"}, "use": "mine-first"}]}
+
+
+def test_the_example_document_of_the_plan_is_valid(tmp_path):
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "opus.md").write_text("Ты — Opus.\n", encoding="utf-8")
+    snapshot = compile_doc(PLAN_EXAMPLE, tmp_path)
+    assert snapshot.profile_names() == ["passthrough", "mine-first", "exact-opus"]
+    assert snapshot.warnings == []
+    assert snapshot.profile("passthrough")["description"] == "the client's system prompt, unchanged"
+    assert snapshot.profile("exact-opus")["head"] == "{{text:opus_role}}"
+    assert snapshot.document["profiles"]["passthrough"] == {"head": "{{client_system}}"}
+    mine = snapshot.profile("mine-first")
+    assert mine["generation"] == {} and mine["publish_as_model"] is False
+    assert mine["tools"]["edits"][0]["text"] == "Не запускай команды, меняющие систему, без подтверждения."
+
+
+def test_a_missing_file_is_the_only_thing_wrong_with_the_example(tmp_path):
+    error = rejected(PLAN_EXAMPLE, tmp_path)
+    assert error.path == "texts.opus_role.file" and "file not found" in error.message
+
+
+@pytest.mark.parametrize("entry", [{"head": "{{client_system}}"}, {"description": "mine"}, {},
+                                   {"description": "x", "head": "{{client_system}}"}])
+def test_an_entry_that_only_repeats_the_builtin_profile_is_accepted_once(tmp_path, entry):
+    snapshot = compile_doc(document(profiles={"passthrough": entry, "p": {}}), tmp_path)
+    assert snapshot.profile_names() == ["passthrough", "p"]
+    assert snapshot.profile("passthrough")["head"] == "{{client_system}}"
+
+
+@pytest.mark.parametrize("entry", [
+    {"head": "x"}, {"head": "{{client_system}} more"}, {"head": {"file": "a.md"}}, {"client_system": {"edits": []}},
+    {"history": {"mid_system": "keep"}}, {"generation": {}}, {"publish_as_model": True}, {"description": 5}, [], "x", None])
+def test_a_different_entry_for_the_builtin_profile_is_an_override_and_refused(tmp_path, entry):
+    error = rejected(document(profiles={"passthrough": entry}), tmp_path)
+    assert error.path == "profiles.passthrough" and "cannot be redefined" in error.message
+
+
+def test_an_unknown_variable_in_a_head_names_the_profile(tmp_path):
+    error = rejected(document(profiles={"mine": {"head": "{{no_such_variable}}"}}), tmp_path)
+    assert error.path == "profiles.mine.head" and error.path.startswith("profiles.mine")
+
+
+def test_compile_warnings_say_what_is_wrong_and_never_quote_a_text(tmp_path):
+    secret = "SECRET-TEXT-0451"
+    doc = document(
+        protected={"enabled": False}, texts={"s": secret},
+        relay_texts={"structured": "Reply " + secret + " with JSON"},
+        profiles={"p": {"head": "{{text:s}}", "tools": {"edits": [{"tool": "x", "hide": True}]},
+                        "client_system": {"edits": [{"op": "append", "text": secret}]}}},
+        rules=[{"name": "loud", "use": "p", "override_protected": True}])
+    warnings = compile_doc(doc, tmp_path).warnings
+    assert len(warnings) == 4 and all(isinstance(line, str) for line in warnings)
+    assert secret not in " ".join(warnings)
+    assert len(set(warnings)) == len(warnings)
+
+
 # -- nothing but a PromptConfigError may escape -------------------------------------------------------------------------
 
 RICH = {

@@ -298,3 +298,22 @@ def test_a_plan_never_touches_the_journal(tmp_path):
     for index in range(20):
         store.plan(key("c%d" % (index % 3)))
     assert journal.JOURNAL.last_seq == after_load >= before
+
+
+def test_unpin_takes_the_tag_that_pins_shows(tmp_path):
+    store = make_store(tmp_path, doc())
+    store.plan(key("claude-metadata:session-1"))
+    store.plan(key("claude-metadata:session-1", purpose="client-text"))
+    store.plan(key("header:other"))
+    revise(store, head="V2")
+    shown = store.pins()
+    assert len(shown) == 3 and all(len(item["conversation"]) == 8 for item in shown)
+    tag = next(item["conversation"] for item in shown if item["purpose"] == "client-text")
+    assert store.unpin(tag) == 2                                   # both purposes of that conversation
+    remaining = store.pins()
+    assert [item["conversation"] for item in remaining] == [journal.tag("header:other")]
+    assert store.plan(key("claude-metadata:session-1")).rev == 2
+    assert store.plan(key("header:other")).rev == 1 and store.plan(key("header:other")).pinned
+    assert store.unpin(remaining[0]["conversation"]) == 1
+    assert store.plan(key("header:other")).rev == 2
+    assert store.unpin(tag) == 1                                    # the new pin of the first conversation, by its tag

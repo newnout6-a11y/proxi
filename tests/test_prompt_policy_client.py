@@ -231,3 +231,27 @@ def test_the_input_is_immutable():
     with pytest.raises(Exception):
         request.client = "x"
     assert json.dumps(request.__dict__)
+
+
+def test_a_codex_responses_request_without_instructions_is_still_a_request_with_a_client_system():
+    developer = [{"type": "message", "role": "developer", "content": [{"type": "input_text", "text": text}]}
+                 for text in ("You are Codex.", "<permissions instructions>\nread-only\n</permissions instructions>",
+                              "<skills_instructions>\n## Skills\n</skills_instructions>")]
+    body = {"model": "gpt-5.5", "stream": True, "tools": [{"type": "function", "name": "shell",
+                                                           "parameters": {"type": "object"}}],
+            "input": developer + [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "fix the bug"}]}]}
+    headers = {"originator": "codex_cli_rs", "user-agent": CODEX_UA, "x-codex-window-id": "w1",
+               "session-id": "9f1c"}
+    parsed = validate.parse_responses(body, CFG)
+    assert parsed.system == "\n\n".join(item["content"][0]["text"] for item in developer)
+    identity = client_context.describe(body, headers, {"client_metadata_home": "Z:\\nowhere"})
+    parsed.dialect = "responses"
+    parsed.request_purpose = client_context.request_kind(parsed, identity)
+    request = pp.PlanInput.from_request(parsed, identity, headers)
+    assert (request.client, request.purpose, request.dialect) == ("codex", "client-tools", "responses")
+    assert request.has_client_system and request.tools and not request.structured
+    assert identity.get("client", "") == ""                      # client_context still does not name Codex
+    body["input"] = body["input"][3:]
+    bare = validate.parse_responses(body, CFG)
+    assert pp.PlanInput.from_request(bare, identity, headers, "responses").has_client_system is False

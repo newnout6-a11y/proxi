@@ -710,3 +710,91 @@ def test_a_file_that_is_busy_for_a_moment_is_replaced_on_a_retry(tmp_path, monke
     assert store.save(doc("V2"), 1).rev == 2 and len(attempts) == 3
     assert json.loads((tmp_path / "prompts.json").read_text(encoding="utf-8"))["profiles"]["a"]["head"] == "V2"
     assert [name for name in os.listdir(tmp_path) if name.endswith(".tmp")] == []
+
+
+# -- a save is the store's own write, not an outside edit ------------------------------------------------------------------
+
+
+def text_document():
+    return document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}"}},
+                    rules=[{"name": "all", "use": "a"}])
+
+
+def test_after_a_save_the_next_reload_finds_nothing_new(tmp_path):
+    clock = Clock()
+    (tmp_path / "t.md").write_text("one", encoding="utf-8")
+    store = make_store(tmp_path, clock=clock)
+    saved = store.save(text_document(), None)
+    since = mark()
+    for _ in range(3):
+        tick(store, clock)
+    assert store.snapshot() is saved and saved.rev == 1
+    assert events(since) == []
+    assert not any(event["kind"] == "prompt.config_error" for event in events(since))
+    # what is written next from outside is still noticed: the remembered state is the saved one, not a blind spot
+    (tmp_path / "t.md").write_text("two!", encoding="utf-8")
+    tick(store, clock)
+    assert store.snapshot().rev == 2 and store.snapshot()._data.texts["t"] == "two!"
+
+
+def test_a_save_over_an_existing_revision_is_not_loaded_again_either(tmp_path):
+    clock = Clock()
+    (tmp_path / "t.md").write_text("one", encoding="utf-8")
+    store = make_store(tmp_path, text_document(), clock=clock)
+    saved = store.save(document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}!"}}), 1)
+    since = mark()
+    tick(store, clock)
+    tick(store, clock, 30)
+    assert store.snapshot() is saved and saved.rev == 2 and events(since) == []
+
+
+def test_a_file_system_that_stamps_the_renamed_file_differently_changes_nothing(tmp_path, monkeypatch):
+    clock = Clock()
+    store = make_store(tmp_path, doc(), clock=clock)
+    real = os.replace
+
+    def replace_and_restamp(source, target):
+        real(source, target)
+        info = os.stat(target)
+        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 5_000_000_000))
+
+    monkeypatch.setattr(pp.os, "replace", replace_and_restamp)
+    saved = store.save(doc("V2"), 1)
+    since = mark()
+    tick(store, clock)
+    assert store.snapshot() is saved and events(since) == []
+
+
+def test_a_write_that_lands_on_top_of_a_save_is_picked_up_as_the_outside_edit_it_is(tmp_path, monkeypatch):
+    clock = Clock()
+    store = make_store(tmp_path, doc(), clock=clock)
+    real = os.replace
+
+    def replace_then_overwrite(source, target):
+        real(source, target)
+        rewrite(target, doc("EXTERNAL"))
+
+    monkeypatch.setattr(pp.os, "replace", replace_then_overwrite)
+    saved = store.save(doc("MINE"), 1)
+    monkeypatch.undo()
+    assert saved.rev == 2
+    tick(store, clock)
+    assert store.snapshot().rev == 3
+    assert store.snapshot().document["profiles"]["a"]["head"] == "EXTERNAL"
+
+
+def test_the_example_of_the_plan_is_saved_and_served(tmp_path):
+    from test_prompt_policy_compile import PLAN_EXAMPLE
+    store = make_store(tmp_path)
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "opus.md").write_text("Ты — Opus.\n", encoding="utf-8")
+    snapshot = store.save(PLAN_EXAMPLE, None)
+    assert snapshot.rev == 1 and snapshot.profile_names() == ["passthrough", "mine-first", "exact-opus"]
+    assert json.loads((tmp_path / "prompts.json").read_text(encoding="utf-8")) == PLAN_EXAMPLE
+    assert store.plan(inp(model="claude-opus-5-5")).profile == "exact-opus"
+    sonnet = inp(model="claude-sonnet-5-5", requested_model="claude-sonnet-5-5")
+    assert store.plan(sonnet).profile == "mine-first"
+    assert store.plan(inp(client="codex", header_profile="mine-first")).profile == "mine-first"
+    assert store.plan(inp(client="codex")).legacy
+    reloaded = pp.PromptStore({"prompts_file": str(tmp_path / "prompts.json")})
+    assert reloaded.snapshot().document == snapshot.document and reloaded.errors() == []
