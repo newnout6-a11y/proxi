@@ -340,3 +340,39 @@ def test_a_legacy_plan_writes_no_plan_event_and_no_record(tmp_path, monkeypatch)
     served(tmp_path, monkeypatch, prompt_policy.Plan(), store=store)
     assert store.records == [] and not [e for e in journal.JOURNAL.query(since=before, limit=500)
                                         if e["kind"].startswith("prompt.")]
+
+
+def test_the_head_is_composed_off_the_event_loop_like_the_legacy_head_is(tmp_path, monkeypatch):
+    seen = []
+    real = FakePlan.compose_head
+
+    def compose(self, client_system, sources):
+        try:
+            asyncio.get_running_loop()
+            seen.append("on the loop")
+        except RuntimeError:
+            seen.append("in a worker thread")
+        return real(self, client_system, sources)
+
+    monkeypatch.setattr(FakePlan, "compose_head", compose)
+    served(tmp_path, monkeypatch, planned("{{relay_task}}"), messages=RELAY_TASK, system="", tools=[])
+    assert seen == ["in a worker thread"]
+
+
+def test_the_agent_transport_starts_its_prompt_with_the_composed_head_and_adds_no_reminder(tmp_path, monkeypatch):
+    prompts = []
+
+    async def stream(session, prompt, provider, tool_names=None):
+        prompts.append(prompt)
+        yield {"type": "text", "delta": "ok"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(RelaySession, "stream", stream)
+    _, _, runner = setup(tmp_path, transport="agent", project_context=False, exec_policy="allowlist",
+                         cookie_values=[], exec_allowlist=[], command_timeout=3, command_output_limit=4000)
+    parsed = request(RELAY_TASK, system="", tools=[])
+    parsed.request_purpose = "generation"
+    parsed.prompt_plan = planned("{{relay_task}}")
+    assert asyncio.run(run(runner, parsed))[-1] == {"type": "end", "reason": "stop"}
+    assert prompts[0].startswith(context.DEFAULT_RELAY_SYSTEM_PROMPT + "\n\n[LOCAL EXECUTION]")
+    assert "Run my relay task" in prompts[0] and "[LOCAL EXEC REMINDER]" not in prompts[0]

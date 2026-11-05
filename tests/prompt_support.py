@@ -322,3 +322,38 @@ def head_of(body):
     if first["role"] != "system":
         return None
     return "\n".join(block["text"] for block in first["content"])
+
+
+def sdk_tool_reply(call_id, signature, name="Read"):
+    """What Retool streams for an answer that thinks (signed) and then calls one tool, as the Agent SDK's tools are named."""
+    return [{"event": "content_block_start", "type": "thinking"},
+            {"event": "content_block_delta", "type": "signature", "partialSignature": signature},
+            {"event": "content_block_end", "type": "thinking"},
+            {"event": "content_block_start", "type": "tool_call", "toolCallId": call_id, "toolName": name},
+            {"event": "content_block_delta", "type": "tool_call", "partialInputs": json.dumps({"path": "a"})},
+            {"event": "content_block_end", "type": "tool_call", "toolCallId": call_id}, *END]
+
+
+def runner_turns(relay, headers, turns=3, prepare=None):
+    """Drive the Desktop runner shape (prompt_bodies.claude_sdk_body) through `turns` requests of one conversation.
+
+    Every answer but the last calls a tool; the next request carries the result and a role:system reminder after it,
+    as the runner sends one on every turn. Returns (status, payload, response headers, body posted to Retool) per turn."""
+    from prompt_bodies import claude_sdk_body
+    body = claude_sdk_body(turns=0)
+    body["stream"] = False
+    if prepare:
+        prepare(body)
+    results = []
+    for turn in range(turns):
+        relay.scripts.append(sdk_tool_reply("t%d" % turn, "opaque-%d" % turn) if turn < turns - 1
+                             else [text("done"), *END])
+        status, payload, answer_headers = relay.post("anthropic", body, headers)
+        results.append((status, payload, answer_headers, relay.posts[-1]))
+        if turn < turns - 1:
+            call = next(block["id"] for block in payload["content"] if block["type"] == "tool_use")
+            body["messages"] += [{"role": "assistant", "content": payload["content"]},
+                                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call,
+                                                               "content": "file contents"}]},
+                                 {"role": "system", "content": "Synthetic per-turn reminder, number %02d." % turn}]
+    return results

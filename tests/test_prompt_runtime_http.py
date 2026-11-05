@@ -103,6 +103,23 @@ def test_a_legacy_plan_leaves_the_request_and_its_trace_untouched(prompt_relay, 
     assert "request_purpose" in validated[0]["parsed"]
 
 
+def test_a_revision_no_rule_of_which_matches_is_the_legacy_path(prompt_relay):
+    relay = fake_relay(prompt_relay)
+    # a file that has a profile and a rule, but no default profile and a rule this request does not meet
+    relay.prompts.publish(1, {"mine": profile(MINE, texts={"rules": RULES})},
+                          rules=[("mine", lambda inp: inp.client == "opencode")])
+    request = client_request("chat", USER, system="CLIENT_SYSTEM", tools=False)
+    store, relay.runtime.prompts, relay.runtime.runner.prompts = relay.prompts, None, None
+    assert relay.post("chat", request, {"user-agent": "other/1"})[0] == 200  # the code of before the layer
+    relay.runtime.prompts = relay.runtime.runner.prompts = store
+    mark = relay.mark()
+    assert relay.post("chat", request, {"user-agent": "other/1", **affinity()})[0] == 200
+    assert relay.posts[1]["messages"] == relay.posts[0]["messages"] and head_of(relay.posts[1]) == "CLIENT_SYSTEM"
+    (plan,) = store.plans
+    assert plan.legacy and plan.rev == 1 and not relay.events(mark, "prompt.plan") and store.records == []
+    assert ("header:dialog-1", "generation") in store.pins  # the conversation is pinned all the same
+
+
 def test_the_store_is_reloaded_and_then_asked_for_every_request(prompt_relay):
     relay = fake_relay(prompt_relay)
     for _ in range(2):
