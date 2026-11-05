@@ -347,6 +347,7 @@ def _load(path):
     cfg = dict(DEFAULTS)
     saved = _read_file(path)
     cfg.update(saved)
+    # null selects the default role; "" and blank text mean no role of our own (context.relay_policy).
     if cfg.get('relay_system_prompt') is not None and not isinstance(cfg['relay_system_prompt'], str):
         raise service_unavailable("relay_system_prompt must be a string or null")
     if cfg.get('relay_system_prompt_mode') not in ('standalone', 'append', 'replace'):

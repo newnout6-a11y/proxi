@@ -3,15 +3,62 @@ import copy
 from dataclasses import dataclass
 import json
 
+INSTRUCTION_ROLES = ("system", "developer")
+INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
+_TEXT_BLOCKS = ("text", "input_text", "output_text", "summary_text")
+_REMINDER_OPEN, _REMINDER_CLOSE = "<system-reminder>", "</system-reminder>"
 
-def client_messages(messages, image_converter):
+
+def leading_instructions(messages, role_key="role"):
+    """How many system/developer messages open the conversation.
+
+    Only these form the head. Later ones keep their place in the history, so a
+    reminder never rewrites the cached prefix the signed thinking belongs to.
+    """
+    count = 0
+    for message in messages:
+        if not isinstance(message, dict) or (message.get(role_key) or message.get("role")) not in INSTRUCTION_ROLES:
+            break
+        count += 1
+    return count
+
+
+def reminder(text):
+    """User-turn text for a system message that arrives after the history started.
+
+    The wrapper is how Claude Code itself carries reminders in a user message
+    when an upstream rejects `system` inside `messages`.
+    """
+    stripped = text.strip()
+    if stripped.startswith(_REMINDER_OPEN) and stripped.endswith(_REMINDER_CLOSE):
+        return text
+    return _REMINDER_OPEN + "\n" + text + "\n" + _REMINDER_CLOSE
+
+
+def client_messages(messages, image_converter, *, lead=None):
     """Canonical client echo for matching, never a source of thinking signatures.
 
     Chat hides signatures; Anthropic and Responses group tool blocks differently.
     Match their visible text, parsed arguments, IDs and results, not display-only
-    reasoning labels. Unsupported shapes keep the existing text bridge.
+    reasoning labels. Unsupported shapes keep the existing text bridge. Leading
+    system messages live in the head; later non-empty ones are user reminders.
     """
     result = []
+    if lead is None:
+        lead = leading_instructions(messages)
+
+    def instruction_text(value):
+        if isinstance(value, str):
+            return value
+        parts = []
+        for block in value or []:
+            if isinstance(block, str):
+                parts.append(block)
+            elif block.get("type") in _TEXT_BLOCKS:
+                parts.append(block["text"])
+            elif block.get("type") not in INLINE_TOOL_BLOCKS:
+                raise ValueError("unsupported instruction block")
+        return "\n".join(part for part in parts if part)
 
     def content(value):
         if value is None:
@@ -48,10 +95,13 @@ def client_messages(messages, image_converter):
         return message
 
     try:
-        for message in messages:
+        for index, message in enumerate(messages):
             role = message.get("role") or ("assistant" if message.get("tool_calls") else None)
             value = message.get("content")
-            if role in ("system", "developer"):
+            if role in INSTRUCTION_ROLES:
+                text = instruction_text(value) if index >= lead else ""
+                if text.strip():
+                    result.append({"role": "user", "content": [{"type": "text", "text": reminder(text)}]})
                 continue
             if role == "assistant":
                 text, calls = [], []

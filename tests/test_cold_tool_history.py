@@ -75,6 +75,32 @@ def test_first_tool_followup_on_a_new_session_rebuilds_roles_without_client_thin
                    for b in m.get('content', []) if isinstance(b, dict))
 
 
+@pytest.mark.parametrize('dialect', ['chat', 'anthropic', 'responses'])
+def test_cold_replay_keeps_a_later_system_reminder_in_place_as_a_user_message(tmp_path, monkeypatch, dialect):
+    from test_native_history import append_result
+    first = parsed(copy.deepcopy(FIRST), dialect)
+    normalized = [{'type': 'tool_call', 'id': 'call-1', 'name': 'read_file', 'arguments': {'path': 'marker'}}]
+    messages = append_result(copy.deepcopy(FIRST), first, normalized, dialect, value='RESULT-MARKER')
+    messages.append({'role': 'system', 'content': 'COLD_REMINDER_77'})
+    pool, runner, sent = harness(tmp_path, monkeypatch, [[text('RESULT-MARKER'), *END]])
+    current = parsed(messages, dialect)
+    assert current.system_messages_normalized is True and 'COLD_REMINDER_77' not in current.system
+
+    async def scenario():
+        try:
+            return await run(runner, current)
+        finally:
+            await close(pool)
+
+    events = asyncio.run(scenario())
+    assert any(e.get('delta') == 'RESULT-MARKER' for e in events)
+    wire = sent[0]['messages']
+    assert [m['role'] for m in wire] == ['system', 'user', 'assistant', 'tool', 'user']
+    assert 'COLD_REMINDER_77' in json.dumps(wire[-1]) and 'COLD_REMINDER_77' not in json.dumps(wire[0])
+    assert not any(b.get('type') in ('thinking', 'redacted_thinking') for m in wire
+                   for b in m.get('content', []) if isinstance(b, dict))
+
+
 def test_client_supplied_thinking_is_removed_before_cold_replay(tmp_path, monkeypatch):
     from test_native_history import append_result
     first = parsed(copy.deepcopy(FIRST), 'anthropic')
