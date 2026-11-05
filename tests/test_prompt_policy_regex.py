@@ -86,6 +86,35 @@ def test_a_safe_pattern_survives_hostile_input_that_breaks_its_unsafe_twin():
     assert time.perf_counter() - started < 5.0
 
 
+WILDCARD_STARTS = [
+    (r"(?s).*foo", ""), (r".*foo", "s"), (r"[^>]*>", ""), (r"[\s\S]*x", ""), (r"(?s)(.*)x", ""), (r"(?s)(?:.*|a)b", ""),
+    (r"(?ms)^.*x", ""), (r"(?s)(?=x).*y", ""), (r"(?s)(?<=a).*b", ""), (r".+?foo", "s"), (r"(?s)(?:\w+|.*?)x", ""),
+]
+ANCHORED_OR_BOUNDED = [
+    (r"(?s)^.*foo", ""), (r"\A(?s:.*)foo", ""), (r".*foo", ""), (r"(?s)<a>.*</a>", ""), (r"x(?s:.*)y", ""),
+    (r"(?s).*", ""), (r"(?s)(.*)", ""), (r"[^>]+", ""), (r"\s+$", "s"), (r"(?m)^[^\n]*foo", ""), (r"(?s).{0,50}foo", ""),
+    (r"(?:^|x).*y", "s"), (r"x[^>]*>", ""),
+]
+
+
+@pytest.mark.parametrize("pattern, flags", WILDCARD_STARTS)
+def test_a_pattern_that_starts_with_a_wildcard_repeat_is_refused(pattern, flags):
+    with pytest.raises(pp.PromptConfigError, match="starts with an unbounded repeat"):
+        compile_pattern(pattern, flags)
+
+
+@pytest.mark.parametrize("pattern, flags", ANCHORED_OR_BOUNDED)
+def test_an_anchored_or_bounded_wildcard_is_fine(pattern, flags):
+    assert compile_pattern(pattern, flags)
+
+
+def test_the_wildcard_rule_keeps_a_big_text_without_a_match_fast_where_the_refused_pattern_would_not():
+    text = "x" * 200_000
+    safe = compile_pattern(r"(?s)^.*foo")
+    started = time.perf_counter()
+    assert safe.search(text) is None
+    assert time.perf_counter() - started < 3.0
+
 def test_pattern_length_is_bounded():
     assert pp.MAX_PATTERN_CHARS == 512
     assert compile_pattern("a" * 512)

@@ -630,6 +630,45 @@ class _Shape:
             elif op == _sre_const.ATOMIC_GROUP:
                 self.scan(av, self.empty, flags, False, False)
 
+    def leading(self, node, flags, continues=False):
+        """Raise _RegexHazard when the pattern starts with an unbounded repeat of almost any character that something
+        follows: the engine retries it at every position of the text, so a text without a match costs time squared.
+
+        Returns True when the pattern is anchored at the very start (nothing to check), False when a consuming item came
+        first, None when only zero-width items were seen so far. `continues` says something follows node.
+        """
+        items = list(_items(node))
+        for index, (op, av) in enumerate(items):
+            after = continues or index < len(items) - 1
+            if op == _sre_const.AT:
+                if av == _sre_const.AT_BEGINNING_STRING or (
+                        av == _sre_const.AT_BEGINNING and not flags & _sre_const.SRE_FLAG_MULTILINE):
+                    return True
+                continue
+            if op in (_sre_const.ASSERT, _sre_const.ASSERT_NOT):
+                continue
+            if op in _REPEATS and self.unbounded(op, av):
+                chars = self.first(av[2], flags)[0]
+                if after and 10 in chars and len(chars) >= 0.9 * len(self.alphabet):
+                    raise _RegexHazard("the pattern starts with an unbounded repeat of almost any character, which is "
+                                       "retried at every position of the text (anchor it with ^ or \\A, or start it "
+                                       "with a literal)")
+                return False
+            if op == _sre_const.SUBPATTERN:
+                found = self.leading(av[3], (flags | av[1]) & ~av[2], after)
+                if found is not None:
+                    return found
+                continue
+            if op == _sre_const.BRANCH:
+                results = [self.leading(alternative, flags, after) for alternative in av[1]]
+                if all(result is True for result in results):
+                    return True
+                if any(result is not None for result in results):
+                    return False
+                continue
+            return False
+        return None
+
     def alternatives(self, alternatives, after, flags):
         seen, empties = self.empty, 0
         for alternative in alternatives:
@@ -665,6 +704,7 @@ def _regex_hazard(tree):
     shape = _Shape(tree)
     try:
         shape.scan(tree, shape.empty, tree.state.flags, False, False)
+        shape.leading(tree, tree.state.flags)
     except _RegexHazard as exc:
         return str(exc)
     except RecursionError:
