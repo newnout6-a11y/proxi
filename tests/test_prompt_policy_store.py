@@ -380,13 +380,17 @@ def test_a_write_that_fails_leaves_the_old_file_and_revision_and_no_litter(tmp_p
     store = make_store(tmp_path, doc())
     before = (tmp_path / "prompts.json").read_bytes()
 
+    attempts = []
+
     def boom(source, target):
+        attempts.append(source)
         raise PermissionError("locked")
 
+    monkeypatch.setattr(pp, "REPLACE_PAUSE", 0)
     monkeypatch.setattr(pp.os, "replace", boom)
     with pytest.raises(apierr.ApiError) as raised:
         store.save(doc("NEW"), 1)
-    assert raised.value.status == 503
+    assert raised.value.status == 503 and len(attempts) == pp.REPLACE_ATTEMPTS
     assert (tmp_path / "prompts.json").read_bytes() == before and store.snapshot().rev == 1
     assert sorted(os.listdir(tmp_path)) == ["prompts.json"] or sorted(os.listdir(tmp_path)) == [
         "prompts.json", "prompts.json.bak"]
@@ -625,3 +629,84 @@ def test_a_limit_that_is_not_a_number_and_an_entry_that_is_not_a_dict_do_no_harm
     assert len(store.recent("3")) == 3 and len(store.recent("many")) == 50 and len(store.recent(None)) == 50
     assert len(store.recent(2.9)) == 2 and len(store.recent()) == 50
     assert store.recent(1)[0]["request_id"] == "r59"
+
+# -- many threads at once ------------------------------------------------------------------------------------------------
+
+
+def test_planning_reloading_saving_and_recording_together_never_break_the_store(tmp_path):
+    class Ticking(Clock):
+        def __call__(self):
+            self.now += 2.0
+            return self.now
+
+    store = make_store(tmp_path, doc(), clock=Ticking())
+    failures, observed = [], {}
+    stop = threading.Event()
+
+    def guard(work):
+        def run():
+            try:
+                work()
+            except BaseException as exc:      # noqa: BLE001 - the test reports whatever a thread hit
+                failures.append(repr(exc))
+                stop.set()
+        return run
+
+    def saver():
+        for index in range(20):
+            if stop.is_set():
+                return
+            try:
+                store.save(doc("S%d" % index), store.snapshot().rev)
+            except apierr.ApiError as exc:
+                assert exc.status in (409, 503)      # stale, or the file was open in the writer at that instant
+
+    def outside():
+        for index in range(8):
+            if stop.is_set():
+                return
+            rewrite(tmp_path / "prompts.json", doc("E%d" % index))
+
+    def planner(name):
+        def run():
+            while not stop.is_set():
+                store.maybe_reload()
+                plan = store.plan(inp(conversation_key=name))
+                assert plan.snapshot is None or plan.rev == plan.snapshot.rev
+                observed.setdefault(name, set()).add(plan.rev)
+                store.record({"request_id": name, "rev": plan.rev})
+                store.recent(3)
+                store.pins()
+        return run
+
+    workers = [threading.Thread(target=guard(saver)), threading.Thread(target=guard(outside))] + [
+        threading.Thread(target=guard(planner("c%d" % n))) for n in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers[:2]:
+        worker.join(timeout=60)
+    stop.set()
+    for worker in workers[2:]:
+        worker.join(timeout=60)
+    assert failures == []
+    assert all(not worker.is_alive() for worker in workers)
+    assert all(len(revs) == 1 for revs in observed.values()), observed       # a pinned conversation keeps its revision
+    assert store.snapshot().rev >= 2
+    revs = sorted(store._history)
+    assert revs == list(range(revs[0], revs[-1] + 1))
+
+def test_a_file_that_is_busy_for_a_moment_is_replaced_on_a_retry(tmp_path, monkeypatch):
+    store = make_store(tmp_path, doc())
+    real, attempts = os.replace, []
+
+    def flaky(source, target):
+        attempts.append(source)
+        if len(attempts) < 3:
+            raise PermissionError("a scanner has it open")
+        return real(source, target)
+
+    monkeypatch.setattr(pp, "REPLACE_PAUSE", 0)
+    monkeypatch.setattr(pp.os, "replace", flaky)
+    assert store.save(doc("V2"), 1).rev == 2 and len(attempts) == 3
+    assert json.loads((tmp_path / "prompts.json").read_text(encoding="utf-8"))["profiles"]["a"]["head"] == "V2"
+    assert [name for name in os.listdir(tmp_path) if name.endswith(".tmp")] == []
