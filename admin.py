@@ -56,7 +56,8 @@ ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balanc
 SETTING_GROUPS = ("routing", "model", "instructions", "retries", "cache", "exec", "limits", "api")
 # Prompt control (docs/prompt-control-plan.md 4.1): the routes and the methods each one answers.
 PROMPTS_PATH = "/admin/api/prompts"
-PROMPT_ROUTES = {PROMPTS_PATH: ("GET", "PUT")}
+PROMPT_ROUTES = {PROMPTS_PATH: ("GET", "PUT"), PROMPTS_PATH + "/preview": ("POST",),
+                 PROMPTS_PATH + "/recent": ("GET",), PROMPTS_PATH + "/pins": ("GET", "POST")}
 # A document is at most MAX_DOCUMENT_BYTES of UTF-8. A client that escapes non-ASCII text (Python's json.dumps does)
 # sends it up to three times as long, so saving takes four times that; max_body_bytes still caps every body as well.
 PROMPTS_BODY_LIMIT = 4 * prompt_policy.MAX_DOCUMENT_BYTES
@@ -359,6 +360,29 @@ def _document_warnings(document):
 def _config_error(error):
     """The 400 for a document the engine refused: its message and, as `param`, the path of the offending field."""
     return apierr.bad_request(error.message or str(error), param=error.path or None)
+
+
+def _plain_headers(headers):
+    return (isinstance(headers, dict) and len(headers) <= 128
+            and all(isinstance(key, str) and isinstance(value, str) and len(key) <= 256 and len(value) <= 8192
+                    for key, value in headers.items()))
+
+
+def _public_entry(entry):
+    """A recent head as the screen may see it: never the kept request, whatever the store hands over."""
+    return {key: value for key, value in entry.items() if key != "request"} if isinstance(entry, dict) else entry
+
+
+def _tagged_keys(keys, tag):
+    """The conversation keys among `keys` (some are tuples such as (key, "text")) whose journal tag is `tag`."""
+    found, todo = [], list(keys)
+    while todo:
+        key = todo.pop()
+        if isinstance(key, (tuple, list)):
+            todo.extend(key)
+        elif isinstance(key, str) and journal.tag(key) == tag:
+            found.append(key)
+    return found
 
 
 def is_admin_path(path):
@@ -1041,16 +1065,24 @@ class Admin:
         except ValueError:
             raise apierr.bad_request("invalid JSON body")
 
-    def _prompts_route(self, handler, path):
+    def _prompts_route(self, handler, path, query):
         if handler.command not in PROMPT_ROUTES[path]:
             raise apierr.method_not_allowed()
         store = self.runtime.prompts
         if handler.command == "GET":
+            if path == PROMPTS_PATH + "/recent":
+                return self._prompts_recent(store, query)
+            if path == PROMPTS_PATH + "/pins":
+                return {"items": store.pins()}
             return self._prompts_state(store)
         # Guard failures must close a connection whose body was not consumed.
         handler.close_connection = True
         self._mutation_guard(handler)
-        return self._prompts_save(handler, store)
+        if path == PROMPTS_PATH:
+            return self._prompts_save(handler, store)
+        if path == PROMPTS_PATH + "/preview":
+            return self._prompts_preview(handler, store)
+        return self._prompts_unpin(handler, store)
 
     def _prompts_state(self, store):
         store.maybe_reload()
@@ -1062,6 +1094,10 @@ class Admin:
                 "legacy": {"mode": self.cfg.get("relay_system_prompt_mode", "standalone"),
                            "role_chars": len(relay_policy(self.cfg.get("relay_system_prompt")))},
                 "builtin": _builtin_prompts()}
+
+    def _prompts_recent(self, store, query):
+        limit = _int_param(query, "limit", 50, 1, prompt_policy.RECENT_LIMIT)
+        return {"items": [_public_entry(entry) for entry in store.recent(limit)]}
 
     def _prompts_save(self, handler, store):
         data = self._prompts_body(handler, PROMPTS_BODY_LIMIT)
@@ -1098,6 +1134,74 @@ class Admin:
         warnings = _document_warnings(document)
         warnings += [str(item) for item in getattr(snapshot, "warnings", None) or () if str(item) not in warnings]
         return {"rev": snapshot.rev, "warnings": warnings}
+
+    def _prompts_preview(self, handler, store):
+        data = self._prompts_body(handler)
+        unknown = set(data) - {"request", "request_id", "dialect", "headers", "document"}
+        if unknown:
+            raise apierr.bad_request("Unknown field in the request", param=sorted(unknown)[0])
+        request, request_id, dialect = data.get("request"), data.get("request_id"), data.get("dialect")
+        headers, draft = data.get("headers"), data.get("document")
+        if request is not None and not isinstance(request, dict):
+            raise apierr.bad_request("'request' must be the body of a client request, an object", param="request")
+        if request_id is not None and not (isinstance(request_id, str) and 0 < len(request_id) <= 128):
+            raise apierr.bad_request("'request_id' must be a non-empty string", param="request_id")
+        if dialect is not None and dialect not in DIALECTS:
+            raise apierr.bad_request("'dialect' must be one of: " + ", ".join(DIALECTS), param="dialect")
+        if headers is not None and not _plain_headers(headers):
+            raise apierr.bad_request("'headers' must be an object of text values", param="headers")
+        if draft is not None:
+            if not isinstance(draft, dict):
+                raise apierr.bad_request("'document' must be the prompts document, an object, or null",
+                                         param="document")
+            _checked_document(draft)
+        store.maybe_reload()
+        if request is None:
+            kept = store.request(request_id)
+            if not kept or not isinstance(kept.get("body"), dict):
+                raise apierr.not_found(
+                    "The request %s is no longer kept: only the newest requests keep their body" % request_id
+                    if request_id else
+                    "No request has been recorded yet: send 'request' or make a request through the relay first")
+            request, dialect = kept["body"], dialect or kept.get("dialect")
+            if headers is None:
+                headers = kept.get("headers") or {}
+        elif dialect is None:
+            raise apierr.bad_request("'dialect' is required with 'request'", param="dialect")
+        try:
+            return store.preview(request, dialect, headers or {}, draft)
+        except prompt_policy.PromptConfigError as error:
+            raise _config_error(error)
+
+    def _prompts_unpin(self, handler, store):
+        data = self._prompts_body(handler)
+        unknown = set(data) - {"action", "conversation"}
+        if unknown:
+            raise apierr.bad_request("Unknown field in the request", param=sorted(unknown)[0])
+        action, conversation = data.get("action"), data.get("conversation")
+        if action not in ("unpin", "apply_all"):
+            raise apierr.bad_request("'action' must be unpin or apply_all", param="action")
+        if action == "apply_all":
+            if conversation not in (None, ""):
+                raise apierr.bad_request("'conversation' is not used with apply_all, which releases every conversation",
+                                         param="conversation")
+            count = store.unpin(None)
+            journal.emit("admin.prompt_pins", "Закрепления промптов сняты у всех диалогов (%d): следующий ход каждого "
+                         "начнёт с текущей ревизии" % count, "warn", action=action, unpinned=count)
+            return {"unpinned": count}
+        if (not isinstance(conversation, str) or not conversation.strip() or len(conversation) > 256
+                or not _plain(conversation)):
+            raise apierr.bad_request("'conversation' must be the tag of a pinned conversation", param="conversation")
+        tag = conversation.strip()
+        count = store.unpin(tag)
+        if not count:
+            # The screen knows a conversation by its tag. A store that matches only keys is asked with the keys
+            # of the open conversations that carry the tag.
+            for key in _tagged_keys(getattr(self.runtime.pool, "_conversations", None) or (), tag):
+                count += store.unpin(key)
+        journal.emit("admin.prompt_pins", "Диалог %s снят с закрепления промптов (%d)" % (tag, count), "info",
+                     action=action, unpinned=count, conversation=tag)
+        return {"unpinned": count}
 
     def _static(self, handler, path):
         relative = "index.html" if path in ("/admin", "/admin/") else unquote(path[len("/admin/"):])
@@ -1197,7 +1301,7 @@ class Admin:
             handler._json(200, self._pool_route(handler, path, account_match))
             return
         if path in PROMPT_ROUTES:
-            handler._json(200, self._prompts_route(handler, path))
+            handler._json(200, self._prompts_route(handler, path, query))
             return
         if handler.command == "GET":
             if path == "/admin/api/overview":
