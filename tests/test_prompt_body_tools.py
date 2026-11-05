@@ -329,3 +329,20 @@ def test_a_rewritten_tool_set_reaches_the_parser_as_the_client_would_have_sent_i
         parse(dialect, dict(result, tool_choice={"type": "function", "function": {"name": "read"}}
                             if dialect == "chat" else ({"type": "tool", "name": "read"} if dialect == "anthropic"
                                                        else {"type": "function", "name": "read"})))
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("template", [r"\d", r"\9", r"\g<x>", "\\"])
+def test_a_replacement_that_cannot_be_expanded_skips_the_rule_instead_of_failing_on_a_tool(dialect, template):
+    result, changes = edit(dialect, {"tool": "bash", "op": "replace_regex", "pattern": r"(\w+) a", "with": template},
+                           {"tool": "bash", "op": "append", "text": "Fine."})
+    assert changes[0] == {"scope": "tools", "op": "replace_regex", "edit": 0, "skipped": True,
+                          "reason": "invalid pattern"}
+    assert description(result["tools"][0], dialect) == "Run a command.\n\nFine."
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_a_replacement_follows_the_rules_of_python_re_templates(dialect):
+    result, _ = edit(dialect, {"tool": "bash", "op": "replace_regex", "pattern": r"(?P<verb>\w+) a (\w+)",
+                               "with": r"\g<2> \g<verb> \\ \n!"})
+    assert description(result["tools"][0], dialect) == "command Run \\ \n!."

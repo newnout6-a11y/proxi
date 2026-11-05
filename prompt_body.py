@@ -410,14 +410,16 @@ def _text_op(context, spec, ops):
             if op == "remove_regex":
                 return _remove_regex_fn(rx), None
             template = spec.get("with")
-            return _replace_regex_fn(rx, template if isinstance(template, str) else ""), None
+            template = template if isinstance(template, str) else ""
+            rx.sub(template, "")                # a replacement that cannot be expanded fails here, not on some message
+            return _replace_regex_fn(rx, template), None
         find = spec.get("find")
         if not isinstance(find, str) or not find:
             return None, "missing find"
         replacement = spec.get("with")
         return _replace_text_fn(find, replacement if isinstance(replacement, str) else "",
                                 spec.get("all", True) is not False), None
-    except (re.error, KeyError, ValueError, TypeError):
+    except (re.error, KeyError, ValueError, TypeError, IndexError):
         return None, "invalid pattern"
 
 
