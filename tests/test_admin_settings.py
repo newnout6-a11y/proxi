@@ -192,6 +192,16 @@ def test_reason_is_about_the_enabled_accounts_not_a_switched_off_one(pool):
     assert nobody["route_blocker"] == "no_accounts" and nobody["route_status"] == "unrouted"
 
 
+def test_reason_follows_the_account_list_discovery_is_judged_against(pool, monkeypatch):
+    pool.backends[1].cfg["openai_provider_resource_name"] = "second-openai"
+    openai = lambda: {item["id"]: item for item in pool.call("/admin/api/models")[1]["data"]}["gpt-6-sol"]  # noqa: E731
+    assert openai()["routable"] is True
+    # Whatever narrows the accounts _routable looks at (shared mode, say) narrows the reason with it.
+    monkeypatch.setattr(admin.Admin, "_route_backends", lambda self: [pool.backends[0]])
+    narrowed = openai()
+    assert narrowed["routable"] is False and narrowed["route_blocker"] == "no_resource"
+
+
 # -- overview ------------------------------------------------------------------------
 def test_overview_session_speaks_for_the_enabled_accounts_only(pool):
     first, second = pool.backends

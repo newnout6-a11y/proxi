@@ -296,14 +296,17 @@ class Admin:
                 "pending_restart": pending, "restart_required": bool(pending),
                 "writable": bool(self.cfg.get("_config_path"))}
 
-    def _routable(self, entry):
+    def _route_backends(self):
+        """The accounts discovery is judged against; None falls back to the account records in the config."""
         runtime = getattr(self, 'runtime', None)
-        backends = getattr(getattr(runtime, 'accounts', None), 'backends', None)
-        return models.catalog_routable(entry, self.cfg, backends)
+        return getattr(getattr(runtime, 'accounts', None), 'backends', None)
+
+    def _routable(self, entry):
+        return models.catalog_routable(entry, self.cfg, self._route_backends())
 
     def _route_configs(self):
         """Configs of the accounts models.catalog_routable weighs: the enabled ones."""
-        backends = getattr(getattr(getattr(self, 'runtime', None), 'accounts', None), 'backends', None)
+        backends = self._route_backends()
         if backends is None:
             return [item for item in (self.cfg.get('accounts') or [self.cfg]) if item.get('enabled', True)]
         return [backend.cfg for backend in backends if backend.cfg.get('enabled', True)]
