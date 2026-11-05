@@ -30,6 +30,7 @@
 
 /* --- page ------------------------------------------------------------------------------------------------ */
 .prompts .page-meta { max-width: 48rem; }
+.prompts .savebar b { font-weight: 500; }
 .p-tabs-row { display: flex; }
 .p-tabs { flex-wrap: wrap; max-width: 100%; }
 .p-tabs button { flex: 0 1 auto; }
@@ -87,7 +88,11 @@
 /* --- profiles --------------------------------------------------------------------------------------------- */
 .p-profiles { display: grid; gap: var(--space-4); min-width: 0; }
 .p-profile-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
-.p-profile-bar .chip { height: 32px; }
+/* A name the user typed has no length limit that suits a phone: it wraps or is cut, never widens the page. */
+.p-profile-bar .chip { height: 32px; max-width: 100%; min-width: 0; }
+.p-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.p-usage .tag, .rule-tags .tag { max-width: 100%; height: auto; min-height: 20px; padding-block: 2px; white-space: normal; overflow-wrap: anywhere; text-align: left; }
+.p-palette .chip, .p-suggest .chip { max-width: 100%; height: auto; min-height: 26px; padding-block: 2px; white-space: normal; overflow-wrap: anywhere; text-align: left; }
 .p-profile-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: var(--space-4); align-items: start; }
 .p-profile-panel, .p-live { display: grid; gap: var(--space-4); align-content: start; }
 .p-live { position: sticky; top: var(--space-4); max-height: calc(100vh - var(--space-8)); overflow: auto; }
@@ -260,6 +265,16 @@
 .pin-row + .pin-row { border-top: 1px solid var(--line); }
 .pin-row .mono { font-size: var(--text-xs); overflow-wrap: anywhere; }
 
+/* A grid with one implicit column is as wide as its widest unbroken child; these may shrink instead, so long names wrap or are cut. */
+.p-profiles, .p-profile, .p-profile-panel, .p-live, .p-live-body, .p-edits, .p-edit, .p-edit-list, .p-field, .p-head-editor, .p-disclosure-body, .p-texts-tab,
+.p-texts, .p-text, .p-protect, .p-rules-panel, .p-rules, .p-legacy, .p-new-profile, .p-publish, .head-view, .diff-view, .p-changes, .p-source,
+.seen-list-panel, .seen-detail, .p-pins, .rule-editor, .p-conditions, .p-codex-map, .p-builtin-wrap, .p-preview > .panel, .p-sample {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* Keyboard focus and scrolling into view keep clear of the sticky save bar below and of the phone header above. */
+:root:has(.prompts) { scroll-padding-top: 5.5rem; scroll-padding-bottom: 6.5rem; }
+
 /* --- responsive --------------------------------------------------------------------------------------------- */
 @media (max-width: 1180px) {
   .p-profile-layout, .p-preview, .p-seen { grid-template-columns: minmax(0, 1fr); }
@@ -290,4 +305,8 @@
   .p-edit-tools { grid-column: 1 / -1; justify-content: flex-end; }
   .p-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .p-disclosure-meta { display: none; }
+  /* The save bar stays two lines tall: the list of what changed is cut, the count and the buttons are not */
+  .prompts .savebar > span { flex: 1 1 100%; }
+  .prompts .savebar-keys { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prompts .savebar .button { flex: 1 1 0; }
 }
