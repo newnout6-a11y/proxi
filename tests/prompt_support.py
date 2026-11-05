@@ -14,7 +14,6 @@ import time
 
 import pytest
 
-import apierr
 import config
 import direct
 import journal

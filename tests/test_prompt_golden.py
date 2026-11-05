@@ -32,7 +32,7 @@ import validate
 from prompt_bodies import (CLAUDE_SDK_HEADERS, CODEX_HEADERS, OPENCODE_COMPACTION_V1, OPENCODE_HEADERS,
                            OPENCODE_SUMMARY, OPENCODE_TITLE_V1, OPENCODE_TITLE_V2, claude_sdk_body, codex_body,
                            opencode_body, service_body)
-from test_native_context_reuse import FIRST, TOOLS, request, run, setup
+from test_native_context_reuse import TOOLS, request, run, setup
 
 GOLDEN = pathlib.Path(__file__).parent / "golden" / "prompt_matrix.json"
 UPDATE = os.environ.get("PROXI_UPDATE_GOLDEN") == "1"

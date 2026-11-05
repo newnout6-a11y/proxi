@@ -1,20 +1,14 @@
 """The prompt hooks of proxy._completion over real HTTP: plan, refusals, failures, pass 2, generation, protected jobs."""
 import collections
-import copy
 import json
 
 import pytest
 
 import apierr
-import client_context
-import direct
-import prompt_body
 import prompt_policy
 import validate
-from prompt_bodies import (CLAUDE_SDK_HEADERS, OPENCODE_HEADERS, OPENCODE_SUMMARY, OPENCODE_TITLE_V1,
-                           OPENCODE_TITLE_V2, filler, opencode_body, service_body)
-from prompt_support import (PATHS, FakePlan, FakePrompts, account, client_request, fake_relay, head_of,  # noqa: F401
-                            profile, prompt_relay)
+from prompt_bodies import OPENCODE_TITLE_V2, service_body
+from prompt_support import FakePlan, client_request, fake_relay, head_of, profile, prompt_relay  # noqa: F401
 
 DIALECTS = ["chat", "anthropic", "responses"]
 USER = [{"role": "user", "content": "inspect ORIGINAL_TASK"}]

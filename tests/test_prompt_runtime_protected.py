@@ -2,8 +2,8 @@
 import pytest
 
 import prompt_policy
-from prompt_bodies import (CLAUDE_SDK_HEADERS, OPENCODE_COMPACTION_V1, OPENCODE_HEADERS, OPENCODE_SUMMARY,
-                           OPENCODE_TITLE_V1, OPENCODE_TITLE_V2, filler, service_body)
+from prompt_bodies import (OPENCODE_COMPACTION_V1, OPENCODE_SUMMARY, OPENCODE_TITLE_V1, OPENCODE_TITLE_V2, filler,
+                           service_body)
 from prompt_support import client_request, fake_relay, head_of, profile, prompt_relay  # noqa: F401
 
 RULES = "MY_RULES"
