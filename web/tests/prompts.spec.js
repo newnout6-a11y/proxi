@@ -103,6 +103,15 @@ test('a file the relay refused is reported with its reason and the revision that
   await expect(banner).toContainText('profiles.mine-first.head');
 });
 
+test('a file the relay refused while no revision was ever accepted is told apart from no file at all', async ({ page }) => {
+  await openPrompts(page, { legacy: true, errors: [{ message: 'prompts.json: invalid JSON at line 3', param: '', ts: 1 }] });
+  await expect(page.locator('.p-file-errors')).toContainText('Действует прежний режим');
+  const intro = page.getByRole('region', { name: 'Файл промптов не действует' });
+  await expect(intro).toContainText('Файл есть, но relay его не принял');
+  await expect(intro).toContainText('сохранение заменит файл');
+  await expect(page.getByRole('region', { name: 'Файл промптов не создан' })).toHaveCount(0);
+});
+
 test('the head template counts UTF-8 bytes, inserts a variable at the caret and flags references the relay would refuse', async ({ page }) => {
   await openPrompts(page);
   const field = head(page);
@@ -220,6 +229,32 @@ test('history, tools, generation and publishing are saved only when they say som
   expect(saved.tools.edits).toEqual([{ tool: 'bash', op: 'append', text: 'Не запускай команды, меняющие систему, без подтверждения.' }, { tool: 'webfetch', hide: true }]);
   expect(saved.generation).toEqual({ effort: 'high', verbosity: 'low' });
   expect(saved.publish_as_model).toEqual(['claude-*', 'claude-opus-*']);
+});
+
+test('emptying the list of model masks keeps the list open for the next mask, and "all" and "none" are saved as they are', async ({ page }) => {
+  const { prompts } = await openPrompts(page);
+  const publish = section(page, 'Публикация как модель');
+  await publish.locator('summary').click();
+  await publish.getByRole('radio', { name: 'Только для моделей по маске' }).check();
+  const masks = publish.getByRole('group', { name: 'Маски моделей' });
+  await expect(masks.locator('.p-token')).toHaveText(['claude-*']);
+  await masks.getByRole('button', { name: 'Убрать значение claude-*' }).click();
+  await expect(masks).toBeVisible();
+  await expect(publish.getByRole('radio', { name: 'Только для моделей по маске' })).toBeChecked();
+  await expect(publish).toContainText('Без масок профиль не публикуется');
+  await masks.getByLabel('Маски моделей: добавить значение').fill('gpt-*');
+  await masks.getByLabel('Маски моделей: добавить значение').press('Enter');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  expect(prompts.saves[0].body.document.profiles['mine-first'].publish_as_model).toEqual(['gpt-*']);
+  await publish.getByRole('radio', { name: 'Опубликовать для всех моделей каталога' }).check();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(2);
+  expect(prompts.saves[1].body.document.profiles['mine-first'].publish_as_model).toBe(true);
+  await publish.getByRole('radio', { name: 'Не публиковать' }).check();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(3);
+  expect('publish_as_model' in prompts.saves[2].body.document.profiles['mine-first']).toBe(false);
 });
 
 test('back to nothing: a profile whose sections are emptied is saved without them', async ({ page }) => {

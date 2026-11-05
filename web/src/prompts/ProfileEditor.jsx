@@ -12,8 +12,6 @@ const EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const VERBOSITIES = ['low', 'medium', 'high'];
 const RELAY_ONLY = ['relay_task', 'local_exec', 'project_context', 'exec_reminder'];
 
-const publishMode = (value) => (Array.isArray(value) ? 'list' : value === true ? 'all' : 'off');
-
 function HeadEditor({ profile, name, builtin, textNames, onChange }) {
   const area = useRef(null);
   const caret = useRef(null);
@@ -98,16 +96,21 @@ function Generation({ profile, name, onChange }) {
 }
 
 function Publish({ profile, name, onChange }) {
-  const mode = publishMode(profile.publish_as_model);
+  // Emptying the list of masks keeps the list open: the user is retyping it, not switching publishing off
+  const [listing, setListing] = useState(false);
+  const mode = Array.isArray(profile.publish_as_model) || (listing && !profile.publish_as_model) ? 'list' : profile.publish_as_model === true ? 'all' : 'off';
   const globs = Array.isArray(profile.publish_as_model) ? profile.publish_as_model : [];
+  const choose = (id) => {
+    setListing(id === 'list');
+    onChange({ publish_as_model: id === 'off' ? false : id === 'all' ? true : globs.length ? globs : ['claude-*'] });
+  };
   return (
     <div className="p-publish">
       <fieldset className="p-radio-group">
         <legend>Каталог моделей</legend>
         {[['off', 'Не публиковать'], ['all', 'Опубликовать для всех моделей каталога'], ['list', 'Только для моделей по маске']].map(([id, label]) => (
           <label className="check" key={id}>
-            <input type="radio" name={`publish-${name}`} checked={mode === id}
-              onChange={() => onChange({ publish_as_model: id === 'off' ? false : id === 'all' ? true : globs.length ? globs : ['claude-*'] })} />
+            <input type="radio" name={`publish-${name}`} checked={mode === id} onChange={() => choose(id)} />
             <span>{label}</span>
           </label>
         ))}
@@ -116,7 +119,8 @@ function Publish({ profile, name, onChange }) {
         <Tokens label="Маски моделей" values={globs} onChange={(values) => onChange({ publish_as_model: values.length ? values : false })}
           placeholder="claude-opus-*" path={`profiles.${name}.publish_as_model`} hint="Модель появится в каталоге как <модель>@имя-профиля. Маски: * и ?" />
       )}
-      {mode !== 'off' && <p className="p-hint">Клиент выбирает профиль, просто называя такую модель: <code>{`claude-opus-5-5@${name}`}</code></p>}
+      {mode === 'list' && !globs.length && <p className="p-hint">Без масок профиль не публикуется</p>}
+      {mode === 'all' || globs.length > 0 ? <p className="p-hint">Клиент выбирает профиль, просто называя такую модель: <code>{`claude-opus-5-5@${name}`}</code></p> : null}
     </div>
   );
 }

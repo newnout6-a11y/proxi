@@ -264,7 +264,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
               <div key={item.id} role="tabpanel" id={`prompts-panel-${item.id}`} aria-labelledby={`prompts-tab-${item.id}`} hidden={tab !== item.id}>
                 {tab === item.id && (
                   EDITING.includes(item.id) && legacyMode ? (
-                    <LegacyStart legacy={server.legacy} path={server.path} taken={[]} onCreate={(name, starter) => {
+                    <LegacyStart legacy={server.legacy} path={server.path} invalid={server.errors.length > 0} onCreate={(name, starter) => {
                       setDraft(addProfile(blankDocument(), name, starterProfile(starter)));
                       setSelected(name);
                       setTab('profiles');
