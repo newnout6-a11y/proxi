@@ -3,7 +3,8 @@
 OpenCode 1 reads this schema directly; installed OpenCode 2 migrates it on load.
 The file may be JSONC (comments, trailing commas). Its BOM, line endings and
 indentation are kept, and nothing is written when the catalog is already current.
-Preview is read-only and masks credentials unless --include-secrets is given.
+Preview is read-only and masks credentials unless --include-secrets is given. The
+masking goes by name and shape, so read a preview before sharing it.
 --write requires a backup directory and preserves other providers, authentication
 and unrelated settings; a file with comments is rewritten only with --allow-reformat.
 A removed model behind agent.compaction.model is replaced only by a cheap model whose
@@ -37,9 +38,19 @@ COMPACTION_AGENT = 'compaction'
 SMALL_MODELS = ('claude-haiku-4-5-20251001', 'gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview',
                 'gemini-3.5-flash', 'gemini-2.5-flash', 'gpt-5-nano', 'gpt-5-mini', 'zai-org/GLM-5.3-Flash')
 MASK = '***'
-# Mappings whose values are credentials (a list under `env` names variables instead).
+# Mappings whose values are credentials; a list under `env` holds NAME=value items instead.
 SECRET_CONTAINERS = ('headers', 'environment', 'env', 'cookies')
+ENVIRONMENTS = ('environment', 'env')
 SECRET_KEY = re.compile(r'apikey|secret|token|password|passwd|authorization|cookie|credential|privatekey|bearer')
+# Names that stand for a credential only as the whole name (`auth.key`, `--key`, `?key=`).
+SECRET_WORDS = ('key', 'auth', 'pass', 'pwd')
+URL = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://[^\s\'"<>]+')
+URL_PARAMETER = re.compile(r'([?&#])([^=&?#/\s]+)=([^&#\s]*)')
+# A value never ends in sentence punctuation: "...?key=abc." keeps its full stop.
+VALUE = r'''"[^"]*"|'[^']*'|[^\s'"&]*[^\s'"&.,;)\]}]'''
+ASSIGNMENT = re.compile(r'(?<![\w.-])(-{0,2}[A-Za-z_][\w.-]*)=(%s)' % VALUE)
+FLAG_VALUE = re.compile(r'(?<![\w.-])(--?[A-Za-z][\w.-]*)([ \t]+)(%s)' % VALUE)
+FLAG = re.compile(r'-{1,2}[A-Za-z][\w.-]*')
 
 
 def _clear_effort(value):
@@ -291,23 +302,92 @@ def encode_settings(document, style):
     return style['bom'] + text.encode('utf-8')
 
 
-def is_secret_key(name, mapping=False):
-    """Whether a key's value holds credentials; `mapping` says the value is a mapping."""
-    key = re.sub(r'[^a-z0-9]', '', str(name).lower())
-    if key in SECRET_CONTAINERS:
-        return mapping
+def _plain(name):
+    return re.sub(r'[^a-z0-9]', '', str(name).lower())
+
+
+def is_secret_name(name, url=False):
+    """Whether a key, flag, variable or URL parameter name stands for a credential."""
+    key = _plain(name)
+    if key in SECRET_WORDS or (url and (key == 'sig' or 'signature' in key)):
+        return True
     # A name ending in "env" (apiKeyEnv) refers to an environment variable, it is not a credential.
     return bool(SECRET_KEY.search(key)) and not key.endswith('env')
 
 
-def mask_document(value, secret=False):
-    """Copy of a JSON document with credential strings replaced by MASK."""
+def is_secret_key(name, mapping=False):
+    """Whether a key's value holds credentials; `mapping` says the value is a mapping."""
+    key = _plain(name)
+    if key in SECRET_CONTAINERS:
+        return mapping
+    if mapping and key in SECRET_WORDS:
+        return False  # `auth: {...}` only groups the keys below it
+    return is_secret_name(name)
+
+
+def is_environment_list(name, value_is_list):
+    """Whether a list under this key holds NAME=value environment items, whose values are credentials."""
+    return value_is_list and _plain(name) in ENVIRONMENTS
+
+
+def is_secret_flag(text):
+    """A bare command-line flag (`--api-key`): the argument after it is a credential."""
+    return bool(FLAG.fullmatch(text)) and is_secret_name(text.lstrip('-'))
+
+
+def _mask_parameter(match):
+    delimiter, name, value = match.groups()
+    return delimiter + name + '=' + (MASK if value and is_secret_name(name, url=True) else value)
+
+
+def _mask_url(match):
+    url = match.group()
+    body = url.rstrip('.,;:!)]}')  # punctuation that follows a URL in prose is not part of it
+    scheme, _, rest = body.partition('://')
+    cut = next((index for index, char in enumerate(rest) if char in '/?#'), len(rest))
+    authority, tail = rest[:cut], rest[cut:]
+    if '@' in authority:
+        authority = MASK + '@' + authority.rpartition('@')[2]
+    return scheme + '://' + authority + URL_PARAMETER.sub(_mask_parameter, tail) + url[len(body):]
+
+
+def mask_text(text):
+    """Text with secret NAME=value and `--flag value` pairs masked, and the user info and secret parameters of URLs."""
+    text = ASSIGNMENT.sub(
+        lambda match: match.group(1) + '=' + MASK if is_secret_name(match.group(1).lstrip('-')) else match.group(), text)
+    text = FLAG_VALUE.sub(
+        lambda match: match.group(1) + match.group(2) + MASK if is_secret_flag(match.group(1)) else match.group(), text)
+    return URL.sub(_mask_url, text)
+
+
+def mask_string(value, assignments=False):
+    """A string outside any credential key; `assignments` says it is an item of an env list (NAME=value)."""
+    if assignments and '=' in value:
+        name, _, rest = value.partition('=')
+        return name + '=' + MASK if rest else value
+    return mask_text(value)
+
+
+def mask_document(value, secret=False, assignments=False):
+    """Copy of a JSON document with credentials replaced by MASK.
+
+    Masked are the strings under credential keys, the argument after a secret flag, the value of every NAME=value
+    item of an env list, secret NAME=value text, and the user info and secret parameters of URLs. The rules go by
+    name and shape: review a preview before sharing it.
+    """
     if isinstance(value, dict):
-        return {key: mask_document(item, secret or is_secret_key(key, isinstance(item, dict)))
+        return {key: mask_document(item, secret or is_secret_key(key, isinstance(item, dict)),
+                                   is_environment_list(key, isinstance(item, list)))
                 for key, item in value.items()}
     if isinstance(value, list):
-        return [mask_document(item, secret) for item in value]
-    return MASK if secret and isinstance(value, str) and value else value
+        masked, flagged = [], False
+        for item in value:
+            masked.append(mask_document(item, secret or flagged, assignments))
+            flagged = isinstance(item, str) and is_secret_flag(item)
+        return masked
+    if not isinstance(value, str) or not value:
+        return value
+    return MASK if secret else mask_string(value, assignments)
 
 
 def write_preview(path, data):

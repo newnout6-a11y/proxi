@@ -11,7 +11,8 @@ import pytest
 import models
 from scripts import sync_opencode_catalog as sync
 from scripts.probe_client_settings import routable_entries
-from scripts.sync_opencode_catalog import main, parse_settings, update_document, write_backed_up
+from scripts.sync_opencode_catalog import (is_secret_flag, main, mask_document, parse_settings, update_document,
+                                           write_backed_up)
 
 HAIKU = 'retool-relay/claude-haiku-4-5-20251001'
 RELAY = {'base': 'https://example.invalid', 'provider_resource_name': 'anthropic-resource',
@@ -288,6 +289,91 @@ def test_preview_masks_credentials_by_default_and_the_full_preview_is_explicit(t
     assert revealed['provider']['retool-relay']['options']['apiKey'] == 'relay-private'
     assert revealed['mcp']['docs']['headers'] == {'X-Token': 'mcp-private'}
     assert settings.read_bytes() == original
+
+
+LEAKY = {
+    'provider': {'retool-relay': {'options': {'baseURL': 'http://localhost:8787/v1', 'apiKey': 'SECRET-A'}, 'models': {}},
+                 'other': {'options': {'apiKeyEnv': 'MY_ENV_NAME', 'timeout': 600,
+                                       'baseURL': 'https://user:SECRET-B@host.example/v1?token=SECRET-C&limit=5'}}},
+    'mcp': {'server': {'command': ['npx', 'srv', '--api-key', 'SECRET-D', '--token=SECRET-E', '--secret', 'SECRET-F',
+                                   '--password', 'SECRET-G', '--port', '8080', '--verbose'],
+                       'url': 'https://h.example/mcp?key=SECRET-H&page=2#access_token=SECRET-I',
+                       'environment': {'PORT': 8080}, 'oauth': {'clientId': 'public-id', 'clientSecret': 'SECRET-J'}},
+            'tool': {'command': ['env', 'API_KEY=SECRET-K', 'run', 'https://:SECRET-L@registry.example/pkg'],
+                     'env': ['SECRET_KEY=SECRET-M', 'PLAIN=SECRET-N', 'KEEP_NAME']}},
+    'auth': {'key': 'SECRET-O', 'type': 'api'}}
+
+
+def test_masking_covers_urls_secret_arguments_env_items_and_auth_keys():
+    original = copy.deepcopy(LEAKY)
+    masked = mask_document(LEAKY)
+    assert LEAKY == original and 'SECRET-' not in json.dumps(masked)
+    assert masked['provider']['other']['options'] == {'apiKeyEnv': 'MY_ENV_NAME', 'timeout': 600,
+                                                      'baseURL': 'https://***@host.example/v1?token=***&limit=5'}
+    assert masked['provider']['retool-relay']['options']['baseURL'] == 'http://localhost:8787/v1'
+    server, tool = masked['mcp']['server'], masked['mcp']['tool']
+    assert server['command'] == ['npx', 'srv', '--api-key', '***', '--token=***', '--secret', '***', '--password', '***',
+                                 '--port', '8080', '--verbose']
+    assert server['url'] == 'https://h.example/mcp?key=***&page=2#access_token=***'
+    assert server['oauth'] == {'clientId': 'public-id', 'clientSecret': '***'}
+    assert tool['command'] == ['env', 'API_KEY=***', 'run', 'https://***@registry.example/pkg']
+    assert tool['env'] == ['SECRET_KEY=***', 'PLAIN=***', 'KEEP_NAME']
+    assert masked['auth'] == {'key': '***', 'type': 'api'}
+
+
+def test_a_masked_document_masked_again_does_not_change():
+    once = mask_document(LEAKY)
+    assert mask_document(once) == once
+
+
+@pytest.mark.parametrize('flag,secret', [('--api-key', True), ('--token', True), ('--secret', True),
+                                         ('--password', True), ('--auth-token', True), ('--key', True),
+                                         ('--client-secret', True), ('--port', False), ('--key-file', False),
+                                         ('--no-auth', False), ('--api-key=x', False), ('-k', False), ('token', False)])
+def test_only_a_bare_secret_flag_makes_the_next_argument_a_secret(flag, secret):
+    assert is_secret_flag(flag) is secret
+    assert mask_document(['run', flag, 'value'])[2] == ('***' if secret else 'value')
+
+
+@pytest.mark.parametrize('url,expected', [
+    ('https://user:pw@host/p', 'https://***@host/p'),
+    ('https://token@github.example/org/repo.git', 'https://***@github.example/org/repo.git'),
+    ('redis://:pw@cache:6379/0', 'redis://***@cache:6379/0'),
+    ('https://host/p?api_key=x&k=y&access_token=z&signature=s&sig=t&page=3', 'https://host/p?api_key=***&k=y&access_token=***&signature=***&sig=***&page=3'),
+    ('https://host/cb#access_token=abc&state=1', 'https://host/cb#access_token=***&state=1'),
+    ('https://host/p?token=', 'https://host/p?token='),
+    ('https://host:8443/a@b?x=1', 'https://host:8443/a@b?x=1'),
+    ('http://localhost:8787/v1', 'http://localhost:8787/v1'),
+    ('see https://u:pw@host/x and https://host/y?key=k.', 'see https://***@host/x and https://host/y?key=***.')])
+def test_url_userinfo_and_secret_parameters_are_masked_wherever_the_url_appears(url, expected):
+    assert mask_document({'note': url}) == {'note': expected}
+    assert mask_document([url]) == [expected]
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('npx srv --api-key SECRET-X --port 80', 'npx srv --api-key *** --port 80'),
+    ('API_KEY=SECRET-X run', 'API_KEY=*** run'),
+    ('export TOKEN="two words" && run', 'export TOKEN=*** && run'),
+    ('run --token=SECRET-X.', 'run --token=***.'),
+    ('PORT=8080 HOST=example', 'PORT=8080 HOST=example'),
+    ('MY_API_KEY_ENV=NAME_OF_VARIABLE', 'MY_API_KEY_ENV=NAME_OF_VARIABLE'),
+    ('keep --key-file /etc/key.pem', 'keep --key-file /etc/key.pem')])
+def test_secret_pairs_inside_one_string_are_masked_and_everything_else_is_kept(text, expected):
+    assert mask_document({'run': text}) == {'run': expected}
+
+
+def test_the_preview_of_a_settings_file_masks_urls_arguments_and_env_items_but_the_written_file_keeps_them(
+        tmp_path, capsys):
+    settings = installed(tmp_path, copy.deepcopy(LEAKY))
+    original = settings.read_bytes()
+    masked, full = tmp_path / 'masked.json', tmp_path / 'full.json'
+    code, summary, error = client(tmp_path, capsys, '--output', str(masked))
+    assert code == 0 and summary['preview_redacted'] is True, error
+    assert 'SECRET-' not in masked.read_text(encoding='utf-8')
+    code, summary, error = client(tmp_path, capsys, '--output', str(full), '--include-secrets')
+    assert code == 0 and 'SECRET-B' in full.read_text(encoding='utf-8')
+    assert client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'))[0] == 0
+    assert 'SECRET-D' in settings.read_text(encoding='utf-8') and settings.read_bytes() != original
 
 
 def test_written_settings_keep_credentials_and_an_existing_preview_is_never_replaced(tmp_path, capsys):
