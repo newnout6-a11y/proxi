@@ -288,6 +288,19 @@ def test_samples_are_capped_per_minute_but_averages_use_every_request(monkeypatc
     assert metrics["totals"]["requests"] == 25 and metrics["totals"]["latency_p50"] == 6
 
 
+def test_user_controlled_labels_cannot_grow_a_slot_without_bound():
+    clock = Clock()
+    log = journal.Journal(clock=clock)
+    clock.now += 5
+    for index in range(300):
+        log.emit("turn.begin", "begin", turn_id="t%d" % index, model="m%03d-" % index + "x" * 500)
+    metrics = log.metrics(window=600, bucket=60)
+    slot = next(iter(log._rollup.coarse.values()))
+    assert len(slot.models) <= journal._LABELS + 1 and "<other>" in slot.models
+    assert all(len(name) <= journal._LABEL_CHARS for name in slot.models)
+    assert sum(slot.models.values()) == 300 and metrics["totals"]["turns"] == 300
+
+
 def test_errors_are_counted_for_every_event_kind():
     clock = Clock()
     log = journal.Journal(clock=clock)

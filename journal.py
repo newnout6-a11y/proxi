@@ -37,6 +37,8 @@ MAX_SAMPLES = 1000  # latency/ttft samples kept per COARSE slot
 SAMPLE_LIMIT = 20000  # samples a percentile is computed from; a longer window is thinned evenly
 MAX_LIVE_TURNS = 4096
 LIVE_TURN_TTL = 6 * 3600
+_LABELS = 64  # distinct labels (models, statuses, ...) kept per slot; the rest fold into "<other>"
+_LABEL_CHARS = 80
 _FINE_MAX = RETENTION // FINE + 8
 _COARSE_MAX = RETENTION // COARSE + 8
 _ROUTES = ("chat", "responses", "anthropic")
@@ -174,6 +176,10 @@ class _Coarse:
 
 
 def _count(counter, key):
+    """Count a label; user-controlled ones (model names) must not grow a slot without bound."""
+    key = key[:_LABEL_CHARS]
+    if key not in counter and len(counter) >= _LABELS:
+        key = "<other>"
     counter[key] = counter.get(key, 0) + 1
 
 
