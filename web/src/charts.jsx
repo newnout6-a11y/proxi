@@ -1,5 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { isNum, fmtShortTime, fmtTokens, fmtFixed, fmtInt, fmtMs } from './format.js';
+import { isNum, fmtShortTime, fmtTokens, fmtFixed, fmtInt, fmtMs, plural } from './format.js';
 import { PHASES, phasesOf } from './turns.js';
 
 function useSize() {
@@ -40,41 +40,78 @@ function timeLabels(buckets, plotW) {
   return n ? fractions.map((f) => Math.min(n - 1, Math.round(f * (n - 1)))) : [];
 }
 
+const STEPS = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1 };
+const KEYS = new Set([...Object.keys(STEPS), 'Home', 'End', 'Escape']);
+
+function focusVisible(element) {
+  try { return element.matches(':focus-visible'); } catch { return true; }
+}
+
+/**
+ * Which period is shown. The pointer and the keyboard each keep their own choice: when the pointer leaves, the
+ * period goes back to the keyboard cursor instead of being wiped, and a key press takes over from the pointer.
+ */
 function useHover(n, plotW) {
-  const [hover, setHover] = useState(null);
+  const [pointer, setPointer] = useState(null);
+  const [cursor, setCursor] = useState(null);
   const onMove = (event) => {
     if (!n) return;
     const box = event.currentTarget.getBoundingClientRect();
     const i = Math.round(((event.clientX - box.left - PAD.l) / plotW) * (n - 1));
-    setHover(i < 0 || i >= n ? null : i);
+    setPointer(i < 0 || i >= n ? null : i);
   };
-  const keyboard = {
-    tabIndex: n ? 0 : -1,
-    onFocus: () => setHover((current) => current ?? 0),
-    onBlur: () => setHover(null),
+  const keyboard = n ? {
+    tabIndex: 0,
+    // Focus from the keyboard shows the first period; focus from a click leaves the choice to the pointer
+    onFocus: (event) => { if (focusVisible(event.currentTarget)) setCursor((current) => current ?? 0); },
+    onBlur: () => setCursor(null),
     onKeyDown: (event) => {
-      if (!n || !['ArrowLeft', 'ArrowRight', 'Home', 'End', 'Escape'].includes(event.key)) return;
+      if (!KEYS.has(event.key) || event.altKey || event.ctrlKey || event.metaKey) return;
       event.preventDefault();
-      setHover((current) => event.key === 'Escape' ? null : event.key === 'Home' ? 0 : event.key === 'End' ? n - 1
-        : Math.min(n - 1, Math.max(0, (current ?? 0) + (event.key === 'ArrowRight' ? 1 : -1))));
+      const from = pointer ?? cursor;
+      setPointer(null);
+      // With nothing chosen, an arrow enters from its own end: right starts at the first period, left at the last
+      setCursor(event.key === 'Escape' ? null : event.key === 'Home' ? 0 : event.key === 'End' ? n - 1
+        : from === null ? (STEPS[event.key] > 0 ? 0 : n - 1)
+          : Math.min(n - 1, Math.max(0, from + STEPS[event.key])));
     },
-  };
-  return [hover, onMove, () => setHover(null), keyboard];
+  } : {};
+  return [pointer ?? cursor, onMove, () => setPointer(null), keyboard];
 }
 
-function Tip({ W, x, children }) {
+const SLIDER_HINT = 'Стрелки выбирают период, Home и End — крайние периоды, Escape снимает выбор';
+
+/** With periods the chart is a slider over them (one tab stop, the period read as its value); without, only a picture. */
+function chartRole(n, active, text) {
+  if (!n) return { role: 'img' };
+  return { role: 'slider', 'aria-orientation': 'horizontal', 'aria-valuemin': 1, 'aria-valuemax': n, 'aria-valuenow': (active ?? 0) + 1,
+    'aria-valuetext': active === null ? 'период не выбран' : text, 'aria-description': SLIDER_HINT };
+}
+
+const periodOf = (bucket, windowSec, n) => `${fmtShortTime(bucket.t)}–${fmtShortTime(bucket.t + windowSec / n)}`;
+const spoken = (value) => String(value).replace('≥ ', 'не менее ').replace(/^—$/, 'нет данных');
+const valueText = (period, rows) => `${period}: ${rows.map(([label, value, said]) => `${label} ${said ?? spoken(value)}`).join(', ')}`;
+
+/** The tooltip repeats what the slider's value text says, so it stays out of the accessibility tree. */
+function Tip({ W, x, period, rows, note }) {
   const flip = x > W - 220;
-  return <dl className="chart-tip" role="status" aria-live="polite" style={flip ? { right: W - x + 12 } : { left: x + 12 }}>{children}</dl>;
+  return (
+    <dl className="chart-tip" aria-hidden="true" style={flip ? { right: W - x + 12 } : { left: x + 12 }}>
+      <dt className="mono">{period}</dt>
+      {rows.map(([label, value]) => <dd key={label}><span>{label}</span><b className="num">{value}</b></dd>)}
+      {note && <dd className="tip-note">{note}</dd>}
+    </dl>
+  );
 }
 
 /**
  * Monotone cubic through the points (Fritsch–Carlson): smooth, but it never
  * overshoots, so a quiet minute stays at zero instead of dipping below the axis.
+ * Returns the Bézier command of every step from point i to point i + 1.
  */
-function smooth(points) {
+function segments(points) {
   const n = points.length;
-  if (!n) return '';
-  if (n === 1) return `M${points[0][0]},${points[0][1]}`;
+  if (n < 2) return [];
   const dx = [], slope = [];
   for (let i = 0; i < n - 1; i += 1) {
     dx.push(points[i + 1][0] - points[i][0]);
@@ -89,16 +126,42 @@ function smooth(points) {
     const h = a * a + b * b;
     if (h > 9) { const k = 3 / Math.sqrt(h); t[i] = k * a * slope[i]; t[i + 1] = k * b * slope[i]; }
   }
-  let d = `M${points[0][0].toFixed(1)},${points[0][1].toFixed(1)}`;
-  for (let i = 0; i < n - 1; i += 1) {
-    const [x0, y0] = points[i], [x1, y1] = points[i + 1], h = dx[i] / 3;
-    d += `C${(x0 + h).toFixed(1)},${(y0 + t[i] * h).toFixed(1)} ${(x1 - h).toFixed(1)},${(y1 - t[i + 1] * h).toFixed(1)} ${x1.toFixed(1)},${y1.toFixed(1)}`;
-  }
-  return d;
+  return dx.map((step, i) => {
+    const [x0, y0] = points[i], [x1, y1] = points[i + 1], h = step / 3;
+    return `C${(x0 + h).toFixed(1)},${(y0 + t[i] * h).toFixed(1)} ${(x1 - h).toFixed(1)},${(y1 - t[i + 1] * h).toFixed(1)} ${x1.toFixed(1)},${y1.toFixed(1)}`;
+  });
+}
+
+const moveTo = ([x, y]) => `M${x.toFixed(1)},${y.toFixed(1)}`;
+
+function smooth(points) {
+  if (!points.length) return '';
+  if (points.length === 1) return `M${points[0][0]},${points[0][1]}`;
+  return moveTo(points[0]) + segments(points).join('');
+}
+
+/** The curve cut into solid and dashed runs: a step touching a point flagged in `unsure` is dashed. */
+function runs(points, unsure) {
+  const result = [];
+  segments(points).forEach((part, i) => {
+    const dashed = Boolean(unsure[i] || unsure[i + 1]);
+    const last = result[result.length - 1];
+    if (last && last.dashed === dashed) last.d += part;
+    else result.push({ dashed, d: moveTo(points[i]) + part });
+  });
+  return result;
 }
 
 const areaUnder = (line, points, baseY) => (points.length
   ? `${line}L${points[points.length - 1][0].toFixed(1)},${baseY}L${points[0][0].toFixed(1)},${baseY}Z` : '');
+
+const diamond = (x, y, r = 4) => `M${x.toFixed(1)},${(y - r).toFixed(1)}L${(x + r).toFixed(1)},${y.toFixed(1)}L${x.toFixed(1)},${(y + r).toFixed(1)}L${(x - r).toFixed(1)},${y.toFixed(1)}Z`;
+
+const spendRows = (bucket) => {
+  const credits = bucket.credits_complete === false
+    ? bucket.credits > 0 ? [`≥ ${fmtFixed(bucket.credits, 2)}`] : ['—', 'не сообщены'] : [fmtFixed(bucket.credits, 2)];
+  return [['кредиты', ...credits], ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
+};
 
 /** Credits spent per bucket as a line: it climbs with a heavy turn and falls back with a light one. */
 export function SpendChart({ buckets, windowSec }) {
@@ -112,14 +175,17 @@ export function SpendChart({ buckets, windowSec }) {
 
   const model = useMemo(() => {
     const values = buckets.map((b) => Number(b.credits) || 0);
+    // A bucket whose cost was not fully reported holds a lower bound, not a measurement
+    const unsure = buckets.map((b) => b.credits_complete === false);
     const peak = Math.max(0, ...values);
     const total = values.reduce((s, v) => s + v, 0);
     const busy = values.filter((v) => v > 0).length;
-    return { values, peak, peakIndex: values.indexOf(peak), total, max: niceMax(peak), average: busy ? total / busy : 0 };
+    return { values, unsure, unsureCount: unsure.filter(Boolean).length, peak, peakIndex: values.indexOf(peak), total,
+      max: niceMax(peak), average: busy ? total / busy : 0 };
   }, [buckets]);
 
   const empty = !n || !model.total;
-  const incomplete = buckets.some((b) => b.credits_complete === false);
+  const incomplete = model.unsureCount > 0;
   const baseY = PAD.t + plotH + 0.5;
   const yAt = (v) => baseY - (v / model.max) * plotH;
   const xAt = (i) => PAD.l + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2);
@@ -131,12 +197,18 @@ export function SpendChart({ buckets, windowSec }) {
   const bucket = active !== null ? buckets[active] : null;
   const span = bucketLabel(windowSec, n);
   const peakRight = !empty && xAt(model.peakIndex) > W - 120;
+  const peakUnsure = model.unsure[model.peakIndex];
+  const bound = incomplete ? 'не менее ' : '';
   const summary = empty ? incomplete ? 'Стоимость не сообщена' : 'Расхода за окно не было'
-    : `Расход кредитов за каждые ${span}: всего ${fmtFixed(model.total, 2)}, максимум ${fmtFixed(model.peak, 2)}`;
+    : `Расход кредитов за каждые ${span}: всего ${bound}${fmtFixed(model.total, 2)}, максимум ${bound}${fmtFixed(model.peak, 2)}`
+      + (incomplete ? `. В ${model.unsureCount} ${plural(model.unsureCount, ['периоде', 'периодах', 'периодах'])} стоимость сообщена не полностью` : '');
+  const period = bucket && periodOf(bucket, windowSec, n);
+  const rows = bucket && spendRows(bucket);
 
   return (
     <div className="chart-frame" ref={ref}>
-      <svg className="chart" width={W} height={H} role="img" aria-label={summary} aria-description="Стрелки влево и вправо выбирают период, Home и End — крайние периоды" {...keyboard} onPointerMove={onMove} onPointerLeave={onLeave}>
+      <svg className="chart" width={W} height={H} aria-label={summary} {...keyboard}
+        {...chartRole(n, active, bucket && valueText(period, rows))} onPointerMove={onMove} onPointerLeave={onLeave}>
         {ticks.map((v) => (
           <g key={v}>
             <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(v)) + 0.5} y2={Math.round(yAt(v)) + 0.5} />
@@ -147,15 +219,18 @@ export function SpendChart({ buckets, windowSec }) {
         {!empty && (
           <>
             <path className="c-spend-area" d={areaUnder(line, points, baseY)} />
-            <path className="c-spend-line" d={line} />
+            {runs(points, model.unsure).map((run, i) => (
+              <path key={i} className={`c-spend-line${run.dashed ? ' is-unsure' : ''}`} d={run.d} />
+            ))}
             {model.average > 0 && (
               <line className="c-average" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(model.average)) + 0.5} y2={Math.round(yAt(model.average)) + 0.5} />
             )}
+            {model.unsure.map((flag, i) => flag && <path key={`u${i}`} className="c-unsure-dot" d={diamond(xAt(i), yAt(model.values[i]))} />)}
             <circle className="c-peak" cx={xAt(model.peakIndex)} cy={yAt(model.peak)} r={4} />
-            {/* The figure is dropped when the scale's top tick already says it */}
-            {fmtFixed(model.peak, model.max < 1 ? 2 : 1) !== fmtFixed(model.max, model.max < 1 ? 2 : 1) && (
+            {/* The figure is dropped when the scale's top tick already says it; a lower bound always keeps it */}
+            {(peakUnsure || fmtFixed(model.peak, model.max < 1 ? 2 : 1) !== fmtFixed(model.max, model.max < 1 ? 2 : 1)) && (
               <text className="c-label c-label-accent" x={xAt(model.peakIndex) + (peakRight ? -8 : 8)} y={yAt(model.peak) - 8}
-                textAnchor={peakRight ? 'end' : 'start'}>{fmtFixed(model.peak, 2)}</text>
+                textAnchor={peakRight ? 'end' : 'start'}>{peakUnsure ? '≥ ' : ''}{fmtFixed(model.peak, 2)}</text>
             )}
           </>
         )}
@@ -172,15 +247,7 @@ export function SpendChart({ buckets, windowSec }) {
         )}
       </svg>
       {empty && <p className="chart-empty">{incomplete ? 'Стоимость не сообщена' : 'Расхода за окно не было'}</p>}
-      {bucket && (
-        <Tip W={W} x={xAt(active)}>
-          <dt className="mono">{fmtShortTime(bucket.t)}–{fmtShortTime(bucket.t + windowSec / n)}</dt>
-          <dd><span>кредиты</span><b className="num">{bucket.credits_complete === false ? bucket.credits > 0 ? `≥ ${fmtFixed(bucket.credits, 2)}` : '—' : fmtFixed(bucket.credits, 2)}</b></dd>
-          <dd><span>запросы</span><b className="num">{fmtInt(bucket.requests)}</b></dd>
-          <dd><span>ходы</span><b className="num">{fmtInt(bucket.turns)}</b></dd>
-          <dd><span>первый токен</span><b className="num">{fmtMs(bucket.ttft)}</b></dd>
-        </Tip>
-      )}
+      {bucket && <Tip W={W} x={xAt(active)} period={period} rows={rows} />}
     </div>
   );
 }
@@ -234,10 +301,14 @@ export function CacheChart({ buckets, windowSec }) {
   const summary = empty ? 'Обращений к кэшу за окно не было'
     : `Кэш за окно: прочитано ${fmtTokens(model.reads.reduce((s, v) => s + v, 0))}, записано ${fmtTokens(model.writes.reduce((s, v) => s + v, 0))}`
       + (spikes.length ? `, всплесков записи: ${spikes.length}` : '');
+  const spike = bucket && model.spikes.has(active) ? 'запись выше обычной за окно' : null;
+  const period = bucket && periodOf(bucket, windowSec, n);
+  const rows = bucket && [['прочитано', fmtTokens(bucket.cache_read)], ['записано', fmtTokens(bucket.cache_write)], ['без кэша', fmtTokens(bucket.input)]];
 
   return (
     <div className="chart-frame chart-frame-cache" ref={ref}>
-      <svg className="chart" width={W} height={H} role="img" aria-label={summary} aria-description="Стрелки влево и вправо выбирают период, Home и End — крайние периоды" {...keyboard} onPointerMove={onMove} onPointerLeave={onLeave}>
+      <svg className="chart" width={W} height={H} aria-label={summary} {...keyboard}
+        {...chartRole(n, active, bucket && `${valueText(period, rows)}${spike ? `, ${spike}` : ''}`)} onPointerMove={onMove} onPointerLeave={onLeave}>
         <text className="c-label" x={PAD.l - 8} y={PAD.t + 8} textAnchor="end">{fmtTokens(model.readMax)}</text>
         <text className="c-label" x={PAD.l - 8} y={writeTop + 8} textAnchor="end">{fmtTokens(model.writeMax)}</text>
         <text className="c-lane" x={PAD.l + 4} y={PAD.t + 10}>чтение</text>
@@ -289,15 +360,7 @@ export function CacheChart({ buckets, windowSec }) {
         )}
       </svg>
       {empty && <p className="chart-empty">Обращений к кэшу за окно не было</p>}
-      {bucket && (
-        <Tip W={W} x={xAt(active)}>
-          <dt className="mono">{fmtShortTime(bucket.t)}–{fmtShortTime(bucket.t + windowSec / n)}</dt>
-          <dd><span>прочитано</span><b className="num">{fmtTokens(bucket.cache_read)}</b></dd>
-          <dd><span>записано</span><b className="num">{fmtTokens(bucket.cache_write)}</b></dd>
-          <dd><span>без кэша</span><b className="num">{fmtTokens(bucket.input)}</b></dd>
-          {model.spikes.has(active) && <dd className="tip-note">запись выше обычной за окно</dd>}
-        </Tip>
-      )}
+      {bucket && <Tip W={W} x={xAt(active)} period={period} rows={rows} note={spike} />}
     </div>
   );
 }

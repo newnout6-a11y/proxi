@@ -462,6 +462,42 @@ test('incomplete usage is not shown as free inference or a reliable forecast', a
   await expect(page.getByText('есть неучтённый расход')).toBeVisible();
 });
 
+test('periods without a complete price are marked on the spend chart and summed as a lower bound', async ({ page }) => {
+  // Period 21 holds a known part of its price, period 31 none at all
+  const buckets = metricsFor(3600).buckets.map((bucket, i) => (i === 20 ? { ...bucket, credits: 0.2, credits_complete: false }
+    : i === 30 ? { ...bucket, credits: 0, credits_complete: false } : bucket));
+  await mockAdmin(page, { metricsPatch: { buckets, totals: { credits_complete: false } } });
+  await login(page);
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
+  await expect(chart).toHaveAttribute('aria-label', /всего не менее \d+,\d\d, максимум не менее \d+,\d\d\. В 2 периодах стоимость сообщена не полностью/);
+  // Marks on the chart itself: a hollow diamond per period and dashed stretches around it
+  await expect(page.locator('.c-unsure-dot')).toHaveCount(2);
+  await expect(page.locator('.c-spend-line.is-unsure')).toHaveCount(2);
+  await expect(page.locator('.c-spend-line:not(.is-unsure)')).toHaveCount(3);
+  await expect(page.locator('.legend', { hasText: 'за каждые 1 мин' })).toContainText('стоимость сообщена не полностью');
+  // The unknown period is read as unknown, not as zero
+  await chart.focus();
+  await chart.press('Home');
+  for (let i = 0; i < 20; i += 1) await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuenow', '21');
+  await expect(chart).toHaveAttribute('aria-valuetext', /кредиты не менее 0,20/);
+  await expect(page.locator('.chart-tip')).toContainText('≥ 0,20');
+  for (let i = 0; i < 10; i += 1) await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuenow', '31');
+  await expect(chart).toHaveAttribute('aria-valuetext', /кредиты не сообщены/);
+  await expect(page.locator('.chart-tip dd').first()).toContainText('—');
+});
+
+test('a spend chart whose prices are all reported has no lower-bound marks', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await expect(page.getByRole('slider', { name: /Расход кредитов/ })).toHaveAttribute('aria-label', /всего \d/);
+  await expect(page.getByRole('slider', { name: /Расход кредитов/ })).not.toHaveAttribute('aria-label', /не менее/);
+  await expect(page.locator('.c-unsure-dot')).toHaveCount(0);
+  await expect(page.locator('.c-spend-line.is-unsure')).toHaveCount(0);
+  await expect(page.locator('.legend', { hasText: 'за каждые 1 мин' })).not.toContainText('не полностью');
+});
+
 test('activity tabs and chart values work with the keyboard', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
@@ -478,6 +514,112 @@ test('activity tabs and chart values work with the keyboard', async ({ page }) =
   await turns.press('ArrowRight');
   await expect(page.getByRole('tab', { name: /Все события/ })).toBeFocused();
   await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'activity-tab-events');
+});
+
+test('activity tabs follow the WAI-ARIA tabs pattern: each controls a real panel, and a panel is a tab stop only when it holds nothing focusable', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Активность');
+  const wiring = () => page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].map((tab) => {
+    const panel = document.getElementById(tab.getAttribute('aria-controls'));
+    return { tab: tab.id, selected: tab.getAttribute('aria-selected'), role: panel?.getAttribute('role'),
+      labelledby: panel?.getAttribute('aria-labelledby'), hidden: panel?.hidden };
+  }));
+  expect(await wiring()).toEqual([
+    { tab: 'activity-tab-turns', selected: 'true', role: 'tabpanel', labelledby: 'activity-tab-turns', hidden: false },
+    { tab: 'activity-tab-events', selected: 'false', role: 'tabpanel', labelledby: 'activity-tab-events', hidden: true },
+  ]);
+  // The turns hold buttons to land on: the panel itself is not an extra stop, and Tab goes straight to the first turn
+  const panel = page.getByRole('tabpanel');
+  await expect.poll(() => panel.getAttribute('tabindex')).toBeNull();
+  await page.getByRole('tab', { name: /Ходы моделей/ }).focus();
+  await page.keyboard.press('Tab');
+  await expect(page.locator('.trace-head').first()).toBeFocused();
+  await page.getByRole('tab', { name: /Все события/ }).click();
+  expect(await wiring()).toEqual([
+    { tab: 'activity-tab-turns', selected: 'false', role: 'tabpanel', labelledby: 'activity-tab-turns', hidden: true },
+    { tab: 'activity-tab-events', selected: 'true', role: 'tabpanel', labelledby: 'activity-tab-events', hidden: false },
+  ]);
+  await expect.poll(() => panel.getAttribute('tabindex')).toBeNull();
+});
+
+test('an empty activity panel is a tab stop of its own, so its message can be reached', async ({ page }) => {
+  await mockAdmin(page, { empty: true });
+  await login(page);
+  await nav(page, 'Активность');
+  const panel = page.getByRole('tabpanel');
+  await expect(panel).toContainText('Ходов пока нет');
+  await expect(panel).toHaveAttribute('tabindex', '0');
+  await page.getByRole('tab', { name: /Ходы моделей/ }).focus();
+  await page.keyboard.press('Tab');
+  await expect(panel).toBeFocused();
+});
+
+test('charts are sliders over their periods: Escape clears, an arrow re-enters from its own end, a passing pointer keeps the keyboard choice', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  // An image carries neither focus nor key handlers: both charts are sliders with a value read out in words
+  await expect(page.locator('svg.chart')).toHaveCount(2);
+  await expect(page.locator('svg.chart[role="img"]')).toHaveCount(0);
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
+  await expect(chart).toHaveAttribute('tabindex', '0');
+  await expect(chart).toHaveAttribute('aria-valuemin', '1');
+  await expect(chart).toHaveAttribute('aria-valuemax', '60');
+  await expect(chart).toHaveAttribute('aria-valuetext', 'период не выбран');
+  await chart.focus();
+  await chart.press('End');
+  await expect(chart).toHaveAttribute('aria-valuenow', '60');
+  await expect(chart).toHaveAttribute('aria-valuetext', /кредиты .*запросы .*ходы /);
+  await expect(page.locator('.chart-tip')).toBeVisible();
+  await chart.press('Escape');
+  await expect(page.locator('.chart-tip')).toHaveCount(0);
+  await expect(chart).toHaveAttribute('aria-valuetext', 'период не выбран');
+  // From nothing, right starts at the first period (it used to skip to the second) and left at the last
+  await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuenow', '1');
+  await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuenow', '2');
+  await chart.press('Escape');
+  await chart.press('ArrowLeft');
+  await expect(chart).toHaveAttribute('aria-valuenow', '60');
+  await chart.press('ArrowDown');
+  await expect(chart).toHaveAttribute('aria-valuenow', '59');
+  await chart.press('ArrowUp');
+  await expect(chart).toHaveAttribute('aria-valuenow', '60');
+  // The pointer takes over while it is over the chart and gives the period back when it leaves
+  await chart.press('End');
+  await chart.scrollIntoViewIfNeeded();
+  const box = await chart.boundingBox();
+  await page.mouse.move(box.x + 56 + 20, box.y + box.height / 2);
+  await expect(chart).toHaveAttribute('aria-valuenow', /^[1-5]$/);
+  await page.mouse.move(5, 5);
+  await expect(chart).toBeFocused();
+  await expect(chart).toHaveAttribute('aria-valuenow', '60');
+  await expect(page.locator('.chart-tip')).toBeVisible();
+  // Leaving focus drops the keyboard choice
+  await chart.blur();
+  await expect(page.locator('.chart-tip')).toHaveCount(0);
+});
+
+test('a chart reached only by the pointer clears when the pointer leaves', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
+  await chart.scrollIntoViewIfNeeded();
+  const box = await chart.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.locator('.chart-tip')).toBeVisible();
+  await expect(chart).not.toBeFocused();
+  await page.mouse.move(5, 5);
+  await expect(page.locator('.chart-tip')).toHaveCount(0);
+});
+
+test('a chart without periods is a plain image: not focusable, no slider', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { buckets: [] } });
+  await login(page);
+  await expect(page.locator('svg.chart[role="img"]')).toHaveCount(2);
+  await expect(page.locator('svg.chart[role="slider"]')).toHaveCount(0);
+  await expect(page.locator('svg.chart[tabindex]')).toHaveCount(0);
 });
 
 test('model controls stay readable on a narrow display', async ({ page }) => {

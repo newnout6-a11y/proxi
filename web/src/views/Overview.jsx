@@ -151,6 +151,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
   const label = WINDOWS.find((w) => w.id === windowSec).long;
   const span = bucketLabel(windowSec, buckets.length);
   const busy = buckets.filter((b) => (b.credits || 0) > 0).length;
+  const unsure = buckets.some((b) => b.credits_complete === false);
 
   return (
     <Page className="overview">
@@ -191,6 +192,12 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
               <li><i className="lg-spend" />за каждые {span || '—'}</li>
               <li><i className="lg-peak" />пик</li>
               <li><i className="lg-average" />среднее по активным</li>
+              {unsure && (
+                <li>
+                  <svg className="lg-unsure" width="14" height="4" viewBox="0 0 14 4" aria-hidden="true"><path d="M0 2H14" /></svg>
+                  стоимость сообщена не полностью
+                </li>
+              )}
             </ul>
           </div>
           <SpendChart buckets={buckets} windowSec={windowSec} />
