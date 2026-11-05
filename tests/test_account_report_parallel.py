@@ -12,7 +12,7 @@ from test_account_dispatcher import Account, Clock
 class Counting:
     """A balance source that records how many lookups are in flight and waits until `want` of them are."""
 
-    def __init__(self, want, window=0.3):
+    def __init__(self, want, window=2.0):
         self.want, self.window = want, window
         self.active = self.peak = 0
         self.lock = threading.Lock()

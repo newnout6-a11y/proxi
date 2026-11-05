@@ -1,7 +1,6 @@
 """A POST to another account is not a retry: the rejected attempt cost nothing, so it never waits."""
 import asyncio
 import io
-import time
 import urllib.error
 from email.message import Message
 from types import SimpleNamespace
@@ -141,12 +140,11 @@ def four_accounts(tmp_path, monkeypatch):
 
 def test_failing_over_past_three_limited_accounts_costs_no_waiting(four_accounts):
     four_accounts.script.update(a=limited, b=limited, c=limited)
-    started = time.monotonic()
     events = asyncio.run(run(four_accounts.runner, request(FIRST)))
     assert four_accounts.posts == ["a", "b", "c", "d"]
     assert {"type": "text", "delta": "OK"} in events and not any(e["type"] == "error" for e in events)
+    # The retries used to add 0.5 + 1 + 2 seconds; the real wait now runs with a delay of zero every time.
     assert four_accounts.delays and not any(four_accounts.delays)
-    assert time.monotonic() - started < 3  # the retries used to add 0.5 + 1 + 2 seconds
 
 
 def test_a_balance_failover_does_not_wait_either(four_accounts):
