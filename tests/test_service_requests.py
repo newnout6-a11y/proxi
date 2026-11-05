@@ -251,8 +251,9 @@ def test_http_logs_distinguish_a_long_title_from_primary_chat(relay, capsys):
     ({"temperature": 0.2, "top_p": 0.9, "top_k": 5, "metadata": {"k": "v"}}, "debug"),
     ({"temperature": 1, "logprobs": True}, "warn"),
     ({"logit_bias": {"50256": -100}}, "warn"),
-    ({"temperature": 1, "prompt_cache_key": "PRIVATE-KEY"}, "warn"),
-], ids=["claude-code", "sampling-only", "logprobs", "logit-bias", "cache-key"])
+    ({"temperature": 1, "prompt_cache_key": "PRIVATE-KEY"}, "debug"),
+    ({"temperature": 1, "output_config": {"task_budget": {"type": "tokens", "total": 1000}}}, "debug"),
+], ids=["claude-code", "sampling-only", "logprobs", "logit-bias", "cache-key", "task-budget"])
 def test_routine_ignored_parameters_are_quiet_but_material_ones_still_warn(relay, monkeypatch, extra, level):
     log = journal.Journal()
     monkeypatch.setattr(journal, "JOURNAL", log)
@@ -260,11 +261,27 @@ def test_routine_ignored_parameters_are_quiet_but_material_ones_still_warn(relay
     with relay.request("/v1/messages", payload) as response:
         assert response.status == 200
         names = response.headers["x-proxi-ignored-parameters"].split(",")
-    assert set(names) == set(extra)
+    expected = {"output_config.task_budget" if key == "output_config" else key for key in extra}
+    assert set(names) == expected
     entries = [e for e in log.query() if e["kind"] == "request.compatibility"]
     assert len(entries) == 1 and entries[0]["level"] == level
     assert entries[0]["data"]["parameters"] == names
     assert "PRIVATE-KEY" not in json.dumps(entries) and '"D"' not in json.dumps(entries)
+
+
+def test_codex_per_request_hints_do_not_warn_on_every_turn(relay, monkeypatch):
+    log = journal.Journal()
+    monkeypatch.setattr(journal, "JOURNAL", log)
+    payload = {"model": "gpt-6-sol", "input": "hi", "store": False, "include": ["reasoning.encrypted_content"],
+               "prompt_cache_key": "PRIVATE-KEY", "client_metadata": {"k": "v"},
+               "prompt_cache_options": {"mode": "auto"}}
+    with relay.request("/v1/responses", payload) as response:
+        assert response.status == 200
+        names = set(response.headers["x-proxi-ignored-parameters"].split(","))
+    assert {"include", "prompt_cache_key", "client_metadata", "prompt_cache_options"} <= names
+    entries = [e for e in log.query() if e["kind"] == "request.compatibility"]
+    assert entries and all(e["level"] == "debug" for e in entries)
+    assert "PRIVATE-KEY" not in json.dumps(entries)
 
 
 def test_token_estimate_includes_large_tool_schema_and_remains_local(relay):

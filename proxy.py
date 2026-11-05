@@ -593,7 +593,11 @@ def make_handler(runtime: Runtime):
                 # Claude Code sends temperature and metadata.user_id on every request and keeps its
                 # late tool announcements in the history, so none of that is a journal warning.
                 names, tool_changes = set(parsed.declared_ignored), set(parsed.inline_tool_changes)
-                routine = {'temperature', 'top_p', 'top_k', 'seed', 'presence_penalty', 'frequency_penalty', 'metadata'}
+                # Hints that clients send on every request and that the relay safely
+                # replaces with its own behaviour; material controls still warn.
+                routine = {'temperature', 'top_p', 'top_k', 'seed', 'presence_penalty', 'frequency_penalty', 'metadata',
+                           'prompt_cache_key', 'prompt_cache_retention', 'prompt_cache_options', 'include',
+                           'client_metadata', 'verbosity', 'text.verbosity', 'output_config.task_budget'}
                 level = 'warn' if names - routine - tool_changes else 'info' if names & tool_changes else 'debug'
                 journal.emit('request.compatibility',
                              'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
