@@ -2,6 +2,7 @@
 import asyncio
 import io
 import json
+import random
 import time
 import urllib.error
 from email.message import Message
@@ -14,10 +15,14 @@ import admin
 import config
 import direct
 import journal
+import upstream_attempts
 from accounts import DEAD_AFTER, AccountDispatcher
 from session import SessionPool
-from test_account_dispatcher import Account, FakeManager, FakeRefresher, dispatcher
+from test_account_dispatcher import Account, Clock, FakeManager, FakeRefresher, dispatcher
 from test_admin import admin_relay  # noqa: F401 - fixture
+from test_native_context_reuse import FIRST, Backend, request, run, setup
+from test_review_fixes_pr19 import END, response, text
+from upstream_attempts import AttemptBudget
 
 MESSAGE = ("You have exceeded your hourly limit of managed API key usage. Please go to the Retool AI resource "
            "in the Resources page to configure your own API keys.")
@@ -316,3 +321,240 @@ def test_the_admin_schema_lists_the_cooldown_as_a_routing_setting(admin_relay):
     status, body, _ = admin_relay.patch({"account_rate_limit_cooldown": 1200})
     assert status == 200 and body["applied"] == [] and body["pending_restart"] == ["account_rate_limit_cooldown"]
     assert admin_relay.patch({"account_rate_limit_cooldown": 4000})[0] == 400
+
+
+# -- 3: the turn moves to another account ------------------------------------------------
+def serve_ok(_request):
+    return response(text("OK"), *END)
+
+
+def hourly(request_):
+    raise urllib.error.HTTPError(request_.full_url, 429, "Too Many Requests", Message(),
+                                 io.BytesIO(HOURLY_BODY.encode()))
+
+
+def short_429(request_):
+    raise urllib.error.HTTPError(request_.full_url, 429, "Too Many Requests", Message(),
+                                 io.BytesIO(SHORT_BODY.encode()))
+
+
+def tag(account_id):
+    return journal.tag(account_id)
+
+
+@pytest.fixture
+def retool(tmp_path, monkeypatch):
+    """Two accounts behind one pool, a real dispatcher and the real direct transport on a scripted Retool."""
+    monkeypatch.setattr(AttemptBudget, "wait", lambda self, delay, cancelled: None)
+    monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
+    settings = dict(transport="direct", project_context=False, cookie_values=[], cache_keepwarm_seconds=0,
+                    upstream_error_dir=str(tmp_path))
+    first, pool, runner = setup(tmp_path, base="https://acc-a.invalid", account_id="acc-a", **settings)
+    second = Backend(tmp_path, base="https://acc-b.invalid", account_id="acc-b", **settings)
+    pool.backends.append(second)
+    for backend in pool.backends:
+        backend.headers = lambda: {}
+    clock = Clock()
+    manager = AccountDispatcher(list(pool.backends), runner.cfg, {}, clock=clock, rng=random.Random(1))
+    runner.accounts = manager
+    posts, script = [], {}
+
+    def opener(request_, **_kwargs):
+        account = request_.full_url.split("/")[2].split(".")[0]
+        posts.append(account)
+        return script.get(account, serve_ok)(request_)
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
+    return SimpleNamespace(pool=pool, runner=runner, dispatcher=manager, clock=clock, a=first, b=second,
+                           posts=posts, script=script)
+
+
+def turn(conversation="conv-1"):
+    parsed = request(FIRST, key=conversation)
+    parsed.request_id = "req-" + conversation
+    return parsed
+
+
+def test_a_turn_that_hits_the_hourly_limit_moves_to_the_next_account_unseen(retool):
+    retool.script["acc-a"] = hourly
+    before = journal.JOURNAL.last_seq
+    events = asyncio.run(run(retool.runner, turn()))
+    assert retool.posts == ["acc-a", "acc-b"]
+    assert {"type": "text", "delta": "OK"} in events and events[-1] == {"type": "end", "reason": "stop"}
+    assert not any(event["type"] == "error" for event in events)
+    assert retool.a.unavailable["reason"] == "rate_limited" and retool.b.unavailable is None
+    assert retool.pool._conversations["conv-1"].backend is retool.b
+    parked = _events("account.rate_limited", before)
+    assert len(parked) == 1 and parked[0]["request_id"] == "req-conv-1"
+    assert parked[0]["data"]["account"] == tag("acc-a") and parked[0]["data"]["until"] > time.time()
+    moved = _events("account.failover", before)
+    assert len(moved) == 1 and moved[0]["request_id"] == "req-conv-1"
+    assert moved[0]["data"]["account"] == tag("acc-a")
+    assert moved[0]["data"]["error"] == "rate_limit_error" and moved[0]["data"]["reason"] == "rate_limited"
+    assert not retool.pool._active
+
+
+def test_the_retry_after_header_sets_the_pause(retool):
+    def hinted(request_):
+        raise urllib.error.HTTPError(request_.full_url, 429, "Too Many Requests", _headers(retry_after="120"),
+                                     io.BytesIO(HOURLY_BODY.encode()))
+
+    retool.script["acc-a"] = hinted
+    asyncio.run(run(retool.runner, turn()))
+    assert (retool.a.unavailable["pause"], retool.a.unavailable["source"]) == (120.0, "retry_after")
+
+
+def test_a_bound_conversation_moves_when_its_account_is_parked(retool):
+    async def scenario():
+        await run(retool.runner, turn())
+        assert retool.pool._conversations["conv-1"].backend is retool.a
+        retool.posts.clear()
+        retool.dispatcher.mark_rate_limited(retool.a)
+        before = journal.JOURNAL.last_seq
+        return before, await run(retool.runner, turn())
+
+    before, events = asyncio.run(scenario())
+    assert retool.posts == ["acc-b"]  # the parked account is not even tried
+    assert {"type": "text", "delta": "OK"} in events
+    assert retool.pool._conversations["conv-1"].backend is retool.b
+    migrated = _events("account.migrate", before)
+    assert len(migrated) == 1 and migrated[0]["data"]["reason"] == "rate_limited"
+
+
+def test_the_account_returns_after_the_pause_and_new_conversations_use_it_again(retool):
+    async def scenario():
+        await run(retool.runner, turn("conv-1"))
+        retool.dispatcher.mark_rate_limited(retool.a)
+        await run(retool.runner, turn("conv-1"))
+        retool.clock.now += 901
+        assert retool.dispatcher.release_rate_limited()
+        await run(retool.runner, turn("conv-2"))
+        await run(retool.runner, turn("conv-1"))
+
+    asyncio.run(scenario())
+    assert retool.a.unavailable is None
+    # The old conversation does not bounce back (its prefix cache lives on the new account).
+    assert retool.pool._conversations["conv-1"].backend is retool.b
+    assert retool.pool._conversations["conv-2"].backend is retool.a
+
+
+def test_the_first_real_request_after_the_pause_parks_the_account_again_for_longer(retool):
+    retool.script["acc-a"] = hourly
+
+    async def scenario():
+        await run(retool.runner, turn("conv-1"))
+        retool.clock.now += 901
+        retool.dispatcher.release_rate_limited()
+        return await run(retool.runner, turn("conv-2"))
+
+    events = asyncio.run(scenario())
+    assert retool.posts == ["acc-a", "acc-b", "acc-a", "acc-b"]
+    assert {"type": "text", "delta": "OK"} in events and not any(event["type"] == "error" for event in events)
+    assert (retool.a.unavailable["pause"], retool.a.unavailable["source"]) == (1800.0, "escalated")
+
+
+def test_when_every_account_is_limited_the_client_gets_a_429_with_retry_after(retool):
+    retool.script["acc-a"] = retool.script["acc-b"] = hourly
+
+    async def scenario():
+        first = await run(retool.runner, turn("conv-1"))
+        posts = len(retool.posts)
+        second = await run(retool.runner, turn("conv-2"))
+        return first, posts, second
+
+    first, posts, second = asyncio.run(scenario())
+    assert posts == 2 and retool.posts == ["acc-a", "acc-b"]  # the second turn never reached Retool
+    for events in (first, second):
+        error = events[-1]["error"]
+        assert (error.status, error.code) == (429, "rate_limit_error")
+        assert "все аккаунты упёрлись в часовой лимит Retool" in error.message
+        assert 890 <= error.retry_after <= 900 and "15 мин" in error.message
+        assert not apierr.is_account_quota(error)
+    assert {retool.a.unavailable["reason"], retool.b.unavailable["reason"]} == {"rate_limited"}
+
+
+def test_a_limit_mixed_with_other_unusable_accounts_still_answers_429(retool):
+    retool.dispatcher.mark_rate_limited(retool.a, retry_after=120)
+    retool.b.unavailable = {"reason": "exhausted", "available": 0.0, "threshold": 20.0}
+    error = SessionPool._unusable_error(retool.pool.backends)
+    assert (error.status, error.code) == (429, "rate_limit_error")
+    assert "1 из 2" in error.message and 100 <= error.retry_after <= 120
+
+
+def test_an_ordinary_429_is_returned_as_before_without_parking_the_account(retool):
+    retool.script["acc-a"] = short_429
+    before = journal.JOURNAL.last_seq
+    events = asyncio.run(run(retool.runner, turn()))
+    error = events[-1]["error"]
+    assert retool.posts == ["acc-a"]
+    assert (error.status, error.code, error.message) == (429, "rate_limit_error", "Slow down, try again")
+    assert retool.a.unavailable is None
+    assert not _events("account.rate_limited", before) and not _events("account.failover", before)
+
+
+def test_an_hourly_error_in_the_middle_of_a_stream_parks_the_account_for_the_next_request(retool):
+    retool.script["acc-a"] = lambda _request: response(
+        text("par"), {"event": "error", "statusCode": 429, "error": {"message": MESSAGE}})
+
+    async def scenario():
+        first = await run(retool.runner, turn())
+        second = await run(retool.runner, turn())
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    # Part of the answer is already with the client: no silent retry, but the account is parked.
+    assert {"type": "text", "delta": "par"} in first
+    assert first[-1]["type"] == "error" and first[-1]["error"].status == 429
+    assert retool.a.unavailable["reason"] == "rate_limited"
+    assert retool.posts == ["acc-a", "acc-b"]
+    assert {"type": "text", "delta": "OK"} in second and not any(event["type"] == "error" for event in second)
+    assert retool.pool._conversations["conv-1"].backend is retool.b
+
+
+def test_without_attempts_left_the_account_is_parked_but_the_turn_is_not_retried(retool, monkeypatch):
+    monkeypatch.setattr(upstream_attempts, "MAX_ATTEMPTS", 1)
+    retool.script["acc-a"] = hourly
+    events = asyncio.run(run(retool.runner, turn()))
+    error = events[-1]["error"]
+    assert retool.posts == ["acc-a"] and error.status == 429 and error.message == MESSAGE
+    assert retool.a.unavailable["reason"] == "rate_limited" and retool.b.unavailable is None
+
+
+def test_a_dispatcher_without_marking_still_moves_the_turn(retool):
+    retool.runner.accounts = SimpleNamespace(check_balance_now=lambda backend: False)
+    retool.script["acc-a"] = hourly
+    events = asyncio.run(run(retool.runner, turn()))
+    assert retool.posts == ["acc-a", "acc-b"] and {"type": "text", "delta": "OK"} in events
+    assert retool.a.unavailable is None
+
+
+def test_a_lone_parked_account_answers_429_and_keeps_its_conversation(tmp_path):
+    _, pool, _ = setup(tmp_path, transport="direct", project_context=False)
+
+    async def scenario():
+        lease = await pool.acquire("chat")
+        first = lease.session
+        await pool.release(lease)
+        pool.backends[0].unavailable = {"reason": "rate_limited", "until_at": time.time() + 600, "pause": 900.0}
+        with pytest.raises(apierr.ApiError) as caught:
+            await pool.acquire("chat")
+        assert pool._conversations["chat"] is first
+        assert not pool._active and pool._slots._value == 8
+        return caught.value
+
+    error = asyncio.run(scenario())
+    assert (error.status, error.code) == (429, "rate_limit_error") and 590 <= error.retry_after <= 600
+
+
+def test_shared_mode_refuses_a_parked_account_without_calling_retool(tmp_path):
+    _, pool, _ = setup(tmp_path, transport="direct", project_context=False, session_mode="shared")
+    pool.backends[0].unavailable = {"reason": "rate_limited", "until_at": time.time() + 120, "pause": 900.0}
+
+    async def scenario():
+        with pytest.raises(apierr.ApiError) as caught:
+            await pool.acquire("chat")
+        assert pool._slots._value == 8
+        return caught.value
+
+    error = asyncio.run(scenario())
+    assert error.status == 429 and 110 <= error.retry_after <= 120

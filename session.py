@@ -906,7 +906,7 @@ class SessionPool:
 
     @staticmethod
     def _usable(backend, exclude=()):
-        """The dispatcher marks exhausted or signed-out accounts unavailable; the
+        """The dispatcher marks exhausted, signed-out or rate-limited accounts unavailable; the
         operator can switch an account off."""
         return (backend not in exclude and getattr(backend, "unavailable", None) is None
                 and account_enabled(backend))
@@ -931,6 +931,11 @@ class SessionPool:
         if not backends:
             return apierr.service_unavailable("no enabled account: every account is switched off")
         reasons = [getattr(b, "unavailable", None) or {} for b in backends]
+        limited = [r for r in reasons if r.get("reason") == "rate_limited"]
+        if limited:
+            # The hourly limit clears by itself: say when, instead of a 402/503 that implies a manual fix.
+            wait = min(max(0.0, r.get("until_at", 0.0) - time.time()) for r in limited)
+            return apierr.accounts_rate_limited(wait, len(limited), len(backends))
         exhausted = [(journal.tag(b.cfg.get("account_id") or b.cfg.get("page_uuid")), r.get("available"))
                      for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
         if exhausted:
@@ -1072,9 +1077,9 @@ class SessionPool:
                 self._check_route(self.backend, model_entry)
                 if not account_enabled(self.backend):
                     raise apierr.service_unavailable("the shared-mode account is switched off")
-                if (self.backend in exclude or
-                        ((getattr(self.backend, "unavailable", None) or {}).get("reason") == "exhausted"
-                         and not self._reserve([self.backend], exclude))):
+                reason = (getattr(self.backend, "unavailable", None) or {}).get("reason")
+                if (self.backend in exclude or reason == "rate_limited" or
+                        (reason == "exhausted" and not self._reserve([self.backend], exclude))):
                     raise self._unusable_error([self.backend])
                 lock = self._lock
                 await lock.acquire()
