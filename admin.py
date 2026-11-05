@@ -340,6 +340,21 @@ class Admin:
             })
         return accounts
 
+    def _session(self):
+        """Session renewal of the accounts that serve: a switched-off first account no longer speaks for the pool."""
+        backends = [backend for backend in self._live_backends()
+                    if account_enabled(backend) and getattr(backend, "refresher", None) is not None]
+        statuses = [backend.refresher.status() for backend in backends]
+        if not statuses:
+            return {**self.runtime.backend.refresher.status(), "accounts": {"enabled": 0, "failing": 0}}
+        renewed = [item.get("last_success_at") for item in statuses if item.get("last_success_at") is not None]
+        return {"keepalive": any(item.get("keepalive") for item in statuses),
+                "last_success_at": max(renewed) if renewed else None,
+                "error": next((item["error"] for item in statuses if item.get("error")), None),
+                "persistence_error": next((item["persistence_error"] for item in statuses
+                                           if item.get("persistence_error")), None),
+                "accounts": {"enabled": len(statuses), "failing": sum(1 for item in statuses if item.get("error"))}}
+
     def _overview(self, handler):
         runtime = self.runtime
         entries = account_report.collect(runtime)
@@ -371,7 +386,7 @@ class Admin:
                        "upstream_empty_retries": self.cfg.get("upstream_empty_retries", 1),
                        "max_workers": self.cfg["max_workers"],
                        "max_conversations": self.cfg["max_conversations"]},
-            "session": runtime.backend.refresher.status(),
+            "session": self._session(),
             "sessions": {"active": len(pool._active), "cached": len(pool._conversations),
                          "max_workers": self.cfg["max_workers"],
                          "max_conversations": self.cfg["max_conversations"], "mode": pool.mode},

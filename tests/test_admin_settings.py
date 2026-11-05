@@ -127,3 +127,19 @@ def test_reason_is_about_the_enabled_accounts_not_a_switched_off_one(pool):
     pool.backends[0].cfg["enabled"] = False
     nobody = openai()
     assert nobody["route_blocker"] == "no_accounts" and nobody["route_status"] == "unrouted"
+
+
+# -- overview ------------------------------------------------------------------------
+def test_overview_session_speaks_for_the_enabled_accounts_only(pool):
+    first, second = pool.backends
+    first.refresher.last_error, first.refresher.last_success_at = "session renewal failed: HTTP 401", 100.0
+    second.refresher.last_error, second.refresher.last_success_at = None, 1700000100.0
+    session = pool.call("/admin/api/overview")[1]["session"]
+    assert session["error"] == "session renewal failed: HTTP 401" and session["last_success_at"] == 1700000100.0
+    assert session["accounts"] == {"enabled": 2, "failing": 1}
+
+    assert pool.call("/admin/api/accounts/" + pool.tags[0], {"enabled": False}, method="PATCH")[0] == 200
+    session = pool.call("/admin/api/overview")[1]["session"]
+    assert session["error"] is None and session["last_success_at"] == 1700000100.0
+    assert session["accounts"] == {"enabled": 1, "failing": 0}
+    assert {"keepalive", "persistence_error"} <= set(session)
