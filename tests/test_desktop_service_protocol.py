@@ -49,13 +49,11 @@ def test_unknown_thinking_display_is_still_rejected():
     assert error.value.param == 'thinking.display'
 
 
-@pytest.mark.parametrize('change', ['system', 'extra_property', 'wrong_type', 'open_object', 'numeric_false', 'tools'])
-def test_title_exception_does_not_enable_general_json_schema(change):
+@pytest.mark.parametrize('change', ['extra_property', 'wrong_type', 'open_object', 'numeric_false', 'tools'])
+def test_only_the_exact_title_contract_gets_the_title_label(change):
     body = title_body()
     schema = body['output_config']['format']['schema']
-    if change == 'system':
-        body['system'] = 'Answer an ordinary question'
-    elif change == 'extra_property':
+    if change == 'extra_property':
         schema['properties']['other'] = {'type': 'string'}
     elif change == 'wrong_type':
         schema['properties']['title']['type'] = 'number'
@@ -65,9 +63,19 @@ def test_title_exception_does_not_enable_general_json_schema(change):
         schema['additionalProperties'] = 0
     else:
         body['tools'] = [{'name': 'read', 'input_schema': {'type': 'object'}}]
-    with pytest.raises(apierr.ApiError) as error:
-        validate.parse_anthropic(body, CFG)
-    assert error.value.param == 'output_config.format'
+    p = validate.parse_anthropic(body, CFG)
+    # The request is still a valid structured output, validated against ITS schema.
+    assert not p.structured_title and p.structured_output['label'] == 'validated-json-schema'
+    assert p.structured_output['schema'] == schema
+
+
+def test_title_is_recognised_by_its_schema_not_by_the_prompt_wording():
+    body = title_body(system='Give this session a short name.')
+    p = validate.parse_anthropic(body, CFG)
+    assert p.structured_title and p.structured_output['label'] == 'validated-session-title'
+    assert client_context.request_kind(p) == 'session-title'
+    body['tools'] = [{'name': 'read', 'input_schema': {'type': 'object'}}]
+    assert client_context.request_kind(validate.parse_anthropic(body, CFG)) == 'client-tools'
 
 
 class Writer:

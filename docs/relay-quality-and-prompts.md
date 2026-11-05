@@ -245,25 +245,55 @@ budget отклоняется до inference. `clear_at` для turn-scoped си
 
 ## Параметры генерации
 
-`verbosity` управляет подробностью видимого ответа, отдельно от reasoning effort.
-Chat Completions принимает `verbosity: "low" | "medium" | "high"`; Responses —
-`text: {"verbosity": "high"}`. Top-level поле также принимается совместимыми
-входами relay, включая Messages при выборе поддержанной GPT-модели. Противоречивые
-значения отклоняются. Параметр доступен только когда каталог содержит
-`verbosity_levels`; это не утверждение доступности самой модели на аккаунте.
+`verbosity` — необязательная подсказка о подробности видимого ответа, отдельно от
+reasoning effort. Chat Completions принимает `verbosity: "low" | "medium" | "high"`;
+Responses — `text: {"verbosity": "high"}`. Top-level поле также принимается
+совместимыми входами relay, включая Messages. Неверное значение и противоречие двух
+значений отклоняются с 422 для любой модели. Дальше судьбу значения решает каталог:
+модели с `verbosity_levels` получают его настоящим полем Retool, а для остальных
+(все Claude, GPT-4.x, Gemini, GLM) relay принимает подсказку, не передаёт её в Retool и
+называет поле (`verbosity` или `text.verbosity`) в `x-proxi-ignored-parameters` и
+журнале. Это не утверждение доступности самой модели на аккаунте.
 
-Текущий список основан на явном registry: GPT-5, 5.1, 5.2, 5.3 Codex, 5.4,
-5.5 и семейство 5.6 Sol/Terra/Luna; для GPT-6 Sol дополнительно выполнен живой
-тест. Поддержка не выводится автоматически из названия GPT или наличия thinking.
-Codex discovery публикует ту же возможность. Изменение verbosity не меняет
-scope подписанной входной истории: в tool loop передаётся текущее значение,
-а прежние assistant blocks и ключ кэша сохраняются. Это не обещание cache hit
+Список `verbosity_levels` — явный registry, а не вывод из названия GPT или наличия
+thinking. Он подтверждён живыми прямыми запросами к маршруту Retool 2026-11-05: один и
+тот же вопрос («Explain what a hash table is and when to use one»,
+`reasoningEffort: low`) без параметра, с `low` и с `high`; в ячейках длина ответа в
+словах, по одному ответу на ячейку.
+
+| Модель | Без параметра | low | high | Маршрут | Итог |
+| --- | ---: | ---: | ---: | --- | --- |
+| `claude-sonnet-5-5` | 492 | 470 | 417 | App Builder | HTTP 200, эффекта нет: подсказка игнорируется |
+| `gpt-6-sol` | 116 | 88 | 141 | App Builder | эффект есть, но слабый |
+| `gpt-5.5` | 550 | 264 | 1349 | App Builder | сильный эффект |
+| `gpt-5` | 393 | 155 | 680 | Assist, без `metadata` | эффект подтверждён |
+| `gpt-5.1` | 345 | 305 | 1242 | Assist, без `metadata` | `high` сильный, `low` слабый |
+| `gpt-5.2` | 398 | 315 | 839 | Assist, без `metadata` | эффект подтверждён |
+| `gpt-5.4` | 413 | 216 | 570 | App Builder | эффект подтверждён |
+| `gpt-5.6-sol` | 229 | 155 | 750 | App Builder | эффект подтверждён |
+| `gpt-5.6-terra` | 389 | 184 | 935 | App Builder | эффект подтверждён |
+| `gpt-5.6-luna` | 243 | 160 | 831 | App Builder | эффект подтверждён |
+| `gpt-5.3-codex` | не проверялась | | | маршрут недоступен | остаётся в registry (источник — схема Retool), живой проверки нет |
+
+Эффект считается подтверждённым, когда длина упорядочена `low` < без параметра <
+`high`, а `high`/`low` не меньше 1,5. Разница между `low` и «без параметра» у GPT-5.1
+(12%) лежит в пределах разброса одного замера; для GPT-6 Sol отношение `high`/`low`
+равно 1,6. Это подсказка модели, а не гарантия длины. Assist-маршрут (`direct._ASSIST_ONLY`)
+не сообщает кредиты, поэтому для трёх Assist-моделей цена замера неизвестна; остальные
+замеры стоили от 0,006 до 1,22 кредита на запрос (максимум — `gpt-5.5` с `high`).
+
+Codex discovery публикует `support_verbosity` только для моделей с уровнями. Изменение
+verbosity не меняет scope подписанной входной истории: в tool loop передаётся текущее
+значение, а прежние assistant blocks и ключ кэша сохраняются. Это не обещание cache hit
 или фиксированной длины ответа при конкретном уровне.
 
 | Управление | Поведение relay |
 | --- | --- |
-| Общие JSON/schema output formats, непустой `stop`/`stop_sequences`, `n > 1` | 422 до inference: маршрут не обеспечивает эту семантику |
-| Точный служебный title-контракт установленного Claude SDK | Post-validation/normalization: буфер до 256 Ki символов, снятие единственной JSON-ограды, затем проверка ровно `title:string`, уникальных ключей и нормального завершения. Невалидное содержимое не выдаётся; это не constrained decoding |
+| `response_format` (Chat), `text.format` (Responses), `output_config.format` и inline `messages[i].output_config.format` (Messages) с `json_schema` или `json_object` | Эмуляция, не constrained decoding. Контракт (схема в компактном виде) добавляется в инструкции; ответ целиком буферизуется (до 256 Ki символов), снимается одна внешняя Markdown-ограда, JSON разбирается (дубликаты ключей и `NaN`/`Infinity` отклоняются) и проверяется по подмножеству схемы: `type`, `properties`, `required`, `additionalProperties`, `items`/`prefixItems`, `enum`, `const`, `anyOf`/`oneOf`/`allOf`, `nullable`, локальный `$ref`. Неизвестные ключевые слова не дают отказа. Невалидный ответ — 502 `upstream_invalid_output` (в Messages тип `api_error`) с `x-should-retry: false` до выдачи любого содержимого; в stream — SSE `error` без контента. Usage и цена сохраняются. Нестрогая проза вокруг JSON не извлекается. Заголовок `x-proxi-output-format`: `validated-json-schema`, `validated-json-object` или `validated-session-title` |
+| Формат вместе с `tools` и `tool_choice` auto/none | Поддерживается: ход с вызовом tool выдаётся как есть, проверяется только финальный ответ без вызовов (так работает `codex exec --output-schema`) |
+| Формат с обязательным вызовом tool (`required`, `any`, имя функции), неизвестный `type`, схема не объект, два разных формата в одном запросе | 422 до inference; для Messages текст содержит подсказку про `CLAUDE_CODE_DISABLE_STRUCTURED_OUTPUTS=1` |
+| Служебный запрос title (Claude Code, Claude Agent SDK, Desktop) | Частный случай эмуляции: в диалекте Messages распознаётся по схеме ровно `{title: string}` без tools, независимо от формулировки промпта (та же схема от Chat/Responses-клиента, например ai-sdk `generateObject`, — обычный запрос); без схемы — по началу блока системного промпта после строк `x-anthropic-billing-header` и identity (текущая формулировка «You are naming a coding session…», прежняя «Generate a concise, sentence-case title…», Desktop). Цитата фразы в середине обычного system не считается. Метка `validated-session-title`, свой system без политики relay |
+| непустой `stop`/`stop_sequences`, `n > 1` | 422 до inference: маршрут не обеспечивает эту семантику |
 | `thinking.display: "updates"` | Доступные summaries с явным `x-proxi-thinking-display: summarized` и предупреждением по имени поля; native beta cadence не обещается |
 | `store: true`, `background: true`, `previous_response_id`, Responses `conversation`, server `prompt` reference | 422: серверное хранение/восстановление/шаблон этим маршрутом не реализованы |
 | `truncation: "auto"`, audio modalities, нестандартный `service_tier` | 422 вместо молчаливой смены поведения |
@@ -271,7 +301,9 @@ scope подписанной входной истории: в tool loop пер�
 | `n: 1`, plain text format, пустые stop, `store: false`, `background: false`, `truncation: "disabled"` | Принимаются как совместимые явные значения по умолчанию |
 | Chat/Messages строковый `conversation` | Сохраняет прежнюю локальную affinity; клиент передаёт полную историю. Это не серверный Responses conversation |
 | temperature, top_p, top_k, seed, penalties, logprobs/logit_bias | Типы/диапазоны проверяются; параметры не передаются upstream и перечисляются по именам в заголовке и событии |
-| prompt_cache_key, prompt_cache_retention, include, metadata | Проверяются формы, поля не передаются как настройки upstream; имена перечисляются в заголовке и событии. Локальная metadata-affinity по-прежнему работает |
+| `verbosity` / `text.verbosity` для модели без `verbosity_levels` | Значение проверяется (low/medium/high, без конфликта), в Retool не передаётся, имя поля перечисляется в заголовке и событии |
+| prompt_cache_key, prompt_cache_retention, prompt_cache_options, include, metadata, client_metadata | Проверяются формы (`prompt_cache_options` и `client_metadata` — объекты), поля не передаются как настройки upstream; имена перечисляются в заголовке и событии. Локальная metadata-affinity по-прежнему работает |
+| Anthropic `output_config.task_budget` | Форма (объект) проверяется, бюджет не передаётся и не соблюдается; имя `output_config.task_budget` перечисляется в заголовке и событии |
 
 Уведомление — `x-proxi-ignored-parameters` и событие `request.compatibility`.
 Если среди имён только рутинные sampling-подсказки (`temperature`, `top_p`, `top_k`,
@@ -285,6 +317,21 @@ cache hints, `thinking.display`) оставляет warn. Заголовок о�
 историю для tool continuation, настроенные журналы и хранение Retool/поставщика.
 Cache retention hints не гарантируют TTL, а `include`
 не обещает дополнительных logprobs или зашифрованных reasoning items.
+
+Эмуляция JSON-форматов проверена живыми прямыми запросами 2026-11-05 (контракт и схема
+собраны кодом relay, ответ оценён его адаптером; шесть малых запросов):
+
+- title, текущая формулировка, `claude-haiku-4-5` (Assist) — ответ в ограде ` ```json `,
+  ограда снята, `{title: string}` принят;
+- memory recall `{selected_memories: string[]}`, `claude-haiku-4-5` — тоже в ограде, принят;
+- title, прежняя формулировка, `claude-sonnet-5-5` — голый JSON, принят;
+- prompt hook `{ok: boolean, reason: string}`, `claude-sonnet-5-5` — голый JSON, принят;
+- схема в стиле `codex exec --output-schema` (`project_name`, `programming_languages[]`),
+  `gpt-6-sol` и `gpt-5.5` — голый JSON, принят.
+
+Расход — 0,095 кредита (Assist цену не сообщает). Это малая выборка: она показывает, что
+инструкция достаточна для этих моделей и схем, и не гарантирует соблюдения схемы каждым
+ответом, поэтому невалидный ответ всё равно даёт ошибку, а не пропускается.
 
 ## Источники и границы доказательств
 

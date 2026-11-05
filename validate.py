@@ -79,6 +79,7 @@ class Parsed:
         self.temperature = None
         self.verbosity = None
         self.structured_title = False
+        self.structured_output = None
         self.system = ""
         self.declared_ignored = []
         self.inline_tool_changes = []
@@ -456,9 +457,9 @@ def _finish(data, parsed, dialect):
                 if candidate in model_catalog.EFFORT_ORDER:
                     parsed.requested_effort = candidate
                 break
-    parsed.structured_title = generation.is_structured_title(data, parsed.system, dialect)
-    parsed.verbosity, parsed.declared_ignored = generation.controls(
-        data, parsed.entry, dialect, structured_title=parsed.structured_title)
+    parsed.structured_output = generation.structured_output(data, dialect)
+    parsed.structured_title = bool(parsed.structured_output and parsed.structured_output['title'])
+    parsed.verbosity, parsed.declared_ignored = generation.controls(data, parsed.entry, dialect)
     parsed.declared_ignored += [name for name in parsed.inline_tool_changes if name not in parsed.declared_ignored]
     stream_options = data.get("stream_options")
     if stream_options is None:

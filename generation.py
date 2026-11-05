@@ -1,7 +1,7 @@
 """Explicit handling of controls absent from Retool's generation schema."""
 import math
-import client_context
 
+import structured
 from apierr import unprocessable
 
 
@@ -15,27 +15,90 @@ def _number(value, name, low, high, *, integer=False):
         raise unprocessable(f"'{name}' has an invalid numeric value", param=name)
 
 
-def _format(value, name):
-    if not isinstance(value, dict) or not isinstance(value.get('type'), str):
-        raise unprocessable(f"'{name}' must be a format object", param=name)
-    if value['type'] != 'text' or set(value) != {'type'}:
-        _reject(name)
-
-
 TITLE_FORMAT = {'type': 'json_schema', 'schema': {'type': 'object',
     'properties': {'title': {'type': 'string'}}, 'required': ['title'], 'additionalProperties': False}}
 
 
-def is_structured_title(data, system, dialect):
-    """The observed SDK service contract, not general constrained decoding."""
+def _is_title_schema(schema):
+    """The session-title contract of Claude Code and the Agent SDK, whatever its prompt says."""
+    properties = schema.get('properties')
+    return (schema.get('type') == 'object' and isinstance(properties, dict) and list(properties) == ['title']
+            and isinstance(properties['title'], dict) and properties['title'].get('type') == 'string'
+            and schema.get('required') == ['title'] and schema.get('additionalProperties') is False)
+
+
+def _label(value, limit):
+    return value.strip()[:limit] or None if isinstance(value, str) else None
+
+
+def _format_spec(value, name, hint):
+    """None for plain text, otherwise the JSON contract the reply has to satisfy."""
+    if not isinstance(value, dict) or not isinstance(value.get('type'), str):
+        raise unprocessable(f"'{name}' must be a format object" + hint, param=name)
+    kind = value['type']
+    if kind == 'text' and set(value) == {'type'}:
+        return None
+    if kind == 'json_object':
+        return {'kind': kind, 'schema': None, 'name': None, 'description': None}
+    if kind != 'json_schema':
+        raise unprocessable(f"'{name}' is not supported by the Retool route" + hint, param=name)
+    # Chat nests the schema in json_schema; Responses and Messages keep it flat.
+    body = value['json_schema'] if isinstance(value.get('json_schema'), dict) else value
+    if not isinstance(body.get('schema'), dict):
+        raise unprocessable(f"'{name}' needs a JSON Schema object" + hint, param=name)
+    return {'kind': kind, 'schema': body['schema'], 'name': _label(body.get('name'), 80),
+            'description': _label(body.get('description'), 500)}
+
+
+def _forces_tool(choice):
+    if isinstance(choice, dict):
+        return choice.get('type') in ('any', 'tool', 'custom', 'function')
+    return choice == 'required'
+
+
+def structured_output(data, dialect):
+    """The JSON contract of the reply, or None for plain text.
+
+    Retool has no constrained decoding: the relay states the contract in the
+    instructions and validates the complete reply, so the client never gets
+    content that breaks it. A request the relay cannot honour is rejected.
+    """
+    hint = structured.HINT if dialect == 'anthropic' else ''
+    text = data.get('text')
+    if text is not None and not isinstance(text, dict):
+        raise unprocessable("'text' must be an object", param='text')
     output = data.get('output_config')
-    return (dialect == 'anthropic' and not data.get('tools')
-            and client_context.is_sdk_title_system(system)
-            and isinstance(output, dict) and output.get('format') == TITLE_FORMAT
-            and output['format']['schema']['additionalProperties'] is False)
+    sources = [('response_format', data.get('response_format')),
+               ('text.format', (text or {}).get('format')),
+               ('output_config.format', output.get('format') if isinstance(output, dict) else None)]
+    messages = data.get('messages', data.get('input'))
+    for i, message in enumerate(messages if isinstance(messages, list) else []):
+        if isinstance(message, dict) and message.get('role') in ('system', 'developer'):
+            inline = message.get('output_config')
+            if isinstance(inline, dict) and inline.get('format') is not None:
+                sources.append((f'messages[{i}].output_config.format', inline['format']))
+    chosen = None
+    for name, value in sources:
+        spec = _format_spec(value, name, hint) if value is not None else None
+        if spec is None:
+            continue
+        if chosen is None:
+            chosen = dict(spec, source=name)
+        elif (spec['kind'], spec['schema']) != (chosen['kind'], chosen['schema']):
+            raise unprocessable('conflicting output formats' + hint, param=name)
+    if chosen is None:
+        return None
+    if data.get('tools') and _forces_tool(data.get('tool_choice')):
+        raise unprocessable(f"'{chosen['source']}' cannot be combined with a required tool call: the relay can "
+                            "only validate a reply that is not a forced tool turn" + hint, param='tool_choice')
+    chosen['title'] = (dialect == 'anthropic' and chosen['kind'] == 'json_schema' and not data.get('tools')
+                       and _is_title_schema(chosen['schema']))
+    chosen['label'] = ('validated-session-title' if chosen['title']
+                       else 'validated-' + chosen['kind'].replace('_', '-'))
+    return chosen
 
 
-def controls(data, entry, dialect, *, structured_title=False):
+def controls(data, entry, dialect):
     """Return validated verbosity and ignored names; never echo sensitive values."""
     ignored = []
     thinking = data.get('thinking')
@@ -46,29 +109,25 @@ def controls(data, entry, dialect, *, structured_title=False):
     if text is not None and not isinstance(text, dict):
         raise unprocessable("'text' must be an object", param='text')
     text = text or {}
-    output = data.get('output_config') or {}
-    for value, name in ((data.get('response_format'), 'response_format'),
-                        (text.get('format'), 'text.format'), (output.get('format'), 'output_config.format')):
-        if value is not None:
-            if not (structured_title and name == 'output_config.format'):
-                _format(value, name)
-    messages = data.get('messages', data.get('input'))
-    for i, message in enumerate(messages if isinstance(messages, list) else []):
-        if isinstance(message, dict) and message.get('role') in ('system', 'developer'):
-            inline = message.get('output_config') or {}
-            if isinstance(inline, dict) and inline.get('format') is not None:
-                _format(inline['format'], f'messages[{i}].output_config.format')
+    output = data.get('output_config')
+    if isinstance(output, dict) and output.get('task_budget') is not None:
+        if not isinstance(output['task_budget'], dict):
+            raise unprocessable("'output_config.task_budget' must be an object", param='output_config.task_budget')
+        ignored.append('output_config.task_budget')
 
-    levels = []
+    # Verbosity is a hint: models without catalog levels (every Claude, GPT-4.x) get
+    # it named as ignored instead of failing the whole request.
+    levels, unsupported = [], []
     for value, name in ((data.get('verbosity'), 'verbosity'), (text.get('verbosity'), 'text.verbosity')):
         if value is not None:
             if not isinstance(value, str) or value not in ('low', 'medium', 'high'):
                 raise unprocessable(f"'{name}' must be low, medium or high", param=name)
-            if value not in entry.get('verbosity_levels', ()):
-                _reject(name)
             levels.append(value)
+            if value not in entry.get('verbosity_levels', ()):
+                unsupported.append(name)
     if len(set(levels)) > 1:
         raise unprocessable('conflicting verbosity controls', param='verbosity')
+    ignored.extend(unsupported)
 
     for name in ('stop', 'stop_sequences'):
         value = data.get(name)
@@ -118,6 +177,12 @@ def controls(data, entry, dialect, *, structured_title=False):
         if data['prompt_cache_retention'] not in ('in_memory', '24h'):
             raise unprocessable("'prompt_cache_retention' has an invalid value", param='prompt_cache_retention')
         ignored.append('prompt_cache_retention')
+    for name in ('prompt_cache_options', 'client_metadata'):
+        # Codex sends both with every request; neither reaches Retool.
+        if data.get(name) is not None:
+            if not isinstance(data[name], dict):
+                raise unprocessable(f"'{name}' must be an object", param=name)
+            ignored.append(name)
     if data.get('include') is not None:
         if not isinstance(data['include'], list) or not all(isinstance(item, str) for item in data['include']):
             raise unprocessable("'include' must be an array of strings", param='include')
@@ -154,4 +219,4 @@ def controls(data, entry, dialect, *, structured_title=False):
         if not isinstance(data['metadata'], dict):
             raise unprocessable("'metadata' must be an object", param='metadata')
         ignored.append('metadata')
-    return (levels[0] if levels else None), ignored
+    return (levels[0] if levels and not unsupported else None), ignored
