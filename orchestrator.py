@@ -209,6 +209,8 @@ class RelaySources:
     The blocks of a relay task come from the same build_system_instructions call as the legacy head, so
     `{{relay_task}}{{exec_reminder}}` repeats that head byte for byte. They stay empty for a request the client owns
     and for one that brings client tools (plan I9): no project context and no shell protocol reach a client's job.
+    The role texts are the file's relay_texts, else config.json's relay_system_prompt (a live setting: the one role
+    slot the legacy head had, read when first needed and kept for this turn), else the built-in text.
     Only cfg is read, so the preview can build the same object for a pasted request.
     """
 
@@ -226,17 +228,26 @@ class RelaySources:
     def _text(self, name):
         return self.snapshot.relay_text(name) if self.snapshot is not None else None
 
+    def _configured_role(self):
+        # One read per turn: a PATCH in the middle of it must not give {{role}} and {{relay_task}} two texts.
+        return self._once("configured_role", lambda: self.cfg.get("relay_system_prompt"))
+
     @property
     def _is_relay_task(self):
         return not self.client_owned and not self.native_tools
 
     def relay_role(self):
         # None is the built-in role, a blank text means no role of the relay's own: as relay_policy reads settings.
-        return self._once("role", lambda: relay_policy(self._text("role")))
+        def build():
+            text = self._text("role")
+            return relay_policy(self._configured_role() if text is None else text)
+        return self._once("role", build)
 
     def native_role(self):
         def build():
             text = self._text("native_role")
+            if text is None:
+                text = self._configured_role()  # legacy: one role slot served a client with tools too
             return DEFAULT_NATIVE_TOOLS_ROLE if text is None else (text if text.strip() else "")
         return self._once("native_role", build)
 
@@ -446,20 +457,22 @@ class TurnRunner:
         return compose(output)
 
     def _instructions(self, native_tools=False):
+        # relay_system_prompt is a live setting: read it once for this head.
+        role = self.cfg.get('relay_system_prompt')
         if native_tools:
-            if self.cfg.get('relay_system_prompt') is not None:
-                return relay_policy(self.cfg['relay_system_prompt'])
+            if role is not None:
+                return relay_policy(role)
             return DEFAULT_NATIVE_TOOLS_ROLE
         return build_system_instructions(
-            self.cfg["workspace_root"], system_prompt=self.cfg.get('relay_system_prompt'),
-            **_relay_task_args(self.cfg))
+            self.cfg["workspace_root"], system_prompt=role, **_relay_task_args(self.cfg))
 
     def _client_instructions(self, instructions):
         """Compose only policy text, never relay workspace or shell capabilities."""
-        mode = self.cfg.get('relay_system_prompt_mode', 'standalone')
+        # Mode and role are live settings: read together, so one head never mixes an old mode with a new role.
+        mode, role = self.cfg.get('relay_system_prompt_mode', 'standalone'), self.cfg.get('relay_system_prompt')
         if mode == 'standalone':
             return instructions
-        policy = relay_policy(self.cfg.get('relay_system_prompt'))
+        policy = relay_policy(role)
         if mode == 'replace':
             return policy
         return '\n\n'.join(part for part in (instructions, policy) if part)

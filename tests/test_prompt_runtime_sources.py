@@ -50,6 +50,61 @@ def test_a_relay_task_is_what_the_legacy_head_of_a_relay_task_is_and_the_reminde
     assert orchestrator.EXEC_REMINDER.startswith("\n\n[LOCAL EXEC REMINDER]\n")
 
 
+@pytest.mark.parametrize("configured", [None, "CONFIGURED_ROLE", "", " \n "])
+def test_with_the_role_of_config_json_the_templates_still_repeat_the_legacy_heads(tmp_path, configured):
+    # the file names no role text, so the role is config.json's setting, as in the legacy heads
+    _, _, runner = setup(tmp_path, transport="direct", exec_policy="allowlist", project_context=True,
+                         context_max_bytes=6000, cookie_values=[], relay_system_prompt=configured)
+    (tmp_path / "README.md").write_text("SYNTHETIC README\n", encoding="utf-8")
+    task = RelaySources(runner.cfg, FakeSnapshot(1, {}), client_owned=False, native_tools=False)
+    legacy = runner._instructions(native_tools=False)
+    assert task.relay_task() + task.exec_reminder() == legacy + orchestrator.EXEC_REMINDER
+    tools = RelaySources(runner.cfg, FakeSnapshot(1, {}), client_owned=False, native_tools=True)
+    assert tools.native_role() == runner._instructions(native_tools=True)
+    assert task.relay_role() == context.relay_policy(configured)
+
+
+def test_the_file_beats_the_setting_of_config_json_and_the_setting_beats_the_built_in_text(tmp_path):
+    configured = sources(tmp_path, relay_system_prompt="CONFIGURED_ROLE")
+    assert configured.relay_role() == "CONFIGURED_ROLE" and configured.native_role() == "CONFIGURED_ROLE"
+    assert configured.relay_task().startswith("CONFIGURED_ROLE\n\n[LOCAL EXECUTION]")
+    both = sources(tmp_path, relay_system_prompt="CONFIGURED_ROLE",
+                   relay_texts={"role": "FILE_ROLE", "native_role": "FILE_NATIVE_ROLE"})
+    assert both.relay_role() == "FILE_ROLE" and both.native_role() == "FILE_NATIVE_ROLE"
+    assert both.relay_task().startswith("FILE_ROLE\n\n")
+    # a role the file leaves out is config.json's setting, whatever the file says about the other one
+    half = sources(tmp_path, relay_system_prompt="CONFIGURED_ROLE", relay_texts={"role": "FILE_ROLE"})
+    assert half.relay_role() == "FILE_ROLE" and half.native_role() == "CONFIGURED_ROLE"
+    blank = sources(tmp_path, relay_system_prompt="CONFIGURED_ROLE", relay_texts={"role": "", "native_role": " "})
+    assert blank.relay_role() == "" and blank.native_role() == ""
+
+
+def test_the_setting_of_config_json_is_read_when_a_turn_asks_and_is_not_kept_between_turns(tmp_path):
+    cfg = cfg_of(tmp_path, relay_system_prompt="FIRST_ROLE")
+    snapshot = FakeSnapshot(1, {})
+    first = RelaySources(cfg, snapshot, client_owned=False, native_tools=False)
+    assert first.relay_role() == "FIRST_ROLE"
+    cfg["relay_system_prompt"] = "SECOND_ROLE"  # the admin saves a new role in the middle of the turn
+    # this turn keeps one role: {{role}} and {{relay_task}} (and the native role) never name two texts
+    assert first.relay_task().startswith("FIRST_ROLE\n\n") and first.native_role() == "FIRST_ROLE"
+    later = RelaySources(cfg, snapshot, client_owned=False, native_tools=False)
+    assert later.relay_role() == "SECOND_ROLE" and later.relay_task().startswith("SECOND_ROLE\n\n")
+    cfg["relay_system_prompt"] = None
+    assert RelaySources(cfg, snapshot, client_owned=False, native_tools=True).native_role() == (
+        orchestrator.DEFAULT_NATIVE_TOOLS_ROLE)
+
+
+def test_the_legacy_heads_read_the_live_settings_when_the_request_comes(tmp_path):
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, exec_policy="off", cookie_values=[])
+    assert runner._instructions(native_tools=True) == orchestrator.DEFAULT_NATIVE_TOOLS_ROLE
+    assert runner._client_instructions("CLIENT") == "CLIENT"
+    runner.cfg.update(relay_system_prompt="LIVE_ROLE", relay_system_prompt_mode="append")
+    assert runner._instructions(native_tools=True) == "LIVE_ROLE"
+    assert runner._client_instructions("CLIENT") == "CLIENT\n\nLIVE_ROLE"
+    runner.cfg.update(relay_system_prompt_mode="replace")
+    assert runner._client_instructions("CLIENT") == "LIVE_ROLE"
+
+
 def test_the_blocks_of_a_relay_task_are_its_role_then_the_shell_protocol_then_the_project(tmp_path):
     task = sources(tmp_path)
     role, local, project = task.relay_role(), task.local_exec(), task.project_context()
@@ -79,12 +134,6 @@ def test_the_role_for_a_client_with_tools_is_its_own_text(tmp_path, text, expect
     assert task.native_role() == expected
     # the two roles are separate texts: setting one does not move the other
     assert task.relay_role() == context.DEFAULT_RELAY_SYSTEM_PROMPT
-
-
-def test_the_legacy_role_setting_is_not_a_source_of_the_templates(tmp_path):
-    task = sources(tmp_path, relay_system_prompt="LEGACY_CONFIG_ROLE")
-    assert task.relay_role() == context.DEFAULT_RELAY_SYSTEM_PROMPT
-    assert "LEGACY_CONFIG_ROLE" not in task.relay_task() and "LEGACY_CONFIG_ROLE" not in task.native_role()
 
 
 @pytest.mark.parametrize("owner", ["client", "tools"])
@@ -199,12 +248,31 @@ def test_a_legacy_plan_and_no_plan_take_the_legacy_head(tmp_path, monkeypatch):
         assert head_sent(sent) == "CLIENT_SYSTEM"
 
 
-def test_the_legacy_settings_play_no_part_in_a_composed_head(tmp_path, monkeypatch):
+def test_the_legacy_mode_plays_no_part_in_a_composed_head_and_the_role_only_where_a_template_names_it(
+        tmp_path, monkeypatch):
     settings = dict(relay_system_prompt="LEGACY ROLE", relay_system_prompt_mode="replace")
     _, sent, _ = served(tmp_path, monkeypatch, planned("{{client_system}}"), **settings)
     assert head_sent(sent) == "CLIENT_SYSTEM"
+    _, sent, _ = served(tmp_path, monkeypatch, planned("{{role}}|{{client_system}}"), **settings)
+    assert head_sent(sent) == "LEGACY ROLE|CLIENT_SYSTEM"
     _, sent, _ = served(tmp_path, monkeypatch, prompt_policy.Plan(), **settings)
     assert head_sent(sent) == "LEGACY ROLE"
+
+
+def test_a_composed_head_follows_the_role_the_admin_saved_before_the_request(tmp_path, monkeypatch):
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, exec_policy="off", cookie_values=[],
+                         relay_system_prompt="FIRST ROLE")
+    sent = capture_direct(monkeypatch)
+    heads = []
+    for role in ("FIRST ROLE", "SECOND ROLE", None):
+        runner.cfg["relay_system_prompt"] = role
+        parsed = request(FIRST, system="CLIENT_SYSTEM", tools=[])
+        parsed.request_purpose = "generation"
+        parsed.prompt_plan = planned("{{role}}|{{client_system}}")
+        assert asyncio.run(run(runner, parsed))[-1] == {"type": "end", "reason": "stop"}
+        heads.append(head_sent(sent, -1))
+    assert heads == ["FIRST ROLE|CLIENT_SYSTEM", "SECOND ROLE|CLIENT_SYSTEM",
+                     context.DEFAULT_RELAY_SYSTEM_PROMPT + "|CLIENT_SYSTEM"]
 
 
 def test_a_relay_task_with_a_reminder_template_gets_the_legacy_head_byte_for_byte(tmp_path, monkeypatch):

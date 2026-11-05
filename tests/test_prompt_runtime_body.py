@@ -335,3 +335,42 @@ def test_a_stream_through_a_composed_head_is_an_ordinary_stream(prompt_relay):
     assert status == 200 and headers["content-type"].startswith("text/event-stream")
     assert "OK" in raw and raw.rstrip().endswith("data: [DONE]")
     assert head_of(relay.posts[0]) == RULES + "\n\nCLIENT_SYSTEM"
+
+
+def spy_on_the_pool(relay, monkeypatch):
+    """The keywords the HTTP layer puts to the pool before a response starts: (model_refusal calls, unavailable_error calls)."""
+    refusals, unavailable = [], []
+    pool, refusal, availability = relay.runtime.pool, relay.runtime.pool.model_refusal, relay.runtime.pool.unavailable_error
+    monkeypatch.setattr(pool, "model_refusal", lambda entry, **scope: refusals.append(scope) or refusal(entry, **scope))
+    monkeypatch.setattr(pool, "unavailable_error",
+                        lambda entry, **scope: unavailable.append(scope) or availability(entry, **scope))
+    return refusals, unavailable
+
+
+def hide_every_tool(data, dialect, profile_, snapshot):
+    body = copy.deepcopy(data)
+    del body["tools"]
+    return body, [{"tool": "read_file", "op": "hide"}]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_pool_is_asked_again_when_pass_2_changes_the_session_the_request_takes(prompt_relay, monkeypatch, stream):
+    relay = fake_relay(prompt_relay)
+    edited(relay.prompts, edits=True)
+    Rewrites(monkeypatch, hide_every_tool)
+    refusals, unavailable = spy_on_the_pool(relay, monkeypatch)
+    assert relay.post("chat", client_request("chat", USER, system="CLIENT_SYSTEM", stream=stream),
+                      {"x-session-affinity": "dialog-1"})[0] == 200
+    # the request asked for the conversation's own session with its tools; without them it asks for the text session
+    assert refusals == [{}, {"context_scope": "text"}]
+    assert unavailable == ([{"context_scope": "text"}] if stream else [])
+
+
+def test_the_pool_is_not_asked_twice_when_pass_2_leaves_the_session_alone(prompt_relay, monkeypatch):
+    relay = fake_relay(prompt_relay)
+    edited(relay.prompts, edits=True)
+    Rewrites(monkeypatch)
+    refusals, _ = spy_on_the_pool(relay, monkeypatch)
+    assert relay.post("chat", client_request("chat", USER, system="CLIENT_SYSTEM"),
+                      {"x-session-affinity": "dialog-1"})[0] == 200
+    assert refusals == [{}]
