@@ -27,6 +27,7 @@ import pytest
 
 import client_context
 import direct
+import prompt_policy
 import validate
 from prompt_bodies import (CLAUDE_SDK_HEADERS, CODEX_HEADERS, OPENCODE_COMPACTION_V1, OPENCODE_HEADERS,
                            OPENCODE_SUMMARY, OPENCODE_TITLE_V1, OPENCODE_TITLE_V2, claude_sdk_body, codex_body,
@@ -361,6 +362,30 @@ def test_capture_shaped_bodies_are_byte_for_byte_the_recorded_legacy_behaviour(t
     expected = load_golden()["real"][label]
     assert len(expected) == 9
     assert differences(expected, produce(make_workspace(tmp_path), wire, "real", label)) == []
+
+
+def inactive_layer(tmp_path):
+    """What proxy._completion leaves on a request when no prompts file exists: the purpose, a store, a legacy plan."""
+    store = prompt_policy.PromptStore({"prompts_file": str(tmp_path / "no-such-prompts.json")})
+
+    def attach(parsed, runner):
+        parsed.prompt_purpose = client_context.prompt_purpose(parsed)
+        parsed.prompt_plan = store.plan(prompt_policy.PlanInput.from_request(
+            parsed, client_context.current(), {}, getattr(parsed, "dialect", None) or "chat"))
+        assert parsed.prompt_plan.legacy
+        runner.prompts = store
+
+    return attach
+
+
+@pytest.mark.skipif(UPDATE, reason="the fixture is being rewritten")
+@pytest.mark.parametrize("section,label", [("matrix", name) for name in LABELS["matrix"]]
+                         + [("real", name) for name in LABELS["real"]])
+def test_a_prompt_layer_with_no_prompts_file_changes_nothing_in_any_cell(tmp_path, wire, section, label):
+    # plan I1: the store is asked, a legacy plan comes back, the runner takes the code that was always there
+    expected = load_golden()[section][label]
+    root = make_workspace(tmp_path)
+    assert differences(expected, produce(root, wire, section, label, attach=inactive_layer(tmp_path))) == []
 
 
 def test_the_fixture_holds_every_cell_and_nothing_else():
