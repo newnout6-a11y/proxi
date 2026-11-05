@@ -246,6 +246,27 @@ def test_http_logs_distinguish_a_long_title_from_primary_chat(relay, capsys):
     assert "PURPOSE: session-title" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("extra,level", [
+    ({"temperature": 1, "metadata": {"user_id": json.dumps({"session_id": "S", "device_id": "D"})}}, "debug"),
+    ({"temperature": 0.2, "top_p": 0.9, "top_k": 5, "metadata": {"k": "v"}}, "debug"),
+    ({"temperature": 1, "logprobs": True}, "warn"),
+    ({"logit_bias": {"50256": -100}}, "warn"),
+    ({"temperature": 1, "prompt_cache_key": "PRIVATE-KEY"}, "warn"),
+], ids=["claude-code", "sampling-only", "logprobs", "logit-bias", "cache-key"])
+def test_routine_ignored_parameters_are_quiet_but_material_ones_still_warn(relay, monkeypatch, extra, level):
+    log = journal.Journal()
+    monkeypatch.setattr(journal, "JOURNAL", log)
+    payload = {"model": "claude-opus-5-5", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}], **extra}
+    with relay.request("/v1/messages", payload) as response:
+        assert response.status == 200
+        names = response.headers["x-proxi-ignored-parameters"].split(",")
+    assert set(names) == set(extra)
+    entries = [e for e in log.query() if e["kind"] == "request.compatibility"]
+    assert len(entries) == 1 and entries[0]["level"] == level
+    assert entries[0]["data"]["parameters"] == names
+    assert "PRIVATE-KEY" not in json.dumps(entries) and '"D"' not in json.dumps(entries)
+
+
 def test_token_estimate_includes_large_tool_schema_and_remains_local(relay):
     payload = {"model": "claude-opus-5-5", "system": "System instructions",
                "messages": [{"role": "user", "content": "hi"}]}
