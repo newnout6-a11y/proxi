@@ -71,6 +71,26 @@ Screenshots, traces and gate JSON stay outside the repository under
 `%TEMP%/proxi-design-qa`, `%TEMP%/relay-admin-playwright` and
 `%TEMP%/opencode/admin-shots/design-*-20261105`.
 
+## Windows CI follow-up
+
+The first design CI run failed in a legacy streaming fixture with WinError10038.
+A deterministic regression then reproduced the underlying ownership defect:
+the fallback cancellation wrapper closed a raw socket handle while its original
+Python owner still retained the number. A later owner finalizer could close a
+reused handle belonging to another connection or an event loop.
+
+The fallback now borrows the handle for shutdown and detaches its temporary
+wrapper instead of stealing ownership. It is explicitly best effort for unknown
+response shapes; Windows may require an owning close to unblock a pending read.
+Real HTTPResponse objects retain their existing `fp.raw._sock` owning-close path.
+The old cancellation fixture now represents that real ownership chain, while a
+separate regression protects unowned handles. This is not a retry-only CI fix.
+Focused validation: **72 passed in 4.08 seconds** with:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests/test_stream_safety.py tests/test_pr2_hardening.py tests/test_shutdown.py tests/test_project_workflow.py -o addopts= -q --tb=short
+```
+
 ## Credits
 
 Design process: [Unslop](https://heydamir.design/unslop) by

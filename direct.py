@@ -102,7 +102,12 @@ def _force_close_response(resp):
         except Exception:
             pass
         return
-    # Fallback for response shapes without a walkable socket chain.
+    # Fallback for response shapes without a walkable socket chain. Borrow the
+    # handle only to shut down reads; never steal ownership from an unseen
+    # Python socket. Closing an alias leaves that original object holding a
+    # stale number, whose later finalizer can kill a reused, unrelated socket.
+    # This is best effort: Winsock may require a real owning close to unblock a
+    # pending recv. Real HTTPResponse objects use the owning path above.
     try:
         fd = resp.fileno() if hasattr(resp, "fileno") else None
         if fd is not None and fd != -1:
@@ -117,7 +122,8 @@ def _force_close_response(resp):
                     s.shutdown(socket.SHUT_RDWR)
                 except Exception:
                     pass
-                s.close()
+                finally:
+                    s.detach()
             except Exception:
                 pass
     except Exception:
