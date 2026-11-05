@@ -409,3 +409,21 @@ def test_a_block_that_only_qualifies_once_the_blocks_inside_it_are_gone_goes_in_
     once, changes = rewrite(conversation("chat", [("user", text), ("assistant", "ok"), ("user", "more")]), "chat", rule)
     assert neutral(once, "chat")[0][1] == "rest" and len(changes) == 1
     assert rewrite(once, "chat", rule) == (once, [])
+
+
+@pytest.mark.parametrize("tag", ["system-reminder", "<system-reminder>", " </system-reminder> ", "<system-reminder/>"])
+def test_the_tag_may_be_written_with_its_angle_brackets(tag):
+    text, changes = edited("chat", "Fix it.\n\n" + REMINDER, {"op": "drop_tag", "tag": tag})
+    assert text == "Fix it." and len(changes) == 1
+
+
+@pytest.mark.parametrize("dialect", ["chat", "responses"])
+def test_bare_strings_inside_a_list_of_parts_are_text_too(dialect):
+    data = conversation(dialect, [("user", "start"), ("assistant", "ok"), ("user", ["keep", REMINDER, "more"]),
+                                  ("assistant", "ok"), ("user", "last")])
+    shift = 1 if dialect == "chat" else 0
+    history_of(data, dialect)[2 + shift]["content"] = ["keep", REMINDER, "more"]       # plain strings, no part dicts
+    result, changes = rewrite(data, dialect, drop_tag())
+    assert history_of(result, dialect)[2 + shift]["content"] == ["keep", "more"]
+    assert [(c["index"], c["removed_chars"]) for c in changes] == [(2 + shift, len(REMINDER))]
+    assert parse(dialect, result).native_messages is not None

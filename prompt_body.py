@@ -396,7 +396,8 @@ def _text_op(context, spec, ops):
     try:
         if op == "drop_tag":
             tag = spec.get("tag")
-            if not isinstance(tag, str) or not tag:
+            tag = tag.strip().strip("<>/").strip() if isinstance(tag, str) else None
+            if not tag:
                 return None, "missing tag"
             pattern, contains = spec.get("pattern"), spec.get("contains")
             if pattern not in (None, "") and not isinstance(pattern, str):
