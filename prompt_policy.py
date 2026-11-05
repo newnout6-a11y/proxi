@@ -104,6 +104,9 @@ RECENT_REQUESTS_KEPT = 10
 # far above max_conversations.
 MAX_PINS = 4096
 PIN_IDLE_SECONDS = 6 * 3600
+# Saving replaces the file; a sharing violation is retried this many times, REPLACE_PAUSE seconds apart.
+REPLACE_ATTEMPTS = 4
+REPLACE_PAUSE = 0.05
 BILLING_PREFIX = "x-anthropic-billing-header:"
 DEFAULT_REMINDER = "<system-reminder>\n{{text}}\n</system-reminder>"
 DEFAULT_RULE_NAME = "default profile"
@@ -2187,7 +2190,15 @@ class PromptStore:
                 except OSError:
                     pass
             info = os.stat(temporary)
-            os.replace(temporary, self.path)
+            for attempt in range(REPLACE_ATTEMPTS):
+                try:
+                    os.replace(temporary, self.path)
+                    break
+                except PermissionError:
+                    # Windows refuses to replace a file that a reader or a virus scanner has open at this instant.
+                    if attempt == REPLACE_ATTEMPTS - 1:
+                        raise
+                    time.sleep(REPLACE_PAUSE)
             return (info.st_mtime_ns, info.st_size)
         except (OSError, ValueError):
             raise apierr.service_unavailable("Cannot save the prompts file") from None
