@@ -24,7 +24,7 @@ import client_context
 import console_log
 import native_history
 import models as model_catalog
-from accounts import account_tag, enabled as account_enabled
+from accounts import account_tag, idle_block
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
 
@@ -789,8 +789,8 @@ async def _keepwarm(session, cfg):
             last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
             if not busy and not getattr(session, "_cache_dependents", 0) and now - last_req > idle:
                 return
-            if not busy and not account_enabled(getattr(session, "backend", None)):
-                # A switched-off account must not keep spending credits on idle warmups.
+            if not busy and idle_block(getattr(session, "backend", None)):
+                # A switched-off, exhausted or signed-out account must not keep spending credits on idle warmups.
                 return
             body = getattr(session, "_warm_body", None)
             identity = getattr(session, "_warm_identity", None) or {}
