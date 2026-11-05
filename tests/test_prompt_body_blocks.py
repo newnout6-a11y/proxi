@@ -424,3 +424,27 @@ def test_bare_strings_inside_a_list_of_parts_are_text_too(dialect):
     assert history_of(result, dialect)[2 + shift]["content"] == ["keep", "more"]
     assert [(c["index"], c["removed_chars"]) for c in changes] == [(2 + shift, len(REMINDER))]
     assert parse(dialect, result).native_messages is not None
+
+
+def test_the_other_tool_result_shapes_are_edited_as_tool_results_too():
+    custom = {"model": "claude-opus-5-5", "input": [
+        {"type": "message", "role": "user", "content": "start"},
+        {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch", "input": "*** patch ***"},
+        {"type": "custom_tool_call_output", "call_id": "c1", "output": "patched\n\n" + TOOL_REMINDER},
+        {"type": "function_call", "call_id": "c2", "name": "shell", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c2", "output": [
+            {"type": "input_text", "text": "done"}, {"type": "input_text", "text": TOOL_REMINDER}]},
+        {"type": "message", "role": "user", "content": "more"}]}
+    result, changes = rewrite(custom, "responses", drop_tag())
+    assert result["input"][2]["output"] == "patched" and result["input"][4]["output"] == [
+        {"type": "input_text", "text": "done"}]
+    assert [(c["index"], c["target"]) for c in changes] == [(2, "tool_result"), (4, "tool_result")]
+    assert result["input"][1] == custom["input"][1] and result["input"][3] == custom["input"][3]
+    legacy = {"model": "claude-opus-5-5", "messages": [
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "function_call": {"name": "lookup", "arguments": "{}"}},
+        {"role": "function", "name": "lookup", "content": "found\n\n" + TOOL_REMINDER},
+        {"role": "user", "content": "more"}]}
+    result, changes = rewrite(legacy, "chat", drop_tag())
+    assert result["messages"][2] == {"role": "function", "name": "lookup", "content": "found"}
+    assert [(c["index"], c["target"]) for c in changes] == [(2, "tool_result")]
