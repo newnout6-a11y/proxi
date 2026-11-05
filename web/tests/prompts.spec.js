@@ -182,6 +182,47 @@ test('edits of the client system are forms by operation: add, change, reorder an
   ]);
 });
 
+test('the focus stays with the user in a list of edits: a new edit takes it, a move keeps it, a removal hands it on', async ({ page }) => {
+  await openPrompts(page);
+  const system = section(page, 'Правки system клиента');
+  const rows = system.locator('.p-edit');
+  const button = (name) => system.getByRole('button', { name });
+
+  // an added edit is for typing into
+  await system.getByLabel('Новая правка').selectOption('replace_text');
+  await button('Добавить правку').click();
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(2).getByLabel('Найти')).toBeFocused();
+  const tools = section(page, 'Инструменты');
+  await tools.getByLabel('Новая правка').selectOption('hide');
+  await tools.getByRole('button', { name: 'Добавить правку' }).click();
+  await expect(tools.locator('.p-edit').nth(1).getByLabel('Инструмент')).toBeFocused();
+
+  // a move leaves the focus on the same button of the moved row, so the key can be pressed again
+  await button('Поднять правку 3').focus();
+  await page.keyboard.press('Enter');
+  await expect(button('Поднять правку 2')).toBeFocused();
+  await expect(rows.nth(1).getByLabel('Найти')).toBeVisible();
+  // a row that reached the top has no button to go up: the focus takes the other one of the row
+  await page.keyboard.press('Enter');
+  await expect(button('Опустить правку 1')).toBeFocused();
+  await expect(rows.nth(0).getByLabel('Найти')).toBeVisible();
+  await page.keyboard.press('Enter');
+  await expect(button('Опустить правку 2')).toBeFocused();
+  await expect(rows.nth(1).getByLabel('Найти')).toBeVisible();
+
+  // a removed row hands the focus to the one that took its place, and the last one to the button that adds
+  await button('Удалить правку 1').click();
+  await expect(rows).toHaveCount(2);
+  await expect(button('Удалить правку 1')).toBeFocused();
+  await button('Удалить правку 2').click();
+  await expect(rows).toHaveCount(1);
+  await expect(button('Удалить правку 1')).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(system.getByText('Правок пока нет')).toBeVisible();
+  await expect(button('Добавить правку')).toBeFocused();
+});
+
 test('the operation of an edit can be switched and keeps the fields both forms share', async ({ page }) => {
   await openPrompts(page);
   const first = section(page, 'Правки system клиента').locator('.p-edit').nth(1);
@@ -1362,6 +1403,181 @@ test('fields and sections the screen does not edit travel with the document unto
   expect(saved.future_key).toEqual({ a: 1 });
   expect(saved.profiles['mine-first'].future_section).toEqual({ keep: 'me' });
   expect(saved.profiles['mine-first'].head).toBe('Изменён {{client_system}}');
+});
+
+// --- focus -------------------------------------------------------------------------------------------------------------
+
+test('a removed rule hands the focus to the rule that took its place, and a new rule takes it for its name', async ({ page }) => {
+  await openPrompts(page, {}, 'Правила');
+  await page.getByRole('button', { name: 'Добавить правило' }).first().click();
+  await expect(userRule(page, 3).getByLabel('Название')).toBeFocused();
+  const remove = (name) => page.getByRole('button', { name: `Удалить правило ${name}`, exact: true });
+  await remove('по заголовку').click();
+  await expect(remove('opencode')).toBeFocused();
+  // the last one hands it back to the one before
+  await remove('Новое правило').click();
+  await expect(remove('opencode')).toBeFocused();
+  await remove('opencode').click();
+  await expect(remove('opus свой')).toBeFocused();
+  await remove('opus свой').click();
+  await expect(page.locator('.p-rules-panel').getByRole('button', { name: 'Добавить правило' })).toBeFocused();
+});
+
+test('a removed condition or value leaves the focus in the list: on the next one, or on the field that adds', async ({ page }) => {
+  await openPrompts(page, {}, 'Правила');
+  await userRule(page, 2).getByRole('button', { name: /opencode/ }).first().click();
+  const editor = userRule(page, 2).locator('.rule-editor');
+  const client = editor.getByRole('group', { name: 'Клиент' });
+  const field = client.getByLabel('Клиент: добавить значение');
+  // the last value of a condition leaves its row open for the next one
+  await client.getByRole('button', { name: 'Убрать значение opencode' }).click();
+  await expect(field).toBeFocused();
+  await expect(client.locator('.p-token')).toHaveCount(0);
+  await field.fill('codex');
+  await field.press('Enter');
+  await field.fill('claude-*');
+  await field.press('Enter');
+  await expect(client.locator('.p-token')).toHaveText(['codex', 'claude-*']);
+  await field.press('Backspace');
+  await expect(client.locator('.p-token')).toHaveText(['codex']);
+  await expect(field).toBeFocused();
+
+  await editor.getByLabel('Добавить условие').selectOption('tools');
+  await editor.getByLabel('Добавить условие').selectOption('model');
+  await editor.getByRole('button', { name: 'Убрать условие «Есть инструменты»' }).click();
+  await expect(editor.getByRole('button', { name: 'Убрать условие «Модель»' })).toBeFocused();
+  await editor.getByRole('button', { name: 'Убрать условие «Модель»' }).click();
+  await expect(editor.getByRole('button', { name: 'Убрать условие «Клиент»' })).toBeFocused();
+  await editor.getByRole('button', { name: 'Убрать условие «Клиент»' }).click();
+  await expect(editor.getByLabel('Добавить условие')).toBeFocused();
+});
+
+test('removed texts and masks hand the focus on, and a rename opens on its field and closes onto its button', async ({ page }) => {
+  page.on('dialog', (dialog) => dialog.accept());
+  await openPrompts(page, {}, 'Тексты');
+  const named = page.getByRole('region', { name: 'Именованные тексты' });
+  const mine = named.getByRole('article', { name: 'Текст my_rules' });
+  await mine.getByRole('button', { name: 'Переименовать' }).click();
+  await expect(mine.getByLabel('Новое имя')).toBeFocused();
+  await mine.getByRole('button', { name: 'Отмена' }).click();
+  await expect(mine.getByRole('button', { name: 'Переименовать' })).toBeFocused();
+  await mine.getByRole('button', { name: 'Переименовать' }).click();
+  await mine.getByLabel('Новое имя').fill('rules_ru');
+  await mine.getByLabel('Новое имя').press('Enter');
+  // the text is a new element under its new name: the focus is on its button all the same
+  await expect(named.getByRole('article', { name: 'Текст rules_ru' }).getByRole('button', { name: 'Переименовать' })).toBeFocused();
+
+  const remove = (name) => named.getByRole('button', { name: `Удалить текст ${name}`, exact: true });
+  await remove('rules_ru').click();
+  await expect(remove('opus_role')).toBeFocused();
+  await named.getByLabel('Новый текст: имя').fill('footer');
+  await named.getByRole('button', { name: 'Добавить текст' }).click();
+  await remove('footer').click();
+  await expect(remove('opus_role')).toBeFocused();
+  await remove('opus_role').click();
+  await expect(named.getByLabel('Новый текст: имя')).toBeFocused();
+
+  const codex = page.getByRole('article', { name: 'Базовые инструкции Codex' });
+  await codex.getByRole('button', { name: 'Изменить' }).click();
+  await codex.getByRole('button', { name: 'Разделить по маскам моделей' }).click();
+  await codex.getByRole('button', { name: 'Добавить маску' }).click();
+  await expect(codex.getByLabel('Маска модели').nth(1)).toBeFocused();
+  await codex.getByLabel('Маска модели').nth(1).fill('gpt-6*');
+  await codex.getByRole('button', { name: 'Убрать маску *', exact: true }).click();
+  await expect(codex.getByRole('button', { name: 'Убрать маску gpt-6*', exact: true })).toBeFocused();
+});
+
+test('the profile forms hand the focus on: a new profile opens on its name, and every way out ends on the chip in view', async ({ page }) => {
+  await openPrompts(page);
+  const newButton = page.getByRole('button', { name: 'Новый профиль' });
+  await newButton.click();
+  await expect(page.getByLabel('Имя профиля')).toBeFocused();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+  await expect(newButton).toBeFocused();
+  await newButton.click();
+  await page.getByLabel('Имя профиля').fill('scratch');
+  await page.getByLabel('Имя профиля').press('Enter');
+  await expect(profileBar(page).getByRole('button', { name: 'scratch' })).toBeFocused();
+  await page.getByRole('button', { name: 'Дублировать' }).click();
+  await expect(profileBar(page).getByRole('button', { name: 'scratch-copy' })).toBeFocused();
+
+  await page.getByRole('button', { name: 'Переименовать' }).click();
+  await expect(page.getByLabel('Новое имя')).toBeFocused();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+  await expect(page.getByRole('button', { name: 'Переименовать' })).toBeFocused();
+  await page.getByRole('button', { name: 'Переименовать' }).click();
+  await page.getByLabel('Новое имя').fill('copy2');
+  await page.getByLabel('Новое имя').press('Enter');
+  await expect(profileBar(page).getByRole('button', { name: 'copy2' })).toBeFocused();
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await expect(profileBar(page).getByRole('button', { name: 'copy2' })).toHaveCount(0);
+  await expect(profileBar(page).locator('[aria-current="true"]')).toBeFocused();
+});
+
+test('the first profile form opens on its name, cancelling returns to its button, and creating ends on the new chip', async ({ page }) => {
+  await openPrompts(page, { legacy: true });
+  const start = page.getByRole('button', { name: 'Создать первый профиль' });
+  await start.click();
+  await expect(page.getByLabel('Имя профиля')).toBeFocused();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+  await expect(start).toBeFocused();
+  await start.click();
+  await page.getByLabel('Имя профиля').press('Enter');
+  await expect(profileBar(page).locator('[aria-current="true"]')).toBeFocused();
+  await expect(profileBar(page).locator('[aria-current="true"]')).toHaveText('mine');
+});
+
+test('after an unpin, an apply to all or a cancelled question the focus is on a button that stays', async ({ page }) => {
+  await openPrompts(page, {}, 'Пины');
+  const refresh = page.locator('.p-pins').getByRole('button', { name: 'Обновить' });
+  await page.locator('.pin-row').nth(0).getByRole('button', { name: 'Открепить диалог c-7f2a' }).click();
+  await expect(page.locator('.pin-row')).toHaveCount(1);
+  await expect(refresh).toBeFocused();
+  await page.getByRole('button', { name: 'Применить ко всем' }).click();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+  await expect(page.getByRole('button', { name: 'Применить ко всем' })).toBeFocused();
+  await page.getByRole('button', { name: 'Применить ко всем' }).click();
+  await page.getByRole('button', { name: 'Да, применить ко всем' }).click();
+  await expect(page.getByText('Закреплённых диалогов нет')).toBeVisible();
+  await expect(refresh).toBeFocused();
+});
+
+test('the save bar leaves the focus on the tab in view when it goes, unless the user has gone on typing', async ({ page }) => {
+  const { prompts } = await openPrompts(page);
+  await head(page).fill('x {{client_system}}');
+  await page.getByRole('button', { name: 'Отменить' }).focus();
+  await page.keyboard.press('Enter');
+  await expect(savebar(page)).toHaveCount(0);
+  await expect(tab(page, 'Профили')).toBeFocused();
+
+  await head(page).fill('y {{client_system}}');
+  await saveButton(page).focus();
+  await page.keyboard.press('Enter');
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  await expect(savebar(page)).toHaveCount(0);
+  await expect(tab(page, 'Профили')).toBeFocused();
+
+  await page.route('**/admin/api/prompts', async (route) => {
+    if (route.request().method() === 'PUT') await new Promise((resolve) => setTimeout(resolve, 400));
+    await route.fallback();
+  });
+  await head(page).fill('z {{client_system}}');
+  await saveButton(page).click();
+  await head(page).focus();
+  await page.keyboard.type(' ещё');
+  await expect.poll(() => prompts.saves.length).toBe(2);
+  await expect(page.getByText('Промпты сохранены').first()).toBeVisible();
+  await expect(head(page)).toBeFocused();
+  await expect(head(page)).toHaveValue('z {{client_system}} ещё');
+});
+
+test('"Проверить в предпросмотре" lands on the preview tab', async ({ page }) => {
+  await openPrompts(page, {}, 'Что увидела модель');
+  await page.getByRole('button', { name: 'Проверить в предпросмотре' }).click();
+  await expect(tab(page, 'Предпросмотр')).toHaveAttribute('aria-selected', 'true');
+  await expect(tab(page, 'Предпросмотр')).toBeFocused();
 });
 
 // --- the screen itself -----------------------------------------------------------------------------------------------
