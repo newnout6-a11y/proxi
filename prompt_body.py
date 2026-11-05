@@ -398,10 +398,14 @@ def _text_op(context, spec, ops):
             tag = spec.get("tag")
             if not isinstance(tag, str) or not tag:
                 return None, "missing tag"
-            pattern = spec.get("pattern")
-            compiled = context.regex(pattern, spec.get("flags")) if isinstance(pattern, str) and pattern else None
-            contains = spec.get("contains")
-            return _drop_tag_fn(tag, contains if isinstance(contains, str) and contains else None, compiled), None
+            pattern, contains = spec.get("pattern"), spec.get("contains")
+            if pattern not in (None, "") and not isinstance(pattern, str):
+                return None, "invalid pattern"
+            if contains not in (None, "") and not isinstance(contains, str):
+                # A filter this module cannot read must not widen the rule to every block.
+                return None, "invalid contains"
+            compiled = context.regex(pattern, spec.get("flags")) if pattern else None
+            return _drop_tag_fn(tag, contains or None, compiled), None
         if op in ("remove_regex", "replace_regex"):
             pattern = spec.get("pattern")
             if not isinstance(pattern, str) or not pattern:

@@ -246,7 +246,9 @@ def test_the_snapshots_own_compile_error_is_a_skipped_edit_too():
 @pytest.mark.parametrize("spec,reason", [
     ({"op": "drop_tag"}, "missing tag"), ({"op": "remove_regex"}, "missing pattern"),
     ({"op": "replace_text", "with": "x"}, "missing find"), ({"op": "bogus"}, "unsupported op"),
-    ({"op": "replace_regex", "pattern": "a", "with": "b"}, "unsupported op")])
+    ({"op": "replace_regex", "pattern": "a", "with": "b"}, "unsupported op"),
+    ({"op": "drop_tag", "tag": "n", "contains": ["Plan", "mode"]}, "invalid contains"),
+    ({"op": "drop_tag", "tag": "n", "pattern": 7}, "invalid pattern")])
 def test_a_rule_that_cannot_run_is_skipped_with_a_reason(spec, reason):
     result, changes = prompt_body.rewrite(rich_conversation("chat"), "chat", profile(user_blocks=[spec]), None)
     assert changes == [{"scope": "history", "op": spec["op"], "edit": 0, "skipped": True, "reason": reason}]
