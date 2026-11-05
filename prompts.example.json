@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "default_profile": null,
+  "protected": {"enabled": true},
+  "texts": {
+    "my_prompt": "Ты — ассистент по разработке в терминале. Отвечай по-русски, кратко и по делу.\nПеред правкой читай файл, после правки запускай проверку и сообщай её результат.\nНе выдумывай результаты инструментов: опирайся на то, что они вернули.\nНе меняй файлы вне рабочей папки и не запускай разрушающие команды без явной просьбы.",
+    "my_rules": "Отвечай по-русски.\nНе меняй файлы без явной просьбы.\nПеред командой, которая удаляет или перезаписывает данные, спрашивай подтверждение.",
+    "opus_role": "Ты — старший инженер в терминале пользователя. Сначала читай код и тесты, потом меняй. Делай минимальные правки, запускай проверки и называй то, что не проверено.",
+    "cc_rules": "Отвечай по-русски. Коммить только по явной просьбе.",
+    "codex_rules": "Отвечай по-русски. Перед массовыми правками показывай план.",
+    "desktop_rules": "Отвечай по-русски. Объясняй решения коротко.",
+    "oc_rules": "Отвечай по-русски. Не добавляй комментарии в код без просьбы.",
+    "terse": "Отвечай как можно короче: без вступлений и пересказа вопроса."
+  },
+  "relay_texts": {
+    "role": null,
+    "native_role": null,
+    "structured": null,
+    "reminder": null,
+    "codex_base": null
+  },
+  "profiles": {
+    "opencode-exact": {
+      "description": "рецепт 1: ровно мой текст вместо system OpenCode",
+      "head": "{{text:my_prompt}}"
+    },
+    "rules-first": {
+      "description": "рецепт 2: мои правила перед system OpenCode",
+      "head": "{{text:my_rules}}\n\n{{client_system}}"
+    },
+    "rules-last": {
+      "description": "рецепт 2: мои правила после system OpenCode",
+      "head": "{{client_system}}\n\n{{text:my_rules}}"
+    },
+    "rules-before-env": {
+      "description": "рецепт 2: мои правила перед блоком окружения OpenCode",
+      "head": "{{client_system}}",
+      "client_system": {
+        "edits": [
+          {
+            "op": "replace_text",
+            "find": "Here is some useful information about the environment you are running in:",
+            "with": "{{text:my_rules}}\n\nHere is some useful information about the environment you are running in:",
+            "all": false
+          }
+        ]
+      }
+    },
+    "opencode-lean": {
+      "description": "рецепт 3: OpenCode без раздела о комментариях, без списка skills и без даты",
+      "head": "{{client_system}}",
+      "client_system": {
+        "edits": [
+          {"op": "remove_section", "heading": "# Code comments"},
+          {
+            "op": "remove_between",
+            "start": "Skills provide specialized instructions and workflows for specific tasks.",
+            "end": "</available_skills>",
+            "inclusive": true
+          },
+          {"op": "remove_regex", "pattern": "^[ \\t]*Today's date:[^\\n]*\\n", "flags": "m"}
+        ]
+      }
+    },
+    "opencode-no-env": {
+      "description": "рецепт 3: OpenCode без блока окружения целиком",
+      "head": "{{client_system}}",
+      "client_system": {
+        "edits": [
+          {
+            "op": "remove_between",
+            "start": "Here is some useful information about the environment you are running in:",
+            "end": "</env>",
+            "inclusive": true
+          }
+        ]
+      }
+    },
+    "opencode-no-mode-reminders": {
+      "description": "рецепт 4: OpenCode без напоминаний о режиме",
+      "head": "{{client_system}}",
+      "history": {
+        "user_blocks": [
+          {"op": "drop_tag", "tag": "system-reminder", "contains": "Plan mode ACTIVE"},
+          {"op": "drop_tag", "tag": "system-reminder", "contains": "operational mode has changed"}
+        ]
+      }
+    },
+    "claude-no-late-system": {
+      "description": "рецепт 4: Claude Code и Desktop без поздних system внутри диалога",
+      "head": "{{client_system}}",
+      "history": {"mid_system": "drop"}
+    },
+    "opus-exact": {
+      "description": "рецепт 5: собственный промпт для Claude Opus в OpenCode",
+      "head": "{{text:opus_role}}"
+    },
+    "cc-rules": {
+      "description": "рецепт 6: Claude Code, мои правила в начале (после строки атрибуции)",
+      "head": "{{text:cc_rules}}\n\n{{client_system}}"
+    },
+    "codex-rules": {
+      "description": "рецепт 6: Codex, мои правила в конце",
+      "head": "{{client_system}}\n\n{{text:codex_rules}}"
+    },
+    "desktop-rules": {
+      "description": "рецепт 6: Claude Desktop, мои правила в конце",
+      "head": "{{client_system}}\n\n{{text:desktop_rules}}"
+    },
+    "oc-rules": {
+      "description": "рецепт 6: OpenCode, мои правила в начале",
+      "head": "{{text:oc_rules}}\n\n{{client_system}}"
+    },
+    "terse": {
+      "description": "рецепт 7: краткие ответы; модель <модель>@terse",
+      "head": "{{client_system}}\n\n{{text:terse}}",
+      "publish_as_model": false
+    },
+    "bash-careful": {
+      "description": "рецепт 9: осторожный bash",
+      "head": "{{client_system}}",
+      "tools": {
+        "edits": [
+          {"tool": "bash", "op": "append", "text": "Не запускай команды, которые меняют систему или удаляют данные, без подтверждения пользователя."}
+        ]
+      }
+    }
+  },
+  "rules": [
+    {"name": "по заголовку x-proxi-profile", "if": {"header_profile": "*"}, "use": "$header"}
+  ]
+}
