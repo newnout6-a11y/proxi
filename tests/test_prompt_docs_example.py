@@ -251,6 +251,25 @@ def test_the_guide_and_the_example_carry_no_personal_data():
     assert found == []
 
 
+def test_the_guide_names_everything_the_engine_enumerates():
+    # The closed lists belong to prompt_policy: a new operation, variable or limit there fails this until it is documented.
+    text = GUIDE.read_text(encoding="utf-8")
+    expected = [f"{{{{{name}}}}}" for name in prompt_policy.VARIABLES]
+    expected += [f"`{name}`" for name in (
+        *prompt_policy.CLIENTS, *prompt_policy.SYSTEM_EDIT_OPS, *prompt_policy.MID_SYSTEM_MODES,
+        *prompt_policy.USER_BLOCK_OPS, *prompt_policy.TOOL_EDIT_OPS, *prompt_policy.CONDITIONS,
+        *prompt_policy.SPECIAL_USES, *prompt_policy.RELAY_TEXT_NAMES, *prompt_policy.CODEX_OVERRIDE_KEYS,
+        *prompt_policy.BUILTIN_PROFILES)]
+    for rule in prompt_policy.PROTECTED_RULES:
+        expected.append(rule["name"])
+        expected += [value for values in rule["if"].values() for value in values]
+    expected += [prompt_policy.PROFILE_NAME.pattern, prompt_policy.DEFAULT_FILE,
+                 f"не больше {prompt_policy.MAX_TEXT_BYTES // 1024} КиБ",
+                 f"не больше {prompt_policy.MAX_DOCUMENT_BYTES // (1024 * 1024)} МиБ",
+                 f"последние {prompt_policy.SNAPSHOT_HISTORY} ревизии", f"по умолчанию {prompt_policy.RECENT_LIMIT}"]
+    assert [item for item in expected if item not in text] == []
+
+
 def test_anchors_in_the_guide_and_towards_it_resolve():
     # test_docs_consistency checks that a linked file exists; a renamed heading breaks the #anchor silently.
     broken = broken_anchors(GUIDE)
