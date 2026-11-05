@@ -30,9 +30,10 @@ export const TURN_STATUS = {
   cancelled: 'отменён',
   timeout: 'таймаут',
   error: 'ошибка',
+  interrupted: 'прерван',
 };
 
-export const STATUS_TONE = { running: 'accent', stop: 'pos', tool_calls: 'muted', cancelled: 'warn', timeout: 'warn', error: 'neg' };
+export const STATUS_TONE = { running: 'accent', stop: 'pos', tool_calls: 'muted', cancelled: 'warn', timeout: 'warn', error: 'neg', interrupted: 'warn' };
 
 export const ACCOUNT_STATE = {
   active: { label: 'в работе', tone: 'pos' },

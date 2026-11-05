@@ -1,5 +1,18 @@
 import { test, expect } from '@playwright/test';
 import { API_KEY, DEFAULT_ROLES, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
+import { NOW, metricsFor } from './fixtures.js';
+
+// Replaces the journal page the admin loads at start; the live stream stays empty.
+const serveEvents = (page, data) => page.route(/\/admin\/api\/events\?/, (route) => route.fulfill({
+  json: { data, last_seq: data.reduce((last, event) => Math.max(last, event.seq), 0) },
+}));
+
+// A turn event `seconds` from now, with the next sequence number; no turn id makes it a relay event.
+let eventSeq = 100;
+const eventAt = (turn, seconds, kind, data = {}, extra = {}) => {
+  eventSeq += 1;
+  return ev(eventSeq, kind, kind, 'info', { ...(turn && { turn_id: turn }), ts: NOW + seconds, data, ...extra });
+};
 
 async function login(page, { remember = false } = {}) {
   await page.goto('./');
@@ -275,6 +288,104 @@ test('turn traces show hidden thinking and tool argument time', async ({ page })
   const trace = page.locator('.trace', { hasText: 'effort high' }).first();
   await expect(trace.locator('[title="По событиям thinking от upstream"]')).toContainText('6,40 с', { timeout: 10000 });
   await expect(trace.locator('[title="Генерация аргументов инструментов"]')).toContainText('7,10 с');
+});
+
+test('turns left running by a restart or by silence are interrupted and never stretch the shared scale', async ({ page }) => {
+  await mockAdmin(page);
+  const day = 86400;
+  await serveEvents(page, [
+    // Restored from journal.jsonl: the process that ran this turn is gone
+    eventAt(null, -3 * day, 'relay.start', {}, { restored: true }),
+    eventAt('t-lost', -3 * day + 1, 'turn.begin', { model: 'model-lost', effort: 'high' }, { restored: true }),
+    eventAt('t-lost', -3 * day + 2, 'upstream.thinking_start', {}, { restored: true }),
+    // Ended by the next relay.start in the journal
+    eventAt(null, -4000, 'relay.start'),
+    eventAt('t-restart', -3900, 'turn.begin', { model: 'model-restart', effort: 'high' }),
+    eventAt('t-restart', -3899, 'upstream.thinking_start'),
+    eventAt(null, -3800, 'relay.start'),
+    // No restart after it, but nothing for 50 minutes
+    eventAt('t-silent', -3000, 'turn.begin', { model: 'model-silent', effort: 'high' }),
+    eventAt('t-silent', -2999, 'upstream.thinking_start'),
+    eventAt('t-done', -60, 'turn.begin', { model: 'model-done', effort: 'low' }),
+    eventAt('t-done', -58, 'turn.end', { reason: 'stop', duration_ms: 2000 }),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  for (const model of ['model-lost', 'model-restart', 'model-silent']) {
+    const row = page.locator('.trace', { hasText: model });
+    await expect(row.locator('.tag')).toHaveText('прерван');
+    await expect(row).toContainText('всего 1,00 с');
+    await expect(row.locator('.live-phase')).toHaveCount(0);
+    await expect(row.locator('.tape')).toHaveClass(/is-interrupted/);
+    // Half of the finished turn's 2 s, not a fraction of 3 days
+    await expect(row.locator('.tape-fill')).toHaveAttribute('style', /width: 50%/);
+  }
+  const done = page.locator('.trace', { hasText: 'model-done' });
+  await expect(done.locator('.tag')).toHaveText('готово');
+  await expect(done.locator('.tape-fill')).toHaveAttribute('style', /width: 100%/);
+});
+
+test('turn rows price a turn by the relay rules: nothing for a refused attempt, unknown for usage without a price, a lower bound while it runs', async ({ page }) => {
+  await mockAdmin(page);
+  await serveEvents(page, [
+    // Rejected before the upstream was reached
+    eventAt('t-failed', -400, 'turn.begin', { model: 'model-failed' }),
+    eventAt('t-failed', -399, 'turn.error', {}, { level: 'error' }),
+    eventAt('t-failed', -399, 'turn.end', { reason: 'error', duration_ms: 1000 }, { level: 'error' }),
+    // An attempt began and the upstream refused it (429): it reported nothing and cost nothing
+    eventAt('t-refused', -350, 'turn.begin', { model: 'model-refused' }),
+    eventAt('t-refused', -350, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-refused', -346, 'turn.end', { reason: 'error', duration_ms: 4000 }, { level: 'error' }),
+    // Usage came back without a price
+    eventAt('t-unpriced', -300, 'turn.begin', { model: 'model-unpriced' }),
+    eventAt('t-unpriced', -300, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-unpriced', -297, 'upstream.usage', { credits: null, attempt: 1, credits_reported: false }),
+    eventAt('t-unpriced', -296, 'turn.end', { reason: 'error', duration_ms: 4000 }, { level: 'error' }),
+    // The client gave up while the attempt was silent: it may have been billed
+    eventAt('t-cancelled', -250, 'turn.begin', { model: 'model-cancelled' }),
+    eventAt('t-cancelled', -250, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-cancelled', -247, 'turn.end', { reason: 'cancelled', duration_ms: 3000 }),
+    // Still running: one attempt priced, the next not yet; and one that has reported nothing
+    eventAt('t-running', -20, 'turn.begin', { model: 'model-running' }),
+    eventAt('t-running', -20, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-running', -15, 'upstream.usage', { credits: 0.5, attempt: 1, credits_reported: true }),
+    eventAt('t-running', -15, 'upstream.usage_start', { attempt: 2 }),
+    eventAt('t-waiting', -10, 'turn.begin', { model: 'model-waiting' }),
+    eventAt('t-waiting', -10, 'upstream.usage_start', { attempt: 1 }),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  const cost = (model) => page.locator('.trace', { hasText: model }).locator('.trace-cost');
+  await expect(cost('model-failed')).toHaveText('0,00');
+  await expect(cost('model-refused')).toHaveText('0,00');
+  await expect(cost('model-unpriced')).toContainText('нет данных');
+  await expect(cost('model-cancelled')).toContainText('нет данных');
+  await expect(cost('model-running')).toContainText('≥ 0,50');
+  await expect(cost('model-running')).toContainText('ход идёт');
+  await expect(cost('model-waiting')).toContainText('ход идёт');
+  await expect(cost('model-waiting')).not.toContainText('нет данных');
+});
+
+test('a local command is shown as its own time and is not counted as the answer', async ({ page }) => {
+  await mockAdmin(page);
+  await serveEvents(page, [
+    eventAt('t-command', -200, 'turn.begin', { model: 'model-command' }),
+    eventAt('t-command', -200, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-command', -195, 'upstream.text_start'),
+    eventAt('t-command', -193, 'exec.start'),
+    eventAt('t-command', -163, 'exec.result', { duration_ms: 30000, exit: 0 }),
+    eventAt('t-command', -163, 'upstream.usage', { credits: 0.5, attempt: 1, credits_reported: true }),
+    eventAt('t-command', -163, 'upstream.usage_start', { attempt: 2 }),
+    eventAt('t-command', -160, 'upstream.usage', { credits: 0.25, attempt: 2, credits_reported: true }),
+    eventAt('t-command', -160, 'turn.end', { reason: 'stop', duration_ms: 40000 }),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  const command = page.locator('.trace', { hasText: 'model-command' });
+  await expect(command.locator('.trace-cost')).toHaveText('0,75');
+  await expect(command.locator('.trace-phases')).toContainText('команды 30,0 с');
+  // 2 s of text, then 30 s of command: only the 2 s are the answer
+  await expect(command.locator('.tape')).toHaveAttribute('aria-label', /ответ 2,00\sс.*без детализации 30,0\sс/);
 });
 
 test('turns empty state shows the stageshow illustration', async ({ page }) => {
@@ -572,6 +683,208 @@ test('incomplete usage is not shown as free inference or a reliable forecast', a
   await expect(page.getByText('есть неучтённый расход')).toBeVisible();
 });
 
+test('periods without a complete price are marked on the spend chart and summed as a lower bound', async ({ page }) => {
+  // Period 21 holds a known part of its price, period 31 none at all; the relay counts the unpriced requests in both
+  const buckets = metricsFor(3600).buckets.map((bucket, i) => (i === 20 ? { ...bucket, credits: 0.2, credits_unknown: 1, credits_complete: false }
+    : i === 30 ? { ...bucket, credits: 0, credits_unknown: 1, credits_complete: false } : bucket));
+  await mockAdmin(page, { metricsPatch: { buckets, totals: { credits_complete: false, credits_unknown: 2 } } });
+  await login(page);
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
+  await expect(chart).toHaveAttribute('aria-label', /всего не менее \d+,\d\d, максимум не менее \d+,\d\d\. В 2 периодах стоимость сообщена не полностью/);
+  // Marks on the chart itself: a hollow diamond per period and dashed stretches around it
+  await expect(page.locator('.c-unsure-dot')).toHaveCount(2);
+  await expect(page.locator('.c-spend-line.is-unsure')).toHaveCount(2);
+  await expect(page.locator('.c-spend-line:not(.is-unsure)')).toHaveCount(3);
+  await expect(page.locator('.legend', { hasText: 'за каждые 1 мин' })).toContainText('стоимость сообщена не полностью');
+  // The unknown period is read as unknown, not as zero
+  await chart.focus();
+  await chart.press('Home');
+  for (let i = 0; i < 20; i += 1) await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuenow', '21');
+  await expect(chart).toHaveAttribute('aria-valuetext', /кредиты не менее 0,20/);
+  await expect(chart).toHaveAttribute('aria-valuetext', /без цены 1/);
+  await expect(page.locator('.chart-tip')).toContainText('≥ 0,20');
+  for (let i = 0; i < 10; i += 1) await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuenow', '31');
+  await expect(chart).toHaveAttribute('aria-valuetext', /кредиты не сообщены/);
+  await expect(chart).toHaveAttribute('aria-valuetext', /без цены 1/);
+  await expect(page.locator('.chart-tip dd').first()).toContainText('—');
+});
+
+test('a spend chart whose prices are all reported has no lower-bound marks', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await expect(page.getByRole('slider', { name: /Расход кредитов/ })).toHaveAttribute('aria-label', /всего \d/);
+  await expect(page.getByRole('slider', { name: /Расход кредитов/ })).not.toHaveAttribute('aria-label', /не менее/);
+  await expect(page.locator('.c-unsure-dot')).toHaveCount(0);
+  await expect(page.locator('.c-spend-line.is-unsure')).toHaveCount(0);
+  await expect(page.locator('.legend', { hasText: 'за каждые 1 мин' })).not.toContainText('не полностью');
+});
+
+const clock = (ts) => new Date(ts * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+test('a window the journal covers only in part says how much it covers and greys out the charts before that', async ({ page }) => {
+  const from = NOW - 600;
+  await mockAdmin(page, { metricsPatch: { coverage: { complete: false, window_start: NOW - 3600, covered_from: from, covered_seconds: 600,
+    oldest_event_ts: from + 12, buffer_oldest_ts: from - 100, buffer_events: 40, buffer_capacity: 20000 } } });
+  await login(page);
+  const notice = page.locator('.banner.tone-warn');
+  await expect(notice).toContainText('Журнал покрывает окно не полностью');
+  await expect(notice).toContainText('данные за 10 мин из окна 60 мин');
+  await expect(notice).toContainText(`(с ${clock(from)})`);
+  await expect(notice).toContainText('Суммы за окно неполные');
+  // Both charts grey out what the journal does not cover: 49 of the 60 one-minute periods end before it began
+  await expect(page.locator('.c-uncovered')).toHaveCount(2);
+  const spend = page.locator('svg.chart').first();
+  await expect(spend).toHaveAttribute('aria-label', new RegExp(`Данные только с ${clock(from)}`));
+  await spend.focus();
+  await spend.press('Home');
+  await expect(spend).toHaveAttribute('aria-valuetext', /нет данных: журнал начат позже/);
+  await expect(page.locator('.chart-tip')).toContainText('нет данных');
+  await expect(page.locator('.c-hover-dot')).toHaveCount(0);
+  await spend.press('End');
+  await expect(spend).toHaveAttribute('aria-valuetext', /кредиты .*запросы /);
+  await expect(page.locator('.chart-tip')).not.toContainText('журнал начат позже');
+  await expect(page.locator('.c-hover-dot')).toHaveCount(1);
+  // The line starts where the data does, not inside the grey stretch
+  const edge = await page.locator('.c-uncovered').first().locator('rect').evaluate((rect) => rect.x.baseVal.value + rect.width.baseVal.value);
+  const starts = await page.locator('.c-spend-line').evaluateAll((paths) => paths.map((path) => Number(path.getAttribute('d').match(/^M(-?[\d.]+)/)[1])));
+  expect(Math.min(...starts)).toBeGreaterThanOrEqual(edge - 0.5);
+  // The cache chart marks the same stretch and its tooltip says so
+  const cache = page.locator('svg.chart').nth(1);
+  await cache.focus();
+  await cache.press('Home');
+  await expect(cache).toHaveAttribute('aria-valuetext', /нет данных: журнал начат позже/);
+  await expect(cache).toHaveAttribute('aria-label', new RegExp(`Данные только с ${clock(from)}`));
+});
+
+test('the gap follows the window that is chosen', async ({ page }) => {
+  const from = NOW - 600;
+  await mockAdmin(page, { metricsPatch: { coverage: { complete: false, covered_from: from, covered_seconds: 600 } } });
+  await login(page);
+  await expect(page.locator('.banner.tone-warn')).toContainText('данные за 10 мин из окна 60 мин');
+  await page.getByRole('group', { name: 'Окно метрик' }).getByRole('button', { name: '6 ч' }).click();
+  await expect(page.locator('.banner.tone-warn')).toContainText('данные за 10 мин из окна 6 ч');
+  await expect(page.locator('.c-uncovered')).toHaveCount(2);
+  const spend = page.locator('svg.chart').first();
+  await expect(spend).toHaveAttribute('aria-valuemax', '72');
+  await spend.focus();
+  await spend.press('End');
+  await spend.press('ArrowLeft');
+  await expect(spend).toHaveAttribute('aria-valuenow', '71');
+  await expect(spend).not.toHaveAttribute('aria-valuetext', /журнал начат позже/);
+});
+
+// The spend of a half covered window is that of its covered half: dividing by the whole window would halve the rate
+for (const [name, coverage, figure, basis] of [
+  ['completely', { complete: true, covered_seconds: 3600, covered_from: NOW - 4200 }, '86,40', 'последний час'],
+  ['for half of it', { complete: false, covered_seconds: 1800, covered_from: NOW - 1800 }, '172,80', '30 мин'],
+  ['for exactly the shortest stretch a forecast needs', { complete: false, covered_seconds: 300, covered_from: NOW - 300 }, '1 036,80', '5 мин'],
+]) {
+  test(`the burn rate divides the spend by what the journal covers: window covered ${name}`, async ({ page }) => {
+    await mockAdmin(page, { metricsPatch: { totals: { credits: 3.6 }, coverage } });
+    await login(page);
+    await expect(page.locator('.forecast')).toContainText(`При темпе за ${basis}`);
+    await expect(page.locator('.forecast b').first()).toHaveText(figure);
+    await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+  });
+}
+
+for (const [name, coverage, reason] of [
+  ['shorter than the shortest stretch a forecast needs', { complete: false, covered_seconds: 299, covered_from: NOW - 299 }, 'журнал покрывает меньше 5 минут'],
+  ['of an unknown length', { complete: false, covered_from: NOW - 900 }, 'неизвестно, какую часть окна покрывает журнал'],
+]) {
+  test(`no forecast from a window covered ${name}`, async ({ page }) => {
+    await mockAdmin(page, { metricsPatch: { totals: { credits: 3.6 }, coverage } });
+    await login(page);
+    await expect(page.locator('.forecast')).toContainText(`Прогноз недоступен: ${reason}`);
+    await expect(page.locator('.forecast')).not.toContainText('хватит примерно');
+  });
+}
+
+test('a gap in the price withholds the forecast even when the whole window is covered', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { credits: 3.6, credits_complete: false, credits_unknown: 1 } } });
+  await login(page);
+  await expect(page.locator('.forecast')).toContainText('Прогноз недоступен: часть стоимости не сообщена');
+});
+
+test('the spend figure is the relay\'s total: the cache refresh is named beside it, never added to it', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { credits: 2, keepwarm_credits: 0.5, keepwarm_pings: 3, credits_in_progress: 2 } } });
+  await login(page);
+  const spent = page.locator('.stat', { hasText: 'Потрачено за окно' });
+  await expect(spent.locator('.stat-value')).toHaveText('2,00');
+  // The note stays one short line: a turn still waiting for its price is named, the refresh is not
+  await expect(spent.locator('.stat-note')).toContainText('ждём цену: 2 хода');
+  await expect(spent.locator('.stat-note')).not.toContainText('часть стоимости');
+  await expect(spent.locator('.stat-note')).not.toContainText('прогрев');
+  const warm = page.locator('.cache-facts dl div', { hasText: 'прогрев кэша' });
+  await expect(warm.locator('dd')).toHaveText('0,50');
+  await expect(warm.locator('dd')).toHaveAttribute('title', /Входит в расход за окно\. Обращений для прогрева: 3/);
+});
+
+test('without a cache refresh in the window there is no row for it', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { keepwarm_credits: 0, keepwarm_pings: 0 } } });
+  await login(page);
+  await expect(page.locator('.cache-facts dl div')).toHaveCount(3);
+  await expect(page.locator('.cache-facts')).not.toContainText('прогрев кэша');
+});
+
+test('a lower-bound spend names how many requests have no price; an unpriced cache refresh makes its share a lower bound too', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { credits: 2, credits_complete: false, credits_unknown: 3, keepwarm_unknown: 1, keepwarm_credits: 0.5, keepwarm_pings: 2 } } });
+  await login(page);
+  const spent = page.locator('.stat', { hasText: 'Потрачено за окно' });
+  await expect(spent.locator('.stat-value')).toHaveText('≥ 2,00');
+  await expect(spent.locator('.stat-note')).toContainText('часть стоимости не сообщена (без цены: 3)');
+  const warm = page.locator('.cache-facts dl div', { hasText: 'прогрев кэша' });
+  await expect(warm.locator('dd')).toHaveText('≥ 0,50');
+  await expect(warm.locator('dd')).toHaveAttribute('title', /без цены: 1/);
+});
+
+test('a period of the spend chart names its cache refresh and its unpriced requests', async ({ page }) => {
+  const buckets = metricsFor(3600).buckets.map((bucket, i) => (i === 20
+    ? { ...bucket, credits: 0.3, keepwarm_credits: 0.05, credits_unknown: 2, credits_complete: false } : bucket));
+  await mockAdmin(page, { metricsPatch: { buckets, totals: { credits_complete: false, credits_unknown: 2 } } });
+  await login(page);
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
+  await chart.focus();
+  await chart.press('Home');
+  for (let i = 0; i < 20; i += 1) await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuetext', /кредиты не менее 0,30, в т\. ч\. прогрев кэша 0,05, без цены 2, запросы /);
+  await expect(page.locator('.chart-tip')).toContainText('в т. ч. прогрев кэша');
+  await expect(page.locator('.chart-tip')).toContainText('без цены');
+  // The figure is the bucket's credits as the relay sent them: the refresh is not added on top
+  await expect(page.locator('.chart-tip dd').first()).toContainText('≥ 0,30');
+  await chart.press('ArrowRight');
+  await expect(chart).not.toHaveAttribute('aria-valuetext', /прогрев кэша|без цены/);
+});
+
+for (const [name, coverage] of [
+  ['covered completely', { complete: true, covered_from: NOW - 99999, covered_seconds: 3600, oldest_event_ts: NOW - 99999 }],
+  ['reported by a relay that does not say how much it covers', undefined],
+]) {
+  test(`a window ${name} shows no gap`, async ({ page }) => {
+    await mockAdmin(page, { metricsPatch: coverage ? { coverage } : {} });
+    await login(page);
+    await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+    await expect(page.locator('.banner.tone-warn')).toHaveCount(0);
+    await expect(page.locator('.c-uncovered')).toHaveCount(0);
+    const spend = page.locator('svg.chart').first();
+    await expect(spend).not.toHaveAttribute('aria-label', /Данные только с/);
+    await spend.focus();
+    await spend.press('Home');
+    await expect(spend).not.toHaveAttribute('aria-valuetext', /журнал начат позже/);
+  });
+}
+
+test('a window that is not covered and has no spend says so instead of "no spend"', async ({ page }) => {
+  const from = NOW - 600;
+  const buckets = metricsFor(3600).buckets.map((bucket) => ({ ...bucket, credits: 0, cache_read: 0, cache_write: 0 }));
+  await mockAdmin(page, { metricsPatch: { buckets, coverage: { complete: false, covered_from: from, covered_seconds: 600 } } });
+  await login(page);
+  await expect(page.locator('.chart-empty').first()).toHaveText(`С ${clock(from)} расхода не было`);
+  await expect(page.locator('.chart-empty').nth(1)).toHaveText(`С ${clock(from)} обращений к кэшу не было`);
+});
+
 test('activity tabs and chart values work with the keyboard', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
@@ -588,6 +901,112 @@ test('activity tabs and chart values work with the keyboard', async ({ page }) =
   await turns.press('ArrowRight');
   await expect(page.getByRole('tab', { name: /Все события/ })).toBeFocused();
   await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'activity-tab-events');
+});
+
+test('activity tabs follow the WAI-ARIA tabs pattern: each controls a real panel, and a panel is a tab stop only when it holds nothing focusable', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Активность');
+  const wiring = () => page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].map((tab) => {
+    const panel = document.getElementById(tab.getAttribute('aria-controls'));
+    return { tab: tab.id, selected: tab.getAttribute('aria-selected'), role: panel?.getAttribute('role'),
+      labelledby: panel?.getAttribute('aria-labelledby'), hidden: panel?.hidden };
+  }));
+  expect(await wiring()).toEqual([
+    { tab: 'activity-tab-turns', selected: 'true', role: 'tabpanel', labelledby: 'activity-tab-turns', hidden: false },
+    { tab: 'activity-tab-events', selected: 'false', role: 'tabpanel', labelledby: 'activity-tab-events', hidden: true },
+  ]);
+  // The turns hold buttons to land on: the panel itself is not an extra stop, and Tab goes straight to the first turn
+  const panel = page.getByRole('tabpanel');
+  await expect.poll(() => panel.getAttribute('tabindex')).toBeNull();
+  await page.getByRole('tab', { name: /Ходы моделей/ }).focus();
+  await page.keyboard.press('Tab');
+  await expect(page.locator('.trace-head').first()).toBeFocused();
+  await page.getByRole('tab', { name: /Все события/ }).click();
+  expect(await wiring()).toEqual([
+    { tab: 'activity-tab-turns', selected: 'false', role: 'tabpanel', labelledby: 'activity-tab-turns', hidden: true },
+    { tab: 'activity-tab-events', selected: 'true', role: 'tabpanel', labelledby: 'activity-tab-events', hidden: false },
+  ]);
+  await expect.poll(() => panel.getAttribute('tabindex')).toBeNull();
+});
+
+test('an empty activity panel is a tab stop of its own, so its message can be reached', async ({ page }) => {
+  await mockAdmin(page, { empty: true });
+  await login(page);
+  await nav(page, 'Активность');
+  const panel = page.getByRole('tabpanel');
+  await expect(panel).toContainText('Ходов пока нет');
+  await expect(panel).toHaveAttribute('tabindex', '0');
+  await page.getByRole('tab', { name: /Ходы моделей/ }).focus();
+  await page.keyboard.press('Tab');
+  await expect(panel).toBeFocused();
+});
+
+test('charts are sliders over their periods: Escape clears, an arrow re-enters from its own end, a passing pointer keeps the keyboard choice', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  // An image carries neither focus nor key handlers: both charts are sliders with a value read out in words
+  await expect(page.locator('svg.chart')).toHaveCount(2);
+  await expect(page.locator('svg.chart[role="img"]')).toHaveCount(0);
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
+  await expect(chart).toHaveAttribute('tabindex', '0');
+  await expect(chart).toHaveAttribute('aria-valuemin', '1');
+  await expect(chart).toHaveAttribute('aria-valuemax', '60');
+  await expect(chart).toHaveAttribute('aria-valuetext', 'период не выбран');
+  await chart.focus();
+  await chart.press('End');
+  await expect(chart).toHaveAttribute('aria-valuenow', '60');
+  await expect(chart).toHaveAttribute('aria-valuetext', /кредиты .*запросы .*ходы /);
+  await expect(page.locator('.chart-tip')).toBeVisible();
+  await chart.press('Escape');
+  await expect(page.locator('.chart-tip')).toHaveCount(0);
+  await expect(chart).toHaveAttribute('aria-valuetext', 'период не выбран');
+  // From nothing, right starts at the first period (it used to skip to the second) and left at the last
+  await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuenow', '1');
+  await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuenow', '2');
+  await chart.press('Escape');
+  await chart.press('ArrowLeft');
+  await expect(chart).toHaveAttribute('aria-valuenow', '60');
+  await chart.press('ArrowDown');
+  await expect(chart).toHaveAttribute('aria-valuenow', '59');
+  await chart.press('ArrowUp');
+  await expect(chart).toHaveAttribute('aria-valuenow', '60');
+  // The pointer takes over while it is over the chart and gives the period back when it leaves
+  await chart.press('End');
+  await chart.scrollIntoViewIfNeeded();
+  const box = await chart.boundingBox();
+  await page.mouse.move(box.x + 56 + 20, box.y + box.height / 2);
+  await expect(chart).toHaveAttribute('aria-valuenow', /^[1-5]$/);
+  await page.mouse.move(5, 5);
+  await expect(chart).toBeFocused();
+  await expect(chart).toHaveAttribute('aria-valuenow', '60');
+  await expect(page.locator('.chart-tip')).toBeVisible();
+  // Leaving focus drops the keyboard choice
+  await chart.blur();
+  await expect(page.locator('.chart-tip')).toHaveCount(0);
+});
+
+test('a chart reached only by the pointer clears when the pointer leaves', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
+  await chart.scrollIntoViewIfNeeded();
+  const box = await chart.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.locator('.chart-tip')).toBeVisible();
+  await expect(chart).not.toBeFocused();
+  await page.mouse.move(5, 5);
+  await expect(page.locator('.chart-tip')).toHaveCount(0);
+});
+
+test('a chart without periods is a plain image: not focusable, no slider', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { buckets: [] } });
+  await login(page);
+  await expect(page.locator('svg.chart[role="img"]')).toHaveCount(2);
+  await expect(page.locator('svg.chart[role="slider"]')).toHaveCount(0);
+  await expect(page.locator('svg.chart[tabindex]')).toHaveCount(0);
 });
 
 test('model controls stay readable on a narrow display', async ({ page }) => {
