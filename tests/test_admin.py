@@ -426,7 +426,9 @@ def test_system_policy_controls_round_trip_without_changing_auth(admin_relay):
     status, body, _ = admin_relay.patch({'relay_system_prompt_mode': 'append', 'relay_system_prompt': policy})
     assert status == 200
     assert body['settings']['relay_system_prompt'] == policy
-    assert set(body['pending_restart']) >= {'relay_system_prompt_mode', 'relay_system_prompt'}
+    # Both are live: the next request already carries them, so nothing waits for a restart.
+    assert body['pending_restart'] == [] and not body['restart_required']
+    assert set(body['applied']) == {'relay_system_prompt_mode', 'relay_system_prompt'}
     after = json.loads(admin_relay.path.read_text(encoding='utf-8'))
     assert after['cookie'] == before['cookie'] and after['xsrf'] == before['xsrf']
     for value in ('', None):
