@@ -42,6 +42,22 @@ DEFAULT_MODELS = ('claude-haiku-4-5-20251001', 'zai-org/GLM-5.3', 'zai-org/GLM-5
                   'gpt-5-mini', 'gpt-5-nano')
 
 
+def usable(value):
+    """Whether a reported figure can be added up: finite, not negative and small enough for a float."""
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+def record_usage(row, key, value):
+    """Keep a usage figure in the row; one that cannot be added up is named under invalid_usage, never stored."""
+    if usable(value):
+        row['usage'][key] = value
+    elif key not in row.setdefault('invalid_usage', []):
+        row['invalid_usage'].append(key)
+
+
 def observe(cfg, entry, effort, *, question='count', timeout=120, max_tokens=6000):
     prompt, expected = QUESTIONS[question]
     provider = {'model': entry['id'], 'providerResourceName': models.provider_resource(cfg, entry)}
@@ -89,10 +105,12 @@ def observe(cfg, entry, effort, *, question='count', timeout=120, max_tokens=600
                                           cookie_values=secrets)[:300]
                 usage = event.get('usage')
                 if isinstance(usage, dict):
-                    row['usage'].update({key: value for key, value in usage.items() if type(value) in (int, float)})
+                    for key, value in usage.items():
+                        if type(value) in (int, float):
+                            record_usage(row, key, value)
                     details = usage.get('output_tokens_details')
                     if isinstance(details, dict) and type(details.get('reasoning_tokens')) in (int, float):
-                        row['usage']['reasoningTokens'] = details['reasoning_tokens']
+                        record_usage(row, 'reasoningTokens', details['reasoning_tokens'])
                 if event.get('event') == 'end_of_stream' or kind == 'end_of_stream':
                     break
     except urllib.error.HTTPError as exc:
@@ -131,7 +149,7 @@ def summarize(rows):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--allow-paid', action='store_true', help='Required: requests can spend provider credits')
-    parser.add_argument('--config', default='config.json')
+    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1] / 'config.json'))
     parser.add_argument('--models', nargs='+', default=list(DEFAULT_MODELS))
     parser.add_argument('--efforts', nargs='+', help='Raw levels; "omit" sends none. Default: per-provider list')
     parser.add_argument('--question', choices=sorted(QUESTIONS), default='count',
@@ -171,6 +189,9 @@ def main(argv=None):
                     print(json.dumps(row, ensure_ascii=False), flush=True)
                     if row['http'] in (401, 403):
                         stopped = 'authentication rejected; no renewal and no retry'
+                    elif 'creditsUsed' in row.get('invalid_usage', ()):
+                        stopped = ('creditsUsed was not a finite non-negative number; '
+                                   'the credit limit cannot be enforced')
                     elif spent >= args.max_credits:
                         stopped = 'credit limit reached'
                     if stopped:

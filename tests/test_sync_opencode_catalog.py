@@ -11,7 +11,8 @@ import pytest
 import models
 from scripts import sync_opencode_catalog as sync
 from scripts.probe_client_settings import routable_entries
-from scripts.sync_opencode_catalog import main, parse_settings, update_document, write_backed_up
+from scripts.sync_opencode_catalog import (is_secret_flag, main, mask_document, parse_settings, update_document,
+                                           write_backed_up)
 
 HAIKU = 'retool-relay/claude-haiku-4-5-20251001'
 RELAY = {'base': 'https://example.invalid', 'provider_resource_name': 'anthropic-resource',
@@ -290,6 +291,91 @@ def test_preview_masks_credentials_by_default_and_the_full_preview_is_explicit(t
     assert settings.read_bytes() == original
 
 
+LEAKY = {
+    'provider': {'retool-relay': {'options': {'baseURL': 'http://localhost:8787/v1', 'apiKey': 'SECRET-A'}, 'models': {}},
+                 'other': {'options': {'apiKeyEnv': 'MY_ENV_NAME', 'timeout': 600,
+                                       'baseURL': 'https://user:SECRET-B@host.example/v1?token=SECRET-C&limit=5'}}},
+    'mcp': {'server': {'command': ['npx', 'srv', '--api-key', 'SECRET-D', '--token=SECRET-E', '--secret', 'SECRET-F',
+                                   '--password', 'SECRET-G', '--port', '8080', '--verbose'],
+                       'url': 'https://h.example/mcp?key=SECRET-H&page=2#access_token=SECRET-I',
+                       'environment': {'PORT': 8080}, 'oauth': {'clientId': 'public-id', 'clientSecret': 'SECRET-J'}},
+            'tool': {'command': ['env', 'API_KEY=SECRET-K', 'run', 'https://:SECRET-L@registry.example/pkg'],
+                     'env': ['SECRET_KEY=SECRET-M', 'PLAIN=SECRET-N', 'KEEP_NAME']}},
+    'auth': {'key': 'SECRET-O', 'type': 'api'}}
+
+
+def test_masking_covers_urls_secret_arguments_env_items_and_auth_keys():
+    original = copy.deepcopy(LEAKY)
+    masked = mask_document(LEAKY)
+    assert LEAKY == original and 'SECRET-' not in json.dumps(masked)
+    assert masked['provider']['other']['options'] == {'apiKeyEnv': 'MY_ENV_NAME', 'timeout': 600,
+                                                      'baseURL': 'https://***@host.example/v1?token=***&limit=5'}
+    assert masked['provider']['retool-relay']['options']['baseURL'] == 'http://localhost:8787/v1'
+    server, tool = masked['mcp']['server'], masked['mcp']['tool']
+    assert server['command'] == ['npx', 'srv', '--api-key', '***', '--token=***', '--secret', '***', '--password', '***',
+                                 '--port', '8080', '--verbose']
+    assert server['url'] == 'https://h.example/mcp?key=***&page=2#access_token=***'
+    assert server['oauth'] == {'clientId': 'public-id', 'clientSecret': '***'}
+    assert tool['command'] == ['env', 'API_KEY=***', 'run', 'https://***@registry.example/pkg']
+    assert tool['env'] == ['SECRET_KEY=***', 'PLAIN=***', 'KEEP_NAME']
+    assert masked['auth'] == {'key': '***', 'type': 'api'}
+
+
+def test_a_masked_document_masked_again_does_not_change():
+    once = mask_document(LEAKY)
+    assert mask_document(once) == once
+
+
+@pytest.mark.parametrize('flag,secret', [('--api-key', True), ('--token', True), ('--secret', True),
+                                         ('--password', True), ('--auth-token', True), ('--key', True),
+                                         ('--client-secret', True), ('--port', False), ('--key-file', False),
+                                         ('--no-auth', False), ('--api-key=x', False), ('-k', False), ('token', False)])
+def test_only_a_bare_secret_flag_makes_the_next_argument_a_secret(flag, secret):
+    assert is_secret_flag(flag) is secret
+    assert mask_document(['run', flag, 'value'])[2] == ('***' if secret else 'value')
+
+
+@pytest.mark.parametrize('url,expected', [
+    ('https://user:pw@host/p', 'https://***@host/p'),
+    ('https://token@github.example/org/repo.git', 'https://***@github.example/org/repo.git'),
+    ('redis://:pw@cache:6379/0', 'redis://***@cache:6379/0'),
+    ('https://host/p?api_key=x&k=y&access_token=z&signature=s&sig=t&page=3', 'https://host/p?api_key=***&k=y&access_token=***&signature=***&sig=***&page=3'),
+    ('https://host/cb#access_token=abc&state=1', 'https://host/cb#access_token=***&state=1'),
+    ('https://host/p?token=', 'https://host/p?token='),
+    ('https://host:8443/a@b?x=1', 'https://host:8443/a@b?x=1'),
+    ('http://localhost:8787/v1', 'http://localhost:8787/v1'),
+    ('see https://u:pw@host/x and https://host/y?key=k.', 'see https://***@host/x and https://host/y?key=***.')])
+def test_url_userinfo_and_secret_parameters_are_masked_wherever_the_url_appears(url, expected):
+    assert mask_document({'note': url}) == {'note': expected}
+    assert mask_document([url]) == [expected]
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('npx srv --api-key SECRET-X --port 80', 'npx srv --api-key *** --port 80'),
+    ('API_KEY=SECRET-X run', 'API_KEY=*** run'),
+    ('export TOKEN="two words" && run', 'export TOKEN=*** && run'),
+    ('run --token=SECRET-X.', 'run --token=***.'),
+    ('PORT=8080 HOST=example', 'PORT=8080 HOST=example'),
+    ('MY_API_KEY_ENV=NAME_OF_VARIABLE', 'MY_API_KEY_ENV=NAME_OF_VARIABLE'),
+    ('keep --key-file /etc/key.pem', 'keep --key-file /etc/key.pem')])
+def test_secret_pairs_inside_one_string_are_masked_and_everything_else_is_kept(text, expected):
+    assert mask_document({'run': text}) == {'run': expected}
+
+
+def test_the_preview_of_a_settings_file_masks_urls_arguments_and_env_items_but_the_written_file_keeps_them(
+        tmp_path, capsys):
+    settings = installed(tmp_path, copy.deepcopy(LEAKY))
+    original = settings.read_bytes()
+    masked, full = tmp_path / 'masked.json', tmp_path / 'full.json'
+    code, summary, error = client(tmp_path, capsys, '--output', str(masked))
+    assert code == 0 and summary['preview_redacted'] is True, error
+    assert 'SECRET-' not in masked.read_text(encoding='utf-8')
+    code, summary, error = client(tmp_path, capsys, '--output', str(full), '--include-secrets')
+    assert code == 0 and 'SECRET-B' in full.read_text(encoding='utf-8')
+    assert client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'))[0] == 0
+    assert 'SECRET-D' in settings.read_text(encoding='utf-8') and settings.read_bytes() != original
+
+
 def test_written_settings_keep_credentials_and_an_existing_preview_is_never_replaced(tmp_path, capsys):
     settings = installed(tmp_path)
     preview = tmp_path / 'preview.json'
@@ -437,12 +523,102 @@ def test_removed_models_in_small_model_and_background_agents_get_a_cheap_publish
     result = update_document(before, entries)
     assert result['small_model'] == HAIKU
     assert result['agent']['title'] == {'model': HAIKU, 'temperature': 0}
-    assert result['agent']['compaction'] == {'model': HAIKU}
     assert result['agent']['summary'] == {'model': 'retool-relay/gpt-6-sol'}
     assert result['agent']['build'] == {'model': 'retool-relay/claude-opus-5-5'}
+    # Compaction reads the whole session: neither Haiku (200K) nor nano (400K) holds the 1.05M main model's.
+    assert result['agent']['compaction'] == {}
     without_haiku = update_document(before, [entry for entry in entries if entry['id'] != 'claude-haiku-4-5-20251001'])
     assert without_haiku['small_model'] == 'retool-relay/gpt-5-nano'
-    assert without_haiku['agent']['compaction'] == {'model': 'retool-relay/gpt-5-nano'}
+    assert without_haiku['agent']['title'] == {'model': 'retool-relay/gpt-5-nano', 'temperature': 0}
+
+
+def compaction_case(main, available, *, compaction='retool-relay/claude-sonnet-4-20250514', section='agent'):
+    """update_document for a removed compaction model; returns (settings, warnings)."""
+    before = source()
+    before.update(model=main, small_model='retool-relay/gpt-5.3-codex')
+    before[section] = {'compaction': {'model': compaction, 'temperature': 0}, 'title': {'model': compaction}}
+    warnings = []
+    result = update_document(before, [models.resolve(name)[0] for name in available], warnings=warnings)
+    return result, warnings
+
+
+@pytest.mark.parametrize('main,expected', [
+    ('retool-relay/claude-opus-5-5', 'retool-relay/gemini-3.5-flash'),
+    ('retool-relay/claude-opus-5-5#max', 'retool-relay/gemini-3.5-flash'),
+    ('retool-relay/gpt-5', 'retool-relay/gemini-3.1-flash-lite-preview'),
+    ('retool-relay/claude-haiku-4-5-20251001', HAIKU)])
+def test_removed_compaction_model_gets_the_cheapest_published_model_whose_window_holds_the_main_models(main, expected):
+    available = ('claude-opus-5-5', 'gpt-5', 'claude-haiku-4-5-20251001', 'gemini-3.1-flash-lite-preview',
+                 'gemini-3.5-flash', 'gpt-5-nano', 'gpt-5.4')
+    result, warnings = compaction_case(main, available)
+    assert result['agent']['compaction'] == {'model': expected, 'temperature': 0}
+    # Titles stay on the cheapest small model: only compaction needs the window.
+    assert result['agent']['title'] == {'model': HAIKU} and result['small_model'] == HAIKU
+    assert len(warnings) == 1 and 'agent.compaction.model' in warnings[0]
+    assert 'retool-relay/claude-sonnet-4-20250514' in warnings[0] and expected in warnings[0]
+
+
+def test_a_smaller_window_is_never_chosen_even_when_it_is_cheaper():
+    # Flash-Lite is earlier in the small tier but holds 983040 tokens, fewer than Opus 5.5's 1000000.
+    result, warnings = compaction_case('retool-relay/claude-opus-5-5',
+                                       ('claude-opus-5-5', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-flash'))
+    assert result['agent']['compaction'] == {'temperature': 0}
+    assert result['agent']['title'] == {'model': 'retool-relay/gemini-3.1-flash-lite-preview'}
+    assert len(warnings) == 1 and 'removed' in warnings[0] and '1000000' in warnings[0]
+
+
+def test_removed_compaction_override_is_dropped_with_a_warning_when_no_cheap_model_has_the_window():
+    result, warnings = compaction_case('retool-relay/claude-opus-5-5',
+                                       ('claude-opus-5-5', 'claude-haiku-4-5-20251001', 'gpt-5-nano', 'gpt-5.4'))
+    assert 'model' not in result['agent']['compaction'] and result['agent']['compaction'] == {'temperature': 0}
+    assert result['agent']['title'] == {'model': HAIKU}
+    assert len(warnings) == 1 and 'retool-relay/claude-sonnet-4-20250514' in warnings[0]
+    assert 'removed' in warnings[0] and 'main model' in warnings[0] and 'retool-relay/claude-opus-5-5' in warnings[0]
+
+
+@pytest.mark.parametrize('main', ['anthropic/claude-sonnet-5', None])
+def test_removed_compaction_override_is_dropped_when_the_main_models_window_is_unknown(main):
+    before = source()
+    before['agent'] = {'compaction': {'model': 'retool-relay/claude-sonnet-4-20250514'}}
+    before.pop('model')
+    if main:
+        before['model'] = main
+    warnings = []
+    result = update_document(before, [models.resolve(name)[0] for name in ('claude-opus-5-5', 'gemini-3.5-flash')],
+                             warnings=warnings)
+    assert result['agent']['compaction'] == {} and len(warnings) == 1
+    assert 'unknown' in warnings[0] and 'removed' in warnings[0]
+
+
+def test_a_deprecated_mode_named_compaction_is_handled_like_the_agent():
+    result, warnings = compaction_case('retool-relay/claude-opus-5-5', ('claude-opus-5-5', 'gemini-3.5-flash'),
+                                       section='mode')
+    assert result['mode']['compaction'] == {'model': 'retool-relay/gemini-3.5-flash', 'temperature': 0}
+    assert len(warnings) == 1 and 'mode.compaction.model' in warnings[0]
+
+
+def test_a_published_compaction_model_is_the_users_choice_and_is_kept_without_a_warning():
+    before = source()
+    before.update(model='retool-relay/claude-opus-5-5')
+    before['agent'] = {'compaction': {'model': HAIKU + '#high'}}
+    warnings = []
+    result = update_document(before, [models.resolve(name)[0] for name in ('claude-opus-5-5', 'claude-haiku-4-5-20251001')],
+                             warnings=warnings)
+    assert result['agent']['compaction'] == {'model': HAIKU} and warnings == []
+
+
+def test_cli_reports_the_compaction_decision_in_the_summary(tmp_path, capsys):
+    settings = installed(tmp_path, {
+        'model': 'retool-relay/gpt-5.3-codex',
+        'agent': {'compaction': {'model': 'retool-relay/claude-sonnet-4-20250514'}},
+        'provider': {'retool-relay': {'options': {'baseURL': 'http://localhost:8787/v1'}, 'models': {}}}})
+    code, summary, error = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'))
+    assert code == 0 and summary['written'] is True, error
+    assert len(summary['warnings']) == 1 and 'agent.compaction.model' in summary['warnings'][0]
+    saved = json.loads(settings.read_text(encoding='utf-8'))
+    assert saved['model'] == 'retool-relay/claude-opus-5-5' and 'model' not in saved['agent']['compaction']
+    code, summary, error = client(tmp_path, capsys)
+    assert code == 0 and summary['warnings'] == [] and summary['changed'] is False
 
 
 def test_removed_model_override_is_dropped_when_no_cheap_model_is_published():
@@ -540,6 +716,60 @@ def test_malformed_model_entries_and_options_are_rebuilt_instead_of_crashing():
     assert catalog['gpt-4.1']['options'] == {'reasoningEffort': 'none'}
     assert catalog['claude-opus-5-5']['custom'] is True
     assert catalog['claude-opus-5-5']['options']['reasoningEffort'] == 'medium'
+
+
+def model_with(name, **fields):
+    """update_document for one model whose entry holds `fields`, next to Opus so the catalog is never empty."""
+    before = source()
+    before['provider']['retool-relay']['models'] = {name: fields}
+    result = update_document(before, [models.resolve(name)[0], models.resolve('claude-opus-5-5')[0]])
+    return result['provider']['retool-relay']['models'][name]
+
+
+@pytest.mark.parametrize('name,default', [('claude-haiku-4-5-20251001', 'none'), ('gpt-4.1', 'none'),
+                                          ('zai-org/GLM-5.3-Flash', None)])
+@pytest.mark.parametrize('where', ['settings', 'body'])
+def test_stale_effort_in_model_level_settings_or_body_is_cleared_where_the_model_has_no_levels(name, default, where):
+    item = model_with(name, **{where: {'reasoningEffort': 'high', 'temperature': 0.2}})
+    assert item[where] == {'temperature': 0.2} and item['variants'] == {}
+    assert item['options'].get('reasoningEffort') == default
+    assert where not in model_with(name, **{where: {'reasoning_effort': 'high'}})  # nothing else left: the empty block goes
+
+
+@pytest.mark.parametrize('where', ['settings', 'body'])
+def test_a_valid_effort_in_model_level_settings_or_body_is_the_users_choice_and_moves_to_options(where):
+    item = model_with('claude-opus-5-5', **{where: {'reasoningEffort': 'low', 'temperature': 0.2}})
+    assert item['options']['reasoningEffort'] == 'low' and item[where] == {'temperature': 0.2}
+
+
+@pytest.mark.parametrize('settings', [{'reasoningEffort': 'xhigh'}, {'effort': 'xhigh'},
+                                      {'extra_body': {'reasoning': {'effort': 'ultra'}}}])
+def test_an_effort_level_the_route_rejects_is_dropped_from_model_level_settings(settings):
+    item = model_with('claude-opus-5-5', settings=dict(settings))
+    assert 'settings' not in item and item['options']['reasoningEffort'] == 'medium'
+
+
+def test_conflicting_model_level_efforts_fall_back_to_the_default_instead_of_picking_one():
+    item = model_with('claude-opus-5-5', options={'reasoningEffort': 'high'}, settings={'reasoningEffort': 'low'})
+    assert item['options']['reasoningEffort'] == 'medium' and 'settings' not in item
+
+
+def test_a_validation_failure_names_the_model_and_the_field():
+    before = source()
+    before['provider']['retool-relay']['models'] = {'gpt-6-sol': {'settings': 'not an object'}, 'gpt-4.1': {}}
+    with pytest.raises(ValueError, match='validation') as error:
+        update_document(before, [models.resolve(name)[0] for name in ('gpt-6-sol', 'gpt-4.1')])
+    assert 'gpt-6-sol' in str(error.value) and 'settings' in str(error.value) and 'gpt-4.1' not in str(error.value)
+
+
+def test_cli_reports_which_model_and_field_failed_validation_and_leaves_the_file_alone(tmp_path, capsys):
+    settings = installed(tmp_path, {'provider': {'retool-relay': {'options': {'baseURL': 'http://localhost:8787/v1'},
+                                                                  'models': {'gpt-6-sol': {'settings': ['high']}}}}})
+    original = settings.read_bytes()
+    code, summary, error = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'))
+    assert code == 1 and summary is None and error.startswith('error: Generated client catalog failed validation')
+    assert 'gpt-6-sol' in error and 'settings' in error and 'Traceback' not in error
+    assert settings.read_bytes() == original and not (tmp_path / 'backups').exists()
 
 
 def test_write_without_a_backup_directory_is_rejected_before_the_settings_are_read(tmp_path):
