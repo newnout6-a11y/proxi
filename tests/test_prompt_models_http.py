@@ -9,6 +9,8 @@ import pytest
 
 import journal
 import models
+import config as config_module
+import prompt_policy
 from prompt_models_support import FakeSnapshot, store  # noqa: F401  (store is a fixture)
 from test_prompt_models_catalog import CODEX_TEXT, dump, legacy_codex_catalog
 
@@ -220,3 +222,34 @@ def test_a_malformed_virtual_name_is_a_400_before_any_work(served, path, payload
 def test_count_tokens_accepts_a_virtual_model_name(served):
     status, body = served.json("/v1/messages/count_tokens", dict(ANTHROPIC, model="claude-opus-5-5@mine"))
     assert status == 200 and body["input_tokens"] > 0
+
+
+# -- the real prompt store (skipped while prompt_policy is only the contract skeleton) -------------
+
+@pytest.fixture
+def real_prompts(monkeypatch, tmp_path):
+    """cfg["prompts_file"] for the relay under test: the real PromptStore loads this file in its constructor."""
+    document = {"version": 1,
+                "relay_texts": {"codex_base": {"gpt-6*": "Real engine text"}},
+                "codex": {"models": {"gpt-6*": {"persistent_instructions": "Real persistent text"}}},
+                "profiles": {"mine": {"head": "{{client_system}}", "publish_as_model": ["gpt-6-sol", "claude-opus-*"]}}}
+    try:
+        prompt_policy.compile_document(document, tmp_path, rev=1)
+    except NotImplementedError:
+        pytest.skip("prompt_policy is only the contract skeleton in this tree")
+    path = tmp_path / "real-prompts.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setitem(config_module.DEFAULTS, "prompts_file", str(path))
+    return path
+
+
+def test_the_real_store_publishes_virtual_models_and_codex_texts_through_the_routes(real_prompts, relay):
+    rows = {row["id"]: row for row in listed(relay)}
+    assert {"gpt-6-sol@mine", "claude-opus-5-5@mine"} <= set(rows) and "gpt-5.5@mine" not in rows
+    assert rows["gpt-6-sol@mine"]["base_model"] == "gpt-6-sol" and rows["gpt-6-sol@mine"]["prompt_profile"] == "mine"
+    items = {item["slug"]: item for item in listed(relay, "/codex/models")}
+    sol = items["gpt-6-sol"]
+    assert sol["base_instructions"] == sol["model_messages"]["instructions_template"] == "Real engine text"
+    assert sol["model_messages"]["persistent_instructions"] == "Real persistent text"
+    assert items["gpt-6-sol@mine"]["base_instructions"] == "Real engine text"
+    assert items["gpt-5.5"]["base_instructions"] == CODEX_TEXT

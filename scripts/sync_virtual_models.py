@@ -7,6 +7,7 @@ the relay configuration (the same PromptStore, so the same path rules) or from -
 or with no profile that publishes, the catalogs are exactly what they were before.
 """
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -39,7 +40,7 @@ def load_snapshot(relay_config, prompts=None):
         raise ValueError('cannot read relay configuration %s: %s' % (relay_config, error)) from None
     if not isinstance(saved, dict):
         raise ValueError('relay configuration %s must contain a JSON object' % relay_config)
-    cfg = {**RELAY_DEFAULTS, **saved, '_config_path': str(relay_config)}
+    cfg = {**RELAY_DEFAULTS, **saved, '_config_path': os.path.abspath(relay_config)}
     try:
         store = prompt_policy.PromptStore(cfg, None if prompts is None else str(prompts))
         snapshot = store.snapshot()

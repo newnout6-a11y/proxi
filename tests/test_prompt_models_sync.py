@@ -5,6 +5,7 @@ and no real prompts file is read.
 """
 import copy
 import json
+import os
 import sys
 from types import SimpleNamespace
 
@@ -261,13 +262,17 @@ def test_the_probe_without_a_snapshot_expects_the_catalog_models_only(tmp_path, 
 
 # -- the shared loader ----------------------------------------------------------------------------
 
-def test_the_loader_builds_the_store_the_way_the_relay_does(tmp_path, store):
+def test_the_loader_builds_the_store_the_way_the_relay_does(tmp_path, store, monkeypatch):
     relay = relay_config(tmp_path)
     store.current = FakeSnapshot(PUBLISH)
     snapshot, path = sync_virtual_models.load_snapshot(relay)
     assert snapshot is store.current and path == str(store.path)
     (cfg, explicit), = store.constructed
     assert explicit is None and cfg['_config_path'] == str(relay) and cfg['base'] == RELAY['base']
+    # config.load stores an absolute path, and a relative prompts_file is read from beside it.
+    monkeypatch.chdir(tmp_path)
+    sync_virtual_models.load_snapshot('relay.json')
+    assert store.constructed[-1][0]['_config_path'] == os.path.abspath('relay.json')
 
 
 def test_no_file_and_no_snapshot_is_not_an_error(tmp_path, store):
@@ -296,3 +301,26 @@ def test_prompts_and_no_virtual_models_exclude_each_other():
     assert parser.parse_args(['--no-virtual-models']).no_virtual_models is True
     with pytest.raises(SystemExit):
         parser.parse_args(['--prompts', 'x.json', '--no-virtual-models'])
+
+
+# -- the real prompt store (skipped while PromptStore does not load files in this tree) ------------
+
+def test_a_real_prompts_file_is_loaded_by_the_real_store_and_published_to_the_catalogs(tmp_path, capsys):
+    prompts = tmp_path / 'real-prompts.json'
+    prompts.write_text(json.dumps({
+        'version': 1, 'profiles': {'mine': {'head': '{{client_system}}',
+                                            'publish_as_model': ['gpt-6-sol', 'claude-opus-*']}}}), encoding='utf-8')
+    try:
+        snapshot, path = sync_virtual_models.load_snapshot(relay_config(tmp_path), prompts)
+    except ValueError as error:
+        if 'could not be loaded' not in str(error):
+            raise
+        pytest.skip('prompt_policy.PromptStore does not load a prompts file in this tree')
+    assert snapshot is not None and path == str(prompts)
+    assert 'mine' in snapshot.profile_names()
+    installed(tmp_path)
+    code, summary, error = opencode_client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'),
+                                           '--prompts', str(prompts))
+    assert code == 0 and summary['written'] is True and summary['prompts'] == str(prompts), error
+    catalog = written_models(tmp_path)[1]
+    assert 'gpt-6-sol@mine' in catalog and 'claude-opus-5-5@mine' in catalog and 'gpt-5.5@mine' not in catalog
