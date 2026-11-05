@@ -107,6 +107,9 @@ def test_a_system_message_that_carries_effort_keeps_it_in_a_blank_entry(dialect,
     assert changes[0]["kept"] == ["output_config"]
     texts = [t for t in neutral(result, dialect) if t[0] == "user"]
     assert (LATE in str(texts)) == (mode != "drop")
+    converted = [m for m in history_of(result, dialect) if m.get("role") == "user" and LATE in json.dumps(m)]
+    assert len(converted) == (mode != "drop")
+    assert all("output_config" not in m and "clear_at" not in m for m in converted)
     assert after.system_messages_normalized is False
     assert [m["role"] for m in after.native_messages] == (["user", "user", "assistant", "user"] if mode != "drop"
                                                          else ["user", "assistant", "user"])

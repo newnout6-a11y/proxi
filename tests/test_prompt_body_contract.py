@@ -40,11 +40,14 @@ def run(data, dialect, name="all", snapshot=None):
 @pytest.mark.parametrize("dialect", DIALECTS)
 def test_an_empty_profile_returns_an_equal_body_that_shares_nothing_mutable(dialect):
     data = rich_conversation(dialect)
+    data["extra"] = ({"nested": [1, 2, {"deep": "x"}]}, [("tuple", {"in": "list"})])
     result, changes = prompt_body.rewrite(data, dialect, profile(), FakeSnapshot())
     assert result == data and changes == []
     assert result is not data
     original = {id(item) for item in leaves(data)}
     assert not original & {id(item) for item in leaves(result)}
+    assert result["extra"][0] is not data["extra"][0] and result["extra"][0]["nested"] is not data["extra"][0]["nested"]
+    assert result["extra"][1][0][1] is not data["extra"][1][0][1]
 
 
 @pytest.mark.parametrize("name", sorted(PROFILES))

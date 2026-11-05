@@ -255,6 +255,22 @@ def test_a_tool_result_made_of_parts_keeps_its_pair_when_the_parts_all_go(dialec
     result, _ = rewrite(conversation(dialect, turns), dialect, drop_tag())
     assert neutral(result, dialect)[2] == ("result", "c1", "")
     assert parse(dialect, result).native_messages[2]["role"] == "tool"
+    message = history_of(result, dialect)[3 if dialect == "chat" else 2]
+    # An emptied list of parts becomes the empty string, the one shape every upstream takes for "no output".
+    raw = {"chat": message.get("content"), "responses": message.get("output"),
+           "anthropic": message["content"][0]["content"] if dialect == "anthropic" else None}[dialect]
+    assert raw == ""
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_a_tool_result_whose_text_is_only_whitespace_afterwards_becomes_the_empty_string(dialect):
+    turns = [("user", "start"), ("call", "c1", "bash"), ("result", "c1", "ok  \n"), ("assistant", "ok"), ("user", "more")]
+    result, changes = rewrite(conversation(dialect, turns), dialect, {"op": "remove_regex", "pattern": "ok"})
+    assert neutral(result, dialect)[2] == ("result", "c1", "") and changes[0]["removed_chars"] == 2
+    message = history_of(result, dialect)[3 if dialect == "chat" else 2]
+    raw = {"chat": message.get("content"), "responses": message.get("output"),
+           "anthropic": message["content"][0]["content"] if dialect == "anthropic" else None}[dialect]
+    assert raw == ""
 
 
 def test_messages_tool_results_are_edited_inside_and_keep_their_message_and_flags():
