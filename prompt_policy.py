@@ -1218,9 +1218,10 @@ class _Compiler:
         try:
             info = target.stat()
         except OSError as exc:
-            self.files.append((key, None, None))
-            _err(path, "file not found: %s" % _clip(name) if isinstance(exc, FileNotFoundError)
-                 else "cannot read the file: %s" % (exc.strerror or exc))
+            if isinstance(exc, FileNotFoundError):
+                self.files.append((key, None, None))
+                _err(path, "file not found: %s" % _clip(name))
+            self._unreadable(key, path, exc)
         self.files.append((key, info.st_mtime_ns, info.st_size))
         if not stat.S_ISREG(info.st_mode):
             _err(path, "must name a regular file")
@@ -1234,7 +1235,7 @@ class _Compiler:
         except UnicodeDecodeError:
             _err(path, "the file is not valid UTF-8")
         except OSError as exc:
-            _err(path, "cannot read the file: %s" % (exc.strerror or exc))
+            self._unreadable(key, path, exc, replace=True)
         if len(data) > MAX_TEXT_BYTES:
             _err(path, "a text is limited to %d KiB" % (MAX_TEXT_BYTES // 1024))
         if text.startswith("\ufeff"):
@@ -1242,6 +1243,18 @@ class _Compiler:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         self._files[key] = text
         return text
+
+    def _unreadable(self, key, path, exc, replace=False):
+        """A file that exists but cannot be read now: not judged, so the stamp kept for it never matches a real one and
+        the next look tries again; the error is marked transient (a repeat of it is journaled once)."""
+        stamp = (key, -1, -1)
+        if replace and self.files and self.files[-1][0] == key:
+            self.files[-1] = stamp
+        else:
+            self.files.append(stamp)
+        error = PromptConfigError(path, "cannot read the file: %s" % (exc.strerror or exc))
+        error.transient = True
+        raise error
 
     def _text(self, value, path):
         """A text given as a string or {"file": "prompts/<name>.md"}: the literal text."""
@@ -2128,22 +2141,31 @@ class PromptStore:
 
     def _read_document(self):
         info = self.path.stat()
+        signature = (info.st_mtime_ns, info.st_size)
         if not stat.S_ISREG(info.st_mode):
-            raise PromptConfigError("", "the prompts file is not a regular file")
+            raise self._unreadable("the prompts file is not a regular file", signature)
         if info.st_size > MAX_DOCUMENT_BYTES:
-            raise PromptConfigError("", "the prompts file is larger than %d MiB" % (MAX_DOCUMENT_BYTES // (1024 * 1024)))
+            raise self._unreadable("the prompts file is larger than %d MiB" % (MAX_DOCUMENT_BYTES // (1024 * 1024)),
+                                   signature)
         data = self.path.read_bytes()
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            raise PromptConfigError("", "the prompts file is not valid UTF-8") from None
+            raise self._unreadable("the prompts file is not valid UTF-8", signature) from None
         if text.startswith("\ufeff"):
             text = text[1:]
         try:
             document = json.loads(text, object_pairs_hook=_no_duplicates)
         except (ValueError, RecursionError) as exc:
-            raise PromptConfigError("", "invalid JSON: %s" % exc) from None
-        return document, (info.st_mtime_ns, info.st_size)
+            raise self._unreadable("invalid JSON: %s" % exc, signature) from None
+        return document, signature
+
+    @staticmethod
+    def _unreadable(message, signature):
+        """A file-level error that remembers the stamp the file had before it was read: a rewrite during the read shows up."""
+        error = PromptConfigError("", message)
+        error.signature = signature
+        return error
 
     def _compile(self, document, rev):
         compiler = _Compiler(document, self.path.parent)
@@ -2172,12 +2194,16 @@ class PromptStore:
                            source="removed")
             return
         except PromptConfigError as exc:
-            self._watch(_signature(self.path), ())
+            self._watch(getattr(exc, "signature", None), ())
             self._reject(exc)
             return
         except OSError as exc:
-            self._watch(_signature(self.path), ())
-            self._reject(PromptConfigError("", "cannot read the prompts file: %s" % (exc.strerror or exc)))
+            # A file that cannot be opened at this instant (an editor or a scanner holds it) is not judged: the next
+            # look tries again, so the error cannot outlive the lock.
+            self._watch(None, ())
+            error = PromptConfigError("", "cannot read the prompts file: %s" % (exc.strerror or exc))
+            error.transient = True
+            self._reject(error)
             return
         snapshot, error, files = self._compile(document, self._next_rev)
         self._watch(main_signature, files)
@@ -2187,8 +2213,12 @@ class PromptStore:
         self._install(snapshot, source, document)
 
     def _reject(self, error):
+        """Remember a problem of the file on disk and journal it; a transient one that repeats is journaled once."""
         record = {"message": error.message, "param": error.path or None, "ts": round(time.time(), 3)}
         with self._lock:
+            known = [(item["message"], item["param"]) for item in self._errors]
+            if getattr(error, "transient", False) and known == [(record["message"], record["param"])]:
+                return
             self._errors = [record]
         self._emit("prompt.config_error", "Файл промптов не принят: %s" % _clip(str(error), 300), "error",
                    param=error.path or None, error=_clip(error.message, 300))
