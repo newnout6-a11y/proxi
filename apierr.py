@@ -6,9 +6,34 @@ from email.utils import parsedate_to_datetime
 # Retool answers 429 with this sentence once an organization has spent its hourly managed-key budget.
 HOURLY_LIMIT = "hourly limit of managed api key usage"
 
-# Anthropic documents a closed set of error types; a relay-specific code must
-# be translated, or the client sees a type its error handling does not know.
-_ANTHROPIC_TYPES = {"unprocessable_entity": "invalid_request_error", "upstream_invalid_output": "api_error"}
+# Anthropic documents a closed set of error types (platform.claude.com/docs/en/api/errors, checked
+# 2026-11-05). A relay code outside it is translated, or the client meets a type its error handling does
+# not know. ApiError.code stays the relay's own: logs, the journal and the OpenAI dialects keep it.
+ANTHROPIC_ERROR_TYPES = frozenset({
+    "invalid_request_error", "authentication_error", "billing_error", "permission_error", "not_found_error",
+    "conflict_error", "request_too_large", "rate_limit_error", "api_error", "timeout_error", "overloaded_error"})
+_ANTHROPIC_TYPES = {
+    "invalid_request_error": "invalid_request_error", "unprocessable_entity": "invalid_request_error",
+    "unsupported_media_type": "invalid_request_error", "method_not_allowed": "invalid_request_error",
+    "unauthorized": "authentication_error", "forbidden": "permission_error", "not_found_error": "not_found_error",
+    "conflict": "conflict_error", "payload_too_large": "request_too_large", "prompt_too_large": "request_too_large",
+    "rate_limit_error": "rate_limit_error", "insufficient_credits": "billing_error",
+    "service_unavailable": "overloaded_error", "upstream_timeout": "timeout_error",
+    # The relay's own upstream, not the client's key: a 502 the client can only retry or report.
+    "upstream_error": "api_error", "upstream_auth_error": "api_error", "upstream_invalid_output": "api_error",
+    "upstream_empty_turn": "api_error", "upstream_attempt_limit": "api_error",
+    "upstream_tool_choice_ignored": "api_error", "internal_error": "api_error"}
+_ANTHROPIC_STATUS_TYPES = {401: "authentication_error", 402: "billing_error", 403: "permission_error",
+                           404: "not_found_error", 409: "conflict_error", 413: "request_too_large",
+                           429: "rate_limit_error", 503: "overloaded_error", 504: "timeout_error",
+                           529: "overloaded_error"}
+
+
+def anthropic_type(code: str, status: int) -> str:
+    """The documented Anthropic error type of a relay error; a code the table lacks follows its status."""
+    if code in _ANTHROPIC_TYPES:
+        return _ANTHROPIC_TYPES[code]
+    return _ANTHROPIC_STATUS_TYPES.get(status) or ("api_error" if status >= 500 else "invalid_request_error")
 
 
 class ApiError(Exception):
@@ -28,7 +53,7 @@ class ApiError(Exception):
 
     def anthropic_envelope(self) -> dict:
         # Anthropic uses a flat type + message pair.
-        return {"type": "error", "error": {"type": _ANTHROPIC_TYPES.get(self.code, self.code),
+        return {"type": "error", "error": {"type": anthropic_type(self.code, self.status),
                                            "message": self.message}}
 
     def responses_envelope(self) -> dict:

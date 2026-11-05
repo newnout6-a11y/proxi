@@ -419,7 +419,10 @@ a concise, sentence-case title…" (older). A system prompt that only quotes the
 further down stays an ordinary request and gets the configured relay policy.
 `output_config.task_budget` is accepted, not enforced, and named in
 `x-proxi-ignored-parameters`. A rejected request now carries the Messages error type
-`invalid_request_error` instead of `unprocessable_entity`.
+`invalid_request_error` instead of `unprocessable_entity`. Every relay error carries one of
+the documented Anthropic types in Messages (JSON and SSE): `upstream_error` is `api_error`,
+`upstream_timeout` is `timeout_error`, `insufficient_credits` is `billing_error`; the README
+lists the whole table.
 
 #### Request classes
 

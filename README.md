@@ -730,6 +730,29 @@ upstream/сессии, 503 upstream недоступен или нет акка�
 
 Таймаут upstream возвращается как 504.
 
+В диалекте Messages (JSON и SSE `event: error`) `error.type` всегда один из документированных
+типов Anthropic ([список](https://platform.claude.com/docs/en/api/errors)): собственный код
+relay переводится, и клиент не встречает тип, которого его обработчик ошибок не знает.
+Собственный код остаётся в `ApiError.code`, в журнале (`http.error`) и в диалектах OpenAI.
+
+| код relay | тип Messages |
+| --- | --- |
+| `invalid_request_error`, `unprocessable_entity`, `unsupported_media_type`, `method_not_allowed` | `invalid_request_error` |
+| `unauthorized` | `authentication_error` |
+| `insufficient_credits` | `billing_error` |
+| `forbidden` | `permission_error` |
+| `not_found_error` | `not_found_error` |
+| `conflict` | `conflict_error` |
+| `payload_too_large`, `prompt_too_large` | `request_too_large` |
+| `rate_limit_error` | `rate_limit_error` |
+| `service_unavailable` | `overloaded_error` |
+| `upstream_timeout` | `timeout_error` |
+| `upstream_error`, `upstream_auth_error`, `upstream_invalid_output`, `upstream_empty_turn`, `upstream_attempt_limit`, `upstream_tool_choice_ignored`, `internal_error` | `api_error` |
+
+Код, которого нет в таблице, переводится по статусу: 401 `authentication_error`, 402
+`billing_error`, 403 `permission_error`, 404 `not_found_error`, 409 `conflict_error`, 413
+`request_too_large`, 429 `rate_limit_error`, 503 `overloaded_error`, 504 `timeout_error`, прочие
+5xx `api_error`, прочие 4xx `invalid_request_error`.
 ## Ограничения (важно)
 
 - Retool на прямом транспорте (`copilotStreamGPT`) принимает клиентские инструменты
