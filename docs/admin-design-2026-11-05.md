@@ -36,6 +36,18 @@ labelled unclassified instead of being attributed to output. Cache-write spikes
 are observations, without an unproven claim that TTL expired. Activity tabs and
 chart time selection support the keyboard.
 
+> **Correction (2026-11-05, PR #24 review).** Two statements above are replaced:
+>
+> - "The backend publishes the built-in policy for preview": the relay has two built-in
+>   roles, and `/admin/api/settings` publishes both in `default_system_prompts`, each with
+>   the requests it serves: the relay role (requests without tools and without client
+>   instructions, and the `append`/`replace` modes) and the role for clients with their own
+>   tools. `default_system_prompt` still carries the relay role alone. While the standard
+>   role is selected, Settings show both; a custom role replaces both.
+> - "Gaps are labelled unclassified": the phase tape names time without a confirmed phase
+>   «без детализации» (pauses between attempts and local commands). A local command is timed
+>   on its own («команды») and is not counted as output.
+
 ## Validation
 
 Browser plugin was not available; the repository's Playwright workflow used the
@@ -66,6 +78,17 @@ node scripts/accuracy_report.mjs
   existing full loop capture was **inconclusive** because sampling gaps prevented
   continuous motion judgement. Its Count entrance warning and incomplete capture
   are retained, not counted as a successful animation audit.
+
+> **Correction (2026-11-05, PR #24 review).** The figures above are those of the first
+> pass. After the review fixes the same commands give:
+>
+> - Python: **3154 passed in 293.70 seconds** (was 1,968).
+> - Trace model, `node --test tests/turns.test.mjs`: **70 passed** (was 12). The file now
+>   also covers the cost rules of a turn, the metrics coverage and the burn rate, and the
+>   interruption of silent turns.
+> - Browser flows: **77 passed in 58 seconds** (was 29).
+> - Rendered gate: **60/60 checks passed**, the same count; its fixtures now also carry a
+>   partial pool balance and a route that ignores effort.
 
 Screenshots, traces and gate JSON stay outside the repository under
 `%TEMP%/proxi-design-qa`, `%TEMP%/relay-admin-playwright` and

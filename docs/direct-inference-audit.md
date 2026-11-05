@@ -160,7 +160,7 @@ Please configure your own API key.
 4. Проверка полного tool/result цикла реальных IDE, больших project prompts, параллельных запросов и субагентов. Маленький get_goal probe этого не заменяет.
 5. Подтверждённый способ доступа именно к Opus 5.5 в выбранном контексте. Обычный managed Assist уже дал отказ; BYOK не настроен.
 
-Эти пункты пока **не реализованы**. Автоматического fallback между direct и agent путями нет. Исправления сессий текущего agent-пути и полный Harness replay описаны в [PR review](pr-1-review.md).
+Эти пункты пока **не реализованы**. Автоматического fallback между direct и agent путями нет. Исправления сессий текущего agent-пути и полный Harness replay описаны в разборе [PR #1](https://github.com/newnout6-a11y/proxi/pull/1); его файл `docs/pr-1-review.md` удалён из репозитория при чистке устаревших документов, последняя версия — `git show 60cc80f^:docs/pr-1-review.md`.
 
 ## Источники
 
