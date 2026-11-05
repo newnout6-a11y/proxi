@@ -153,14 +153,25 @@ function SystemInstructions({ settings, saved, roles, field, bytes, limit, onCha
   );
 }
 
+// One line for the pool: a failing account among working ones is a warning, not "the session is down".
+function sessionStatus(overview) {
+  if (!overview) return { tone: 'muted', text: 'проверяем сессию' };
+  const { enabled, failing } = overview.session?.accounts || {};
+  if (isNum(enabled) && isNum(failing) && failing > 0 && failing < enabled) {
+    return { tone: 'warn', text: `ошибка сессии: ${failing} из ${enabled}`,
+      title: `Продление сессии не удалось у ${failing} из ${enabled} включённых аккаунтов; остальные работают` };
+  }
+  return overview.session?.error ? { tone: 'neg', text: 'сессия Retool с ошибкой' } : { tone: 'pos', text: 'сессия Retool активна' };
+}
+
 function Connection({ overview }) {
   const rows = [['OpenAI-совместимый адрес', overview?.connection?.openai_base_url], ['Anthropic-совместимый адрес', overview?.connection?.anthropic_base_url]];
+  const session = sessionStatus(overview);
   return (
     <section id="settings-connection" className="panel connect" aria-label="Подключение IDE">
       <div className="panel-head">
         <h2>Подключение IDE</h2>
-        <span className="status"><Dot tone={!overview ? 'muted' : overview.session?.error ? 'neg' : 'pos'} />
-          {!overview ? 'проверяем сессию' : overview.session?.error ? 'сессия Retool с ошибкой' : 'сессия Retool активна'}</span>
+        <span className="status" title={session.title}><Dot tone={session.tone} />{session.text}</span>
       </div>
       {rows.map(([label, value]) => (
         <div className="connect-row" key={label}>

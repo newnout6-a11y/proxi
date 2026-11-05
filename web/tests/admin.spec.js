@@ -540,6 +540,29 @@ test('the model catalog says why a model has no route', async ({ page }) => {
   await expect(route('gemini-3-pro')).toHaveAttribute('title', /Google BYOK/);
 });
 
+// The relay summarises the enabled accounts; one failing among several must not read as "the session is down".
+const SESSION_CASES = [
+  ['all enabled accounts renew', { error: null, accounts: { enabled: 3, failing: 0 } }, 'сессия Retool активна', /tone-pos/],
+  ['one of three fails', { error: 'session renewal failed: HTTP 401', accounts: { enabled: 3, failing: 1 } },
+    'ошибка сессии: 1 из 3', /tone-warn/],
+  ['every enabled account fails', { error: 'session renewal failed: HTTP 401', accounts: { enabled: 2, failing: 2 } },
+    'сессия Retool с ошибкой', /tone-neg/],
+  ['an older relay without the summary', { error: 'session renewal failed: HTTP 401' }, 'сессия Retool с ошибкой', /tone-neg/],
+];
+for (const [name, session, text, tone] of SESSION_CASES) {
+  test(`the connection card reports the pool session: ${name}`, async ({ page }) => {
+    await mockAdmin(page, { overviewPatch: { session: { keepalive: true, last_success_at: null, persistence_error: null, ...session } } });
+    await login(page);
+    await nav(page, 'Настройки');
+    const status = page.locator('#settings-connection .status');
+    await expect(status).toContainText(text);
+    await expect(status.locator('.dot')).toHaveClass(tone);
+    if (session.accounts?.failing && session.accounts.failing < session.accounts.enabled) {
+      await expect(status).toHaveAttribute('title', /остальные работают/);
+    }
+  });
+}
+
 test('incomplete usage is not shown as free inference or a reliable forecast', async ({ page }) => {
   await mockAdmin(page, { metricsPatch: { totals: { credits: 0, credits_complete: false } },
     overviewPatch: { balance: { available: 100, monthly_allocation: 3000, unreported_usage: true } } });
