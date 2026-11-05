@@ -677,8 +677,14 @@ class StructuredOutputAdapter:
             self.adapter.feed(event)
 
     def end(self, reason, prompt_text=None):
+        if reason == 'cancelled':
+            # The client left or the turn was aborted: nothing is validated and nothing buffered is
+            # released, so the request ends like any other cancelled one and is no upstream error.
+            return self.adapter.end(reason, prompt_text)
         if reason == 'tool_calls' or self.released:
             self._release()
+        elif reason == 'timeout':
+            raise apierr.upstream_timeout('upstream turn timed out before the structured reply was complete')
         else:
             try:
                 if reason != 'stop':

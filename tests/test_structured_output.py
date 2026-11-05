@@ -1,6 +1,7 @@
 """JSON output formats are emulated: contract in the instructions, whole reply validated first."""
 import asyncio
 import json
+import socket
 import time
 import urllib.error
 
@@ -8,6 +9,7 @@ import pytest
 
 import adapters
 import apierr
+import journal
 import structured
 import validate
 from session import RelaySession
@@ -302,8 +304,8 @@ INVALID = [
     ('not json', 'stop'), ('{"selected_memories":"PRIVATE-REPLY"}', 'stop'),
     ('{"selected_memories":["a"],"PRIVATE-EXTRA":1}', 'stop'), ('{}', 'stop'),
     ('{"selected_memories":[1]}', 'stop'), ('Here you go: {"selected_memories":[]}', 'stop'),
-    ('```json\n{"selected_memories":[]}\n```\nDone.', 'stop'), ('{"selected_memories":[]}', 'timeout'),
-    ('{"selected_memories":[]}', 'cancelled'), ('{"selected_memories":[', 'stop'), ('', 'stop'),
+    ('```json\n{"selected_memories":[]}\n```\nDone.', 'stop'), ('{"selected_memories":[]}', 'max_exec'),
+    ('{"selected_memories":[]}', 'hitl'), ('{"selected_memories":[', 'stop'), ('', 'stop'),
     ('{"selected_memories":[],"selected_memories":["x"]}', 'stop'),
 ]
 
@@ -328,6 +330,44 @@ def test_invalid_reply_is_an_error_before_any_content_and_still_costs(dialect, t
     if stream:
         assert emitted_text(dialect, writer.events) == ''
         assert not any(name in ('response.completed', 'message_stop', 'done') for name, _ in writer.events)
+    assert adapter.adapter.credits == .5 and adapter.adapter.output_tokens == 9
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('dialect', DIALECTS)
+def test_a_timed_out_turn_is_an_upstream_timeout_with_no_content_and_the_cost_kept(dialect, stream):
+    writer = Writer() if stream else None
+    adapter = adapters.for_dialect(dialect, parse(dialect), writer)
+    adapter.begin()
+    adapter.feed({'type': 'usage_start'})
+    adapter.feed({'type': 'text', 'delta': '{"selected_memories":['})
+    adapter.feed({'type': 'credits', 'value': .5, 'usage': {'input_tokens': 4, 'output_tokens': 9}})
+    with pytest.raises(apierr.ApiError) as error:
+        adapter.end('timeout')
+    assert (error.value.status, error.value.code) == (504, 'upstream_timeout')
+    assert 'x-should-retry' not in error.value.headers and 'PRIVATE' not in str(error.value)
+    if stream:
+        assert emitted_text(dialect, writer.events) == ''
+        assert not any(name in ('response.completed', 'response.incomplete', 'message_stop', 'done')
+                       for name, _ in writer.events)
+    assert adapter.adapter.credits == .5 and adapter.adapter.output_tokens == 9
+
+
+@pytest.mark.parametrize('text', ['{"selected_memories":[', '{"selected_memories":"PRIVATE"}', VALID, ''])
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('dialect', DIALECTS)
+def test_a_cancelled_turn_is_not_validated_and_ends_like_any_other_request(dialect, stream, text):
+    writer = Writer() if stream else None
+    adapter = adapters.for_dialect(dialect, parse(dialect), writer)
+    adapter.begin()
+    adapter.feed({'type': 'usage_start'})
+    adapter.feed({'type': 'text', 'delta': text})
+    adapter.feed({'type': 'credits', 'value': .5, 'usage': {'input_tokens': 4, 'output_tokens': 9}})
+    payload = adapter.end('cancelled')
+    assert payload_text(dialect, payload) == ''
+    if stream:
+        assert emitted_text(dialect, writer.events) == '' and 'error' not in dict(writer.events)
+        assert writer.events[-1] == ('done', {})
     assert adapter.adapter.credits == .5 and adapter.adapter.output_tokens == 9
 
 
@@ -456,6 +496,76 @@ def test_http_invalid_reply_fails_visibly_without_content_and_keeps_cost(relay, 
         assert status == 502 and headers['x-should-retry'] == 'false'
         message = json.loads(raw)['error']
         assert message['type'] == ('api_error' if dialect == 'anthropic' else 'upstream_invalid_output')
+    assert relay.credits.used == [('turn', .5)]
+
+
+def abort_midway(relay, dialect, payload):
+    """A client that sends a request and drops the connection while the model is still writing."""
+    data = json.dumps(payload).encode()
+    host, port = relay.url[len('http://'):].split(':')
+    with socket.create_connection((host, int(port)), timeout=10) as sock:
+        sock.sendall(('POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n'
+                      'Authorization: Bearer %s\r\nContent-Length: %d\r\n\r\n'
+                      % (PATHS[dialect], relay.key, len(data))).encode() + data)
+        if payload.get('stream'):
+            sock.settimeout(5)
+            seen = b''
+            while b'\r\n\r\n' not in seen:
+                seen += sock.recv(4096)
+        time.sleep(0.4)
+
+
+def wait_for(predicate, seconds=10):
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('format_requested', [True, False])
+def test_http_a_client_that_aborts_is_no_error_with_or_without_a_format(relay, monkeypatch, stream, format_requested):
+    log = journal.Journal()
+    monkeypatch.setattr(journal, 'JOURNAL', log)
+    holders = []
+
+    async def slow(parsed, out, holder):
+        holders.append(holder)
+        try:
+            out.put({'type': 'usage_start'})
+            out.put({'type': 'text', 'delta': '{"selected_memories":['})
+            await asyncio.sleep(30)  # the proxy cancels this future once the client has gone
+        finally:
+            out.put(None)
+
+    relay.fake.run = slow
+    payload = (body if format_requested else lambda dialect, **extra: _body(dialect, **extra))('anthropic', stream=stream)
+    abort_midway(relay, 'anthropic', payload)
+    wait_for(lambda: [e for e in log.query() if e['kind'] == 'http.request'])
+    events = log.query()
+    assert not [e for e in events if e['kind'] == 'http.error']
+    request = next(e for e in events if e['kind'] == 'http.request')
+    assert request['level'] != 'error' and request['data']['status'] == 200
+    assert log.metrics(3600, 60)['totals']['errors'] == 0
+    assert holders and holders[-1]['cancel_event'].is_set()
+
+
+def error_type(dialect, failure):
+    return failure['code'] if dialect == 'responses' else failure['error']['type']
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('dialect', DIALECTS)
+def test_http_a_timed_out_structured_turn_is_a_504_and_keeps_its_cost(relay, dialect, stream):
+    relay.fake.script = [{'type': 'text', 'delta': '{"selected_memories":['},
+                         {'type': 'credits', 'value': .5}, {'type': 'end', 'reason': 'timeout'}]
+    status, headers, raw = post(relay, dialect, body(dialect, stream=stream))
+    expected = 'timeout_error' if dialect == 'anthropic' else 'upstream_timeout'
+    if stream:
+        assert status == 200 and error_type(dialect, dict(sse_events(raw))['error']) == expected
+        assert emitted_text(dialect, sse_events(raw)) == ''
+    else:
+        assert status == 504 and json.loads(raw)['error']['type'] == expected
     assert relay.credits.used == [('turn', .5)]
 
 
