@@ -86,14 +86,23 @@ shows `written: false`. The `--output` preview masks credentials as `***`
 
 A reference to a removed relay model is replaced instead of left dangling, in
 `model`, `small_model`, `agent.*.model`, `command.*.model` and the deprecated
-`mode.*.model`. `small_model` and the hidden background agents (`title`, `summary`,
-`compaction`) get the first published model of the small tier (Haiku, Flash, nano,
-mini, GLM Flash), or lose the override when none is published so OpenCode chooses
-its own. Everything else gets the default model (Opus 5.5 when published). A valid
-reference keeps a `#variant` suffix only while that model still publishes it.
-Haiku's window is 200K tokens, smaller than the 1M-token models: if you compact very
-long sessions, set `agent.compaction.model` to a larger-window model yourself; the
-script touches only references to models that no longer exist.
+`mode.*.model`. `small_model` and the hidden `title` and `summary` agents get the
+first published model of the small tier (Haiku, Flash, nano, mini, GLM Flash), or
+lose the override when none is published so OpenCode chooses its own. Everything
+else gets the default model (Opus 5.5 when published). A valid reference keeps a
+`#variant` suffix only while that model still publishes it.
+
+`agent.compaction.model` is treated differently, because compaction summarizes the
+whole session and a model whose window is smaller than the session stalls without an
+error (OpenCode issue #46164). A removed compaction model is replaced by the first
+model of the small tier whose window is at least the main `model`'s. For the default
+main model, Opus 5.5 with 1,000,000 tokens, Haiku (200K), nano, mini and GLM Flash
+all fall short and only Gemini 3.5 Flash qualifies, which is published only when a
+Google resource is configured. So the usual outcome is that the override is removed
+and OpenCode compacts with the session's model; the same happens when the main model
+is not a relay model and its window is unknown. Either way the summary's `warnings`
+name the old reference and what was done. A compaction model you chose that is still
+published is kept as it is, even if its window is smaller: check that yourself.
 
 The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
 retool-relay/zai-org/GLM-5.3 --variant high`; OpenCode 2.2.5 uses `--model

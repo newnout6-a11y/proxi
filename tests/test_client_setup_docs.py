@@ -18,3 +18,10 @@ def test_the_desktop_section_names_the_row_fields_the_script_owns_and_where_over
     sentence = next(part for part in text.split('. ') if 'owns exactly' in part)
     assert all('`%s`' % field in sentence for field in OWNED_FIELDS)
     assert 'overwrites' in text and '`changed_fields`' in text
+
+
+def test_the_opencode_section_says_compaction_follows_the_main_models_window():
+    text = section('OpenCode')
+    assert 'to a larger-window model yourself' not in text  # the old advice: the script now picks the window
+    assert 'whose window is at least the main `model`' in text and 'issue #46164' in text
+    assert "compacts with the session's model" in text and '`warnings`' in text
