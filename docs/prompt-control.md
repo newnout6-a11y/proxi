@@ -713,7 +713,7 @@ You are an AI agent running in OpenCode, …  <- client: system OpenCode цел�
 $env:ANTHROPIC_CUSTOM_HEADERS = "X-Proxi-Profile: cc-rules"
 ```
 
-Постоянно — блок `env` файла настроек Claude Code ([параметр `env`](https://code.claude.com/docs/en/settings-reference)): пользовательский `~/.claude/settings.json` или локальный для проекта `.claude/settings.local.json`, который Claude Code держит вне git ([файлы настроек](https://code.claude.com/docs/en/settings)):
+Постоянно — блок `env` файла настроек Claude Code ([параметр `env`](https://code.claude.com/docs/en/settings-reference)): пользовательский `~/.claude/settings.json` или локальный для проекта `.claude/settings.local.json` (Claude Code исключает его из git, когда создаёт сам; файл, созданный вручную, добавьте в `.gitignore` сами — [файлы настроек](https://code.claude.com/docs/en/settings)):
 
 ```json
 {
