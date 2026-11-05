@@ -458,7 +458,15 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         block = {"type": "text", "text": head}
         if cache:
             block["cache"] = True
-        messages.append({"role": "system", "content": [block]})
+        blocks = [block]
+        first, separator, rest = head.partition('\n')
+        if first.startswith('x-anthropic-billing-header:') and separator and rest:
+            # Anthropic consumes this SDK attribution block. Combining real
+            # instructions with it makes those instructions disappear upstream.
+            # This split is deterministic from head, including on signed replay.
+            block['text'] = rest
+            blocks.insert(0, {'type': 'text', 'text': first})
+        messages.append({"role": "system", "content": blocks})
     history = [part for part in (chunks or []) if part]
     if not history:
         if prompt:
@@ -878,6 +886,17 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             journal.emit("native_history.reset", "История или настройки изменились; прежняя подпись не переиспользуется",
                          "warn", reason="prefix_or_settings_mismatch")
         body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
+        cold = (native_history.unsigned_tool_transcript(client)
+                if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
+        if cold is not None:
+            # The opaque signed branch may have expired or belonged to another
+            # account. Client-visible calls/results are still valid protocol.
+            # Rebuild them without trusting any client-supplied thinking blocks.
+            initial = body['messages'][:1] if head else []
+            body['messages'] = native_history.cache_messages(initial + cold, cfg.get('direct_cache', True), tools)
+            body['rit'] = make_rit(body['messages'], tools)
+            journal.emit('native_history.cold', 'История инструментов восстановлена без старых thinking-подписей',
+                         'info', messages=len(cold), signatures=0)
     session._direct_reply = None
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:

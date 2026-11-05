@@ -189,7 +189,8 @@ def make_handler(runtime: Runtime):
                              "x-claude-code-session-id, x-claude-code-agent-id")
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
             self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after, "
-                             "x-proxi-ignored-parameters, x-proxi-system-messages")
+                             "x-proxi-ignored-parameters, x-proxi-system-messages, "
+                             "x-proxi-thinking-display, x-proxi-output-format")
 
         def _json(self, status, payload, extra=None):
             self._status = status
@@ -581,6 +582,10 @@ def make_handler(runtime: Runtime):
 
             parsed.request_purpose = client_context.request_kind(parsed)
             compatibility_headers = {}
+            if parsed.structured_title:
+                compatibility_headers['x-proxi-output-format'] = 'validated-session-title'
+            if 'thinking.display' in parsed.declared_ignored:
+                compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:
                 compatibility_headers['x-proxi-ignored-parameters'] = ','.join(parsed.declared_ignored)
                 journal.emit('request.compatibility',
@@ -655,7 +660,11 @@ def make_handler(runtime: Runtime):
                 if kind == "end":
                     reason = event.get("reason", "stop")
                     continue
-                adapter.feed(event)
+                try:
+                    adapter.feed(event)
+                except apierr.ApiError:
+                    self._cancel_turn(fut, holder_session)
+                    raise
                 if sse.client_gone(self):
                     self._cancel_turn(fut, holder_session)
                     return "cancelled"
@@ -714,7 +723,11 @@ def make_handler(runtime: Runtime):
                     reason = event.get("reason", "stop")
                     holder["reason"] = reason
                     continue
-                adapter.feed(event)
+                try:
+                    adapter.feed(event)
+                except apierr.ApiError:
+                    self._cancel_turn(fut, holder)
+                    raise
                 last_write = time.time()
                 # Check for a disconnect on every event, not only when the stream idles.
                 if sse.client_gone(self) or getattr(writer, "broken", False):

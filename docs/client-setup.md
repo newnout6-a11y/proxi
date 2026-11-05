@@ -322,6 +322,54 @@ blocks are collapsed by default: `Ctrl+O` expands them;
 `showThinkingSummaries: true` enables summaries. This cannot reveal text that
 Retool has redacted or omitted.
 
+## Claude Desktop on Windows
+
+The installed 4.4212.0.0 Code-mode client reads its gateway policy from
+`HKCU\Software\Policies\Claude`. Its native discovery filters the relay's
+27 routes to 11 currently available Claude models. It does not accept GPT or
+GLM merely because those models speak the same API; do not invent Anthropic
+family tiers for them.
+
+A nonempty `inferenceModels` policy is the authoritative list. Enabling
+discovery alone enriches those rows and does not add missing models. The
+maintainer `scripts/sync_claude_desktop_catalog.py` previews the compatible
+Claude subset and updates only that model-list value with `--write
+--backup-dir PATH`. The endpoint, key, authentication scheme, high default and
+all other policies are preserved. The installed policy now contains all 11
+Claude routes instead of only Opus/Sonnet 5.5.
+
+Native picker levels vary by model: a max cap on older five-level rows would
+offer the route-rejected xhigh. Those rows are capped at high; Opus 4.6 and
+Sonnet 4.6 keep their valid four-level max. Unknown 5.5 rows have no built-in
+effort selector in this installed version; setting their policy does not claim
+the GUI gained one. Their gateway default remains high.
+
+The installed ASAR's actual discovery/filter/merge/picker functions and bundled
+Agent SDK were executed without Electron or UI input. Exact SDK wrapper
+0.3.309 also returned a real answer through the current production relay using
+an explicitly selected cached Desktop runner 2.1.295. The embedded target is
+2.1.309; that target binary was not present, and this check does not claim the
+cached version is the target. See the dated audit for hashes, commands and
+scope. Opening and clicking the window is not a prerequisite for these code
+and protocol checks, and no GUI interaction pass is claimed.
+
+The gateway separates the SDK's leading `x-anthropic-billing-header` attribution
+line from its actual system instructions. Anthropic consumes that attribution
+block; merging instructions into it discards them upstream. This deterministic
+split also applies to native tool continuations and keeps cache hints on the
+real system prefix.
+
+Haiku 4.5 accepts verified `thinking: {type: "disabled"}`. The SDK's beta
+`thinking.display: "updates"` uses the route's available summaries, with
+`x-proxi-thinking-display: summarized` and a named compatibility warning; the
+beta's native update cadence is not implemented. Its exact session-title schema
+has a bounded, buffered post-validation path. A sole JSON Markdown fence may be
+removed; the object must still contain exactly one string `title`, no duplicate
+keys and a complete normal finish. Invalid output becomes an error before any
+title content is emitted. `x-proxi-output-format: validated-session-title`
+identifies this service exception; arbitrary structured-output schemas remain
+unsupported. This is validation/normalization, not native constrained decoding.
+
 ## IDE commands and subagents
 
 Commands such as `/goal` belong to the IDE. It turns them into its own workflow

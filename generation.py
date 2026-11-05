@@ -1,5 +1,6 @@
 """Explicit handling of controls absent from Retool's generation schema."""
 import math
+import client_context
 
 from apierr import unprocessable
 
@@ -21,9 +22,26 @@ def _format(value, name):
         _reject(name)
 
 
-def controls(data, entry, dialect):
+TITLE_FORMAT = {'type': 'json_schema', 'schema': {'type': 'object',
+    'properties': {'title': {'type': 'string'}}, 'required': ['title'], 'additionalProperties': False}}
+
+
+def is_structured_title(data, system, dialect):
+    """The observed SDK service contract, not general constrained decoding."""
+    output = data.get('output_config')
+    return (dialect == 'anthropic' and not data.get('tools')
+            and client_context.is_sdk_title_system(system)
+            and isinstance(output, dict) and output.get('format') == TITLE_FORMAT
+            and output['format']['schema']['additionalProperties'] is False)
+
+
+def controls(data, entry, dialect, *, structured_title=False):
     """Return validated verbosity and ignored names; never echo sensitive values."""
     ignored = []
+    thinking = data.get('thinking')
+    if isinstance(thinking, dict) and thinking.get('display') == 'updates':
+        # Retool exposes summaries, not Anthropic's negotiated update cadence.
+        ignored.append('thinking.display')
     text = data.get('text')
     if text is not None and not isinstance(text, dict):
         raise unprocessable("'text' must be an object", param='text')
@@ -32,7 +50,8 @@ def controls(data, entry, dialect):
     for value, name in ((data.get('response_format'), 'response_format'),
                         (text.get('format'), 'text.format'), (output.get('format'), 'output_config.format')):
         if value is not None:
-            _format(value, name)
+            if not (structured_title and name == 'output_config.format'):
+                _format(value, name)
     messages = data.get('messages', data.get('input'))
     for i, message in enumerate(messages if isinstance(messages, list) else []):
         if isinstance(message, dict) and message.get('role') in ('system', 'developer'):

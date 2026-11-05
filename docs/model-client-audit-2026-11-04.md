@@ -551,13 +551,12 @@ a Proxi failure and their active routes were not replaced:
 | Cline VS Code extension 4.1.26 | Installed; effective Proxi extension settings not established | Distinct from CLI globalState; no extension execution claim |
 | Continue | Existing config points to a different OpenAI-compatible endpoint; installed extension not found in checked IDE indexes | Inventory only; existing provider retained |
 | Aider | Not found in PATH, standard configuration or checked Python/uv/pipx locations | No installed-client runtime available |
-| Claude Desktop | Configured relay Opus 5.5 high is visible in a fresh session | GUI input not verified: both activation attempts returned `failed to activate captured window` |
+| Claude Desktop 4.4212.0.0 | Gateway policy reconciled to 11 Claude routes; endpoint/auth/default preserved | Actual installed discovery/picker code and Agent SDK executed; real title/main protocol pass, details below |
 
-Claude Desktop is the remaining GUI acceptance gap. Computer Use recovery
-retried the selected window once and then stopped input as required. The user
-has been asked to open/activate that window; no response or successful
-activation is inferred from elapsed time. Until that check is completed, the
-full audit must not be described as all IDEs having passed end to end.
+Earlier GUI activation failures are historical. The user explicitly selected
+installed-code and protocol verification without waiting for window activation.
+There is no outstanding manual-action requirement. No GUI interaction pass is
+claimed; inventory-only/absent clients retain their stated coverage limits.
 
 Final source validation after the Harness maintenance utility used the full
 Python command above: **1894 passed in 210.17 seconds**. The OpenCode label
@@ -565,3 +564,89 @@ command passed **4 tests** again, and `git diff --check` was clean. The real
 listener still belonged to the unchanged user process on port 8787; these
 current-source acceptance probes used isolated runtimes and do not claim the
 production process hot-reloaded the new code.
+
+### Final code/protocol verification — 2026-11-05
+
+The running relay was replaced after the user stopped its old process. Discovery
+returned 27 routes and startup showed the pool balance 13,296.0055/15,000.
+An eight-request production smoke exposed a genuine cold tool-history bug:
+an anonymous follow-up acquired another account and flattened assistant calls
+and tool results into text. The first six stream/nonstream checks had passed;
+that did not close the tool-continuation failure.
+
+Complete client-visible tool batches now replay as native user/assistant/tool
+roles when an opaque signed branch cannot resume. Matching result IDs,
+duplicate/orphan/incomplete batches and reordered parallel results are checked.
+Client thinking/signatures are never trusted. Relay-only retry instructions and
+byte-identical internal retries are preserved. Three real current-source calls
+across Chat, Responses and Messages returned exact tool-result markers with
+native roles. Independent review also covered budget rejection before upstream.
+Evidence: `cold-tool-live-current/manifest.json` and
+`desktop-code-audit/cold-history-review-manifest.json` in the private audit tree.
+
+Desktop's installed ASAR discovery/filter/merge/picker functions were extracted
+and executed read-only. Its native filter accepts 11 Claude models from the
+27-route API; GPT/GLM must not be disguised as Anthropic families. A nonempty
+policy list is authoritative; discovery alone does not populate missing rows.
+`sync_claude_desktop_catalog.py` updates only `inferenceModels` with an exact
+backup and before-write/read-back checks. The applied policy preserved every
+other registry value, including auth. Older effort pickers are capped at high
+to avoid route-invalid xhigh; Opus/Sonnet 4.6 keep their four-level max. This
+does not invent missing selectors for new 5.5 model IDs.
+
+Exact installed SDK wrapper **0.3.309** was loaded from ASAR. Its embedded target
+runner **2.1.309** is absent on disk. Live checks explicitly used cached Desktop
+runner **2.1.295**, SHA-256
+`a30012741c3d0b55e2a6c252dab3781134b75be95896ae89d40a93e10f83bcd6`.
+It is not passed off as the missing target. Source hashes/function pointers:
+`desktop-code-audit/installed-code-manifest.json`.
+
+Actual synthetic SDK traffic found and fixed these service incompatibilities:
+
+- Haiku `thinking: disabled` failed locally. Direct Assist probes proved `none`
+  works for this exact route; only its capability was extended. OpenCode and
+  both Harness profiles were synchronized again with exact backups.
+- Beta `thinking.display: updates` triggered 422 and SDK retry. It now uses
+  summaries with explicit compatibility headers/warnings; native beta update
+  cadence is not claimed.
+- The current title prefix was unrecognized. Its exact no-tools, `title:string`
+  schema now gets an isolated buffered service path. A sole JSON fence may be
+  normalized; duplicate keys, extra properties, wrong types and incomplete
+  finishes fail before content. Limit: 256 Ki characters. General schemas still
+  get 422 before inference. Usage/cost remain separate; early adapter rejection
+  cancels upstream instead of leaving a paid background turn.
+- Merging SDK billing attribution and system instructions caused Anthropic to
+  consume the whole block. Raw A/B measured **87 input tokens and lost policy
+  when merged**, versus **786 and correct title behavior when split**. The
+  deterministic first-line split preserves actual instructions, one system role,
+  signed continuation scope and cache budgets. Ordinary Desktop calls benefit
+  as well: their input count rose from 64 to 456 when real policy reached upstream.
+
+The final exact-SDK run made **two generation POSTs**, title/main: both 200,
+no SSE errors or generation retries, main marker exact, 4.316 seconds. Runtime
+was isolated; account config and ASAR stayed byte-identical. An earlier SDK main
+result succeeded despite background title failures; it alone is not counted as
+full service acceptance. Evidence: `desktop-code-audit/service-current-source-final/manifest.json`
+and `desktop-code-audit/system-block-comparison.json`.
+
+Independent final review: **366 passed in 10.63 seconds**, plus **29 separate
+edge checks** covering signed billing replay/reset, prefix identity, cache budget,
+title buffer boundary, JSON normalization/rejection and paid-tail cancellation.
+No actionable findings remained. Exact command:
+
+```powershell
+python -B -m pytest -p no:cacheprovider tests/test_desktop_service_protocol.py tests/test_native_history.py tests/test_cold_tool_history.py tests/test_native_context_reuse.py tests/test_prompt_ownership.py tests/test_generation_controls.py tests/test_client_context.py tests/test_models_hardening.py tests/test_model_catalog.py
+```
+
+Root validation and live reproduction commands:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest -o addopts= -q --tb=short
+node --test tests/test_opencode_labels.mjs
+git diff --check
+uv run --python 3.14 --with-requirements requirements.txt --no-project python .agents/desktop-current-source.py .agents/model-audit-20261104/desktop-code-audit/service-current-source-final
+```
+
+Final full Python suite: **1,962 passed in 211.82 seconds**. OpenCode label
+tests: **4 passed**. Follow-up service/catalog/CORS suite: **78 passed in
+4.37 seconds**. `git diff --check` passed. No design changes were included.

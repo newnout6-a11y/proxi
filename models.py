@@ -18,6 +18,8 @@ EFFORTS_BY_PROVIDER = {
 # xhigh entries: copilotStreamGPT rejects that value with HTTP 422.
 _BASE_EFFORTS = ("low", "medium", "high")
 _EFFORTS_BY_MODEL = {
+    # Direct Assist route answered with thinking disabled, 2026-11-05.
+    "claude-haiku-4-5-20251001": ("none",) + _BASE_EFFORTS + ("max",),
     "gpt-5": _BASE_EFFORTS + ("minimal",),
     "gpt-5.1": ("none",) + _BASE_EFFORTS,
     "gpt-5.2": ("none",) + _BASE_EFFORTS,

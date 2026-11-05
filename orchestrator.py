@@ -486,6 +486,12 @@ class TurnRunner:
                     None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
                 raise asyncio.CancelledError()
+            if getattr(parsed, 'structured_title', False):
+                # The route lacks constrained decoding. Supply the fixed service
+                # contract as instructions and validate the complete reply later.
+                instructions += ('\n\n[SESSION TITLE OUTPUT FORMAT]\n'
+                                 'Return only one JSON object with one string field named "title". '
+                                 'Do not wrap it in Markdown fences or add any other text.')
             reminder = ""
             if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
@@ -669,6 +675,9 @@ class TurnRunner:
                             chunks)
                         direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
                                                                  if native_tools else None)
+                        # Relay-only retry instructions live in chunks; a cold
+                        # canonical replay must not discard those later attempts.
+                        direct_target._native_allow_cold_replay = not (empty_retries or tool_retries or exec_steps)
                         direct_target._native_conversation_key = key
                     stream = (session.stream(stream_prompt, model_provider, tool_names=tool_names)
                               if native_tools else session.stream(stream_prompt, model_provider))

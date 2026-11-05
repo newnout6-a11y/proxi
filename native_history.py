@@ -107,6 +107,41 @@ def canonical_assistant(blocks):
     return {"role": "assistant", "content": ([{"type": "text", "text": text}] if text else []) + calls}
 
 
+def unsigned_tool_transcript(client):
+    """Keep logical tool roles on a cold context; never invent/replay signatures.
+
+    Only a complete canonical client transcript is usable. Incomplete batches
+    keep the existing compatibility path instead of attaching orphan results.
+    """
+    if not client:
+        return None
+    pending, seen, has_results = set(), set(), False
+    for message in client:
+        role = message.get('role')
+        if role == 'tool':
+            call_id = message['content']['toolCallId']
+            if call_id not in pending:
+                return None
+            pending.remove(call_id)
+            has_results = True
+        else:
+            if pending:
+                return None
+            if role == 'assistant':
+                for block in message['content']:
+                    if block['type'] not in ('text', 'tool_call'):
+                        return None
+                    if block['type'] == 'tool_call':
+                        call_id = block['toolCallId']
+                        if call_id in seen:
+                            return None
+                        seen.add(call_id)
+                        pending.add(call_id)
+            elif role != 'user':
+                return None
+    return copy.deepcopy(client) if has_results and not pending else None
+
+
 class ReplyCapture:
     """Keep raw NDJSON block order and opaque signatures before argument coercion."""
     def __init__(self):
@@ -243,6 +278,13 @@ def cache_messages(messages, enabled, tools):
             continue
         for block in value:
             if block.get("type") not in ("text", "tool_call"):
+                continue
+            text = block.get('text', '')
+            if (message.get('role') == 'system' and isinstance(text, str)
+                    and text.startswith('x-anthropic-billing-header:') and '\n' not in text):
+                # An attribution-only SDK block is consumed by Anthropic and
+                # must not displace the actual system prefix cache breakpoint.
+                block.pop('cache', None)
                 continue
             eligible.append(block)
             if block.pop("cache", False):

@@ -78,6 +78,7 @@ class Parsed:
         self.max_tokens = None
         self.temperature = None
         self.verbosity = None
+        self.structured_title = False
         self.system = ""
         self.declared_ignored = []
         self.system_messages_normalized = False
@@ -438,7 +439,9 @@ def _finish(data, parsed, dialect):
                 if candidate in model_catalog.EFFORT_ORDER:
                     parsed.requested_effort = candidate
                 break
-    parsed.verbosity, parsed.declared_ignored = generation.controls(data, parsed.entry, dialect)
+    parsed.structured_title = generation.is_structured_title(data, parsed.system, dialect)
+    parsed.verbosity, parsed.declared_ignored = generation.controls(
+        data, parsed.entry, dialect, structured_title=parsed.structured_title)
     stream_options = data.get("stream_options")
     if stream_options is None:
         stream_options = data.get("streamOptions")
@@ -803,7 +806,7 @@ def _show_thinking(data, cfg):
     thinking = data.get("thinking")
     if isinstance(thinking, dict) and thinking.get("display") is not None:
         display = thinking["display"]
-        if display not in ("summarized", "omitted"):
-            raise unprocessable("thinking.display must be 'summarized' or 'omitted'", param="thinking.display")
+        if display not in ("summarized", "omitted", "updates"):
+            raise unprocessable("thinking.display must be 'summarized', 'omitted' or 'updates'", param="thinking.display")
         show = show and display != "omitted"
     return show

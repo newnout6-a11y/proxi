@@ -91,6 +91,13 @@ workspace, project context и локальное исполнение управ
 Legacy agent transport получает ту же композицию текстом в своём prompt;
 настоящий system message обеспечивает direct transport.
 
+Если сохранённой подписанной ветки больше нет (например, после рестарта или
+при запросе без affinity), полный корректный клиентский диалог с завершёнными
+вызовами инструментов передаётся нативными `assistant` / `tool` ролями.
+Клиентские thinking-блоки и подписи при этом не считаются доверенными и не
+восстанавливаются. Неполный/неподдержанный transcript сохраняет прежний
+совместимый путь; relay не придумывает недостающий результат инструмента.
+
 ## Системные напоминания внутри диалога
 
 Современный Anthropic API поддерживает `role: "system"` внутри `messages` и
@@ -152,7 +159,9 @@ scope подписанной входной истории: в tool loop пер�
 
 | Управление | Поведение relay |
 | --- | --- |
-| JSON/schema output formats, непустой `stop`/`stop_sequences`, `n > 1` | 422 до inference: маршрут не обеспечивает эту семантику |
+| Общие JSON/schema output formats, непустой `stop`/`stop_sequences`, `n > 1` | 422 до inference: маршрут не обеспечивает эту семантику |
+| Точный служебный title-контракт установленного Claude SDK | Post-validation/normalization: буфер до 256 Ki символов, снятие единственной JSON-ограды, затем проверка ровно `title:string`, уникальных ключей и нормального завершения. Невалидное содержимое не выдаётся; это не constrained decoding |
+| `thinking.display: "updates"` | Доступные summaries с явным `x-proxi-thinking-display: summarized` и предупреждением по имени поля; native beta cadence не обещается |
 | `store: true`, `background: true`, `previous_response_id`, Responses `conversation`, server `prompt` reference | 422: серверное хранение/восстановление/шаблон этим маршрутом не реализованы |
 | `truncation: "auto"`, audio modalities, нестандартный `service_tier` | 422 вместо молчаливой смены поведения |
 | `parallel_tool_calls: false` или Anthropic `disable_parallel_tool_use: true` с tools | 422: последовательность native tool calls не гарантируется |
