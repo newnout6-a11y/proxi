@@ -636,6 +636,7 @@ class TurnRunner:
                 self._check_prompt(self._direct_text(instructions, client_chunks))
             base_prompt = self._check_prompt(prompt)
             session = None
+            account_context = None
             try:
                 key = getattr(parsed, "conversation_key", None)
                 parent_key = getattr(parsed, "parent_conversation_key", None)
@@ -649,6 +650,10 @@ class TurnRunner:
                 acquired = session.session if isinstance(session, SessionLease) else session
                 # Every later event of this turn, errors included, names the account serving it.
                 trace["account"] = account_tag(getattr(acquired, "backend", None))
+                if trace["account"]:
+                    # Events that other modules emit for this turn (the transport, native history) get the
+                    # tag through the context: they know no more than the session they run on.
+                    account_context = client_context.bind({**client_context.current(), "account": trace["account"]})
                 # Debit the account that actually served the turn.
                 account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
                 acquired._credits_manager = account_credits
@@ -1082,6 +1087,12 @@ class TurnRunner:
                     prompt = self._followup(instructions, reminder, *last_followup,
                                             direct_chunks=client_chunks + exec_chunks[:-1] if direct_mode else None)
             finally:
+                if account_context is not None:
+                    # Releasing may evict other conversations, and the next attempt may use another account.
+                    try:
+                        client_context.reset(account_context)
+                    except ValueError:  # a token of another context: nothing of ours is left to undo
+                        pass
                 if session is not None:
                     await self.pool.release(session)
         except apierr.ApiError as err:

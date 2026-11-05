@@ -2,13 +2,17 @@
 import asyncio
 import io
 import json
+import time
 import urllib.error
 from types import SimpleNamespace
 
 import direct
 import journal
 from keepwarm_harness import backend as warm_backend, drive, session as warm_session
+from test_account_rate_limit import hourly, retool, turn  # noqa: F401 - fixture
 from test_native_context_reuse import FIRST, Backend, request, run, setup
+from test_serving_accounts import M, account, relay_pool  # noqa: F401 - fixture
+from test_stream_status import park
 
 ACCOUNT, PAGE = "acc-journal-a", "page-journal-a"
 TAG = journal.tag(ACCOUNT)
@@ -137,6 +141,109 @@ def test_keepwarm_billing_event_carries_the_account_tag(monkeypatch):
     billed = [e for e in journal.JOURNAL.query(since=before) if e["kind"] == "cache.keepwarm_usage"]
     assert len(billed) == 1 and billed[0]["data"]["account"] == TAG
     assert ACCOUNT not in json.dumps(billed)
+
+
+def test_a_turn_never_borrows_the_tag_of_the_account_it_failed_over_from(retool):
+    retool.script["acc-a"] = hourly
+    before = journal.JOURNAL.last_seq
+    asyncio.run(run(retool.runner, turn()))
+    events = [e for e in journal.JOURNAL.query(since=before, limit=2000) if e.get("turn_id")]
+    first, second = journal.tag("acc-a"), journal.tag("acc-b")
+    # turn.begin comes before the account is chosen, so it has no tag; the later events of each attempt name theirs.
+    begins = [e for e in events if e["kind"] == "turn.begin"]
+    assert len(begins) == 2 and all("account" not in e["data"] for e in begins)
+    assert [e["data"]["account"] for e in events if e["kind"] == "session.acquire"] == [first, second]
+    assert [e["data"]["account"] for e in events if e["kind"] == "turn.end"] == [first, second]
+    assert [e["data"]["account"] for e in events if e["kind"] == "turn.error"] == [first]
+
+
+def test_upstream_events_after_acquire_carry_the_account_tag_without_passing_it_around(tmp_path, monkeypatch):
+    events, journaled = served(tmp_path, monkeypatch, lambda *_a, **_kw: stream(
+        {"event": "content_block_start", "type": "thinking"},
+        {"event": "content_block_delta", "type": "text", "partialText": "OK"},
+        {"event": "metadata", "usage": {"inputTokens": 4, "outputTokens": 3, "creditsUsed": 0.25}},
+        {"event": "end_of_stream"}))
+    assert events[-1] == {"type": "end", "reason": "stop"}
+    signals = by_kind(journaled).get("upstream.thinking_signal")
+    assert signals and all(event["data"].get("account") == TAG for event in signals)
+
+
+def test_an_upstream_rejection_names_the_account_even_from_the_transport_thread(tmp_path, monkeypatch):
+    def rejected(req, **_kw):
+        raise urllib.error.HTTPError(req.full_url, 400, "bad", {}, io.BytesIO(b'{"message": "not accepted"}'))
+
+    events, journaled = served(tmp_path, monkeypatch, rejected)
+    assert events[-1]["type"] == "error"
+    refusals = by_kind(journaled).get("upstream.rejected")
+    assert refusals and all(event["data"].get("account") == TAG for event in refusals)
+    assert ACCOUNT not in json.dumps(journaled, ensure_ascii=False)
+
+
+def test_the_tag_leaves_the_context_before_the_session_is_released(tmp_path):
+    # Releasing can evict other conversations: those events must not be labelled with this turn's account.
+    import client_context
+    _, pool, runner = setup(tmp_path, transport="direct", project_context=False, account_id=ACCOUNT)
+    seen, real = [], pool.release
+
+    async def spy(lease):
+        seen.append(client_context.current().get("account"))
+        await real(lease)
+
+    pool.release = spy
+    asyncio.run(run(runner, request(FIRST)))
+    assert seen == [None]
+
+
+# -- the events of the HTTP layer ------------------------------------------------------------------------------
+CHAT = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}
+TWO = [account("acc-a", provider_resource_name=M), account("acc-b", provider_resource_name=M)]
+
+
+def logged(request_id, kind):
+    """The events of one request; http.request is written after the response, so wait for it."""
+    deadline = time.monotonic() + 3
+    while True:
+        found = [e for e in journal.JOURNAL.query(limit=3000) if e["kind"] == kind and e.get("request_id") == request_id]
+        if found or time.monotonic() > deadline:
+            return found
+        time.sleep(0.01)
+
+
+def test_the_request_event_names_the_account_that_served_it(relay_pool):
+    call = relay_pool(TWO)
+    park(call.runtime, call.runtime.accounts.backends[0])
+    status, _, headers = call("/v1/chat/completions", CHAT)
+    assert status == 200
+    events = logged(headers["x-request-id"], "http.request")
+    assert len(events) == 1 and events[0]["data"]["account"] == journal.tag("acc-b")
+    assert "acc-b" not in json.dumps(events)
+
+
+def test_the_error_and_request_events_of_a_failed_turn_name_its_account(relay_pool, monkeypatch):
+    call = relay_pool(TWO[:1])
+
+    def down(req, **_kw):
+        raise urllib.error.HTTPError(req.full_url, 500, "down", {}, io.BytesIO(b"down"))
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", down)
+    status, _, headers = call("/v1/chat/completions", CHAT)
+    assert status == 502
+    errors = logged(headers["x-request-id"], "http.error")
+    assert len(errors) == 1 and errors[0]["data"]["account"] == journal.tag("acc-a")
+    assert errors[0]["data"]["status"] == 502
+    requests = logged(headers["x-request-id"], "http.request")
+    assert requests and requests[0]["data"]["account"] == journal.tag("acc-a")
+
+
+def test_a_request_refused_before_any_account_is_chosen_has_no_account_tag(relay_pool):
+    call = relay_pool(TWO)
+    park(call.runtime)
+    for stream in (False, True):
+        status, _, headers = call("/v1/chat/completions", dict(CHAT, stream=stream))
+        assert status == 429
+        for kind in ("http.error", "http.request"):
+            events = logged(headers["x-request-id"], kind)
+            assert events and all("account" not in event["data"] for event in events), (kind, stream)
 
 
 def test_tag_helper_never_exposes_the_identity_and_survives_missing_config():

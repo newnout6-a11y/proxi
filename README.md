@@ -364,11 +364,15 @@ SHA-256 от `account_id` (или `page_uuid`); сам идентификато�
 тег стоит в `accounts[].account` ответа `GET /v1/balance`, поэтому по нему можно найти все
 события одного аккаунта. Тег есть у `session.acquire`, `session.create`, `upstream.request`,
 `upstream.attempt`, `upstream.usage` и остальных событий хода после получения сессии
-(включая `turn.error` и `turn.end`), у `cache.keepwarm`, `cache.keepwarm_usage` и
-`cache.keepwarm_stop`, а также у `auth.refresh`, `account.exhausted`, `account.failover` и
-`admin.account`. У `account.migrate` два тега: `from_account` (откуда переехал диалог) и
-`to_account` (куда). Ход, которому не удалось получить сессию, тега не имеет: аккаунт ещё
-не выбран.
+(включая `turn.error` и `turn.end`, а также события транспорта и нативной истории вроде
+`upstream.thinking_signal`, `upstream.rejected` и `native_history.*`), у `cache.keepwarm`,
+`cache.keepwarm_usage` и `cache.keepwarm_stop`, у `auth.refresh`, `account.exhausted`,
+`account.failover` и `admin.account`, а у HTTP-событий `http.request` и `http.error` — когда
+запрос обслужил какой-то аккаунт. У `account.migrate` два тега: `from_account` (откуда
+переехал диалог) и `to_account` (куда). `turn.begin` пишется до выбора аккаунта, поэтому
+тега у него нет, как и у хода или запроса, которому не удалось получить сессию (например,
+отказ 404/429/402/503 до начала ответа): аккаунт ещё не выбран. При повторе хода на другом
+аккаунте тег каждой попытки свой, он не переходит на следующую.
 
 Для локальных Claude Code/Desktop и OpenCode журнал добавляет название приложения,
 имя чата, ID сессии и агента. Имена читаются из локальных метаданных только этих

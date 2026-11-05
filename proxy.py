@@ -28,7 +28,7 @@ import models as model_catalog
 import sse
 import models
 import validate
-from accounts import AccountDispatcher
+from accounts import AccountDispatcher, account_tag
 from credits import CreditsManager
 from orchestrator import TurnRunner, acquire_plan
 from session import Backend, SessionPool
@@ -277,7 +277,7 @@ def make_handler(runtime: Runtime):
                          status=status, duration_ms=round(took), model=None if model == "-" else model,
                          stream=bool(getattr(self, "_streaming", False)),
                          user_agent=self.headers.get("user-agent", "")[:120] if self.headers else "",
-                         error=getattr(self, "_error_code", None))
+                         error=getattr(self, "_error_code", None), **self._account_fields())
 
         def _serving_account(self):
             """The account that answered this request, else the primary one."""
@@ -289,6 +289,11 @@ def make_handler(runtime: Runtime):
                 return backend, runtime.credits
             manager = getattr(backend, "credits", None) or runtime.accounts.managers.get(backend)
             return backend, manager or runtime.credits
+
+        def _account_fields(self):
+            """`account` for the events of a request an account served; nothing while none was chosen."""
+            tag = account_tag(self._serving_account()[0])
+            return {"account": tag} if tag else {}
 
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
@@ -413,7 +418,7 @@ def make_handler(runtime: Runtime):
                          upstream_status=getattr(err, "upstream_status", None),
                          upstream_attempts=getattr(err, "upstream_attempts", None),
                          upstream_request_id=getattr(err, "upstream_request_id", None),
-                         diagnostic_id=getattr(err, "diagnostic_id", None))
+                         diagnostic_id=getattr(err, "diagnostic_id", None), **self._account_fields())
 
         def _error_payload(self, dialect, err):
             body = adapters.error_payload(dialect, err)
