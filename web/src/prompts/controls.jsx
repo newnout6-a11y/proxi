@@ -144,12 +144,16 @@ export function Tokens({ label, values, onChange, suggestions = [], placeholder,
   );
 }
 
-/** A native disclosure: keyboard and screen readers get it for free. Its state is the user's: edits never fold it. */
-export function Disclosure({ title, meta, defaultOpen = false, children, id }) {
-  const [open, setOpen] = useState(defaultOpen);
+/**
+ * A native disclosure: keyboard and screen readers get it for free. Only the user's own click on the summary changes
+ * it, so edits never fold it; `open` and `onOpenChange` let a parent decide the state until the user has chosen.
+ */
+export function Disclosure({ title, meta, defaultOpen = false, open: controlled, onOpenChange, children, id }) {
+  const [inner, setInner] = useState(defaultOpen);
+  const open = controlled ?? inner;
   return (
-    <details className="p-disclosure" open={open} id={id} onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary>
+    <details className="p-disclosure" open={open} id={id}>
+      <summary onClick={(event) => { event.preventDefault(); (onOpenChange || setInner)(!open); }}>
         <ChevronRight className="chev" size={16} strokeWidth={1.5} aria-hidden="true" />
         <span className="p-disclosure-title">{title}</span>
         {meta && <span className="p-disclosure-meta">{meta}</span>}

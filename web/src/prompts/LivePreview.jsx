@@ -21,6 +21,8 @@ export default function LivePreview({ apiKey, doc, profile, sampleState, setSamp
   const live = usePreview(apiKey, draftBody, { onUnauthorized });
   const base = usePreview(apiKey, baseBody, { delay: 0, onUnauthorized });
   const [view, setView] = useState('cut');
+  // The sample form folds away once a sample is chosen, and opens again while there is none, until the user decides
+  const [folded, setFolded] = useState(null);
   const rows = useMemo(() => (live.data && base.data ? diffLines(base.data.head, live.data.head) : []), [live.data, base.data]);
   const data = live.data;
 
@@ -30,8 +32,8 @@ export default function LivePreview({ apiKey, doc, profile, sampleState, setSamp
         <h2>Что получит модель</h2>
         {live.loading && <span className="muted small" role="status">обновляем</span>}
       </div>
-      <Disclosure title="Образец запроса" meta={sample ? sample.label : 'не выбран'} defaultOpen={!sample}>
-        <SampleInput value={sampleState} onChange={setSampleState} recent={recent} error={resolved.error} detected={detected} onRefresh={refreshRecent} />
+      <Disclosure title="Образец запроса" meta={sample ? sample.label : 'не выбран'} open={folded === null ? !sample || sampleState.mode === 'paste' : !folded} onOpenChange={(open) => setFolded(!open)}>
+        <SampleInput value={sampleState} onChange={setSampleState} recent={recent} error={resolved.error} detected={detected} onRefresh={refreshRecent} legendHidden />
       </Disclosure>
       {!sample && !resolved.error && (
         <p className="p-hint">Выберите образец: профиль применится к нему, и здесь появится то, что он вырезал и добавил. Живой предпросмотр работает по черновику, до сохранения</p>

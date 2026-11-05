@@ -30,7 +30,7 @@
 
 /* --- page ------------------------------------------------------------------------------------------------ */
 .prompts .page-meta { max-width: 48rem; }
-.prompts .savebar b { font-weight: 500; }
+.prompts strong, .prompts b { font-weight: 500; }
 .p-tabs-row { display: flex; }
 .p-tabs { flex-wrap: wrap; max-width: 100%; }
 .p-tabs button { flex: 0 1 auto; }
@@ -282,10 +282,9 @@
 }
 @media (max-width: 860px) {
   .p-pair, .p-add-text, .p-edit-add { grid-template-columns: minmax(0, 1fr); }
-  .rule-head { grid-template-columns: 20px 36px minmax(0, 1fr); }
-  .rule-head .rule-grip { display: none; }
-  .rule-tags { grid-column: 3; justify-content: flex-start; }
-  .rule-tools { grid-column: 3; }
+  .rule-head { grid-template-columns: 20px 20px 36px minmax(0, 1fr); }
+  .rule-tags { grid-column: 4; justify-content: flex-start; }
+  .rule-tools { grid-column: 4; }
   .rule-body { padding: var(--space-3); }
   .rule-locked .rule-head { grid-template-columns: 24px minmax(0, 1fr); }
   .rule-locked .rule-sub, .rule-locked .tag { grid-column: 2; justify-self: start; }

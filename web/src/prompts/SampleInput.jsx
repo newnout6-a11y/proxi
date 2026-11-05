@@ -3,13 +3,13 @@ import { Area, Select } from './controls.jsx';
 import { DIALECTS, recentLabel } from './sample.js';
 
 /** Picks the request a preview is made for: a recent one the relay still holds, or a body pasted by hand. */
-export default function SampleInput({ value, onChange, recent, error, detected, onRefresh }) {
+export default function SampleInput({ value, onChange, recent, error, detected, onRefresh, legendHidden = false }) {
   const group = useId();
   const usable = recent.filter((item) => item.has_request);
   const set = (patch) => onChange({ ...value, ...patch });
   return (
     <fieldset className="p-sample">
-      <legend>Образец запроса</legend>
+      <legend className={legendHidden ? 'p-sr' : undefined}>Образец запроса</legend>
       <div className="p-modes">
         <label className="check">
           <input type="radio" name={group} checked={value.mode === 'recent'} onChange={() => set({ mode: 'recent' })} />
