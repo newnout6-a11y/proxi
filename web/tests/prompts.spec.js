@@ -393,10 +393,16 @@ test('the live preview applies the profile under edit to the chosen sample and s
   // the facts of a forced profile leave out the rule and the revision
   await expect(panel.locator('.p-facts dt')).toHaveText(['Назначение', 'Клиент', 'Модель', 'Размер head']);
 
+  // the edits of the client's system of the profile under edit are reported one by one under the diff
+  const edited = panel.getByRole('region', { name: 'Как сработали правки system клиента' });
+  await expect(edited.locator('li')).toHaveCount(2);
+  await expect(edited.locator('li .tag', { hasText: 'сработала' })).toHaveCount(2);
+
   // an edit changes the answer within a moment
   const before = prompts.previews.length;
   await page.getByRole('button', { name: 'Удалить правку 1' }).first().click();
   await expect(panel.locator('.diff-del .diff-text', { hasText: '# Code comments' })).toHaveCount(0);
+  await expect(edited.locator('li')).toHaveCount(1);
   expect(prompts.previews.length).toBeGreaterThan(before);
   await panel.getByRole('button', { name: 'Итоговый head' }).click();
   await expect(panel.locator('.head-text')).toContainText('IMPORTANT: DO NOT ADD');
@@ -799,17 +805,31 @@ test('a pasted request is previewed with its headers and dialect: rule, profile,
   await expect(text.locator('[data-source="literal"]')).toHaveText('\n\n');
   await expect(text.locator('[data-source="client_edited"]')).toContainText('You are opencode');
   await expect(text.locator('[data-source="client_edited"]')).not.toContainText('# Code comments');
-  await expect(result.locator('.src-legend li')).toHaveText(['именованный текст53', 'текст шаблона2', /^system клиента после правок\d+$/]);
+  await expect(result.locator('.src-legend li')).toHaveText(['именованный текст53', 'текст шаблона2', /^system клиента\d+$/]);
   await result.locator('.head-parts summary').click();
   await expect(result.locator('.head-parts li')).toHaveCount(3);
   await expect(result.locator('.head-parts li').nth(0)).toContainText('текст «my_rules»');
   await expect(result.locator('.head-parts li').nth(1)).toContainText('текст шаблона');
   await expect(result.locator('.head-parts li').nth(2)).toContainText('system клиента после правок');
 
-  await expect(result.getByRole('region', { name: 'Изменения истории' })).toContainText('Убрать блок тега');
-  await expect(result.getByRole('region', { name: 'Изменения истории' })).toContainText('тег: system-reminder');
+  const edited = result.getByRole('region', { name: 'Как сработали правки system клиента' });
+  await expect(edited.locator('li')).toHaveCount(2);
+  await expect(edited.locator('li').nth(0)).toContainText('Убрать раздел');
+  await expect(edited.locator('li').nth(0)).toContainText('правка 1');
+  await expect(edited.locator('li').nth(0)).toContainText('сработала');
+  await expect(edited.locator('li').nth(0)).toContainText('цель: # Code comments');
+  await expect(edited.locator('li').nth(1)).toContainText('Убрать блок тега');
+  await expect(edited.locator('li').nth(1)).toContainText('сработала');
+  const history = result.getByRole('region', { name: 'Изменения истории' });
+  await expect(history).toContainText('Убрать блок тега');
+  await expect(history).toContainText('история · правка 1');
+  await expect(history).toContainText('цель: system-reminder');
+  await expect(history).toContainText('позиции в теле: 0');
+  await expect(result.getByRole('region', { name: 'Изменения инструментов' })).toContainText('Добавить в конец описания');
+  await expect(result.getByRole('region', { name: 'Изменения инструментов' })).toContainText('инструменты · правка 1');
   await expect(result.getByRole('region', { name: 'Изменения инструментов' })).toContainText('инструмент: bash');
   await expect(result.getByRole('region', { name: 'Не сработали' })).toHaveCount(0);
+  await expect(result.getByRole('region', { name: 'Не применены' })).toHaveCount(0);
 });
 
 test('edits that found nothing are listed as not applied, and relay-only variables in a client request are warned about', async ({ page }) => {
@@ -819,10 +839,20 @@ test('edits that found nothing are listed as not applied, and relay-only variabl
   await sample.getByLabel('Тело запроса (JSON)').fill(JSON.stringify({ model: 'claude-sonnet-5-5', system: 'Короткий system без разделов' }));
   await sample.getByLabel('Заголовки').fill('User-Agent: opencode/1.4.2');
   const result = page.getByRole('region', { name: 'Результат предпросмотра' });
+  // the edits of the client's system are all listed, each with what it looked for; the misses are not repeated below
+  const edited = result.getByRole('region', { name: 'Как сработали правки system клиента' });
+  await expect(edited.locator('li')).toHaveCount(2);
+  await expect(edited.locator('li').nth(0)).toContainText('Убрать раздел');
+  await expect(edited.locator('li').nth(0)).toContainText('не нашла');
+  await expect(edited.locator('li').nth(0)).toContainText('искали: # Code comments');
+  await expect(edited.locator('li').nth(1)).toContainText('искали: available_skills');
+  // the edits of the history and the tools are named by their place in the profile
   const unmatched = result.getByRole('region', { name: 'Не сработали' });
-  await expect(unmatched).toContainText('Убрать раздел');
-  await expect(unmatched).toContainText('заголовок: # Code comments');
-  await expect(unmatched).toContainText('Убрать блок тега');
+  await expect(unmatched.locator('li')).toHaveCount(2);
+  await expect(unmatched.locator('li').nth(0)).toContainText('Убрать блок тега');
+  await expect(unmatched.locator('li').nth(0)).toContainText('история · правка 1');
+  await expect(unmatched.locator('li').nth(1)).toContainText('Добавить в конец описания');
+  await expect(unmatched.locator('li').nth(1)).toContainText('инструменты · правка 1');
   await expect(unmatched).toContainText('Это не ошибка');
   await expect(result.getByRole('region', { name: 'Изменения истории' })).toHaveCount(0);
 
@@ -830,6 +860,84 @@ test('edits that found nothing are listed as not applied, and relay-only variabl
   await head(page).fill('{{relay_task}}{{client_system}}');
   await page.getByRole('tab', { name: /^Предпросмотр/ }).click();
   await expect(page.getByRole('region', { name: 'Предупреждения' })).toContainText('{{relay_task}} пуст: запрос принадлежит клиенту');
+});
+
+test('a big body folds the entries of one edit into one line with a count, and an edit the relay skipped is listed apart with its reason', async ({ page }) => {
+  const document = initialDocument();
+  document.profiles['mine-first'].history.mid_system = 'drop';
+  document.profiles['mine-first'].tools.edits = [
+    { tool: 'bash', op: 'append', text: 'Осторожно.' },
+    { tool: 'edit', op: 'replace_text', find: 'нет такого текста', with: 'x' },
+    { tool: 'webfetch', hide: true },
+    { tool: 'grep', op: 'append', text: 'не дойдёт' },
+  ];
+  await openPrompts(page, { document }, 'Предпросмотр');
+  const sample = page.getByRole('region', { name: 'Образец' });
+  await sample.getByRole('radio', { name: 'Своё тело запроса' }).check();
+  const reminder = (n) => ({ role: 'user', content: [{ type: 'text', text: `<system-reminder>Plan mode is on ${n}</system-reminder>` }] });
+  const body = {
+    model: 'claude-sonnet-5-5', system: SYSTEM_OPENCODE,
+    tools: [{ name: 'bash', description: 'Run a command' }, { name: 'edit', description: 'Edit a file' }, { name: 'webfetch', description: 'Fetch a page' }],
+    messages: [...Array.from({ length: 12 }, (_, n) => reminder(n)), { role: 'system', content: 'mid one' }, { role: 'system', content: 'mid two' }],
+  };
+  await sample.getByLabel('Тело запроса (JSON)').fill(JSON.stringify(body));
+  await sample.getByLabel('Заголовки').fill('User-Agent: opencode/1.4.2');
+  const result = page.getByRole('region', { name: 'Результат предпросмотра' });
+
+  // twelve reminders and two mid-dialog system messages are two lines, each with how often it happened
+  const history = result.getByRole('region', { name: 'Изменения истории' });
+  await expect(history.locator('h3 .chip-count')).toHaveText('14');
+  await expect(history.locator('li')).toHaveCount(2);
+  const blocks = history.locator('li').nth(0);
+  await expect(blocks).toContainText('Убрать блок тега');
+  await expect(blocks).toContainText('история · правка 1');
+  await expect(blocks).toContainText('12 раз');
+  await expect(blocks).toContainText('цель: system-reminder');
+  await expect(blocks).toContainText('позиции в теле: 0, 1, 2, 3, 4, 5 и ещё 6');
+  await expect(blocks).toContainText('убрано симв.: 626');
+  const mid = history.locator('li').nth(1);
+  await expect(mid).toContainText('Системные сообщения посреди диалога: удалить');
+  await expect(mid).toContainText('2 раза');
+  await expect(mid).toContainText('позиции в теле: 12, 13');
+  await expect(mid).toContainText('удалено: 2');
+  await expect(mid).not.toContainText('правка');
+
+  const tools = result.getByRole('region', { name: 'Изменения инструментов' });
+  await expect(tools.locator('li')).toHaveCount(2);
+  await expect(tools.locator('li').nth(0)).toContainText('Добавить в конец описания');
+  await expect(tools.locator('li').nth(0)).toContainText('инструмент: bash');
+  await expect(tools.locator('li').nth(0)).toContainText('добавлено симв.: 10');
+  await expect(tools.locator('li').nth(1)).toContainText('Скрыть инструмент');
+  await expect(tools.locator('li').nth(1)).toContainText('инструменты · правка 3');
+  await expect(tools.locator('li').nth(1)).toContainText('инструмент: webfetch');
+  await expect(tools.locator('li').nth(1)).toContainText('удалено: 1');
+
+  // an edit the relay skipped is not among the applied ones: it has a place of its own, and says why
+  const skipped = result.getByRole('region', { name: 'Не применены' });
+  await expect(skipped.locator('li')).toHaveCount(1);
+  await expect(skipped.locator('li')).toContainText('Заменить текст в описании');
+  await expect(skipped.locator('li')).toContainText('инструменты · правка 2');
+  await expect(skipped.locator('li')).toContainText('инструмент: edit');
+  await expect(skipped.locator('li')).toContainText('не применена: the text to replace is not in the description');
+  await expect(tools).not.toContainText('Заменить текст в описании');
+  // an edit that matched nothing at all is another thing again
+  await expect(result.getByRole('region', { name: 'Не сработали' }).locator('li')).toHaveText([/Добавить в конец описания\s*инструменты · правка 4/]);
+});
+
+test('the client system has one tint, as sent or after the edits, and the legend counts it once while the parts keep their names', async ({ page }) => {
+  await openPrompts(page);
+  await head(page).fill('{{client_system}}\n--\n{{client_system_raw}}');
+  await page.getByRole('tab', { name: /^Предпросмотр/ }).click();
+  const result = page.getByRole('region', { name: 'Результат предпросмотра' });
+  const text = result.locator('.head-text');
+  await expect(text.locator('[data-source="client_edited"]')).toBeVisible();
+  await expect(text.locator('[data-source="client"]')).toBeVisible();
+  const tints = await text.locator('[data-source^="client"]').evaluateAll((items) => items.map((item) => getComputedStyle(item).backgroundColor));
+  expect(tints).toHaveLength(2);
+  expect(tints[0]).toBe(tints[1]);
+  await expect(result.locator('.src-legend li')).toHaveText([/^system клиента[\d\s]+$/, 'текст шаблона4']);
+  await result.locator('.head-parts summary').click();
+  await expect(result.locator('.head-parts li')).toHaveText([/^system клиента после правок/, /^текст шаблона/, /^system клиента\s*\d/]);
 });
 
 test('a protected service request says so, and a request no rule takes falls back to the legacy path', async ({ page }) => {
@@ -915,7 +1023,11 @@ test('the recent requests are listed with the rule, the profile and the revision
   await expect(text).toContainText('/home/dev/other');
   await expect(text.locator('[data-source="text:my_rules"]')).toBeVisible();
   await expect(text.locator('[data-source="client_edited"]')).toBeVisible();
-  await expect(detail.getByRole('region', { name: 'Изменения инструментов' })).toContainText('bash');
+  await expect(detail.getByRole('region', { name: 'Изменения инструментов' })).toContainText('инструмент: bash');
+  await expect(detail.getByRole('region', { name: 'Изменения истории' })).toContainText('история · правка 1');
+  // what the relay keeps in memory for a request is the changes of the history and the tools, not the edits of the system
+  await expect(detail.getByRole('region', { name: 'Как сработали правки system клиента' })).toHaveCount(0);
+  await expect(detail.getByRole('region', { name: 'Не сработали' })).toHaveCount(0);
   await list.locator('.seen-item').nth(4).click();
   await expect(detail).toContainText('req-title-1');
   await expect(detail.locator('.head-text')).toHaveText('Generate a title');

@@ -192,9 +192,13 @@ function removeSection(text, heading) {
   return [...lines.slice(0, start), ...lines.slice(end)].join('\n');
 }
 
+// What an edit looks for, as the relay reports it in `target`
+const targetOf = (edit) => edit.heading ?? edit.tag ?? edit.find ?? edit.pattern ?? edit.start ?? undefined;
+
 function applySystemEdits(system, edits) {
   let text = system;
   const unmatched = [];
+  const report = [];
   edits.forEach((edit, index) => {
     const before = text;
     if (edit.op === 'remove_section') text = removeSection(text, edit.heading || '');
@@ -203,9 +207,13 @@ function applySystemEdits(system, edits) {
     else if (edit.op === 'prepend') text = `${edit.text || ''}${text}`;
     else if (edit.op === 'append') text = `${text}${edit.text || ''}`;
     else if (edit.op === 'remove_regex') text = text.replace(new RegExp(edit.pattern, `g${edit.flags || ''}`), '');
-    if (text === before) unmatched.push({ scope: 'client_system', index, op: edit.op, ...(edit.heading ? { heading: edit.heading } : {}), ...(edit.tag ? { tag: edit.tag } : {}) });
+    const matched = text !== before;
+    const target = targetOf(edit);
+    report.push({ index, op: edit.op, matched, ...(target !== undefined ? { target } : {}),
+      ...(matched ? { removed_chars: Math.max(0, before.length - text.length), added_chars: Math.max(0, text.length - before.length) } : {}) });
+    if (!matched) unmatched.push({ scope: 'client_system', index, op: edit.op, ...(target !== undefined ? { target } : {}) });
   });
-  return { text: text.replace(/\n{3,}/g, '\n\n'), unmatched };
+  return { text: text.replace(/\n{3,}/g, '\n\n'), unmatched, report };
 }
 
 // {{...}} in a template become parts: text between them is "literal", a variable is its own part.
@@ -247,14 +255,20 @@ function requestOf(sample) {
   const agent = headers['user-agent'] || '';
   const client = headers['x-proxi-client'] || (/opencode/i.test(agent) ? 'opencode' : /claude-cli|claude-code/i.test(agent) ? 'claude-code' : 'unknown');
   const body = sample.body || {};
+  const messages = body.messages || [];
   const system = typeof body.system === 'string' ? body.system
     : Array.isArray(body.system) ? body.system.map((block) => block.text || '').join('\n')
-      : (body.messages || []).filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+      : messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+  const textOf = (message) => (typeof message.content === 'string' ? message.content : (message.content || []).map((b) => b.text || '').join(''));
   return {
     dialect: sample.dialect || 'chat', client, agent: '', model: body.model || '', purpose: headers['x-test-purpose'] || (body.tools?.length ? 'client-tools' : 'client-text'),
     request_class: headers['x-claude-code-request-class'] || '', tools: Boolean(body.tools?.length), structured: false, has_client_system: Boolean(system.trim()),
-    header_profile: headers['x-proxi-profile'] || '', system, tool_names: (body.tools || []).map((tool) => tool.name || tool.function?.name),
-    blocks: (body.messages || []).flatMap((m) => (typeof m.content === 'string' ? [m.content] : (m.content || []).map((b) => b.text || ''))),
+    header_profile: headers['x-proxi-profile'] || '', system,
+    // the tools and the text blocks with their place in the body, which is what the relay reports as `index`
+    tool_list: (body.tools || []).map((tool, index) => ({ index, name: tool.name || tool.function?.name || '', description: tool.description || tool.function?.description || '' })),
+    blocks: messages.flatMap((message, index) => (typeof message.content === 'string' ? [{ index, text: message.content }]
+      : (message.content || []).map((block) => ({ index, text: block.text || '' })))),
+    mid_system: messages.flatMap((message, index) => (message.role === 'system' && messages.slice(0, index).some((other) => other.role !== 'system') ? [{ index, chars: textOf(message).length }] : [])),
   };
 }
 
@@ -274,7 +288,7 @@ export function simulate(sample, doc) {
     else if (doc.default_profile) profile = doc.default_profile;
   }
   const result = { rule, profile, protected: isProtected, purpose: request.purpose, client: request.client, model: request.model,
-    history_changes: [], tools_changes: [], edits_unmatched: [], warnings: [] };
+    history_changes: [], tools_changes: [], edits_unmatched: [], edits: [], warnings: [] };
   if (!profile) return { ...result, head: '', parts: [], head_bytes: 0, tokens_estimate: 0 };
   const spec = profile === 'passthrough' ? { head: '{{client_system}}' } : doc.profiles[profile];
   if (!spec) return { ...result, profile, head: '', parts: [], head_bytes: 0, tokens_estimate: 0, warnings: [`profile ${profile} not found`] };
@@ -288,18 +302,31 @@ export function simulate(sample, doc) {
   const composed = composeHead(spec.head && typeof spec.head === 'string' ? spec.head : '', {
     system: applied.text, raw: system, edited: applied.text !== system, billing, request, texts: doc?.texts || {},
   });
-  const toolEdits = spec.tools?.edits || [];
-  for (const edit of toolEdits) {
-    if (request.tool_names.some((name) => matchesValue(name, edit.tool))) result.tools_changes.push({ tool: edit.tool, op: edit.hide ? 'hide' : edit.op, chars: edit.text?.length || 0 });
-    else result.edits_unmatched.push({ scope: 'tools', tool: edit.tool, op: edit.hide ? 'hide' : edit.op });
+  // history and tools are reported the way the relay does: one entry per message or tool touched, an edit that touched nothing in edits_unmatched
+  (spec.history?.user_blocks || []).forEach((block, at) => {
+    const hits = request.blocks.filter((item) => item.text.includes(`<${block.tag}`) && (!block.contains || item.text.includes(block.contains)));
+    if (!hits.length) { result.edits_unmatched.push({ scope: 'history', op: block.op, edit: at }); return; }
+    for (const hit of hits) result.history_changes.push({ scope: 'history', op: block.op, edit: at, index: hit.index, target: block.tag, removed_chars: hit.text.length });
+  });
+  const mode = spec.history?.mid_system;
+  if (mode && mode !== 'keep') {
+    if (!request.mid_system.length) result.edits_unmatched.push({ scope: 'history', op: 'mid_system', mode });
+    for (const item of request.mid_system) {
+      result.history_changes.push({ scope: 'history', op: 'mid_system', mode, index: item.index, ...(mode === 'drop' ? { deleted: true, removed_chars: item.chars } : { kept: true }) });
+    }
   }
-  for (const block of spec.history?.user_blocks || []) {
-    const hits = request.blocks.filter((text) => text.includes(`<${block.tag}`) && (!block.contains || text.includes(block.contains))).length;
-    if (hits) result.history_changes.push({ op: block.op, tag: block.tag, count: hits });
-    else result.edits_unmatched.push({ scope: 'history.user_blocks', op: block.op, tag: block.tag });
-  }
+  (spec.tools?.edits || []).forEach((edit, at) => {
+    const op = edit.hide ? 'hide' : edit.op;
+    const hits = request.tool_list.filter((tool) => matchesValue(tool.name, edit.tool));
+    if (!hits.length) { result.edits_unmatched.push({ scope: 'tools', op, edit: at }); return; }
+    for (const tool of hits) {
+      const entry = { scope: 'tools', op, edit: at, index: tool.index, tool: tool.name };
+      if (op === 'replace_text' && edit.find && !tool.description.includes(edit.find)) result.tools_changes.push({ ...entry, skipped: true, reason: 'the text to replace is not in the description' });
+      else result.tools_changes.push({ ...entry, ...(op === 'hide' ? { deleted: true } : { added_chars: (edit.text || '').length }) });
+    }
+  });
   result.edits_unmatched.unshift(...applied.unmatched);
-  return { ...result, ...composed, warnings: [...composed.warnings], head_bytes: bytes(composed.head), tokens_estimate: Math.ceil(bytes(composed.head) / 4) };
+  return { ...result, ...composed, edits: applied.report, warnings: [...composed.warnings], head_bytes: bytes(composed.head), tokens_estimate: Math.floor(bytes(composed.head) / 4) };
 }
 
 // --- the recent requests the relay holds ---------------------------------------------------------------------------

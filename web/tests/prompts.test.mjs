@@ -12,10 +12,11 @@ import {
 } from '../src/prompts/draft.js';
 import {
   BASELINE_DOCUMENT, DEFAULT_VARIABLES, MAX_DOCUMENT_BYTES, RELAY_TASK_VARIABLES, compileProfileName, detectDialect, failureLead, failureOf, forceProfile,
-  normalizeBuiltin, normalizeLimits, normalizePins, normalizePreview, normalizePrompts, normalizeRecent, normalizeSaved, normalizeSpecialUses,
+  normalizeBuiltin, normalizeEditReport, normalizeLimits, normalizePins, normalizePreview, normalizePrompts, normalizeRecent, normalizeSaved, normalizeSpecialUses,
   normalizeVariables, parseBody, parseHeaders, previewRequest,
 } from '../src/prompts/api.js';
-import { describeChange } from '../src/prompts/changes.js';
+import { describeChange, describeGroup, describeReport, describeUnmatched, groupChanges, opLabel, scopeLabel, shortList } from '../src/prompts/changes.js';
+import { fmtInt } from '../src/format.js';
 import { emptySample, newestSample, recentLabel, resolveSample } from '../src/prompts/sample.js';
 
 // --- template ------------------------------------------------------------------------------------------------
@@ -127,12 +128,13 @@ test('unchanged stretches fold away except the context around a change', () => {
 
 // --- parts -----------------------------------------------------------------------------------------------------
 
-test('every source is told apart by kind and named for people', () => {
-  assert.deepEqual(['client', 'client_edited', 'text:mine', 'relay:role', 'literal', 'billing', 'weird'].map(sourceKind),
-    ['client', 'edited', 'text', 'relay', 'literal', 'billing', 'other']);
+test('every source belongs to a family that sets its tint, and is named for people', () => {
+  assert.deepEqual(['client', 'client_edited', 'text:mine', 'text:other', 'relay:role', 'relay:task', 'literal', 'billing', 'weird'].map(sourceKind),
+    ['client', 'client', 'text', 'text', 'relay', 'relay', 'literal', 'billing', 'other']);
   assert.equal(sourceLabel('text:my_rules'), 'текст «my_rules»');
   assert.equal(sourceLabel('relay:native_role'), 'роль для клиента с tools');
   assert.equal(sourceLabel('relay:future'), 'relay: future');
+  assert.equal(sourceLabel('client'), 'system клиента');
   assert.equal(sourceLabel('client_edited'), 'system клиента после правок');
 });
 
@@ -169,6 +171,15 @@ test('the legend counts characters per kind in the order the kinds appear', () =
     { kind: 'literal', label: 'текст шаблона', chars: 3, parts: 2 },
     { kind: 'client', label: 'system клиента', chars: 3, parts: 1 },
   ]);
+});
+
+test('the client system as sent and after the edits is one kind in the legend, and two parts in the list', () => {
+  const segments = segmentHead('aabbbcc', [{ source: 'client_edited', start: 0, end: 2 }, { source: 'text:x', start: 2, end: 5 }, { source: 'client', start: 5, end: 7 }]);
+  assert.deepEqual(summarizeKinds(segments), [
+    { kind: 'client', label: 'system клиента', chars: 4, parts: 2 },
+    { kind: 'text', label: 'именованный текст', chars: 3, parts: 1 },
+  ]);
+  assert.deepEqual(segments.map((segment) => [segment.source, segment.kind]), [['client_edited', 'client'], ['text:x', 'text'], ['client', 'client']]);
 });
 
 // --- edit operations -------------------------------------------------------------------------------------------
@@ -453,10 +464,22 @@ test('a preview answer always has lists and parts as spans, and keeps null where
   assert.equal(preview.rule, null);
   assert.equal(preview.rev, null);
   assert.deepEqual(preview.parts.map((part) => part.end), [1, 3]);
-  assert.deepEqual([preview.warnings, preview.edits_unmatched, preview.history_changes, preview.tools_changes], [[], [], [], []]);
+  assert.deepEqual([preview.warnings, preview.edits_unmatched, preview.history_changes, preview.tools_changes, preview.edits], [[], [], [], [], []]);
   assert.equal(preview.head_bytes, 3);
   assert.equal(normalizePreview(null).head, '');
   assert.equal(normalizePreview({ protected: true }).protected, true);
+});
+
+test('the report on the edits of the client system keeps the position of each edit and says only what the relay said about a match', () => {
+  assert.deepEqual(normalizeEditReport([{ index: 0, op: 'remove_tag', matched: true, target: 'x' }, { op: 'append', matched: false }, { op: 'prepend' }, 'junk']), [
+    { index: 0, op: 'remove_tag', matched: true, target: 'x' },
+    { index: 1, op: 'append', matched: false },
+    { index: 2, op: 'prepend', matched: null },
+  ]);
+  assert.deepEqual(normalizeEditReport(undefined), []);
+  const preview = normalizePreview({ edits: [{ index: 0, op: 'remove_section', matched: true, removed_chars: 5 }], warnings: ['one', { message: 'two' }] });
+  assert.deepEqual(preview.edits, [{ index: 0, op: 'remove_section', matched: true, removed_chars: 5 }]);
+  assert.deepEqual(preview.warnings, ['one', 'two']);
 });
 
 test('recent heads and pins are read for what the screen shows', () => {
@@ -667,4 +690,93 @@ test('a change the relay reports is read for its operation, its place and its no
   assert.deepEqual(describeChange({ op: 'x', mystery: 'seen', nested: { a: 1 } }).details, [['mystery', 'seen']]);
   assert.equal(describeChange(null).title, '');
   assert.equal(describeChange({ message: 'x'.repeat(200) }).title.length, 80);
+});
+
+test('scopes and operations are named by where they belong', () => {
+  assert.deepEqual(['client_system', 'history', 'tools', 'future'].map(scopeLabel), ['system клиента', 'история', 'инструменты', 'future']);
+  assert.equal(scopeLabel(''), '');
+  assert.equal(opLabel('tools', 'append'), 'Добавить в конец описания');
+  assert.equal(opLabel('client_system', 'append'), 'Добавить в конец');
+  assert.equal(opLabel('history', 'replace_text'), 'Заменить текст');
+  assert.equal(opLabel('tools', 'replace_text'), 'Заменить текст в описании');
+  assert.equal(opLabel('history', 'mid_system', 'wrap'), 'Системные сообщения посреди диалога: обернуть как напоминание');
+  assert.equal(opLabel('history', 'mid_system'), 'Системные сообщения посреди диалога');
+  assert.equal(opLabel('', 'hide'), 'Скрыть инструмент');
+  assert.equal(opLabel('tools', ''), '');
+  assert.equal(opLabel('tools', 'future_op'), 'future_op');
+  assert.equal(shortList(['a', 'b', 'c', 'd', 'e'], 3), 'a, b, c и ещё 2');
+  assert.equal(shortList(['a', 'b'], 3), 'a, b');
+});
+
+test('the entries of a large body are folded by scope, operation and edit, and counted; skipped edits stay apart with their reason', () => {
+  const items = [
+    ...Array.from({ length: 12 }, (_, n) => ({ scope: 'history', op: 'drop_tag', edit: 0, index: n, target: 'system-reminder', removed_chars: 50 + n })),
+    { scope: 'history', op: 'drop_tag', edit: 1, index: 3, target: 'other', removed_chars: 5 },
+    { scope: 'history', op: 'mid_system', mode: 'drop', index: 20, deleted: true, removed_chars: 7 },
+    { scope: 'history', op: 'mid_system', mode: 'drop', index: 22, deleted: true, removed_chars: 9 },
+    { scope: 'history', op: 'mid_system', mode: 'wrap', index: 24, kept: true },
+    { scope: 'history', op: 'drop_tag', edit: 0, index: 99, skipped: true, reason: 'protected' },
+    { scope: 'history', op: 'drop_tag', edit: 0, index: 98, skipped: true, reason: 'protected' },
+    { scope: 'history', op: 'drop_tag', edit: 0, index: 97, skipped: true, reason: 'too late' },
+    'plain note', 'plain note',
+  ];
+  const groups = groupChanges(items);
+  assert.deepEqual(groups.map((group) => [group.op || group.message, group.mode, group.edit, group.skipped, group.reason, group.count]), [
+    ['drop_tag', '', 0, false, '', 12],
+    ['drop_tag', '', 1, false, '', 1],
+    ['mid_system', 'drop', null, false, '', 2],
+    ['mid_system', 'wrap', null, false, '', 1],
+    ['drop_tag', '', 0, true, 'protected', 2],
+    ['drop_tag', '', 0, true, 'too late', 1],
+    ['plain note', '', null, false, '', 2],
+  ]);
+  const folded = describeGroup(groups[0]);
+  assert.deepEqual([folded.title, folded.where, folded.count, folded.reason], ['Убрать блок тега', 'история · правка 1', 12, '']);
+  assert.deepEqual(folded.details, [['цель', 'system-reminder'], ['позиции в теле', '0, 1, 2, 3, 4, 5 и ещё 6'], ['убрано симв.', fmtInt(666)]]);
+  const dropped = describeGroup(groups[2]);
+  assert.deepEqual([dropped.title, dropped.where, dropped.count], ['Системные сообщения посреди диалога: удалить', 'история', 2]);
+  assert.deepEqual(dropped.details, [['позиции в теле', '20, 22'], ['убрано симв.', '16'], ['удалено', '2']]);
+  assert.deepEqual(describeGroup(groups[3]).details, [['позиции в теле', '24'], ['оставлено', '1']]);
+  const skipped = describeGroup(groups[4]);
+  assert.deepEqual([skipped.reason, skipped.count, groups[4].skipped], ['protected', 2, true]);
+  assert.deepEqual(describeGroup(groups[6]), { title: 'plain note', where: '', count: 2, details: [], reason: '' });
+  assert.deepEqual(groupChanges(undefined), []);
+});
+
+test('tool changes name the tool and what was added, and a hidden tool counts as deleted', () => {
+  const groups = groupChanges([
+    { scope: 'tools', op: 'append', edit: 0, index: 0, tool: 'bash', added_chars: 10 },
+    { scope: 'tools', op: 'append', edit: 0, index: 4, tool: 'mcp_a', added_chars: 10 },
+    { scope: 'tools', op: 'hide', edit: 2, index: 2, tool: 'webfetch', deleted: true },
+    { scope: 'tools', op: 'future', edit: 3, index: 5, tool: 'x', brand_new: 'seen', nested: { a: 1 } },
+  ]);
+  assert.deepEqual(groups.map((group) => group.count), [2, 1, 1]);
+  assert.deepEqual(describeGroup(groups[0]), { title: 'Добавить в конец описания', where: 'инструменты · правка 1', count: 2, reason: '',
+    details: [['инструменты', 'bash, mcp_a'], ['позиции в теле', '0, 4'], ['добавлено симв.', '20']] });
+  assert.deepEqual(describeGroup(groups[1]).details, [['инструмент', 'webfetch'], ['позиции в теле', '2'], ['удалено', '1']]);
+  // a field the screen has no word for is still shown, under its own name
+  assert.deepEqual(describeGroup(groups[2]).details, [['инструмент', 'x'], ['позиции в теле', '5'], ['brand_new', 'seen']]);
+});
+
+test('an edit that matched nothing is named by its place and says what it looked for', () => {
+  assert.deepEqual(describeUnmatched({ scope: 'client_system', index: 1, op: 'remove_tag', target: 'available_skills' }),
+    { title: 'Убрать блок тега', where: 'system клиента · правка 2', details: [['искали', 'available_skills']], note: '' });
+  assert.deepEqual(describeUnmatched({ scope: 'history', op: 'drop_tag', edit: 0 }),
+    { title: 'Убрать блок тега', where: 'история · правка 1', details: [], note: '' });
+  assert.deepEqual(describeUnmatched({ scope: 'history', op: 'mid_system', mode: 'drop' }),
+    { title: 'Системные сообщения посреди диалога: удалить', where: 'история', details: [], note: '' });
+  assert.deepEqual(describeUnmatched({ scope: 'tools', op: 'append', edit: 3 }),
+    { title: 'Добавить в конец описания', where: 'инструменты · правка 4', details: [], note: '' });
+  assert.deepEqual(describeUnmatched('что-то'), { title: 'что-то', where: '', details: [], note: '' });
+  assert.equal(describeUnmatched({ message: 'x' }).title, 'x');
+});
+
+test('the report on the edits of the client system is read edit by edit, with what an unmatched edit looked for', () => {
+  const unmatched = [{ scope: 'client_system', index: 1, op: 'remove_tag', target: 'available_skills' }];
+  assert.deepEqual(describeReport({ index: 0, op: 'remove_section', matched: true, target: '# Code comments', removed_chars: 612 }, unmatched),
+    { number: 1, title: 'Убрать раздел', matched: true, details: [['цель', '# Code comments'], ['убрано симв.', fmtInt(612)]] });
+  assert.deepEqual(describeReport({ index: 1, op: 'remove_tag', matched: false }, unmatched),
+    { number: 2, title: 'Убрать блок тега', matched: false, details: [['искали', 'available_skills']] });
+  assert.deepEqual(describeReport({ index: 2, op: 'prepend', matched: null, count: 1 }, []).details, [['совпадений', '1']]);
+  assert.equal(describeReport({ index: 0, op: 'brand_new', matched: true }).title, 'brand_new');
 });
