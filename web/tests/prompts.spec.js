@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
 import { API_KEY, mockAdmin } from './fixtures.js';
 import { BUILTIN, SYSTEM_OPENCODE, initialDocument, mockPrompts } from './prompts-fixtures.js';
 
@@ -1342,7 +1343,7 @@ for (const width of [280, 320, 414, 1440]) {
   });
 }
 
-test('every control of the prompts screen has a name, and focus is visible on the controls that open and move things', async ({ page }) => {
+test('every control of the prompts screen has a name', async ({ page }) => {
   await openPrompts(page);
   for (const name of TABS) {
     await tab(page, name).click();
@@ -1356,3 +1357,61 @@ test('every control of the prompts screen has a name, and focus is visible on th
     expect({ name, nameless }).toEqual({ name, nameless: [] });
   }
 });
+
+// The design gate looks at every tab; this looks at the states it does not reach: refused saves, banners, forms, switched-off rules.
+for (const theme of ['dark', 'light']) {
+  test(`axe finds nothing in the states with errors, warnings and forms (${theme})`, async ({ page }) => {
+    await page.addInitScript((value) => localStorage.setItem('relay.admin.theme', value), theme);
+    await page.setViewportSize({ width: 1280, height: 1000 });
+    const { prompts } = await openPrompts(page, { errors: [{ message: 'bad file', param: 'profiles.x', ts: 1 }] });
+    const violations = [];
+    const scan = async (label) => {
+      await page.waitForTimeout(300);
+      const result = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+      for (const found of result.violations) violations.push({ label, id: found.id, targets: found.nodes.map((node) => node.target.join(' ')) });
+    };
+    await scan('the banner of the file errors');
+    await head(page).fill('{{typo}} {{text:gone}}');
+    await scan('references the relay would refuse');
+    await saveButton(page).click();
+    await expect(page.locator('.p-save-error')).toBeVisible();
+    await scan('a refused save with the field marked');
+    await head(page).fill('{{client_system}}');
+    await page.getByRole('button', { name: 'Переименовать' }).click();
+    await page.getByLabel('Новое имя').fill('bad name');
+    await scan('a rename form with an error');
+    await page.getByRole('button', { name: 'Отмена' }).click();
+    await page.getByRole('button', { name: 'Новый профиль' }).click();
+    await scan('the form of a new profile');
+    await page.getByRole('button', { name: 'Отмена' }).click();
+    await tab(page, 'Правила').click();
+    await page.getByRole('switch', { name: 'Защита служебных запросов' }).click();
+    await page.getByRole('switch', { name: 'Правило по заголовку включено' }).click();
+    await scan('protection off and a rule switched off');
+    const rule = userRule(page, 2);
+    await rule.getByRole('button', { name: /opencode/ }).first().click();
+    await rule.getByLabel('Применять и к защищённым запросам (override_protected)').check();
+    await rule.getByLabel('Добавить условие').selectOption('tools');
+    await rule.getByLabel('Добавить условие').selectOption('model');
+    await scan('a rule with the override warning and conditions');
+    prompts.rev = 9;
+    await saveButton(page).click();
+    await expect(page.locator('.p-conflict')).toBeVisible();
+    await scan('the conflict banner');
+    await tab(page, 'Тексты').click();
+    await page.getByRole('button', { name: 'Переименовать' }).first().click();
+    await page.getByLabel('Новое имя').fill('has space');
+    await scan('the rename form of a text');
+    await tab(page, 'Предпросмотр').click();
+    await page.getByRole('radio', { name: 'Своё тело запроса' }).check();
+    await page.getByLabel('Тело запроса (JSON)').fill('{oops');
+    await scan('a pasted body that is not JSON');
+    await page.getByLabel('Тело запроса (JSON)').fill(JSON.stringify({ model: 'm', system: 'Короткий', messages: [] }));
+    await page.getByLabel('Заголовки').fill('User-Agent: opencode/1');
+    await scan('a preview of a pasted request');
+    await tab(page, 'Что увидела модель').click();
+    await page.locator('.seen-item').nth(4).click();
+    await scan('a protected request among the recent ones');
+    expect(violations).toEqual([]);
+  });
+}

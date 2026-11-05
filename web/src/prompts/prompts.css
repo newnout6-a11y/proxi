@@ -193,7 +193,7 @@
 .rule-list:empty { display: none; }
 .rule { position: relative; background: var(--surface); min-width: 0; }
 .rule + .rule { border-top: 1px solid var(--line); }
-.rule.is-off .rule-main { opacity: 0.6; }
+.rule.is-off .rule-title { color: var(--ink-2); }
 .rule.is-dragging { background: var(--raised); box-shadow: inset 2px 0 0 var(--accent); }
 .rule[data-drop="before"]::before, .rule[data-drop="after"]::after { content: ''; position: absolute; left: 0; right: 0; height: 2px; background: var(--accent); z-index: 1; }
 .rule[data-drop="before"]::before { top: -1px; }
@@ -216,7 +216,7 @@
 .rule-locked .rule-head { grid-template-columns: 24px minmax(0, 1.2fr) minmax(0, 2fr) auto; min-height: 44px; }
 .rule-locked .rule-title { font-weight: 400; font-size: var(--text-xs); }
 .rule-locked .rule-sub { grid-column: auto; }
-.rule-list.locked.is-off .rule-title, .rule-list.locked.is-off .rule-sub { text-decoration: line-through; opacity: 0.7; }
+.rule-list.locked.is-off .rule-title, .rule-list.locked.is-off .rule-sub { text-decoration: line-through; }
 .p-default { padding-top: var(--space-3); max-width: 36rem; }
 
 /* --- texts ------------------------------------------------------------------------------------------------- */
