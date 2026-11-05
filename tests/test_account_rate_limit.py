@@ -41,7 +41,7 @@ def _headers(**values):
     return message
 
 
-# -- 1: recognition ----------------------------------------------------------------
+# -- recognition ---------------------------------------------------------------------
 @pytest.mark.parametrize("text,expected", [
     (MESSAGE, True),
     (MESSAGE.upper(), True),
@@ -132,7 +132,7 @@ def test_the_transport_raises_the_flagged_error_after_one_attempt(tmp_path, monk
     assert error.retry_after == (90.0 if quota else None)
 
 
-# -- 2: parking the account ----------------------------------------------------------
+# -- parking the account -------------------------------------------------------------
 def _events(kind, since):
     return [event for event in journal.JOURNAL.query(since=since) if event["kind"] == kind]
 
@@ -280,7 +280,7 @@ def test_marking_an_unknown_account_does_nothing():
     assert value.mark_rate_limited(Account("stranger")) is None
 
 
-# -- 8: the setting ------------------------------------------------------------------
+# -- the setting ---------------------------------------------------------------------
 @pytest.fixture
 def clean_env(monkeypatch):
     for name in ("RETOOL_BASE", "RETOOL_COOKIE", "RETOOL_XSRF", "RETOOL_PAGE_UUID", "RETOOL_THREAD_ID",
@@ -327,7 +327,7 @@ def test_the_admin_schema_lists_the_cooldown_as_a_routing_setting(admin_relay):
     assert admin_relay.patch({"account_rate_limit_cooldown": 4000})[0] == 400
 
 
-# -- 3: the turn moves to another account ------------------------------------------------
+# -- the turn moves to another account -----------------------------------------------
 def serve_ok(_request):
     return response(text("OK"), *END)
 
@@ -361,7 +361,8 @@ def retool(tmp_path, monkeypatch):
     clock = Clock()
     manager = AccountDispatcher(list(pool.backends), runner.cfg, {}, clock=clock, rng=random.Random(1))
     runner.accounts = manager
-    posts, script = [], {}
+    posts, script, paid = [], {}, []
+    runner.credits = SimpleNamespace(record_turn=lambda key, cost: paid.append((key, cost)))
 
     def opener(request_, **_kwargs):
         account = request_.full_url.split("/")[2].split(".")[0]
@@ -370,7 +371,7 @@ def retool(tmp_path, monkeypatch):
 
     monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
     return SimpleNamespace(pool=pool, runner=runner, dispatcher=manager, clock=clock, a=first, b=second,
-                           posts=posts, script=script)
+                           posts=posts, script=script, paid=paid)
 
 
 def turn(conversation="conv-1"):
@@ -388,6 +389,9 @@ def test_a_turn_that_hits_the_hourly_limit_moves_to_the_next_account_unseen(reto
     assert not any(event["type"] == "error" for event in events)
     assert retool.a.unavailable["reason"] == "rate_limited" and retool.b.unavailable is None
     assert retool.pool._conversations["conv-1"].backend is retool.b
+    # The rejected attempt cost nothing and is not reported as an unknown charge.
+    assert [cost for _, cost in retool.paid] == [0.1]
+    assert not any(event["type"] == "usage" and not event.get("usage") for event in events)
     parked = _events("account.rate_limited", before)
     assert len(parked) == 1 and parked[0]["request_id"] == "req-conv-1"
     assert parked[0]["data"]["account"] == tag("acc-a") and parked[0]["data"]["until"] > time.time()
@@ -496,6 +500,15 @@ def test_an_ordinary_429_is_returned_as_before_without_parking_the_account(retoo
     assert not _events("account.rate_limited", before) and not _events("account.failover", before)
 
 
+def test_an_hourly_error_as_the_very_first_stream_event_still_moves_the_turn(retool):
+    retool.script["acc-a"] = lambda _request: response(
+        {"event": "error", "statusCode": 429, "error": {"message": MESSAGE}})
+    events = asyncio.run(run(retool.runner, turn()))
+    assert retool.posts == ["acc-a", "acc-b"] and {"type": "text", "delta": "OK"} in events
+    assert not any(event["type"] == "error" for event in events)
+    assert retool.a.unavailable["reason"] == "rate_limited"
+
+
 def test_an_hourly_error_in_the_middle_of_a_stream_parks_the_account_for_the_next_request(retool):
     retool.script["acc-a"] = lambda _request: response(
         text("par"), {"event": "error", "statusCode": 429, "error": {"message": MESSAGE}})
@@ -564,7 +577,7 @@ def test_shared_mode_refuses_a_parked_account_without_calling_retool(tmp_path):
     assert error.status == 429 and 110 <= error.retry_after <= 120
 
 
-# -- 7: what the client and the operator see -------------------------------------------------
+# -- what the client and the operator see ---------------------------------------------
 RELAY_KEY = "rate-limit-relay-key-123"
 CHAT = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}
 
