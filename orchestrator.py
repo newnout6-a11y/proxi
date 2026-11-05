@@ -683,6 +683,7 @@ class TurnRunner:
                         "debug", transport="direct" if direct_mode else "agent",
                         prompt_chars=len(stream_prompt or ""), attempt=empty_retries + tool_retries + exec_steps + 1)
                     first_token = False
+                    text_open = False
                     think_started = None
                     tool_started = {}
                     out.put({"type": "usage_start"})
@@ -697,8 +698,13 @@ class TurnRunner:
                                 ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
                                 log("upstream.first_token", "Первый токен через %d мс" % ttft,
                                     "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
+                            if event["type"] in ("thinking_status", "thinking_start", "thinking", "thinking_signature",
+                                                 "tool_call"):
+                                text_open = False
                             if event["type"] == "text":
-                                if not upstream_text:
+                                if not text_open and event["delta"]:
+                                    # Every text segment (text, thinking, text) opens its own answer span.
+                                    text_open = True
                                     ms = round((time.time() - holder["upstream_started_at"]) * 1000)
                                     log("upstream.text_start", "Модель начала писать текст через %d мс" % ms,
                                         "debug", ms=ms)

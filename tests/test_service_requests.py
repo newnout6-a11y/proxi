@@ -279,3 +279,43 @@ def test_token_estimate_includes_large_tool_schema_and_remains_local(relay):
         assert response.headers["x-proxi-token-count"] == "estimated"
     assert counted["input_tokens"] > plain["input_tokens"] + 4000
     assert not relay.fake.seen and relay.credits.used == []
+
+
+TEXT_SEGMENTS = {
+    "plain": (["text:a", "text:b"], 1),
+    "thinking-first": (["think", "text:a"], 1),
+    "text-thinking-text": (["text:a", "think", "text:b"], 2),
+    "three-segments": (["text:a", "think", "text:b", "think", "text:c"], 3),
+    "heartbeat-is-no-boundary": (["text:a", "beat", "text:b"], 1),
+    "text-tool-text": (["text:a", "call", "text:b"], 2),
+    "empty-delta-opens-nothing": (["text:", "text:a"], 1),
+}
+
+
+@pytest.mark.parametrize("name", sorted(TEXT_SEGMENTS))
+def test_each_text_segment_opens_its_own_answer_span(tmp_path, monkeypatch, name):
+    script, expected = TEXT_SEGMENTS[name]
+    log = journal.Journal()
+    monkeypatch.setattr(journal, "JOURNAL", log)
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[])
+
+    async def stream(session, prompt, provider, tool_names=None):
+        for item in script:
+            kind, _, value = item.partition(":")
+            if kind == "text":
+                yield {"type": "text", "delta": value}
+            elif kind == "think":
+                yield {"type": "thinking_start"}
+                yield {"type": "thinking", "delta": "planning"}
+                yield {"type": "thinking_signature"}
+            elif kind == "beat":
+                yield {"type": "thinking_heartbeat", "elapsed": 5.0}
+            else:
+                yield {"type": "tool_call", "id": "call-1", "name": "read_file", "arguments": "{}"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(RelaySession, "stream", stream)
+    events = asyncio.run(run(runner, request(FIRST)))
+    assert not any(event["type"] == "error" for event in events)
+    starts = [e for e in log.query() if e["kind"] == "upstream.text_start"]
+    assert len(starts) == expected
