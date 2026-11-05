@@ -1,8 +1,8 @@
 """Deterministic rewrites of a client request body selected by a prompts profile.
 
-Contract-first skeleton; see docs/prompt-control-plan.md (sections 2.3 and 4). The
-rewrite runs on the raw JSON before validate.parse_* so native-history fingerprints,
-chunks, cache markers and rit all derive from the rewritten request (plan I4).
+See docs/prompt-control-plan.md (sections 2.3 and 4). The rewrite runs on the raw JSON before
+validate.parse_* so native-history fingerprints, chunks, cache markers and rit all derive from the
+rewritten request (plan I4).
 
 What is edited (everything else, including the head, assistant turns, thinking blocks and
 signatures, images, tool calls and tool_choice, is copied untouched):

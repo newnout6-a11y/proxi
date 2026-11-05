@@ -298,3 +298,28 @@ def test_the_real_snapshot_gives_prompt_body_what_it_reads(tmp_path):
         assert {c["op"] for c in changes} == {"drop_tag", "remove_regex", "mid_system", "append"}
         again, _ = prompt_body.rewrite(result, dialect, cut, snapshot)
         assert dump(again) == dump(result)
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_the_profile_and_the_snapshot_are_read_only(dialect):
+    rules = copy.deepcopy(PROFILES["all"])
+    rules["history"]["user_blocks"].append({"op": "remove_regex", "pattern": "Use tabs", "flags": "i"})
+    rules["tools"]["edits"].append({"tool": "read", "op": "replace_regex", "pattern": "(Read) a", "with": r"\1 the"})
+    before = copy.deepcopy(rules)
+    snapshot = FakeSnapshot(reminder="[note]\n{{text}}\n[/note]")
+    prompt_body.rewrite(rich_conversation(dialect), dialect, rules, snapshot)
+    assert rules == before and snapshot.reminder == "[note]\n{{text}}\n[/note]"
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_the_same_profile_gives_the_same_bytes_from_many_threads(dialect):
+    from concurrent.futures import ThreadPoolExecutor
+
+    rules, snapshot = PROFILES["all"], FakeSnapshot()
+    expected = dump(prompt_body.rewrite(rich_conversation(dialect), dialect, rules, snapshot))
+
+    def work(_):
+        return dump(prompt_body.rewrite(rich_conversation(dialect), dialect, rules, snapshot))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert set(pool.map(work, range(64))) == {expected}
