@@ -9,7 +9,8 @@ export const catalog = [
     metadata_status: 'verified' },
   { id: 'gpt-5.5', label: 'GPT 5.5', provider: 'openai', context: 1050000, max_output: 128000,
     reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], routable: false,
-    metadata_status: 'verified' },
+    metadata_status: 'verified', route_status: 'unrouted', route_blocker: 'no_resource',
+    route_reason: "No enabled account that can serve this model has a Retool resource for openai ('openai_provider_resource_name')" },
 ];
 
 const extraCatalog = [
@@ -20,7 +21,8 @@ const extraCatalog = [
   { id: 'gpt-5.5-codex', label: 'GPT 5.5 Codex', provider: 'openai', context: 400000, max_output: 128000,
     reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], routable: true, metadata_status: 'verified' },
   { id: 'gemini-3-pro', label: 'Gemini 3 Pro', provider: 'google', context: 2000000, max_output: 64000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'high'], routable: false, metadata_status: 'estimated' },
+    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'high'], routable: false, metadata_status: 'estimated',
+    route_status: 'unverified', route_blocker: 'blocked', route_reason: 'Requires Google BYOK; no configured route was tested.' },
 ];
 
 // Mirrors admin._schema: every field has a group, a real description and, where it applies, a unit.

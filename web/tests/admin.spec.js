@@ -438,6 +438,18 @@ test('leaving the settings with unsaved edits asks first and keeps them when dec
   expect(unexpected).toEqual([]);
 });
 
+test('the model catalog says why a model has no route', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const route = (id) => page.locator('.model-card').filter({ has: page.getByText(id, { exact: true }) }).locator('.model-route');
+  await expect(route('claude-opus-5-5')).toContainText('маршрут есть');
+  await expect(route('gpt-5.5')).toContainText('нет ресурса');
+  await expect(route('gpt-5.5')).toHaveAttribute('title', /openai_provider_resource_name/);
+  await expect(route('gemini-3-pro')).toContainText('нужен BYOK или retention');
+  await expect(route('gemini-3-pro')).toHaveAttribute('title', /Google BYOK/);
+});
+
 test('incomplete usage is not shown as free inference or a reliable forecast', async ({ page }) => {
   await mockAdmin(page, { metricsPatch: { totals: { credits: 0, credits_complete: false } },
     overviewPatch: { balance: { available: 100, monthly_allocation: 3000, unreported_usage: true } } });

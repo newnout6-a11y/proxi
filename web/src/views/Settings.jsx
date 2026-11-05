@@ -128,6 +128,14 @@ function Connection({ overview }) {
   );
 }
 
+// Why a model has no route, from the relay's own reason (route_blocker); older relays only said "no resource".
+function routeLabel(model) {
+  if (model.routable) return 'маршрут есть';
+  if (model.route_blocker === 'no_accounts') return 'нет включённых аккаунтов';
+  if (model.route_blocker === 'blocked') return model.route_status === 'unsupported' ? 'маршрут не поддерживается' : 'нужен BYOK или retention';
+  return 'нет ресурса';
+}
+
 function Catalog({ apiKey, onUnauthorized, onData }) {
   const [data, setData] = useState(null);
   const [query, setQuery] = useState('');
@@ -172,8 +180,8 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
           <span className="model-effort"><span>Effort: {model.reasoning ? (model.reasoning_effort_levels || []).join(' · ') || 'выбирает провайдер' : 'без мышления'}</span>
             <span>Verbosity: {model.verbosity_levels?.length ? model.verbosity_levels.join(' · ') : 'не поддерживается'}</span>
           </span>
-          <span className="model-route">
-            <Dot tone={model.routable ? 'pos' : 'muted'} />{model.routable ? 'маршрут есть' : 'нет ресурса'}
+          <span className="model-route" title={model.routable ? undefined : model.route_reason}>
+            <Dot tone={model.routable ? 'pos' : 'muted'} />{routeLabel(model)}
             {model.id === data?.default_model && <Tag tone="accent">по умолчанию</Tag>}
           </span>
         </article>
