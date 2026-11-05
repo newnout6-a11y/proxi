@@ -79,6 +79,15 @@ def collect(runtime, *, force_refresh=False):
     return entries
 
 
+def serving_entry(entries):
+    """The account /health describes: a routable one first, then an enabled one, then the first.
+
+    The first account in config.json is not special: it may be switched off while the pool serves.
+    """
+    return (next((entry for entry in entries if entry["routable"]), None)
+            or next((entry for entry in entries if enabled(entry["backend"])), None) or entries[0])
+
+
 def summarize(entries):
     """Readiness figures shared by /health and the admin overview."""
     states = {}
@@ -93,7 +102,12 @@ def summarize(entries):
 
 
 def aggregate_balance(infos):
-    """Top-level /v1/balance figures: sums over accounts whose balance is known."""
+    """Top-level /v1/balance figures: sums over accounts whose balance is known.
+
+    `unknown_accounts` counts the accounts left out; `partial` is true when the sums cover only part of
+    the pool (an unknown balance, or a known balance without a monthly allocation), so a lower total is
+    never mistaken for the whole pool.
+    """
     with_balance = [info for info in infos if known(info.get("available")) is not None]
     allocation = [value for value in (known(info.get("monthly_allocation")) for info in with_balance)
                   if value is not None]
@@ -107,6 +121,9 @@ def aggregate_balance(infos):
         "session_used": round(sum(known(info.get("session_used")) or 0.0 for info in infos), 4),
         "stale": any(info.get("stale") for info in with_balance),
         "unreported_usage": any(info.get("unreported_usage") for info in infos),
+        "accounts_total": len(infos),
+        "unknown_accounts": len(infos) - len(with_balance),
+        "partial": bool(with_balance) and (len(with_balance) < len(infos) or len(allocation) < len(with_balance)),
     }
 
 

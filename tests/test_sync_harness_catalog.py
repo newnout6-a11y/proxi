@@ -47,7 +47,9 @@ def test_refresh_keeps_selection_other_providers_credentials_and_custom_fields()
     assert 'xhigh' not in catalog['gpt-6-sol']['reasoningEfforts']
     assert catalog['gpt-6-sol']['reasoningEfforts']['off'] == 'none'
     assert catalog['gpt-4.1']['reasoningEfforts'] is False
-    assert set(catalog['zai-org/GLM-5.3-Flash']['reasoningEfforts']) == {'low', 'medium', 'high', 'max'}
+    # No selectors (the route ignores effort), so GLM shares the provider whose SDK default is "off".
+    assert catalog['zai-org/GLM-5.3-Flash']['reasoningEfforts'] is False
+    assert any(model['id'] == 'zai-org/GLM-5.3-Flash' for model in text['models'])
     assert catalog['zai-org/GLM-5.3-Flash']['input'] == ['text', 'image']
 
 

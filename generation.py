@@ -3,6 +3,7 @@ import math
 
 import structured
 from apierr import unprocessable
+import models
 
 
 def _reject(name):
@@ -197,6 +198,9 @@ def controls(data, entry, dialect):
         _reject('truncation')
     if data.get('modalities') is not None and data['modalities'] != ['text']:
         _reject('modalities')
+    if entry.get('reasoning_effort_control') == 'accepted-ignored':
+        # Retool takes these and changes nothing: accepted, never forwarded, named without values.
+        ignored.extend(name for name in models.ignored_effort_controls(data, entry) if name not in ignored)
 
     numeric = (('temperature', 0, 2, False), ('top_p', 0, 1, False), ('top_k', 0, 2**31-1, True),
                ('seed', -(2**63), 2**63-1, True), ('presence_penalty', -2, 2, False),

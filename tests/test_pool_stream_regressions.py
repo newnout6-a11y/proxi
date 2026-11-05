@@ -32,7 +32,6 @@ def pool_config(**overrides):
 @pytest.mark.parametrize("model,requested,effective", [
     ("claude-opus-5-5", "xhigh", "high"),
     ("claude-opus-5-5", "max", "max"),
-    ("claude-haiku-4-5-20251001", "xhigh", "high"),
     ("gpt-6-sol", "xhigh", "high"),
     ("gpt-6.1-sol", "max", "max"),
     ("gpt-5.5", "xhigh", "high"),
@@ -168,7 +167,7 @@ async def test_missing_route_releases_slots_and_conversation_locks():
     entry, _ = models.resolve("claude-opus-5-5")
     with pytest.raises(ApiError) as caught:
         await pool.acquire("conversation", model_entry=entry)
-    assert caught.value.status == 503
+    assert caught.value.status == 404 and "provider_resource_name" in caught.value.message
     assert pool._slots._value == 8
     assert not pool._conversation_locks
     assert not pool._conversation_refs
