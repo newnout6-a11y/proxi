@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from accounts import idle_block
+from accounts import DEAD_AFTER, idle_block
 from keepwarm_harness import START, backend as warm_backend, drive, session as warm_session
+from test_account_dispatcher import Account, FakeManager, FakeRefresher, dispatcher
 
 STATES = {"disabled": {"enabled": False}, "exhausted": {"unavailable": {"reason": "exhausted", "available": 3.0}},
           "auth_dead": {"unavailable": {"reason": "auth_dead"}},
@@ -65,6 +66,35 @@ def test_an_account_that_recovers_is_warmed_again(monkeypatch):
     assert pings == [] and clock.now - START < 2
     target.backend.unavailable = None
     clock, pings = drive(monkeypatch, target, seconds=10)
+    assert len(pings) == 1
+
+
+@pytest.mark.parametrize("cause", ["exhausted", "auth_dead"])
+def test_an_exclusion_made_by_the_real_dispatcher_stops_idle_warming_and_its_end_restarts_it(monkeypatch, cause):
+    if cause == "exhausted":
+        account, manager = Account("dispatched"), FakeManager(5.0)
+        control, _ = dispatcher([account], {account: manager})
+        control.check_balance(account)
+
+        def recover():
+            manager.available = 500
+            control.check_balance(account)
+    else:
+        account = Account("dispatched", FakeRefresher([(False, "auth")] * DEAD_AFTER))
+        control, _ = dispatcher([account])
+        for _ in range(DEAD_AFTER):
+            control.refresh(account)
+
+        def recover():
+            control.refresh(account)
+
+    assert account.unavailable and account.unavailable["reason"] == cause
+    target = warm_session(backend=account, _warm_at=0)
+    clock, pings = drive(monkeypatch, target, seconds=60)
+    assert pings == [] and clock.now - START < 2
+    recover()
+    assert account.unavailable is None
+    _, pings = drive(monkeypatch, target, seconds=60)
     assert len(pings) == 1
 
 
