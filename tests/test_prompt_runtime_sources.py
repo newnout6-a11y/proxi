@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import apierr
 import client_context
 import context
 import direct
@@ -376,3 +377,13 @@ def test_the_agent_transport_starts_its_prompt_with_the_composed_head_and_adds_n
     assert asyncio.run(run(runner, parsed))[-1] == {"type": "end", "reason": "stop"}
     assert prompts[0].startswith(context.DEFAULT_RELAY_SYSTEM_PROMPT + "\n\n[LOCAL EXECUTION]")
     assert "Run my relay task" in prompts[0] and "[LOCAL EXEC REMINDER]" not in prompts[0]
+
+
+def test_a_refusal_raised_while_composing_reaches_the_client_and_nothing_goes_upstream(tmp_path, monkeypatch):
+    def refuse(self, client_system, sources):
+        raise apierr.ApiError(413, "prompt_too_large", "the composed head is too large for this profile")
+
+    monkeypatch.setattr(FakePlan, "compose_head", refuse)
+    events, sent, _ = served(tmp_path, monkeypatch, planned("{{client_system}}"))
+    error = next(event["error"] for event in events if event.get("type") == "error")
+    assert (error.status, error.code) == (413, "prompt_too_large") and sent == []
