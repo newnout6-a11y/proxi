@@ -1,5 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { failureOf, previewPrompts } from './api.js';
+
+/**
+ * Where the focus goes once the next render is done: for an action that removes the control that had it (a delete, a
+ * form that closes) or opens something to type in. The returned function takes `find`, which returns the element.
+ */
+export function useFocusLater() {
+  const later = useRef(null);
+  useLayoutEffect(() => {
+    const find = later.current;
+    if (!find) return;
+    later.current = null;
+    find()?.focus();
+  });
+  return useCallback((find) => { later.current = find; }, []);
+}
 
 /**
  * The answer to one preview request, asked again a moment after the request changes. A request that is

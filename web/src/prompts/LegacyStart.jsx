@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
 import { Button } from '../ui.jsx';
 import { fmtInt } from '../format.js';
+import { useFocusLater } from './hooks.js';
 import NewProfile from './NewProfile.jsx';
 
 const MODES = { standalone: 'Самостоятельные запросы', append: 'Дополнить клиента', replace: 'Заменить роль клиента' };
@@ -17,9 +18,11 @@ function roleText(legacy, builtin) {
 /** No prompts document in force: say which path is in force and how to start. `invalid`: a file exists but the relay refused it. */
 export default function LegacyStart({ legacy, builtin, path, invalid = false, onCreate }) {
   const [starting, setStarting] = useState(false);
+  const root = useRef(null);
+  const focusLater = useFocusLater();
   const mode = legacy?.mode || '';
   return (
-    <section className="panel p-legacy" aria-label={invalid ? 'Файл промптов не действует' : 'Файл промптов не создан'}>
+    <section className="panel p-legacy" aria-label={invalid ? 'Файл промптов не действует' : 'Файл промптов не создан'} ref={root}>
       <h2>{invalid ? 'Файл промптов не действует' : 'Файла промптов пока нет'}</h2>
       <p>
         {invalid ? 'Файл есть, но relay его не принял (причины указаны выше), поэтому ' : 'Сейчас '}
@@ -41,9 +44,10 @@ export default function LegacyStart({ legacy, builtin, path, invalid = false, on
           : 'Чтобы начать, создайте первый профиль. Он сохранится в файле рядом с config.json и заработает без перезапуска, как только его выберет правило. Пока ни одно правило не подходит и профиля по умолчанию нет, запросы идут прежним путём'}
       </p>
       {starting ? (
-        <NewProfile taken={['passthrough']} pattern={builtin?.profileName} title="Первый профиль" onCreate={onCreate} onCancel={() => setStarting(false)} />
+        <NewProfile taken={['passthrough']} pattern={builtin?.profileName} title="Первый профиль" onCreate={onCreate}
+          onCancel={() => { setStarting(false); focusLater(() => root.current?.querySelector('[data-act="start"]')); }} />
       ) : (
-        <div><Button tone="primary" icon={Plus} onClick={() => setStarting(true)}>Создать первый профиль</Button></div>
+        <div><Button tone="primary" icon={Plus} data-act="start" onClick={() => setStarting(true)}>Создать первый профиль</Button></div>
       )}
     </section>
   );

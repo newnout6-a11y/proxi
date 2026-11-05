@@ -1,9 +1,10 @@
-import { Fragment, useState } from 'react';
+import { Fragment, useRef, useState } from 'react';
 import { Plus, Trash } from 'lucide-react';
 import { Button, Tag } from '../ui.jsx';
 import { fmtInt } from '../format.js';
 import { Area, Disclosure, IconBtn, Line, Notice } from './controls.jsx';
 import { isObject, removeText, renameText, setRelayText, textNameError, textUsage, textsOf } from './draft.js';
+import { useFocusLater } from './hooks.js';
 
 const RELAY_TEXTS = [
   { name: 'role', title: 'Роль relay', where: 'Запросы без system клиента и без инструментов («задачи relay»), а также переменная {{role}}', vars: [] },
@@ -28,37 +29,50 @@ function TextBody({ label, value, onChange, path, limit, rows = 6, placeholder }
   return <Area label={label} labelHidden value={typeof value === 'string' ? value : ''} onChange={onChange} rows={rows} limit={limit} path={path} placeholder={placeholder} />;
 }
 
-function NamedText({ doc, setDoc, name, limit }) {
+function NamedText({ doc, setDoc, name, limit, onRemoved, onRenamed }) {
   const value = doc.texts[name];
   const used = textUsage(doc, name);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(name);
+  const article = useRef(null);
+  const focusLater = useFocusLater();
   const taken = Object.keys(doc.texts).filter((key) => key !== name);
   const error = renaming ? textNameError(draft, taken) : null;
   const set = (next) => setDoc((current) => ({ ...current, texts: { ...current.texts, [name]: next } }));
+  // the form opens on its field and closes onto the button that opened it
+  const rename = (open) => {
+    setDraft(name);
+    setRenaming(open);
+    focusLater(() => article.current?.querySelector(open ? '.p-rename input' : '[data-act="rename"]'));
+  };
   return (
-    <article className="p-text" aria-label={`Текст ${name}`}>
+    <article className="p-text" aria-label={`Текст ${name}`} ref={article}>
       <div className="p-text-head">
         <div>
           <h3 className="mono">{name}</h3>
           <p className="p-hint">Вставка в шаблон: <code>{`{{text:${name}}}`}</code></p>
         </div>
         <div className="head-actions">
-          <Button onClick={() => { setDraft(name); setRenaming(!renaming); }} aria-expanded={renaming}>Переименовать</Button>
-          <IconBtn icon={Trash} tone="danger" label={`Удалить текст ${name}`}
+          <Button data-act="rename" onClick={() => rename(!renaming)} aria-expanded={renaming}>Переименовать</Button>
+          <IconBtn icon={Trash} tone="danger" label={`Удалить текст ${name}`} data-act="remove"
             onClick={() => {
               if (used.length && !window.confirm(`Текст ${name} используется в профилях: ${used.join(', ')}. Убрать его всё равно?`)) return;
               setDoc((current) => removeText(current, name));
+              onRemoved(name);
             }} />
         </div>
       </div>
       {renaming && (
-        <form className="p-rename" onSubmit={(event) => { event.preventDefault(); if (!error && draft !== name) setDoc((current) => renameText(current, name, draft)); setRenaming(false); }}>
+        <form className="p-rename" onSubmit={(event) => {
+          event.preventDefault();
+          if (!error && draft !== name) { setDoc((current) => renameText(current, name, draft)); onRenamed(name); return; }
+          rename(false);
+        }}>
           <Line label="Новое имя" value={draft} onChange={setDraft} hint="Ссылки в шаблонах и правках профилей перейдут на новое имя" />
           {error && draft !== name && <p className="p-error">{error}</p>}
           <div className="head-actions">
             <Button type="submit" tone="primary" disabled={!!error || draft === name}>Переименовать</Button>
-            <Button onClick={() => setRenaming(false)}>Отмена</Button>
+            <Button onClick={() => rename(false)}>Отмена</Button>
           </div>
         </form>
       )}
@@ -72,9 +86,22 @@ function NamedTexts({ doc, setDoc, limit }) {
   const texts = textsOf(doc);
   const names = Object.keys(texts);
   const [name, setName] = useState('');
+  const root = useRef(null);
+  const focusLater = useFocusLater();
   const error = textNameError(name, names);
+  const articles = () => [...(root.current?.querySelectorAll('.p-texts > .p-text') || [])];
+  // a removed text takes its buttons along: the focus goes to the text that took its place, or to the form that adds one
+  const removed = (key) => {
+    const at = names.indexOf(key);
+    focusLater(() => articles()[Math.min(at, articles().length - 1)]?.querySelector('[data-act="remove"]') || root.current?.querySelector('.p-add-text input'));
+  };
+  // a renamed text is a new element under its new name, in the same place
+  const renamed = (key) => {
+    const at = names.indexOf(key);
+    focusLater(() => articles()[at]?.querySelector('[data-act="rename"]'));
+  };
   return (
-    <section className="panel p-texts" aria-label="Именованные тексты">
+    <section className="panel p-texts" aria-label="Именованные тексты" ref={root}>
       <div className="panel-head">
         <div>
           <h2>Именованные тексты</h2>
@@ -82,7 +109,7 @@ function NamedTexts({ doc, setDoc, limit }) {
         </div>
       </div>
       {!names.length && <p className="p-empty-line muted">Текстов пока нет</p>}
-      {names.map((key) => <NamedText key={key} doc={doc} setDoc={setDoc} name={key} limit={limit} />)}
+      {names.map((key) => <NamedText key={key} doc={doc} setDoc={setDoc} name={key} limit={limit} onRemoved={removed} onRenamed={renamed} />)}
       <form className="p-add-text" onSubmit={(event) => { event.preventDefault(); if (!error) { setDoc((current) => ({ ...current, texts: { ...textsOf(current), [name]: '' } })); setName(''); } }}>
         <Line label="Новый текст: имя" value={name} onChange={setName} placeholder="my_rules" />
         <Button type="submit" icon={Plus} disabled={!!error}>Добавить текст</Button>
@@ -94,6 +121,8 @@ function NamedTexts({ doc, setDoc, limit }) {
 
 // codex_base is one string for every model or a map of model masks to strings.
 function CodexBase({ value, onChange, limit }) {
+  const root = useRef(null);
+  const focusLater = useFocusLater();
   const map = isObject(value) && typeof value.file !== 'string' ? value : null;
   if (!map) {
     return (
@@ -105,18 +134,29 @@ function CodexBase({ value, onChange, limit }) {
   }
   const entries = Object.entries(map);
   const set = (next) => onChange(Object.fromEntries(next));
+  const rows = () => [...(root.current?.querySelectorAll('.p-codex-row') || [])];
+  const addMask = () => {
+    set([...entries, ['', '']]);
+    // a new mask is for typing: the focus goes to its field
+    focusLater(() => rows().at(-1)?.querySelector('input'));
+  };
+  const removeMask = (index) => {
+    set(entries.filter((_, i) => i !== index));
+    // the pressed button may go with its row: the focus goes to the mask that took its place, or to the button that adds one
+    focusLater(() => rows()[Math.min(index, rows().length - 1)]?.querySelector('[data-act="remove"]') || root.current?.querySelector('[data-act="add-mask"]'));
+  };
   return (
-    <div className="p-codex-map">
+    <div className="p-codex-map" ref={root}>
       {entries.map(([glob, text], index) => (
         <div className="p-codex-row" key={index}>
           <Line label="Маска модели" value={glob} onChange={(next) => set(entries.map(([key, item], i) => [i === index ? next : key, item]))} placeholder="gpt-5*" />
           <Area label={`Инструкции для ${glob || 'маски'}`} value={text} limit={limit} rows={5} path={`relay_texts.codex_base.${glob}`}
             onChange={(next) => set(entries.map(([key, item], i) => [key, i === index ? next : item]))} />
-          <IconBtn icon={Trash} tone="danger" label={`Убрать маску ${glob || index + 1}`} onClick={() => set(entries.filter((_, i) => i !== index))} />
+          <IconBtn icon={Trash} tone="danger" label={`Убрать маску ${glob || index + 1}`} data-act="remove" onClick={() => removeMask(index)} />
         </div>
       ))}
       <div className="head-actions">
-        <Button icon={Plus} onClick={() => set([...entries, ['', '']])}>Добавить маску</Button>
+        <Button icon={Plus} data-act="add-mask" onClick={addMask}>Добавить маску</Button>
         <Button onClick={() => onChange(entries[0]?.[1] ?? '')}>Одна строка для всех моделей</Button>
       </div>
       <p className="p-hint">Первая подходящая маска в порядке списка. Модели, которых не поймала ни одна маска, получают встроенный текст</p>

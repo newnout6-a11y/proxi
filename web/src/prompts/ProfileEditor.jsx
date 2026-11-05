@@ -5,6 +5,7 @@ import { fmtInt } from '../format.js';
 import { Area, Disclosure, Line, Notice, Select, Tokens } from './controls.jsx';
 import EditList from './EditList.jsx';
 import { isObject, patchProfile, profileNameError } from './draft.js';
+import { useFocusLater } from './hooks.js';
 import { MID_SYSTEM_MODES } from './ops.js';
 import { insertAt, problemText, templateProblems, variableNames } from './template.js';
 
@@ -129,8 +130,16 @@ export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, u
   const profile = doc.profiles[name];
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(name);
+  const root = useRef(null);
+  const focusLater = useFocusLater();
   const taken = Object.keys(doc.profiles).filter((key) => key !== name);
   const nameError = renaming ? profileNameError(nameDraft, taken, builtin.profileName ?? undefined) : null;
+  // the form opens on its field and closes onto the button that opened it
+  const rename = (open) => {
+    setNameDraft(name);
+    setRenaming(open);
+    focusLater(() => root.current?.querySelector(open ? '.p-rename input' : '[data-act="rename"]'));
+  };
   const patch = (change) => setDoc((current) => patchProfile(current, name, change));
   const systemEdits = profile.client_system?.edits || [];
   const userBlocks = profile.history?.user_blocks || [];
@@ -141,25 +150,29 @@ export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, u
   const used = usage.rules.length + (usage.isDefault ? 1 : 0);
 
   return (
-    <div className="p-profile">
+    <div className="p-profile" ref={root}>
       <div className="p-profile-head">
         <div>
           <h2 className="mono">{name}</h2>
           <p className="p-hint">Имя профиля — суффикс модели: <code>{`<модель>@${name}`}</code></p>
         </div>
         <div className="head-actions">
-          <Button icon={Pencil} onClick={() => { setNameDraft(name); setRenaming(!renaming); }} aria-expanded={renaming}>Переименовать</Button>
+          <Button icon={Pencil} data-act="rename" onClick={() => rename(!renaming)} aria-expanded={renaming}>Переименовать</Button>
           <Button icon={Copy} onClick={onDuplicate}>Дублировать</Button>
           <Button tone="danger" disabled={used > 0} title={used > 0 ? 'Профиль используется правилами: сначала измените их' : undefined} onClick={onDelete}>Удалить</Button>
         </div>
       </div>
       {renaming && (
-        <form className="p-rename" onSubmit={(event) => { event.preventDefault(); if (!nameError && nameDraft !== name) { onRename(nameDraft); } setRenaming(false); }}>
+        <form className="p-rename" onSubmit={(event) => {
+          event.preventDefault();
+          if (!nameError && nameDraft !== name) { onRename(nameDraft); return; }
+          rename(false);
+        }}>
           <Line label="Новое имя" value={nameDraft} onChange={setNameDraft} hint="Правила, которые используют профиль, перейдут на новое имя" />
           {nameError && nameDraft !== name && <p className="p-error">{nameError}</p>}
           <div className="head-actions">
             <Button type="submit" tone="primary" disabled={!!nameError || nameDraft === name}>Переименовать</Button>
-            <Button onClick={() => setRenaming(false)}>Отмена</Button>
+            <Button onClick={() => rename(false)}>Отмена</Button>
           </div>
         </form>
       )}

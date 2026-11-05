@@ -5,6 +5,7 @@ import { usePolling } from '../useJournal.js';
 import { fmtAgo, fmtInt, plural } from '../format.js';
 import { changePins, failureOf, loadPins } from './api.js';
 import { Notice } from './controls.jsx';
+import { useFocusLater } from './hooks.js';
 
 /** Conversations held on the revision they started with, until they are unpinned or everything is applied at once. */
 export default function PinsTab({ apiKey, rev, onUnauthorized }) {
@@ -14,6 +15,8 @@ export default function PinsTab({ apiKey, rev, onUnauthorized }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const heading = useRef(null);
+  const root = useRef(null);
+  const focusLater = useFocusLater();
 
   const load = async () => {
     try {
@@ -29,6 +32,8 @@ export default function PinsTab({ apiKey, rev, onUnauthorized }) {
 
   async function run(action, conversation) {
     setBusy(true);
+    // The row and the panel that were pressed go away with the answer: the focus waits on the button that never does
+    root.current?.querySelector('[data-act="refresh"]')?.focus();
     try {
       const result = await changePins(apiKey, action, conversation);
       const count = Number.isFinite(result?.unpinned) ? result.unpinned : 0;
@@ -48,15 +53,15 @@ export default function PinsTab({ apiKey, rev, onUnauthorized }) {
   const items = pins || [];
   const now = Date.now() / 1000;
   return (
-    <section className="panel p-pins" aria-label="Закреплённые диалоги">
+    <section className="panel p-pins" aria-label="Закреплённые диалоги" ref={root}>
       <div className="panel-head">
         <div>
           <h2>Закреплённые диалоги</h2>
           <p className="panel-meta">Диалог остаётся на ревизии, с которой начался: смена head посреди диалога сбрасывает кэш. Закрепления живут в памяти relay</p>
         </div>
         <div className="head-actions">
-          <Button icon={RefreshCw} onClick={load}>Обновить</Button>
-          <Button tone="primary" disabled={!items.length || busy || confirming} onClick={() => setConfirming(true)}>Применить ко всем</Button>
+          <Button icon={RefreshCw} data-act="refresh" onClick={load}>Обновить</Button>
+          <Button tone="primary" data-act="apply-all" disabled={!items.length || busy || confirming} onClick={() => setConfirming(true)}>Применить ко всем</Button>
         </div>
       </div>
       <p className="p-hint">
@@ -74,7 +79,7 @@ export default function PinsTab({ apiKey, rev, onUnauthorized }) {
           </p>
           <div className="head-actions">
             <Button tone="primary" disabled={busy} onClick={() => run('apply_all')}>{busy ? 'Применяем' : 'Да, применить ко всем'}</Button>
-            <Button disabled={busy} onClick={() => setConfirming(false)}>Отмена</Button>
+            <Button disabled={busy} onClick={() => { setConfirming(false); focusLater(() => root.current?.querySelector('[data-act="apply-all"]')); }}>Отмена</Button>
           </div>
         </Notice>
       )}

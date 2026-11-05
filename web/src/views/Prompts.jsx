@@ -8,6 +8,7 @@ import { fmtInt } from '../format.js';
 import { failureLead, failureOf, loadPrompts, loadRecent, savePrompts } from '../prompts/api.js';
 import { ErrorContext, Notice } from '../prompts/controls.jsx';
 import { addProfile, blankDocument, changedPaths, equalJson, errorHits, insertAt, locate, newRule, normalizePath, pathLabel, profilesOf, rulesOf, starterProfile } from '../prompts/draft.js';
+import { useFocusLater } from '../prompts/hooks.js';
 import LegacyStart from '../prompts/LegacyStart.jsx';
 import PinsTab from '../prompts/PinsTab.jsx';
 import PreviewTab from '../prompts/PreviewTab.jsx';
@@ -63,8 +64,11 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
   const [recentLoading, setRecentLoading] = useState(false);
   const draftRef = useRef(draft);
   const baseRef = useRef(base);
+  const focusLater = useFocusLater();
   draftRef.current = draft;
   baseRef.current = base;
+  // Where the focus goes when the control that had it is gone: the tab of the section in view
+  const toActiveTab = () => document.querySelector('.p-tabs [role="tab"][aria-selected="true"]');
 
   const adopt = useCallback((next) => {
     setBase({ document: next.document, rev: next.rev });
@@ -139,6 +143,9 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
       setBase({ document: submitted, rev: result.rev });
       setSavedWarnings(result.warnings);
       toast({ tone: 'success', title: 'Промпты сохранены', text: `Ревизия ${result.rev}. Новые диалоги получат её сразу, начатые остаются на своей` });
+      // The bar goes away with the save, and the focus with it, unless the user has moved on to a field of their own
+      const active = document.activeElement;
+      if (!active || active === document.body || active.closest?.('.savebar')) focusLater(toActiveTab);
       const fresh = await loadPrompts(apiKey);
       setServer(fresh);
       if (fresh.rev === result.rev) {
@@ -272,6 +279,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
                       setDraft(addProfile(blankDocument(), name, starterProfile(starter)));
                       setSelected(name);
                       setTab('profiles');
+                      focusLater(() => document.querySelector('.p-profile-bar [aria-current="true"]'));
                     }} />
                   ) : item.id === 'profiles' ? (
                     <ProfilesTab apiKey={apiKey} doc={draft} setDoc={setDoc} builtin={builtin} selected={selected} select={setSelected}
@@ -284,7 +292,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
                     <PreviewTab apiKey={apiKey} doc={draft} dirty={dirty > 0} {...live} onUnauthorized={onUnauthorized} />
                   ) : item.id === 'seen' ? (
                     <SeenTab items={recent} error={recentError} loading={recentLoading} refresh={loadSamples}
-                      onPreview={(entry) => { setSampleState((state) => ({ ...state, mode: 'recent', requestId: entry.request_id })); setTab('preview'); }} />
+                      onPreview={(entry) => { setSampleState((state) => ({ ...state, mode: 'recent', requestId: entry.request_id })); setTab('preview'); focusLater(toActiveTab); }} />
                   ) : (
                     <PinsTab apiKey={apiKey} rev={server.rev} onUnauthorized={onUnauthorized} />
                   )
@@ -299,7 +307,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
         {dirty > 0 && (
           <motion.div className="savebar" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} transition={{ duration: 0.2, ease }}>
             <span><b className="num">{dirty}</b> несохранённых: <span className="savebar-keys" title={dirtyPaths.map(pathLabel).join(', ')}>{dirtyPaths.map(pathLabel).join(', ')}</span></span>
-            <Button icon={RotateCcw} onClick={() => { setDraft(base.document); setFailure(null); }}>Отменить</Button>
+            <Button icon={RotateCcw} onClick={() => { setDraft(base.document); setFailure(null); focusLater(toActiveTab); }}>Отменить</Button>
             <Button icon={Save} tone="primary" onClick={save} disabled={saving}>{saving ? 'Сохранение' : 'Сохранить'}</Button>
           </motion.div>
         )}

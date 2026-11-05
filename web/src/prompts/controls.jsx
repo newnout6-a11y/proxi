@@ -1,4 +1,4 @@
-import { createContext, useContext, useId, useState } from 'react';
+import { createContext, useContext, useId, useRef, useState } from 'react';
 import { ChevronRight, X } from 'lucide-react';
 import { fmtInt } from '../format.js';
 import { errorHits } from './draft.js';
@@ -107,6 +107,7 @@ export function IconBtn({ icon: Icon, label, onClick, disabled, tone, ...rest })
 export function Tokens({ label, values, onChange, suggestions = [], placeholder, hint, path }) {
   const id = useId();
   const [draft, setDraft] = useState('');
+  const input = useRef(null);
   const blamed = useFieldError(path);
   const error = blamed;
   const add = (raw) => {
@@ -122,12 +123,12 @@ export function Tokens({ label, values, onChange, suggestions = [], placeholder,
         {values.map((value) => (
           <span className="p-token" key={value}>
             <code>{value}</code>
-            <button type="button" aria-label={`Убрать значение ${value}`} onClick={() => onChange(values.filter((item) => item !== value))}>
+            <button type="button" aria-label={`Убрать значение ${value}`} onClick={() => { onChange(values.filter((item) => item !== value)); input.current?.focus(); }}>
               <X size={12} strokeWidth={1.5} aria-hidden="true" />
             </button>
           </span>
         ))}
-        <input className="mono" value={draft} placeholder={values.length ? '' : placeholder} aria-label={`${label}: добавить значение`} spellCheck={false}
+        <input ref={input} className="mono" value={draft} placeholder={values.length ? '' : placeholder} aria-label={`${label}: добавить значение`} spellCheck={false}
           autoComplete="off" aria-describedby={describedBy(id, error, hint)} onChange={(event) => setDraft(event.target.value)} onBlur={() => add(draft)}
           onKeyDown={(event) => {
             if (event.key === 'Enter' || event.key === ',') { event.preventDefault(); add(draft); }

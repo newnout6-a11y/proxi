@@ -5,7 +5,7 @@ import Conditions from './Conditions.jsx';
 import { Check, IconBtn, Line, Notice, Select } from './controls.jsx';
 import { summarizeConditions } from './conditions.js';
 import { catchAllIndex, idOf, insertAt, moveItem, newRule, protectedEnabled, removeAt, rulesOf, setProtected, setRuleField, updateAt } from './draft.js';
-import { useAnnouncer } from './hooks.js';
+import { useFocusLater, useAnnouncer } from './hooks.js';
 
 const HELP_ID = 'rules-move-help';
 
@@ -88,6 +88,8 @@ export default function RulesTab({ doc, setDoc, builtin, profileNames, expandInd
   const [status, announce] = useAnnouncer();
   const rows = useRef(new Map());
   const focus = useRef(null);
+  const root = useRef(null);
+  const focusLater = useFocusLater();
   const toggleOpen = (id) => setOpen((previous) => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const unreachableFrom = catchAllIndex(rules);
 
@@ -96,6 +98,8 @@ export default function RulesTab({ doc, setDoc, builtin, profileNames, expandInd
     const id = idOf(rules[expandIndex]);
     setOpen((previous) => new Set(previous).add(id));
     rows.current.get(id)?.scrollIntoView({ block: 'nearest' });
+    // the user was sent here to this rule: the focus goes to its first field once it is open
+    focusLater(() => rows.current.get(id)?.querySelector('.rule-body input'));
     onExpanded?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expandIndex]);
@@ -127,14 +131,19 @@ export default function RulesTab({ doc, setDoc, builtin, profileNames, expandInd
   const patchRule = (index) => (change) => setDoc((current) => ({ ...current, rules: updateAt(rulesOf(current), index, change) }));
   const remove = (index) => {
     const name = rules[index].name || `номер ${index + 1}`;
+    const neighbour = rules[index + 1] || rules[index - 1];
     setDoc((current) => ({ ...current, rules: removeAt(rulesOf(current), index) }));
     announce(`Правило «${name}» удалено из черновика`);
+    // the pressed button goes with its rule: the focus goes to the rule that took its place, or to the button that adds one
+    focusLater(() => (neighbour ? rows.current.get(idOf(neighbour))?.querySelector('[data-act="remove"]') : root.current?.querySelector('[data-act="add-rule"]')));
   };
   const add = () => {
     const rule = newRule(profileNames.find((name) => name !== 'passthrough') || '');
     setDoc((current) => ({ ...current, rules: insertAt(rulesOf(current), rulesOf(current).length, rule) }));
     setOpen((previous) => new Set(previous).add(idOf(rule)));
     announce('Добавлено новое правило в конец списка');
+    // a new rule is for filling in: the focus goes to its name
+    focusLater(() => rows.current.get(idOf(rule))?.querySelector('.rule-body input'));
   };
 
   // Where a dragged rule would land: the number of rows whose middle is above the pointer.
@@ -149,7 +158,7 @@ export default function RulesTab({ doc, setDoc, builtin, profileNames, expandInd
   };
 
   return (
-    <div className="p-rules">
+    <div className="p-rules" ref={root}>
       <Protection doc={doc} setDoc={setDoc} builtin={builtin} />
       <section className="panel p-rules-panel" aria-label="Ваши правила">
         <div className="panel-head">
@@ -157,7 +166,7 @@ export default function RulesTab({ doc, setDoc, builtin, profileNames, expandInd
             <h2>Ваши правила</h2>
             <p className="panel-meta">Запрос проверяется сверху вниз: побеждает первое включённое правило, подошедшее по условиям</p>
           </div>
-          <Button icon={Plus} onClick={add}>Добавить правило</Button>
+          <Button icon={Plus} data-act="add-rule" onClick={add}>Добавить правило</Button>
         </div>
         <p className="p-hint">Порядок меняют перетаскиванием за ручку слева или кнопками «Выше» и «Ниже». С клавиатуры: Alt и стрелка вверх или вниз на названии правила</p>
         <span className="p-sr" id={HELP_ID}>Alt и стрелка вверх или вниз перемещают правило</span>
@@ -206,7 +215,7 @@ export default function RulesTab({ doc, setDoc, builtin, profileNames, expandInd
                   <span className="rule-tools">
                     <IconBtn icon={ArrowUp} label={`Выше: правило ${name}`} disabled={index === 0} data-act="up" onClick={() => move(index, index - 1)} />
                     <IconBtn icon={ArrowDown} label={`Ниже: правило ${name}`} disabled={index === rules.length - 1} data-act="down" onClick={() => move(index, index + 1)} />
-                    <IconBtn icon={Trash} tone="danger" label={`Удалить правило ${name}`} onClick={() => remove(index)} />
+                    <IconBtn icon={Trash} tone="danger" label={`Удалить правило ${name}`} data-act="remove" onClick={() => remove(index)} />
                   </span>
                 </div>
                 {isOpen && (
