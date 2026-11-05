@@ -511,6 +511,9 @@ def make_handler(runtime: Runtime):
                 "accounts": {"total": summary["total"], "routable": summary["routable"],
                              "reserve": summary["reserve"], "states": summary["states"]},
             }
+            if summary["rate_limited_until"]:
+                # The earliest return of an account parked after Retool's hourly limit.
+                payload["accounts"]["rate_limited_until"] = summary["rate_limited_until"]
             self._json(200 if ok else 503, payload)
 
         # -- completions --------------------------------------------------

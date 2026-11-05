@@ -87,6 +87,8 @@ DEFAULTS = {
     "min_account_balance": 20,
     "account_balance_interval": 300,
     "account_refresh_parallel": 3,
+    # Pause after Retool's hourly managed-key limit; doubles (up to 3600) when the account fails again soon after.
+    "account_rate_limit_cooldown": 900,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -394,6 +396,7 @@ def _load(path):
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
                     "cache_keepwarm_subagent_idle",
                     "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
+                    "account_rate_limit_cooldown",
                     "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
         try:
             cfg[num_key] = int(cfg[num_key])
@@ -410,6 +413,8 @@ def _load(path):
         raise service_unavailable("min_account_balance must be a finite non-negative number")
     if cfg["account_balance_interval"] < 0 or cfg["account_refresh_parallel"] < 1:
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
+    if not 1 <= cfg["account_rate_limit_cooldown"] <= 3600:
+        raise service_unavailable("account_rate_limit_cooldown must be between 1 and 3600 seconds")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",

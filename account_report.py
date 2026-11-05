@@ -37,7 +37,8 @@ def collect(runtime, *, force_refresh=False):
     active, exhausted accounts with a positive or unknown balance (the failover
     reserve) are still served. A lone auth_dead account is also tried there as a
     last resort, but it is deliberately reported as not routable: a signed-out
-    account cannot be called healthy.
+    account cannot be called healthy. A rate_limited account (Retool's hourly
+    managed-key limit) is parked until `rate_limited_until` and is never a reserve.
     """
     rows = account_managers(runtime)
     states = account_states(runtime)
@@ -71,6 +72,7 @@ def collect(runtime, *, force_refresh=False):
         entries.append({
             "backend": backend, "manager": manager, "info": info, "state": state,
             "auth_failures": status.get("auth_failures") or 0, "available": available,
+            "rate_limited_until": status.get("rate_limited_until"),
             "fresh": available is not None and not info.get("stale"),
             "routable": backend in active or backend in spare, "reserve": backend in spare,
         })
@@ -82,10 +84,12 @@ def summarize(entries):
     states = {}
     for entry in entries:
         states[entry["state"]] = states.get(entry["state"], 0) + 1
+    until = [entry["rate_limited_until"] for entry in entries if entry.get("rate_limited_until")]
     return {"ok": any(entry["routable"] and entry["fresh"] for entry in entries),
             "balance_known": any(entry["fresh"] for entry in entries),
             "total": len(entries), "routable": sum(entry["routable"] for entry in entries),
-            "reserve": sum(entry["reserve"] for entry in entries), "states": states}
+            "reserve": sum(entry["reserve"] for entry in entries), "states": states,
+            "rate_limited_until": min(until) if until else None}
 
 
 def aggregate_balance(infos):
@@ -116,6 +120,8 @@ def balance_report(entries):
         error = info.get("error") or info.get("stale_error")
         if error:
             item["error"] = error
+        if entry.get("rate_limited_until"):
+            item["rate_limited_until"] = entry["rate_limited_until"]
         accounts.append(item)
     report = aggregate_balance([entry["info"] for entry in entries])
     report["accounts"] = accounts

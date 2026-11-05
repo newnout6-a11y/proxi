@@ -83,6 +83,9 @@ def _schema():
         ("account_balance_interval", "integer", "Проверка баланса", "routing",
          "Как часто спрашивать у Retool баланс каждого включённого аккаунта; 0 — раз в час",
          "с", 0, 86400, None),
+        ("account_rate_limit_cooldown", "integer", "Пауза после часового лимита", "routing",
+         "На сколько секунд аккаунт уходит из пула, когда Retool сообщает о часовом лимите managed-ключей; "
+         "лимит сразу после возврата удваивает паузу, но не больше часа", "с", 1, 3600, None),
         ("session_refresh_interval", "integer", "Продление сессии", "routing",
          "Как часто продлевать сессию Retool каждого включённого аккаунта; 0 — не продлевать по таймеру",
          "с", 0, 86400, None),
@@ -362,6 +365,8 @@ class Admin:
                 "last_renewed_at": getattr(getattr(backend, "refresher", None), "last_success_at", None),
                 "error": self._safe(str(error))[:200] if error else None,
             })
+            if entry.get("rate_limited_until"):
+                accounts[-1]["rate_limited_until"] = entry["rate_limited_until"]
         return accounts
 
     def _session(self):
