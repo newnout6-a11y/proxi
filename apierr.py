@@ -1,23 +1,29 @@
 """Typed API errors with OpenAI/Anthropic-shaped envelopes."""
 
+# Anthropic documents a closed set of error types; a relay-specific code must
+# be translated, or the client sees a type its error handling does not know.
+_ANTHROPIC_TYPES = {"unprocessable_entity": "invalid_request_error", "upstream_invalid_output": "api_error"}
+
 
 class ApiError(Exception):
     """An error with a definite HTTP status and machine code."""
 
-    def __init__(self, status: int, code: str, message: str, *, param=None, retry_after=None):
+    def __init__(self, status: int, code: str, message: str, *, param=None, retry_after=None, headers=None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
         self.param = param
         self.retry_after = retry_after
+        self.headers = dict(headers or {})
 
     def openai_envelope(self) -> dict:
         return {"error": {"message": self.message, "type": self.code, "code": self.code, "param": self.param}}
 
     def anthropic_envelope(self) -> dict:
         # Anthropic uses a flat type + message pair.
-        return {"type": "error", "error": {"type": self.code, "message": self.message}}
+        return {"type": "error", "error": {"type": _ANTHROPIC_TYPES.get(self.code, self.code),
+                                           "message": self.message}}
 
     def responses_envelope(self) -> dict:
         # Responses SSE errors are flat events with an explicit type; without it a
@@ -73,6 +79,11 @@ def upstream_error(message: str) -> ApiError:
 
 def upstream_timeout(message: str = "upstream turn timed out") -> ApiError:
     return ApiError(504, "upstream_timeout", message)
+
+
+def invalid_structured_output(message: str) -> ApiError:
+    """A paid reply that breaks the JSON contract; retrying blindly would pay again."""
+    return ApiError(502, "upstream_invalid_output", message, headers={"x-should-retry": "false"})
 
 
 def service_unavailable(message: str) -> ApiError:

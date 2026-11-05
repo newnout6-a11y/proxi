@@ -18,6 +18,7 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
+import structured
 from context import DEFAULT_RELAY_SYSTEM_PROMPT, build_system_instructions
 from redact import redact
 from session import SessionLease
@@ -474,24 +475,27 @@ class TurnRunner:
             is_native = bool(native_tools)
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
-            client_owns_instructions = client_text or bool(parsed.system)
+            output_spec = getattr(parsed, "structured_output", None)
+            # A JSON-only reply has no room for the relay's workspace or shell protocol.
+            client_owns_instructions = client_text or bool(parsed.system) or bool(output_spec)
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
                 instructions = parsed.system or ""
-                if purpose not in client_context.SERVICE_KINDS:
+                if not client_context.keeps_client_prompt(purpose):
                     instructions = self._client_instructions(instructions)
             else:
                 instructions = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
                 raise asyncio.CancelledError()
-            if getattr(parsed, 'structured_title', False):
-                # The route lacks constrained decoding. Supply the fixed service
-                # contract as instructions and validate the complete reply later.
-                instructions += ('\n\n[SESSION TITLE OUTPUT FORMAT]\n'
-                                 'Return only one JSON object with one string field named "title". '
-                                 'Do not wrap it in Markdown fences or add any other text.')
+            if output_spec:
+                # The route lacks constrained decoding. Supply the contract as
+                # instructions; the HTTP adapter validates the complete reply.
+                instructions = "\n\n".join(part for part in (
+                    instructions, structured.instructions(output_spec, tools=bool(native_tools))) if part)
+                log("turn.structured_output", "Структурированный вывод эмулируется проверкой ответа: %s" % output_spec["kind"],
+                    "debug", output_format=output_spec["kind"], source=output_spec["source"])
             reminder = ""
             if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)

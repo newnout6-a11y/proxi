@@ -436,8 +436,10 @@ def make_handler(runtime: Runtime):
             # Non-stream HTTP errors use the standard OpenAI envelope for both chat
             # and responses routes; the flat responses shape is for SSE events only.
             body = self._error_payload("chat" if dialect == "responses" else dialect, err)
-            extra = {"retry-after": err.retry_after} if err.retry_after else None
-            self._json(err.status, body, extra)
+            extra = dict(getattr(err, "headers", None) or {})
+            if err.retry_after:
+                extra["retry-after"] = err.retry_after
+            self._json(err.status, body, extra or None)
 
         def _throttle_auth_failure(self):
             # rate_limit_rps is off by default and covers only completions, so key
@@ -582,8 +584,8 @@ def make_handler(runtime: Runtime):
 
             parsed.request_purpose = client_context.request_kind(parsed)
             compatibility_headers = {}
-            if parsed.structured_title:
-                compatibility_headers['x-proxi-output-format'] = 'validated-session-title'
+            if parsed.structured_output:
+                compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
             if 'thinking.display' in parsed.declared_ignored:
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:
