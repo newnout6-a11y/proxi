@@ -52,13 +52,14 @@ function Section({ title, count, note, children }) {
 
 /** One line of a list of changes: what, where, how often, and the details under it. */
 function Row({ title, where, count = 1, status, details = [], note, tone = 'muted' }) {
+  // the spaces between the parts are real text, so a reader that goes by the text does not run the words together
   return (
     <li className={`tone-${tone}`}>
       <span className="p-change-head">
         <span className="p-change-title">{title}</span>
-        {where && <span className="p-change-where">{where}</span>}
-        {status}
-        {count > 1 && <span className="p-change-count mono">{fmtInt(count)} {plural(count, ['раз', 'раза', 'раз'])}</span>}
+        {where && <>{' '}<span className="p-change-where">{where}</span></>}
+        {status && <>{' '}{status}</>}
+        {count > 1 && <>{' '}<span className="p-change-count mono">{fmtInt(count)} {plural(count, ['раз', 'раза', 'раз'])}</span></>}
       </span>
       {details.length > 0 && <span className="p-change-details mono">{details.map(([name, value]) => `${name}: ${value}`).join(' · ')}</span>}
       {note && <span className={tone === 'warn' ? 'p-change-note' : 'muted small'}>{note}</span>}
