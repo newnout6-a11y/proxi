@@ -1,5 +1,6 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { isNum, fmtShortTime, fmtTokens, fmtFixed, fmtInt, fmtMs, plural } from './format.js';
+import { uncoveredBuckets } from './coverage.js';
 import { PHASES, phasesOf } from './turns.js';
 
 function useSize() {
@@ -163,8 +164,21 @@ const spendRows = (bucket) => {
   return [['кредиты', ...credits], ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
 };
 
+const NO_DATA = 'нет данных: журнал начат позже';
+
+/** The stretch of the window before the journal's coverage begins: no data, which is not the same as zero. */
+function Uncovered({ x0, x1, y0, y1, labelY = y0 + 16 }) {
+  return (
+    <g className="c-uncovered">
+      <rect x={x0} y={y0} width={Math.max(0, x1 - x0)} height={y1 - y0} />
+      <line x1={x1} x2={x1} y1={y0} y2={y1} />
+      {x1 - x0 > 90 && <text className="c-label" x={x0 + 8} y={labelY}>нет данных</text>}
+    </g>
+  );
+}
+
 /** Credits spent per bucket as a line: it climbs with a heavy turn and falls back with a light one. */
-export function SpendChart({ buckets, windowSec }) {
+export function SpendChart({ buckets, windowSec, coveredFrom = null }) {
   const [ref, size] = useSize();
   const n = buckets.length;
   const W = size.w;
@@ -172,17 +186,19 @@ export function SpendChart({ buckets, windowSec }) {
   const plotW = Math.max(10, W - PAD.l - PAD.r);
   const plotH = H - PAD.t - PAD.b;
   const [hover, onMove, onLeave, keyboard] = useHover(n, plotW);
+  const unseen = uncoveredBuckets(buckets, windowSec, coveredFrom);
 
   const model = useMemo(() => {
-    const values = buckets.map((b) => Number(b.credits) || 0);
+    // Nothing is known about the periods before the journal began: they are not spend, and not zero either
+    const values = buckets.map((b, i) => (i < unseen ? 0 : Number(b.credits) || 0));
     // A bucket whose cost was not fully reported holds a lower bound, not a measurement
-    const unsure = buckets.map((b) => b.credits_complete === false);
+    const unsure = buckets.map((b, i) => i >= unseen && b.credits_complete === false);
     const peak = Math.max(0, ...values);
     const total = values.reduce((s, v) => s + v, 0);
     const busy = values.filter((v) => v > 0).length;
     return { values, unsure, unsureCount: unsure.filter(Boolean).length, peak, peakIndex: values.indexOf(peak), total,
       max: niceMax(peak), average: busy ? total / busy : 0 };
-  }, [buckets]);
+  }, [buckets, unseen]);
 
   const empty = !n || !model.total;
   const incomplete = model.unsureCount > 0;
@@ -190,25 +206,32 @@ export function SpendChart({ buckets, windowSec }) {
   const yAt = (v) => baseY - (v / model.max) * plotH;
   const xAt = (i) => PAD.l + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2);
   const points = model.values.map((v, i) => [xAt(i), yAt(v)]);
-  const line = smooth(points);
+  const shown = points.slice(unseen);
+  const line = smooth(shown);
   const ticks = [model.max / 2, model.max];
   const labels = timeLabels(buckets, plotW);
   const active = hover !== null && buckets[hover] ? hover : null;
   const bucket = active !== null ? buckets[active] : null;
+  const blank = active !== null && active < unseen;
   const span = bucketLabel(windowSec, n);
   const peakRight = !empty && xAt(model.peakIndex) > W - 120;
   const peakUnsure = model.unsure[model.peakIndex];
   const bound = incomplete ? 'не менее ' : '';
-  const summary = empty ? incomplete ? 'Стоимость не сообщена' : 'Расхода за окно не было'
+  const since = unseen > 0 ? fmtShortTime(coveredFrom) : null;
+  const emptyText = incomplete ? 'Стоимость не сообщена' : since ? `С ${since} расхода не было` : 'Расхода за окно не было';
+  const summary = empty ? emptyText
     : `Расход кредитов за каждые ${span}: всего ${bound}${fmtFixed(model.total, 2)}, максимум ${bound}${fmtFixed(model.peak, 2)}`
-      + (incomplete ? `. В ${model.unsureCount} ${plural(model.unsureCount, ['периоде', 'периодах', 'периодах'])} стоимость сообщена не полностью` : '');
+      + (incomplete ? `. В ${model.unsureCount} ${plural(model.unsureCount, ['периоде', 'периодах', 'периодах'])} стоимость сообщена не полностью` : '')
+      + (since ? `. Данные только с ${since}` : '');
   const period = bucket && periodOf(bucket, windowSec, n);
-  const rows = bucket && spendRows(bucket);
+  const rows = bucket && !blank ? spendRows(bucket) : [];
 
   return (
     <div className="chart-frame" ref={ref}>
       <svg className="chart" width={W} height={H} aria-label={summary} {...keyboard}
-        {...chartRole(n, active, bucket && valueText(period, rows))} onPointerMove={onMove} onPointerLeave={onLeave}>
+        {...chartRole(n, active, bucket && (blank ? `${period}: ${NO_DATA}` : valueText(period, rows)))}
+        onPointerMove={onMove} onPointerLeave={onLeave}>
+        {unseen > 0 && <Uncovered x0={PAD.l} x1={xAt(unseen)} y0={PAD.t} y1={baseY} />}
         {ticks.map((v) => (
           <g key={v}>
             <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(v)) + 0.5} y2={Math.round(yAt(v)) + 0.5} />
@@ -218,12 +241,12 @@ export function SpendChart({ buckets, windowSec }) {
         <text className="c-label" x={PAD.l - 8} y={baseY + 4} textAnchor="end">0</text>
         {!empty && (
           <>
-            <path className="c-spend-area" d={areaUnder(line, points, baseY)} />
-            {runs(points, model.unsure).map((run, i) => (
+            <path className="c-spend-area" d={areaUnder(line, shown, baseY)} />
+            {runs(shown, model.unsure.slice(unseen)).map((run, i) => (
               <path key={i} className={`c-spend-line${run.dashed ? ' is-unsure' : ''}`} d={run.d} />
             ))}
             {model.average > 0 && (
-              <line className="c-average" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(model.average)) + 0.5} y2={Math.round(yAt(model.average)) + 0.5} />
+              <line className="c-average" x1={unseen > 0 ? xAt(unseen) : PAD.l} x2={W - PAD.r} y1={Math.round(yAt(model.average)) + 0.5} y2={Math.round(yAt(model.average)) + 0.5} />
             )}
             {model.unsure.map((flag, i) => flag && <path key={`u${i}`} className="c-unsure-dot" d={diamond(xAt(i), yAt(model.values[i]))} />)}
             <circle className="c-peak" cx={xAt(model.peakIndex)} cy={yAt(model.peak)} r={4} />
@@ -242,12 +265,12 @@ export function SpendChart({ buckets, windowSec }) {
         {bucket && (
           <g>
             <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={baseY} />
-            <circle className="c-hover-dot" cx={xAt(active)} cy={yAt(model.values[active])} r={3.5} />
+            {!blank && <circle className="c-hover-dot" cx={xAt(active)} cy={yAt(model.values[active])} r={3.5} />}
           </g>
         )}
       </svg>
-      {empty && <p className="chart-empty">{incomplete ? 'Стоимость не сообщена' : 'Расхода за окно не было'}</p>}
-      {bucket && <Tip W={W} x={xAt(active)} period={period} rows={rows} />}
+      {empty && <p className="chart-empty">{emptyText}</p>}
+      {bucket && <Tip W={W} x={xAt(active)} period={period} rows={rows} note={blank ? NO_DATA : null} />}
     </div>
   );
 }
@@ -267,7 +290,7 @@ export function writeSpikes(buckets) {
  * on its own scale. On a shared scale reads (millions) flatten writes to the
  * axis; here a sudden write, the expensive moment, stands out and is marked.
  */
-export function CacheChart({ buckets, windowSec }) {
+export function CacheChart({ buckets, windowSec, coveredFrom = null }) {
   const [ref, size] = useSize();
   const n = buckets.length;
   const W = size.w;
@@ -276,12 +299,15 @@ export function CacheChart({ buckets, windowSec }) {
   const gap = 20;
   const laneH = (H - PAD.t - PAD.b - gap) / 2;
   const [hover, onMove, onLeave, keyboard] = useHover(n, plotW);
+  const unseen = uncoveredBuckets(buckets, windowSec, coveredFrom);
 
   const model = useMemo(() => {
-    const reads = buckets.map((b) => b.cache_read || 0);
-    const writes = buckets.map((b) => b.cache_write || 0);
-    return { reads, writes, readMax: niceMax(Math.max(0, ...reads)), writeMax: niceMax(Math.max(0, ...writes)), spikes: writeSpikes(buckets) };
-  }, [buckets]);
+    // The periods before the journal began carry no data: they are not a cold cache
+    const seen = buckets.map((b, i) => (i < unseen ? {} : b));
+    const reads = seen.map((b) => b.cache_read || 0);
+    const writes = seen.map((b) => b.cache_write || 0);
+    return { reads, writes, readMax: niceMax(Math.max(0, ...reads)), writeMax: niceMax(Math.max(0, ...writes)), spikes: writeSpikes(seen) };
+  }, [buckets, unseen]);
 
   const readBase = PAD.t + laneH + 0.5;
   const writeTop = PAD.t + laneH + gap;
@@ -289,26 +315,31 @@ export function CacheChart({ buckets, windowSec }) {
   const xAt = (i) => PAD.l + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2);
   const readY = (v) => readBase - (v / model.readMax) * (laneH - 4);
   const writeY = (v) => writeBase - (v / model.writeMax) * (laneH - 4);
-  const readPts = model.reads.map((v, i) => [xAt(i), readY(v)]);
-  const writePts = model.writes.map((v, i) => [xAt(i), writeY(v)]);
+  const readPts = model.reads.map((v, i) => [xAt(i), readY(v)]).slice(unseen);
+  const writePts = model.writes.map((v, i) => [xAt(i), writeY(v)]).slice(unseen);
   const readLine = smooth(readPts);
   const writeLine = smooth(writePts);
   const empty = !n || (!Math.max(0, ...model.reads) && !Math.max(0, ...model.writes));
   const labels = timeLabels(buckets, plotW);
   const active = hover !== null && buckets[hover] ? hover : null;
   const bucket = active !== null ? buckets[active] : null;
+  const blank = active !== null && active < unseen;
   const spikes = [...model.spikes];
-  const summary = empty ? 'Обращений к кэшу за окно не было'
+  const since = unseen > 0 ? fmtShortTime(coveredFrom) : null;
+  const emptyText = since ? `С ${since} обращений к кэшу не было` : 'Обращений к кэшу за окно не было';
+  const summary = empty ? emptyText
     : `Кэш за окно: прочитано ${fmtTokens(model.reads.reduce((s, v) => s + v, 0))}, записано ${fmtTokens(model.writes.reduce((s, v) => s + v, 0))}`
-      + (spikes.length ? `, всплесков записи: ${spikes.length}` : '');
+      + (spikes.length ? `, всплесков записи: ${spikes.length}` : '') + (since ? `. Данные только с ${since}` : '');
   const spike = bucket && model.spikes.has(active) ? 'запись выше обычной за окно' : null;
   const period = bucket && periodOf(bucket, windowSec, n);
-  const rows = bucket && [['прочитано', fmtTokens(bucket.cache_read)], ['записано', fmtTokens(bucket.cache_write)], ['без кэша', fmtTokens(bucket.input)]];
+  const rows = bucket && !blank ? [['прочитано', fmtTokens(bucket.cache_read)], ['записано', fmtTokens(bucket.cache_write)], ['без кэша', fmtTokens(bucket.input)]] : [];
 
   return (
     <div className="chart-frame chart-frame-cache" ref={ref}>
       <svg className="chart" width={W} height={H} aria-label={summary} {...keyboard}
-        {...chartRole(n, active, bucket && `${valueText(period, rows)}${spike ? `, ${spike}` : ''}`)} onPointerMove={onMove} onPointerLeave={onLeave}>
+        {...chartRole(n, active, bucket && (blank ? `${period}: ${NO_DATA}` : `${valueText(period, rows)}${spike ? `, ${spike}` : ''}`))}
+        onPointerMove={onMove} onPointerLeave={onLeave}>
+        {unseen > 0 && <Uncovered x0={PAD.l} x1={xAt(unseen)} y0={PAD.t} y1={writeBase} labelY={PAD.t + laneH / 2 + 4} />}
         <text className="c-label" x={PAD.l - 8} y={PAD.t + 8} textAnchor="end">{fmtTokens(model.readMax)}</text>
         <text className="c-label" x={PAD.l - 8} y={writeTop + 8} textAnchor="end">{fmtTokens(model.writeMax)}</text>
         <text className="c-lane" x={PAD.l + 4} y={PAD.t + 10}>чтение</text>
@@ -354,13 +385,13 @@ export function CacheChart({ buckets, windowSec }) {
         {bucket && (
           <g>
             <line className="c-cursor" x1={xAt(active)} x2={xAt(active)} y1={PAD.t} y2={writeBase} />
-            <circle className="c-hover-dot" cx={xAt(active)} cy={readY(model.reads[active])} r={3.5} />
-            <circle className="c-hover-dot" cx={xAt(active)} cy={writeY(model.writes[active])} r={3.5} />
+            {!blank && <circle className="c-hover-dot" cx={xAt(active)} cy={readY(model.reads[active])} r={3.5} />}
+            {!blank && <circle className="c-hover-dot" cx={xAt(active)} cy={writeY(model.writes[active])} r={3.5} />}
           </g>
         )}
       </svg>
-      {empty && <p className="chart-empty">Обращений к кэшу за окно не было</p>}
-      {bucket && <Tip W={W} x={xAt(active)} period={period} rows={rows} note={spike} />}
+      {empty && <p className="chart-empty">{emptyText}</p>}
+      {bucket && <Tip W={W} x={xAt(active)} period={period} rows={rows} note={blank ? NO_DATA : spike} />}
     </div>
   );
 }

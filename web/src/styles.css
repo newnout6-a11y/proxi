@@ -423,6 +423,8 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 .c-spend-line { fill: none; stroke: var(--ink); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
 .c-spend-line.is-unsure { stroke-dasharray: 4 3; stroke-linecap: butt; }
 .c-unsure-dot { fill: var(--surface); stroke: var(--ink); stroke-width: 1.5; stroke-linejoin: round; }
+.c-uncovered rect { fill: var(--raised); opacity: 0.7; }
+.c-uncovered line { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .c-spend-area { fill: var(--ink); opacity: 0.08; }
 .c-peak { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
 .c-hover-dot { fill: var(--surface); stroke: var(--ink); stroke-width: 1.5; }

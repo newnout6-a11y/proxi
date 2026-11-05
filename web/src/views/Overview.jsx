@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import { usePolling } from '../useJournal.js';
 import { AnimatedNumber, Dot, Page } from '../motion.jsx';
 import { CacheChart, RankedList, SpendChart, bucketLabel } from '../charts.jsx';
+import { coverageOf, fmtSince, fmtSpan } from '../coverage.js';
 import { Button, Tag } from '../ui.jsx';
 import {
   fmtDay, fmtDuration, fmtFixed, fmtInt, fmtMs, fmtPercent, fmtTokens, fmtUptime, isNum, parseDay, plural,
@@ -49,6 +50,7 @@ function Balance({ overview, metrics, windowSec, go }) {
   let forecast;
   if (!metrics) forecast = 'Прогноз появится после загрузки метрик';
   else if (metrics.totals?.credits_complete === false || balance?.unreported_usage) forecast = 'Прогноз недоступен: часть стоимости не сообщена';
+  else if (coverageOf(metrics, windowSec)) forecast = 'Прогноз недоступен: журнал покрывает только часть окна';
   else if (!perDay) forecast = `За ${window} кредиты не тратились, прогноза нет`;
   else {
     forecast = (
@@ -152,6 +154,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
   const span = bucketLabel(windowSec, buckets.length);
   const busy = buckets.filter((b) => (b.credits || 0) > 0).length;
   const unsure = buckets.some((b) => b.credits_complete === false);
+  const coverage = coverageOf(current, windowSec);
 
   return (
     <Page className="overview">
@@ -170,6 +173,18 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
       </header>
 
       {problem && <div className="banner tone-neg" role="alert"><TriangleAlert size={16} strokeWidth={1.5} /> {problem}</div>}
+
+      {coverage && (
+        <div className="banner tone-warn">
+          <TriangleAlert size={16} strokeWidth={1.5} aria-hidden="true" />
+          <span>
+            Журнал покрывает окно не полностью
+            {coverage.from !== null && <>: данные с <b className="num">{fmtSince(coverage.from)}</b></>}
+            {coverage.seconds !== null && ` (${fmtSpan(coverage.seconds)} из ${fmtSpan(windowSec)})`}.
+            Суммы и прогноз за окно неполные
+          </span>
+        </div>
+      )}
 
       <div className="ov-top">
         <Balance overview={overview} metrics={current} windowSec={windowSec} go={go} />
@@ -200,7 +215,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
               )}
             </ul>
           </div>
-          <SpendChart buckets={buckets} windowSec={windowSec} />
+          <SpendChart buckets={buckets} windowSec={windowSec} coveredFrom={coverage?.from ?? null} />
         </section>
         <div className="ov-side">
           <section className="panel" aria-label="Модели">
@@ -223,7 +238,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
               <li><i className="lg-spike" />всплеск записи</li>
             </ul>
           </div>
-          <CacheChart buckets={buckets} windowSec={windowSec} />
+          <CacheChart buckets={buckets} windowSec={windowSec} coveredFrom={coverage?.from ?? null} />
         </section>
     </Page>
   );

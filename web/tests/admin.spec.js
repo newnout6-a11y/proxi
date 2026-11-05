@@ -525,6 +525,88 @@ test('a spend chart whose prices are all reported has no lower-bound marks', asy
   await expect(page.locator('.legend', { hasText: 'за каждые 1 мин' })).not.toContainText('не полностью');
 });
 
+const clock = (ts) => new Date(ts * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+test('a window the journal covers only in part says from when, greys out the charts before that and withholds the forecast', async ({ page }) => {
+  const from = NOW - 600;
+  await mockAdmin(page, { metricsPatch: { coverage: { complete: false, window_start: NOW - 3600, covered_from: from, covered_seconds: 600,
+    oldest_event_ts: from + 12, buffer_oldest_ts: from - 100, buffer_events: 40, buffer_capacity: 20000 } } });
+  await login(page);
+  const notice = page.locator('.banner.tone-warn');
+  await expect(notice).toContainText('Журнал покрывает окно не полностью');
+  await expect(notice).toContainText(`данные с ${clock(from)}`);
+  await expect(notice).toContainText('10 мин из 60 мин');
+  await expect(page.locator('.forecast')).toContainText('журнал покрывает только часть окна');
+  await expect(page.locator('.forecast')).not.toContainText('хватит примерно');
+  // Both charts grey out what the journal does not cover: 49 of the 60 one-minute periods end before it began
+  await expect(page.locator('.c-uncovered')).toHaveCount(2);
+  const spend = page.locator('svg.chart').first();
+  await expect(spend).toHaveAttribute('aria-label', new RegExp(`Данные только с ${clock(from)}`));
+  await spend.focus();
+  await spend.press('Home');
+  await expect(spend).toHaveAttribute('aria-valuetext', /нет данных: журнал начат позже/);
+  await expect(page.locator('.chart-tip')).toContainText('нет данных');
+  await expect(page.locator('.c-hover-dot')).toHaveCount(0);
+  await spend.press('End');
+  await expect(spend).toHaveAttribute('aria-valuetext', /кредиты .*запросы /);
+  await expect(page.locator('.chart-tip')).not.toContainText('журнал начат позже');
+  await expect(page.locator('.c-hover-dot')).toHaveCount(1);
+  // The line starts where the data does, not inside the grey stretch
+  const edge = await page.locator('.c-uncovered').first().locator('rect').evaluate((rect) => rect.x.baseVal.value + rect.width.baseVal.value);
+  const starts = await page.locator('.c-spend-line').evaluateAll((paths) => paths.map((path) => Number(path.getAttribute('d').match(/^M(-?[\d.]+)/)[1])));
+  expect(Math.min(...starts)).toBeGreaterThanOrEqual(edge - 0.5);
+  // The cache chart marks the same stretch and its tooltip says so
+  const cache = page.locator('svg.chart').nth(1);
+  await cache.focus();
+  await cache.press('Home');
+  await expect(cache).toHaveAttribute('aria-valuetext', /нет данных: журнал начат позже/);
+  await expect(cache).toHaveAttribute('aria-label', new RegExp(`Данные только с ${clock(from)}`));
+});
+
+test('the gap follows the window that is chosen', async ({ page }) => {
+  const from = NOW - 600;
+  await mockAdmin(page, { metricsPatch: { coverage: { complete: false, covered_from: from, covered_seconds: 600 } } });
+  await login(page);
+  await expect(page.locator('.banner.tone-warn')).toContainText('10 мин из 60 мин');
+  await page.getByRole('group', { name: 'Окно метрик' }).getByRole('button', { name: '6 ч' }).click();
+  await expect(page.locator('.banner.tone-warn')).toContainText('10 мин из 6 ч');
+  await expect(page.locator('.c-uncovered')).toHaveCount(2);
+  const spend = page.locator('svg.chart').first();
+  await expect(spend).toHaveAttribute('aria-valuemax', '72');
+  await spend.focus();
+  await spend.press('End');
+  await spend.press('ArrowLeft');
+  await expect(spend).toHaveAttribute('aria-valuenow', '71');
+  await expect(spend).not.toHaveAttribute('aria-valuetext', /журнал начат позже/);
+});
+
+for (const [name, coverage] of [
+  ['covered completely', { complete: true, covered_from: NOW - 99999, covered_seconds: 3600, oldest_event_ts: NOW - 99999 }],
+  ['reported by a relay that does not say how much it covers', undefined],
+]) {
+  test(`a window ${name} shows no gap`, async ({ page }) => {
+    await mockAdmin(page, { metricsPatch: coverage ? { coverage } : {} });
+    await login(page);
+    await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+    await expect(page.locator('.banner.tone-warn')).toHaveCount(0);
+    await expect(page.locator('.c-uncovered')).toHaveCount(0);
+    const spend = page.locator('svg.chart').first();
+    await expect(spend).not.toHaveAttribute('aria-label', /Данные только с/);
+    await spend.focus();
+    await spend.press('Home');
+    await expect(spend).not.toHaveAttribute('aria-valuetext', /журнал начат позже/);
+  });
+}
+
+test('a window that is not covered and has no spend says so instead of "no spend"', async ({ page }) => {
+  const from = NOW - 600;
+  const buckets = metricsFor(3600).buckets.map((bucket) => ({ ...bucket, credits: 0, cache_read: 0, cache_write: 0 }));
+  await mockAdmin(page, { metricsPatch: { buckets, coverage: { complete: false, covered_from: from, covered_seconds: 600 } } });
+  await login(page);
+  await expect(page.locator('.chart-empty').first()).toHaveText(`С ${clock(from)} расхода не было`);
+  await expect(page.locator('.chart-empty').nth(1)).toHaveText(`С ${clock(from)} обращений к кэшу не было`);
+});
+
 test('activity tabs and chart values work with the keyboard', async ({ page }) => {
   await mockAdmin(page);
   await login(page);

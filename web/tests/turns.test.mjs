@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { STALE_AFTER, buildTraces, costOf, phasesOf, scaleOf, statusAt } from '../src/turns.js';
+import { coverageOf, fmtSince, fmtSpan, uncoveredBuckets } from '../src/coverage.js';
 
 const ev = (ts, kind, data = {}) => ({ ts, kind, data, turn_id: 'test-turn' });
 const finish = (ts, duration, reason = 'stop') => ev(ts, 'turn.end', { reason, duration_ms: duration });
@@ -309,4 +310,54 @@ test('an attempt that gets no signal at all waited until the next one began', ()
   assert.equal(p.wait, 12000);
   assert.equal(p.out, 1000);
   assert.equal(p.other, 0);
+});
+
+test('only an explicit complete: false is reported as a gap in the metrics window', () => {
+  assert.equal(coverageOf(undefined, 3600), null);
+  assert.equal(coverageOf({}, 3600), null);
+  assert.equal(coverageOf({ coverage: { complete: true, covered_from: 1000 } }, 3600), null);
+  for (const complete of [undefined, null, 0, 'false', 'no']) {
+    assert.equal(coverageOf({ coverage: { complete, covered_from: 1000 } }, 3600), null);
+  }
+  assert.deepEqual(coverageOf({ coverage: { complete: false, covered_from: 1000, covered_seconds: 600 } }, 3600),
+    { from: 1000, seconds: 600 });
+});
+
+test('the coverage start falls back to the oldest event; invalid numbers are ignored and the span stays inside the window', () => {
+  assert.equal(coverageOf({ coverage: { complete: false, oldest_event_ts: 900 } }, 3600).from, 900);
+  assert.equal(coverageOf({ coverage: { complete: false, covered_from: '1000', oldest_event_ts: NaN } }, 3600).from, null);
+  // The raw buffer's oldest event says nothing about what the aggregates cover
+  assert.equal(coverageOf({ coverage: { complete: false, buffer_oldest_ts: 500 } }, 3600).from, null);
+  const seconds = (covered_seconds) => coverageOf({ coverage: { complete: false, covered_seconds } }, 3600).seconds;
+  assert.equal(seconds(-5), 0);
+  assert.equal(seconds(99999), 3600);
+  assert.equal(seconds('600'), null);
+  assert.equal(seconds(undefined), null);
+});
+
+test('buckets that end before the coverage begins are no data; the newest bucket always is data', () => {
+  const buckets = Array.from({ length: 6 }, (_, i) => ({ t: 1000 + i * 60 }));
+  assert.equal(uncoveredBuckets(buckets, 360, null), 0);
+  assert.equal(uncoveredBuckets(buckets, 360, 1000), 0);
+  assert.equal(uncoveredBuckets(buckets, 360, 1059), 0);
+  assert.equal(uncoveredBuckets(buckets, 360, 1060), 1);
+  assert.equal(uncoveredBuckets(buckets, 360, 1200), 3);
+  assert.equal(uncoveredBuckets(buckets, 360, 99999), 5);
+  assert.equal(uncoveredBuckets([{ t: 1000 }], 60, 99999), 0);
+  assert.equal(uncoveredBuckets(buckets, 0, 1200), 0);
+  assert.equal(uncoveredBuckets([{}, {}], 120, 1200), 0);
+  assert.equal(uncoveredBuckets([], 3600, 1200), 0);
+});
+
+test('a time span and a moment are written for people', () => {
+  assert.equal(fmtSpan(40), '40\u00a0с');
+  assert.equal(fmtSpan(600), '10\u00a0мин');
+  assert.equal(fmtSpan(5400), '90\u00a0мин');
+  assert.equal(fmtSpan(7200), '2\u00a0ч');
+  assert.equal(fmtSpan(9000), '2,5\u00a0ч');
+  assert.equal(fmtSpan(NaN), '—');
+  const now = new Date(2026, 10, 5, 12, 0, 0).getTime() / 1000;
+  assert.match(fmtSince(now - 600, now), /^\d{2}:\d{2}$/);
+  assert.match(fmtSince(now - 3 * 86400, now), /^\d{1,2} [а-яё]+, \d{2}:\d{2}$/);
+  assert.equal(fmtSince(undefined, now), '—');
 });
