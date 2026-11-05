@@ -1,7 +1,7 @@
-// Where each piece of a composed head came from (Part.source in prompt_policy) and how it is shown.
+// Where each piece of a composed head came from (Part.source in prompt_policy) and how it is shown. A piece is tinted by
+// the family of its source: client* (as sent, or after the edits), text:*, relay:*, literal and billing.
 export const KINDS = {
-  client: { label: 'system клиента', hint: 'как прислал клиент' },
-  edited: { label: 'system клиента после правок', hint: 'с вашими правками client_system.edits' },
+  client: { label: 'system клиента', hint: 'как прислал клиент или после ваших правок client_system.edits' },
   text: { label: 'именованный текст', hint: '{{text:имя}}' },
   literal: { label: 'текст шаблона', hint: 'набран прямо в шаблоне head' },
   relay: { label: 'встроенный текст relay', hint: 'роль, задача, структурированный ответ' },
@@ -21,8 +21,7 @@ const RELAY_LABELS = {
 
 export function sourceKind(source) {
   const name = String(source ?? '');
-  if (name === 'client') return 'client';
-  if (name === 'client_edited') return 'edited';
+  if (name === 'client' || name === 'client_edited') return 'client';
   if (name.startsWith('text:')) return 'text';
   if (name.startsWith('relay:')) return 'relay';
   if (name === 'literal') return 'literal';
@@ -30,9 +29,11 @@ export function sourceKind(source) {
   return 'other';
 }
 
+/** One piece in words: the family says where it is from, the source says which one, and whether the edits touched it. */
 export function sourceLabel(source) {
   const name = String(source ?? '');
   const kind = sourceKind(name);
+  if (name === 'client_edited') return 'system клиента после правок';
   if (kind === 'text') return `текст «${name.slice(5)}»`;
   if (kind === 'relay') return RELAY_LABELS[name.slice(6)] || `relay: ${name.slice(6)}`;
   return KINDS[kind].label;

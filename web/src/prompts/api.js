@@ -139,6 +139,19 @@ export function normalizeSaved(raw) {
   return { rev: isNum(data.rev) ? data.rev : null, warnings: list(data.warnings).map(warningText) };
 }
 
+/**
+ * The report on the edits of the client's system, one entry per edit of the profile: {index, op, matched, ...}.
+ * `matched` is true or false as the relay says it, and null when the relay says nothing about it.
+ */
+export function normalizeEditReport(raw) {
+  return list(raw).filter(isObject).map((item, position) => ({
+    ...item,
+    index: isNum(item.index) ? item.index : position,
+    op: text(item.op),
+    matched: item.matched === true ? true : item.matched === false ? false : null,
+  }));
+}
+
 /** POST /admin/api/prompts/preview */
 export function normalizePreview(raw) {
   const data = isObject(raw) ? raw : {};
@@ -155,7 +168,8 @@ export function normalizePreview(raw) {
     history_changes: list(data.history_changes),
     tools_changes: list(data.tools_changes),
     edits_unmatched: list(data.edits_unmatched),
-    warnings: list(data.warnings),
+    edits: normalizeEditReport(data.edits),
+    warnings: list(data.warnings).map(warningText),
     head_bytes: isNum(data.head_bytes) ? data.head_bytes : null,
     tokens_estimate: isNum(data.tokens_estimate) ? data.tokens_estimate : null,
   };

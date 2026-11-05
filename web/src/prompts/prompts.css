@@ -2,7 +2,6 @@
    only colour added, and they always come with a legend and a list in words. */
 .prompts {
   --src-client: transparent;
-  --src-edited: var(--accent-soft);
   --src-text: var(--pos-soft);
   --src-literal: color-mix(in srgb, var(--ink) 9%, transparent);
   --src-relay: color-mix(in srgb, var(--ink) 17%, transparent);
@@ -134,7 +133,6 @@
 .src-legend b { font-weight: 400; color: var(--muted); font-family: var(--mono); }
 .swatch { display: inline-block; flex: none; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--line-strong); }
 .swatch.src-client { background: var(--raised); }
-.swatch.src-edited { background: var(--src-edited); border-color: var(--accent-line); }
 .swatch.src-text { background: var(--src-text); border-color: var(--pos); }
 .swatch.src-literal { background: var(--src-literal); border-style: dotted; }
 .swatch.src-relay { background: var(--src-relay); border-style: dashed; }
@@ -145,7 +143,6 @@
 .head-text { margin: 0; padding: var(--space-3); font-family: var(--mono); font-size: var(--text-xs); line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); }
 .src { border-radius: 2px; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
 .src-client { background: var(--src-client); }
-.src-edited { background: var(--src-edited); }
 .src-text { background: var(--src-text); }
 .src-literal { background: var(--src-literal); }
 .src-relay { background: var(--src-relay); box-shadow: 0 1px 0 0 var(--muted); }
@@ -179,6 +176,10 @@
 .p-changes li { display: grid; gap: 2px; padding: var(--space-2) var(--space-3); border-radius: var(--radius-control); background: var(--raised); font-size: var(--text-sm); overflow-wrap: anywhere; }
 .p-changes li.tone-warn { background: var(--warn-soft); }
 .p-change-details { font-size: var(--text-xs); color: var(--ink-2); }
+.p-change-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px var(--space-2); }
+.p-change-head .tag { align-self: center; }
+.p-change-where, .p-change-count { font-size: var(--text-xs); color: var(--ink-2); }
+.p-change-note { font-size: var(--text-xs); color: var(--ink); }
 .p-preview { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.4fr); gap: var(--space-4); align-items: start; }
 .p-preview > .panel { display: grid; gap: var(--space-4); align-content: start; }
 .p-preview .panel-head { margin-bottom: 0; }
