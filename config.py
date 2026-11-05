@@ -74,7 +74,13 @@ DEFAULTS = {
     "client_trace_dir": "",    # explicit private client request/response traces; disabled by default
     # Provider caches expire in minutes; re-read the prefix to hold it open.
     "cache_keepwarm_seconds": 240,
-    "cache_keepwarm_idle": 1800,
+    # Idle warming stops this long after a conversation's last real request. A ping reads
+    # the cached prefix (4e-6 credits/token), a miss writes it again (1e-4): 900 is the
+    # conversation_idle_timeout, after which the pool closes the conversation anyway.
+    "cache_keepwarm_idle": 900,
+    # A subagent that answered with a tool call is still expected back; one that answered
+    # with plain text is done and is not warmed at all. 0 = no idle warming for subagents.
+    "cache_keepwarm_subagent_idle": 600,
     "cache_keepwarm_during_turns": True,
     "cache_keepwarm_turn_offset": 200,
     # Accounts below this confirmed balance leave the routing pool.
@@ -276,10 +282,13 @@ def _ensure_relay_key(cfg):
 
 
 def persist_auth(cfg):
-    """Merge only this account's rotation under a shared storage transaction."""
+    """Merge only this account's rotation under a shared storage transaction.
+
+    Returns True when config.json was rewritten and False when it already held these
+    values: a renewal that rotated nothing must not rewrite the whole file."""
     path = cfg.get("_config_path")
     if not path or not cfg.get("_persist_auth", False):
-        return
+        return False
     with storage_lock(path):
         saved = _read_file(path)
         record = _account_record(saved, cfg)
@@ -288,11 +297,17 @@ def persist_auth(cfg):
         disk_auth = (record.get("cookie"), record.get("xsrf"))
         if disk_auth != cfg.get("_disk_auth", disk_auth) and disk_auth != (cfg["cookie"], cfg["xsrf"]):
             raise ValueError("session configuration changed during renewal")
+        auth = (cfg["cookie"], cfg["xsrf"])
+        needs_id = bool(cfg.get("account_id")) and not record.get("account_id")
+        if disk_auth == auth and not needs_id:
+            cfg["_disk_auth"] = auth
+            return False
         record.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
-        if cfg.get("account_id") and not record.get("account_id"):
+        if needs_id:
             record["account_id"] = cfg["account_id"]
         _write_file(path, saved)
-        cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
+        cfg["_disk_auth"] = auth
+        return True
 
 
 def reload_auth(cfg):
@@ -377,6 +392,7 @@ def _load(path):
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
+                    "cache_keepwarm_subagent_idle",
                     "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
                     "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
         try:
@@ -400,6 +416,8 @@ def _load(path):
                 "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
         if cfg[key] < 0:
             raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
+    if cfg["cache_keepwarm_subagent_idle"] < 0:
+        raise service_unavailable("cache_keepwarm_subagent_idle must be non-negative (0 = no idle warming for subagents)")
     for key in ("turn_timeout", "recv_timeout", "upstream_timeout", "command_timeout", "max_workers",
                 "max_body_bytes", "max_frame_bytes"):
         if cfg[key] < 1:
