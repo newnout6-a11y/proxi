@@ -306,6 +306,27 @@ An explicit `model_reasoning_effort` remains authoritative when set. The built-i
 server-side Responses web search is not implemented; client function tools for
 search use the ordinary tool bridge.
 
+`codex exec --output-schema FILE` sends the schema as Responses `text.format`
+(`json_schema`, `strict: true`). Retool cannot constrain decoding, so the relay
+emulates it: the schema goes into the instructions, tool turns pass through
+unchanged, and only the final reply without tool calls is checked. One outer
+Markdown fence is removed, the JSON is parsed and validated against the common
+subset of the schema (`type`, `properties`, `required`, `additionalProperties`,
+`items`, `enum`, `anyOf`, nullable, local `$ref`; unknown keywords never reject).
+Nothing of that reply reaches Codex before the check passes. An invalid reply ends
+the stream with an SSE `error` event (non-stream: `502 upstream_invalid_output`
+with `x-should-retry: false`) and its credits stay accounted. Codex then decides how
+often to ask again within its own `stream_max_retries`; every retry is a paid
+request. `x-proxi-output-format: validated-json-schema` marks the emulation, and a
+format combined with a required tool call is rejected with 422. This is
+post-validation, not constrained decoding: a live check on 2026-11-05 (`gpt-6-sol`,
+`gpt-5.5`, a `project_name`/`programming_languages` schema) returned valid bare JSON,
+which does not guarantee every model or schema.
+
+Codex also sends `prompt_cache_options` and `client_metadata` with each request. The
+relay does not forward them; it names both, without values, in
+`x-proxi-ignored-parameters` and the `request.compatibility` journal event.
+
 Codex 0.164.0 passed real source reading, patching and testing (two tests), and a
 separate real subagent spawn/wait/result round trip. See `pr-1-review.md` for
 commands, versions and limitations.
@@ -321,6 +342,53 @@ Claude Code 2.1.310 passed real Read/Edit/Bash plus three fixture tests. Thinkin
 blocks are collapsed by default: `Ctrl+O` expands them;
 `showThinkingSummaries: true` enables summaries. This cannot reveal text that
 Retool has redacted or omitted.
+
+### Structured outputs, titles and side requests
+
+Claude Code sends `output_config.format` (`json_schema`) for session titles, memory
+recall and prompt hooks. Retool cannot constrain decoding, so the relay emulates it:
+the schema goes into the system instructions, the whole reply is buffered, one outer
+Markdown fence is removed, and the JSON is parsed and validated against the schema's
+common subset (`type`, `properties`, `required`, `additionalProperties`, `items`,
+`enum`, `anyOf`, nullable, local `$ref`; unknown keywords never reject). Only a
+valid reply is sent; an invalid one is a `502` with type `api_error` (a stream ends with
+an SSE `error` event, with no content), and its credits stay accounted. The 502 carries
+`x-should-retry: false` so that Claude Code does not repeat the paid request; a stream
+cannot carry that header, and Claude Code's own retries of server errors can repeat it.
+A live check on
+2026-11-05 (Haiku 4.5, Sonnet 5.5) returned valid JSON for the title, memory recall
+and hook schemas; Haiku wrapped both replies in a ` ```json ` fence, which is removed.
+
+If a model keeps failing the check, set `CLAUDE_CODE_DISABLE_STRUCTURED_OUTPUTS=1`
+(Claude Code 2.1.288 or newer). Claude Code then stops sending `output_config.format`
+and its beta header, and titles, memory recall and hooks rely on the prompt alone.
+`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` also removes the format, together with
+other pre-release fields. A format combined with a required tool call cannot be
+emulated and gets a 422 that names this variable. `x-proxi-output-format` shows the
+emulation (`validated-json-schema`, `validated-session-title`).
+
+A title request is recognised by its schema, exactly `{title: string}` without tools,
+whatever the prompt says. Without a schema (the variable above) the start of the
+prompt block decides, after the `x-anthropic-billing-header` and identity lines. Both
+wordings are known: "You are naming a coding session…" (Claude Code 2.1.234 and newer,
+the Agent SDK) and "Generate a concise, sentence-case title…" (older). A system prompt
+that only quotes the phrase further down stays an ordinary request and gets the
+configured relay policy. `output_config.task_budget` is accepted, not enforced, and
+named in `x-proxi-ignored-parameters`. A rejected request now carries the Messages
+error type `invalid_request_error` instead of `unprocessable_entity`.
+
+#### Request classes
+
+Behind a custom base URL Claude Code omits gateway hint headers unless
+`CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set (Claude Code 2.1.273 or newer). It then
+sends `x-claude-code-request-class` with `main`, `subagent`, `workflow`, `compaction`
+or `auxiliary` (titles, classifiers, summaries). For `auxiliary` and `compaction` the
+relay does not apply `relay_system_prompt_mode` `append` or `replace`: those requests
+keep their own system prompt and output format. Sessions, isolation and cache scopes
+stay as they are; only the policy changes. Other classes, and requests without the
+header, still get the configured policy. The class appears in the journal entries of
+the request. Without the header only the recognised service kinds (titles, Auto mode
+check, connection probe) are protected.
 
 ## Claude Desktop on Windows
 
@@ -367,8 +435,8 @@ has a bounded, buffered post-validation path. A sole JSON Markdown fence may be
 removed; the object must still contain exactly one string `title`, no duplicate
 keys and a complete normal finish. Invalid output becomes an error before any
 title content is emitted. `x-proxi-output-format: validated-session-title`
-identifies this service exception; arbitrary structured-output schemas remain
-unsupported. This is validation/normalization, not native constrained decoding.
+marks this case; other schemas use the same emulation described under Claude Code.
+This is validation/normalization, not native constrained decoding.
 
 ## IDE commands and subagents
 
