@@ -241,6 +241,8 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     session: { keepalive: true, last_success_at: NOW - 30, error: null, persistence_error: null, accounts: { enabled: 2, failing: 0 } },
     sessions: { active: 1, cached: 3, mode: 'per_conversation' },
     models: { total: models.length, routable: models.filter((m) => m.routable).length, default: 'claude-opus-5-5' },
+    // The values in force: what the relay is running with, not what is saved for the next start.
+    resources: { turn_timeout: 900 },
     connection: { openai_base_url: 'http://127.0.0.1:8787/v1', anthropic_base_url: 'http://127.0.0.1:8787' },
     ...overviewPatch,
   };

@@ -338,6 +338,40 @@ test('turns left running by a restart or by silence are interrupted and never st
   await expect(done.locator('.tape-fill')).toHaveAttribute('style', /width: 100%/);
 });
 
+test('a turn silent for longer than the default limit keeps running while the relay allows turns that long', async ({ page }) => {
+  // The relay runs with a two hour turn timeout: a turn may be silent that long, and five minutes more for its end
+  await mockAdmin(page, { overviewPatch: { resources: { turn_timeout: 7200 } } });
+  await serveEvents(page, [
+    eventAt('t-long', -1800, 'turn.begin', { model: 'model-long', effort: 'high' }),
+    eventAt('t-long', -1799, 'upstream.thinking_start'),
+    eventAt('t-gone', -8000, 'turn.begin', { model: 'model-gone', effort: 'high' }),
+    eventAt('t-gone', -7999, 'upstream.thinking_start'),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  // Half an hour of silence is past the 20 minutes of the default limit, but within this relay's turn timeout
+  const long = page.locator('.trace', { hasText: 'model-long' });
+  await expect(long.locator('.tag')).toHaveText('идёт');
+  await expect(long.locator('.live-phase')).toHaveCount(1);
+  await expect(long.locator('.tape')).not.toHaveClass(/is-interrupted/);
+  // More than two hours and five minutes is not: that turn ended without a word
+  const gone = page.locator('.trace', { hasText: 'model-gone' });
+  await expect(gone.locator('.tag')).toHaveText('прерван');
+  await expect(gone.locator('.live-phase')).toHaveCount(0);
+  await expect(gone).toContainText('всего 1,00 с');
+});
+
+test('without a turn timeout from the relay a silent turn is interrupted after the default 20 minutes', async ({ page }) => {
+  await mockAdmin(page, { overviewPatch: { resources: undefined } });
+  await serveEvents(page, [
+    eventAt('t-quiet', -1800, 'turn.begin', { model: 'model-quiet', effort: 'high' }),
+    eventAt('t-quiet', -1799, 'upstream.thinking_start'),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  await expect(page.locator('.trace', { hasText: 'model-quiet' }).locator('.tag')).toHaveText('прерван');
+});
+
 test('turn rows price a turn by the relay rules: nothing for a refused attempt, unknown for usage without a price, a lower bound while it runs', async ({ page }) => {
   await mockAdmin(page);
   await serveEvents(page, [

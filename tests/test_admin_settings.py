@@ -254,3 +254,13 @@ def test_overview_session_speaks_for_the_enabled_accounts_only(pool):
     assert session["error"] is None and session["last_success_at"] == 1700000100.0
     assert session["accounts"] == {"enabled": 1, "failing": 0}
     assert {"keepalive", "persistence_error"} <= set(session)
+
+
+def test_overview_publishes_the_turn_timeout_in_force_that_the_ui_judges_a_silent_turn_by(admin_relay):
+    def timeouts():
+        overview = admin_relay.request("/admin/api/overview")[1]
+        return overview["resources"]["turn_timeout"], admin_relay.request("/admin/api/settings")[1]["settings"]["turn_timeout"]
+
+    assert timeouts() == (900, 900)
+    assert admin_relay.patch({"turn_timeout": 7200})[0] == 200
+    assert timeouts() == (900, 7200)  # saved for the next start: the running relay still times a turn out after 900 s
