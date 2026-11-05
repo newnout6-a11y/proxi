@@ -26,6 +26,9 @@ class AttemptBudget:
         self.empty_dump_id = None
         self.empty_dump_attempted = False
         self.cancel_event = cancel_event
+        # The account that got the latest POST and how many POSTs in a row it got within this step.
+        self.account = None
+        self.account_streak = 0
         self._lock = threading.Lock()
 
     @property
@@ -39,6 +42,7 @@ class AttemptBudget:
         """A successful local exec follow-up is a new step with a fresh retry counter."""
         with self._lock:
             self.step_used = 0
+            self.account_streak = 0
 
     def _limit_error(self):
         limit = self.total_cap if self.total_cap and self.used >= self.total_cap else MAX_ATTEMPTS
@@ -55,12 +59,17 @@ class AttemptBudget:
             else:
                 time.sleep(interval)
 
-    def take(self, cancelled):
+    def take(self, cancelled, account=None):
+        """Claim the next POST of the step; `account` is the backend it goes to (None when unknown)."""
         if not self.remaining:
             raise self._limit_error()
-        # The first POST of a step is not a retry and never waits.
-        delay = (min(0.5 * 2 ** max(0, self.step_used - 1), 4.0)
-                 if self.step_used and self.last.get("outcome") != "content" else 0)
+        # The first POST of a step is not a retry and never waits. Neither does a POST to another
+        # account than the previous one: the backoff spares the account that just failed, and that
+        # attempt cost nothing, so a failover starts at once and its new account backs off from scratch.
+        same = account is None or account is self.account
+        streak = self.account_streak if same else 0
+        delay = (min(0.5 * 2 ** max(0, streak - 1), 4.0)
+                 if streak and self.last.get("outcome") != "content" else 0)
         self.wait(delay, cancelled)
         if cancelled() or (self.cancel_event and self.cancel_event.is_set()):
             raise InterruptedError("upstream retry cancelled")
@@ -69,6 +78,9 @@ class AttemptBudget:
                 raise self._limit_error()
             self.used += 1
             self.step_used += 1
+            self.account_streak = streak + 1
+            if account is not None:
+                self.account = account
             return self.used
 
     def persist_last(self):
