@@ -29,9 +29,9 @@ import models as model_catalog
 import sse
 import models
 import validate
-from accounts import AccountDispatcher
+from accounts import UNNAMED, AccountDispatcher, account_tag
 from credits import CreditsManager
-from orchestrator import TurnRunner
+from orchestrator import TurnRunner, acquire_plan
 from session import Backend, SessionPool
 from upstream_diagnostics import WireTrace
 from io_workers import DaemonIOExecutor
@@ -267,7 +267,7 @@ def make_handler(runtime: Runtime):
                 backend, manager = self._serving_account()
                 snapshot = getattr(manager, "balance_snapshot", None)
                 if snapshot:
-                    tag = account_report.account_tag(backend) if backend is not None and len(runtime.accounts.backends) > 1 else None
+                    tag = account_tag(backend, UNNAMED) if backend is not None and len(runtime.accounts.backends) > 1 else None
                     console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used, account=tag))
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
@@ -278,7 +278,7 @@ def make_handler(runtime: Runtime):
                          status=status, duration_ms=round(took), model=None if model == "-" else model,
                          stream=bool(getattr(self, "_streaming", False)),
                          user_agent=self.headers.get("user-agent", "")[:120] if self.headers else "",
-                         error=getattr(self, "_error_code", None))
+                         error=getattr(self, "_error_code", None), **self._account_fields())
 
         def _serving_account(self):
             """The account that answered this request, else the primary one."""
@@ -290,6 +290,11 @@ def make_handler(runtime: Runtime):
                 return backend, runtime.credits
             manager = getattr(backend, "credits", None) or runtime.accounts.managers.get(backend)
             return backend, manager or runtime.credits
+
+        def _account_fields(self):
+            """`account` for the events of a request an account served; nothing while none was chosen."""
+            tag = account_tag(self._serving_account()[0])
+            return {"account": tag} if tag else {}
 
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
@@ -419,7 +424,7 @@ def make_handler(runtime: Runtime):
                          upstream_status=getattr(err, "upstream_status", None),
                          upstream_attempts=getattr(err, "upstream_attempts", None),
                          upstream_request_id=getattr(err, "upstream_request_id", None),
-                         diagnostic_id=getattr(err, "diagnostic_id", None))
+                         diagnostic_id=getattr(err, "diagnostic_id", None), **self._account_fields())
 
         def _error_payload(self, dialect, err):
             body = adapters.error_payload(dialect, err)
@@ -443,8 +448,9 @@ def make_handler(runtime: Runtime):
             # and responses routes; the flat responses shape is for SSE events only.
             body = self._error_payload("chat" if dialect == "responses" else dialect, err)
             extra = dict(getattr(err, "headers", None) or {})
-            if err.retry_after:
-                extra["retry-after"] = err.retry_after
+            retry_after = apierr.retry_after_header(err.retry_after)
+            if retry_after:
+                extra["retry-after"] = retry_after
             self._json(err.status, body, extra or None)
 
         def _throttle_auth_failure(self):
@@ -587,7 +593,10 @@ def make_handler(runtime: Runtime):
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
-            refusal = runtime.pool.model_refusal(parsed.entry)
+            parsed.request_purpose = client_context.request_kind(parsed)
+            # The pool is asked about the accounts this very request would run on (acquire reads the same plan).
+            scope = acquire_plan(cfg, parsed).kwargs
+            refusal = runtime.pool.model_refusal(parsed.entry, **scope)
             if refusal is not None:
                 raise refusal
 
@@ -596,7 +605,6 @@ def make_handler(runtime: Runtime):
                 "provider" if parsed.entry.get("reasoning") and
                 parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
 
-            parsed.request_purpose = client_context.request_kind(parsed)
             compatibility_headers = {}
             if parsed.structured_output:
                 compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
@@ -626,6 +634,13 @@ def make_handler(runtime: Runtime):
                              request_id=self.request_id, retry_after=round(wait, 2))
                 raise apierr.too_many_requests("relay rate limit reached", wait)
 
+            if parsed.stream:
+                # A stream opens with a 200 and can only report an error as an event. What the pool already
+                # knows (no account can take the request now) is answered here, with its real status and Retry-After.
+                unavailable = self._pool_unavailable(parsed.entry, scope)
+                if unavailable is not None:
+                    raise unavailable
+
             events = queue.Queue()
             holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
             self._holder = holder
@@ -654,6 +669,17 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _pool_unavailable(self, entry, scope):
+            """acquire()'s error for this request if it were asked now, after the one balance recheck a 402 gets."""
+            error = runtime.pool.unavailable_error(entry, **scope)
+            if error is not None and error.code == "insufficient_credits":
+                # TurnRunner confirms excluded balances once before it answers 402, so a top-up does not
+                # wait for the timer; a stream is refused only after the same confirmation.
+                recheck = getattr(runtime.accounts, "recheck_exhausted", None)
+                if recheck is not None and recheck():
+                    error = runtime.pool.unavailable_error(entry, **scope)
+            return error
 
         def _collect(self, fut, events, adapter, prompt_text, holder_session=None):
             holder_session = holder_session or {}
@@ -845,7 +871,8 @@ def banner_lines(cfg, balance, warnings=()):
               " session mode:  " + cfg["session_mode"] + " | workspace: " + cfg["workspace_root"],
               " exec policy:   " + cfg["exec_policy"] + " | max turns: " + str(cfg["max_exec_turns"])]
     if balance.get("available") is not None:
-        line = " balance:       " + str(balance["available"]) + " / " + str(balance.get("monthly_allocation"))
+        allocation = balance.get("monthly_allocation")
+        line = (" balance:       " + str(balance["available"]) + " / " + ("?" if allocation is None else str(allocation)))
         if balance.get("partial"):
             unknown = balance.get("unknown_accounts") or 0
             line += (("  (partial: %d of %d accounts unknown)" % (unknown, balance.get("accounts_total", unknown)))

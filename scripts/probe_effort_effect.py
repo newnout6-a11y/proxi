@@ -22,8 +22,8 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import direct
-import journal
 import models
+from accounts import cfg_tag
 from auth import upstream_headers
 from redact import redact
 from scripts.audit_models import load_accounts, route_available
@@ -75,7 +75,7 @@ def observe(cfg, entry, effort, *, question='count', timeout=120, max_tokens=600
                                        for part in cfg.get('cookie', '').split(';') if '=' in part]
     secrets += [str(cfg[key]) for key in models.PROVIDER_RESOURCE_KEY.values() if cfg.get(key)]
     row = dict(model=entry['id'], effort=effort, question=question, surface=surface,
-               account=journal.tag(cfg.get('account_id') or cfg.get('page_uuid')), http=None,
+               account=cfg_tag(cfg), http=None,
                thinking_events=0, thinking_chars=0, text_chars=0, usage={})
     text = ''
     started = time.monotonic()

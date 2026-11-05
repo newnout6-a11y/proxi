@@ -1,5 +1,6 @@
 """Turn orchestration: context injection, execution loop, event fan-out."""
 import asyncio
+import collections
 import hashlib
 
 import direct
@@ -19,7 +20,7 @@ import client_context
 import console_log
 import models as model_catalog
 import structured
-from accounts import account_tag
+from accounts import UNNAMED, account_tag
 from context import build_system_instructions, relay_policy
 from redact import redact
 from session import SessionLease
@@ -160,6 +161,66 @@ def _may_be_balance_related(error):
     return status >= 500 and code != "upstream_timeout"
 
 
+def _can_exec(cfg, steps: int) -> bool:
+    """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
+    if cfg["exec_policy"] == "off":
+        return False
+    max_steps = int(cfg.get("max_exec_turns", 0) or 0)
+    return max_steps <= 0 or steps < max_steps
+
+
+def _purpose(parsed):
+    return getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
+
+
+def _client_system(parsed):
+    """The client's own system text; a blank one (an effort-only entry, a lone newline) is no instruction at all."""
+    return parsed.system if (parsed.system or "").strip() else ""
+
+
+def _client_owns_instructions(parsed, purpose, native_tools):
+    """True when the client brings the instructions of this job, so the relay adds no project context or shell protocol.
+
+    A JSON-only reply has no room for the relay's workspace or shell protocol;
+    a client that supplies tools keeps the relay's native-tools role as before."""
+    return (purpose in client_context.CLIENT_TEXT_KINDS or bool(_client_system(parsed))
+            or (bool(getattr(parsed, "structured_output", None)) and not native_tools))
+
+
+# kind: "text" (the persistent text chat), "isolated" (a standalone job) or "session" (the conversation's own one).
+AcquirePlan = collections.namedtuple("AcquirePlan", "kind kwargs")
+
+
+def acquire_plan(cfg, parsed):
+    """Which pool session a turn asks for, as SessionPool.acquire()'s `isolated` / `context_scope` keywords.
+
+    TurnRunner acquires with exactly this plan, and the HTTP layer puts the same keywords to the pool
+    (model_refusal, unavailable_error) before a response starts: the check and the acquire read the same accounts.
+    """
+    native_tools = getattr(parsed, "tools", None) or []
+    direct_mode = cfg.get("transport") == "direct"
+    mode = cfg.get("session_mode")
+    purpose = _purpose(parsed)
+    key = getattr(parsed, "conversation_key", None)
+    parent_key = getattr(parsed, "parent_conversation_key", None)
+    can_exec = (_can_exec(cfg, 0) and not native_tools
+                and not _client_owns_instructions(parsed, purpose, native_tools))
+    persistent_text = (direct_mode and not native_tools and mode != "per_request"
+                       and purpose not in client_context.SERVICE_KINDS and (key or mode == "shared"))
+    isolated = (not native_tools and not persistent_text
+                and (direct_mode or purpose in client_context.CLIENT_TEXT_KINDS or (key and not can_exec)))
+    child_scope = ("subagent", key) if parent_key and key and mode == "shared" else None
+    if persistent_text:
+        # Ordinary text chats retain idle keepwarm, with state separate from native
+        # tools even when their conversation ID is the same.
+        return AcquirePlan("text", {"context_scope": (child_scope, "text") if child_scope else "text"})
+    if isolated:
+        # A standalone job can share account affinity, never the main chat's tools, head,
+        # implicit history, cache breakpoints or idle keepwarm.
+        return AcquirePlan("isolated", {"isolated": True})
+    return AcquirePlan("session", {"context_scope": child_scope} if child_scope else {})
+
+
 class TurnRunner:
     def __init__(self, cfg, credits, pool):
         self.cfg = cfg
@@ -169,11 +230,7 @@ class TurnRunner:
         self.accounts = None
 
     def _can_exec(self, steps: int) -> bool:
-        """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
-        if self.cfg["exec_policy"] == "off":
-            return False
-        max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
-        return max_steps <= 0 or steps < max_steps
+        return _can_exec(self.cfg, steps)
 
     def _looks_looping(self, command: str, history) -> bool:
         """True when this command already ran three times in the recent window."""
@@ -398,7 +455,8 @@ class TurnRunner:
         # Exec steps are bounded only by max_exec_turns; each step (plus the summary
         # step) may spend up to MAX_ATTEMPTS POSTs, which is the hard cap per request.
         holder["_attempt_budget"] = AttemptBudget(
-            cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None)
+            cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None,
+            clock=getattr(getattr(self, "accounts", None), "clock", None))
         while True:
             relay = _FailoverOut(out)
             holder.pop("session", None)
@@ -422,8 +480,10 @@ class TurnRunner:
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):
+                        # A limit that a request sent before the account's last return reports is old news.
                         accounts.mark_rate_limited(backend, retry_after=getattr(error, "retry_after", None),
-                                                   request_id=getattr(parsed, "request_id", None))
+                                                   request_id=getattr(parsed, "request_id", None),
+                                                   sent_at=holder["_attempt_budget"].sent_at)
                     rate_limited = retryable and backend not in exclude
                 if (retryable and backend is None and error.code == "insufficient_credits"
                         and not rechecked and hasattr(accounts, "recheck_exhausted")):
@@ -442,24 +502,20 @@ class TurnRunner:
                 raise
             if rate_limited:
                 exclude.append(backend)
-                cfg = getattr(backend, "cfg", None) or {}
-                tag = journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
                 journal.emit("account.failover", "Часовой лимит Retool — запрос повторён на другом аккаунте",
-                             "warn", account=tag, request_id=getattr(parsed, "request_id", None),
+                             "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code, reason="rate_limited")
                 console_log.write("[%s] [account] %s: часовой лимит Retool, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", tag))
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
                 holder["reason"] = "stop"
                 continue
             if exhausted:
                 exclude.append(backend)
-                cfg = getattr(backend, "cfg", None) or {}
-                tag = journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
                 journal.emit("account.failover", "Баланс аккаунта закончился — запрос повторён на другом",
-                             "warn", account=tag, request_id=getattr(parsed, "request_id", None),
+                             "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code)
                 console_log.write("[%s] [account] %s: баланс закончился, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", tag))
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
                 holder["reason"] = "stop"
                 continue
             if error is not None:
@@ -494,15 +550,11 @@ class TurnRunner:
                 tool_names = [choice["function"]["name"]]
             direct_mode = self.cfg.get("transport") == "direct"
             is_native = bool(native_tools)
-            purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
+            purpose = _purpose(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
             output_spec = getattr(parsed, "structured_output", None)
-            # A blank system (an effort-only entry, a lone newline) is no instruction at all.
-            client_system = parsed.system if (parsed.system or "").strip() else ""
-            # A JSON-only reply has no room for the relay's workspace or shell protocol;
-            # a client that supplies tools keeps the relay's native-tools role as before.
-            client_owns_instructions = (client_text or bool(client_system)
-                                        or (bool(output_spec) and not native_tools))
+            client_system = _client_system(parsed)
+            client_owns_instructions = _client_owns_instructions(parsed, purpose, native_tools)
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
@@ -581,36 +633,24 @@ class TurnRunner:
                 self._check_prompt(self._direct_text(instructions, client_chunks))
             base_prompt = self._check_prompt(prompt)
             session = None
+            account_context = None
             try:
                 key = getattr(parsed, "conversation_key", None)
                 parent_key = getattr(parsed, "parent_conversation_key", None)
-                can_exec = self._can_exec(0) and not native_tools and not client_owns_instructions
-                persistent_text = (direct_mode and not native_tools
-                                   and self.cfg.get("session_mode") != "per_request"
-                                   and purpose not in client_context.SERVICE_KINDS
-                                   and (key or self.cfg.get("session_mode") == "shared"))
-                isolated = not native_tools and not persistent_text and (direct_mode or client_text or (key and not can_exec))
+                plan = acquire_plan(self.cfg, parsed)
+                persistent_text, isolated = plan.kind == "text", plan.kind == "isolated"
                 failover = {"exclude": exclude} if exclude else {}
                 if parent_key and parent_key != key:
                     failover["parent_key"] = parent_key
-                child_scope = (("subagent", key) if parent_key and key
-                               and self.cfg.get("session_mode") == "shared" else None)
-                if persistent_text:
-                    # Ordinary text chats retain idle keepwarm, with state separate
-                    # from native tools even when their conversation ID is the same.
-                    session = await self.pool.acquire(key, context_scope=(child_scope, "text") if child_scope else "text",
-                                                      model_entry=parsed.entry, **failover)
-                elif isolated:
-                    # A standalone job can share account affinity, never the main chat's
-                    # tools, head, implicit history, cache breakpoints or idle keepwarm.
-                    session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry, **failover)
-                else:
-                    scoped = {"context_scope": child_scope} if child_scope else {}
-                    session = await self.pool.acquire(key, model_entry=parsed.entry, **scoped, **failover)
+                session = await self.pool.acquire(key, model_entry=parsed.entry, **plan.kwargs, **failover)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
                 # Every later event of this turn, errors included, names the account serving it.
                 trace["account"] = account_tag(getattr(acquired, "backend", None))
+                if trace["account"]:
+                    # Events that other modules emit for this turn (the transport, native history) get the
+                    # tag through the context: they know no more than the session they run on.
+                    account_context = client_context.bind({**client_context.current(), "account": trace["account"]})
                 # Debit the account that actually served the turn.
                 account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
                 acquired._credits_manager = account_credits
@@ -1044,6 +1084,12 @@ class TurnRunner:
                     prompt = self._followup(instructions, reminder, *last_followup,
                                             direct_chunks=client_chunks + exec_chunks[:-1] if direct_mode else None)
             finally:
+                if account_context is not None:
+                    # Releasing may evict other conversations, and the next attempt may use another account.
+                    try:
+                        client_context.reset(account_context)
+                    except ValueError:  # a token of another context: nothing of ours is left to undo
+                        pass
                 if session is not None:
                     await self.pool.release(session)
         except apierr.ApiError as err:

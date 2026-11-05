@@ -21,7 +21,7 @@ import auth
 import config
 import journal
 import models
-from accounts import enabled as account_enabled, priority as account_priority
+from accounts import UNNAMED, account_tag, cfg_tag, enabled as account_enabled, priority as account_priority
 from redact import redact
 import sse
 import validate
@@ -85,7 +85,8 @@ def _schema():
          "с", 0, 86400, None),
         ("account_rate_limit_cooldown", "integer", "Пауза после часового лимита", "routing",
          "На сколько секунд аккаунт уходит из пула, когда Retool сообщает о часовом лимите managed-ключей; "
-         "лимит сразу после возврата удваивает паузу, но не больше часа", "с", 1, 3600, None),
+         "лимит сразу после возврата удлиняет паузу на 5 минут за раз, но не дольше 20 минут "
+         "(или самой паузы, если она длиннее)", "с", 1, 3600, None),
         ("session_refresh_interval", "integer", "Продление сессии", "routing",
          "Как часто продлевать сессию Retool каждого включённого аккаунта; 0 — не продлевать по таймеру",
          "с", 0, 86400, None),
@@ -351,7 +352,7 @@ class Admin:
             info, backend = entry["info"], entry["backend"]
             error = info.get("error") or info.get("stale_error")
             accounts.append({
-                "account": account_report.account_tag(backend), "state": entry["state"],
+                "account": account_tag(backend, UNNAMED), "state": entry["state"],
                 "routable": entry["routable"], "reserve": entry["reserve"],
                 "available": entry["available"],
                 "monthly_allocation": account_report.known(info.get("monthly_allocation")),
@@ -439,7 +440,7 @@ class Admin:
 
     @staticmethod
     def _record_tag(record):
-        return journal.tag(record.get("account_id") or record.get("page_uuid")) or "account"
+        return cfg_tag(record, UNNAMED)
 
     def _live_backends(self):
         return getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]

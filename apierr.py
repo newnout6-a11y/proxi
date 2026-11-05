@@ -161,7 +161,7 @@ def is_account_quota(error) -> bool:
 
 
 def retry_after_seconds(value):
-    """Seconds from a Retry-After header (delta-seconds or an HTTP date); None when absent or unusable."""
+    """Whole seconds from a Retry-After header (delta-seconds or an HTTP date), rounded up; None when absent or unusable."""
     if value is None:
         return None
     text = str(value).strip()
@@ -172,7 +172,14 @@ def retry_after_seconds(value):
             seconds = parsedate_to_datetime(text).timestamp() - time.time()
         except (TypeError, ValueError, IndexError, OverflowError):
             return None
-    return seconds if math.isfinite(seconds) and seconds > 0 else None
+    return math.ceil(seconds) if math.isfinite(seconds) and seconds > 0 else None
+
+
+def retry_after_header(seconds):
+    """The Retry-After value of a response: RFC 9110 delta-seconds are whole, so round up; None for no header."""
+    if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return str(math.ceil(seconds))
 
 
 def wait_text(seconds: float) -> str:

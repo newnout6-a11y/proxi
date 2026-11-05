@@ -1241,7 +1241,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             while True:
                 if is_cancelled():
                     return
-                budget.take(is_cancelled)
+                budget.take(is_cancelled, session.backend)
                 trace = AttemptTrace(cfg, budget, request_id, body.get("model"), payload)
                 holder["trace"] = trace
                 request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
