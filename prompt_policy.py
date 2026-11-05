@@ -426,12 +426,13 @@ def _items(node):
     return node.data if hasattr(node, "data") else node
 
 
+@functools.lru_cache(maxsize=4096)
 def _case_variants(point):
     variants = set()
     for variant in (chr(point).lower(), chr(point).upper(), chr(point).swapcase()):
         if len(variant) == 1:
             variants.add(ord(variant))
-    return variants
+    return frozenset(variants)
 
 
 def _collect_points(node, points):

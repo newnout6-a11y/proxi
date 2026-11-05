@@ -613,3 +613,95 @@ def test_a_document_round_trips_through_json(tmp_path):
     doc = document(texts={"a": "Я"}, profiles={"p": {"head": "{{text:a}}"}})
     snapshot = compile_doc(json.loads(json.dumps(doc, ensure_ascii=False)), tmp_path)
     assert snapshot.document == doc
+
+# -- nothing but a PromptConfigError may escape -------------------------------------------------------------------------
+
+RICH = {
+    "version": 1, "default_profile": "p", "protected": {"enabled": True},
+    "texts": {"t": "TXT", "f": {"file": "a.md"}},
+    "relay_texts": {"role": "R", "native_role": {"file": "a.md"}, "structured": "{{default}} {{schema}} {{schema_name}}",
+                    "reminder": "<r>{{text}}</r>", "codex_base": {"gpt-*": "x", "claude-*": {"file": "a.md"}}},
+    "profiles": {"p": {"description": "d", "head": "{{text:t}}\n{{client_system}}", "client_system": {"edits": [
+        {"op": "remove_section", "heading": "# A"}, {"op": "keep_sections", "headings": ["# B"]},
+        {"op": "remove_tag", "tag": "t"}, {"op": "keep_tag_inner", "tag": "u"},
+        {"op": "remove_between", "start": "<", "end": ">", "inclusive": True},
+        {"op": "remove_regex", "pattern": "x+", "flags": "i"},
+        {"op": "replace_regex", "pattern": "(y)", "flags": "s", "with": "\\1{{text:t}}"},
+        {"op": "replace_text", "find": "a", "with": "b", "all": False},
+        {"op": "prepend", "text": "P"}, {"op": "append", "text": "{{text:t}}"}]},
+        "history": {"mid_system": "wrap", "user_blocks": [
+            {"op": "drop_tag", "tag": "system-reminder", "contains": "x"},
+            {"op": "drop_tag", "tag": "a", "pattern": "p+", "flags": "m"}, {"op": "remove_regex", "pattern": "r"},
+            {"op": "replace_text", "find": "f", "with": "w"}]},
+        "tools": {"edits": [{"tool": "bash", "op": "append", "text": "A"}, {"tool": "x*", "hide": True},
+                            {"tool": "y", "op": "replace_regex", "pattern": "h", "with": "i"},
+                            {"tool": "z", "op": "set", "text": "S"},
+                            {"tool": "w", "op": "replace_text", "find": "a", "with": "b"}]},
+        "generation": {"effort": "high", "verbosity": "low"}, "publish_as_model": ["gpt-*"]}, "q": {}},
+    "rules": [{"name": "r1", "enabled": True, "override_protected": False, "use": "p", "if": {
+        "client": ["opencode"], "agent": "a", "purpose": "p", "request_class": "c", "model": "m", "tools": True,
+        "structured": False, "has_client_system": True, "dialect": "chat", "header_profile": "*",
+        "virtual_profile": "*"}}, {"name": "r2", "use": "$header"}, {"name": "r3", "use": "$virtual"},
+        {"name": "r4", "use": "$legacy"}],
+    "codex": {"models": {"gpt-6*": {"persistent_instructions": "pi", "include_skills_usage_instructions": True,
+                                    "include_plugin_usage_instructions": False,
+                                    "include_apps_usage_instructions": True}}}}
+WEIRD = [None, True, 0, "", "x", "{{", "(", [], {}, [1], {"a": 1}, {"file": "../x"}, "a" * 1000, float("nan"), "#"]
+
+
+def every_path(node, prefix=()):
+    yield prefix
+    if isinstance(node, dict):
+        for key in list(node):
+            yield from every_path(node[key], prefix + (key,))
+    elif isinstance(node, list):
+        for index in range(len(node)):
+            yield from every_path(node[index], prefix + (index,))
+
+
+def change(doc, path, value, delete=False):
+    node = doc
+    for key in path[:-1]:
+        node = node[key]
+    if delete:
+        node.pop(path[-1]) if isinstance(node, list) else node.pop(path[-1], None)
+    else:
+        node[path[-1]] = value
+
+
+def test_no_mutation_of_a_valid_document_escapes_as_anything_but_a_config_error(tmp_path):
+    (tmp_path / "a.md").write_text("file text", encoding="utf-8")
+    compile_doc(RICH, tmp_path)
+    cases = 0
+    for path in every_path(RICH):
+        if not path:
+            continue
+        for value in WEIRD + ["<delete>"]:
+            doc = json.loads(json.dumps(RICH))
+            try:
+                change(doc, path, value, delete=value == "<delete>")
+            except (KeyError, IndexError, TypeError):
+                continue
+            cases += 1
+            try:
+                snapshot = compile_doc(doc, tmp_path)
+            except pp.PromptConfigError:
+                continue
+            for name in snapshot.profile_names():
+                snapshot.profile(name)
+    assert cases > 1500
+
+
+def test_a_document_nested_beyond_reason_is_refused_not_crashed(tmp_path):
+    deep = []
+    for _ in range(3000):
+        deep = [deep]
+    for doc in (document(texts={"a": deep}), document(profiles={"p": {"description": deep}}),
+                document(rules=[{"name": "r", "use": "passthrough", "if": {"client": deep}}])):
+        with pytest.raises(pp.PromptConfigError):
+            compile_doc(doc, tmp_path)
+    nested = {}
+    for _ in range(3000):
+        nested = {"a": nested}
+    with pytest.raises(pp.PromptConfigError):
+        compile_doc(document(texts=nested), tmp_path)
