@@ -196,3 +196,66 @@ def test_gateway_probe_cleans_up_its_server_and_journal_without_upstream_calls(t
     assert results[0]["http"] == 400
     assert results[0]["sent_upstream_efforts"] == []
     assert list((tmp_path / ".agents").iterdir()) == []
+
+
+IGNORING = ["claude-haiku-4-5-20251001", "zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash"]
+HAIKU_BODY = {"model": "claude-haiku-4-5-20251001", "max_tokens": 4096,
+              "messages": [{"role": "user", "content": "OK"}]}
+
+
+def test_openai_discovery_publishes_no_levels_for_routes_that_ignore_effort(relay):
+    status, payload = relay.json("/v1/models")
+    rows = {row["id"]: row for row in payload["data"]}
+    assert status == 200 and set(IGNORING) <= set(rows)
+    for model in IGNORING:
+        caps = rows[model]["capabilities"]
+        assert caps["reasoning_effort_levels"] == [] and caps["default_reasoning_effort"] is None
+        assert caps["reasoning_effort_control"] == "accepted-ignored"
+    assert rows["claude-haiku-4-5-20251001"]["capabilities"]["reasoning"] is False
+    assert rows["zai-org/GLM-5.3"]["capabilities"]["reasoning"] is True
+    assert rows["claude-opus-5-5"]["capabilities"]["reasoning_effort_levels"] == ["low", "medium", "high", "max"]
+    assert rows["gpt-5-mini"]["capabilities"]["reasoning_effort_levels"] == ["low", "medium", "high"]
+
+
+def test_codex_discovery_publishes_no_levels_for_routes_that_ignore_effort(relay):
+    status, payload = relay.json("/codex/models")
+    rows = {row["slug"]: row for row in payload["models"]}
+    assert status == 200 and set(IGNORING) <= set(rows)
+    for model in IGNORING:
+        assert rows[model]["supported_reasoning_levels"] == [] and rows[model]["default_reasoning_level"] is None
+    assert [item["effort"] for item in rows["gpt-5-nano"]["supported_reasoning_levels"]] == ["low", "medium", "high"]
+
+
+@pytest.mark.parametrize("budget,level", [(1024, "low"), (8192, "medium"), (24576, "high"), (100000, "max")])
+def test_claude_code_thinking_budget_for_haiku_is_accepted_ignored_and_named(relay, budget, level):
+    with relay.request("/v1/messages", dict(HAIKU_BODY, thinking={"type": "enabled", "budget_tokens": budget})) as reply:
+        names = reply.headers["x-proxi-ignored-parameters"].split(",")
+        assert reply.status == 200
+    assert names == ["thinking.budget_tokens", "thinking.type"]
+    seen = relay.fake.seen[-1]
+    assert seen.effort is None and seen.requested_effort == level
+
+
+def test_haiku_adaptive_thinking_and_effort_are_accepted_and_named(relay):
+    body = dict(HAIKU_BODY, thinking={"type": "adaptive"}, output_config={"effort": "xhigh"})
+    with relay.request("/v1/messages", body) as reply:
+        names = reply.headers["x-proxi-ignored-parameters"].split(",")
+        assert reply.status == 200
+    assert names == ["output_config.effort", "thinking.type"] and relay.fake.seen[-1].effort is None
+
+
+def test_haiku_disabled_thinking_is_honoured_and_not_reported(relay):
+    with relay.request("/v1/messages", dict(HAIKU_BODY, thinking={"type": "disabled"})) as reply:
+        assert reply.status == 200 and reply.headers.get("x-proxi-ignored-parameters") is None
+    assert relay.fake.seen[-1].effort is None
+
+
+def test_a_level_nobody_defines_is_still_a_400_for_haiku(relay):
+    status, body = relay.json_any("/v1/messages", dict(HAIKU_BODY, output_config={"effort": "extra"}))
+    assert status == 400 and not relay.fake.seen and "known level" in json.dumps(body)
+
+
+def test_effort_for_a_route_that_honours_it_is_not_reported_as_ignored(relay):
+    with relay.request("/v1/chat/completions", dict(body("chat", "high"), model="gpt-5-mini")) as reply:
+        assert reply.status == 200 and reply.headers.get("x-proxi-ignored-parameters") is None
+    assert relay.fake.seen[-1].effort == "high"

@@ -4,7 +4,6 @@ The relay therefore accepts any known level, forwards none and names the control
 """
 import pytest
 
-import generation
 import models
 import validate
 from apierr import ApiError
@@ -98,12 +97,12 @@ def test_non_reasoning_model_still_omits_configured_effort(monkeypatch):
 ])
 def test_every_effort_source_the_validator_reads_is_named_when_ignored(payload, names):
     entry = models.resolve('zai-org/GLM-5.3')[0]
-    assert generation.ignored_effort_controls(payload, entry) == names
+    assert models.ignored_effort_controls(payload, entry) == names
     if names:
         assert validate._effort(dict(payload, model='x')) is not None
 
 
 def test_effort_values_are_never_echoed_in_the_ignored_names():
     entry = models.resolve('zai-org/GLM-5.3')[0]
-    names = generation.ignored_effort_controls({'reasoning_effort': 'secret-level-value'}, entry)
+    names = models.ignored_effort_controls({'reasoning_effort': 'secret-level-value'}, entry)
     assert 'secret-level-value' not in ''.join(names)

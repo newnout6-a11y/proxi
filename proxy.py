@@ -852,7 +852,7 @@ def main(argv=None):
                  session_mode=cfg["session_mode"], exec_policy=cfg["exec_policy"])
     warnings = startup_warnings(runtime)
     for text in warnings:
-        journal.emit("relay.warning", text, "warn", model=cfg["model"])
+        journal.emit("relay.warning", text, "warn")
     handler = make_handler(runtime)
     slots = threading.BoundedSemaphore(cfg["max_workers"])
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
