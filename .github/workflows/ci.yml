@@ -24,3 +24,5 @@ jobs:
         run: python -m pytest tests -q
       - name: Run OpenCode label plugin tests
         run: node --test tests/test_opencode_labels.mjs
+      - name: Run admin trace model tests
+        run: node --test web/tests/turns.test.mjs

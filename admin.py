@@ -23,6 +23,7 @@ from accounts import enabled as account_enabled, priority as account_priority
 from redact import redact
 import sse
 import validate
+from context import DEFAULT_RELAY_SYSTEM_PROMPT
 
 
 BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
@@ -38,7 +39,7 @@ ACCOUNT_RECORD_KEYS = ("base", "page_uuid", "cookie", "xsrf", "account_id", "thr
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balance|renew))?")
-SETTING_GROUPS = ("routing", "model", "retries", "cache", "exec", "limits", "api")
+SETTING_GROUPS = ("routing", "model", "instructions", "retries", "cache", "exec", "limits", "api")
 
 
 def _int_param(query, name, default, low, high):
@@ -105,6 +106,12 @@ def _schema():
          "Добавлять к запросу краткое описание рабочей папки relay", None, None, None, None),
         ("context_max_bytes", "integer", "Размер контекста проекта", "model",
          "Предел описания рабочей папки, которое добавляется к каждому запросу", "байт", 1, 10_000_000, None),
+        ("relay_system_prompt_mode", "string", "Применение инструкций", "instructions",
+         "Где применяется собственная роль relay; служебные запросы IDE сохраняют свои инструкции",
+         None, None, None, ["standalone", "append", "replace"]),
+        ("relay_system_prompt", "string", "Инструкции для модели", "instructions",
+         "Роль, стиль ответа и рабочие границы. null возвращает стандартную роль, пустая строка убирает собственную роль",
+         None, None, None, None),
         ("upstream_empty_retries", "integer", "Повторы пустого ответа", "retries",
          "Сколько раз повторить запрос, если Retool вернул пустой ответ или одно мышление; каждый повтор платный",
          None, 0, 4, None),
@@ -170,6 +177,8 @@ def _schema():
         if enum is not None:
             field["enum"] = enum
         fields[key] = field
+    fields['relay_system_prompt']['nullable'] = True
+    fields['relay_system_prompt']['multiline'] = True
     return fields
 
 
@@ -251,6 +260,7 @@ class Admin:
             desired["session_mode"] = effective["session_mode"]
         pending = [key for key in self.schema if desired[key] != effective[key]]
         return {"settings": desired, "effective": effective, "schema": self.schema,
+                "default_system_prompt": DEFAULT_RELAY_SYSTEM_PROMPT,
                 "pending_restart": pending, "restart_required": bool(pending),
                 "writable": bool(self.cfg.get("_config_path"))}
 
@@ -639,6 +649,8 @@ class Admin:
             if field is None:
                 raise apierr.bad_request("Unknown or protected setting", param=key)
             kind = field["type"]
+            if value is None and field.get('nullable'):
+                continue
             valid = ((kind == "boolean" and isinstance(value, bool)) or
                      (kind == "integer" and type(value) is int) or
                      (kind == "number" and type(value) in (int, float) and math.isfinite(value)) or

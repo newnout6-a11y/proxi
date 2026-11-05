@@ -688,6 +688,10 @@ class TurnRunner:
                     think_started = None
                     tool_started = {}
                     out.put({"type": "usage_start"})
+                    journal_attempt = holder.get('_journal_attempt', 0) + 1
+                    holder['_journal_attempt'] = journal_attempt
+                    log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
+                    usage_started = False
                     try:
                         async for event in stream:
                             if not first_token and event["type"] in ("text", "thinking", "tool_call"):
@@ -732,6 +736,11 @@ class TurnRunner:
                                 out.put(event)
                             elif event["type"] in ("thinking_heartbeat", "usage_start"):
                                 if event["type"] == "usage_start":
+                                    if usage_started:
+                                        journal_attempt += 1
+                                        holder['_journal_attempt'] = journal_attempt
+                                        log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
+                                    usage_started = True
                                     think_started = None
                                     holder['_attempt_usage'] = {}
                                     holder['_attempt_credited'] = False
@@ -760,7 +769,8 @@ class TurnRunner:
                                 known = holder.get('_attempt_credited') or event.get('credits_reported')
                                 log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
                                                       'Токены получены; стоимость upstream не сообщена'),
-                                    'info' if known else 'warn', credits=None, **delta,
+                                    'info' if known else 'warn', credits=None, attempt=journal_attempt,
+                                    credits_reported=bool(known), **delta,
                                     **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
                                 if session is not None:
                                     acquired._last_prefix_tokens = breakdown['prompt_tokens']
@@ -780,7 +790,7 @@ class TurnRunner:
                                 log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
                                     event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
                                     "%d%%" % round(hit * 100) if hit is not None else "—"),
-                                    "info", credits=event["value"], **delta,
+                                    "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
                                     **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
                                 if session is not None:
                                     # Write through the lease: SessionLease only proxies

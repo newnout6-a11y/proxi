@@ -383,6 +383,63 @@ def test_settings_reject_values_above_maximum(admin_relay):
     assert status == 200, "legitimate values must still pass"
 
 
+def test_system_policy_controls_round_trip_without_changing_auth(admin_relay):
+    before = json.loads(admin_relay.path.read_text(encoding='utf-8'))
+    policy = 'Ты — инженер.\nНе удаляй данные без подтверждения.'
+    status, body, _ = admin_relay.patch({'relay_system_prompt_mode': 'append', 'relay_system_prompt': policy})
+    assert status == 200
+    assert body['settings']['relay_system_prompt'] == policy
+    assert set(body['pending_restart']) >= {'relay_system_prompt_mode', 'relay_system_prompt'}
+    after = json.loads(admin_relay.path.read_text(encoding='utf-8'))
+    assert after['cookie'] == before['cookie'] and after['xsrf'] == before['xsrf']
+    for value in ('', None):
+        status, body, _ = admin_relay.patch({'relay_system_prompt': value})
+        assert status == 200 and body['settings']['relay_system_prompt'] == value
+
+
+def test_system_policy_null_and_modes_are_validated_per_field(admin_relay):
+    for change in ({'relay_system_prompt': 42}, {'relay_system_prompt_mode': None},
+                   {'relay_system_prompt_mode': 'unsupported'}):
+        assert admin_relay.patch(change)[0] == 400
+
+
+def test_metrics_expose_unreported_cost_instead_of_asserting_zero():
+    log = journal.Journal()
+    log.emit('turn.begin', 'start', turn_id='cost-test')
+    log.emit('upstream.usage', 'unknown', turn_id='cost-test', credits=None)
+    totals = log.metrics()['totals']
+    assert totals['credits'] == 0 and totals['credits_complete'] is False and totals['credits_unknown'] == 1
+    log.emit('upstream.usage', 'known', turn_id='other-attempt', credits=1.5)
+    assert log.metrics()['totals']['credits'] == 1.5
+    assert log.metrics()['totals']['credits_complete'] is False
+    known = journal.Journal()
+    known.emit('upstream.usage', 'free', credits=0)
+    assert known.metrics()['totals']['credits_complete'] is True
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_token_snapshots_do_not_hide_or_invent_an_extra_charge(reverse):
+    log = journal.Journal()
+    events = [{'credits': 1.5}, {'credits': None}]
+    if reverse:
+        events.reverse()
+    for data in events:
+        log.emit('upstream.usage', 'snapshot', turn_id='t1', attempt=1, **data)
+    totals = log.metrics()['totals']
+    assert totals['credits'] == 1.5 and totals['credits_complete'] is True
+    log.emit('upstream.usage_start', 'next', turn_id='t1', attempt=2)
+    assert log.metrics()['totals']['credits_complete'] is False
+
+
+def test_a_billed_turn_cannot_mask_another_turn_without_telemetry():
+    log = journal.Journal()
+    log.emit('turn.begin', 'first', turn_id='t1')
+    log.emit('upstream.usage', 'known', turn_id='t1', credits=1)
+    log.emit('turn.begin', 'second', turn_id='t2')
+    log.emit('turn.end', 'second ended', turn_id='t2')
+    assert log.metrics()['totals']['credits_complete'] is False
+
+
 def test_settings_reject_burst_below_one(admin_relay):
     """burst < 1 can never reach the 1.0 token threshold: all completions would
     be 429 forever."""
