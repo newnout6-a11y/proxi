@@ -437,12 +437,102 @@ def test_removed_models_in_small_model_and_background_agents_get_a_cheap_publish
     result = update_document(before, entries)
     assert result['small_model'] == HAIKU
     assert result['agent']['title'] == {'model': HAIKU, 'temperature': 0}
-    assert result['agent']['compaction'] == {'model': HAIKU}
     assert result['agent']['summary'] == {'model': 'retool-relay/gpt-6-sol'}
     assert result['agent']['build'] == {'model': 'retool-relay/claude-opus-5-5'}
+    # Compaction reads the whole session: neither Haiku (200K) nor nano (400K) holds the 1.05M main model's.
+    assert result['agent']['compaction'] == {}
     without_haiku = update_document(before, [entry for entry in entries if entry['id'] != 'claude-haiku-4-5-20251001'])
     assert without_haiku['small_model'] == 'retool-relay/gpt-5-nano'
-    assert without_haiku['agent']['compaction'] == {'model': 'retool-relay/gpt-5-nano'}
+    assert without_haiku['agent']['title'] == {'model': 'retool-relay/gpt-5-nano', 'temperature': 0}
+
+
+def compaction_case(main, available, *, compaction='retool-relay/claude-sonnet-4-20250514', section='agent'):
+    """update_document for a removed compaction model; returns (settings, warnings)."""
+    before = source()
+    before.update(model=main, small_model='retool-relay/gpt-5.3-codex')
+    before[section] = {'compaction': {'model': compaction, 'temperature': 0}, 'title': {'model': compaction}}
+    warnings = []
+    result = update_document(before, [models.resolve(name)[0] for name in available], warnings=warnings)
+    return result, warnings
+
+
+@pytest.mark.parametrize('main,expected', [
+    ('retool-relay/claude-opus-5-5', 'retool-relay/gemini-3.5-flash'),
+    ('retool-relay/claude-opus-5-5#max', 'retool-relay/gemini-3.5-flash'),
+    ('retool-relay/gpt-5', 'retool-relay/gemini-3.1-flash-lite-preview'),
+    ('retool-relay/claude-haiku-4-5-20251001', HAIKU)])
+def test_removed_compaction_model_gets_the_cheapest_published_model_whose_window_holds_the_main_models(main, expected):
+    available = ('claude-opus-5-5', 'gpt-5', 'claude-haiku-4-5-20251001', 'gemini-3.1-flash-lite-preview',
+                 'gemini-3.5-flash', 'gpt-5-nano', 'gpt-5.4')
+    result, warnings = compaction_case(main, available)
+    assert result['agent']['compaction'] == {'model': expected, 'temperature': 0}
+    # Titles stay on the cheapest small model: only compaction needs the window.
+    assert result['agent']['title'] == {'model': HAIKU} and result['small_model'] == HAIKU
+    assert len(warnings) == 1 and 'agent.compaction.model' in warnings[0]
+    assert 'retool-relay/claude-sonnet-4-20250514' in warnings[0] and expected in warnings[0]
+
+
+def test_a_smaller_window_is_never_chosen_even_when_it_is_cheaper():
+    # Flash-Lite is earlier in the small tier but holds 983040 tokens, fewer than Opus 5.5's 1000000.
+    result, warnings = compaction_case('retool-relay/claude-opus-5-5',
+                                       ('claude-opus-5-5', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-flash'))
+    assert result['agent']['compaction'] == {'temperature': 0}
+    assert result['agent']['title'] == {'model': 'retool-relay/gemini-3.1-flash-lite-preview'}
+    assert len(warnings) == 1 and 'removed' in warnings[0] and '1000000' in warnings[0]
+
+
+def test_removed_compaction_override_is_dropped_with_a_warning_when_no_cheap_model_has_the_window():
+    result, warnings = compaction_case('retool-relay/claude-opus-5-5',
+                                       ('claude-opus-5-5', 'claude-haiku-4-5-20251001', 'gpt-5-nano', 'gpt-5.4'))
+    assert 'model' not in result['agent']['compaction'] and result['agent']['compaction'] == {'temperature': 0}
+    assert result['agent']['title'] == {'model': HAIKU}
+    assert len(warnings) == 1 and 'retool-relay/claude-sonnet-4-20250514' in warnings[0]
+    assert 'removed' in warnings[0] and 'main model' in warnings[0] and 'retool-relay/claude-opus-5-5' in warnings[0]
+
+
+@pytest.mark.parametrize('main', ['anthropic/claude-sonnet-5', None])
+def test_removed_compaction_override_is_dropped_when_the_main_models_window_is_unknown(main):
+    before = source()
+    before['agent'] = {'compaction': {'model': 'retool-relay/claude-sonnet-4-20250514'}}
+    before.pop('model')
+    if main:
+        before['model'] = main
+    warnings = []
+    result = update_document(before, [models.resolve(name)[0] for name in ('claude-opus-5-5', 'gemini-3.5-flash')],
+                             warnings=warnings)
+    assert result['agent']['compaction'] == {} and len(warnings) == 1
+    assert 'unknown' in warnings[0] and 'removed' in warnings[0]
+
+
+def test_a_deprecated_mode_named_compaction_is_handled_like_the_agent():
+    result, warnings = compaction_case('retool-relay/claude-opus-5-5', ('claude-opus-5-5', 'gemini-3.5-flash'),
+                                       section='mode')
+    assert result['mode']['compaction'] == {'model': 'retool-relay/gemini-3.5-flash', 'temperature': 0}
+    assert len(warnings) == 1 and 'mode.compaction.model' in warnings[0]
+
+
+def test_a_published_compaction_model_is_the_users_choice_and_is_kept_without_a_warning():
+    before = source()
+    before.update(model='retool-relay/claude-opus-5-5')
+    before['agent'] = {'compaction': {'model': HAIKU + '#high'}}
+    warnings = []
+    result = update_document(before, [models.resolve(name)[0] for name in ('claude-opus-5-5', 'claude-haiku-4-5-20251001')],
+                             warnings=warnings)
+    assert result['agent']['compaction'] == {'model': HAIKU} and warnings == []
+
+
+def test_cli_reports_the_compaction_decision_in_the_summary(tmp_path, capsys):
+    settings = installed(tmp_path, {
+        'model': 'retool-relay/gpt-5.3-codex',
+        'agent': {'compaction': {'model': 'retool-relay/claude-sonnet-4-20250514'}},
+        'provider': {'retool-relay': {'options': {'baseURL': 'http://localhost:8787/v1'}, 'models': {}}}})
+    code, summary, error = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'))
+    assert code == 0 and summary['written'] is True, error
+    assert len(summary['warnings']) == 1 and 'agent.compaction.model' in summary['warnings'][0]
+    saved = json.loads(settings.read_text(encoding='utf-8'))
+    assert saved['model'] == 'retool-relay/claude-opus-5-5' and 'model' not in saved['agent']['compaction']
+    code, summary, error = client(tmp_path, capsys)
+    assert code == 0 and summary['warnings'] == [] and summary['changed'] is False
 
 
 def test_removed_model_override_is_dropped_when_no_cheap_model_is_published():

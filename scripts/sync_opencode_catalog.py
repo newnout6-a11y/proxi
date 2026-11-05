@@ -6,6 +6,9 @@ indentation are kept, and nothing is written when the catalog is already current
 Preview is read-only and masks credentials unless --include-secrets is given.
 --write requires a backup directory and preserves other providers, authentication
 and unrelated settings; a file with comments is rewritten only with --allow-reformat.
+A removed model behind agent.compaction.model is replaced only by a cheap model whose
+window holds the main model's, else the override is dropped; the summary's warnings
+say which.
 """
 import argparse
 import codecs
@@ -25,8 +28,10 @@ from apierr import ApiError
 from scripts.probe_client_settings import catalog_policy, effort_controls, routable_entries
 
 PROVIDER = 'retool-relay'
-# Hidden OpenCode agents that run on their own (titles, summaries, compaction).
-BACKGROUND_AGENTS = ('title', 'summary', 'compaction')
+# Hidden OpenCode agents that run on their own over small inputs (titles, summaries). Compaction is
+# not one of them: it reads the whole session, so it is handled apart (see update_document).
+BACKGROUND_AGENTS = ('title', 'summary')
+COMPACTION_AGENT = 'compaction'
 # Retool credits have no verified USD price here, so "cheap" means the small/fast
 # tier, in the order OpenCode itself prefers for small_model (Haiku, Flash, nano).
 SMALL_MODELS = ('claude-haiku-4-5-20251001', 'gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview',
@@ -65,7 +70,23 @@ def _named_objects(section):
     return [(name, item) for name, item in section.items() if isinstance(item, dict)] if isinstance(section, dict) else []
 
 
-def update_document(document, entries, default_model='claude-opus-5-5'):
+def _compaction_warning(where, dropped, replacement, main, main_window):
+    """What happened to a compaction model that is no longer published, and why."""
+    lost = '%s is no longer published' % dropped
+    if replacement:
+        return ("%s: %s; replaced with %s, the cheapest published model whose window holds the main model's "
+                '(%d tokens), because compaction reads the whole session' % (where, lost, replacement, main_window))
+    if main_window is None:
+        return ('%s: %s and the window of the main model (%s) is unknown, so no replacement can be shown to hold '
+                "the session; the override was removed and OpenCode compacts with the session's model"
+                % (where, lost, main or 'no "model" set'))
+    return ('%s: %s and no cheap published model has a window of the main model\'s %d tokens (%s); the override '
+            "was removed and OpenCode compacts with the session's model" % (where, lost, main_window, main))
+
+
+def update_document(document, entries, default_model='claude-opus-5-5', warnings=None):
+    """The document with the relay catalog replaced; `warnings` collects what the caller should read."""
+    warnings = [] if warnings is None else warnings
     result = copy.deepcopy(document)
     providers = result.get('provider')
     provider = providers.get(PROVIDER) if isinstance(providers, dict) else None
@@ -111,10 +132,13 @@ def update_document(document, entries, default_model='claude-opus-5-5'):
     small = next((name for name in SMALL_MODELS if name in new_models), None)
 
     def update_reference(container, key, replacement):
-        """Canonicalize a relay model reference; a removed model gets `replacement`, or no override at all."""
+        """Canonicalize a relay model reference; a removed model gets `replacement`, or no override at all.
+
+        Returns the old reference when its model was removed, else None.
+        """
         item = container.get(key)
         if not isinstance(item, str) or not item.startswith(PROVIDER + '/'):
-            return
+            return None
         raw, _, variant = item[len(PROVIDER) + 1:].partition('#')
         try:
             name = models.resolve(raw)[0]['id']
@@ -123,15 +147,36 @@ def update_document(document, entries, default_model='claude-opus-5-5'):
         if name in new_models:
             suffix = '#' + variant if variant in new_models[name]['variants'] else ''
             container[key] = PROVIDER + '/' + name + suffix
-        elif replacement:
+            return None
+        if replacement:
             container[key] = PROVIDER + '/' + replacement
         else:
             del container[key]
+        return item
+
+    def window(reference):
+        """Context window of a published relay model reference, None for anything else."""
+        if isinstance(reference, str) and reference.startswith(PROVIDER + '/'):
+            published = new_models.get(reference[len(PROVIDER) + 1:].partition('#')[0])
+            return published['limit']['context'] if published else None
+        return None
     update_reference(result, 'model', fallback)
     update_reference(result, 'small_model', small)
+    # Compaction summarizes the whole session, and a model with a smaller window than the session
+    # stalls without an error (OpenCode issue #46164). Only the small tier counts as cheap here.
+    main = result.get('model')
+    main_window = window(main)
+    roomy = next((name for name in SMALL_MODELS if main_window is not None and name in new_models
+                  and new_models[name]['limit']['context'] >= main_window), None)
     for section in ('agent', 'mode'):
         for name, agent in _named_objects(result.get(section)):
-            update_reference(agent, 'model', small if name in BACKGROUND_AGENTS else fallback)
+            if name == COMPACTION_AGENT:
+                dropped = update_reference(agent, 'model', roomy)
+                if dropped:
+                    warnings.append(_compaction_warning('%s.%s.model' % (section, name), dropped,
+                                                        agent.get('model'), main, main_window))
+            else:
+                update_reference(agent, 'model', small if name in BACKGROUND_AGENTS else fallback)
     for _, command in _named_objects(result.get('command')):
         update_reference(command, 'model', fallback)
     listed = '\n'.join(PROVIDER + '/' + name for name in new_models)
@@ -357,7 +402,8 @@ def run(args):
     original = read_file(path, 'OpenCode settings file', ' (use --settings; OpenCode also reads opencode.json)')
     document, style, commented = parse_settings(original, str(path))
     entries = routable_entries(args.relay_config)
-    result = update_document(document, entries)
+    warnings = []
+    result = update_document(document, entries, warnings=warnings)
     unchanged = result == document
     encoded = original if unchanged else encode_settings(result, style)
     if args.write and commented and not unchanged and not args.allow_reformat:
@@ -370,7 +416,7 @@ def run(args):
     print(json.dumps({'models': len(entries), 'written': backup is not None, 'changed': not unchanged,
                       'backup': str(backup) if backup else None, 'preview': args.output,
                       'preview_redacted': bool(args.output) and not args.include_secrets,
-                      'drops_comments': commented and not unchanged}, ensure_ascii=False))
+                      'drops_comments': commented and not unchanged, 'warnings': warnings}, ensure_ascii=False))
     return 0
 
 
