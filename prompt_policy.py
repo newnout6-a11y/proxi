@@ -119,7 +119,9 @@ class PlanInput:
 
         parsed.requested_model (set by validate, P6) is the client's model name without the
         @profile and #effort suffixes and before alias resolution; it falls back to parsed.model.
-        parsed.virtual_profile (P6) is the @profile suffix or None.
+        parsed.virtual_profile (P6) is the @profile suffix or None. parsed.prompt_purpose (P2) is
+        the prompt-layer purpose, e.g. "client-service", while parsed.request_purpose stays what
+        it is today (plan 4.3); it falls back to parsed.request_purpose.
         """
         headers = _lower_headers(headers)
         identity = identity or {}
@@ -129,7 +131,7 @@ class PlanInput:
             dialect=str(dialect or getattr(parsed, "dialect", "") or ""),
             client=prompt_client(identity, headers),
             agent=str(identity.get("agent") or ""),
-            purpose=str(getattr(parsed, "request_purpose", "") or ""),
+            purpose=str(getattr(parsed, "prompt_purpose", "") or getattr(parsed, "request_purpose", "") or ""),
             request_class=str(identity.get("request_class") or ""),
             model=model,
             requested_model=str(getattr(parsed, "requested_model", "") or model),
@@ -265,6 +267,17 @@ def compile_document(doc: dict, base_dir: pathlib.Path, *, rev: int) -> Snapshot
     raise NotImplementedError
 
 
+def structured_contract(snapshot: Snapshot | None, output_spec: dict | None, *, tools: bool, tool_choice) -> str:
+    """The structured-output contract for a head (plan I10), shared by the runtime and preview.
+
+    "" without output_spec. The default text is structured.instructions(output_spec, tools=...,
+    tool_choice=...) called, never copied; relay_texts.structured, when set, wraps it with
+    {{default}}, {{schema}} and {{schema_name}}. P1 implements it; until then callers fall back
+    to structured.instructions on NotImplementedError.
+    """
+    raise NotImplementedError
+
+
 class PromptStore:
     """Revisions, conversation pins, live reload and the in-memory record of recent heads.
 
@@ -319,12 +332,21 @@ class PromptStore:
         return 0
 
     def record(self, entry: dict) -> None:
+        """Keep one non-legacy request in the in-memory ring (RECENT_LIMIT entries, newest first in recent()).
+
+        entry may carry "request": {"body", "dialect", "headers"} for preview without a pasted
+        body (plan 4.3); the ring keeps it only for the newest few entries and never journals it.
+        """
         if self.snapshot() is None:
             return
         raise NotImplementedError
 
     def recent(self, limit: int = 50) -> list[dict]:
         return []
+
+    def request(self, request_id: str | None = None) -> dict | None:
+        """The kept {"body", "dialect", "headers"} of the newest recorded request (or of request_id), None if not kept."""
+        return None
 
     def preview(self, body: dict, dialect: str, headers: dict, document: dict | None = None) -> dict:
         raise NotImplementedError
