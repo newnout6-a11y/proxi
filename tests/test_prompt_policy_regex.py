@@ -20,6 +20,9 @@ BOMBS = [
     r"(?:(?:ab)*)*", r"(?i)(?:[a-z]+\d*)+", r"(?:\w+\s*)*:",
     # neighbouring unbounded repeats over the same characters: polynomial, but with no way to bound the text
     r"a*a*", r".*.*=.*", r"\s*\s*x", r"\w+\w+\w+", r"a*b?a*", r"(?:ab)*(?:ab)*c", r"[a-c]+[b-d]+x",
+    # long items that are not plain repeats: a group or an optional wrapper around an unbounded repeat
+    r"(?i)a{2,}(a+)?b", r"(?i)\s*\s?(?:\d+[^a]|[^a]*?\d)", r"([ab]{2,}|[ab]+?).*?ab+", r"(?s).\w*([ab]*\d)-?",
+    r"\s*(?:foo|bar)?\s*x", r"(?:a+)?a+b", r"(?:\w+,)*\w*(?:\w+,)*x",
 ]
 
 NORMAL = [

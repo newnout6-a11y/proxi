@@ -582,6 +582,19 @@ class _Shape:
     def unbounded(op, av):
         return op in _REPEATS and av[1] >= _LARGE_REPEAT
 
+    def wide(self, op, av):
+        """True when one match of the item can be arbitrarily long: an unbounded repeat inside it, not an atomic one."""
+        if op in _REPEATS:
+            return av[1] >= _LARGE_REPEAT or self.wide_in(av[2])
+        if op == _sre_const.SUBPATTERN:
+            return self.wide_in(av[3])
+        if op == _sre_const.BRANCH:
+            return any(self.wide_in(alternative) for alternative in av[1])
+        return False
+
+    def wide_in(self, node):
+        return any(self.wide(op, av) for op, av in _items(node))
+
     def scan(self, node, follow, flags, in_loop, big_loop):
         """Raise _RegexHazard for the first dangerous construct in node.
 
@@ -681,19 +694,19 @@ class _Shape:
             raise _RegexHazard("an optional alternative inside a repeated group can match what follows it")
 
     def adjacent(self, items, firsts, flags):
-        """Two unbounded repeats side by side are ambiguous when they can match one and the same non-empty text.
+        """Two long items side by side are ambiguous when they can match one and the same non-empty text.
 
         Such a text starts with a character both can start with and ends with a character both can end with.
         """
         for index, (op, av) in enumerate(items):
-            if not self.unbounded(op, av):
+            if not self.wide(op, av):
                 continue
-            starts = self.first(av[2], flags)[0]
-            ends = self.first(av[2], flags, True)[0]
+            starts = self.item_first(op, av, flags)[0]
+            ends = self.item_first(op, av, flags, True)[0]
             for other in range(index + 1, len(items)):
                 other_op, other_av = items[other]
-                if (self.unbounded(other_op, other_av) and starts & self.first(other_av[2], flags)[0]
-                        and ends & self.first(other_av[2], flags, True)[0]):
+                if (self.wide(other_op, other_av) and starts & self.item_first(other_op, other_av, flags)[0]
+                        and ends & self.item_first(other_op, other_av, flags, True)[0]):
                     raise _RegexHazard("neighbouring unbounded repeats can match the same text")
                 if not firsts[other][1]:
                     break
@@ -1287,7 +1300,7 @@ class _Compiler:
         self._compile_codex()
         data.patterns = self.patterns
         data.files = tuple(self.files)
-        data.warnings = tuple(self.warnings)
+        data.warnings = tuple(dict.fromkeys(self.warnings))
         data.size = self.total
         return data
 
@@ -1367,13 +1380,24 @@ class _Compiler:
             for name, value in raw.items():
                 path = _path("profiles", name)
                 if name in BUILTIN_PROFILES:
-                    _err(path, "the built-in profile %r cannot be redefined" % name)
+                    self._builtin_entry(name, value, path)
+                    continue
                 if not PROFILE_NAME.fullmatch(name):
                     _err(path, "a profile name uses letters, digits, '.', '_' and '-', starts with a letter or digit "
                                "and has up to 64 characters (it is also the model suffix after @)")
                 profiles[name] = self._profile(name, value, path)
                 data.profile_order.append(name)
         data.profiles = profiles
+
+    @staticmethod
+    def _builtin_entry(name, value, path):
+        """An entry for a built-in profile may only repeat what the built-in says (the plan's example lists passthrough)."""
+        builtin = BUILTIN_PROFILES[name]
+        repeats = (isinstance(value, dict) and set(value) <= {"description", "head"}
+                   and value.get("head", builtin["head"]) == builtin["head"]
+                   and isinstance(value.get("description", ""), str))
+        if not repeats:
+            _err(path, "the built-in profile %r cannot be redefined (an entry may only repeat it)" % name)
 
     def _profile(self, name, raw, path):
         _object(raw, path)
@@ -2252,7 +2276,7 @@ class PromptStore:
                     if attempt == REPLACE_ATTEMPTS - 1:
                         raise
                     time.sleep(REPLACE_PAUSE)
-            return (info.st_mtime_ns, info.st_size)
+            return self._written(info, payload)
         except (OSError, ValueError):
             raise apierr.service_unavailable("Cannot save the prompts file") from None
         finally:
@@ -2262,6 +2286,22 @@ class PromptStore:
                     os.unlink(temporary)
                 except OSError:
                     pass
+
+    def _written(self, before, payload):
+        """The (mtime_ns, size) of the file that save just put in place, to be remembered as already known.
+
+        A rename keeps the stamp, so it is normally the one `before` (the temporary file) had. If the file system stamped it
+        otherwise, or something wrote over it at once, the bytes decide: only our own bytes are remembered, anything else
+        stays unknown and the next maybe_reload() picks it up as the outside edit it is.
+        """
+        after = _signature(self.path)
+        if after == (before.st_mtime_ns, before.st_size):
+            return after
+        try:
+            ours = self.path.read_bytes() == payload.encode("utf-8")
+        except OSError:
+            ours = False
+        return after if ours else None
 
     # -- planning ---------------------------------------------------------------------------------------------------
     def plan(self, inp: PlanInput) -> Plan:
