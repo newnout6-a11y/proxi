@@ -1,5 +1,6 @@
 """Journal events name the account that served them: a short tag, never a raw ID."""
 import asyncio
+import copy
 import io
 import json
 import time
@@ -179,6 +180,30 @@ def test_an_upstream_rejection_names_the_account_even_from_the_transport_thread(
     refusals = by_kind(journaled).get("upstream.rejected")
     assert refusals and all(event["data"].get("account") == TAG for event in refusals)
     assert ACCOUNT not in json.dumps(journaled, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("edited,kind", [(False, "native_history.resume"), (True, "native_history.reset")])
+def test_native_history_events_carry_the_account_tag(tmp_path, monkeypatch, edited, kind):
+    from test_native_history import append_result, close, harness, parsed, tool_reply
+    from test_review_fixes_pr19 import END, text
+
+    pool, runner, _ = harness(tmp_path, monkeypatch, [tool_reply(), [text("done"), *END]])
+    pool.backends[0].cfg["account_id"] = ACCOUNT
+    before = journal.JOURNAL.last_seq
+
+    async def scenario():
+        try:
+            first = parsed(FIRST)
+            messages = append_result(copy.deepcopy(FIRST), first, await run(runner, first), "chat")
+            if edited:
+                messages[0]["content"] = "edited task"  # the signed prefix no longer matches
+            await run(runner, parsed(messages))
+        finally:
+            await close(pool)
+
+    asyncio.run(scenario())
+    found = [e for e in journal.JOURNAL.query(since=before, limit=2000) if e["kind"] == kind]
+    assert len(found) == 1 and found[0]["data"].get("account") == TAG
 
 
 def test_the_tag_leaves_the_context_before_the_session_is_released(tmp_path):
