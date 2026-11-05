@@ -29,6 +29,9 @@ DEFAULTS = {
     "show_unrouted_models": False,
     "relay_system_prompt": None,  # null uses the default role; a string supplies the user's policy
     "relay_system_prompt_mode": "standalone",  # standalone | append | replace client instructions
+    # Prompt control (profiles, rules, relay texts). "" is prompts.json next to config.json, a relative path
+    # starts there too; load() replaces it with the absolute path. Without the file nothing changes.
+    "prompts_file": "",
     "provider_access": {},  # resource-bound BYOK/retention facts, scoped to each account
     "max_body_bytes": 32 * 1024 * 1024,
     "max_frame_bytes": 16 * 1024 * 1024,
@@ -98,6 +101,8 @@ DEFAULTS = {
 }
 
 REQUIRED = ("base", "page_uuid", "ua")
+PROMPTS_FILE = "prompts.json"
+PROMPTS_FILE_MAX_CHARS = 4096
 
 # Cookie values that are just host names are not secrets.
 HOSTNAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
@@ -269,6 +274,17 @@ def _read_file(path):
         raise service_unavailable(f"config is not valid JSON: {exc}")
 
 
+def _prompts_path(value, config_path):
+    """Absolute path of the prompts file: "" is prompts.json beside config.json, a relative path starts there too."""
+    if not isinstance(value, str):
+        raise service_unavailable("prompts_file must be a string")
+    if "\x00" in value:
+        raise service_unavailable("prompts_file must not contain NUL characters")
+    if len(value) > PROMPTS_FILE_MAX_CHARS:
+        raise service_unavailable(f"prompts_file must be at most {PROMPTS_FILE_MAX_CHARS} characters")
+    return os.path.abspath(os.path.join(os.path.dirname(config_path), value.strip() or PROMPTS_FILE))
+
+
 def _ensure_relay_key(cfg):
     key = os.environ.get("RELAY_API_KEY") or cfg.get("relay_api_key")
     if key:
@@ -406,6 +422,7 @@ def _load(path):
     if cfg.get('relay_system_prompt_mode') not in ('standalone', 'append', 'replace'):
         raise service_unavailable("relay_system_prompt_mode must be one of standalone, append, replace")
     cfg["_config_path"] = os.path.abspath(path)
+    cfg["prompts_file"] = _prompts_path(cfg.get("prompts_file"), cfg["_config_path"])
     cfg["_persist_auth"] = not (os.environ.get("RETOOL_COOKIE") or os.environ.get("RETOOL_XSRF"))
 
     # Secrets may live outside the repo: env wins over file.
