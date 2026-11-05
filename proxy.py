@@ -28,6 +28,7 @@ import generation
 import models as model_catalog
 import sse
 import models
+import prompt_body
 import prompt_policy
 import validate
 from accounts import UNNAMED, AccountDispatcher, account_tag
@@ -43,6 +44,11 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# A recorded request keeps its body for the preview only up to this size (plan 4.3 item 15).
+RECORD_REQUEST_BYTES = 1024 * 1024
+# What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
+_CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
+                 "dialect", "thinking_placeholder", "virtual_profile", "requested_model")
 
 
 class RateLimiter:
@@ -602,6 +608,16 @@ def make_handler(runtime: Runtime):
             refusal = runtime.pool.model_refusal(parsed.entry, **scope)
             if refusal is not None:
                 raise refusal
+            before = parsed
+            parsed = self._apply_prompts(data, parsed, dialect, len(raw))
+            if parsed is not before:
+                # An edited body can change what acquire() would plan (a profile that hides every tool).
+                changed = acquire_plan(cfg, parsed).kwargs
+                if changed != scope:
+                    scope = changed
+                    refusal = runtime.pool.model_refusal(parsed.entry, **scope)
+                    if refusal is not None:
+                        raise refusal
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
             self._effort_str = effective_effort or (
@@ -627,7 +643,11 @@ def make_handler(runtime: Runtime):
                              request_id=self.request_id, control='mid_conversation_system',
                              handling='inline_user_text')
             if self._client_trace:
-                self._client_trace.event("validated_request", parsed=vars(parsed), effective_effort=self._effort_str)
+                # The prompt layer's own attributes (prompt_*) are not part of what the client validated.
+                self._client_trace.event("validated_request",
+                                         parsed={key: value for key, value in vars(parsed).items()
+                                                 if not key.startswith("prompt_")},
+                                         effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
             console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}")
 
@@ -672,6 +692,97 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _apply_prompts(self, data, parsed, dialect, size):
+            """The prompt hooks of a completion (plan section 3): the plan, a second parse of an edited body, the generation.
+
+            Returns the request the turn runs on: `parsed` itself, or the parse of the body a profile rewrote. A refusal
+            of the engine (apierr.ApiError: 400 for a $header profile that does not exist, 404 for a virtual model whose
+            profile does not) reaches the client before anything goes upstream, a stream included. Any other failure of
+            the layer is journaled and the request takes the legacy path (plan I8).
+            """
+            parsed.prompt_purpose = client_context.prompt_purpose(parsed)
+            prompts = getattr(runtime, "prompts", None)
+            if prompts is None:
+                return parsed
+            plan_input, stage = None, "reload"
+            try:
+                prompts.maybe_reload()
+                stage = "plan"
+                plan_input = prompt_policy.PlanInput.from_request(parsed, client_context.current(), self.headers,
+                                                                  dialect)
+                plan = prompts.plan(plan_input)
+            except apierr.ApiError:
+                raise
+            except Exception as exc:
+                self._prompt_failure(stage, exc)
+                plan = prompt_policy.Plan()
+            parsed.prompt_plan = plan
+            if plan.legacy:
+                return parsed
+            changes, warnings, first = [], [], parsed
+            if plan.body_edits:
+                try:
+                    rewritten, changes = prompt_body.rewrite(data, dialect, plan.snapshot.profile(plan.profile),
+                                                             plan.snapshot)
+                    parse = {"anthropic": validate.parse_anthropic,
+                             "responses": validate.parse_responses}.get(dialect, validate.parse_chat)
+                    parsed = parse(rewritten, cfg)
+                except Exception as exc:
+                    self._prompt_failure("rewrite", exc)
+                    first.prompt_plan = prompt_policy.Plan()
+                    return first
+                for name in _CARRIED_OVER:
+                    if hasattr(first, name):
+                        setattr(parsed, name, getattr(first, name))
+                self._journal_skipped_edits(changes)
+            self._apply_generation(parsed, plan, warnings)
+            parsed.prompt_plan, parsed.prompt_input = plan, plan_input
+            parsed.prompt_changes, parsed.prompt_warnings = changes, warnings
+            if size <= RECORD_REQUEST_BYTES:
+                parsed.prompt_request = {"body": data, "dialect": dialect,
+                                         "headers": client_context.recorded_headers(self.headers)}
+            return parsed
+
+        def _apply_generation(self, parsed, plan, warnings):
+            """The profile's effort and verbosity replace the client's, under the rules the client's own obey (plan 2.3)."""
+            effort, verbosity = (plan.generation or {}).get("effort"), (plan.generation or {}).get("verbosity")
+            where = "profiles.%s.generation." % plan.profile
+            if effort is not None:
+                try:
+                    _, resolved = models.resolve_tolerant(
+                        parsed.model, effort, strict=cfg["strict_models"], default_model=cfg.get("model"),
+                        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+                except apierr.ApiError as error:
+                    raise apierr.bad_request("profile '%s' sets generation.effort to '%s': %s" % (
+                        plan.profile, effort, error.message), param=where + "effort")
+                parsed.effort, parsed.requested_effort = resolved, str(effort).lower()
+            if verbosity is not None:
+                if verbosity not in ("low", "medium", "high"):
+                    raise apierr.bad_request("profile '%s' sets generation.verbosity to '%s': it must be low, medium "
+                                             "or high" % (plan.profile, verbosity), param=where + "verbosity")
+                if verbosity in parsed.entry.get("verbosity_levels", ()):
+                    parsed.verbosity = verbosity
+                else:
+                    warnings.append("generation.verbosity %s not applied: %s has no such level" % (verbosity, parsed.model))
+
+        def _journal_skipped_edits(self, changes):
+            """One prompt.edit_skipped per kind of edit the rewrite had to leave out of this request."""
+            skipped = {}
+            for change in changes:
+                if change.get("skipped"):
+                    key = (str(change.get("op")), str(change.get("reason")))
+                    skipped[key] = skipped.get(key, 0) + 1
+            for (op, reason), count in skipped.items():
+                journal.emit("prompt.edit_skipped", "Правка промпта пропущена: %s (%s)" % (op, reason), "warn",
+                             request_id=self.request_id, op=op, reason=reason, count=count)
+
+        def _prompt_failure(self, stage, exc):
+            """The prompt layer failed on this request: the legacy path serves it (plan I8)."""
+            text = redact(str(exc)).replace("\n", " ")[:160]
+            journal.emit("prompt.runtime_error", "Слой промптов дал сбой (%s), запрос идёт прежним путём: %s: %s" % (
+                stage, type(exc).__name__, text), "error", request_id=self.request_id, stage=stage)
+            console_log.write("[err] prompt layer failed (%s): %s; legacy path" % (stage, type(exc).__name__))
 
         def _pool_unavailable(self, entry, scope):
             """acquire()'s error for this request if it were asked now, after the one balance recheck a 402 gets."""
