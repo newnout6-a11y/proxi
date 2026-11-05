@@ -29,6 +29,25 @@ CLIENT_TEXT_KINDS = SERVICE_KINDS | {"client-text"}
 # output contract (summaries, titles, classifiers), never the chat the relay
 # policy is written for. The header needs CLAUDE_CODE_GATEWAY_HINT_HEADERS=1.
 OWN_PROMPT_CLASSES = frozenset({"auxiliary", "compaction"})
+# OpenCode runs its title, compaction and summary jobs as hidden agents of these names. The 1.x plugin
+# scripts/integrations/proxi-session-labels.js sends the agent of every request as X-Proxi-Agent.
+OPENCODE_SERVICE_AGENTS = frozenset({"title", "compaction", "summary"})
+# The opening of the prompt each of those agents runs on, which is its whole system text (the prompt layer
+# matches on the start, never the full text: the rest is reworded from release to release).
+#   1.x agent/prompt/title.txt (unchanged since 2025-12, and still the 2.0 and 2.1 title agent), 2.2 title agent in
+#   core/src/plugin/agent.ts, 1.x compaction.txt (the second line before 2026-04-22), summary.txt and the 2.x summary agent.
+# OpenCode 2.x compaction has no prompt of its own: it resends the chat's own system and tools and ends on a
+# user message, so it is told apart by nothing here and goes where the chat goes (which keeps the prompt cache).
+OPENCODE_SERVICE_PROMPTS = (
+    "You are a title generator. You output ONLY a thread title. Nothing else.",
+    "You name conversations so the user can find them later in a list of past sessions.",
+    "You are an anchored context summarization assistant for coding sessions.",
+    "You are a helpful AI assistant tasked with summarizing conversations.",
+    "Summarize what was done in this conversation. Write like a pull request description.",
+)
+# Request headers a recorded request keeps for a preview: client identity and affinity, never a credential.
+_RECORDED_HEADERS = frozenset({"user-agent", "originator", "x-session-affinity", "x-session-id"})
+_RECORDED_PREFIXES = ("x-proxi-", "x-claude-code-", "x-opencode-")
 SDK_TITLE_PREFIX = "You are naming a coding session so the user can pick it out of a long list of sessions."
 # Claude Code before 2.1.234 asked for the same title in these words.
 LEGACY_TITLE_PREFIX = "Generate a concise, sentence-case title"
@@ -80,6 +99,42 @@ def request_kind(parsed, identity=None):
             and (getattr(parsed, "prompt", "") or "").strip() == "User: ."):
         return "connection-probe"
     return "client-text" if info.get("client") in _CLIENTS else "generation"
+
+
+def _is_opencode_service_job(parsed, identity=None):
+    """True for OpenCode's own title, compaction and summary jobs: tool-less, run by one of its hidden agents."""
+    if getattr(parsed, "tools", None):
+        return False
+    info = current() if identity is None else identity
+    agent = str(info.get("agent") or "").strip().lower()
+    if info.get("client") == "opencode" and agent in OPENCODE_SERVICE_AGENTS:
+        return True
+    return (getattr(parsed, "system", "") or "").lstrip().startswith(OPENCODE_SERVICE_PROMPTS)
+
+
+def prompt_purpose(parsed, identity=None):
+    """The purpose prompt rules match on: request_purpose, except that OpenCode's own title, compaction and
+    summary jobs are "client-service".
+
+    request_kind and parsed.request_purpose stay as they are. The journal, the console, the retry of an empty reply
+    and execution read them, so a legacy request must keep its old value (plan 4.3 item 14); the prompt layer alone
+    protects client-service jobs from prompt edits. A request that sends tools never counts: OpenCode 2.x
+    compaction resends the chat's own tools and system, so it follows the chat's profile and shares its cache.
+    """
+    kind = getattr(parsed, "request_purpose", None) or request_kind(parsed, identity)
+    if kind in ("client-text", "generation") and _is_opencode_service_job(parsed, identity):
+        return "client-service"
+    return kind
+
+
+def recorded_headers(headers):
+    """The headers of a request that a recorded preview keeps, lower-cased: client identity and affinity, no credential."""
+    kept = {}
+    for name, value in (headers or {}).items():
+        lowered = str(name).lower()
+        if lowered in _RECORDED_HEADERS or lowered.startswith(_RECORDED_PREFIXES):
+            kept[lowered] = str(value)
+    return kept
 
 
 def clean(value, limit=240):
