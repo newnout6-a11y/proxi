@@ -1325,6 +1325,7 @@ test('the role settings of the legacy path are applied at once: saving them asks
   await mockPrompts(page);
   await login(page);
   await rail(page, 'Настройки').click();
+  await expect(page.locator('#system-instructions-live')).toContainText('применяются сразу, в том числе к начатым диалогам: кэш промпта активных диалогов будет записан заново');
   await page.getByLabel('Стандартная роль relay').uncheck();
   await page.getByLabel('Инструкции для модели', { exact: true }).fill('Новая роль');
   await page.getByRole('radio', { name: /Дополнить клиента/ }).check();
