@@ -412,8 +412,13 @@ python scripts/replay_upstream.py --allow-paid --body "<state-dir>/logs/upstream
 ход на обработку контекста (до начала мышления), скрытое мышление, генерацию аргументов
 инструментов и текст. Аргументы инструментов стримятся клиенту по мере генерации.
 
-Сборка фронтенда: `cd web; npm install; npm run build` (результат в `web/dist`).
-E2E: `npx playwright test`.
+Сборка фронтенда: `cd web; npm ci; npm run build` (результат в `web/dist`). Сборка закоммичена,
+и CI падает, если свежая пересборка отличается от неё: после правок в `web/src` пересоберите
+и закоммитьте `web/dist`.
+Проверки админки (синтетические данные, relay не нужен): `node --test web/tests/turns.test.mjs`;
+браузерные сценарии `cd web; npx playwright test` (нужен Chromium: `npx playwright install chromium`
+или путь к установленному в `PW_CHROMIUM`); дизайн-гейт с axe и проверкой переполнения
+`cd web; npm run test:design`.
 
 Консоль: cache `read` выделен бирюзовым, `write` — янтарным. Запись от 50 000
 токенов получает красную метку `WRITE HIGH`; рост write относительно предыдущего
