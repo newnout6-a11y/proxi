@@ -11,7 +11,7 @@ import pytest
 
 import direct
 import journal
-from keepwarm_harness import backend as warm_backend, drive, session as warm_session
+from keepwarm_harness import DUE, backend as warm_backend, drive, session as warm_session
 from test_account_rate_limit import hourly, retool, turn  # noqa: F401 - fixture
 from test_native_context_reuse import FIRST, Backend, request, run, setup
 from test_serving_accounts import M, account, relay_pool  # noqa: F401 - fixture
@@ -113,7 +113,7 @@ def test_pool_events_name_the_account_a_conversation_moves_from_and_to(tmp_path)
 
 
 def test_keepwarm_ping_events_carry_the_account_tag(monkeypatch):
-    target = warm_session(backend=warm_backend(ACCOUNT), _warm_at=0)
+    target = warm_session(backend=warm_backend(ACCOUNT), _warm_at=DUE)
     before = journal.JOURNAL.last_seq
     drive(monkeypatch, target, seconds=3)
     pinged = [e for e in journal.JOURNAL.query(since=before) if e["kind"] == "cache.keepwarm"]
@@ -121,7 +121,7 @@ def test_keepwarm_ping_events_carry_the_account_tag(monkeypatch):
 
 
 def test_keepwarm_failure_events_carry_the_account_tag(monkeypatch):
-    target = warm_session(backend=warm_backend(ACCOUNT), _warm_at=0)
+    target = warm_session(backend=warm_backend(ACCOUNT), _warm_at=DUE)
 
     def fail(*_args):
         raise OSError("synthetic failure")
