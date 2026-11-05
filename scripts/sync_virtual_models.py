@@ -42,7 +42,9 @@ def load_snapshot(relay_config, prompts=None):
         raise ValueError('relay configuration %s must contain a JSON object' % relay_config)
     cfg = {**RELAY_DEFAULTS, **saved, '_config_path': os.path.abspath(relay_config)}
     try:
-        store = prompt_policy.PromptStore(cfg, None if prompts is None else str(prompts))
+        # An explicit path is the user's, relative to where the command runs; the store would read a relative
+        # one from beside the relay configuration.
+        store = prompt_policy.PromptStore(cfg, None if prompts is None else os.path.abspath(prompts))
         snapshot = store.snapshot()
     except prompt_policy.PromptConfigError as error:
         raise ValueError('prompts file is invalid: %s' % error) from None

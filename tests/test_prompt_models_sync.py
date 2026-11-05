@@ -109,6 +109,20 @@ def test_an_explicit_prompts_file_is_handed_to_the_store_as_given(tmp_path, caps
     assert cfg['strict_models'] is True  # the relay's own defaults, as the relay builds its store
 
 
+def test_a_relative_prompts_path_means_relative_to_where_the_command_runs(tmp_path, store, monkeypatch):
+    # The store reads a relative path from beside the relay configuration, so the script makes it absolute first.
+    (tmp_path / 'elsewhere').mkdir()
+    (tmp_path / 'elsewhere' / 'p.json').write_text('{}', encoding='utf-8')
+    store.path = tmp_path / 'elsewhere' / 'p.json'
+    store.current = FakeSnapshot(PUBLISH)
+    monkeypatch.chdir(tmp_path / 'elsewhere')
+    sync_virtual_models.load_snapshot(relay_config(tmp_path), 'p.json')
+    assert store.constructed[-1][1] == str(tmp_path / 'elsewhere' / 'p.json')
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match='prompts file not found'):
+        sync_virtual_models.load_snapshot(relay_config(tmp_path), 'p.json')
+
+
 def test_a_missing_explicit_prompts_file_stops_the_sync_before_anything_is_written(tmp_path, capsys, store):
     store.current = FakeSnapshot(PUBLISH)
     settings = installed(tmp_path)
