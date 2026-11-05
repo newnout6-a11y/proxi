@@ -518,7 +518,8 @@ class TurnRunner:
                 # The route lacks constrained decoding. Supply the contract as
                 # instructions; the HTTP adapter validates the complete reply.
                 instructions = "\n\n".join(part for part in (
-                    instructions, structured.instructions(output_spec, tools=bool(native_tools))) if part)
+                    instructions, structured.instructions(output_spec, tools=bool(native_tools),
+                                                          tool_choice=choice)) if part)
                 log("turn.structured_output", "Структурированный вывод эмулируется проверкой ответа: %s" % output_spec["kind"],
                     "debug", output_format=output_spec["kind"], source=output_spec["source"])
             reminder = ""

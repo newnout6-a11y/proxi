@@ -560,3 +560,41 @@ def test_json_object_and_tool_instructions_differ_from_the_schema_text():
     with_tools = structured.instructions(spec, tools=True)
     assert with_tools.startswith('[STRUCTURED OUTPUT FORMAT]\nUse the supplied tools as usual.')
     assert 'Schema name: memory' in with_tools and 'Schema description: picks files' in with_tools
+
+
+CONTRACT = ('exactly one JSON value that conforms to the JSON Schema below. Output only that JSON. '
+            'Do not wrap it in Markdown fences and do not add any other text.\n'
+            'JSON Schema: ' + json.dumps(MEMORY, separators=(',', ':')))
+TOOLLESS_HEAD = '[STRUCTURED OUTPUT FORMAT]\nYour reply must be ' + CONTRACT
+TOOL_HEAD = ('[STRUCTURED OUTPUT FORMAT]\nUse the supplied tools as usual. Your final answer, the reply in which '
+             'you call no tool, must be ' + CONTRACT)
+
+
+def test_the_usual_contract_texts_stay_byte_identical_because_they_are_part_of_the_cached_head():
+    spec = {'kind': 'json_schema', 'schema': MEMORY, 'name': None, 'description': None}
+    assert structured.instructions(spec) == TOOLLESS_HEAD
+    assert structured.instructions(spec, tools=True) == TOOL_HEAD
+    assert structured.instructions(spec, tools=True, tool_choice='auto') == TOOL_HEAD
+    assert structured.instructions(spec, tools=False, tool_choice='auto') == TOOLLESS_HEAD
+
+
+def test_tools_the_model_may_not_call_do_not_appear_in_the_contract():
+    spec = {'kind': 'json_schema', 'schema': MEMORY, 'name': None, 'description': None}
+    assert structured.instructions(spec, tools=True, tool_choice='none') == TOOLLESS_HEAD
+    assert structured.instructions(spec, tools=False, tool_choice='none') == TOOLLESS_HEAD
+
+
+@pytest.mark.parametrize('choice', ['auto', 'none'])
+def test_the_head_sent_upstream_follows_the_tools_the_model_may_call(tmp_path, monkeypatch, choice):
+    from test_native_context_reuse import request
+    _, _, runner = setup(tmp_path, transport='direct', project_context=False, exec_policy='off', cookie_values=[])
+    sent = capture_direct(monkeypatch)
+    parsed = request([{'role': 'user', 'content': 'Inspect ORIGINAL_TASK.'}], system='')
+    assert parsed.tools
+    parsed.structured_output = parse('chat').structured_output
+    parsed.tool_choice = choice
+    events = asyncio.run(run(runner, parsed))
+    assert events[-1] == {'type': 'end', 'reason': 'stop'}
+    head = sent[0][1]['messages'][0]['content'][0]['text']
+    assert structured.instructions(parsed.structured_output, tools=choice == 'auto') in head
+    assert ('Use the supplied tools' in head) is (choice == 'auto')
