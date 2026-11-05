@@ -3,6 +3,7 @@
 Those are other work packages: in a tree where they are not merged yet every test here is skipped. After the merge
 they run for real and pin that the three agree on the contract: the plan, the pins, the protected rules, the refusals.
 """
+import copy
 import json
 import pathlib
 import time
@@ -11,7 +12,8 @@ import pytest
 
 import direct
 import prompt_policy
-from prompt_bodies import CLAUDE_SDK_HEADERS, OPENCODE_TITLE_V2, service_body
+from prompt_bodies import (CLAUDE_SDK_HEADERS, CODEX_HEADERS, OPENCODE_HEADERS, OPENCODE_TITLE_V2, claude_sdk_body,
+                           codex_body, opencode_body, service_body)
 from prompt_support import (after_tool_call, client_request, head_of, prompt_relay, rewrite_ready,  # noqa: F401
                             runner_turns, strip_cache)
 from test_native_history import tool_reply
@@ -163,3 +165,44 @@ def test_dropping_the_inline_system_entries_of_the_desktop_runner_keeps_its_hist
     last = results[-1][3]
     assert [block["signature"] for message in last["messages"] if isinstance(message["content"], list)
             for block in message["content"] if block.get("type") == "thinking"] == ["opaque-0", "opaque-1"]
+
+
+def previewed():
+    """Requests whose head the client owns, as the three clients send them: what a preview of them can show exactly."""
+    return [("opencode", "chat", {**opencode_body(), "stream": False}, OPENCODE_HEADERS),
+            ("agent sdk runner", "anthropic", {**claude_sdk_body(turns=2), "stream": False}, CLAUDE_SDK_HEADERS),
+            ("codex", "responses", {**codex_body(), "stream": False}, CODEX_HEADERS),
+            ("opencode title", "chat", service_body(OPENCODE_TITLE_V2), {**OPENCODE_HEADERS, "x-proxi-agent": "title"})]
+
+
+@engine
+@pytest.mark.parametrize("label,dialect,body,headers", previewed(), ids=[case[0] for case in previewed()])
+def test_the_preview_shows_the_head_the_relay_then_sends(prompt_relay, tmp_path, label, dialect, body, headers):
+    write(tmp_path, document(default_profile="mine"))
+    relay = prompt_relay(allow_effort_downgrade=True)
+    preview = relay.runtime.prompts.preview(copy.deepcopy(body), dialect, headers)
+    assert relay.post(dialect, body, headers)[0] == 200
+    sent = head_of(relay.posts[-1])
+    assert preview["head"] == sent and preview["purpose"] == ("client-service" if label == "opencode title"
+                                                              else "client-tools")
+    # the service job is the one a profile for everything does not touch
+    assert ("RULES_ONE" in sent) == (label != "opencode title")
+
+
+@rewriting
+def test_the_preview_lists_the_changes_the_relay_then_records(prompt_relay, tmp_path):
+    doc = document(default_profile="mine", profiles={"mine": {
+        "head": "{{text:my_rules}}\n\n{{client_system}}", "history": {
+            "mid_system": "drop", "user_blocks": [{"op": "drop_tag", "tag": "system-reminder"}]},
+        "tools": {"edits": [{"tool": "Bash", "op": "append", "text": " NOTE_ON_BASH"}]}}})
+    write(tmp_path, doc)
+    relay = prompt_relay(allow_effort_downgrade=True)
+    body = {**claude_sdk_body(turns=2), "stream": False}
+    preview = relay.runtime.prompts.preview(copy.deepcopy(body), "anthropic", CLAUDE_SDK_HEADERS)
+    assert relay.post("anthropic", body, CLAUDE_SDK_HEADERS)[0] == 200
+    (entry,) = relay.runtime.prompts.recent()
+    assert preview["history_changes"] and preview["tools_changes"]
+    assert preview["history_changes"] == entry["history_changes"] and preview["tools_changes"] == entry["tools_changes"]
+    assert {change["op"] for change in entry["history_changes"]} == {"drop_tag", "mid_system"}
+    assert "NOTE_ON_BASH" in json.dumps(relay.posts[-1]["tools"]) and "Synthetic inline environment" not in json.dumps(
+        relay.posts[-1]["messages"])
