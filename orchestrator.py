@@ -39,6 +39,13 @@ DEFAULT_NATIVE_TOOLS_ROLE = ("[ROLE]\nYou are a coding assistant using the clien
                              "Use those tools to inspect, edit and test that project. "
                              "Do not claim to have read, changed or tested files without tool evidence. "
                              "Reply in the user's language.")
+# The reminder a relay task (no client system, no client tools) gets at the end of its head while shell execution is on.
+EXEC_REMINDER = (
+    "\n\n[LOCAL EXEC REMINDER]\n"
+    "To run anything on the user's machine you MUST output "
+    "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
+    "Do not answer that you cannot run commands."
+)
 
 
 def _b(text: str) -> int:
@@ -187,6 +194,95 @@ def _client_owns_instructions(parsed, purpose, native_tools):
             or (bool(getattr(parsed, "structured_output", None)) and not native_tools))
 
 
+def _relay_task_args(cfg):
+    """What build_system_instructions takes besides the workspace and the role.
+
+    The legacy head and the blocks of a prompt template read the same settings the same way."""
+    return dict(enable_context=cfg["project_context"], enable_local_exec=cfg["exec_policy"] != "off",
+                limit=cfg["context_max_bytes"], cookie_values=cfg.get("cookie_values", ()),
+                exec_policy=cfg["exec_policy"])
+
+
+class RelaySources:
+    """The relay's own texts a prompt template may name (prompt_policy.HeadSources), each built once, and only when asked.
+
+    The blocks of a relay task come from the same build_system_instructions call as the legacy head, so
+    `{{relay_task}}{{exec_reminder}}` repeats that head byte for byte. They stay empty for a request the client owns
+    and for one that brings client tools (plan I9): no project context and no shell protocol reach a client's job.
+    Only cfg is read, so the preview can build the same object for a pasted request.
+    """
+
+    def __init__(self, cfg, snapshot, *, client_owned, native_tools, output_spec=None, tool_choice="auto"):
+        self.cfg, self.snapshot = cfg, snapshot
+        self.client_owned = client_owned
+        self.native_tools, self.output_spec, self.tool_choice = bool(native_tools), output_spec, tool_choice
+        self._built = {}
+
+    def _once(self, name, build):
+        if name not in self._built:
+            self._built[name] = build()
+        return self._built[name]
+
+    def _text(self, name):
+        return self.snapshot.relay_text(name) if self.snapshot is not None else None
+
+    @property
+    def _is_relay_task(self):
+        return not self.client_owned and not self.native_tools
+
+    def relay_role(self):
+        # None is the built-in role, a blank text means no role of the relay's own: as relay_policy reads settings.
+        return self._once("role", lambda: relay_policy(self._text("role")))
+
+    def native_role(self):
+        def build():
+            text = self._text("native_role")
+            return DEFAULT_NATIVE_TOOLS_ROLE if text is None else (text if text.strip() else "")
+        return self._once("native_role", build)
+
+    def _blocks(self):
+        def build():
+            if not self._is_relay_task:
+                return "", ""
+            args, root = _relay_task_args(self.cfg), self.cfg["workspace_root"]
+            return (build_system_instructions(root, system_prompt="", **{**args, "enable_context": False}),
+                    build_system_instructions(root, system_prompt="", **{**args, "enable_local_exec": False}))
+        return self._once("blocks", build)
+
+    def local_exec(self):
+        return self._blocks()[0]
+
+    def project_context(self):
+        return self._blocks()[1]
+
+    def relay_task(self):
+        return self._once("task", lambda: "\n\n".join(
+            part for part in (self.relay_role(), *self._blocks()) if part) if self._is_relay_task else "")
+
+    def exec_reminder(self):
+        return EXEC_REMINDER if self._is_relay_task and self.cfg["exec_policy"] != "off" else ""
+
+    def structured(self):
+        if not self.output_spec:
+            return ""
+        # Imported here: prompt_policy may need this module for the built-in texts.
+        import prompt_policy
+        tools = bool(self.native_tools)
+        try:
+            return prompt_policy.structured_contract(self.snapshot, self.output_spec, tools=tools,
+                                                     tool_choice=self.tool_choice)
+        except NotImplementedError:  # until the engine lands, the contract is the function's own text
+            return structured.instructions(self.output_spec, tools=tools, tool_choice=self.tool_choice)
+
+
+def split_changes(changes):
+    """(history, tools) from the one list prompt_body.rewrite returns: a change naming a tool edits tools, the rest the history."""
+    history, tools = [], []
+    for change in changes or ():
+        (tools if change.get("scope") == "tools" or "tool" in change else history).append(change)
+    return history, tools
+
+
 # kind: "text" (the persistent text chat), "isolated" (a standalone job) or "session" (the conversation's own one).
 AcquirePlan = collections.namedtuple("AcquirePlan", "kind kwargs")
 
@@ -228,6 +324,8 @@ class TurnRunner:
         self.pool = pool
         # AccountDispatcher; set by Runtime when it manages account health.
         self.accounts = None
+        # PromptStore; set by Runtime. None keeps every head on the legacy path.
+        self.prompts = None
 
     def _can_exec(self, steps: int) -> bool:
         return _can_exec(self.cfg, steps)
@@ -353,14 +451,8 @@ class TurnRunner:
                 return relay_policy(self.cfg['relay_system_prompt'])
             return DEFAULT_NATIVE_TOOLS_ROLE
         return build_system_instructions(
-            self.cfg["workspace_root"],
-            enable_context=self.cfg["project_context"],
-            enable_local_exec=self.cfg["exec_policy"] != "off",
-            limit=self.cfg["context_max_bytes"],
-            cookie_values=self.cfg.get("cookie_values", ()),
-            system_prompt=self.cfg.get('relay_system_prompt'),
-            exec_policy=self.cfg["exec_policy"],
-        )
+            self.cfg["workspace_root"], system_prompt=self.cfg.get('relay_system_prompt'),
+            **_relay_task_args(self.cfg))
 
     def _client_instructions(self, instructions):
         """Compose only policy text, never relay workspace or shell capabilities."""
@@ -371,6 +463,64 @@ class TurnRunner:
         if mode == 'replace':
             return policy
         return '\n\n'.join(part for part in (instructions, policy) if part)
+
+    async def _compose_head(self, parsed, client_system, client_owned, native_tools, output_spec, choice, log):
+        """(head, parts, warnings) when a prompt profile owns this head (plan section 3); None sends it down the legacy path."""
+        plan = getattr(parsed, "prompt_plan", None)
+        if plan is None or plan.legacy:
+            return None
+        sources = RelaySources(self.cfg, plan.snapshot, client_owned=client_owned, native_tools=native_tools,
+                               output_spec=output_spec, tool_choice=choice)
+        try:
+            # Off the event loop, as the legacy head is: a relay task reads its project from disk.
+            composed = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: plan.compose_head(client_system, sources))
+            head, parts, warnings = composed
+            if not isinstance(head, str):
+                raise TypeError("compose_head returned %s instead of the head text" % type(head).__name__)
+        except apierr.ApiError:
+            raise
+        except Exception as exc:  # a failing engine must not fail the request (plan I8): the legacy head serves it
+            text = redact(str(exc)).replace("\n", " ")[:160]
+            log("prompt.runtime_error", "Слой промптов не собрал head, запрос идёт прежним путём: %s: %s" % (
+                type(exc).__name__, text), "error", stage="compose")
+            console_log.write("[err] prompt layer failed (compose): %s; legacy head" % type(exc).__name__)
+            return None
+        return head, parts, warnings
+
+    def _note_plan(self, log, holder, parsed, composed):
+        """The prompt.plan event of a turn and, once per request, the ring entry of what the model saw (plan 4.1, 4.2).
+
+        The journal gets lengths, a sha8 and the source of every part, never a text; the ring keeps the texts, in memory."""
+        import prompt_policy
+        plan, (head, parts, warnings) = parsed.prompt_plan, composed
+        history, tools = split_changes(getattr(parsed, "prompt_changes", None))
+        notes = list(warnings or ()) + list(getattr(parsed, "prompt_warnings", ()))
+        inp = getattr(parsed, "prompt_input", None)
+        try:
+            log("prompt.plan", "Промпт: профиль «%s», правило «%s», ревизия %s" % (plan.profile, plan.rule, plan.rev),
+                "debug", rev=plan.rev, profile=plan.profile, rule=plan.rule, pinned=plan.pinned,
+                protected=plan.protected, head_chars=len(head), head_sha8=prompt_policy.sha8(head),
+                parts=[[part.source, len(part.text)] for part in parts],
+                history_changes=sum(not change.get("skipped") for change in history),
+                tools_changes=sum(not change.get("skipped") for change in tools),
+                generation=dict(plan.generation or {}), warnings=notes)
+            if self.prompts is None or holder.get("_prompt_recorded"):
+                return
+            holder["_prompt_recorded"] = True
+            entry = {"ts": time.time(), "request_id": getattr(parsed, "request_id", None),
+                     "client": getattr(inp, "client", None) or prompt_policy.prompt_client(client_context.current(), {}),
+                     "agent": getattr(inp, "agent", None) or client_context.current().get("agent") or "",
+                     "model": parsed.model, "dialect": getattr(parsed, "dialect", None),
+                     "purpose": getattr(inp, "purpose", None) or _purpose(parsed),
+                     "rule": plan.rule, "profile": plan.profile, "rev": plan.rev, "pinned": plan.pinned,
+                     "protected": plan.protected, "head": head, "parts": prompt_policy.part_spans(parts),
+                     "history_changes": history, "tools_changes": tools, "warnings": notes}
+            if getattr(parsed, "prompt_request", None):
+                entry["request"] = parsed.prompt_request
+            self.prompts.record(entry)
+        except Exception:  # recording is best effort: the turn goes on
+            log("prompt.runtime_error", "Не удалось записать план промпта", "error", stage="record")
 
     @staticmethod
     def _usage_update(holder, event):
@@ -555,7 +705,14 @@ class TurnRunner:
             output_spec = getattr(parsed, "structured_output", None)
             client_system = _client_system(parsed)
             client_owns_instructions = _client_owns_instructions(parsed, purpose, native_tools)
-            if client_owns_instructions:
+            composed = await self._compose_head(parsed, client_system, client_owns_instructions, native_tools,
+                                                output_spec, choice, log)
+            if composed is not None:
+                # A prompt profile composed the whole head, the structured contract and billing header included;
+                # nothing is appended to it below (plan 4.3 item 12).
+                instructions = composed[0]
+                self._note_plan(log, holder, parsed, composed)
+            elif client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
                 instructions = client_system
@@ -569,21 +726,18 @@ class TurnRunner:
             if output_spec:
                 # The route lacks constrained decoding. Supply the contract as
                 # instructions; the HTTP adapter validates the complete reply.
-                instructions = "\n\n".join(part for part in (
-                    instructions, structured.instructions(output_spec, tools=bool(native_tools),
-                                                          tool_choice=choice)) if part)
+                if composed is None:
+                    instructions = "\n\n".join(part for part in (
+                        instructions, structured.instructions(output_spec, tools=bool(native_tools),
+                                                              tool_choice=choice)) if part)
                 log("turn.structured_output", "Структурированный вывод эмулируется проверкой ответа: %s" % output_spec["kind"],
                     "debug", output_format=output_spec["kind"], source=output_spec["source"])
             reminder = ""
             if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif not native_tools and not client_owns_instructions and self.cfg["exec_policy"] != "off":
-                reminder = (
-                    "\n\n[LOCAL EXEC REMINDER]\n"
-                    "To run anything on the user's machine you MUST output "
-                    "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
-                    "Do not answer that you cannot run commands."
-                )
+            elif (composed is None and not native_tools and not client_owns_instructions
+                  and self.cfg["exec_policy"] != "off"):
+                reminder = EXEC_REMINDER
             if direct_mode:
                 # Direct path keeps the stable instructions (plus tool block) as the
                 # cached system head and sends the raw client tail as the user turn.
