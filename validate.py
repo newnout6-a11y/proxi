@@ -268,6 +268,10 @@ def _parse_content(content, index, role):
             chunks.append(f"[tool_call {name} id={call_id}: {json.dumps(args, ensure_ascii=False)}]")
         elif btype in ("thinking", "redacted_thinking"):
             continue
+        elif btype in ("tool_addition", "tool_removal"):
+            raise unprocessable(
+                f"{where}: inline tool changes ({btype}) are not supported by the Retool route; "
+                "declare the full tool set in 'tools' on every request", param=where)
         else:
             chunks.append(f"[{btype or 'block'}: {json.dumps(block, ensure_ascii=False)[:200]}]")
     return "\n".join(c for c in chunks if c), images
@@ -279,12 +283,22 @@ def _blocks_to_text(content, index, role):
     return text
 
 
-def _render_chunks(messages, role_key="role", *, allow_system=True):
+def _instruction_text(*parts):
+    """Join instruction texts in order; blank ones (effort-only entries) leave no trace."""
+    return "\n\n".join(part for part in parts if part and part.strip())
+
+
+def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, converted=None):
     """Return (system_text, [chunk per conversation message]).
 
     Chunks keep one message per element so the direct transport can place cache
-    breakpoints along the history instead of re-sending it uncached.
+    breakpoints along the history instead of re-sending it uncached. Only the
+    leading system/developer messages form the head; a later non-empty one keeps
+    its place as a user-turn reminder (its index is appended to `converted`),
+    and a blank one, such as an effort-only entry, produces nothing.
     """
+    if lead is None:
+        lead = native_history.leading_instructions(messages, role_key) if allow_system else 0
     system_parts, convo = [], []
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -296,7 +310,12 @@ def _render_chunks(messages, role_key="role", *, allow_system=True):
             raise unprocessable(f"messages[{index}].{role_key} must be a string", param=f"messages[{index}].{role_key}")
         text, images = _parse_content(message.get("content"), index, role)
         if role in ("system", "developer") and allow_system:
-            system_parts.append(text)
+            if index < lead:
+                system_parts.append(text)
+            elif text.strip():
+                if converted is not None:
+                    converted.append(index)
+                convo.append(native_history.reminder(text))
             continue
         if role in ("tool", "function"):
             name = message.get("name") or message.get("tool_call_id") or "tool"
@@ -350,12 +369,12 @@ def _render_chunks(messages, role_key="role", *, allow_system=True):
             convo.append(blocks)
         else:
             convo.append(user_text)
-    return "\n\n".join(system_parts), convo
+    return _instruction_text(*system_parts), convo
 
 
-def _render_messages(messages, role_key="role", *, allow_system=True):
+def _render_messages(messages, role_key="role", *, allow_system=True, lead=None):
     """Return (system_text, prompt_text)."""
-    system, convo = _render_chunks(messages, role_key, allow_system=allow_system)
+    system, convo = _render_chunks(messages, role_key, allow_system=allow_system, lead=lead)
     text_chunks = []
     for c in convo:
         if isinstance(c, str):
@@ -375,11 +394,13 @@ def _render_messages(messages, role_key="role", *, allow_system=True):
     return system, "\n\n".join(text_chunks)
 
 
-def _message_fingerprints(messages):
+def _message_fingerprints(messages, lead=None):
     """Hash each bridge-visible message, preserving boundaries but not cache markers."""
-    return tuple(hashlib.sha256(json.dumps(_render_messages([message]), ensure_ascii=False, sort_keys=True,
-                                          separators=(",", ":")).encode("utf-8")).digest()
-                 for message in messages)
+    if lead is None:
+        lead = native_history.leading_instructions(messages)
+    return tuple(hashlib.sha256(json.dumps(_render_messages([message], lead=int(index < lead)), ensure_ascii=False,
+                                          sort_keys=True, separators=(",", ":")).encode("utf-8")).digest()
+                 for index, message in enumerate(messages))
 
 
 def _responses_item(item):
@@ -420,16 +441,6 @@ def _messages(data, *, min_items=1):
 
 
 def _finish(data, parsed, dialect):
-    source_messages = data.get('messages', data.get('input'))
-    history_started = False
-    if isinstance(source_messages, list):
-        for message in source_messages:
-            if not isinstance(message, dict):
-                continue
-            if message.get('role') in ('system', 'developer'):
-                parsed.system_messages_normalized |= history_started
-            else:
-                history_started = True
     parsed.requested_effort = _effort(data)
     if parsed.requested_effort is None:
         for separator in ("#", ":"):
@@ -639,11 +650,13 @@ def parse_chat(data, cfg):
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     _reject_images_unsupported(entry, data)
     messages = _messages(data)
-    system, chunks = _render_chunks(messages)
+    lead, converted = native_history.leading_instructions(messages), []
+    system, chunks = _render_chunks(messages, lead=lead, converted=converted)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.system, parsed.prompt, parsed.message_chunks = system, "\n\n".join(text_chunks), chunks
-    parsed.message_fingerprints = _message_fingerprints(messages)
-    parsed.native_messages = native_history.client_messages(messages, _extract_image_data)
+    parsed.system_messages_normalized = bool(converted)
+    parsed.message_fingerprints = _message_fingerprints(messages, lead)
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
                          or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
@@ -669,16 +682,18 @@ def parse_responses(data, cfg):
         raise bad_request("'input' is required", param="input")
     else:
         raise bad_request("'input' must be a string or an array", param="input")
-    system, chunks = _render_chunks(messages)
+    lead, converted = native_history.leading_instructions(messages), []
+    system, chunks = _render_chunks(messages, lead=lead, converted=converted)
     instructions = _opt_str(data, "instructions") or ""
-    parsed.system = "\n\n".join(x for x in (instructions, system) if x)
+    parsed.system = _instruction_text(instructions, system)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
-    parsed.message_fingerprints = _message_fingerprints(messages)
+    parsed.system_messages_normalized = bool(converted)
+    parsed.message_fingerprints = _message_fingerprints(messages, lead)
     native_input = ([message for item, message in zip(raw_input, messages)
                      if item.get("type") != "reasoning" or "role" in item]
                     if isinstance(raw_input, list) else messages)
-    parsed.native_messages = native_history.client_messages(native_input, _extract_image_data)
+    parsed.native_messages = native_history.client_messages(native_input, _extract_image_data, lead=lead)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
@@ -695,17 +710,19 @@ def parse_anthropic(data, cfg):
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     _reject_images_unsupported(entry, data)
     messages = _messages(data)
-    # Retool currently rejects multiple native system messages. Normalize all
-    # instruction text into its single head so native continuation cannot drop it.
-    # A changed head invalidates the old signed prefix, deliberately and visibly.
-    system, chunks = _render_chunks(messages)
+    # Retool rejects several system messages and a changed head drops the signed
+    # prefix, so only the leading instructions join the top-level system text.
+    # Later ones keep their place as user-turn reminders.
+    lead, converted = native_history.leading_instructions(messages), []
+    system, chunks = _render_chunks(messages, lead=lead, converted=converted)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     declared_system = data.get("system")
     declared_text = _blocks_to_text(declared_system, 0, 'system') if declared_system else ''
-    parsed.system = '\n\n'.join(part for part in (declared_text, system) if part)
-    parsed.message_fingerprints = _message_fingerprints(messages)
-    parsed.native_messages = native_history.client_messages(messages, _extract_image_data)
+    parsed.system = _instruction_text(declared_text, system)
+    parsed.system_messages_normalized = bool(converted)
+    parsed.message_fingerprints = _message_fingerprints(messages, lead)
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
     parsed.stream = _opt_bool(data, "stream")
     if data.get("max_tokens") is None:
         raise bad_request("'max_tokens' is required for the Anthropic dialect", param="max_tokens")
