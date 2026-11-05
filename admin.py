@@ -21,11 +21,14 @@ import auth
 import config
 import journal
 import models
+import native_history
+import prompt_policy
 from accounts import UNNAMED, account_tag, cfg_tag, enabled as account_enabled, priority as account_priority
 from redact import redact
 import sse
+import structured
 import validate
-from context import DEFAULT_RELAY_SYSTEM_PROMPT
+from context import DEFAULT_RELAY_SYSTEM_PROMPT, relay_policy
 from orchestrator import DEFAULT_NATIVE_TOOLS_ROLE
 
 
@@ -51,6 +54,17 @@ UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-
 HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balance|renew))?")
 SETTING_GROUPS = ("routing", "model", "instructions", "retries", "cache", "exec", "limits", "api")
+# Prompt control (docs/prompt-control-plan.md 4.1): the routes and the methods each one answers.
+PROMPTS_PATH = "/admin/api/prompts"
+PROMPT_ROUTES = {PROMPTS_PATH: ("GET",)}
+DIALECTS = ("chat", "responses", "anthropic")
+# What a rule may name as `purpose`: client_context.request_kind() and the prompt layer's own client-service (plan 2.1).
+PURPOSES = ("client-tools", "client-text", "generation", "session-title", "auto-mode-check", "connection-probe",
+            "client-service")
+CONDITION_FLAGS = ("tools", "structured", "has_client_system")
+# A sample to show what the built-in structured contract says.
+STRUCTURED_EXAMPLE = {"kind": "json_schema", "name": "example", "schema": {
+    "type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}}
 
 
 def _int_param(query, name, default, low, high):
@@ -222,6 +236,55 @@ def _default_roles():
 def _free_text(field):
     """Free-form text, as opposed to a choice or a number: the journal records its size, not its content."""
     return field["type"] == "string" and "enum" not in field
+
+
+def _codex_base():
+    """The base instructions /codex/models publishes while no prompts file replaces them ('' if nothing is published)."""
+    try:
+        return models.codex_catalog(models.catalog()[:1])["models"][0]["base_instructions"]
+    except (IndexError, KeyError, TypeError):
+        return ""
+
+
+def _builtin_prompts():
+    """What the relay supplies itself and the closed vocabularies a prompts document is written in."""
+    values = {"client": prompt_policy.CLIENTS, "purpose": PURPOSES, "dialect": DIALECTS}
+    return {
+        "relay_texts": {"role": DEFAULT_RELAY_SYSTEM_PROMPT, "native_role": DEFAULT_NATIVE_TOOLS_ROLE,
+                        # The wrapper that hands the default contract on unchanged; structured_example shows its words.
+                        "structured": "{{default}}", "reminder": native_history.reminder("{{text}}"),
+                        "codex_base": _codex_base()},
+        "structured_example": structured.instructions(STRUCTURED_EXAMPLE),
+        "protected_rules": copy.deepcopy(list(prompt_policy.PROTECTED_RULES)),
+        "variables": list(prompt_policy.VARIABLES),
+        "relay_task_variables": list(prompt_policy.RELAY_TASK_VARIABLES),
+        "edit_ops": {"client_system": list(prompt_policy.SYSTEM_EDIT_OPS),
+                     "mid_system": list(prompt_policy.MID_SYSTEM_MODES),
+                     "user_blocks": list(prompt_policy.USER_BLOCK_OPS), "tools": list(prompt_policy.TOOL_EDIT_OPS)},
+        "conditions": {name: {"type": "boolean"} if name in CONDITION_FLAGS else
+                       {"type": "string", "glob": True, **({"values": list(values[name])} if name in values else {})}
+                       for name in prompt_policy.CONDITIONS},
+        "special_uses": list(prompt_policy.SPECIAL_USES),
+        "profiles": list(prompt_policy.BUILTIN_PROFILES),
+        "profile_name": prompt_policy.PROFILE_NAME.pattern,
+        "limits": {"max_text_bytes": prompt_policy.MAX_TEXT_BYTES,
+                   "max_document_bytes": prompt_policy.MAX_DOCUMENT_BYTES},
+    }
+
+
+def _document_warnings(document):
+    """What the operator should know about a valid document that lowers what the relay protects (plan I6)."""
+    warnings = []
+    protected = document.get("protected")
+    if isinstance(protected, dict) and protected.get("enabled") is False:
+        warnings.append("Защита служебных запросов выключена (protected.enabled: false): заголовки, сжатие и проверки "
+                        "клиентов получат ваш промпт вместо своего")
+    rules = document.get("rules")
+    for index, rule in enumerate(rules if isinstance(rules, list) else []):
+        if isinstance(rule, dict) and rule.get("override_protected") is True:
+            warnings.append("Правило «%s» перекрывает защиту служебных запросов (override_protected)"
+                            % (rule.get("name") or "№%d" % (index + 1)))
+    return warnings
 
 
 def is_admin_path(path):
@@ -884,6 +947,24 @@ class Admin:
                     (handler.headers.get("host") or "").lower() or parsed.path or parsed.query or parsed.fragment):
                 raise apierr.ApiError(403, "forbidden", "Administration requires a same-origin request")
 
+    # -- prompt control (docs/prompt-control-plan.md 4.1) ---------------------------------------------
+    def _prompts_route(self, handler, path):
+        if handler.command not in PROMPT_ROUTES[path]:
+            raise apierr.method_not_allowed()
+        store = self.runtime.prompts
+        return self._prompts_state(store)
+
+    def _prompts_state(self, store):
+        store.maybe_reload()
+        snapshot = store.snapshot()
+        document = snapshot.document if snapshot is not None else None
+        return {"document": document, "rev": snapshot.rev if snapshot is not None else None,
+                "path": str(getattr(store, "path", "") or ""), "errors": store.errors(),
+                "warnings": _document_warnings(document) if document else [],
+                "legacy": {"mode": self.cfg.get("relay_system_prompt_mode", "standalone"),
+                           "role_chars": len(relay_policy(self.cfg.get("relay_system_prompt")))},
+                "builtin": _builtin_prompts()}
+
     def _static(self, handler, path):
         relative = "index.html" if path in ("/admin", "/admin/") else unquote(path[len("/admin/"):])
         suffix_types = {".js": "application/javascript", ".css": "text/css", ".svg": "image/svg+xml",
@@ -980,6 +1061,9 @@ class Admin:
         account_match = ACCOUNT_PATH.fullmatch(path)
         if path == "/admin/api/accounts" or account_match:
             handler._json(200, self._pool_route(handler, path, account_match))
+            return
+        if path in PROMPT_ROUTES:
+            handler._json(200, self._prompts_route(handler, path))
             return
         if handler.command == "GET":
             if path == "/admin/api/overview":
