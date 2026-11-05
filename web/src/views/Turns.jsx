@@ -11,11 +11,11 @@ import { TurnsArt } from '../stage/Art.jsx';
 
 const LIVE_PHASE = { wait: 'ждём upstream', think: 'upstream: thinking', tools: 'аргументы инструмента', out: 'пишет ответ', exec: 'выполняет команду' };
 
-// "нет данных" and the unknown-cost marks are for a finished turn that lacks a price; a running turn just has none yet
-const costNote = (cost) => (!cost.final ? 'ход идёт' : cost.credits === null ? 'нет данных' : cost.complete ? '' : 'неполные данные');
-const costTitle = (cost) => (!cost.final ? 'Ход ещё идёт: стоимость будет известна, когда upstream ответит'
+// "нет данных" and the lower-bound mark are for a turn that is over and lacks a price; a running turn just has none yet
+const costNote = (cost) => (cost.running ? 'ход идёт' : cost.credits === null ? 'нет данных' : cost.complete ? '' : 'неполные данные');
+const costTitle = (cost) => (cost.running ? 'Ход ещё идёт: стоимость будет известна, когда upstream ответит'
   : cost.credits === null ? 'Стоимость не сообщена' : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена');
-const lowerBound = (cost) => cost.credits !== null && (!cost.final || !cost.complete);
+const lowerBound = (cost) => cost.credits !== null && !cost.complete;
 
 function Steps({ trace }) {
   const start = trace.started;

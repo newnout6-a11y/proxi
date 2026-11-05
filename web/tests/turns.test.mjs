@@ -9,17 +9,17 @@ const relayStart = (ts) => ({ ts, kind: 'relay.start', data: {} });
 const forTurn = (id, events) => events.map((event) => ({ ...event, turn_id: id }));
 
 test('unknown credits remain unknown and explicit zero remains known', () => {
-  const [unknown] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: null })]);
+  const [unknown] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: null }), finish(102, 2000)]);
   assert.equal(unknown.credits, null);
   assert.equal(unknown.creditsComplete, false);
-  const [zero] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: 0 })]);
+  const [zero] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: 0 }), finish(102, 2000)]);
   assert.equal(zero.credits, 0);
   assert.equal(zero.creditsComplete, true);
 });
 
 test('a known debit and an unknown attempt are displayed as a lower bound', () => {
   const [trace] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: null, attempt: 1 }),
-    ev(102, 'upstream.usage', { credits: 3.5, attempt: 2 })]);
+    ev(102, 'upstream.usage', { credits: 3.5, attempt: 2 }), finish(103, 3000)]);
   assert.equal(trace.credits, 3.5);
   assert.equal(trace.creditsComplete, false);
 });
@@ -51,7 +51,7 @@ for (const reverse of [false, true]) {
   test(`token snapshots do not create extra unknown charges (${reverse ? 'before' : 'after'} cost)`, () => {
     const usage = [{ credits: 1.5, attempt: 1 }, { credits: null, attempt: 1 }];
     if (reverse) usage.reverse();
-    const [trace] = buildTraces([ev(100, 'turn.begin'), ...usage.map((data, i) => ev(101 + i, 'upstream.usage', data))]);
+    const [trace] = buildTraces([ev(100, 'turn.begin'), ...usage.map((data, i) => ev(101 + i, 'upstream.usage', data)), finish(103, 3000)]);
     assert.equal(trace.credits, 1.5);
     assert.equal(trace.creditsComplete, true);
   });
@@ -106,11 +106,13 @@ test('a turn that failed before reaching upstream costs nothing', () => {
   assert.equal(trace.creditsComplete, true);
 });
 
-// The price rules of the relay's journal (tests/test_journal_costs.py, SCENARIOS), seen from one turn:
-// [name, steps, credits, unknown attempts, cost is complete]. Each ended turn is closed by its own turn.end.
+// The price rules of the relay's journal (tests/test_journal_costs.py on fix/pr24-wp03-usage, SCENARIOS and the turn
+// traces), seen from one turn: [name, steps, credits, unknown attempts, cost is complete]. A turn that was never
+// started with usage_start has no attempt: the first attempt is the one the journal opens, never an implicit 0.
 const START = (n) => ['upstream.usage_start', { attempt: n }];
 const USAGE = (n, credits, extra = {}) => ['upstream.usage', { attempt: n, credits, ...extra }];
 const MARKER = { credits_reported: false };
+const BEGIN = () => ['turn.begin', {}];
 const END = (reason = 'stop') => ['turn.end', { reason, duration_ms: 1000 }];
 const turnOf = (steps) => buildTraces([ev(99, 'turn.begin'), ...steps.map(([kind, data], i) => ev(100 + i, kind, data))])[0];
 const COSTS = [
@@ -121,21 +123,26 @@ const COSTS = [
   ['exec step: two priced attempts', [START(1), USAGE(1, 0.01), START(2), USAGE(2, 0.02), END()], 0.03, 0, true],
   ['second attempt never reported anything', [START(1), USAGE(1, 0.01), START(2), END()], 0.01, 0, true],
   ['second attempt reported usage without a price', [START(1), USAGE(1, 0.01), START(2), USAGE(2, null, MARKER), END()], 0.01, 1, false],
+  ['two turns sharing one key', [START(1), USAGE(1, 0.01), BEGIN(), START(1), USAGE(1, 0.02), END()], 0.03, 0, true],
   ['tokens-only update after the price', [START(1), USAGE(1, 0.01), USAGE(1, null, { credits_reported: true }), END()], 0.01, 0, true],
   ['price after a tokens-only snapshot', [START(1), USAGE(1, null), USAGE(1, 0.25), END()], 0.25, 0, true],
   ['a reported zero is a price', [START(1), USAGE(1, 0), END()], 0, 0, true],
+  ['usage without an attempt number belongs to the last started attempt', [START(2), ['upstream.usage', { credits: 0.5 }], END()], 0.5, 0, true],
+  ['usage before any attempt was started opens attempt 0', [['upstream.usage', { credits: 0.5 }], END()], 0.5, 0, true],
+  ['usage without a number or a price before any attempt is unknown', [['upstream.usage', { credits: null }], END()], null, 1, false],
   ['cancelled while the attempt was silent: may have been billed', [START(1), END('cancelled')], null, 1, false],
   ['cancelled before any attempt started', [END('cancelled')], 0, 0, true],
   ['graceful cancel: the marker and the cancelled end count once', [START(1), USAGE(1, null, MARKER), END('cancelled')], null, 1, false],
   ['cancelled second attempt after a priced first one', [START(1), USAGE(1, 0.01), START(2), END('cancelled')], 0.01, 1, false],
   ['cancelled after the price arrived', [START(1), USAGE(1, 0.01), END('cancelled')], 0.01, 0, true],
+  ['a silent last attempt of any other ending is not a missing price', [START(1), USAGE(1, 0.01), START(2), END('timeout')], 0.01, 0, true],
   ['an invalid price after a valid one changes nothing', [START(1), USAGE(1, 0.1), USAGE(1, -4, { credits_reported: true }), START(2), USAGE(2, 0.2), END()], 0.3, 0, true],
 ];
 for (const [name, steps, credits, unknown, complete] of COSTS) {
   test(`cost of a finished turn: ${name}`, () => {
     const trace = turnOf(steps);
     const cost = costOf(trace);
-    assert.equal(cost.final, true);
+    assert.equal(cost.running, false);
     assert.equal(cost.credits === null ? null : Math.round(cost.credits * 1e6) / 1e6, credits);
     assert.equal(cost.unknown, unknown);
     assert.equal(cost.complete, complete);
@@ -144,12 +151,27 @@ for (const [name, steps, credits, unknown, complete] of COSTS) {
   });
 }
 
-test('a running turn is never a finished unknown: nothing reported yet is not a gap, a price so far is a lower bound', () => {
-  const waiting = costOf(turnOf([START(1)]));
-  assert.deepEqual(waiting, { credits: null, unknown: 0, final: false, complete: true });
-  const between = costOf(turnOf([START(1), USAGE(1, 0.1)]));
-  assert.deepEqual(between, { credits: 0.1, unknown: 0, final: false, complete: true });
-  assert.deepEqual(costOf(turnOf([])), { credits: null, unknown: 0, final: false, complete: true });
+test('a turn that never reached upstream has no attempt, so it is neither pending nor unknown', () => {
+  const trace = turnOf([END('error')]);
+  assert.equal(trace.costAttempts.size, 0);
+  assert.equal(costOf(trace).credits, 0);
+});
+
+test('a running turn is never complete: nothing reported yet has no price, a price so far is a lower bound', () => {
+  assert.deepEqual(costOf(turnOf([])), { credits: null, unknown: 0, running: true, complete: false });
+  assert.deepEqual(costOf(turnOf([START(1)])), { credits: null, unknown: 0, running: true, complete: false });
+  assert.deepEqual(costOf(turnOf([START(1), USAGE(1, 0.1)])), { credits: 0.1, unknown: 0, running: true, complete: false });
+  assert.deepEqual(costOf(turnOf([START(1), USAGE(1, 0.1), START(2)])), { credits: 0.1, unknown: 0, running: true, complete: false });
+  // An attempt that reported usage without a price is a gap even before the turn ends; the relay counts it too
+  assert.deepEqual(costOf(turnOf([START(1), USAGE(1, null, MARKER)])), { credits: null, unknown: 1, running: true, complete: false });
+});
+
+test('a pending attempt is not unknown until it reports something', () => {
+  const pending = turnOf([START(1), USAGE(1, 0.2), START(2)]);
+  assert.equal(costOf(pending).unknown, 0);
+  const observed = turnOf([START(1), USAGE(1, 0.2), START(2), USAGE(2, null, MARKER)]);
+  assert.equal(costOf(observed).unknown, 1);
+  assert.equal(costOf(observed).credits, 0.2);
 });
 
 test('a price that is not a finite non-negative number is invalid, even when it claims to be reported', () => {
@@ -171,12 +193,12 @@ test('the reported flag alone never creates a price but keeps an earlier one', (
   assert.equal(kept.unknown, 0);
 });
 
-test('a turn cut off by a relay restart or by silence while its attempt was silent may have been billed', () => {
-  const silent = turnOf([START(1)]);
-  assert.deepEqual(costOf(silent, 'interrupted'), { credits: null, unknown: 1, final: true, complete: false });
-  const priced = turnOf([START(1), USAGE(1, 0.25)]);
-  assert.deepEqual(costOf(priced, 'interrupted'), { credits: 0.25, unknown: 0, final: true, complete: true });
-  assert.deepEqual(costOf(turnOf([]), 'interrupted'), { credits: 0, unknown: 0, final: true, complete: true });
+test('a turn whose end the relay never recorded is not complete and has no final price', () => {
+  // The relay turns a silent attempt into a missing price only on a cancelled end, so a lost turn is no gap by itself
+  assert.deepEqual(costOf(turnOf([]), 'interrupted'), { credits: null, unknown: 0, running: false, complete: false });
+  assert.deepEqual(costOf(turnOf([START(1)]), 'interrupted'), { credits: null, unknown: 0, running: false, complete: false });
+  assert.deepEqual(costOf(turnOf([START(1), USAGE(1, 0.25)]), 'interrupted'), { credits: 0.25, unknown: 0, running: false, complete: false });
+  assert.deepEqual(costOf(turnOf([START(1), USAGE(1, null, MARKER)]), 'interrupted'), { credits: null, unknown: 1, running: false, complete: false });
 });
 
 test('a turn from before a relay restart is interrupted and ends at its last event', () => {
@@ -212,14 +234,20 @@ test('a running turn silent past the stale limit is interrupted by the clock and
   assert.equal(late.open, false);
   assert.equal(late.total, 1000);
   assert.deepEqual(phasesOf(trace, 101 + 3 * 86400), late);
-  assert.equal(costOf(trace, statusAt(trace, 101 + STALE_AFTER + 1)).complete, true);
+  // The relay never recorded its end: it is not a complete cost, and no price was reported
+  assert.deepEqual(costOf(trace, statusAt(trace, 101 + STALE_AFTER + 1)), { credits: null, unknown: 0, running: false, complete: false });
 });
 
-test('an interrupted turn whose attempt never got a price has an unknown cost', () => {
+test('an interrupted turn has no final price: it never ended, so even a silent attempt is no proven gap', () => {
   const [trace] = buildTraces([ev(100, 'turn.begin'), ev(100, 'upstream.usage_start', { attempt: 1 }), relayStart(500)]);
   assert.equal(trace.status, 'interrupted');
   assert.equal(trace.credits, null);
   assert.equal(trace.creditsComplete, false);
+  const [priced] = buildTraces([ev(100, 'turn.begin'), ev(100, 'upstream.usage_start', { attempt: 1 }),
+    ev(101, 'upstream.usage', { credits: 0.25, attempt: 1 }), relayStart(500)]);
+  assert.equal(priced.status, 'interrupted');
+  assert.equal(priced.credits, 0.25);
+  assert.equal(priced.creditsComplete, false);
 });
 
 test('the shared scale is the longest finished turn: a running one never stretches it', () => {

@@ -185,20 +185,22 @@ export function buildTraces(events) {
 }
 
 /**
- * What a turn cost, by the relay's own rules (journal._Turn): an attempt that reported usage without a valid price is
- * unknown; one that only started (refused, 429, never left) cost nothing; a turn without attempts costs 0. A turn cut
- * off while its attempt was still silent (cancelled, or interrupted by a restart) may have been billed, so that
- * attempt is unknown too. `complete` means no attempt is unknown; `final` that the turn is over: a running turn
- * without a price has none yet, which is not a gap.
+ * What a turn cost, by the relay's own rules (journal._Turn, as /admin/api/turns reports it): an attempt that reported
+ * usage without a valid price is unknown, and so is the silent attempt of a turn the client cancelled; one that only
+ * started (refused, 429/500, never left) cost nothing. `credits` is the sum of the valid prices, else 0 for a turn
+ * that ended without an unknown attempt (also one that never reached upstream), else null. `complete` holds only for
+ * a turn whose end the relay recorded and that has no unknown attempt, so a running or interrupted turn is never
+ * complete: its price so far is a lower bound.
  */
 export function costOf(trace, status = trace.status) {
-  const final = status !== 'running';
+  const running = status === 'running';
+  const ended = !running && status !== 'interrupted';
   const attempts = [...trace.costAttempts.values()];
   const latest = trace.costAttempts.get(trace.costAttempt);
-  const silent = (status === 'cancelled' || status === 'interrupted') && latest !== undefined && !latest.observed;
+  const silent = status === 'cancelled' && latest !== undefined && !latest.observed;
   const unknown = attempts.filter((attempt) => attempt.observed && !attempt.known).length + (silent ? 1 : 0);
   const priced = attempts.some((attempt) => attempt.known);
-  return { credits: priced ? trace.creditsSum : final && !unknown ? 0 : null, unknown, final, complete: unknown === 0 };
+  return { credits: priced ? trace.creditsSum : ended && !unknown ? 0 : null, unknown, running, complete: ended && !unknown };
 }
 
 /** A turn silent for longer than this is not running any more: the relay's own turn timeout is 15 minutes by default. */
