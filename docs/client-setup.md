@@ -480,8 +480,20 @@ default model. The script keeps existing rows in order with every field it does
 not derive (`labelOverride`, `supports1m`, `behavesAs` and so on), appends new
 models at the end and moves the first row only for an explicit `--default-model`;
 a current default that is no longer available is an error, not a silent
-replacement. It owns `isFamilyDefault`, `anthropicFamilyTier` and `maxEffort`,
-and gives new rows the relay's label.
+replacement.
+
+The script owns exactly three row fields: `isFamilyDefault`,
+`anthropicFamilyTier` and `maxEffort`. It computes them again on every run and
+overwrites what the file holds, because it cannot tell its own earlier value from
+one you typed. A hand-edited `maxEffort` or `isFamilyDefault` does not survive; a
+row whose model has no family tier or no effort selector loses that field; and
+turning `allow_effort_downgrade` on raises `maxEffort` of the five-level rows from
+`high` to `max` on the next run (turning it off lowers it again). `name` identifies
+the row, `labelOverride` is set only for rows the
+script adds (the relay's label), and every other field is kept as it is. The
+summary lists each change to an existing row in `changed_fields`, for a preview
+and for `--write` alike: `model`, `field`, `was` and `now`, where `null` means the
+field was absent. Read it before writing.
 
 Which models: the relay exposes 27 routes and the script selects the verified
 Claude ones (`provider` anthropic with a `claude-` prefix), currently 11. That is
