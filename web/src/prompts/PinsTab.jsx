@@ -59,6 +59,10 @@ export default function PinsTab({ apiKey, rev, onUnauthorized }) {
           <Button tone="primary" disabled={!items.length || busy || confirming} onClick={() => setConfirming(true)}>Применить ко всем</Button>
         </div>
       </div>
+      <p className="p-hint">
+        Прежний путь без профилей (роль и режим её применения в «Настройках») меняется на лету и сразу для всех его диалогов: закрепления его
+        не удерживают, кэш промпта активных диалогов будет записан заново
+      </p>
       {error && <p className="banner tone-neg" role="alert">Не удалось загрузить: {error}</p>}
       {confirming && (
         <Notice tone="warn" icon={TriangleAlert} role="group" className="p-confirm">

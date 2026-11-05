@@ -5,9 +5,9 @@ import { Button, Tag, useToast } from '../ui.jsx';
 import { Page, ease } from '../motion.jsx';
 import { usePolling } from '../useJournal.js';
 import { fmtInt } from '../format.js';
-import { failureOf, loadPrompts, loadRecent, savePrompts } from '../prompts/api.js';
+import { failureLead, failureOf, loadPrompts, loadRecent, savePrompts } from '../prompts/api.js';
 import { ErrorContext, Notice } from '../prompts/controls.jsx';
-import { addProfile, blankDocument, changedPaths, errorHits, insertAt, locate, newRule, normalizePath, pathLabel, profilesOf, rulesOf, starterProfile } from '../prompts/draft.js';
+import { addProfile, blankDocument, changedPaths, equalJson, errorHits, insertAt, locate, newRule, normalizePath, pathLabel, profilesOf, rulesOf, starterProfile } from '../prompts/draft.js';
 import LegacyStart from '../prompts/LegacyStart.jsx';
 import PinsTab from '../prompts/PinsTab.jsx';
 import PreviewTab from '../prompts/PreviewTab.jsx';
@@ -52,7 +52,8 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
   const [loadError, setLoadError] = useState('');
   const [saving, setSaving] = useState(false);
   const [failure, setFailure] = useState(null);
-  const [warnings, setWarnings] = useState([]);
+  // What the relay said about the document at the last save, for a relay that does not list warnings with the document itself
+  const [savedWarnings, setSavedWarnings] = useState([]);
   const [tab, setTab] = useState(initialTab);
   const [selected, setSelected] = useState(null);
   const [expand, setExpand] = useState(null);
@@ -69,6 +70,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
     setBase({ document: next.document, rev: next.rev });
     setDraft(next.document);
     setFailure(null);
+    setSavedWarnings([]);
   }, []);
 
   const refresh = useCallback(async ({ force = false } = {}) => {
@@ -134,14 +136,15 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
     setFailure(null);
     try {
       const result = await savePrompts(apiKey, submitted, base.rev);
-      setBase({ document: submitted, rev: result.rev ?? null });
-      setWarnings(Array.isArray(result.warnings) ? result.warnings : []);
+      setBase({ document: submitted, rev: result.rev });
+      setSavedWarnings(result.warnings);
       toast({ tone: 'success', title: 'Промпты сохранены', text: `Ревизия ${result.rev}. Новые диалоги получат её сразу, начатые остаются на своей` });
       const fresh = await loadPrompts(apiKey);
       setServer(fresh);
       if (fresh.rev === result.rev) {
         setBase({ document: fresh.document, rev: fresh.rev });
-        setDraft((current) => (current === submitted ? fresh.document : current));
+        // A document the relay stored as sent leaves the draft as it is, so open rules and the focus stay where they were
+        setDraft((current) => (current === submitted && !equalJson(submitted, fresh.document) ? fresh.document : current));
       }
     } catch (error) {
       if (error.status === 401) { onUnauthorized(); return; }
@@ -193,6 +196,8 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
   };
 
   const builtin = server?.builtin;
+  // The relay lists its warnings with the document in force; the answer of the last save stands in when it does not
+  const docWarnings = server?.hasWarnings ? server.warnings : savedWarnings;
   const profileNames = [...(builtin?.profiles?.length ? builtin.profiles : ['passthrough']), ...Object.keys(profilesOf(draft))];
   const counts = { profiles: Object.keys(profilesOf(draft)).length, rules: rulesOf(draft).length, texts: Object.keys(draft?.texts || {}).length, seen: recent.length };
   const live = { sampleState, setSampleState, resolved, recent, detected: sampleState.mode === 'paste' && !sampleState.dialect ? resolved.sample?.dialect : '', refreshRecent: loadSamples };
@@ -235,15 +240,14 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
       )}
       {failure && failure.status !== 409 && (
         <Notice tone="neg" icon={TriangleAlert} role="alert" className="p-save-error">
-          <strong>Не сохранено.</strong> {failure.status === 400 ? 'Relay не принял документ' : 'Ошибка'}: {failure.message}
+          <strong>Не сохранено.</strong> {failureLead(failure)}: {failure.message}
           {failure.param && <> <code>{failure.param}</code></>}
         </Notice>
       )}
-      {warnings.length > 0 && (
-        <Notice tone="warn" icon={TriangleAlert} className="p-save-warnings">
-          <strong>Сохранено с предупреждениями</strong>
-          <ul>{warnings.map((warning, index) => <li key={index}>{typeof warning === 'string' ? warning : warning?.message || JSON.stringify(warning)}</li>)}</ul>
-          <Button onClick={() => setWarnings([])}>Закрыть</Button>
+      {docWarnings.length > 0 && (
+        <Notice tone="warn" icon={TriangleAlert} className="p-doc-warnings">
+          <strong>Предупреждения relay о документе</strong>
+          <ul>{docWarnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
         </Notice>
       )}
 
@@ -264,7 +268,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
               <div key={item.id} role="tabpanel" id={`prompts-panel-${item.id}`} aria-labelledby={`prompts-tab-${item.id}`} hidden={tab !== item.id}>
                 {tab === item.id && (
                   EDITING.includes(item.id) && legacyMode ? (
-                    <LegacyStart legacy={server.legacy} path={server.path} invalid={server.errors.length > 0} onCreate={(name, starter) => {
+                    <LegacyStart legacy={server.legacy} builtin={builtin} path={server.path} invalid={server.errors.length > 0} onCreate={(name, starter) => {
                       setDraft(addProfile(blankDocument(), name, starterProfile(starter)));
                       setSelected(name);
                       setTab('profiles');

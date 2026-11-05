@@ -3,25 +3,22 @@ import { ArrowDown, ArrowUp, ChevronRight, GripVertical, Lock, Plus, ShieldAlert
 import { Button, Tag, Toggle } from '../ui.jsx';
 import Conditions from './Conditions.jsx';
 import { Check, IconBtn, Line, Notice, Select } from './controls.jsx';
-import { SPECIAL_USES, summarizeConditions } from './conditions.js';
+import { summarizeConditions } from './conditions.js';
 import { catchAllIndex, idOf, insertAt, moveItem, newRule, protectedEnabled, removeAt, rulesOf, setProtected, setRuleField, updateAt } from './draft.js';
 import { useAnnouncer } from './hooks.js';
 
 const HELP_ID = 'rules-move-help';
 
-function targetLabel(use) {
-  const special = SPECIAL_USES.find((item) => item.id === use);
-  return special ? `${special.id}` : use || 'профиль не выбран';
-}
+const targetLabel = (use) => use || 'профиль не выбран';
 
-function RuleEditor({ rule, path, specs, profileNames, onChange }) {
+function RuleEditor({ rule, path, specs, profileNames, specialUses, onChange }) {
   const options = [
     ...(rule.use ? [] : [{ value: '', label: 'Выберите профиль' }]),
     ...profileNames.map((name) => ({ value: name, label: name })),
-    ...SPECIAL_USES.map((item) => ({ value: item.id, label: `${item.id} — ${item.label}` })),
+    ...specialUses.map((item) => ({ value: item.id, label: item.label && item.label !== item.id ? `${item.id} — ${item.label}` : item.id })),
   ];
   if (rule.use && !options.some((option) => option.value === rule.use)) options.push({ value: rule.use, label: `${rule.use} — такого профиля нет` });
-  const special = SPECIAL_USES.find((item) => item.id === rule.use);
+  const special = specialUses.find((item) => item.id === rule.use);
   return (
     <div className="rule-editor">
       <Line label="Название" value={rule.name || ''} mono={false} path={`${path}.name`} hint="Показывается в предпросмотре и журнале"
@@ -214,7 +211,7 @@ export default function RulesTab({ doc, setDoc, builtin, profileNames, expandInd
                 </div>
                 {isOpen && (
                   <div className="rule-body" id={`rule-body-${id}`}>
-                    <RuleEditor rule={rule} path={`rules.${index}`} specs={builtin.conditions} profileNames={profileNames} onChange={patchRule(index)} />
+                    <RuleEditor rule={rule} path={`rules.${index}`} specs={builtin.conditions} profileNames={profileNames} specialUses={builtin.specialUses} onChange={patchRule(index)} />
                   </div>
                 )}
               </li>

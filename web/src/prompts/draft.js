@@ -61,11 +61,12 @@ export const rulesOf = (doc) => (Array.isArray(doc?.rules) ? doc.rules : []);
 export const textsOf = (doc) => (isObject(doc?.texts) ? doc.texts : {});
 export const protectedEnabled = (doc) => doc?.protected?.enabled !== false;
 
-export function profileNameError(name, taken = []) {
+/** `pattern` is the relay's own rule when it published one (builtin.profile_name), else the documented one. */
+export function profileNameError(name, taken = [], pattern = PROFILE_NAME) {
   const value = String(name ?? '');
   if (!value) return 'Введите имя профиля';
   if (value === BUILTIN_PROFILE) return 'Имя passthrough занято: это встроенный профиль';
-  if (!PROFILE_NAME.test(value)) return 'Имя: латинские буквы, цифры, точка, дефис и подчёркивание, до 64 знаков, начинается с буквы или цифры';
+  if (!pattern.test(value)) return 'Имя: латинские буквы, цифры, точка, дефис и подчёркивание, до 64 знаков, начинается с буквы или цифры';
   if (taken.includes(value)) return 'Профиль с таким именем уже есть';
   return null;
 }

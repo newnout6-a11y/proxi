@@ -3,11 +3,11 @@ import { Button } from '../ui.jsx';
 import { Line } from './controls.jsx';
 import { STARTERS, profileNameError } from './draft.js';
 
-/** Name and starting point of a new profile; the caller adds it to the draft. */
-export default function NewProfile({ taken, onCreate, onCancel, suggested = 'mine', title = 'Новый профиль' }) {
+/** Name and starting point of a new profile; the caller adds it to the draft. `pattern` is the relay's own name rule, when it published one. */
+export default function NewProfile({ taken, onCreate, onCancel, pattern, suggested = 'mine', title = 'Новый профиль' }) {
   const [name, setName] = useState(suggested);
   const [starter, setStarter] = useState('same');
-  const error = profileNameError(name, taken);
+  const error = profileNameError(name, taken, pattern ?? undefined);
   return (
     <form className="panel p-new-profile" onSubmit={(event) => { event.preventDefault(); if (!error) onCreate(name, starter); }}>
       <h2>{title}</h2>

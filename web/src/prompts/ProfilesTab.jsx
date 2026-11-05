@@ -46,7 +46,7 @@ export default function ProfilesTab({ apiKey, doc, setDoc, builtin, selected, se
         ))}
         <Button icon={Plus} onClick={() => setCreating(true)} disabled={creating}>Новый профиль</Button>
       </div>
-      {creating && <NewProfile taken={[...names, ...builtinNames]} suggested={uniqueName('mine', names)} onCreate={create} onCancel={() => setCreating(false)} />}
+      {creating && <NewProfile taken={[...names, ...builtinNames]} pattern={builtin.profileName} suggested={uniqueName('mine', names)} onCreate={create} onCancel={() => setCreating(false)} />}
       {!creating && isBuiltin && (
         <section className="panel">
           <h2 className="mono">{current}</h2>

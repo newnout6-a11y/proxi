@@ -1,16 +1,20 @@
 // Every call of the prompts screen to the relay lives here, together with the code that reads what comes back,
 // so a change in the admin API (plan 4.1) is fixed in one place. Shapes beyond 4.1 are read defensively.
 import { api } from '../api.js';
-import { normalizeConditions } from './conditions.js';
+import { SPECIAL_USES, normalizeConditions } from './conditions.js';
+import { isObject } from './draft.js';
 import { normalizeEditOps } from './ops.js';
 import { normalizeParts } from './parts.js';
-import { isObject } from './draft.js';
+import { MAX_TEXT_BYTES } from './template.js';
 
 const isNum = (value) => typeof value === 'number' && Number.isFinite(value);
 const list = (value) => (Array.isArray(value) ? value : []);
 const text = (value) => (typeof value === 'string' ? value : '');
 
 export const RELAY_TEXT_NAMES = ['role', 'native_role', 'structured', 'reminder', 'codex_base'];
+export const MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
+// Variables that expand only for a request the relay owns (plan I9); the relay says the same in builtin.relay_task_variables.
+export const RELAY_TASK_VARIABLES = ['relay_task', 'local_exec', 'project_context', 'exec_reminder'];
 
 // What the screen says about the variables when the relay names them without a description (plan 2.2).
 export const VARIABLE_HINTS = {
@@ -47,9 +51,45 @@ function normalizeRule(rule) {
   return { name: text(rule.name) || text(rule.label), if: isObject(rule.if) ? rule.if : {}, use: text(rule.use) || 'passthrough', description: text(rule.description) };
 }
 
+/** The special `use` targets ($header, $virtual, $legacy): names alone, or objects with a description. */
+export function normalizeSpecialUses(raw) {
+  const known = new Map(SPECIAL_USES.map((item) => [item.id, item]));
+  const found = [];
+  for (const item of list(raw)) {
+    const id = typeof item === 'string' ? item : item?.id || item?.name || item?.use;
+    if (typeof id !== 'string' || !id || found.some((entry) => entry.id === id)) continue;
+    const base = known.get(id) || { id, label: id, hint: '' };
+    const hint = isObject(item) ? text(item.description || item.hint) : '';
+    found.push(hint ? { ...base, hint } : base);
+  }
+  return found.length ? found : SPECIAL_USES;
+}
+
+/** The profile name rule as the relay writes it (a Python regex source): a whole-string test, or null when it does not read here. */
+export function compileProfileName(source) {
+  if (typeof source !== 'string' || !source) return null;
+  try {
+    return new RegExp(`^(?:${source})$`);
+  } catch {
+    return null;
+  }
+}
+
+/** Limits the relay enforces; what it does not say stays at the documented value (plan section 2). */
+export function normalizeLimits(raw) {
+  const data = isObject(raw) ? raw : {};
+  const size = (...keys) => keys.map((key) => data[key]).find((value) => isNum(value) && value > 0);
+  return {
+    textBytes: size('max_text_bytes', 'text_bytes', 'text') ?? MAX_TEXT_BYTES,
+    documentBytes: size('max_document_bytes', 'document_bytes', 'document') ?? MAX_DOCUMENT_BYTES,
+  };
+}
+
 export function normalizeBuiltin(raw) {
   const data = isObject(raw) ? raw : {};
   const relayTexts = isObject(data.relay_texts) ? data.relay_texts : {};
+  const taskVariables = list(data.relay_task_variables).filter((name) => typeof name === 'string' && name);
+  const example = data.structured_example;
   return {
     relayTexts,
     protectedRules: list(data.protected_rules).map(normalizeRule).filter(Boolean),
@@ -57,6 +97,11 @@ export function normalizeBuiltin(raw) {
     editOps: normalizeEditOps(data.edit_ops),
     conditions: normalizeConditions(data.conditions),
     profiles: list(data.profiles).map((item) => (typeof item === 'string' ? item : item?.name)).filter(Boolean),
+    relayTaskVariables: taskVariables.length ? taskVariables : RELAY_TASK_VARIABLES,
+    specialUses: normalizeSpecialUses(data.special_uses),
+    profileName: compileProfileName(data.profile_name),
+    limits: normalizeLimits(data.limits),
+    structuredExample: typeof example === 'string' ? example : isObject(example) || Array.isArray(example) ? JSON.stringify(example, null, 2) : '',
   };
 }
 
@@ -64,6 +109,8 @@ export function normalizeErrors(raw) {
   return list(raw).map((item) => (typeof item === 'string' ? { message: item, param: '', ts: null }
     : { message: text(item?.message) || 'Ошибка', param: text(item?.param), ts: isNum(item?.ts) ? item.ts : null }));
 }
+
+const warningText = (item) => (typeof item === 'string' ? item : text(item?.message) || JSON.stringify(item));
 
 export function normalizeLegacy(raw) {
   const data = isObject(raw) ? raw : {};
@@ -78,9 +125,18 @@ export function normalizePrompts(raw) {
     rev: isNum(data.rev) ? data.rev : null,
     path: text(data.path),
     errors: normalizeErrors(data.errors),
+    // what the relay warns about in the document in force: protection off, rules that override it
+    warnings: list(data.warnings).map(warningText),
+    hasWarnings: Array.isArray(data.warnings),
     legacy: normalizeLegacy(data.legacy),
     builtin: normalizeBuiltin(data.builtin),
   };
+}
+
+/** PUT /admin/api/prompts: {rev, warnings}. */
+export function normalizeSaved(raw) {
+  const data = isObject(raw) ? raw : {};
+  return { rev: isNum(data.rev) ? data.rev : null, warnings: list(data.warnings).map(warningText) };
 }
 
 /** POST /admin/api/prompts/preview */
@@ -213,7 +269,7 @@ export const BASELINE_DOCUMENT = { version: 1, default_profile: 'passthrough', p
 
 export const loadPrompts = (key, signal) => api(key, 'prompts', { signal }).then(normalizePrompts);
 
-export const savePrompts = (key, document, baseRev) => api(key, 'prompts', { method: 'PUT', body: { document, base_rev: baseRev } });
+export const savePrompts = (key, document, baseRev) => api(key, 'prompts', { method: 'PUT', body: { document, base_rev: baseRev } }).then(normalizeSaved);
 
 export const previewPrompts = (key, body, signal) => api(key, 'prompts/preview', { method: 'POST', body, signal }).then(normalizePreview);
 
@@ -229,4 +285,13 @@ export const changePins = (key, action, conversation) => api(key, 'prompts/pins'
 export function failureOf(failure) {
   const error = failure?.body?.error;
   return { status: failure?.status ?? 0, message: text(error?.message) || failure?.message || 'Ошибка запроса', param: text(error?.param) };
+}
+
+/** How a refused save opens its message: 400 refusal, 413 too large, 503 disk, 0 no answer. */
+export function failureLead({ status }) {
+  if (status === 400) return 'Relay не принял документ';
+  if (status === 413) return 'Документ слишком большой: relay принимает не больше 2 МиБ';
+  if (status === 503) return 'Relay не смог записать файл на диск';
+  if (status === 0) return 'Relay недоступен';
+  return 'Ошибка';
 }

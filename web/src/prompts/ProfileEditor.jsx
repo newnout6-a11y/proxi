@@ -6,11 +6,10 @@ import { Area, Disclosure, Line, Notice, Select, Tokens } from './controls.jsx';
 import EditList from './EditList.jsx';
 import { isObject, patchProfile, profileNameError } from './draft.js';
 import { MID_SYSTEM_MODES } from './ops.js';
-import { MAX_TEXT_BYTES, insertAt, problemText, templateProblems, variableNames } from './template.js';
+import { insertAt, problemText, templateProblems, variableNames } from './template.js';
 
 const EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const VERBOSITIES = ['low', 'medium', 'high'];
-const RELAY_ONLY = ['relay_task', 'local_exec', 'project_context', 'exec_reminder'];
 
 function HeadEditor({ profile, name, builtin, textNames, onChange }) {
   const area = useRef(null);
@@ -21,7 +20,7 @@ function HeadEditor({ profile, name, builtin, textNames, onChange }) {
   const variables = useMemo(() => builtin.variables.map((variable) => variable.name), [builtin.variables]);
   const problems = useMemo(() => templateProblems(head, variables, textNames), [head, variables, textNames]);
   const used = new Set(variableNames(head));
-  const relayOnly = RELAY_ONLY.filter((variable) => used.has(variable));
+  const relayOnly = builtin.relayTaskVariables.filter((variable) => used.has(variable));
   const missingClient = !fromFile && head && !used.has('client_system') && !used.has('client_system_raw');
 
   useLayoutEffect(() => {
@@ -52,7 +51,7 @@ function HeadEditor({ profile, name, builtin, textNames, onChange }) {
   }
   return (
     <div className="p-head-editor">
-      <Area label="Шаблон head" value={head} onChange={(value) => onChange({ head: value })} rows={9} limit={MAX_TEXT_BYTES} areaRef={area}
+      <Area label="Шаблон head" value={head} onChange={(value) => onChange({ head: value })} rows={9} limit={builtin.limits.textBytes} areaRef={area}
         path={`profiles.${name}.head`} placeholder={'Мои правила…\n\n{{client_system}}'}
         hint="Текст, который модель получит как system. Переменные в двойных фигурных скобках; \{{ — буквальные скобки" />
       <div className="p-palette" role="group" aria-label="Вставить переменную в курсор">
@@ -131,7 +130,7 @@ export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, u
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(name);
   const taken = Object.keys(doc.profiles).filter((key) => key !== name);
-  const nameError = renaming ? profileNameError(nameDraft, taken) : null;
+  const nameError = renaming ? profileNameError(nameDraft, taken, builtin.profileName ?? undefined) : null;
   const patch = (change) => setDoc((current) => patchProfile(current, name, change));
   const systemEdits = profile.client_system?.edits || [];
   const userBlocks = profile.history?.user_blocks || [];

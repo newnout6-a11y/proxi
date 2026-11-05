@@ -4,7 +4,6 @@ import { Button, Tag } from '../ui.jsx';
 import { fmtInt } from '../format.js';
 import { Area, Disclosure, IconBtn, Line, Notice } from './controls.jsx';
 import { isObject, removeText, renameText, setRelayText, textNameError, textUsage, textsOf } from './draft.js';
-import { MAX_TEXT_BYTES } from './template.js';
 
 const RELAY_TEXTS = [
   { name: 'role', title: 'Роль relay', where: 'Запросы без system клиента и без инструментов («задачи relay»), а также переменная {{role}}', vars: [] },
@@ -24,12 +23,12 @@ function FromFile({ value, onReplace }) {
   );
 }
 
-function TextBody({ label, value, onChange, path, rows = 6, placeholder }) {
+function TextBody({ label, value, onChange, path, limit, rows = 6, placeholder }) {
   if (isObject(value) && typeof value.file === 'string') return <FromFile value={value} onReplace={() => onChange('')} />;
-  return <Area label={label} labelHidden value={typeof value === 'string' ? value : ''} onChange={onChange} rows={rows} limit={MAX_TEXT_BYTES} path={path} placeholder={placeholder} />;
+  return <Area label={label} labelHidden value={typeof value === 'string' ? value : ''} onChange={onChange} rows={rows} limit={limit} path={path} placeholder={placeholder} />;
 }
 
-function NamedText({ doc, setDoc, name }) {
+function NamedText({ doc, setDoc, name, limit }) {
   const value = doc.texts[name];
   const used = textUsage(doc, name);
   const [renaming, setRenaming] = useState(false);
@@ -63,13 +62,13 @@ function NamedText({ doc, setDoc, name }) {
           </div>
         </form>
       )}
-      <TextBody label={`Текст ${name}`} value={value} onChange={set} path={`texts.${name}`} />
+      <TextBody label={`Текст ${name}`} value={value} onChange={set} path={`texts.${name}`} limit={limit} />
       <p className="p-hint">{used.length ? `Используется в профилях: ${used.join(', ')}` : 'Пока нигде не используется'}</p>
     </article>
   );
 }
 
-function NamedTexts({ doc, setDoc }) {
+function NamedTexts({ doc, setDoc, limit }) {
   const texts = textsOf(doc);
   const names = Object.keys(texts);
   const [name, setName] = useState('');
@@ -83,7 +82,7 @@ function NamedTexts({ doc, setDoc }) {
         </div>
       </div>
       {!names.length && <p className="p-empty-line muted">Текстов пока нет</p>}
-      {names.map((key) => <NamedText key={key} doc={doc} setDoc={setDoc} name={key} />)}
+      {names.map((key) => <NamedText key={key} doc={doc} setDoc={setDoc} name={key} limit={limit} />)}
       <form className="p-add-text" onSubmit={(event) => { event.preventDefault(); if (!error) { setDoc((current) => ({ ...current, texts: { ...textsOf(current), [name]: '' } })); setName(''); } }}>
         <Line label="Новый текст: имя" value={name} onChange={setName} placeholder="my_rules" />
         <Button type="submit" icon={Plus} disabled={!!error}>Добавить текст</Button>
@@ -94,12 +93,12 @@ function NamedTexts({ doc, setDoc }) {
 }
 
 // codex_base is one string for every model or a map of model masks to strings.
-function CodexBase({ value, onChange }) {
+function CodexBase({ value, onChange, limit }) {
   const map = isObject(value) && typeof value.file !== 'string' ? value : null;
   if (!map) {
     return (
       <>
-        <TextBody label="Базовые инструкции Codex" value={value} onChange={onChange} path="relay_texts.codex_base" />
+        <TextBody label="Базовые инструкции Codex" value={value} onChange={onChange} path="relay_texts.codex_base" limit={limit} />
         {typeof value === 'string' && <div><Button onClick={() => onChange({ '*': value })}>Разделить по маскам моделей</Button></div>}
       </>
     );
@@ -111,7 +110,7 @@ function CodexBase({ value, onChange }) {
       {entries.map(([glob, text], index) => (
         <div className="p-codex-row" key={index}>
           <Line label="Маска модели" value={glob} onChange={(next) => set(entries.map(([key, item], i) => [i === index ? next : key, item]))} placeholder="gpt-5*" />
-          <Area label={`Инструкции для ${glob || 'маски'}`} value={text} limit={MAX_TEXT_BYTES} rows={5} path={`relay_texts.codex_base.${glob}`}
+          <Area label={`Инструкции для ${glob || 'маски'}`} value={text} limit={limit} rows={5} path={`relay_texts.codex_base.${glob}`}
             onChange={(next) => set(entries.map(([key, item], i) => [key, i === index ? next : item]))} />
           <IconBtn icon={Trash} tone="danger" label={`Убрать маску ${glob || index + 1}`} onClick={() => set(entries.filter((_, i) => i !== index))} />
         </div>
@@ -148,8 +147,8 @@ function RelayText({ doc, setDoc, builtin, info }) {
       </div>
       {custom ? (
         <>
-          {info.name === 'codex_base' ? <CodexBase value={raw} onChange={set} />
-            : <TextBody label={info.title} value={raw} onChange={set} path={`relay_texts.${info.name}`} />}
+          {info.name === 'codex_base' ? <CodexBase value={raw} onChange={set} limit={builtin.limits.textBytes} />
+            : <TextBody label={info.title} value={raw} onChange={set} path={`relay_texts.${info.name}`} limit={builtin.limits.textBytes} />}
           {standardText && (
             <Disclosure title="Встроенный текст" meta={`${fmtInt(standardText.length)} симв.`}>
               <pre className="p-builtin" tabIndex={0}>{standardText}</pre>
@@ -164,6 +163,11 @@ function RelayText({ doc, setDoc, builtin, info }) {
       ) : (
         <Notice tone="muted">Relay не сообщил встроенный текст: он действует как есть. Если нажать «Изменить», начнёте с пустого поля</Notice>
       )}
+      {info.name === 'structured' && builtin.structuredExample && (
+        <Disclosure title="Пример контракта, как он выглядит в head" meta={`${fmtInt(builtin.structuredExample.length)} симв.`}>
+          <pre className="p-builtin" tabIndex={0}>{builtin.structuredExample}</pre>
+        </Disclosure>
+      )}
     </article>
   );
 }
@@ -171,7 +175,7 @@ function RelayText({ doc, setDoc, builtin, info }) {
 export default function TextsTab({ doc, setDoc, builtin }) {
   return (
     <div className="p-texts-tab">
-      <NamedTexts doc={doc} setDoc={setDoc} />
+      <NamedTexts doc={doc} setDoc={setDoc} limit={builtin.limits.textBytes} />
       <section className="panel p-texts" aria-label="Тексты relay">
         <div className="panel-head">
           <div>
