@@ -632,6 +632,60 @@ def test_malformed_model_entries_and_options_are_rebuilt_instead_of_crashing():
     assert catalog['claude-opus-5-5']['options']['reasoningEffort'] == 'medium'
 
 
+def model_with(name, **fields):
+    """update_document for one model whose entry holds `fields`, next to Opus so the catalog is never empty."""
+    before = source()
+    before['provider']['retool-relay']['models'] = {name: fields}
+    result = update_document(before, [models.resolve(name)[0], models.resolve('claude-opus-5-5')[0]])
+    return result['provider']['retool-relay']['models'][name]
+
+
+@pytest.mark.parametrize('name,default', [('claude-haiku-4-5-20251001', 'none'), ('gpt-4.1', 'none'),
+                                          ('zai-org/GLM-5.3-Flash', None)])
+@pytest.mark.parametrize('where', ['settings', 'body'])
+def test_stale_effort_in_model_level_settings_or_body_is_cleared_where_the_model_has_no_levels(name, default, where):
+    item = model_with(name, **{where: {'reasoningEffort': 'high', 'temperature': 0.2}})
+    assert item[where] == {'temperature': 0.2} and item['variants'] == {}
+    assert item['options'].get('reasoningEffort') == default
+    assert where not in model_with(name, **{where: {'reasoning_effort': 'high'}})  # nothing else left: the empty block goes
+
+
+@pytest.mark.parametrize('where', ['settings', 'body'])
+def test_a_valid_effort_in_model_level_settings_or_body_is_the_users_choice_and_moves_to_options(where):
+    item = model_with('claude-opus-5-5', **{where: {'reasoningEffort': 'low', 'temperature': 0.2}})
+    assert item['options']['reasoningEffort'] == 'low' and item[where] == {'temperature': 0.2}
+
+
+@pytest.mark.parametrize('settings', [{'reasoningEffort': 'xhigh'}, {'effort': 'xhigh'},
+                                      {'extra_body': {'reasoning': {'effort': 'ultra'}}}])
+def test_an_effort_level_the_route_rejects_is_dropped_from_model_level_settings(settings):
+    item = model_with('claude-opus-5-5', settings=dict(settings))
+    assert 'settings' not in item and item['options']['reasoningEffort'] == 'medium'
+
+
+def test_conflicting_model_level_efforts_fall_back_to_the_default_instead_of_picking_one():
+    item = model_with('claude-opus-5-5', options={'reasoningEffort': 'high'}, settings={'reasoningEffort': 'low'})
+    assert item['options']['reasoningEffort'] == 'medium' and 'settings' not in item
+
+
+def test_a_validation_failure_names_the_model_and_the_field():
+    before = source()
+    before['provider']['retool-relay']['models'] = {'gpt-6-sol': {'settings': 'not an object'}, 'gpt-4.1': {}}
+    with pytest.raises(ValueError, match='validation') as error:
+        update_document(before, [models.resolve(name)[0] for name in ('gpt-6-sol', 'gpt-4.1')])
+    assert 'gpt-6-sol' in str(error.value) and 'settings' in str(error.value) and 'gpt-4.1' not in str(error.value)
+
+
+def test_cli_reports_which_model_and_field_failed_validation_and_leaves_the_file_alone(tmp_path, capsys):
+    settings = installed(tmp_path, {'provider': {'retool-relay': {'options': {'baseURL': 'http://localhost:8787/v1'},
+                                                                  'models': {'gpt-6-sol': {'settings': ['high']}}}}})
+    original = settings.read_bytes()
+    code, summary, error = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'))
+    assert code == 1 and summary is None and error.startswith('error: Generated client catalog failed validation')
+    assert 'gpt-6-sol' in error and 'settings' in error and 'Traceback' not in error
+    assert settings.read_bytes() == original and not (tmp_path / 'backups').exists()
+
+
 def test_write_without_a_backup_directory_is_rejected_before_the_settings_are_read(tmp_path):
     never_read = tmp_path / 'never-read.jsonc'
     with pytest.raises(SystemExit) as error:

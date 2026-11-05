@@ -84,6 +84,19 @@ def _compaction_warning(where, dropped, replacement, main, main_window):
             "was removed and OpenCode compacts with the session's model" % (where, lost, main_window, main))
 
 
+def _policy_problems(policy):
+    """Why the catalog policy rejected a generated catalog: models and fields, never their values."""
+    problems = ['%s: %s %s' % (item['model'], item['field'], item['problem'])
+                for item in policy['forbidden_variant_fields']]
+    for key, text in (('forbidden_models', 'models the relay does not publish'),
+                      ('catalog_forbidden_models', 'listed models the relay does not publish'),
+                      ('missing_models', 'published models missing'),
+                      ('catalog_mismatch', 'models whose configuration and listing differ')):
+        if policy[key]:
+            problems.append('%s: %s' % (text, ', '.join(policy[key])))
+    return '; '.join(problems) or 'the catalog policy rejected it'
+
+
 def update_document(document, entries, default_model='claude-opus-5-5', warnings=None):
     """The document with the relay catalog replaced; `warnings` collects what the caller should read."""
     warnings = [] if warnings is None else warnings
@@ -114,10 +127,17 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
         options = item.get('options')
         if not isinstance(options, dict):
             options = item['options'] = {}
-        previous = effort_controls(options)
+        # A stale control can sit in the model's own settings or body too, and the catalog policy reads
+        # `settings` before `options`, so all three are read for the user's choice and cleared together.
+        scopes = [options] + [item[key] for key in ('settings', 'body') if isinstance(item.get(key), dict)]
+        previous = [value for scope in scopes for value in effort_controls(scope)]
         valid = [value for value in previous if isinstance(value, str) and value in levels]
         selected = valid[0] if len(set(valid)) == 1 else entry.get('default_reasoning_effort')
-        _clear_effort(options)
+        for scope in scopes:
+            _clear_effort(scope)
+        for key in ('settings', 'body'):
+            if item.get(key) == {}:
+                del item[key]
         if levels:
             options['reasoningEffort'] = selected
         elif not entry.get('reasoning'):
@@ -180,8 +200,9 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
     for _, command in _named_objects(result.get('command')):
         update_reference(command, 'model', fallback)
     listed = '\n'.join(PROVIDER + '/' + name for name in new_models)
-    if not catalog_policy(result, listed, 'opencode', allowed_entries=entries, require_complete=True)['passed']:
-        raise ValueError('Generated client catalog failed validation')
+    policy = catalog_policy(result, listed, 'opencode', allowed_entries=entries, require_complete=True)
+    if not policy['passed']:
+        raise ValueError('Generated client catalog failed validation: ' + _policy_problems(policy))
     return result
 
 
