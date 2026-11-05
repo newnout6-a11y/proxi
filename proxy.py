@@ -28,6 +28,7 @@ import generation
 import models as model_catalog
 import sse
 import models
+import prompt_policy
 import validate
 from accounts import UNNAMED, AccountDispatcher, account_tag
 from credits import CreditsManager
@@ -96,6 +97,8 @@ class Runtime:
         self.accounts = AccountDispatcher(list(managers), cfg, managers)
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.runner.accounts = self.accounts
+        self.prompts = prompt_policy.PromptStore(cfg)
+        self.runner.prompts = self.prompts
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
         self.journal = journal.JOURNAL
