@@ -19,6 +19,7 @@ EXAMPLE = ROOT / "prompts.example.json"
 FENCE = re.compile(r"^```(json|jsonc)[ \t]*\r?\n(.*?)^```[ \t]*\r?$", re.S | re.M)
 RECIPES = "\n## Рецепты\n"
 RULE_KEYS = {"name", "if", "use", "enabled", "override_protected"}
+LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 VARIABLE = re.compile(r"(?<!\\)\{\{([^{}]*)\}\}")
 PERSONAL = (re.compile(r"[A-Za-z]:\\Users\\"), re.compile(r"/(?:home|Users)/[^\s/]+"),
             re.compile(r"(?i)(?:api[_-]?key|cookie|token|secret)[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9._~+/-]{16,}"))
@@ -166,6 +167,31 @@ def compile_or_skip(document, base):
         pytest.skip("prompt_policy.compile_document is not implemented yet")
 
 
+def heading_slugs(path):
+    """The anchors GitHub gives the headings of a markdown file (fenced code is skipped)."""
+    slugs, fenced = set(), False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+        elif not fenced and re.match(r"#{1,6} ", line):
+            title = line.lstrip("#").strip().replace("`", "").lower()
+            slugs.add(re.sub(r"[^\w\- ]", "", title).replace(" ", "-"))
+    return slugs
+
+
+def broken_anchors(source, *, only_into=None):
+    """Links of `source` that name a heading missing from the file they point at."""
+    broken = []
+    for target in LINK.findall(source.read_text(encoding="utf-8")):
+        if re.match(r"[a-z][a-z0-9+.-]*:", target) or "#" not in target:
+            continue
+        name, _hash, anchor = target.partition("#")
+        page = (source.parent / name).resolve() if name else source
+        if (only_into is None or page == only_into) and anchor not in heading_slugs(page):
+            broken.append(f"{source.relative_to(ROOT).as_posix()}: {target}")
+    return broken
+
+
 def test_every_json_block_of_the_guide_parses():
     blocks = guide_blocks()
     assert len(blocks) >= 12, "the guide lost its examples"
@@ -223,6 +249,14 @@ def test_the_guide_and_the_example_carry_no_personal_data():
         text = path.read_text(encoding="utf-8")
         found += [f"{path.name}: {match.group(0)}" for pattern in PERSONAL for match in pattern.finditer(text)]
     assert found == []
+
+
+def test_anchors_in_the_guide_and_towards_it_resolve():
+    # test_docs_consistency checks that a linked file exists; a renamed heading breaks the #anchor silently.
+    broken = broken_anchors(GUIDE)
+    for source in (README, ROOT / "docs" / "relay-quality-and-prompts.md"):
+        broken += broken_anchors(source, only_into=GUIDE)
+    assert broken == []
 
 
 def test_the_readme_example_follows_the_contract():
