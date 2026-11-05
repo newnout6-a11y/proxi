@@ -7,9 +7,9 @@ import json
 
 import pytest
 
+import config as config_module
 import journal
 import models
-import config as config_module
 import prompt_policy
 from prompt_models_support import FakeSnapshot, store  # noqa: F401  (store is a fixture)
 from test_prompt_models_catalog import CODEX_TEXT, dump, legacy_codex_catalog
