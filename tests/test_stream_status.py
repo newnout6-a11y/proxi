@@ -32,7 +32,9 @@ def answer(call, dialect, stream, model=OPUS, tools=False, headers=None):
     path, build = DIALECTS[dialect]
     status, body, response_headers = call(path, dict(build(model, tools), stream=stream), headers)
     error = body.get("error") if isinstance(body, dict) else None
-    return {"status": status, "type": (error or {}).get("type"), "message": (error or {}).get("message"),
+    # Messages errors carry a documented Anthropic type; the relay's own code stays in relay_code.
+    code = (error or {}).get("relay_code") or (error or {}).get("type")
+    return {"status": status, "type": code, "message": (error or {}).get("message"),
             "retry_after": response_headers.get("retry-after"), "body": body}
 
 
