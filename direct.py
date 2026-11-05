@@ -757,113 +757,216 @@ def _ping(session, body):
     return actual_credits
 
 
+_STOP_TEXT = {
+    "idle_limit": "Прогрев остановлен: диалог не запрашивали дольше лимита простоя",
+    "subagent_done": "Прогрев остановлен: субагент ответил без вызова инструмента",
+    "account_unavailable": "Прогрев остановлен: аккаунт недоступен для фоновых запросов",
+    "evicted": "Прогрев остановлен: диалог вытеснен из пула",
+    "failures": "Прогрев остановлен после пяти неудач",
+    "closed": "Прогрев остановлен: сессия закрыта",
+}
+
+
+class _WarmCycle:
+    """Pings and cost of one keepwarm task; reported once, as cache.keepwarm_stop, when it ends."""
+    __slots__ = ("session", "account", "pings", "idle_pings", "cost0", "reason", "detail")
+
+    def __init__(self, session, account):
+        self.session, self.account = session, account
+        self.pings = self.idle_pings = 0
+        self.cost0 = float(getattr(session, "_keepwarm_cost", 0.0) or 0.0)
+        # Cancelled by whoever closed the session; the pool names its own reasons (eviction).
+        self.reason, self.detail = "closed", {}
+
+    def stop(self, reason, **detail):
+        self.reason, self.detail = reason, detail
+
+    def cancelled(self):
+        self.stop(getattr(self.session, "_warm_stop_reason", None) or "closed")
+
+    def announce(self):
+        session, reason = self.session, self.reason
+        if reason == "closed" and not self.pings:
+            return  # a session closed without a single ping has nothing to account for
+        try:
+            last = getattr(session, "_last_request_at", None)
+            spent = float(getattr(session, "_keepwarm_cost", 0.0) or 0.0) - self.cost0
+            level = ("warn" if reason == "failures" else
+                     "debug" if reason == "account_unavailable" and not self.pings else "info")
+            owner = getattr(session, "_turn_identity", None) or getattr(session, "_warm_identity", None) or {}
+            token = client_context.bind(owner)
+            try:
+                journal.emit("cache.keepwarm_stop", _STOP_TEXT.get(reason, reason), level, reason=reason,
+                             pings=self.pings, idle_pings=self.idle_pings, credits=round(max(0.0, spent), 5),
+                             idle_seconds=round(max(0.0, time.time() - last)) if isinstance(last, (int, float)) else None,
+                             subagent=bool(getattr(session, "_parent_key", None)),
+                             model=(getattr(session, "_warm_body", None) or {}).get("model"),
+                             thread=journal.tag(getattr(session, "thread_id", None)), account=self.account,
+                             **self.detail)
+            finally:
+                client_context.reset(token)
+        except Exception:  # noqa: BLE001 - reporting must not break the session's own shutdown
+            pass
+
+
+def _dependents_live(session, now, turn_timeout, limit):
+    """True while a child request that pins this conversation is really alive.
+
+    The pool counts leases, and a release that never comes would pin the count forever.
+    Only activity counts here: a child turn busy for at most turn_timeout, or any child
+    request within its own idle limit; a request still being set up counts for turn_timeout."""
+    for record in tuple(getattr(session, "_cache_dependent_records", None) or ()):
+        child, since = getattr(record, "session", None), getattr(record, "since", 0) or 0
+        if child is None:
+            if now - since <= turn_timeout:
+                return True
+            continue
+        started = getattr(child, "_turn_started_at", 0) or 0
+        if getattr(child, "_busy", False) and started:
+            if now - started <= turn_timeout:
+                return True
+            continue
+        if now - max(getattr(child, "_last_request_at", 0) or 0, since) <= limit:
+            return True
+    return False
+
+
 async def _keepwarm(session, cfg):
     """Refresh active and idle prefixes, scheduling from request starts.
 
     Only one ping runs per session. Active turns get their first refresh at
     the configured offset, then at most every 240s (inside the 5-minute TTL).
     Failures back off; an unknown cache result is never reported as a hit.
+
+    Idle warming ends by limits that hold whatever the pool's bookkeeping says: after
+    cache_keepwarm_idle seconds without a real request (pings do not count), after
+    cache_keepwarm_subagent_idle for a subagent whose answer asked for a tool, at once
+    for a subagent that answered without one. A turn busy for longer than turn_timeout and
+    a child request that went quiet keep nothing warm. The reason, the pings and the credits
+    of the cycle are journaled as cache.keepwarm_stop.
     """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
     if interval <= 0:
         return
-    idle = float(cfg.get("cache_keepwarm_idle", 1800) or 1800)
+    idle = float(cfg.get("cache_keepwarm_idle", 900) or 900)
+    subagent_idle = float(_int_setting(cfg, "cache_keepwarm_subagent_idle", 600))
+    turn_timeout = float(_int_setting(cfg, "turn_timeout", 900) or 900)
     during_turns = bool(cfg.get("cache_keepwarm_during_turns", True))
     turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), 285.0)
     active_interval = min(interval, 240.0)
     account = account_tag(getattr(session, "backend", None))
+    cycle = _WarmCycle(session, account)
     scheduled_seq = None
     next_turn_ping = 0.0
     retry_at = 0.0
-    while True:
-        context_token = client_context.bind({})
-        try:
-            await asyncio.sleep(0.05)
-            now = time.time()
-            busy = bool(getattr(session, "_busy", False))
-            started = getattr(session, "_turn_started_at", 0) or 0
-            seq = getattr(session, "_turn_seq", 0)
-            if seq != scheduled_seq:
-                scheduled_seq = seq
-                next_turn_ping = started + turn_offset
-            last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
-            if not busy and not getattr(session, "_cache_dependents", 0) and now - last_req > idle:
-                return
-            if not busy and idle_block(getattr(session, "backend", None)):
-                # A switched-off, exhausted or signed-out account must not keep spending credits on idle warmups.
-                return
-            body = getattr(session, "_warm_body", None)
-            identity = getattr(session, "_warm_identity", None) or {}
-            if busy:
-                if not during_turns or not started:
+    try:
+        while True:
+            busy, seq = False, None
+            context_token = client_context.bind({})
+            try:
+                await asyncio.sleep(0.05)
+                now = time.time()
+                started = getattr(session, "_turn_started_at", 0) or 0
+                # A turn busy for longer than turn_timeout is stuck, not working: it keeps nothing warm.
+                busy = bool(getattr(session, "_busy", False)) and not (started and now - started > turn_timeout)
+                seq = getattr(session, "_turn_seq", 0)
+                if seq != scheduled_seq:
+                    scheduled_seq = seq
+                    next_turn_ping = started + turn_offset
+                last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
+                if not busy:
+                    subagent = bool(getattr(session, "_parent_key", None))
+                    limit = subagent_idle if subagent else idle
+                    if subagent and getattr(session, "_turn_final", False):
+                        cycle.stop("subagent_done")
+                        return
+                    pinned = _dependents_live(session, now, turn_timeout, subagent_idle)
+                    if not pinned and now - last_req > limit:
+                        cycle.stop("idle_limit", limit=limit)
+                        return
+                    unavailable = idle_block(getattr(session, "backend", None))
+                    if unavailable:
+                        # A switched-off, exhausted or signed-out account must not keep spending credits on idle warmups.
+                        cycle.stop("account_unavailable", account_state=unavailable)
+                        return
+                body = getattr(session, "_warm_body", None)
+                identity = getattr(session, "_warm_identity", None) or {}
+                if busy:
+                    if not during_turns or not started:
+                        await asyncio.sleep(0.95)
+                        continue
+                    turn_body = getattr(session, "_turn_body", None)
+                    if turn_body:
+                        body = turn_body
+                        identity = getattr(session, "_turn_identity", None) or {}
+                    due = max(next_turn_ping, retry_at)
+                else:
+                    due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
+                if not body:
                     await asyncio.sleep(0.95)
                     continue
-                turn_body = getattr(session, "_turn_body", None)
-                if turn_body:
-                    body = turn_body
-                    identity = getattr(session, "_turn_identity", None) or {}
-                due = max(next_turn_ping, retry_at)
-            else:
-                due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
-            if not body:
-                await asyncio.sleep(0.95)
-                continue
-            if now < due:
-                await asyncio.sleep(min(0.95, max(0.05, due - now)))
-                continue
-            # The scheduler spans turns: bind the owner of this exact body,
-            # snapshotting before to_thread so a following turn cannot relabel it.
-            client_context.bind(identity)
-            ping_started = now
-            loop = asyncio.get_running_loop()
-            io_executor = getattr(loop, "_relay_io_executor", None)
-            if io_executor is None:
-                actual = await asyncio.to_thread(_ping, session, body)
-            else:
-                actual = await loop.run_in_executor(io_executor, contextvars.copy_context().run,
-                                                    _ping, session, body)
-            if busy and getattr(session, "_turn_seq", 0) == seq:
-                session._turn_pinged = True
-                next_turn_ping = ping_started + active_interval
-            session._warm_at = ping_started
-            session._warm_failures = 0
-            retry_at = 0.0
-            prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
-            estimate = prefix_tokens * credits.RATE_CACHE_READ
-            if actual is None:
-                session._keepwarm_estimated_cost = round(
-                    getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
-            usage = getattr(session, "_last_warm_usage", {})
-            touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
-                "promptTokensReadFromCache", "promptTokensWrittenToCache"))
-            journal.emit("cache.keepwarm",
-                         "Кэш прочитан или записан при прогреве" if touched else
-                         "Запрос прогрева завершён; использование кэша не подтверждено",
-                         "info" if busy else "debug",
-                         model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
-                         account=account,
-                         during_turn=busy, turn_age_seconds=round(ping_started - started) if busy else None,
-                         prefix_tokens=prefix_tokens, est_credits=round(estimate, 4),
-                         actual_credits=actual, credits_total=getattr(session, "_keepwarm_cost", 0.0),
-                         cache_verified=touched, usage=usage)
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            if busy and getattr(session, "_turn_seq", 0) == seq:
-                session._turn_pinged = True
-            failures = getattr(session, "_warm_failures", 0) + 1
-            session._warm_failures = failures
-            if failures >= 5:
-                journal.emit("cache.keepwarm", "Прогрев остановлен после пяти неудач", "warn", account=account)
-                console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire")
+                if now < due:
+                    await asyncio.sleep(min(0.95, max(0.05, due - now)))
+                    continue
+                # The scheduler spans turns: bind the owner of this exact body,
+                # snapshotting before to_thread so a following turn cannot relabel it.
+                client_context.bind(identity)
+                ping_started = now
+                cycle.pings += 1
+                cycle.idle_pings += 0 if busy else 1
+                loop = asyncio.get_running_loop()
+                io_executor = getattr(loop, "_relay_io_executor", None)
+                if io_executor is None:
+                    actual = await asyncio.to_thread(_ping, session, body)
+                else:
+                    actual = await loop.run_in_executor(io_executor, contextvars.copy_context().run,
+                                                        _ping, session, body)
+                if busy and getattr(session, "_turn_seq", 0) == seq:
+                    session._turn_pinged = True
+                    next_turn_ping = ping_started + active_interval
+                session._warm_at = ping_started
+                session._warm_failures = 0
+                retry_at = 0.0
+                prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
+                estimate = prefix_tokens * credits.RATE_CACHE_READ
+                if actual is None:
+                    session._keepwarm_estimated_cost = round(
+                        getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
+                usage = getattr(session, "_last_warm_usage", {})
+                touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
+                    "promptTokensReadFromCache", "promptTokensWrittenToCache"))
+                journal.emit("cache.keepwarm",
+                             "Кэш прочитан или записан при прогреве" if touched else
+                             "Запрос прогрева завершён; использование кэша не подтверждено",
+                             "info" if busy else "debug",
+                             model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
+                             account=account,
+                             during_turn=busy, turn_age_seconds=round(ping_started - started) if busy else None,
+                             prefix_tokens=prefix_tokens, est_credits=round(estimate, 4),
+                             actual_credits=actual, credits_total=getattr(session, "_keepwarm_cost", 0.0),
+                             cache_verified=touched, usage=usage)
+            except asyncio.CancelledError:
+                cycle.cancelled()
                 return
-            retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
-            next_turn_ping = retry_at
-            journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn",
-                         account=account)
-            console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" % str(exc)[:200])
-        finally:
-            client_context.reset(context_token)
+            except Exception as exc:
+                if busy and getattr(session, "_turn_seq", 0) == seq:
+                    session._turn_pinged = True
+                failures = getattr(session, "_warm_failures", 0) + 1
+                session._warm_failures = failures
+                if failures >= 5:
+                    journal.emit("cache.keepwarm", "Прогрев остановлен после пяти неудач", "warn", account=account)
+                    console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire")
+                    cycle.stop("failures", failures=failures)
+                    return
+                retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
+                next_turn_ping = retry_at
+                journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn",
+                             account=account)
+                console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" % str(exc)[:200])
+            finally:
+                client_context.reset(context_token)
+    finally:
+        cycle.announce()
 
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
@@ -916,9 +1019,20 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     session._turn_identity = identity
     session._turn_started_at = time.time()
     session._turn_pinged = False
+    session._turn_final = False
     session._turn_seq = getattr(session, "_turn_seq", 0) + 1
     session._last_request_at = time.time()
     rejected = False
+    # A completed answer that asked for no tool is final: a subagent that gave one is done.
+    asked_tool, ended = False, None
+
+    def note(event):
+        nonlocal asked_tool, ended
+        if event.get("type") == "tool_call" and not event.get("partial"):
+            asked_tool = True
+        elif event.get("type") == "end":
+            ended = event.get("reason")
+
     if body.get("openAICacheKey"):
         session._turn_body = body
         # Start the scheduler with the turn, not after it: a session's first long
@@ -927,6 +1041,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     try:
         try:
             async for event in _stream_body(cfg, session, body, param_types):
+                note(event)
                 yield event
         except apierr.ApiError as error:
             # Models absent from the App Builder list (legacy GPT-5, Haiku) live on
@@ -946,6 +1061,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             if body.get("openAICacheKey"):
                 session._turn_body = body
             async for event in _stream_body(cfg, session, body, param_types):
+                note(event)
                 yield event
         reply = getattr(session, "_direct_reply", None)
         if client is not None and history is not None and reply is not None and not session._cancelled:
@@ -959,6 +1075,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         session._busy = False
         session._turn_body = None
         session._turn_identity = None
+        session._turn_final = ended == "stop" and not asked_tool and not getattr(session, "_cancelled", False)
         if body.get("openAICacheKey") and not rejected:
             prior_key = getattr(session, "_last_cache_key", None)
             if prior_key and prior_key != body["openAICacheKey"]:

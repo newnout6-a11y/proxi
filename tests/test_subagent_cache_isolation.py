@@ -66,7 +66,7 @@ def test_claude_metadata_parent_is_available_without_a_title_lookup(tmp_path):
 def test_parent_keeps_warming_during_long_child_and_resumes_its_own_cache(tmp_path, monkeypatch, mode, minutes):
     _, pool, runner = setup(tmp_path, transport="direct", session_mode=mode, project_context=False,
                             cookie_values=[], cache_keepwarm_seconds=240, cache_keepwarm_idle=1800,
-                            conversation_idle_timeout=900)
+                            conversation_idle_timeout=900, turn_timeout=3600)
     clock = SimpleNamespace(now=1000.0)
     real_sleep = asyncio.sleep
     sent, pings = [], []

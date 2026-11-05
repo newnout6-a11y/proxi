@@ -849,6 +849,18 @@ class SessionLease:
             yield event
 
 
+class _Dependent:
+    """One in-flight request of a child conversation that pins its ancestors' warm cache.
+
+    The scheduler judges it by what the child session really did, never by the lease
+    count alone, so a release that never comes cannot keep an ancestor warm forever."""
+    __slots__ = ("since", "session")
+
+    def __init__(self):
+        self.since = time.time()
+        self.session = None
+
+
 class SessionPool:
     """Bounded persistent conversations with one exclusive lease per request."""
 
@@ -1000,6 +1012,7 @@ class SessionPool:
             self._conversation_refs.pop(key, None)
             self._last_used.pop(key, None)
             if session is not None:
+                session._warm_stop_reason = "evicted"
                 closing.append(session)
             journal.emit("session.evict", "Диалог вытеснен (%s)" % ("простой" if expired else "нет места"),
                          "debug", conversation=journal.tag(key), reason="idle" if expired else "capacity")
@@ -1032,9 +1045,18 @@ class SessionPool:
                     pending.append(ancestor)
         return parents
 
-    def _touch_cache_parents(self, parents, delta):
+    def _touch_cache_parents(self, parents, delta, dependent=None):
         for key, session in parents:
-            session._cache_dependents = getattr(session, "_cache_dependents", 0) + delta
+            # Never below zero: an unbalanced release must not corrupt the next request's pin.
+            session._cache_dependents = max(0, getattr(session, "_cache_dependents", 0) + delta)
+            if dependent is not None:
+                records = getattr(session, "_cache_dependent_records", None)
+                if records is None:
+                    records = session._cache_dependent_records = set()
+                if delta > 0:
+                    records.add(dependent)
+                else:
+                    records.discard(dependent)
             session._last_request_at = time.time()
             if key in self._conversations:
                 self._last_used[key] = time.monotonic()
@@ -1054,7 +1076,8 @@ class SessionPool:
         referenced = False
         keep = False
         parents = self._cache_parents(parent_key) if parent_key != conversation_key else []
-        self._touch_cache_parents(parents, 1)
+        dependent = _Dependent() if parents else None
+        self._touch_cache_parents(parents, 1, dependent)
         client_key = conversation_key
         try:
             affinity_parent = (self._shared if self.mode == "shared" else
@@ -1164,13 +1187,16 @@ class SessionPool:
                 session = RelaySession(backend, await self._new_thread_id(backend))
             session._client_key = client_key
             session._parent_key = parent_key
+            if dependent is not None:
+                dependent.session = session
             session.begin_request()
             lease = SessionLease(session)
             lease._cache_parents = parents
+            lease._cache_dependent = dependent
             self._active[lease] = (session, key, lock, keep)
             return lease
         except BaseException:
-            self._touch_cache_parents(parents, -1)
+            self._touch_cache_parents(parents, -1, dependent)
             if locked:
                 lock.release()
             if referenced:
@@ -1204,7 +1230,8 @@ class SessionPool:
             if not keep or session._needs_drain or session._cancelled:
                 await session.aclose()
         finally:
-            self._touch_cache_parents(getattr(lease, "_cache_parents", []), -1)
+            self._touch_cache_parents(getattr(lease, "_cache_parents", []), -1,
+                                      getattr(lease, "_cache_dependent", None))
             if key is not None:
                 self._conversation_refs[key] -= 1
                 self._last_used[key] = time.monotonic()

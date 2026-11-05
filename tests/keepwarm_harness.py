@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import direct
 
 START = 1000.0
+REAL_SLEEP = asyncio.sleep
 CFG = {"cache_keepwarm_seconds": 240, "cache_keepwarm_idle": 900, "cache_keepwarm_subagent_idle": 600,
        "cache_keepwarm_during_turns": True, "cache_keepwarm_turn_offset": 200, "turn_timeout": 900}
 
@@ -22,32 +23,43 @@ def session(**fields):
     return SimpleNamespace(**state)
 
 
-def drive(monkeypatch, target, cfg=None, *, seconds=3600, ping=None, on_tick=None):
-    """Run direct._keepwarm on a simulated clock until it stops itself or `seconds` have passed.
+def install(monkeypatch, *, seconds=None, ping=None, on_tick=None):
+    """Run asyncio sleeps, time.time and pings on a simulated clock; no real waiting.
 
-    Returns (clock, pings): the simulated clock and the time of every ping that was sent."""
-    clock = SimpleNamespace(now=START)
-    real_sleep = asyncio.sleep
+    Returns (clock, pings): the clock and the time of every ping sent. With `seconds`, the
+    scheduler is cancelled when that much simulated time has passed."""
+    clock = SimpleNamespace(now=START, frozen=False)
     pings = []
 
     async def sleep(delay):
-        clock.now += delay
-        if on_tick is not None:
-            on_tick(clock.now)
-        if clock.now >= START + seconds:
-            raise asyncio.CancelledError()
-        await real_sleep(0)
+        if not clock.frozen:
+            clock.now += delay
+            if on_tick is not None:
+                on_tick(clock.now)
+            if seconds is not None and clock.now >= START + seconds:
+                raise asyncio.CancelledError()
+        await REAL_SLEEP(0)
 
     async def to_thread(fn, *args):
         return fn(*args)
 
     def send(owner, body):
         pings.append(clock.now)
-        return 0.1 if ping is None else ping(owner, body)
+        value = 0.1 if ping is None else ping(owner, body)
+        if value is not None:
+            # What the real _ping books for a billed request.
+            owner._keepwarm_cost = getattr(owner, "_keepwarm_cost", 0.0) + value
+        return value
 
     monkeypatch.setattr(direct.time, "time", lambda: clock.now)
     monkeypatch.setattr(direct.asyncio, "sleep", sleep)
     monkeypatch.setattr(direct.asyncio, "to_thread", to_thread)
     monkeypatch.setattr(direct, "_ping", send)
+    return clock, pings
+
+
+def drive(monkeypatch, target, cfg=None, *, seconds=3600, **options):
+    """Run direct._keepwarm on a simulated clock until it stops itself or `seconds` have passed."""
+    clock, pings = install(monkeypatch, seconds=seconds, **options)
     asyncio.run(direct._keepwarm(target, dict(CFG, **(cfg or {}))))
     return clock, pings
