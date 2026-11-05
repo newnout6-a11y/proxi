@@ -18,7 +18,7 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
-from context import DEFAULT_RELAY_SYSTEM_PROMPT, build_system_instructions
+from context import build_system_instructions, relay_policy
 from redact import redact
 from session import SessionLease
 from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
@@ -285,7 +285,7 @@ class TurnRunner:
     def _instructions(self, native_tools=False):
         if native_tools:
             if self.cfg.get('relay_system_prompt') is not None:
-                return self.cfg['relay_system_prompt']
+                return relay_policy(self.cfg['relay_system_prompt'])
             return ("[ROLE]\nYou are a coding assistant using the client's tools. "
                     "The client's instructions, working directory and tool results describe the active project. "
                     "Use those tools to inspect, edit and test that project. "
@@ -306,9 +306,7 @@ class TurnRunner:
         mode = self.cfg.get('relay_system_prompt_mode', 'standalone')
         if mode == 'standalone':
             return instructions
-        policy = self.cfg.get('relay_system_prompt')
-        if policy is None:
-            policy = DEFAULT_RELAY_SYSTEM_PROMPT
+        policy = relay_policy(self.cfg.get('relay_system_prompt'))
         if mode == 'replace':
             return policy
         return '\n\n'.join(part for part in (instructions, policy) if part)
@@ -474,11 +472,13 @@ class TurnRunner:
             is_native = bool(native_tools)
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
-            client_owns_instructions = client_text or bool(parsed.system)
+            # A blank system (an effort-only entry, a lone newline) is no instruction at all.
+            client_system = parsed.system if (parsed.system or "").strip() else ""
+            client_owns_instructions = client_text or bool(client_system)
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
-                instructions = parsed.system or ""
+                instructions = client_system
                 if purpose not in client_context.SERVICE_KINDS:
                     instructions = self._client_instructions(instructions)
             else:
@@ -502,8 +502,6 @@ class TurnRunner:
                     "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
                     "Do not answer that you cannot run commands."
                 )
-            if parsed.system and not client_owns_instructions:
-                instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
             if direct_mode:
                 # Direct path keeps the stable instructions (plus tool block) as the
                 # cached system head and sends the raw client tail as the user turn.
