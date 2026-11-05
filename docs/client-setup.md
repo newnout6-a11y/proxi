@@ -126,13 +126,23 @@ plugin patch lists at `~/.dsh/profiles/web/cordis.patch.yml` and
 `~/.dsh/profiles/desktop/cordis.patch.yml`. The `llm-pi-ai` node stores providers
 under `config.providers`. The existing Proxi route uses OpenAI Chat Completions.
 
-Both profiles have been reconciled to the same 27 verified IDs. The main
-`retool` group holds 26 reasoning models, preserving its medium default and
-every supported selector; `retool-text` holds GPT-4.1 without a reasoning
-selector. Both use the same existing connection and credential reference. This
-split avoids an installed SDK limitation: a provider-wide medium default is
-rejected for a non-reasoning model before HTTP, while simply deleting that
-default can silently disable thinking on a model with an off selector.
+Both profiles have been reconciled to the same 27 verified IDs. After a sync the
+main `retool` group holds 23 models and `retool-text` holds 4. `retool` takes the
+models that publish selectable reasoning levels and keeps its medium default and
+every supported selector. `retool-text` takes the four that publish none: GPT-4.1
+(not a reasoning model), Haiku 4.5, GLM-5.3 and GLM-5.3 Flash (Retool accepts an
+effort level for the last three and ignores it). Both use the same existing
+connection and credential reference. This split avoids an installed SDK
+limitation: a provider-wide medium default is rejected for a model without
+selectors before HTTP, while simply deleting that default can silently disable
+thinking on a model with an off selector.
+
+The name `retool-text` and its display-name suffix "(без thinking)" mean "no
+reasoning-level selector", not "does not think". GLM-5.3 and GLM-5.3 Flash reason
+on every request, whatever level is sent, and the group keeps the provider's
+`thinkingFormat: deepseek` setting, so Harness shows their thinking like that of
+any other model. The group is not renamed: the sync recognizes the managed group
+by that name and display name.
 
 To preview or update an existing profile, use `scripts/sync_harness_catalog.py
 --settings PATH`. Preview writes only with `--output`; replacing the profile

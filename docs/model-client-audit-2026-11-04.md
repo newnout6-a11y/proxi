@@ -505,6 +505,14 @@ rejects GPT-4.1 before HTTP, but deleting that default on the one-provider
 catalog silently disables thinking for GPT-6 Sol's default/off selector.
 The separate text group keeps every valid selector and the reasoning default.
 
+> **Correction (2026-11-05, PR #24 review).** "26 reasoning models in `retool`
+> and GPT-4.1 in `retool-text`" describes the catalog before the 2026-11-05 effort
+> probe. Haiku 4.5, GLM-5.3 and GLM-5.3 Flash have since lost their published
+> levels (Retool accepts and ignores the control), so a sync now puts 23 models
+> in `retool` and 4 in `retool-text`: GPT-4.1, Haiku 4.5 and both GLM routes.
+> `retool-text` means "no reasoning-level selector", not "no thinking": GLM still
+> reasons and its thinking is shown. See `client-setup.md`.
+
 An independent runtime probe loaded the actual CLI adapter 0.2.2-alpha.3 with
 pi-ai 1.5.0 and the actual Desktop adapter 0.2.1-rc.5 with pi-ai 1.1.0 from its
 ASAR. It ran **22 cases**, including default/explicit off/high, rejection of
