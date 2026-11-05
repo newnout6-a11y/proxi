@@ -24,6 +24,9 @@ probes/chunks/
 # Personal prompt control files: profiles, rules and the texts they read (prompts.example.json is the shared sample).
 /prompts.json
 /prompts/
+# What saving prompts.json leaves beside it: the previous version and an interrupted write.
+/prompts.json.bak
+/.prompts-*.tmp
 
 # Private investigation artifacts can contain captured upstream credentials.
 .verify*/

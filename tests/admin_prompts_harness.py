@@ -9,7 +9,6 @@ import pytest
 import apierr
 import journal
 import prompt_policy
-from prompt_policy import Snapshot
 
 KEY = "private-relay-key"  # the relay key of test_admin.admin_relay
 MARKER = "PRIVATE-PROMPT-TEXT-MARKER"
@@ -19,6 +18,23 @@ DOC = {"version": 1,
        "rules": [{"name": "opencode", "if": {"client": "opencode"}, "use": "mine"}]}
 REQUEST = {"model": "claude-opus-5-5",
            "messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}]}
+
+
+class Snapshot:
+    """The part of prompt_policy.Snapshot the admin routes read (rev, document, source_path, warnings).
+
+    The real Snapshot validates its document; these tests exercise the routes with deliberately arbitrary documents,
+    so the fake store keeps them in this plain stand-in instead (the real engine is covered by the *_real_* tests)."""
+
+    def __init__(self, rev, document, source_path=None):
+        self.rev = rev
+        self._document = copy.deepcopy(document)
+        self.source_path = source_path
+        self.warnings = []
+
+    @property
+    def document(self):
+        return copy.deepcopy(self._document)
 
 
 class FakeStore:
