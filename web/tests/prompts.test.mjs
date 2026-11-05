@@ -6,14 +6,16 @@ import { normalizeParts, segmentHead, sourceKind, sourceLabel, summarizeKinds } 
 import { describeEdit, flagsOf, joinFlags, newEdit, normalizeEditOps, opOf, setEditField, switchOp } from '../src/prompts/ops.js';
 import { CONDITION_SPECS, conditionText, fromValues, normalizeConditions, setCondition, summarizeConditions, valuesOf } from '../src/prompts/conditions.js';
 import {
-  addProfile, blankDocument, changedPaths, equalJson, errorHits, idOf, insertAt, locate, moveItem, newRule, normalizePath, patchProfile,
+  addProfile, blankDocument, catchAllIndex, changedPaths, equalJson, errorHits, idOf, insertAt, locate, moveItem, newRule, normalizePath, patchProfile,
   pathLabel, profileNameError, profileUsage, protectedEnabled, pruneProfile, removeAt, removeProfile, removeText, renameProfile, renameText,
-  setProtected, setRelayText, textNameError, textUsage, updateAt,
+  setProtected, setRelayText, setRuleField, STARTERS, starterProfile, textNameError, textUsage, uniqueName, updateAt,
 } from '../src/prompts/draft.js';
 import {
   BASELINE_DOCUMENT, DEFAULT_VARIABLES, detectDialect, failureOf, forceProfile, normalizeBuiltin, normalizePins, normalizePreview,
   normalizePrompts, normalizeRecent, normalizeVariables, parseBody, parseHeaders, previewRequest,
 } from '../src/prompts/api.js';
+import { describeChange } from '../src/prompts/changes.js';
+import { emptySample, newestSample, recentLabel, resolveSample } from '../src/prompts/sample.js';
 
 // --- template ------------------------------------------------------------------------------------------------
 
@@ -510,4 +512,78 @@ test('a failed call is read as status, message and the path the relay blames', (
   assert.deepEqual(failureOf({ status: 409, message: 'stale', body: null }), { status: 409, message: 'stale', param: '' });
   assert.deepEqual(failureOf(new Error('boom')), { status: 0, message: 'boom', param: '' });
   assert.deepEqual(failureOf(undefined), { status: 0, message: 'Ошибка запроса', param: '' });
+});
+
+// --- rules, starting points and samples ------------------------------------------------------------------------------
+
+test('a rule field is written only when it differs from the default', () => {
+  const rule = { name: 'r', if: {}, use: 'p' };
+  assert.deepEqual(setRuleField(rule, 'enabled', false), { ...rule, enabled: false });
+  assert.deepEqual(setRuleField({ ...rule, enabled: false }, 'enabled', true), rule);
+  assert.deepEqual(setRuleField(rule, 'override_protected', true), { ...rule, override_protected: true });
+  assert.deepEqual(setRuleField({ ...rule, override_protected: true }, 'override_protected', false), rule);
+  assert.deepEqual(setRuleField(rule, 'name', 'x'), { ...rule, name: 'x' });
+  assert.deepEqual(setRuleField(rule, 'name', undefined), { if: {}, use: 'p' });
+});
+
+test('whatever follows the first enabled rule that matches everything can never be reached', () => {
+  const rule = (extra) => ({ name: 'r', use: 'p', ...extra });
+  assert.equal(catchAllIndex([rule({ if: { client: 'codex' } }), rule({ if: {} }), rule({ if: { client: 'x' } })]), 1);
+  assert.equal(catchAllIndex([rule({}), rule({ if: {} })]), 0);
+  assert.equal(catchAllIndex([rule({ if: {}, enabled: false }), rule({ if: { tools: true } })]), -1);
+  assert.equal(catchAllIndex([]), -1);
+});
+
+test('the starting points keep both kinds of request as they are or start from the user\'s own text', () => {
+  assert.deepEqual(STARTERS.map((item) => item.id), ['same', 'rules-first', 'exact']);
+  assert.equal(starterProfile('same').head, '{{client_system}}{{relay_task}}{{exec_reminder}}');
+  assert.match(starterProfile('rules-first').head, /^Отвечай по-русски.*\n\n\{\{client_system\}\}/s);
+  assert.doesNotMatch(starterProfile('exact').head, /client_system/);
+  assert.deepEqual(starterProfile('nope'), starterProfile('same'));
+  for (const item of STARTERS) {
+    const known = ['client_system', 'relay_task', 'exec_reminder'];
+    assert.deepEqual(templateProblems(item.head, known, []), []);
+  }
+});
+
+test('a free name is the base itself, or the base with the next number', () => {
+  assert.equal(uniqueName('mine', ['a']), 'mine');
+  assert.equal(uniqueName('mine', ['mine']), 'mine-2');
+  assert.equal(uniqueName('mine', ['mine', 'mine-2', 'mine-3']), 'mine-4');
+});
+
+test('a sample is a recent request with a kept body, or a pasted body with its headers and dialect', () => {
+  const recent = [
+    { request_id: 'a', ts: 1700000000, client: 'opencode', model: 'claude-opus-5-5', purpose: 'client-tools', has_request: false },
+    { request_id: 'b', ts: 1700000100, client: 'codex', model: 'gpt-5.5', purpose: '', has_request: true },
+  ];
+  assert.equal(newestSample(recent).request_id, 'b');
+  assert.equal(newestSample([recent[0]]), null);
+  assert.match(recentLabel(recent[1]), /codex · gpt-5\.5$/);
+  assert.deepEqual(resolveSample(emptySample(), recent), { sample: null, error: '' });
+  assert.deepEqual(resolveSample({ ...emptySample(), requestId: 'a' }, recent), { sample: null, error: '' });
+  const picked = resolveSample({ ...emptySample(), requestId: 'b' }, recent);
+  assert.deepEqual([picked.sample.kind, picked.sample.request_id], ['recent', 'b']);
+
+  const paste = { mode: 'paste', text: '{"model": "m", "system": "s"}', dialect: '', headersText: 'User-Agent: x' };
+  const pasted = resolveSample(paste, []);
+  assert.deepEqual([pasted.sample.kind, pasted.sample.dialect, pasted.sample.headers, pasted.sample.request], ['paste', 'anthropic', { 'User-Agent': 'x' }, { model: 'm', system: 's' }]);
+  assert.equal(resolveSample({ ...paste, dialect: 'responses' }, []).sample.dialect, 'responses');
+  assert.deepEqual(resolveSample({ ...paste, text: '  ' }, []), { sample: null, error: '' });
+  assert.match(resolveSample({ ...paste, text: '{oops' }, []).error, /Не JSON/);
+  assert.match(resolveSample({ ...paste, headersText: 'nope' }, []).error, /без двоеточия/);
+  assert.deepEqual(resolveSample(null), { sample: null, error: '' });
+});
+
+test('a change the relay reports is read for its operation, its place and its note, whatever fields it has', () => {
+  assert.deepEqual(describeChange('plain text'), { title: 'plain text', details: [], note: '' });
+  assert.deepEqual(describeChange({ op: 'drop_tag', tag: 'system-reminder', count: 3 }),
+    { title: 'Убрать блок тега', details: [['тег', 'system-reminder'], ['совпадений', '3']], note: '' });
+  assert.deepEqual(describeChange({ op: 'append', tool: 'bash', chars: 57, reason: 'tool matched' }),
+    { title: 'Добавить в конец', details: [['инструмент', 'bash'], ['симв.', '57']], note: 'tool matched' });
+  assert.equal(describeChange({ message: 'skipped: would break the roles' }).title, 'skipped: would break the roles');
+  assert.equal(describeChange({ op: 'future_op' }).title, 'future_op');
+  assert.deepEqual(describeChange({ op: 'x', mystery: 'seen', nested: { a: 1 } }).details, [['mystery', 'seen']]);
+  assert.equal(describeChange(null).title, '');
+  assert.equal(describeChange({ message: 'x'.repeat(200) }).title.length, 80);
 });
