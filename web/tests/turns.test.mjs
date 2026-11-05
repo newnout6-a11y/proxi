@@ -157,6 +157,27 @@ test('a turn that never reached upstream has no attempt, so it is neither pendin
   assert.equal(costOf(trace).credits, 0);
 });
 
+// The relay marks the attempt a client cancelled while it was silent at the moment of that end (journal._Turn.end), once
+// and for good: what arrives later neither repeats the mark nor undoes it. Found by replaying random event sequences
+// through the relay's own journal.turns() and comparing every turn.
+const AFTER_END = [
+  ['a cancelled end before any attempt marks nothing, a later attempt is only pending', [END('cancelled'), START(3)], 0, 0, true],
+  ['an attempt started after a cancelled end is pending, the earlier silent one is the gap', [START(1), END('cancelled'), START(2)], null, 1, false],
+  ['every cancelled end marks the attempt that was silent then', [START(1), USAGE(1, 0.25), START(2), END('cancelled'), START(3), END('cancelled')], 0.25, 2, false],
+  ['a price that arrives after the cancelled end makes the attempt known again', [START(1), END('cancelled'), USAGE(1, 0.25)], 0.25, 0, true],
+  ['a marker that arrives after the cancelled end does not count the attempt twice', [START(1), END('cancelled'), USAGE(1, null, MARKER)], null, 1, false],
+  ['a cancelled end after the attempt reported marks nothing', [START(1), USAGE(1, 0.01), END('timeout'), END('cancelled')], 0.01, 0, true],
+  ['usage for another attempt does not clear the mark of the silent current one', [START(1), START(2), END('cancelled'), USAGE(1, 0.5)], 0.5, 1, false],
+];
+for (const [name, steps, credits, unknown, complete] of AFTER_END) {
+  test(`cost when events follow the end: ${name}`, () => {
+    const cost = costOf(turnOf(steps));
+    assert.equal(cost.credits === null ? null : Math.round(cost.credits * 1e6) / 1e6, credits);
+    assert.equal(cost.unknown, unknown);
+    assert.equal(cost.complete, complete);
+  });
+}
+
 test('a running turn is never complete: nothing reported yet has no price, a price so far is a lower bound', () => {
   assert.deepEqual(costOf(turnOf([])), { credits: null, unknown: 0, running: true, complete: false });
   assert.deepEqual(costOf(turnOf([START(1)])), { credits: null, unknown: 0, running: true, complete: false });

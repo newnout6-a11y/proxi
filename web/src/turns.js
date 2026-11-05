@@ -102,6 +102,10 @@ export function buildTraces(events) {
       closeExec(trace, event.ts);
       closeWait(trace, event.ts);
       Object.assign(trace, { ended: event.ts, duration: data.duration_ms, status: data.reason || 'stop' });
+      // A client that cancels does not wait for the telemetry: like the relay's journal, count the attempt that was
+      // silent at this moment as possibly billed, for good (what arrives later does not undo or repeat it)
+      const last = trace.costAttempts.get(trace.costAttempt);
+      if (data.reason === 'cancelled' && last) last.observed = true;
     }
     if (event.kind === 'upstream.first_token') {
       signal(trace, event.ts);
@@ -186,19 +190,17 @@ export function buildTraces(events) {
 
 /**
  * What a turn cost, by the relay's own rules (journal._Turn, as /admin/api/turns reports it): an attempt that reported
- * usage without a valid price is unknown, and so is the silent attempt of a turn the client cancelled; one that only
- * started (refused, 429/500, never left) cost nothing. `credits` is the sum of the valid prices, else 0 for a turn
- * that ended without an unknown attempt (also one that never reached upstream), else null. `complete` holds only for
- * a turn whose end the relay recorded and that has no unknown attempt, so a running or interrupted turn is never
- * complete: its price so far is a lower bound.
+ * usage without a valid price is unknown, and so is the attempt a client cancelled while it was silent (marked when
+ * the turn ended, see buildTraces); one that only started (refused, 429/500, never left) cost nothing. `credits` is
+ * the sum of the valid prices, else 0 for a turn that ended without an unknown attempt (also one that never reached
+ * upstream), else null. `complete` holds only for a turn whose end the relay recorded and that has no unknown
+ * attempt, so a running or interrupted turn is never complete: its price so far is a lower bound.
  */
 export function costOf(trace, status = trace.status) {
   const running = status === 'running';
   const ended = !running && status !== 'interrupted';
   const attempts = [...trace.costAttempts.values()];
-  const latest = trace.costAttempts.get(trace.costAttempt);
-  const silent = status === 'cancelled' && latest !== undefined && !latest.observed;
-  const unknown = attempts.filter((attempt) => attempt.observed && !attempt.known).length + (silent ? 1 : 0);
+  const unknown = attempts.filter((attempt) => attempt.observed && !attempt.known).length;
   const priced = attempts.some((attempt) => attempt.known);
   return { credits: priced ? trace.creditsSum : ended && !unknown ? 0 : null, unknown, running, complete: ended && !unknown };
 }
