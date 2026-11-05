@@ -80,9 +80,14 @@ writes, it keeps the file's BOM, line endings, indentation and final-newline
 state. Rewriting removes comments, so a file that has them is refused until you
 delete them or pass `--allow-reformat`; the backup keeps the original. Nothing is
 written and no backup is made when the catalog is already current: the summary
-shows `written: false`. The `--output` preview masks credentials as `***`
-(`apiKey`, header and environment values, other token/secret/password fields);
-`--include-secrets` writes it verbatim.
+shows `written: false`. The `--output` preview masks credentials as `***`: the
+values of `apiKey`, header and environment keys and other token/secret/password
+fields, a string under `key`, `auth`, `pass` or `pwd`, the user info and secret
+parameters (`token`, `key`, `signature` and the like) of any URL, the argument after
+a secret flag in a command (`--api-key X`, `--token=X`), every `NAME=value` item of
+an `env` list and secret `NAME=value` text. `--include-secrets` writes it verbatim.
+The rules go by name and shape, so they can miss a credential in an unexpected place:
+read a preview before you share it.
 
 A reference to a removed relay model is replaced instead of left dangling, in
 `model`, `small_model`, `agent.*.model`, `command.*.model` and the deprecated
@@ -158,15 +163,21 @@ passed default, off, high and rejection checks with the exact generated files;
 the SDK bundles and Desktop ASAR were not modified.
 
 The `--output` preview masks credential values (`apiKey`, header and environment
-values, tokens, passwords) as `'***'` and replaces only those values; `apiKeyEnv`
-references stay visible. `--include-secrets` writes the exact bytes. A profile that
-is already current is not rewritten and gets no backup (`written: false`). A last
-provider block without a final newline is spliced correctly and keeps that ending.
-A profile that is not UTF-8 or not valid YAML is reported with its line and column,
-never its content. Catalog discovery uses the whole relay config like the relay.
-One limit remains: a comment written directly after the Proxi block, before the next
-provider, can be dropped or repeated (ruamel attaches it to the block's last key), so
-compare the preview with the profile before `--write`.
+values, tokens, passwords) as `'***'`, and also the user info and secret parameters
+of URLs, the argument after a secret flag, every `NAME=value` item of an `env` list and
+secret `NAME=value` text; `apiKeyEnv` references stay visible. Every comment keeps its
+place but reads `# ***`, because a comment can quote an old key. Other bytes are kept,
+except that a plain or quoted value with a masked URL or argument is rewritten in
+double quotes. `--include-secrets` writes the exact bytes. The rules go by name and
+shape, so they can miss a credential in an unexpected place: read a preview before you
+share it. A profile that is already current is not rewritten and gets no backup
+(`written: false`). A last provider block without a final newline is spliced correctly
+and keeps that ending. A profile that is not UTF-8 or not valid YAML is reported with
+its line and column, never its content. Catalog discovery uses the whole relay config
+like the relay. One limit remains: a comment written directly after the Proxi block,
+before the next provider, can be dropped or repeated (ruamel attaches it to the block's
+last key), so compare the preview with the profile before `--write`: the preview shows
+each comment as `# ***` in its place, and `--include-secrets` shows the text.
 
 ### Historical Harness setup — 0.1.5-rc.2
 

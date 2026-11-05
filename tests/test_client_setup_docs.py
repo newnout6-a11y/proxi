@@ -87,3 +87,12 @@ def test_the_audit_withdraws_the_claim_that_haiku_publishes_a_none_level():
     assert note - claim < 300  # right behind the dated sentence, not somewhere else in the file
     withdrawn = audit[note:note + 700]
     assert 'withdrawn' in withdrawn and 'publishes no levels' in withdrawn and 'accepted-ignored' in withdrawn
+
+
+def test_both_preview_sections_say_what_is_masked_and_to_read_a_preview_before_sharing_it():
+    opencode, harness = section('OpenCode'), section('DeepSeek Harness')
+    for text in (opencode, harness):
+        assert 'read a preview before you share it' in text and 'user info' in text and 'secret flag' in text
+        assert '`NAME=value`' in text and '`env`' in text and '`--include-secrets`' in text
+    assert '`--api-key X`' in opencode and '`key`' in opencode
+    assert 'reads `# ***`' in harness and 'a comment can quote an old key' in harness
