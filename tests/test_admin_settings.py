@@ -42,6 +42,7 @@ def test_single_account_gate_moves_into_the_first_pool_record_and_keeps_gated_mo
     fable = models.resolve("claude-fable-5")[0]
     single = config.load(str(admin_relay.path))
     assert models.catalog_routable(fable, single, offline_pool(single).backends)
+    assert single["config_warnings"] == []  # without accounts[] the root is the source of the descriptor
 
     assert "provider_access" in admin.ACCOUNT_RECORD_KEYS
     status, _, _ = post_account(admin_relay)
@@ -49,28 +50,35 @@ def test_single_account_gate_moves_into_the_first_pool_record_and_keeps_gated_mo
     saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
     first, second = saved["accounts"]
     assert first["provider_access"] == RETENTION and "provider_access" not in second
+    # With accounts[] a root copy is ignored and warned about at every start: the descriptor moves, it is not copied.
+    assert "provider_access" not in saved
     # The pool reads the descriptor only from the account record: the gated model must survive the conversion.
     reloaded = config.load(str(admin_relay.path))
+    assert reloaded["config_warnings"] == []
     backends = offline_pool(reloaded).backends
     assert [SessionPool._routable(backend, fable) for backend in backends] == [True, False]
     assert models.catalog_routable(fable, reloaded, backends)
 
 
+@pytest.mark.parametrize("root_copy", [True, False])
 @pytest.mark.parametrize("second_gate", [{"anthropic": {"resource_name": "resource-acc-b", "byok": True}}, None])
-def test_deleting_the_first_account_hands_the_root_descriptor_to_the_new_first_account(pool, second_gate):
+def test_deleting_the_first_account_leaves_no_descriptor_in_the_root(pool, second_gate, root_copy):
     first_gate = {"anthropic": {"resource_name": "resource-acc-a", "data_retention_enabled": True}}
     saved = pool.saved()
     saved["accounts"][0]["provider_access"] = first_gate
-    saved["provider_access"] = first_gate  # the root mirrors accounts[0], as after a single -> pool conversion
+    if root_copy:
+        saved["provider_access"] = first_gate  # left by a conversion made before the root copy was dropped
     if second_gate:
         saved["accounts"][1]["provider_access"] = second_gate
     pool.path.write_text(json.dumps(saved), encoding="utf-8")
     assert pool.call("/admin/api/accounts/" + pool.tags[0], {}, method="DELETE")[0] == 200
     saved = pool.saved()
     assert [item.get("provider_access") for item in saved["accounts"]] == [second_gate]
-    assert saved.get("provider_access") == second_gate
-    assert "resource-acc-a" not in json.dumps(saved.get("provider_access"))
-    assert config.load(str(pool.path))["accounts"][0].get("provider_access") == second_gate
+    # The new first account keeps its own descriptor; mirrored into the root it would be warned about at every start.
+    assert "provider_access" not in saved and "resource-acc-a" not in json.dumps(saved)
+    reloaded = config.load(str(pool.path))
+    assert reloaded["accounts"][0].get("provider_access") == second_gate
+    assert reloaded["config_warnings"] == []
 
 
 # -- both built-in roles -------------------------------------------------------------

@@ -644,7 +644,9 @@ class Admin:
                 first = {key: copy.deepcopy(saved[key]) for key in ACCOUNT_RECORD_KEYS if key in saved}
                 if not first.get("account_id") and self.cfg.get("account_id"):
                     first["account_id"] = self.cfg["account_id"]
-                for key in ("cookie", "xsrf"):
+                # The access descriptor moves with the account: with accounts[] a root copy is ignored,
+                # and config.load would warn about it at every start.
+                for key in ("cookie", "xsrf", "provider_access"):
                     saved.pop(key, None)
                 saved["accounts"] = [first]
             saved["accounts"].append(record)
@@ -709,10 +711,9 @@ class Admin:
             if first.get(key):
                 saved[key] = first[key]
         # An access descriptor is bound to one account's resource and never inherited, so unlike a
-        # resource it is not handed to same-tenant accounts; the root must not keep the removed one's.
+        # resource it is neither handed to same-tenant accounts nor mirrored into the root: with
+        # accounts[] a root copy is ignored, and config.load would warn about it at every start.
         saved.pop("provider_access", None)
-        if first.get("provider_access"):
-            saved["provider_access"] = copy.deepcopy(first["provider_access"])
 
     def _pool_route(self, handler, path, match):
         allowed = ("GET", "POST") if match is None else ("POST",) if match.group(2) else ("PATCH", "DELETE")
