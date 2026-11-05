@@ -622,6 +622,33 @@ def test_a_document_round_trips_through_json(tmp_path):
     snapshot = compile_doc(json.loads(json.dumps(doc, ensure_ascii=False)), tmp_path)
     assert snapshot.document == doc
 
+def test_the_params_of_every_edit_op_are_described_for_the_admin(tmp_path):
+    params = pp.EDIT_OP_PARAMS
+    assert set(params["client_system"]) == set(pp.SYSTEM_EDIT_OPS)
+    assert set(params["user_blocks"]) == set(pp.USER_BLOCK_OPS)
+    assert set(params["tools"]) == set(pp.TOOL_EDIT_OPS) | {"hide"}
+    assert params["client_system"]["remove_between"] == {"required": ["start", "end"], "optional": {"inclusive": False}}
+    assert params["client_system"]["replace_text"] == {"required": ["find", "with"], "optional": {"all": True}}
+    assert params["user_blocks"]["drop_tag"] == {
+        "required": ["tag"], "optional": {"contains": None, "pattern": None, "flags": ""}}
+    assert params["tools"]["append"] == {"required": ["tool", "text"], "optional": {}}
+    assert params["tools"]["hide"] == {"required": ["tool"], "optional": {}}
+    json.dumps(params)
+    # what is described is what compile_document takes: every op with its required params only compiles
+    for section, ops in params.items():
+        for op, shape in ops.items():
+            if op == "hide":
+                continue
+            values = {"heading": "# A", "headings": ["# A"], "tag": "t", "start": "a", "end": "b", "pattern": "x",
+                      "find": "f", "with": "w", "text": "t", "tool": "bash"}
+            edit = {name: values[name] for name in shape["required"]}
+            if section != "tools" or op != "hide":
+                edit["op"] = op
+            holder = {"client_system": {"client_system": {"edits": [edit]}},
+                      "user_blocks": {"history": {"user_blocks": [edit]}},
+                      "tools": {"tools": {"edits": [edit]}}}[section]
+            compile_doc(document(profiles={"p": holder}), tmp_path)
+
 # -- nothing but a PromptConfigError may escape -------------------------------------------------------------------------
 
 RICH = {

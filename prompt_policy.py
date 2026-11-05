@@ -998,6 +998,19 @@ _TOOL_SPECS = {
     "replace_regex": _SYSTEM_SPECS["replace_regex"],
 }
 _TOP_KEYS = ("version", "default_profile", "protected", "texts", "relay_texts", "profiles", "rules", "codex")
+
+
+def _describe_ops(specs, extra_required=()):
+    return {op: {"required": [*extra_required, *(row[0] for row in rows if row[2])],
+                 "optional": {row[0]: row[3] for row in rows if not row[2]}} for op, rows in specs.items()}
+
+
+# What each edit op takes, for the admin forms: {section: {op: {"required": [names], "optional": {name: default}}}}.
+# A hidden tool is {"tool", "hide": true} and takes no op.
+EDIT_OP_PARAMS = {
+    "client_system": _describe_ops(_SYSTEM_SPECS),
+    "user_blocks": _describe_ops(_USER_SPECS),
+    "tools": {**_describe_ops(_TOOL_SPECS, ("tool",)), "hide": {"required": ["tool"], "optional": {}}}}
 _PROFILE_KEYS = ("description", "head", "client_system", "history", "tools", "generation", "publish_as_model")
 _STRUCTURED_VARIABLES = ("default", "schema", "schema_name")
 # Values a rule condition can usefully name; a literal outside them cannot match, which deserves a warning.
