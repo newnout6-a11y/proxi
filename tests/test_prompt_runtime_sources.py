@@ -11,11 +11,12 @@ import direct
 import executor
 import journal
 import orchestrator
+import prompt_body
 import prompt_policy
 import structured
 import validate
-from orchestrator import RelaySources, split_changes
-from prompt_support import FakePlan, FakePrompts, FakeSnapshot, profile
+from orchestrator import RelaySources, journal_changes, split_changes
+from prompt_support import FakePlan, FakePrompts, FakeSnapshot, install_summaries, profile
 from session import RelaySession
 from test_native_context_reuse import FIRST, request, run, setup
 from test_service_requests import capture_direct
@@ -170,7 +171,7 @@ def test_a_missing_snapshot_still_gives_the_built_in_texts(tmp_path):
     assert task.native_role() == orchestrator.DEFAULT_NATIVE_TOOLS_ROLE
 
 
-def test_the_structured_contract_is_empty_without_a_format_and_the_functions_own_text_without_an_engine(tmp_path):
+def test_the_structured_contract_is_empty_without_a_format_and_the_functions_own_text_without_a_wrapper(tmp_path):
     assert sources(tmp_path).structured() == ""
     for tools, choice in ((False, "auto"), (True, "auto"), (True, "none")):
         task = sources(tmp_path, spec=SPEC, native_tools=tools, choice=choice)
@@ -191,12 +192,42 @@ def test_the_engine_builds_the_contract_when_it_has_one(tmp_path, monkeypatch):
     assert asked == [(task.snapshot, SPEC, True, "required")]
 
 
-def test_changes_are_split_by_what_they_edit():
-    history = {"index": 4, "op": "drop_tag", "removed_chars": 12}
-    named = {"tool": "bash", "op": "append", "added_chars": 40}
-    scoped = {"scope": "tools", "op": "hide"}
-    assert split_changes([history, named, scoped]) == ([history], [named, scoped])
+def test_changes_are_split_by_the_scope_they_name_and_a_change_without_one_by_the_tool_it_names():
+    history = {"scope": "history", "op": "drop_tag", "edit": 0, "index": 4, "target": "user", "removed_chars": 12}
+    tools = {"scope": "tools", "op": "append", "edit": 1, "index": 0, "tool": "bash", "added_chars": 40}
+    assert split_changes([history, tools]) == ([history], [tools])
+    # the scope decides, whatever else the change carries
+    odd = {"scope": "history", "op": "drop_tag", "tool": "bash"}
+    assert split_changes([odd, tools]) == ([odd], [tools])
+    # a rewrite that names no scope: the tool decides
+    bare_history, bare_tools = {"index": 4, "op": "drop_tag"}, {"tool": "bash", "op": "append"}
+    assert split_changes([bare_history, bare_tools]) == ([bare_history], [bare_tools])
     assert split_changes([]) == ([], []) and split_changes(None) == ([], [])
+
+
+def test_the_journal_takes_one_line_per_kind_of_change_however_many_messages_were_edited(monkeypatch):
+    install_summaries(monkeypatch)
+    changes = [{"scope": "history", "op": "drop_tag", "edit": 0, "index": number, "target": "user",
+                "removed_chars": 3} for number in range(5000)]
+    changes += [{"scope": "tools", "op": "hide", "edit": 0, "index": 2, "tool": "bash"},
+                {"scope": "history", "op": "mid_system", "mode": "drop", "index": 7, "target": "system",
+                 "removed_chars": 20, "skipped": True, "reason": "it would end the conversation"}]
+    summary = journal_changes(changes)
+    assert [(g["scope"], g["op"], g.get("mode"), g["count"], g.get("skipped", False)) for g in summary] == [
+        ("history", "drop_tag", None, 5000, False), ("tools", "hide", None, 1, False),
+        ("history", "mid_system", "drop", 1, True)]
+    assert summary[0]["removed_chars"] == 15000 and summary[0]["indexes"] == list(range(8))
+    assert summary[2]["reason"] == "it would end the conversation"
+    assert journal_changes([]) == [] and journal_changes(None) == []
+    assert changes[0] == {"scope": "history", "op": "drop_tag", "edit": 0, "index": 0, "target": "user",
+                          "removed_chars": 3}  # the list the rewrite returned is not touched
+
+
+def test_without_a_summary_of_its_own_the_rewrite_gives_the_journal_its_first_changes_only(monkeypatch):
+    monkeypatch.delattr(prompt_body, "summarize_changes", raising=False)
+    changes = [{"scope": "history", "op": "drop_tag", "index": number} for number in range(100)]
+    assert journal_changes(changes) == changes[:orchestrator.JOURNAL_CHANGES]
+    assert len(journal_changes(changes)) == 20 and journal_changes(None) == []
 
 
 # -- a composed head in the runner ------------------------------------------------------------------------------------
@@ -383,9 +414,12 @@ def test_a_client_owned_request_never_executes_whatever_the_template_names(tmp_p
 
 def test_the_runner_records_the_plan_with_its_parts_and_changes_and_tells_the_journal_only_lengths(
         tmp_path, monkeypatch):
+    install_summaries(monkeypatch)
     store, before = FakePrompts(), journal.JOURNAL.last_seq
-    attributes = {"prompt_changes": [{"index": 2, "op": "drop_tag", "removed_chars": 5},
-                                     {"tool": "read_file", "op": "append"}],
+    attributes = {"prompt_changes": [{"scope": "history", "op": "drop_tag", "edit": 0, "index": 2, "target": "user",
+                                      "removed_chars": 5},
+                                     {"scope": "tools", "op": "append", "edit": 0, "index": 0, "tool": "read_file",
+                                      "added_chars": 12}],
                   "prompt_warnings": ["from the hooks"], "prompt_request": {"body": {"model": "m"}, "dialect": "chat",
                                                                            "headers": {}}}
     plan = planned("RULES\n\n{{client_system}}", warn=("from the engine",))
@@ -396,11 +430,15 @@ def test_the_runner_records_the_plan_with_its_parts_and_changes_and_tells_the_jo
     assert [(p["source"], p["start"], p["end"]) for p in entry["parts"]] == [("literal", 0, 7), ("client", 7, 20)]
     assert entry["history_changes"] == [attributes["prompt_changes"][0]]
     assert entry["tools_changes"] == [attributes["prompt_changes"][1]]
+    assert [(g["scope"], g["op"], g["count"]) for g in entry["changes_summary"]] == [
+        ("history", "drop_tag", 1), ("tools", "append", 1)]
     assert entry["warnings"] == ["from the engine", "from the hooks"]
     assert entry["request"] == attributes["prompt_request"] and entry["model"] == "claude-opus-5-5"
     (event,) = [e for e in journal.JOURNAL.query(since=before, limit=500, order="asc") if e["kind"] == "prompt.plan"]
     assert event["data"]["parts"] == [["literal", 7], ["client", 13]]
     assert event["data"]["warnings"] == ["from the engine", "from the hooks"]
+    assert [(g["op"], g["count"]) for g in event["data"]["history_changes"]] == [("drop_tag", 1)]
+    assert [(g["op"], g["tool"]) for g in event["data"]["tools_changes"]] == [("append", "read_file")]
     assert "RULES" not in json.dumps(event) and "CLIENT_SYSTEM" not in json.dumps(event)
 
 

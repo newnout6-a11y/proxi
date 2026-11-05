@@ -19,6 +19,7 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
+import prompt_body
 import structured
 from accounts import UNNAMED, account_tag
 from context import build_system_instructions, relay_policy
@@ -287,11 +288,31 @@ class RelaySources:
 
 
 def split_changes(changes):
-    """(history, tools) from the one list prompt_body.rewrite returns: a change naming a tool edits tools, the rest the history."""
+    """(history, tools) from the one list prompt_body.rewrite returns, by the scope each change names.
+
+    A change without a scope (a rewrite that does not name one) edits tools when it names a tool."""
     history, tools = [], []
     for change in changes or ():
-        (tools if change.get("scope") == "tools" or "tool" in change else history).append(change)
+        scope = change.get("scope")
+        if scope not in ("history", "tools"):
+            scope = "tools" if "tool" in change else "history"
+        (tools if scope == "tools" else history).append(change)
     return history, tools
+
+
+# What a recorded request keeps of the changes a rewrite made: the ring is in memory, so a body with thousands of
+# edited messages is cut here, and the summary (one entry per kind of edit) still names every kind.
+RING_CHANGES = 200
+# The journal takes prompt_body.summarize_changes; a rewrite without one gets its first entries only.
+JOURNAL_CHANGES = 20
+
+
+def journal_changes(changes):
+    """The changes of a rewrite in the form a journal event takes: one entry per kind of edit, never one per message."""
+    summarize = getattr(prompt_body, "summarize_changes", None)
+    if summarize is None:
+        return list(changes or ())[:JOURNAL_CHANGES]
+    return summarize(list(changes or ()))
 
 
 # kind: "text" (the persistent text chat), "isolated" (a standalone job) or "session" (the conversation's own one).
@@ -507,16 +528,18 @@ class TurnRunner:
         The journal gets lengths, a sha8 and the source of every part, never a text; the ring keeps the texts, in memory."""
         import prompt_policy
         plan, (head, parts, warnings) = parsed.prompt_plan, composed
-        history, tools = split_changes(getattr(parsed, "prompt_changes", None))
+        changes = list(getattr(parsed, "prompt_changes", None) or ())
+        history, tools = split_changes(changes)
         notes = list(warnings or ()) + list(getattr(parsed, "prompt_warnings", ()))
         inp = getattr(parsed, "prompt_input", None)
         try:
+            summary = journal_changes(changes)
+            summary_history, summary_tools = split_changes(summary)
             log("prompt.plan", "Промпт: профиль «%s», правило «%s», ревизия %s" % (plan.profile, plan.rule, plan.rev),
                 "debug", rev=plan.rev, profile=plan.profile, rule=plan.rule, pinned=plan.pinned,
                 protected=plan.protected, head_chars=len(head), head_sha8=prompt_policy.sha8(head),
                 parts=[[part.source, len(part.text)] for part in parts],
-                history_changes=sum(not change.get("skipped") for change in history),
-                tools_changes=sum(not change.get("skipped") for change in tools),
+                history_changes=summary_history, tools_changes=summary_tools,
                 generation=dict(plan.generation or {}), warnings=notes)
             if self.prompts is None or holder.get("_prompt_recorded"):
                 return
@@ -528,7 +551,10 @@ class TurnRunner:
                      "purpose": getattr(inp, "purpose", None) or _purpose(parsed),
                      "rule": plan.rule, "profile": plan.profile, "rev": plan.rev, "pinned": plan.pinned,
                      "protected": plan.protected, "head": head, "parts": prompt_policy.part_spans(parts),
-                     "history_changes": history, "tools_changes": tools, "warnings": notes}
+                     "history_changes": history[:RING_CHANGES], "tools_changes": tools[:RING_CHANGES],
+                     "changes_summary": summary, "warnings": notes}
+            if len(history) > RING_CHANGES or len(tools) > RING_CHANGES:
+                entry["changes_total"] = {"history": len(history), "tools": len(tools)}
             if getattr(parsed, "prompt_request", None):
                 entry["request"] = parsed.prompt_request
             self.prompts.record(entry)

@@ -163,8 +163,8 @@ def drop_inline_system(data, dialect, profile_, snapshot):
     kept, changes = [], []
     for index, message in enumerate(body["messages"]):
         if message.get("role") == "system" and kept:
-            changes.append({"index": index, "op": "mid_system", "mode": "drop",
-                            "removed_chars": len(json.dumps(message))})
+            changes.append({"scope": "history", "op": "mid_system", "mode": "drop", "index": index,
+                            "target": "system", "removed_chars": len(json.dumps(message))})
             continue
         kept.append(message)
     body["messages"] = kept

@@ -5,6 +5,7 @@ import json
 import pytest
 
 import direct
+import orchestrator
 import prompt_body
 import validate
 from prompt_support import client_request, fake_relay, head_of, profile, prompt_relay  # noqa: F401
@@ -22,15 +23,23 @@ def edited(store, **options):
 
 
 def drop_marker(data, dialect, profile_, snapshot):
-    """A stand-in for prompt_body.rewrite: removes MARK from message texts and reports each change."""
+    """A stand-in for prompt_body.rewrite: removes MARK from message texts and reports each change as P3's rewrite does."""
     body = copy.deepcopy(data)
     changes = []
     for index, message in enumerate(body["input" if dialect == "responses" else "messages"]):
         if isinstance(message.get("content"), str) and MARK in message["content"]:
             before = len(message["content"])
             message["content"] = message["content"].replace(MARK, "")
-            changes.append({"index": index, "op": "drop_tag", "removed_chars": before - len(message["content"])})
+            changes.append({"scope": "history", "op": "drop_tag", "edit": 0, "index": index, "target": "user",
+                            "removed_chars": before - len(message["content"])})
     return body, changes
+
+
+def hide_every_tool(data, dialect, profile_, snapshot):
+    """A stand-in for a rewrite whose tools.edits hide the only tool of the request."""
+    body = copy.deepcopy(data)
+    del body["tools"]
+    return body, [{"scope": "tools", "op": "hide", "edit": 0, "index": 0, "tool": "read_file"}]
 
 
 class Rewrites:
@@ -152,7 +161,8 @@ def test_what_the_virtual_model_parse_found_in_pass_1_is_carried_into_pass_2(pro
     assert relay.prompts.inputs[0].virtual_profile == "mine"
 
 
-def test_the_ring_keeps_the_original_body_and_the_changes_and_the_journal_only_their_number(prompt_relay, monkeypatch):
+def test_the_ring_keeps_the_original_body_and_the_changes_and_the_journal_only_a_summary_of_them(
+        prompt_relay, monkeypatch):
     relay = fake_relay(prompt_relay)
     edited(relay.prompts, edits=True)
     Rewrites(monkeypatch)
@@ -161,18 +171,25 @@ def test_the_ring_keeps_the_original_body_and_the_changes_and_the_journal_only_t
     assert relay.post("chat", request, {"x-session-affinity": "dialog-1"})[0] == 200
     (entry,) = relay.prompts.records
     assert entry["request"]["body"] == request and MARK in json.dumps(entry["request"]["body"])
-    assert entry["history_changes"] == [{"index": 1, "op": "drop_tag", "removed_chars": len(MARK)}]
+    assert entry["history_changes"] == [{"scope": "history", "op": "drop_tag", "edit": 0, "index": 1,
+                                         "target": "user", "removed_chars": len(MARK)}]
     assert entry["tools_changes"] == []
+    summary = [{"scope": "history", "op": "drop_tag", "edit": 0, "count": 1, "removed_chars": len(MARK),
+                "added_chars": 0, "indexes": [1]}]
+    assert entry["changes_summary"] == summary and "changes_total" not in entry
     (event,) = relay.events(mark, "prompt.plan")
-    assert event["data"]["history_changes"] == 1 and event["data"]["tools_changes"] == 0
-    assert "drop_tag" not in json.dumps(event)
+    assert event["data"]["history_changes"] == summary and event["data"]["tools_changes"] == []
+    assert "DROP_ME" not in json.dumps(event) and "ORIGINAL_TASK" not in json.dumps(event)
 
 
-def test_changes_that_name_a_tool_are_tools_changes(prompt_relay, monkeypatch):
+def test_the_changes_of_one_rewrite_are_split_by_their_scope(prompt_relay, monkeypatch):
     def result(data, dialect, profile_, snapshot):
-        return copy.deepcopy(data), [{"index": 1, "op": "drop_tag", "removed_chars": 3},
-                                     {"tool": "read_file", "op": "append", "added_chars": 40},
-                                     {"scope": "tools", "op": "hide", "name": "write"}]
+        return copy.deepcopy(data), [
+            {"scope": "history", "op": "drop_tag", "edit": 0, "index": 1, "target": "user", "removed_chars": 3},
+            {"scope": "tools", "op": "append", "edit": 0, "index": 0, "tool": "read_file", "added_chars": 40},
+            {"scope": "history", "op": "mid_system", "mode": "wrap", "index": 2, "target": "system",
+             "removed_chars": 5, "added_chars": 32},
+            {"scope": "tools", "op": "hide", "edit": 1, "index": 1, "tool": "write"}]
 
     relay = fake_relay(prompt_relay)
     edited(relay.prompts, edits=True)
@@ -180,19 +197,54 @@ def test_changes_that_name_a_tool_are_tools_changes(prompt_relay, monkeypatch):
     mark = relay.mark()
     assert relay.post("chat", client_request("chat", USER, system="CLIENT_SYSTEM"))[0] == 200
     (entry,) = relay.prompts.records
-    assert [c["op"] for c in entry["history_changes"]] == ["drop_tag"]
+    assert [c["op"] for c in entry["history_changes"]] == ["drop_tag", "mid_system"]
     assert [c["op"] for c in entry["tools_changes"]] == ["append", "hide"]
     (event,) = relay.events(mark, "prompt.plan")
-    assert (event["data"]["history_changes"], event["data"]["tools_changes"]) == (1, 2)
+    history, tools = event["data"]["history_changes"], event["data"]["tools_changes"]
+    assert [(g["op"], g.get("mode"), g["count"]) for g in history] == [("drop_tag", None, 1), ("mid_system", "wrap", 1)]
+    assert [(g["op"], g["tool"], g["count"]) for g in tools] == [("append", "read_file", 1), ("hide", "write", 1)]
 
 
-def test_an_edit_the_rewrite_left_out_is_one_warning_per_kind_and_not_a_change(prompt_relay, monkeypatch):
+def test_a_body_with_thousands_of_changes_gives_the_journal_a_line_per_kind_and_the_ring_a_bounded_list(
+        prompt_relay, monkeypatch):
+    many = orchestrator.RING_CHANGES * 10 + 7
+
+    def result(data, dialect, profile_, snapshot):
+        changes = [{"scope": "history", "op": "drop_tag", "edit": 0, "index": number, "target": "tool_result",
+                    "removed_chars": 2} for number in range(many)]
+        return copy.deepcopy(data), changes + [
+            {"scope": "tools", "op": "append", "edit": 0, "index": 0, "tool": "read_file", "added_chars": 9}]
+
+    relay = fake_relay(prompt_relay)
+    edited(relay.prompts, edits=True)
+    Rewrites(monkeypatch, result)
+    mark = relay.mark()
+    assert relay.post("chat", client_request("chat", USER, system="CLIENT_SYSTEM"))[0] == 200
+    (entry,) = relay.prompts.records
+    assert len(entry["history_changes"]) == orchestrator.RING_CHANGES and len(entry["tools_changes"]) == 1
+    assert entry["history_changes"][0]["index"] == 0 and entry["changes_total"] == {"history": many, "tools": 1}
+    assert [(g["op"], g["count"], g["removed_chars"]) for g in entry["changes_summary"]] == [
+        ("drop_tag", many, 2 * many), ("append", 1, 0)]
+    (event,) = relay.events(mark, "prompt.plan")
+    (group,) = event["data"]["history_changes"]
+    assert (group["op"], group["count"], group["removed_chars"]) == ("drop_tag", many, 2 * many)
+    assert group["indexes"] == list(range(8)) and len(event["data"]["tools_changes"]) == 1
+    assert len(json.dumps(event)) < 2000
+
+
+def test_an_edit_the_rewrite_left_out_is_one_warning_per_kind_and_a_flagged_line_of_the_summary(
+        prompt_relay, monkeypatch):
+    reason = "would break a tool_use pair"
+
     def result(data, dialect, profile_, snapshot):
         return copy.deepcopy(data), [
-            {"index": 3, "op": "drop_tag", "skipped": True, "reason": "would break a tool_use pair"},
-            {"index": 5, "op": "drop_tag", "skipped": True, "reason": "would break a tool_use pair"},
-            {"tool": "bash", "op": "append", "skipped": True, "reason": "no such tool"},
-            {"index": 1, "op": "drop_tag", "removed_chars": 9}]
+            {"scope": "history", "op": "drop_tag", "edit": 0, "index": 3, "target": "user",
+             "skipped": True, "reason": reason},
+            {"scope": "history", "op": "drop_tag", "edit": 0, "index": 5, "target": "user",
+             "skipped": True, "reason": reason},
+            {"scope": "tools", "op": "append", "edit": 1, "index": 2, "tool": "bash",
+             "skipped": True, "reason": "no such tool"},
+            {"scope": "history", "op": "drop_tag", "edit": 0, "index": 1, "target": "user", "removed_chars": 9}]
 
     relay = fake_relay(prompt_relay)
     edited(relay.prompts, edits=True)
@@ -201,10 +253,16 @@ def test_an_edit_the_rewrite_left_out_is_one_warning_per_kind_and_not_a_change(p
     assert relay.post("chat", client_request("chat", USER, system="CLIENT_SYSTEM"))[0] == 200
     skipped = relay.events(mark, "prompt.edit_skipped")
     assert [(e["level"], e["data"]["op"], e["data"]["reason"], e["data"]["count"]) for e in skipped] == [
-        ("warn", "drop_tag", "would break a tool_use pair", 2), ("warn", "append", "no such tool", 1)]
+        ("warn", "drop_tag", reason, 2), ("warn", "append", "no such tool", 1)]
+    # where it happened: the rule, the tool and the first message or tool it concerned
+    assert [(e["data"]["scope"], e["data"]["edit"], e["data"].get("tool"), e["data"]["index"]) for e in skipped] == [
+        ("history", 0, None, 3), ("tools", 1, "bash", 2)]
     assert all(e["request_id"] for e in skipped)
     (event,) = relay.events(mark, "prompt.plan")
-    assert (event["data"]["history_changes"], event["data"]["tools_changes"]) == (1, 0)
+    history, tools = event["data"]["history_changes"], event["data"]["tools_changes"]
+    assert [(g["op"], g.get("skipped", False), g["count"]) for g in history] == [
+        ("drop_tag", True, 2), ("drop_tag", False, 1)]
+    assert [(g["op"], g["skipped"], g["reason"]) for g in tools] == [("append", True, "no such tool")]
 
 
 @pytest.mark.parametrize("failure", ["raises", "unparsable"])
@@ -229,14 +287,9 @@ def test_a_failing_rewrite_serves_the_request_on_the_legacy_path(prompt_relay, m
 
 
 def test_hiding_every_tool_changes_the_session_the_request_asks_for(prompt_relay, monkeypatch):
-    def result(data, dialect, profile_, snapshot):
-        body = copy.deepcopy(data)
-        del body["tools"]
-        return body, [{"tool": "read_file", "op": "hide"}]
-
     relay = fake_relay(prompt_relay)
     edited(relay.prompts, edits=True)
-    Rewrites(monkeypatch, result)
+    Rewrites(monkeypatch, hide_every_tool)
     status, _, _ = relay.post("chat", client_request("chat", USER, system="CLIENT_SYSTEM"),
                               {"x-session-affinity": "dialog-1"})
     assert status == 200
@@ -345,12 +398,6 @@ def spy_on_the_pool(relay, monkeypatch):
     monkeypatch.setattr(pool, "unavailable_error",
                         lambda entry, **scope: unavailable.append(scope) or availability(entry, **scope))
     return refusals, unavailable
-
-
-def hide_every_tool(data, dialect, profile_, snapshot):
-    body = copy.deepcopy(data)
-    del body["tools"]
-    return body, [{"tool": "read_file", "op": "hide"}]
 
 
 @pytest.mark.parametrize("stream", [False, True])

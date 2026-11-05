@@ -270,7 +270,7 @@ def test_the_head_is_what_the_plan_composes_and_the_journal_holds_no_text(prompt
     assert data["rule"] == "default" and data["head_chars"] == len(head)
     assert data["head_sha8"] == prompt_policy.sha8(head)
     assert data["parts"] == [["text:rules", len(RULES)], ["literal", 2], ["client", len(system)]]
-    assert data["history_changes"] == data["tools_changes"] == 0 and data["warnings"] == []
+    assert data["history_changes"] == data["tools_changes"] == [] and data["warnings"] == []
     assert event["request_id"] and event["turn_id"] and event["conversation"]
     encoded = json.dumps(relay.events(mark))
     assert "PRIVATE_SECOND_LINE" not in encoded and RULES not in encoded and "ORIGINAL_TASK" not in encoded

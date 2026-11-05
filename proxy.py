@@ -33,7 +33,7 @@ import prompt_policy
 import validate
 from accounts import UNNAMED, AccountDispatcher, account_tag
 from credits import CreditsManager
-from orchestrator import TurnRunner, acquire_plan
+from orchestrator import TurnRunner, acquire_plan, journal_changes
 from session import Backend, SessionPool
 from upstream_diagnostics import WireTrace
 from io_workers import DaemonIOExecutor
@@ -49,6 +49,22 @@ RECORD_REQUEST_BYTES = 1024 * 1024
 # What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
 _CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
                  "dialect", "thinking_placeholder", "virtual_profile", "requested_model")
+
+
+def _carry_compatibility(first, parsed, changes):
+    """What the second parse can no longer see of the body the client sent: it reads the rewritten one.
+
+    A tool change inside a system message that a profile turned into user text or dropped leaves no block to
+    name, and the relay did not apply it either way, so the first parse's names stay among the ignored parameters.
+    System messages a profile turned into user text (wrap, plain) are still passed as user text, which is what
+    x-proxi-system-messages says. Dropped ones are not passed at all: no header, and prompt.plan counts them."""
+    lost = [name for name in first.inline_tool_changes if name not in parsed.inline_tool_changes]
+    parsed.inline_tool_changes = [*parsed.inline_tool_changes, *lost]
+    parsed.declared_ignored = [*parsed.declared_ignored, *(name for name in lost if name not in parsed.declared_ignored)]
+    converted = any(change.get("op") == "mid_system" and change.get("mode") in ("wrap", "plain")
+                    and not change.get("skipped") for change in changes)
+    if first.system_messages_normalized and converted:
+        parsed.system_messages_normalized = True
 
 
 class RateLimiter:
@@ -735,6 +751,7 @@ def make_handler(runtime: Runtime):
                 for name in _CARRIED_OVER:
                     if hasattr(first, name):
                         setattr(parsed, name, getattr(first, name))
+                _carry_compatibility(first, parsed, changes)
                 self._journal_skipped_edits(changes)
             self._apply_generation(parsed, plan, warnings)
             parsed.prompt_plan, parsed.prompt_input = plan, plan_input
@@ -768,14 +785,15 @@ def make_handler(runtime: Runtime):
 
         def _journal_skipped_edits(self, changes):
             """One prompt.edit_skipped per kind of edit the rewrite had to leave out of this request."""
-            skipped = {}
-            for change in changes:
-                if change.get("skipped"):
-                    key = (str(change.get("op")), str(change.get("reason")))
-                    skipped[key] = skipped.get(key, 0) + 1
-            for (op, reason), count in skipped.items():
-                journal.emit("prompt.edit_skipped", "Правка промпта пропущена: %s (%s)" % (op, reason), "warn",
-                             request_id=self.request_id, op=op, reason=reason, count=count)
+            for group in journal_changes([change for change in changes if change.get("skipped")]):
+                where = {key: group[key] for key in ("scope", "edit", "tool", "mode") if group.get(key) is not None}
+                indexes = group.get("indexes") or ([group["index"]] if group.get("index") is not None else [])
+                if indexes:
+                    where["index"] = indexes[0]
+                journal.emit("prompt.edit_skipped",
+                             "Правка промпта пропущена: %s (%s)" % (group.get("op"), group.get("reason")), "warn",
+                             request_id=self.request_id, op=group.get("op"), reason=group.get("reason"),
+                             count=group.get("count", 1), **where)
 
         def _prompt_failure(self, stage, exc):
             """The prompt layer failed on this request: the legacy path serves it (plan I8)."""

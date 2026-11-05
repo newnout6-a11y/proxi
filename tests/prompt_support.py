@@ -5,18 +5,21 @@ The engine (prompt_policy) and the body rewrite (prompt_body) belong to other wo
 the runtime does with whatever they return, so the store here stands in for them: it takes pins, protected rules and
 refusals from the contract (plan 4.3) and renders heads the way compose_head promises to (plan I5, I9, I10).
 """
+import copy
 import dataclasses
 import http.client
 import json
 import re
 import threading
 import time
+import types
 
 import pytest
 
 import config
 import direct
 import journal
+import prompt_body
 import prompt_policy
 import proxy
 from test_review_fixes_pr19 import END, response, text
@@ -77,11 +80,14 @@ class FakePlan(prompt_policy.Plan):
 
 
 class FakeSnapshot:
-    """The part of prompt_policy.Snapshot the runtime reads: one profile per name and the relay's own texts."""
+    """The part of prompt_policy.Snapshot the runtime and the body rewrite read: profiles, relay texts, regex."""
 
     def __init__(self, rev, profiles, relay_texts=None, rules=(), default_profile=None):
         self.rev, self.profiles, self.relay_texts = rev, profiles, dict(relay_texts or {})
         self.rules, self.default_profile = list(rules), default_profile
+        # prompt_policy.structured_contract reads the wrapper a real Snapshot compiled out of relay_texts.structured
+        self._data = types.SimpleNamespace(
+            relay_templates={name: text for name, text in self.relay_texts.items() if name == "structured"})
 
     def profile(self, name):
         return self.profiles[name]
@@ -89,9 +95,66 @@ class FakeSnapshot:
     def relay_text(self, name):
         return self.relay_texts.get(name)
 
+    def regex(self, pattern, flags=""):
+        return re.compile(pattern, sum(FLAGS[flag] for flag in flags))
 
-def profile(template, *, edits=False, generation=None, texts=None):
-    return {"template": template, "edits": edits, "generation": dict(generation or {}), "texts": dict(texts or {})}
+
+FLAGS = {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL}
+
+
+def profile(template, *, edits=None, generation=None, texts=None, mid_system="keep", user_blocks=(), tool_edits=()):
+    """A normalized profile as Snapshot.profile() returns it (plan 4.3), plus what the fake plan renders.
+
+    `edits` says whether the profile rewrites the body; it follows from the history and tools sections unless given."""
+    rewrites = mid_system != "keep" or bool(user_blocks) or bool(tool_edits)
+    return {"description": "", "head": template, "client_system": {"edits": []},
+            "history": {"mid_system": mid_system, "user_blocks": copy.deepcopy(list(user_blocks))},
+            "tools": {"edits": copy.deepcopy(list(tool_edits))}, "generation": dict(generation or {}),
+            "publish_as_model": False,
+            "template": template, "edits": rewrites if edits is None else edits, "texts": dict(texts or {})}
+
+
+def summarize_like_the_rewrite(changes, indexes=8):
+    """prompt_body.summarize_changes as its package ships it: one entry per kind of change, with counts.
+
+    The tests install it only while prompt_body has none of its own (see install_summaries)."""
+    groups = {}
+    for change in changes or []:
+        skipped = bool(change.get("skipped"))
+        key = (change.get("scope"), change.get("op"), change.get("mode"), change.get("edit"), change.get("tool"),
+               skipped, change.get("reason") if skipped else None)
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {"scope": change.get("scope"), "op": change.get("op")}
+            for name in ("mode", "edit", "tool"):
+                if change.get(name) is not None:
+                    group[name] = change[name]
+            group.update(count=0, removed_chars=0, added_chars=0, indexes=[])
+            if skipped:
+                group.update(skipped=True, reason=change.get("reason"))
+        group["count"] += 1
+        group["removed_chars"] += int(change.get("removed_chars") or 0)
+        group["added_chars"] += int(change.get("added_chars") or 0)
+        if change.get("index") is not None and len(group["indexes"]) < indexes:
+            group["indexes"].append(change["index"])
+    return list(groups.values())
+
+
+def install_summaries(monkeypatch):
+    """A tree where prompt_body has no summarize_changes yet gets the contract's version, so the journal is testable."""
+    if not hasattr(prompt_body, "summarize_changes"):
+        monkeypatch.setattr(prompt_body, "summarize_changes", summarize_like_the_rewrite, raising=False)
+
+
+def rewrite_ready():
+    """Whether prompt_body.rewrite is the real one (work package P3) and not the skeleton that raises NotImplementedError."""
+    try:
+        prompt_body.rewrite({"messages": []}, "chat", {}, None)
+    except NotImplementedError:
+        return False
+    except Exception:  # a rewrite that refuses this minimal body is still a rewrite
+        return True
+    return True
 
 
 class FakePrompts:
@@ -222,6 +285,7 @@ class Relay:
 @pytest.fixture
 def prompt_relay(tmp_path, monkeypatch):
     """start(**cfg) -> Relay: real HTTP, pool, runner and transport; Retool is scripted, its bodies are kept."""
+    install_summaries(monkeypatch)
     monkeypatch.setattr(AttemptBudget, "wait", lambda self, delay, cancelled: None)
     monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
     started, posts, scripts = [], [], []
