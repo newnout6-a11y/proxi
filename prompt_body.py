@@ -59,6 +59,20 @@ def rewrite(data: dict, dialect: str, profile: dict, snapshot) -> tuple[dict, li
     snapshot.relay_text("reminder") (None = the built-in "<system-reminder>\\n{{text}}\\n</system-reminder>").
     A snapshot without those methods (or None) falls back to a local compile with a cache.
 
+    The rules it reads: history.mid_system (keep, wrap, plain, drop), history.user_blocks[] (drop_tag
+    with tag and optional contains / pattern / flags, remove_regex with pattern / flags, replace_text
+    with find / with / all, all defaulting to true) and tools.edits[] (tool: a glob or a list of globs,
+    matched case-insensitively against the name, and either hide: true or op append, prepend, set with
+    text, replace_text with find / with / all, replace_regex with pattern / flags / with). A rule that
+    cannot run (unknown op, missing field, a pattern that does not compile) is recorded as skipped.
+
+    drop_tag removes the outermost <tag ...>...</tag> blocks whose opening tag starts a line, with the
+    blank lines they leave: a mention inside a line (code, prose) is not a block. contains / pattern
+    keep only the blocks that hold that text / match that regex. Blocks nest; an unclosed opening tag
+    is ignored. replace_text whose replacement holds the searched text leaves text that already reads
+    like the replacement alone, so running it twice changes nothing. append and prepend add nothing
+    that the description already contains.
+
     Order: history.mid_system and history.user_blocks go over the messages once, in order (a
     system message that mid_system turns into user text is then a user message for user_blocks,
     which is why a second run changes nothing), then tools.edits in order.
@@ -181,7 +195,7 @@ class _Context:
 
     def regex(self, pattern, flags):
         """Compiled once with the revision (snapshot.regex); a local cache when the snapshot cannot."""
-        flags = flags if isinstance(flags, str) else ""
+        flags = "".join(flags) if isinstance(flags, (list, tuple)) else flags if isinstance(flags, str) else ""
         getter = getattr(self.snapshot, "regex", None)
         if getter is not None:
             try:
@@ -522,6 +536,120 @@ def _history_list(out, dialect):
     return ("messages", value, False) if isinstance(value, list) else (None, None, False)
 
 
+class _Walk:
+    """One pass over the conversation: the messages kept so far and what a deletion would break."""
+
+    def __init__(self, context, messages, mode, edits):
+        self.context, self.messages, self.mode, self.edits = context, messages, mode, edits
+        self.dialect, self.changes = context.dialect, context.changes
+        self.lead = native_history.leading_instructions(messages)
+        self.result, self.seen, self.rebuilt = [], [], False
+
+    def run(self):
+        for index, message in enumerate(self.messages):
+            if index < self.lead or not isinstance(message, dict):
+                self.keep(message, None if index < self.lead else "U")
+                continue
+            kind = _kind(message, self.dialect)
+            if kind == "S":
+                message = self.system(index, message)
+                if message is None:
+                    continue
+                kind = "U"
+            if self.edits and kind in ("U", "T"):
+                message = self.edit(index, message, kind)
+                if message is None:
+                    continue
+            self.keep(message, "U" if kind == "X" else kind)
+        return self.result
+
+    def keep(self, message, seen):
+        self.result.append(message)
+        self.seen.append(seen)
+
+    def blocker(self, index):
+        """Why message `index` cannot leave the conversation, or None when it can."""
+        before = next((k for k in reversed(self.seen) if k is not None), None)
+        after, scan, size = None, index + 1, len(self.messages)
+        while scan < size:
+            after = _visible_kind(self.messages[scan], self.dialect)
+            if after is not None:
+                break
+            scan += 1
+        if before is None and after is None:
+            return "would leave the conversation empty"
+        if before is None and after in ("A", "T"):
+            return "would start the conversation with an assistant or tool message"
+        if after is None and before == "A":
+            return "would end the conversation with an assistant message"
+        if before == "A" and after == "A":
+            return "would put two assistant messages next to each other"
+        following = self.messages[index + 1] if index + 1 < size else None
+        if index == self.lead and isinstance(following, dict) and _kind(following, self.dialect) == "S":
+            return "would move a later system message into the head"
+        return None
+
+    def system(self, index, message):
+        """A system message after the head: None when it stays, goes or is a blank entry, else the user message
+        that replaces it."""
+        text = _instruction_text(message.get("content"))
+        if text is not None and not text.strip():
+            self.keep(message, None)
+            return None
+        mode = self.mode
+        if mode == "keep" or text is None:
+            if text is None and mode != "keep":
+                self.context.skipped("history", "mid_system", "unsupported system content", mode=mode,
+                                     index=index, target="system")
+            self.keep(message, "U")
+            return None
+        change = {"scope": "history", "op": "mid_system", "mode": mode, "index": index, "target": "system"}
+        kept = [name for name in _CONTROL_KEYS if name in message]
+        if mode == "drop":
+            reason = self.blocker(index)
+            if reason is not None:
+                self.context.skipped("history", "mid_system", reason, mode=mode, index=index, target="system")
+                self.keep(message, "U")
+                return None
+            change.update(removed_chars=len(text), added_chars=0, deleted=True)
+            replacement = None
+        else:
+            rendered = _render_reminder(self.context.template, text) if mode == "wrap" else text
+            change.update(removed_chars=0, added_chars=len(rendered) - len(text))
+            replacement = _as_user_message(message, rendered, self.dialect)
+        if kept:
+            # The effort and the output format of the entry are not text: a blank entry carries them on.
+            self.keep(dict(message, content=[]), None)
+            change["kept"] = kept
+        self.changes.append(change)
+        self.rebuilt = True
+        return replacement
+
+    def edit(self, index, message, kind):
+        """Apply the user_blocks rules to a user message or a tool result; None when the message is deleted."""
+        target = "user" if kind == "U" else "tool_result"
+        field = "output" if self.dialect == "responses" and kind == "T" and message.get("output") is not None \
+            else "content"
+        for position, op, fn in self.edits:
+            res = _map_content(message.get(field), fn, self.dialect == "anthropic")
+            if res is None:
+                continue
+            value, removed, added, empty = res
+            change = {"scope": "history", "op": op, "edit": position, "index": index, "target": target,
+                      "removed_chars": removed, "added_chars": added}
+            if empty and kind == "U":
+                reason = self.blocker(index)
+                if reason is not None:
+                    self.context.skipped("history", op, reason, edit=position, index=index, target=target)
+                    continue
+                self.changes.append(dict(change, deleted=True))
+                self.rebuilt = True
+                return None
+            message[field] = "" if empty else value
+            self.changes.append(change)
+        return message
+
+
 def _rewrite_history(out, context, history):
     mode = history.get("mid_system") if history.get("mid_system") in ("drop", "wrap", "plain") else "keep"
     edits = []
@@ -538,109 +666,13 @@ def _rewrite_history(out, context, history):
     key, messages, scalar = _history_list(out, context.dialect)
     if messages is None:
         return
-    dialect, changes = context.dialect, context.changes
-    first_change = len(changes)
-    lead = native_history.leading_instructions(messages)
-    size = len(messages)
-    result, seen, rebuilt = [], [], False
-
-    def blocker(index):
-        before = next((k for k in reversed(seen) if k is not None), None)
-        after, scan = None, index + 1
-        while scan < size:
-            after = _visible_kind(messages[scan], dialect)
-            if after is not None:
-                break
-            scan += 1
-        if before is None and after is None:
-            return "would leave the conversation empty"
-        if before is None and after in ("A", "T"):
-            return "would start the conversation with an assistant or tool message"
-        if after is None and before == "A":
-            return "would end the conversation with an assistant message"
-        if before == "A" and after == "A":
-            return "would put two assistant messages next to each other"
-        if index == lead and index + 1 < size and isinstance(messages[index + 1], dict) \
-                and _kind(messages[index + 1], dialect) == "S":
-            return "would move a later system message into the head"
-        return None
-
-    for index, message in enumerate(messages):
-        if index < lead or not isinstance(message, dict):
-            result.append(message)
-            seen.append(None if index < lead else "U")
-            continue
-        kind = _kind(message, dialect)
-        if kind == "S":
-            text = _instruction_text(message.get("content"))
-            if text is not None and not text.strip():
-                result.append(message)
-                seen.append(None)
-                continue
-            if mode == "keep" or text is None:
-                if text is None and mode != "keep":
-                    context.skipped("history", "mid_system", "unsupported system content", mode=mode,
-                                    index=index, target="system")
-                result.append(message)
-                seen.append("U")
-                continue
-            kept = [name for name in _CONTROL_KEYS if name in message]
-            if mode == "drop":
-                reason = blocker(index)
-                if reason is not None:
-                    context.skipped("history", "mid_system", reason, mode=mode, index=index, target="system")
-                    result.append(message)
-                    seen.append("U")
-                    continue
-                if kept:
-                    result.append(dict(message, content=[]))
-                    seen.append(None)
-                change = {"scope": "history", "op": "mid_system", "mode": mode, "index": index, "target": "system",
-                          "removed_chars": len(text), "added_chars": 0, "deleted": True}
-                if kept:
-                    change["kept"] = kept
-                changes.append(change)
-                rebuilt = True
-                continue
-            rendered = _render_reminder(context.template, text) if mode == "wrap" else text
-            change = {"scope": "history", "op": "mid_system", "mode": mode, "index": index, "target": "system",
-                      "removed_chars": 0, "added_chars": len(rendered) - len(text)}
-            if kept:
-                result.append(dict(message, content=[]))
-                seen.append(None)
-                change["kept"] = kept
-            changes.append(change)
-            message, kind, rebuilt = _as_user_message(message, rendered, dialect), "U", True
-        if edits and kind in ("U", "T"):
-            target = "user" if kind == "U" else "tool_result"
-            field = "output" if dialect == "responses" and kind == "T" and message.get("output") is not None \
-                else "content"
-            deleted = False
-            for position, op, fn in edits:
-                res = _map_content(message.get(field), fn, dialect == "anthropic")
-                if res is None:
-                    continue
-                value, removed, added, empty = res
-                if empty and kind == "U":
-                    reason = blocker(index)
-                    if reason is not None:
-                        context.skipped("history", op, reason, edit=position, index=index, target=target)
-                        continue
-                    changes.append({"scope": "history", "op": op, "edit": position, "index": index, "target": target,
-                                    "removed_chars": removed, "added_chars": added, "deleted": True})
-                    deleted = rebuilt = True
-                    break
-                message[field] = "" if empty else value
-                changes.append({"scope": "history", "op": op, "edit": position, "index": index, "target": target,
-                                "removed_chars": removed, "added_chars": added})
-            if deleted:
-                continue
-        result.append(message)
-        seen.append("U" if kind == "X" else kind)
+    first = len(context.changes)
+    walk = _Walk(context, messages, mode, edits)
+    result = walk.run()
     if scalar:
-        if len(changes) > first_change:
+        if len(context.changes) > first:
             out[key] = result[0]["content"]
-    elif rebuilt:
+    elif walk.rebuilt:
         out[key] = result
 
 
@@ -759,15 +791,31 @@ def _description_fn(context, spec):
     return _text_op(context, spec, ("replace_text", "replace_regex"))
 
 
+class _Hide:
+    """What hide must not do to this request: the tools it may never remove."""
+
+    def __init__(self, out, dialect, entries):
+        choice = out.get("tool_choice")
+        self.named, self.forced = _choice_names(choice), _forces_a_call(choice)
+        self.called, self.entries, self.hidden = _called_names(out, dialect), entries, set()
+
+    def refusal(self, entry):
+        if self.named.intersection(entry.names):
+            return "tool_choice names the tool"
+        if self.called.intersection(entry.names):
+            return "the conversation already called the tool"
+        if self.forced and not any(e is not entry and id(e.item) not in self.hidden for e in self.entries):
+            return "tool_choice demands a call and no tool would be left"
+        return None
+
+
 def _rewrite_tools(out, context, tools_config):
     specs = tools_config.get("edits") or []
     tools = out.get("tools")
     if not specs or not isinstance(tools, list) or not tools:
         return
-    entries = _collect_tools(tools)
-    changes = context.changes
-    hidden, emptied = set(), set()
-    state = {}
+    entries, changes = _collect_tools(tools), context.changes
+    hide, emptied = None, set()
     for position, spec in enumerate(specs):
         if not isinstance(spec, dict):
             continue
@@ -782,40 +830,34 @@ def _rewrite_tools(out, context, tools_config):
             if fn is None:
                 context.skipped("tools", str(op), reason, edit=position)
                 continue
+        elif hide is None:
+            hide = _Hide(out, context.dialect, entries)
         for entry in entries:
-            if id(entry.item) in hidden or not any(p.fullmatch(n.lower()) for p in patterns for n in entry.names):
+            if hide is not None and id(entry.item) in hide.hidden:
                 continue
-            if not hiding:
-                old = entry.fields.get("description")
-                res = fn(old if isinstance(old, str) else "")
-                if res is not None:
-                    entry.fields["description"] = res[0]
-                    changes.append({"scope": "tools", "op": op, "edit": position, "index": entry.top,
-                                    "tool": entry.name, "removed_chars": res[1], "added_chars": res[2]})
+            if not any(p.fullmatch(n.lower()) for p in patterns for n in entry.names):
                 continue
-            if not state:
-                choice = out.get("tool_choice")
-                state.update(named=_choice_names(choice), forced=_forces_a_call(choice),
-                             called=_called_names(out, context.dialect))
-            reason = None
-            if state["named"].intersection(entry.names):
-                reason = "tool_choice names the tool"
-            elif state["called"].intersection(entry.names):
-                reason = "the conversation already called the tool"
-            elif state["forced"] and not any(e is not entry and id(e.item) not in hidden for e in entries):
-                reason = "tool_choice demands a call and no tool would be left"
-            if reason is not None:
-                context.skipped("tools", "hide", reason, edit=position, index=entry.top, tool=entry.name)
+            if hiding:
+                reason = hide.refusal(entry)
+                if reason is not None:
+                    context.skipped("tools", "hide", reason, edit=position, index=entry.top, tool=entry.name)
+                    continue
+                hide.hidden.add(id(entry.item))
+                emptied.add(id(entry.holder))
+                changes.append({"scope": "tools", "op": "hide", "edit": position, "index": entry.top,
+                                "tool": entry.name, "added_chars": 0,
+                                "removed_chars": len(json.dumps(entry.item, ensure_ascii=False, default=str))})
                 continue
-            hidden.add(id(entry.item))
-            emptied.add(id(entry.holder))
-            changes.append({"scope": "tools", "op": "hide", "edit": position, "index": entry.top, "tool": entry.name,
-                            "removed_chars": len(json.dumps(entry.item, ensure_ascii=False, default=str)),
-                            "added_chars": 0})
-    if not hidden:
+            old = entry.fields.get("description")
+            res = fn(old if isinstance(old, str) else "")
+            if res is not None:
+                entry.fields["description"] = res[0]
+                changes.append({"scope": "tools", "op": op, "edit": position, "index": entry.top, "tool": entry.name,
+                                "removed_chars": res[1], "added_chars": res[2]})
+    if hide is None or not hide.hidden:
         return
-    for holder in {id(entry.holder): entry.holder for entry in entries if id(entry.item) in hidden}.values():
-        holder[:] = [item for item in holder if id(item) not in hidden]
+    for holder in {id(e.holder): e.holder for e in entries if id(e.item) in hide.hidden}.values():
+        holder[:] = [item for item in holder if id(item) not in hide.hidden]
     out["tools"] = [item for item in tools if not (
         isinstance(item, dict) and item.get("type") == "namespace" and isinstance(item.get("tools"), list)
         and id(item["tools"]) in emptied and not item["tools"])]
