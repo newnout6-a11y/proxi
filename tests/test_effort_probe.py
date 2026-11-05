@@ -106,6 +106,49 @@ def test_the_credit_limit_stops_the_run_after_the_request_that_reached_it(tmp_pa
     assert result == 1 and len(rows) == 1
 
 
+def strict(line):
+    """A row as a strict JSON reader sees it: NaN and Infinity are not JSON."""
+    def refuse(constant):
+        raise ValueError('not JSON: ' + constant)
+    return json.loads(line, parse_constant=refuse)
+
+
+@pytest.mark.parametrize('credits', [pytest.param(float('nan'), id='nan'), pytest.param(float('inf'), id='infinity'),
+                                     pytest.param(-50.0, id='negative'), pytest.param(10 ** 400, id='too-large')])
+def test_a_credit_figure_that_cannot_be_added_up_stops_the_run_instead_of_disabling_the_limit(
+        tmp_path, monkeypatch, capsys, credits):
+    monkeypatch.setattr(probe.urllib.request, 'urlopen',
+                        lambda request, timeout: answer(usage={'outputTokens': 5, 'creditsUsed': credits}))
+    monkeypatch.setattr(probe, 'load_accounts', lambda _: [account()])
+    result = probe.main(['--allow-paid', '--models', GLM, '--repeats', '3', '--max-credits', '1',
+                         '--output', str(tmp_path / 'e.jsonl')])
+    lines = (tmp_path / 'e.jsonl').read_text(encoding='utf-8').splitlines()
+    assert result == 1 and len(lines) == 1
+    row = strict(lines[0])
+    assert row['invalid_usage'] == ['creditsUsed'] and 'creditsUsed' not in row['usage']
+    assert row['usage']['outputTokens'] == 5
+    summary = strict(capsys.readouterr().out.strip().splitlines()[-1])
+    assert 'creditsUsed' in summary['stopped'] and summary['credits_reported'] == 0
+
+
+def test_an_unusable_figure_other_than_credits_is_dropped_from_the_evidence_without_stopping_the_run(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(probe.urllib.request, 'urlopen',
+                        lambda request, timeout: answer(usage={'outputTokens': float('nan'), 'creditsUsed': 0.1}))
+    monkeypatch.setattr(probe, 'load_accounts', lambda _: [account()])
+    result = probe.main(['--allow-paid', '--models', GLM, '--efforts', 'omit', '--repeats', '2', '--max-credits', '5',
+                         '--output', str(tmp_path / 'e.jsonl')])
+    rows = [strict(line) for line in (tmp_path / 'e.jsonl').read_text(encoding='utf-8').splitlines()]
+    assert result == 0 and len(rows) == 2
+    assert all(row['invalid_usage'] == ['outputTokens'] and row['usage'] == {'creditsUsed': 0.1} for row in rows)
+
+
+def test_ordinary_usage_rows_carry_no_invalid_usage_marker(monkeypatch):
+    monkeypatch.setattr(probe.urllib.request, 'urlopen', lambda request, timeout: answer())
+    row = probe.observe(account(), models.resolve(GLM)[0], 'high')
+    assert 'invalid_usage' not in row and row['usage']['creditsUsed'] == 0.02
+
+
 def test_the_default_config_is_the_repository_one_whatever_the_working_directory(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(probe, 'load_accounts', lambda path: seen.append(path) or [])
