@@ -200,3 +200,8 @@ def test_ignored_effort_still_rejects_values_no_provider_defines(model, bogus):
     with pytest.raises(models.ApiError) as caught:
         models.resolve(model, bogus)
     assert caught.value.status == 400 and 'known level' in caught.value.message
+
+
+def test_the_suite_runs_on_a_fixed_calendar_day():
+    # conftest pins models._today; without it the published counts would change on 2026-11-30.
+    assert models._today() == datetime.date(2026, 11, 5)

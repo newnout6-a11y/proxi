@@ -257,3 +257,12 @@ def test_unconfigured_pool_explains_the_missing_resource_as_a_404_event_in_the_s
     assert 'not_found_error' in raw and "needs config key 'provider_resource_name'" in raw
     status, _, raw = call('/v1/chat/completions', {'model': 'claude-opus-5-5', 'messages': MESSAGE})
     assert status == 404 and "needs config key 'provider_resource_name'" in raw
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_a_request_without_a_model_gets_the_reason_when_the_default_model_is_hidden(relay_with_pool, stream):
+    call = relay_with_pool(LIVE_LIKE, model='claude-fable-5')
+    status, headers, raw = call('/v1/chat/completions', {'messages': MESSAGE, 'stream': stream})
+    error = json.loads(raw)['error']
+    assert status == 404 and error['type'] == 'not_found_error'
+    assert "model 'claude-fable-5' is not available" in error['message'] and 'data_retention_enabled' in error['message']

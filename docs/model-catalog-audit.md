@@ -146,9 +146,9 @@ no consistent change in thinking volume, output tokens or latency between levels
 so the relay publishes no selectors for it. GLM-5.3 Flash is a separate model whose
 route was measured on its own, not inferred from GLM-5.3. Haiku 4.5 never returned
 thinking at any level; Anthropic lists "Default effort: Not supported" for it and
-extended thinking there needs a manual `budget_tokens` that this route does not
-expose, so it is listed as not reasoning and Claude Code's budget is accepted and
-ignored. Provider-supplied thinking or reasoning summaries can
+its extended thinking is manual (`budget_tokens`), yet no thinking appeared through
+this route at any level that was tried, so it is listed as not reasoning and Claude
+Code's budget is accepted and ignored. Provider-supplied thinking or reasoning summaries can
 be forwarded. Hidden raw internal reasoning cannot be reconstructed by a relay.
 
 ## Sources and repeatability

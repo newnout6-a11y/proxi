@@ -193,8 +193,8 @@ _entry['reasoning_effort_checked_at'] = '2026-11-05'
 _entry['metadata_notes'] = ('Retool accepts reasoningEffort for this model and ignores it: no thinking events and no '
                             'ordering of output tokens or latency across none/low/medium/high/max (live probe '
                             '2026-11-05), so the route is listed as not reasoning. Anthropic lists "Default effort: '
-                            'Not supported" for Haiku 4.5; extended thinking needs a manual budget that the route '
-                            'does not expose.')
+                            'Not supported" for Haiku 4.5, whose extended thinking is manual (budget_tokens); no '
+                            'thinking appeared through this route at any level that was tried.')
 
 _BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))
 
