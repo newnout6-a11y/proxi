@@ -454,3 +454,114 @@ seconds**. Private evidence: `stage6-codex-live` (failed reproduction),
 `stage6-codex-live-strict`, all under `.agents/model-audit-20261104/`.
 Claude Desktop GUI acceptance and the remaining related-client inventory are
 still separate requirements; a Codex CLI pass does not establish those.
+
+### Stage 6 follow-up: current OpenCode and Claude Code inference
+
+Both installed OpenCode versions completed a real `zai-org/GLM-5.3` high
+request through an isolated current-source relay. Each sent the exact canonical
+ID and high effort, received upstream thinking-start and text, then exited 0
+with its synthetic success marker. CLI 1.19.3 finished in **7.900 seconds**
+(one POST, **0.91880 reported credits**); CLI 2.2.5 finished in **5.863 seconds**
+(one POST, **0.67812 reported credits**). This directly rechecks the original
+GLM effort 400 through the actual clients. A first CLI 2 invocation used the
+CLI 1 `--variant` flag and was rejected before HTTP; the correct CLI 2 form is
+`--model provider/model#high`. The failed command remains in private evidence.
+
+Fresh installed Claude Code 2.1.310 also read, edited and tested a separate
+synthetic fixture through the current relay: four POSTs, **18.188 seconds**,
+**0.92351 reported credits**, success exit and marker. Three existing unittest
+cases passed inside the client and again in an independent verifier. No agents
+or real project commands were used. Its optional `HEAD /api/hello` capability
+probe received 404; inference and model discovery still succeeded. The CLI's
+USD list-price estimate is not a measured conversion of Retool credits.
+
+Each run used a new synthetic conversation and temporary endpoint/key override.
+Real account configuration stayed byte-identical, and the production process
+was not restarted. Private evidence: `stage6-opencode-glm-live`,
+`stage6-opencode2-glm-live-fixed`, and `stage6-claude-live-fixture` under the audit
+scratch folder. A text GLM pass does not prove every tool or image flow in the GUI.
+
+### Stage 6 follow-up: current Harness catalogs
+
+Read-only inventory found a real remaining defect in both current profile
+patches: 29 stale Proxi models, including seven currently unavailable routes,
+five missing verified routes, and unsupported xhigh levels. The current paths
+are `~/.dsh/profiles/{desktop,web}/cordis.patch.yml`; the old root settings file
+is not the current installed profile location.
+
+`scripts/sync_harness_catalog.py` now reconciles those profiles without changing
+other providers, plugin source, credentials or the active model. All 27 unique
+IDs remain available: 26 reasoning models in `retool` and GPT-4.1 in
+`retool-text`. Both retain the same existing endpoint and credential reference.
+The split is required by the two installed SDKs: an inherited medium default
+rejects GPT-4.1 before HTTP, but deleting that default on the one-provider
+catalog silently disables thinking for GPT-6 Sol's default/off selector.
+The separate text group keeps every valid selector and the reasoning default.
+
+An independent runtime probe loaded the actual CLI adapter 0.2.2-alpha.3 with
+pi-ai 1.5.0 and the actual Desktop adapter 0.2.1-rc.5 with pi-ai 1.1.0 from its
+ASAR. It ran **22 cases**, including default/explicit off/high, rejection of
+medium on GPT-4.1, and exact selectors for Sol and Terra: **16 fake fetches,
+zero upstream requests**, all assertions passed. The same probe passed again
+after the profile update. Native tool schemas and text/image metadata survived.
+The SDK/ASAR were read-only; no application boot or real image inference is
+claimed from this check.
+
+The writer replaces only the Proxi blocks in the YAML. Full-document
+round-tripping was rejected during development because it could alter other
+providers' timestamp headers; ruamel's TimeStamp deepcopy also loses timezone
+without explicit handling. Byte splicing, immutable timestamp handling and a
+semantic guard now protect other data. The independent preservation check
+verified every byte outside Proxi, the full parsed unrelated state, active
+selection, custom tags and plugin source. External aliases and namespace
+collisions are refused before writing. It approved the exact two previews.
+
+The following writes completed, preserving an exact backup for each profile:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings C:/Users/Redmi/.dsh/profiles/desktop/cordis.patch.yml --write --backup-dir .agents/backups/harness-catalog-20261105/desktop
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings C:/Users/Redmi/.dsh/profiles/web/cordis.patch.yml --write --backup-dir .agents/backups/harness-catalog-20261105/web
+```
+
+Post-write bytes equal the reviewed previews. Restoring the original Proxi
+blocks in memory reproduces the entire old parsed profile; the other active
+provider/model remains unchanged. Shared writer/catalog tests passed **22 tests**:
+
+```powershell
+uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest tests/test_sync_harness_catalog.py tests/test_sync_opencode_catalog.py -o addopts= -q --tb=short
+```
+
+Private reproducible evidence: `reviewer-harness-runtime.mjs`,
+`reviewer-harness-runtime-manifest.json`, `harness-runtime-after-write.json`,
+`reviewer-harness-preservation.py` and its manifest, plus both exact previews,
+under `.agents/model-audit-20261104/`. Backups stay private under `.agents/backups/`.
+
+### Remaining installed-client coverage
+
+The related clients were inventoried separately; using another provider is not
+a Proxi failure and their active routes were not replaced:
+
+| Client | Current local state | Evidence scope |
+| --- | --- | --- |
+| Codex CLI 0.164.0 | Active user provider remains separate; isolated Proxi setup works | Real read/patch/test and installed strict-parser checks above |
+| Claude Code 2.1.310 | Existing relay configuration retained | Fresh real Read/Edit/Bash fixture and child/default probes above |
+| OpenCode CLI 1.19.3 and Desktop sidecar 2.2.5 | Shared Proxi catalog now 27 canonical IDs | Real GLM high request, full catalog and child/tool protocol probes |
+| Harness CLI 0.2.2-alpha.3 and Desktop 0.2.1-rc.5 | Proxi models now 26+1; current active provider is separate | Both installed SDKs tested with exact profiles; no fresh GUI interaction |
+| Cline CLI 3.0.55 | Plan/Act provider is `cline` | Inventory only; no Proxi request or provider change |
+| Cline VS Code extension 4.1.26 | Installed; effective Proxi extension settings not established | Distinct from CLI globalState; no extension execution claim |
+| Continue | Existing config points to a different OpenAI-compatible endpoint; installed extension not found in checked IDE indexes | Inventory only; existing provider retained |
+| Aider | Not found in PATH, standard configuration or checked Python/uv/pipx locations | No installed-client runtime available |
+| Claude Desktop | Configured relay Opus 5.5 high is visible in a fresh session | GUI input not verified: both activation attempts returned `failed to activate captured window` |
+
+Claude Desktop is the remaining GUI acceptance gap. Computer Use recovery
+retried the selected window once and then stopped input as required. The user
+has been asked to open/activate that window; no response or successful
+activation is inferred from elapsed time. Until that check is completed, the
+full audit must not be described as all IDEs having passed end to end.
+
+Final source validation after the Harness maintenance utility used the full
+Python command above: **1894 passed in 210.17 seconds**. The OpenCode label
+command passed **4 tests** again, and `git diff --check` was clean. The real
+listener still belonged to the unchanged user process on port 8787; these
+current-source acceptance probes used isolated runtimes and do not claim the
+production process hot-reloaded the new code.

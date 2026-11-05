@@ -73,7 +73,36 @@ first; writing requires `--write --backup-dir`. The current configured pool
 publishes 27 verified routes. Its effort lists, including GPT-6's lack of xhigh,
 come from the dated route checks rather than the native provider's larger list.
 
+The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
+retool-relay/zai-org/GLM-5.3 --variant high`; OpenCode 2.2.5 uses `--model
+retool-relay/zai-org/GLM-5.3#high`. Version 2 rejects `--variant` before sending a
+model request. Both exact clients passed a real GLM high request through an
+isolated current-source relay; their timings and evidence are in the audit.
+
 ## DeepSeek Harness
+
+The current installed CLI (0.2.2-alpha.3) and Desktop (0.2.1-rc.5) use separate
+plugin patch lists at `~/.dsh/profiles/web/cordis.patch.yml` and
+`~/.dsh/profiles/desktop/cordis.patch.yml`. The `llm-pi-ai` node stores providers
+under `config.providers`. The existing Proxi route uses OpenAI Chat Completions.
+
+Both profiles have been reconciled to the same 27 verified IDs. The main
+`retool` group holds 26 reasoning models, preserving its medium default and
+every supported selector; `retool-text` holds GPT-4.1 without a reasoning
+selector. Both use the same existing connection and credential reference. This
+split avoids an installed SDK limitation: a provider-wide medium default is
+rejected for a non-reasoning model before HTTP, while simply deleting that
+default can silently disable thinking on a model with an off selector.
+
+To preview or update an existing profile, use `scripts/sync_harness_catalog.py
+--settings PATH`. Preview writes only with `--output`; replacing the profile
+requires `--write --backup-dir`. The utility splices only the Proxi blocks and
+keeps other bytes intact, including date headers and plugin source. The active
+provider/model and credentials are preserved. Both installed SDK versions
+passed default, off, high and rejection checks with the exact generated files;
+the SDK bundles and Desktop ASAR were not modified.
+
+### Historical Harness setup — 0.1.5-rc.2
 
 The earlier installed `DeepSeek Harness.lnk` setup launched the
 `@deepseek-ai/dsh` Web UI. Its multi-provider adapter was `llm-pi-ai`; use an
@@ -85,7 +114,9 @@ That local setup added `llm-pi-ai.providers.retool` to
 `RETOOL_RELAY_API_KEY` to `%USERPROFILE%\.dsh\.credentials.yaml`.
 These files are outside this repository. Existing providers, comments, and the
 selected provider are preserved. Both documents are watched, so the running
-Harness picks up the added route without restarting existing chats.
+Harness could pick up the added route without restarting existing chats. These
+paths and the abbreviated mapping below describe that earlier configuration;
+use the profile patch paths above for the current installed versions.
 
 This abbreviated configuration shows two models. Generate the complete list
 and valid efforts from the current `/v1/models` response; this example is not
