@@ -1310,11 +1310,17 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             if trace:
                 trace.wire.event("reader_error", exception_type=type(exc).__name__)
             if not is_cancelled():
+                # urlopen wraps DNS, refused, TLS and send failures in URLError: the request never
+                # reached upstream. Any other failure (a read timeout, a closed connection)
+                # happens after it was sent and may still be billed.
+                unsent = isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError)
                 if isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException,
                                     OSError)):  # OSError covers ssl.SSLError (TLS drops mid-stream)
                     timed_out = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
                     exc = (apierr.upstream_timeout("Retool response timed out") if timed_out else
                            apierr.upstream_error("Retool connection failed: %s" % type(exc).__name__))
+                if unsent:
+                    exc.request_sent = False
                 hand_off_final(exc, queue)
         finally:
             _force_close_response(holder.get("response"))
@@ -1338,6 +1344,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             yield {"type": "usage_start"}
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
+            previous_trace = holder.get("trace")
             task = loop.run_in_executor(getattr(loop, "_relay_io_executor", None),
                                         contextvars.copy_context().run, worker, queue)
             flags = {"budget": budget}
@@ -1373,8 +1380,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     raise
             finally:
                 current_trace = holder.get("trace")
-                possibly_billed = (current_trace is not None and
-                                   (current_trace.http_status is None or 200 <= current_trace.http_status < 300))
+                if current_trace is previous_trace:
+                    current_trace = None  # this attempt stopped before creating a trace of its own
+                status = getattr(current_trace, "http_status", None)
+                # Without a status the request may still be in flight, unless it provably never left.
+                possibly_billed = (current_trace is not None and (
+                    200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
                     flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
