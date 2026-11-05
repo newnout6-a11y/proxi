@@ -39,5 +39,6 @@ export const ACCOUNT_STATE = {
   active: { label: 'в работе', tone: 'pos' },
   exhausted: { label: 'исчерпан', tone: 'warn' },
   auth_dead: { label: 'нет доступа', tone: 'neg' },
+  rate_limited: { label: 'пауза: часовой лимит', tone: 'warn' },
   pending: { label: 'не подключён', tone: 'muted' },
 };

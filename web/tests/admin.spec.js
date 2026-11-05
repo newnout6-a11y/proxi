@@ -192,6 +192,19 @@ test('the last enabled account cannot be switched off', async ({ page }) => {
   expect(state.accountRequests.filter((r) => r.method === 'PATCH' && r.body?.enabled === false)).toHaveLength(1);
 });
 
+test('an account parked by the Retool hourly limit says so and when it returns', async ({ page }) => {
+  const state = await mockAdmin(page);
+  const until = NOW + 600;
+  state.pool[0] = { ...state.pool[0], state: 'rate_limited', routable: false, rate_limited_until: until };
+  await login(page);
+  await nav(page, 'Аккаунты');
+  const row = page.locator('.pool-row').nth(0);
+  await expect(row).toContainText('пауза: часовой лимит');
+  const clock = new Date(until * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', hour12: false });
+  await expect(row).toContainText(`вернётся в ${clock}`);
+  await expect(page.locator('.pool-row').nth(1)).not.toContainText('вернётся в');
+});
+
 test('accounts can be added and removed; both wait for a restart', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
