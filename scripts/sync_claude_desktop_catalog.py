@@ -19,7 +19,8 @@ reads the configuration at launch.
 Prompt profiles that publish themselves as models (publish_as_model) add rows named
 <model>@<profile> for the Claude routes they cover (scripts/sync_virtual_models.py);
 --no-virtual-models leaves them out. Desktop keeps only names that look like an Anthropic
-model, so avoid profile names that contain another vendor's name (gpt, glm, gemini, codex).
+model, judged by substrings of the whole name: avoid profile names that contain another
+vendor's name anywhere (gpt, glm, gemini, codex, solar, qwen and the like).
 """
 import argparse
 import base64
@@ -519,8 +520,9 @@ def run(args):
     virtual_rows = [name for name in after if name in virtual_names]
     if virtual_rows:
         warnings.append('Virtual models are listed as <model>@<profile>: Desktop removes list entries whose name does '
-                        "not look like an Anthropic model, judging the whole name, so a profile name containing "
-                        "another vendor's name (gpt, glm, gemini, codex and the like) loses its row")
+                        'not look like an Anthropic model, judging the whole name by substrings, so a profile name '
+                        "that contains another vendor's name anywhere (gpt, glm, gemini, codex, solar, qwen and the "
+                        'like) loses its row')
     encoded = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
     if args.output:
         try:
