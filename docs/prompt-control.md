@@ -34,7 +34,7 @@ Relay отправляет модели один system-блок (head), ист�
 | Базовые инструкции Codex в `/codex/models` | relay | `relay_texts.codex_base`, `codex.models` |
 | Служебный system провайдера при tools, строка effort у GLM | провайдер, шаблон модели | ничего, см. [«Что остаётся вне контроля»](#что-остаётся-вне-контроля) |
 
-«Задача relay» — запрос без system клиента, без tools и без structured-формата от клиента, который relay не считает Claude Code, Desktop или OpenCode (curl, скрипты). Только такими запросами владеет relay: только им он добавляет роль, `[LOCAL EXECUTION]` и `[PROJECT CONTEXT]` и исполняет `<exec_command>` из ответа. Во всех остальных запросах инструкции, исполнение команд и файлы остаются у клиента.
+«Задача relay» — запрос без system клиента, без tools и без structured-формата от клиента, который relay не считает Claude Code, Desktop или OpenCode (curl, скрипты). Только такими запросами владеет relay: только им он добавляет роль, `[LOCAL EXECUTION]` и `[PROJECT CONTEXT]` и исполняет `<exec_command>` из ответа (по `exec_policy`). Во всех остальных запросах инструкции, исполнение команд и файлы остаются у клиента.
 
 На проверенном маршруте Retool ничего не добавляет к тому, что отправил relay. Пробы 2026-11-05 (15 запросов: Sonnet 5.5, Haiku 4.5, GPT-5.5, GPT-5.2, GLM-5.3, один аккаунт): число `prompt_tokens` совпадает с чистой разметкой провайдера с точностью до одного токена (Claude: 10 токенов на «hi», GPT: 7, GLM: 13 по официальному шаблону плюс 1); system доходит отдельным system-сообщением без изменений и исполняется; чужих tools нет; эхо-проба скрытого текста не нашла. Opus 5.5 напрямую не пробовался, system длиннее примерно 1 000 токенов не проверялся.
 
@@ -721,10 +721,13 @@ $env:ANTHROPIC_CUSTOM_HEADERS = "X-Proxi-Profile: cc-rules"
 ```json
 {
   "env": {
-    "ANTHROPIC_CUSTOM_HEADERS": "X-Proxi-Profile: cc-rules"
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Proxi-Profile: cc-rules",
+    "CLAUDE_CODE_GATEWAY_HINT_HEADERS": "1"
   }
 }
 ```
+
+`CLAUDE_CODE_GATEWAY_HINT_HEADERS` нужен, чтобы Claude Code присылал `x-claude-code-request-class`: тогда защитное правило узнаёт compaction и auxiliary и профиль по заголовку к ним не применяется ([источник](https://code.claude.com/docs/en/llm-gateway-protocol)).
 
 **Codex.** Ключи `http_headers` и `env_http_headers` провайдера в `~/.codex/config.toml` ([справочник](https://developers.openai.com/codex/config-reference), [пример](https://developers.openai.com/codex/config-advanced), [реализация](https://github.com/openai/codex/blob/main/codex-rs/model-provider-info/src/lib.rs)): `http_headers` — статичные заголовки запросов к провайдеру, `env_http_headers` — заголовки из переменных окружения, когда они заданы.
 
@@ -745,7 +748,7 @@ http_headers = { "X-Proxi-Profile" = "codex-rules" }
 env_http_headers = { "X-Proxi-Profile" = "PROXI_PROFILE" }
 ```
 
-Тогда перед запуском: `$env:PROXI_PROFILE = "codex-rules"`.
+Тогда перед запуском: `$env:PROXI_PROFILE = "codex-rules"`. Если в предпросмотре Codex определяется как `unknown`, добавьте в `http_headers` ещё и `"X-Proxi-Client" = "codex"`: явный заголовок главнее остальных признаков клиента.
 
 **Claude Desktop.** Ключ `inferenceCustomHeaders`: объект «имя → значение», дополнительные заголовки каждого запроса к модели, только для маршрутизации (не для секретов; с версии 1.8089.0) ([справочник](https://claude.com/docs/third-party/claude-desktop/configuration)). Задайте его в окне Developer → Configure Third-Party Inference… (поле «Custom inference headers» раздела Connection; режим разработчика включается в Help → Troubleshooting → Enable Developer Mode) и нажмите Apply Changes ([окно настройки](https://claude.com/docs/third-party/claude-desktop/in-app-configuration)). Значение:
 
