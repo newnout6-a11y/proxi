@@ -24,6 +24,7 @@ import client_context
 import console_log
 from redact import redact
 import config as config_module
+import generation
 import models as model_catalog
 import sse
 import models
@@ -598,21 +599,10 @@ def make_handler(runtime: Runtime):
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:
                 compatibility_headers['x-proxi-ignored-parameters'] = ','.join(parsed.declared_ignored)
-                # Claude Code sends temperature and metadata.user_id on every request and keeps its
-                # late tool announcements in the history, so none of that is a journal warning.
-                names, tool_changes = set(parsed.declared_ignored), set(parsed.inline_tool_changes)
-                # Hints that clients send on every request and that the relay safely
-                # replaces with its own behaviour; material controls still warn.
-                routine = {'temperature', 'top_p', 'top_k', 'seed', 'presence_penalty', 'frequency_penalty', 'metadata',
-                           'prompt_cache_key', 'prompt_cache_retention', 'prompt_cache_options', 'include',
-                           'client_metadata', 'verbosity', 'text.verbosity', 'output_config.task_budget'}
-                # A route that accepts and ignores effort (Haiku 4.5, GLM) gets the level clients send to every model.
-                routine |= {name for name in names if name.lower().endswith('effort') or name.endswith('.budget_tokens')
-                            or name == 'thinking.type'}
-                level = 'warn' if names - routine - tool_changes else 'info' if names & tool_changes else 'debug'
                 journal.emit('request.compatibility',
                              'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
-                             level, request_id=self.request_id, parameters=parsed.declared_ignored)
+                             generation.compatibility_level(parsed), request_id=self.request_id,
+                             parameters=parsed.declared_ignored)
             if parsed.system_messages_normalized:
                 compatibility_headers['x-proxi-system-messages'] = 'inline-as-user-text'
                 journal.emit('request.compatibility',

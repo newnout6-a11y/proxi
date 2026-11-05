@@ -252,7 +252,7 @@ def test_http_logs_distinguish_a_long_title_from_primary_chat(relay, capsys):
     ({"temperature": 1, "logprobs": True}, "warn"),
     ({"logit_bias": {"50256": -100}}, "warn"),
     ({"temperature": 1, "prompt_cache_key": "PRIVATE-KEY"}, "debug"),
-    ({"temperature": 1, "output_config": {"task_budget": {"type": "tokens", "total": 1000}}}, "debug"),
+    ({"temperature": 1, "output_config": {"task_budget": {"type": "tokens", "total": 1000}}}, "warn"),
 ], ids=["claude-code", "sampling-only", "logprobs", "logit-bias", "cache-key", "task-budget"])
 def test_routine_ignored_parameters_are_quiet_but_material_ones_still_warn(relay, monkeypatch, extra, level):
     log = journal.Journal()

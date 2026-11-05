@@ -530,7 +530,7 @@ real system prefix.
 
 Haiku 4.5 accepts verified `thinking: {type: "disabled"}`. The SDK's beta
 `thinking.display: "updates"` uses the route's available summaries, with
-`x-proxi-thinking-display: summarized` and a named compatibility warning; the
+`x-proxi-thinking-display: summarized` and a debug-level compatibility event naming the field; the
 beta's native update cadence is not implemented. Its exact session-title schema
 has a bounded, buffered post-validation path. A sole JSON Markdown fence may be
 removed; the object must still contain exactly one string `title`, no duplicate

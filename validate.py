@@ -82,6 +82,7 @@ class Parsed:
         self.structured_output = None
         self.system = ""
         self.declared_ignored = []
+        self.routine_ignored = []
         self.inline_tool_changes = []
         self.system_messages_normalized = False
         self.wants_usage = False
@@ -459,7 +460,8 @@ def _finish(data, parsed, dialect):
                 break
     parsed.structured_output = generation.structured_output(data, dialect)
     parsed.structured_title = bool(parsed.structured_output and parsed.structured_output['title'])
-    parsed.verbosity, parsed.declared_ignored = generation.controls(data, parsed.entry, dialect)
+    parsed.verbosity, parsed.declared_ignored, parsed.routine_ignored = generation.controls(
+        data, parsed.entry, dialect)
     parsed.declared_ignored += [name for name in parsed.inline_tool_changes if name not in parsed.declared_ignored]
     stream_options = data.get("stream_options")
     if stream_options is None:

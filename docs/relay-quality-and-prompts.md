@@ -294,7 +294,7 @@ verbosity не меняет scope подписанной входной исто
 | Формат с обязательным вызовом tool (`required`, `any`, имя функции), неизвестный `type`, схема не объект, два разных формата в одном запросе | 422 до inference; для Messages текст содержит подсказку про `CLAUDE_CODE_DISABLE_STRUCTURED_OUTPUTS=1` |
 | Служебный запрос title (Claude Code, Claude Agent SDK, Desktop) | Частный случай эмуляции: в диалекте Messages распознаётся по схеме ровно `{title: string}` без tools, независимо от формулировки промпта (та же схема от Chat/Responses-клиента, например ai-sdk `generateObject`, — обычный запрос); без схемы — по началу блока системного промпта после строк `x-anthropic-billing-header` и identity (текущая формулировка «You are naming a coding session…», прежняя «Generate a concise, sentence-case title…», Desktop). Цитата фразы в середине обычного system не считается. Метка `validated-session-title`, свой system без политики relay |
 | непустой `stop`/`stop_sequences`, `n > 1` | 422 до inference: маршрут не обеспечивает эту семантику |
-| `thinking.display: "updates"` | Доступные summaries с явным `x-proxi-thinking-display: summarized` и предупреждением по имени поля; native beta cadence не обещается |
+| `thinking.display: "updates"` | Доступные summaries с явным `x-proxi-thinking-display: summarized`; имя поля перечисляется в `x-proxi-ignored-parameters`, событие `request.compatibility` пишется на уровне debug (Desktop шлёт его в каждом запросе); native beta cadence не обещается |
 | `store: true`, `background: true`, `previous_response_id`, Responses `conversation`, server `prompt` reference | 422: серверное хранение/восстановление/шаблон этим маршрутом не реализованы |
 | `truncation: "auto"`, audio modalities, нестандартный `service_tier` | 422 вместо молчаливой смены поведения |
 | `parallel_tool_calls: false` или Anthropic `disable_parallel_tool_use: true` с tools | 422: последовательность native tool calls не гарантируется |
@@ -303,16 +303,40 @@ verbosity не меняет scope подписанной входной исто
 | temperature, top_p, top_k, seed, penalties, logprobs/logit_bias | Типы/диапазоны проверяются; параметры не передаются upstream и перечисляются по именам в заголовке и событии |
 | `verbosity` / `text.verbosity` для модели без `verbosity_levels` | Значение проверяется (low/medium/high, без конфликта), в Retool не передаётся, имя поля перечисляется в заголовке и событии |
 | prompt_cache_key, prompt_cache_retention, prompt_cache_options, include, metadata, client_metadata | Проверяются формы (`prompt_cache_options` и `client_metadata` — объекты), поля не передаются как настройки upstream; имена перечисляются в заголовке и событии. Локальная metadata-affinity по-прежнему работает |
-| Anthropic `output_config.task_budget` | Форма (объект) проверяется, бюджет не передаётся и не соблюдается; имя `output_config.task_budget` перечисляется в заголовке и событии |
+| Anthropic `output_config.task_budget` | Форма (объект) проверяется, бюджет не передаётся и не соблюдается; имя `output_config.task_budget` перечисляется в заголовке и событии (уровень warn) |
 
-Уведомление — `x-proxi-ignored-parameters` и событие `request.compatibility`.
-Если среди имён только рутинные sampling-подсказки (`temperature`, `top_p`, `top_k`,
-`seed`, `presence_penalty`, `frequency_penalty`) и `metadata`, как у Claude Code,
-который присылает `temperature` и `metadata.user_id` в каждом запросе, событие
-пишется на уровне debug. Любое другое имя (`logprobs`, `logit_bias`, `include`,
-cache hints, `thinking.display`) оставляет warn. Заголовок одинаков в обоих случаях.
-Они содержат только имена полей, без значений, stop-текстов, схем или metadata.
-Заголовок доступен браузерным клиентам через CORS. `store: false` не создаёт
+Уведомление — `x-proxi-ignored-parameters` и событие `request.compatibility`. Заголовок
+называет все игнорированные имена, а уровень события отделяет рутину от существенного.
+Debug получает запрос, где каждое имя одновременно (а) приходит от массовых клиентов в
+каждом запросе, (б) не меняет ни ответ, ни стоимость и (в) уже раскрыто в заголовках
+ответа:
+
+- sampling-подсказки `temperature`, `top_p`, `top_k`, `presence_penalty`,
+  `frequency_penalty` и `metadata` (Claude Code присылает `temperature` и `metadata.user_id` в
+  каждом запросе);
+- `thinking.display: "updates"` (Desktop runner 2.1.309 и 2.1.317 шлёт его в каждом запросе;
+  раскрыт ещё и в `x-proxi-thinking-display`);
+- effort и `thinking.*` у маршрутов `accepted-ignored` (Haiku 4.5, GLM): клиенты копируют один
+  уровень на все модели;
+- `verbosity` и `text.verbosity` у моделей без уровней;
+- cache hints, которые relay заменяет своим кэшем: `prompt_cache_key`,
+  `prompt_cache_options`, и `client_metadata` Codex;
+- `include`, только если все значения — `reasoning.encrypted_content`: это единственное,
+  что Codex 0.164.0 шлёт по умолчанию (`codex-rs/core/src/client.rs`; его
+  `output.encrypted_content` включает выключенная по умолчанию функция) и что AI SDK добавляет
+  при `store: false` для reasoning-модели.
+
+Warn — всё остальное, то есть то, чего клиент мог не желать терять молча: `seed`,
+`prompt_cache_retention`, `output_config.task_budget`, `logprobs`, `top_logprobs`,
+`logit_bias`, `include` с любым другим значением (например `message.output_text.logprobs`,
+`file_search_call.results`). Если среди имён есть inline-блоки `tool_addition` и
+`tool_removal` и нет существенных имён, уровень info. Одно существенное имя делает warn всё
+событие. Проверено на 56 снятых телах Desktop runner 2.1.309 и 2.1.317, на фикстурах Claude
+Code и OpenCode и на живом запросе Codex 0.164.0: ни один не даёт warn на каждом запросе.
+Постоянно шлёт существенный параметр только клиент, который сам его задаёт (например `seed`).
+
+Заголовок и событие содержат только имена полей, без значений, stop-текстов, схем или
+metadata. Заголовок доступен браузерным клиентам через CORS. `store: false` не создаёт
 доступное по response ID хранилище Responses. Это не отключает оперативную
 историю для tool continuation, настроенные журналы и хранение Retool/поставщика.
 Cache retention hints не гарантируют TTL, а `include`
