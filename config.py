@@ -276,10 +276,13 @@ def _ensure_relay_key(cfg):
 
 
 def persist_auth(cfg):
-    """Merge only this account's rotation under a shared storage transaction."""
+    """Merge only this account's rotation under a shared storage transaction.
+
+    Returns True when config.json was rewritten and False when it already held these
+    values: a renewal that rotated nothing must not rewrite the whole file."""
     path = cfg.get("_config_path")
     if not path or not cfg.get("_persist_auth", False):
-        return
+        return False
     with storage_lock(path):
         saved = _read_file(path)
         record = _account_record(saved, cfg)
@@ -288,11 +291,17 @@ def persist_auth(cfg):
         disk_auth = (record.get("cookie"), record.get("xsrf"))
         if disk_auth != cfg.get("_disk_auth", disk_auth) and disk_auth != (cfg["cookie"], cfg["xsrf"]):
             raise ValueError("session configuration changed during renewal")
+        auth = (cfg["cookie"], cfg["xsrf"])
+        needs_id = bool(cfg.get("account_id")) and not record.get("account_id")
+        if disk_auth == auth and not needs_id:
+            cfg["_disk_auth"] = auth
+            return False
         record.update(cookie=cfg["cookie"], xsrf=cfg["xsrf"])
-        if cfg.get("account_id") and not record.get("account_id"):
+        if needs_id:
             record["account_id"] = cfg["account_id"]
         _write_file(path, saved)
-        cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
+        cfg["_disk_auth"] = auth
+        return True
 
 
 def reload_auth(cfg):
