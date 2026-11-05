@@ -461,7 +461,11 @@ an error, never a silent write to a source Desktop ignores. `--write
 --backup-dir PATH` replaces a configLibrary file atomically (the backup must be
 on the same volume) or updates the existing `HKCU` value in place, after saving
 the old content. A configLibrary backup holds the gateway settings: keep it
-private. Quit Desktop first: it reads its configuration at launch. Every other
+private. Nothing is written and no backup is made when the generated list equals
+the existing one, compared as parsed JSON so another layout does not count: the
+summary then shows `written: false, changed: false` (a preview shows `changed` as
+well, and `written` is `false` until `--write` has actually replaced something).
+Quit Desktop first: it reads its configuration at launch. Every other
 key, the endpoint, the gateway key and the authentication scheme stay untouched.
 The script never writes `HKLM` and never creates a policy: a policy that sets any
 other key would switch Desktop away from its working local configuration, so

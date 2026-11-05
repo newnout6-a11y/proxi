@@ -289,6 +289,75 @@ def test_a_string_encoded_local_list_stays_a_string(tmp_path, monkeypatch, capsy
     assert isinstance(encoded, str) and len(json.loads(encoded)) == 9 and ' ' not in encoded.split('"name"')[0]
 
 
+@pytest.mark.parametrize('as_string', [False, True])
+def test_a_current_local_list_is_not_rewritten_and_makes_no_second_backup(tmp_path, monkeypatch, capsys, as_string):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary', json.dumps(USER_ROWS) if as_string else USER_ROWS)
+    backups = tmp_path / 'backups'
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--config-library', path.parent, '--write', '--backup-dir', backups]
+    code, first, error = cli(capsys, *arguments)
+    assert code == 0 and first['written'] is True and first['changed'] is True, error
+    synchronized, stamp = path.read_bytes(), path.stat().st_mtime_ns
+    code, second, error = cli(capsys, *arguments)
+    assert code == 0 and second['written'] is False and second['changed'] is False, error
+    assert second['backup'] is None and second['models'] == first['models']
+    assert path.read_bytes() == synchronized and path.stat().st_mtime_ns == stamp
+    assert [item.read_bytes() for item in backups.iterdir()] == [data]
+
+
+def test_a_current_local_list_in_another_layout_is_left_alone_not_reformatted(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary')
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--config-library', path.parent]
+    assert cli(capsys, *arguments, '--write', '--backup-dir', tmp_path / 'backups')[0] == 0
+    reindented = json.dumps(json.loads(path.read_bytes()), indent=4).encode('utf-8')
+    path.write_bytes(reindented)
+    code, report, error = cli(capsys, *arguments, '--write', '--backup-dir', tmp_path / 'backups2')
+    assert code == 0 and report['written'] is False and report['changed'] is False, error
+    assert path.read_bytes() == reindented and not (tmp_path / 'backups2').exists()
+
+
+def test_a_dry_run_reports_whether_a_write_would_change_anything_and_never_claims_it_wrote(tmp_path, monkeypatch,
+                                                                                         capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary')
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--config-library', path.parent]
+    code, report, error = cli(capsys, *arguments)
+    assert code == 0 and report['written'] is False and report['changed'] is True, error
+    assert cli(capsys, *arguments, '--write', '--backup-dir', tmp_path / 'backups')[0] == 0
+    code, report, error = cli(capsys, *arguments)
+    assert code == 0 and report['written'] is False and report['changed'] is False, error
+
+
+def test_a_current_user_policy_is_not_written_again_and_makes_no_second_backup(tmp_path, monkeypatch, capsys):
+    state = registry(monkeypatch, hkcu=policy_values(USER_ROWS))
+    backups = tmp_path / 'backups'
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--write', '--backup-dir', backups]
+    code, first, error = cli(capsys, *arguments)
+    assert code == 0 and first['written'] is True and first['changed'] is True, error
+    assert len(state.writes) == 1
+    code, second, error = cli(capsys, *arguments)
+    assert code == 0 and second['written'] is False and second['changed'] is False, error
+    assert second['backup'] is None and len(state.writes) == 1 and len(list(backups.iterdir())) == 1
+
+
+def test_user_policy_values_are_compared_parsed_so_other_json_formatting_is_not_a_change(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch, hkcu=policy_values(USER_ROWS))
+    catalog = anthropic_catalog(tmp_path)
+    report, rows = preview(capsys, tmp_path, '--desktop-catalog', catalog)
+    assert report['changed'] is True
+    pretty = {'inferenceProvider': ('gateway', SZ), 'inferenceModels': (json.dumps(rows, indent=2), SZ)}
+    state = registry(monkeypatch, hkcu=pretty)
+    code, report, error = cli(capsys, '--relay-config', relay_config(tmp_path), '--desktop-catalog', catalog,
+                              '--write', '--backup-dir', tmp_path / 'backups')
+    assert code == 0 and report['written'] is False and report['changed'] is False, error
+    assert state.writes == [] and state.hives['HKCU'] == pretty and not (tmp_path / 'backups').exists()
+
+
 def test_user_policy_in_effect_is_the_only_target_and_the_local_file_is_left_alone(tmp_path, monkeypatch, capsys):
     state = registry(monkeypatch, hkcu=policy_values(USER_ROWS, inferenceGatewayApiKey=('synthetic', SZ)))
     path, data = local_library(tmp_path / 'configLibrary')

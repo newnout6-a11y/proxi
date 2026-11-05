@@ -12,8 +12,9 @@ list: a configLibrary file is replaced atomically with a backup, HKCU is updated
 in place and HKLM is never written. It never creates a policy: one that sets any
 other key would switch Desktop away from its working local configuration.
 Credentials and all other keys stay untouched. Writing requires a backup directory
-(it holds the old gateway settings: keep it private). Quit Desktop before writing:
-it reads the configuration at launch.
+(it holds the old gateway settings: keep it private). Nothing is written and no
+backup is made when the list is already current. Quit Desktop before writing: it
+reads the configuration at launch.
 """
 import argparse
 import base64
@@ -476,15 +477,17 @@ def run(args):
                 json.dump(result, output, ensure_ascii=False, indent=2)
         except FileExistsError:
             raise SyncError('Preview file already exists and is never overwritten: %s' % args.output) from None
+    # Parsed values decide, not bytes: the same list in another JSON layout needs no write and no backup.
+    changed = result != previous
     backup = None
-    if args.write:
+    if args.write and changed:
         if effective == 'local':
             updated = copy.deepcopy(document)
             updated[VALUE_NAME] = encoded if isinstance(raw, str) else result
             backup = write_backed_up(path, original, encode_local(original, updated), args.backup_dir)
         else:
             backup = write_policy(raw, kind, encoded, args.backup_dir)
-    print(json.dumps({'models': len(result), 'written': bool(args.write),
+    print(json.dumps({'models': len(result), 'written': backup is not None, 'changed': changed,
                       'backup': str(backup) if backup else None, 'preview': args.output,
                       'source': effective, 'target': target, 'default_model': after[0],
                       'added': [name for name in after if name not in before],
