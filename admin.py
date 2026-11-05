@@ -293,6 +293,8 @@ class Admin:
                 "last_renewed_at": getattr(getattr(backend, "refresher", None), "last_success_at", None),
                 "error": self._safe(str(error))[:200] if error else None,
             })
+            if entry.get("rate_limited_until"):
+                accounts[-1]["rate_limited_until"] = entry["rate_limited_until"]
         return accounts
 
     def _overview(self, handler):

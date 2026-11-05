@@ -1,8 +1,10 @@
 """Retool's hourly managed-key limit is an account quota: it parks the account and moves the turn."""
 import asyncio
+import http.client
 import io
 import json
 import random
+import threading
 import time
 import urllib.error
 from email.message import Message
@@ -15,6 +17,7 @@ import admin
 import config
 import direct
 import journal
+import proxy
 import upstream_attempts
 from accounts import DEAD_AFTER, AccountDispatcher
 from session import SessionPool
@@ -22,6 +25,7 @@ from test_account_dispatcher import Account, Clock, FakeManager, FakeRefresher, 
 from test_admin import admin_relay  # noqa: F401 - fixture
 from test_native_context_reuse import FIRST, Backend, request, run, setup
 from test_review_fixes_pr19 import END, response, text
+from test_review_fixes_proxy import FakeManager as BalanceManager
 from upstream_attempts import AttemptBudget
 
 MESSAGE = ("You have exceeded your hourly limit of managed API key usage. Please go to the Retool AI resource "
@@ -558,3 +562,140 @@ def test_shared_mode_refuses_a_parked_account_without_calling_retool(tmp_path):
 
     error = asyncio.run(scenario())
     assert error.status == 429 and 110 <= error.retry_after <= 120
+
+
+# -- 7: what the client and the operator see -------------------------------------------------
+RELAY_KEY = "rate-limit-relay-key-123"
+CHAT = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}
+
+
+@pytest.fixture
+def served(monkeypatch, tmp_path):
+    """The real relay (two accounts, real TurnRunner and transport) over HTTP, with a scripted Retool."""
+    monkeypatch.setattr(AttemptBudget, "wait", lambda self, delay, cancelled: None)
+    monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
+
+    def account(name):
+        return {"account_id": name, "page_uuid": "page-" + name, "thread_id": "thread-" + name,
+                "cookie": "accessToken=cookie-%s-123456; xsrfToken=q" % name, "xsrf": "q",
+                "provider_resource_name": "resource-" + name}
+
+    cfg = dict(config.DEFAULTS)
+    cfg.update({"base": "https://example.invalid", "page_uuid": "page-acc-a", "thread_id": "thread-a",
+                "ua": "test-agent", "cookie": "accessToken=cookie-acc-a-123456; xsrfToken=q", "xsrf": "q",
+                "relay_api_key": RELAY_KEY, "workspace_root": str(tmp_path), "command_log": str(tmp_path / "c.log"),
+                "host": "127.0.0.1", "port": 0, "cookie_values": [], "client_metadata_home": str(tmp_path),
+                "cache_keepwarm_seconds": 0, "upstream_error_dir": str(tmp_path),
+                "accounts": [account("acc-a"), account("acc-b")]})
+    runtime = proxy.Runtime(cfg)
+    managers = [BalanceManager(100.0), BalanceManager(80.0)]
+    for backend, manager in zip(runtime.accounts.backends, managers):
+        runtime.accounts.managers[backend] = manager
+        backend.credits = manager
+    runtime.credits = managers[0]
+    script, posts = {}, []
+
+    def opener(request_, **_kwargs):
+        who = "acc-a" if "cookie-acc-a" in (request_.get_header("Cookie") or "") else "acc-b"
+        posts.append(who)
+        return script.get(who, serve_ok)(request_)
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
+    server = proxy.BoundedServer(("127.0.0.1", 0), proxy.make_handler(runtime), threading.BoundedSemaphore(4))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+
+    def call(path, payload=None, *, key=RELAY_KEY):
+        # http.client: urllib's urlopen is the scripted Retool in these tests.
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+        headers = {"content-type": "application/json"}
+        if key:
+            headers["authorization"] = "Bearer " + key
+        connection.request("POST" if payload is not None else "GET", path,
+                           json.dumps(payload).encode() if payload is not None else None, headers)
+        response = connection.getresponse()
+        raw = response.read().decode()
+        connection.close()
+        is_json = "json" in response.headers.get("content-type", "")
+        return response.status, (json.loads(raw or "{}") if is_json else raw), response.headers
+
+    yield SimpleNamespace(runtime=runtime, script=script, posts=posts, call=call,
+                          dispatcher=runtime.accounts, backends=runtime.accounts.backends)
+    server.shutdown()
+    try:
+        server.server_close()
+    except OSError:
+        pass
+    runtime.close()
+
+
+def test_the_client_never_sees_the_hourly_limit_while_another_account_is_free(served):
+    served.script["acc-a"] = hourly
+    status, body, _ = served.call("/v1/chat/completions", CHAT)
+    assert status == 200 and body["choices"][0]["message"]["content"] == "OK"
+    assert served.posts == ["acc-a", "acc-b"]
+    assert served.backends[0].unavailable["reason"] == "rate_limited"
+
+
+def test_the_parked_account_and_its_return_time_are_visible_everywhere(served):
+    served.script["acc-a"] = hourly
+    assert served.call("/v1/chat/completions", CHAT)[0] == 200
+    until = served.backends[0].unavailable["until_at"]
+    assert time.time() < until <= time.time() + 900
+
+    status, health, _ = served.call("/health", key=None)
+    assert status == 200
+    assert health["accounts"] == {"total": 2, "routable": 1, "reserve": 0, "rate_limited_until": until,
+                                  "states": {"rate_limited": 1, "active": 1}}
+
+    status, balance, _ = served.call("/v1/balance")
+    parked, free = balance["accounts"]
+    assert (parked["state"], parked["rate_limited_until"]) == ("rate_limited", until)
+    assert free["state"] == "active" and "rate_limited_until" not in free
+
+    status, overview, _ = served.call("/admin/api/overview")
+    parked, free = overview["accounts"]
+    assert (parked["state"], parked["routable"], parked["rate_limited_until"]) == ("rate_limited", False, until)
+    assert free["state"] == "active" and "rate_limited_until" not in free
+    assert overview["accounts_summary"]["states"] == {"rate_limited": 1, "active": 1}
+
+    status, pool, _ = served.call("/admin/api/accounts")
+    parked, free = pool["accounts"]
+    assert (parked["state"], parked["rate_limited_until"]) == ("rate_limited", until)
+    assert free["state"] == "active" and "rate_limited_until" not in free
+    assert pool["summary"]["states"] == {"rate_limited": 1, "active": 1}
+
+
+def test_when_every_account_is_parked_the_http_answer_is_429_with_retry_after_not_503(served):
+    served.script["acc-a"] = served.script["acc-b"] = hourly
+    status, body, headers = served.call("/v1/chat/completions", CHAT)
+    assert status == 429 and served.posts == ["acc-a", "acc-b"]
+    assert 1 <= int(headers["retry-after"]) <= 900
+    assert body["error"]["type"] == "rate_limit_error"
+    assert "все аккаунты упёрлись в часовой лимит Retool" in body["error"]["message"]
+    # Parked accounts are not tried again: the next request is answered locally.
+    status, body, headers = served.call("/v1/messages", {**CHAT, "max_tokens": 64})
+    assert status == 429 and served.posts == ["acc-a", "acc-b"]
+    assert body["error"]["type"] == "rate_limit_error" and int(headers["retry-after"]) >= 1
+
+    status, health, _ = served.call("/health", key=None)
+    assert status == 503 and health["accounts"]["states"] == {"rate_limited": 2}
+    assert health["accounts"]["routable"] == 0 and health["upstream"] == "degraded"
+
+
+def test_a_streaming_client_gets_the_same_explanation_in_its_error_event(served):
+    served.dispatcher.mark_rate_limited(served.backends[0])
+    served.dispatcher.mark_rate_limited(served.backends[1])
+    status, body, _ = served.call("/v1/chat/completions", {**CHAT, "stream": True})
+    assert "rate_limit_error" in body and "все аккаунты упёрлись в часовой лимит Retool" in body
+    assert served.posts == []
+
+
+def test_an_ordinary_429_reaches_the_client_and_parks_nothing(served):
+    served.script["acc-a"] = short_429
+    status, body, headers = served.call("/v1/chat/completions", CHAT)
+    assert status == 429 and body["error"]["message"] == "Slow down, try again"
+    assert served.posts == ["acc-a"]
+    assert all(backend.unavailable is None for backend in served.backends)
+    status, health, _ = served.call("/health", key=None)
+    assert "rate_limited_until" not in health["accounts"] and health["accounts"]["states"] == {"active": 2}
