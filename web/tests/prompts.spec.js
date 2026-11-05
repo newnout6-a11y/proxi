@@ -1261,7 +1261,7 @@ async function openEverything(page, name) {
 }
 
 test('no glow, gradient, uppercase, endless animation or heavy weight on any tab of the prompts screen', async ({ page }) => {
-  await openPrompts(page);
+  const { prompts } = await openPrompts(page, { errors: [{ message: 'profiles.mine-first.head: unknown variable {{typo}}', param: 'profiles.mine-first.head', ts: 1 }] });
   const scan = () => page.evaluate(() => {
     const bad = [];
     for (const el of document.querySelectorAll('.prompts *')) {
@@ -1283,6 +1283,22 @@ test('no glow, gradient, uppercase, endless animation or heavy weight on any tab
     found[name] = await scan();
   }
   expect(found).toEqual(Object.fromEntries(TABS.map((name) => [name, []])));
+  // every banner of the screen as well: the file errors are up already; a refused save, a conflict and the warnings
+  await tab(page, 'Профили').click();
+  await head(page).fill('{{typo}}');
+  prompts.warnings = ['предупреждение сохранения'];
+  await saveButton(page).click();
+  await expect(page.locator('.p-save-error')).toBeVisible();
+  expect(await scan()).toEqual([]);
+  await head(page).fill('{{client_system}}');
+  await saveButton(page).click();
+  await expect(page.locator('.p-save-warnings')).toBeVisible();
+  expect(await scan()).toEqual([]);
+  prompts.rev = 9;
+  await head(page).fill('{{client_system}} ещё');
+  await saveButton(page).click();
+  await expect(page.locator('.p-conflict')).toBeVisible();
+  expect(await scan()).toEqual([]);
 });
 
 for (const width of [280, 320, 414, 1440]) {
