@@ -51,6 +51,13 @@ function signal(trace, at) {
 
 const toolKey = (data) => data.call_id ?? data.name ?? '';
 
+/** One paid upstream attempt, as the relay's journal keeps it: did it report usage, and did a valid price come with it. */
+function attemptOf(trace, number) {
+  let attempt = trace.costAttempts.get(number);
+  if (!attempt) trace.costAttempts.set(number, attempt = { observed: false, known: false });
+  return attempt;
+}
+
 export function buildTraces(events) {
   const map = new Map();
   for (const event of events) {
@@ -63,12 +70,12 @@ export function buildTraces(events) {
     let trace = map.get(event.turn_id);
     if (!trace) {
       trace = { id: event.turn_id, started: event.ts, ended: null, status: 'running', restored: false, model: null, effort: null,
-        transport: null, dialect: null, ttft: null, duration: null, credits: null, creditsSum: null, creditsComplete: true,
+        transport: null, dialect: null, ttft: null, duration: null, credits: null, creditsSum: null, creditsComplete: false,
         phase: 'wait', phaseStarted: event.ts, waitStarted: event.ts, waitMs: 0, firstSignal: null,
         thinkingStarted: null, thinking: 0, textStarted: null, textMs: 0, toolOpen: new Map(), toolSpans: [], args: 0,
         execStarted: null, execMs: 0, inputTokens: 0, cacheRead: 0, cacheWrite: 0,
         tools: 0, commands: 0, errors: 0, last: event.ts, events: [],
-        costAttempts: new Map(), costAttempt: 0 };
+        costAttempts: new Map(), costAttempt: null };
       map.set(event.turn_id, trace);
     }
     const data = event.data || {};
@@ -82,8 +89,8 @@ export function buildTraces(events) {
       closeWait(trace, event.ts);
       trace.waitStarted = event.ts;
       trace.phase = 'wait'; trace.phaseStarted = event.ts;
-      trace.costAttempt = data.attempt ?? trace.costAttempts.size + 1;
-      if (!trace.costAttempts.has(trace.costAttempt)) trace.costAttempts.set(trace.costAttempt, false);
+      trace.costAttempt = Number.isInteger(data.attempt) ? data.attempt : Math.max(-1, ...trace.costAttempts.keys()) + 1;
+      attemptOf(trace, trace.costAttempt);
     }
     trace.events.push(event);
     trace.last = Math.max(trace.last, event.ts);
@@ -104,10 +111,13 @@ export function buildTraces(events) {
       trace.phaseStarted = event.ts;
     }
     if (event.kind === 'upstream.usage') {
-      const attempt = data.attempt ?? trace.costAttempt;
-      const priced = isPrice(data.credits);
-      if (priced) trace.creditsSum = (trace.creditsSum ?? 0) + data.credits;
-      trace.costAttempts.set(attempt, trace.costAttempts.get(attempt) === true || data.credits_reported === true || priced);
+      // The price is the only thing that makes an attempt known: the relay's reported flag alone never does
+      const attempt = attemptOf(trace, Number.isInteger(data.attempt) ? data.attempt : trace.costAttempt ?? 0);
+      attempt.observed = true;
+      if (isPrice(data.credits)) {
+        attempt.known = true;
+        trace.creditsSum = (trace.creditsSum ?? 0) + data.credits;
+      }
       trace.inputTokens += Number(data.input_tokens) || 0;
       trace.cacheRead += Number(data.cache_read) || 0;
       trace.cacheWrite += Number(data.cache_write) || 0;
@@ -175,17 +185,20 @@ export function buildTraces(events) {
 }
 
 /**
- * What a turn cost. A turn that never reached upstream cost nothing. An attempt without a price is unknown only
- * once the turn is over: a running attempt may still report one, so a running turn shows no gap yet.
+ * What a turn cost, by the relay's own rules (journal._Turn): an attempt that reported usage without a valid price is
+ * unknown; one that only started (refused, 429, never left) cost nothing; a turn without attempts costs 0. A turn cut
+ * off while its attempt was still silent (cancelled, or interrupted by a restart) may have been billed, so that
+ * attempt is unknown too. `complete` means no attempt is unknown; `final` that the turn is over: a running turn
+ * without a price has none yet, which is not a gap.
  */
 export function costOf(trace, status = trace.status) {
-  const open = status === 'running';
+  const final = status !== 'running';
   const attempts = [...trace.costAttempts.values()];
-  return {
-    credits: trace.creditsSum ?? (open || attempts.length ? null : 0),
-    complete: open || attempts.every(Boolean),
-    pending: open && trace.creditsSum === null,
-  };
+  const latest = trace.costAttempts.get(trace.costAttempt);
+  const silent = (status === 'cancelled' || status === 'interrupted') && latest !== undefined && !latest.observed;
+  const unknown = attempts.filter((attempt) => attempt.observed && !attempt.known).length + (silent ? 1 : 0);
+  const priced = attempts.some((attempt) => attempt.known);
+  return { credits: priced ? trace.creditsSum : final && !unknown ? 0 : null, unknown, final, complete: unknown === 0 };
 }
 
 /** A turn silent for longer than this is not running any more: the relay's own turn timeout is 15 minutes by default. */

@@ -8,17 +8,17 @@ const relayStart = (ts) => ({ ts, kind: 'relay.start', data: {} });
 const forTurn = (id, events) => events.map((event) => ({ ...event, turn_id: id }));
 
 test('unknown credits remain unknown and explicit zero remains known', () => {
-  const [unknown] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: null }), finish(102, 2000)]);
+  const [unknown] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: null })]);
   assert.equal(unknown.credits, null);
   assert.equal(unknown.creditsComplete, false);
-  const [zero] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: 0 }), finish(102, 2000)]);
+  const [zero] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: 0 })]);
   assert.equal(zero.credits, 0);
   assert.equal(zero.creditsComplete, true);
 });
 
 test('a known debit and an unknown attempt are displayed as a lower bound', () => {
   const [trace] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: null, attempt: 1 }),
-    ev(102, 'upstream.usage', { credits: 3.5, attempt: 2 }), finish(103, 3000)]);
+    ev(102, 'upstream.usage', { credits: 3.5, attempt: 2 })]);
   assert.equal(trace.credits, 3.5);
   assert.equal(trace.creditsComplete, false);
 });
@@ -105,39 +105,77 @@ test('a turn that failed before reaching upstream costs nothing', () => {
   assert.equal(trace.creditsComplete, true);
 });
 
-test('an attempt without a price is unknown once the turn is over, not while the turn runs', () => {
-  const begun = [ev(100, 'turn.begin'), ev(100, 'upstream.usage_start', { attempt: 1 })];
-  const [running] = buildTraces(begun);
-  assert.equal(running.creditsComplete, true);
-  assert.equal(running.credits, null);
-  assert.equal(costOf(running).pending, true);
-  const [over] = buildTraces([...begun, finish(103, 3000, 'error')]);
-  assert.equal(over.credits, null);
-  assert.equal(over.creditsComplete, false);
-  assert.equal(costOf(over).pending, false);
+// The price rules of the relay's journal (tests/test_journal_costs.py, SCENARIOS), seen from one turn:
+// [name, steps, credits, unknown attempts, cost is complete]. Each ended turn is closed by its own turn.end.
+const START = (n) => ['upstream.usage_start', { attempt: n }];
+const USAGE = (n, credits, extra = {}) => ['upstream.usage', { attempt: n, credits, ...extra }];
+const MARKER = { credits_reported: false };
+const END = (reason = 'stop') => ['turn.end', { reason, duration_ms: 1000 }];
+const turnOf = (steps) => buildTraces([ev(99, 'turn.begin'), ...steps.map(([kind, data], i) => ev(100 + i, kind, data))])[0];
+const COSTS = [
+  ['normal', [START(1), USAGE(1, 0.01), END()], 0.01, 0, true],
+  ['rejected before the upstream (413/402/503)', [END('error')], 0, 0, true],
+  ['an attempt that was refused costs nothing (429/500)', [START(1), END('error')], 0, 0, true],
+  ['an attempt that reported usage without a price is unknown', [START(1), USAGE(1, null, MARKER), END('error')], null, 1, false],
+  ['exec step: two priced attempts', [START(1), USAGE(1, 0.01), START(2), USAGE(2, 0.02), END()], 0.03, 0, true],
+  ['second attempt never reported anything', [START(1), USAGE(1, 0.01), START(2), END()], 0.01, 0, true],
+  ['second attempt reported usage without a price', [START(1), USAGE(1, 0.01), START(2), USAGE(2, null, MARKER), END()], 0.01, 1, false],
+  ['tokens-only update after the price', [START(1), USAGE(1, 0.01), USAGE(1, null, { credits_reported: true }), END()], 0.01, 0, true],
+  ['price after a tokens-only snapshot', [START(1), USAGE(1, null), USAGE(1, 0.25), END()], 0.25, 0, true],
+  ['a reported zero is a price', [START(1), USAGE(1, 0), END()], 0, 0, true],
+  ['cancelled while the attempt was silent: may have been billed', [START(1), END('cancelled')], null, 1, false],
+  ['cancelled before any attempt started', [END('cancelled')], 0, 0, true],
+  ['graceful cancel: the marker and the cancelled end count once', [START(1), USAGE(1, null, MARKER), END('cancelled')], null, 1, false],
+  ['cancelled second attempt after a priced first one', [START(1), USAGE(1, 0.01), START(2), END('cancelled')], 0.01, 1, false],
+  ['cancelled after the price arrived', [START(1), USAGE(1, 0.01), END('cancelled')], 0.01, 0, true],
+  ['an invalid price after a valid one changes nothing', [START(1), USAGE(1, 0.1), USAGE(1, -4, { credits_reported: true }), START(2), USAGE(2, 0.2), END()], 0.3, 0, true],
+];
+for (const [name, steps, credits, unknown, complete] of COSTS) {
+  test(`cost of a finished turn: ${name}`, () => {
+    const trace = turnOf(steps);
+    const cost = costOf(trace);
+    assert.equal(cost.final, true);
+    assert.equal(cost.credits === null ? null : Math.round(cost.credits * 1e6) / 1e6, credits);
+    assert.equal(cost.unknown, unknown);
+    assert.equal(cost.complete, complete);
+    assert.equal(trace.credits, cost.credits);
+    assert.equal(trace.creditsComplete, complete);
+  });
+}
+
+test('a running turn is never a finished unknown: nothing reported yet is not a gap, a price so far is a lower bound', () => {
+  const waiting = costOf(turnOf([START(1)]));
+  assert.deepEqual(waiting, { credits: null, unknown: 0, final: false, complete: true });
+  const between = costOf(turnOf([START(1), USAGE(1, 0.1)]));
+  assert.deepEqual(between, { credits: 0.1, unknown: 0, final: false, complete: true });
+  assert.deepEqual(costOf(turnOf([])), { credits: null, unknown: 0, final: false, complete: true });
 });
 
-test('a priced attempt followed by an unpriced one is a lower bound only after the turn ends', () => {
-  const attempts = [ev(100, 'turn.begin'), ev(100, 'upstream.usage_start', { attempt: 1 }),
-    ev(101, 'upstream.usage', { credits: 2, attempt: 1 }), ev(102, 'upstream.usage_start', { attempt: 2 })];
-  const [running] = buildTraces(attempts);
-  assert.equal(running.credits, 2);
-  assert.equal(running.creditsComplete, true);
-  const [over] = buildTraces([...attempts, finish(104, 4000)]);
-  assert.equal(over.credits, 2);
-  assert.equal(over.creditsComplete, false);
-});
-
-test('a negative price is invalid and stays unknown, as the relay treats it', () => {
-  for (const credits of [-3, NaN]) {
-    const [trace] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits, attempt: 1 }), finish(102, 2000)]);
-    assert.equal(trace.credits, null);
-    assert.equal(trace.creditsComplete, false);
+test('a price that is not a finite non-negative number is invalid, even when it claims to be reported', () => {
+  for (const credits of [-1, -0.5, NaN, Infinity, -Infinity, true, '0.5', [0.5]]) {
+    for (const reported of [true, undefined]) {
+      const cost = costOf(turnOf([START(1), USAGE(1, credits, { credits_reported: reported }), END()]));
+      assert.equal(cost.credits, null);
+      assert.equal(cost.unknown, 1);
+      assert.equal(cost.complete, false);
+    }
   }
-  const [mixed] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: 2, attempt: 1 }),
-    ev(102, 'upstream.usage', { credits: -3, attempt: 2 }), finish(103, 3000)]);
-  assert.equal(mixed.credits, 2);
-  assert.equal(mixed.creditsComplete, false);
+});
+
+test('the reported flag alone never creates a price but keeps an earlier one', () => {
+  assert.equal(costOf(turnOf([START(1), USAGE(1, null, { credits_reported: true }), END()])).unknown, 1);
+  const kept = costOf(turnOf([START(1), USAGE(1, 0.1), USAGE(1, -1, { credits_reported: true }),
+    USAGE(1, NaN, { credits_reported: true }), END()]));
+  assert.equal(kept.credits, 0.1);
+  assert.equal(kept.unknown, 0);
+});
+
+test('a turn cut off by a relay restart or by silence while its attempt was silent may have been billed', () => {
+  const silent = turnOf([START(1)]);
+  assert.deepEqual(costOf(silent, 'interrupted'), { credits: null, unknown: 1, final: true, complete: false });
+  const priced = turnOf([START(1), USAGE(1, 0.25)]);
+  assert.deepEqual(costOf(priced, 'interrupted'), { credits: 0.25, unknown: 0, final: true, complete: true });
+  assert.deepEqual(costOf(turnOf([]), 'interrupted'), { credits: 0, unknown: 0, final: true, complete: true });
 });
 
 test('a turn from before a relay restart is interrupted and ends at its last event', () => {

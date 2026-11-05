@@ -323,15 +323,50 @@ test('turns left running by a restart or by silence are interrupted and never st
   await expect(done.locator('.tape-fill')).toHaveAttribute('style', /width: 100%/);
 });
 
-test('turn rows tell a turn that never reached upstream, an unpriced one and a running one apart, and keep a command out of the answer', async ({ page }) => {
+test('turn rows price a turn by the relay rules: nothing for a refused attempt, unknown for usage without a price, a lower bound while it runs', async ({ page }) => {
   await mockAdmin(page);
   await serveEvents(page, [
+    // Rejected before the upstream was reached
     eventAt('t-failed', -400, 'turn.begin', { model: 'model-failed' }),
     eventAt('t-failed', -399, 'turn.error', {}, { level: 'error' }),
     eventAt('t-failed', -399, 'turn.end', { reason: 'error', duration_ms: 1000 }, { level: 'error' }),
+    // An attempt began and the upstream refused it (429): it reported nothing and cost nothing
+    eventAt('t-refused', -350, 'turn.begin', { model: 'model-refused' }),
+    eventAt('t-refused', -350, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-refused', -346, 'turn.end', { reason: 'error', duration_ms: 4000 }, { level: 'error' }),
+    // Usage came back without a price
     eventAt('t-unpriced', -300, 'turn.begin', { model: 'model-unpriced' }),
     eventAt('t-unpriced', -300, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-unpriced', -297, 'upstream.usage', { credits: null, attempt: 1, credits_reported: false }),
     eventAt('t-unpriced', -296, 'turn.end', { reason: 'error', duration_ms: 4000 }, { level: 'error' }),
+    // The client gave up while the attempt was silent: it may have been billed
+    eventAt('t-cancelled', -250, 'turn.begin', { model: 'model-cancelled' }),
+    eventAt('t-cancelled', -250, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-cancelled', -247, 'turn.end', { reason: 'cancelled', duration_ms: 3000 }),
+    // Still running: one attempt priced, the next not yet; and one that has reported nothing
+    eventAt('t-running', -20, 'turn.begin', { model: 'model-running' }),
+    eventAt('t-running', -20, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-running', -15, 'upstream.usage', { credits: 0.5, attempt: 1, credits_reported: true }),
+    eventAt('t-running', -15, 'upstream.usage_start', { attempt: 2 }),
+    eventAt('t-waiting', -10, 'turn.begin', { model: 'model-waiting' }),
+    eventAt('t-waiting', -10, 'upstream.usage_start', { attempt: 1 }),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  const cost = (model) => page.locator('.trace', { hasText: model }).locator('.trace-cost');
+  await expect(cost('model-failed')).toHaveText('0,00');
+  await expect(cost('model-refused')).toHaveText('0,00');
+  await expect(cost('model-unpriced')).toContainText('нет данных');
+  await expect(cost('model-cancelled')).toContainText('нет данных');
+  await expect(cost('model-running')).toContainText('≥ 0,50');
+  await expect(cost('model-running')).toContainText('ход идёт');
+  await expect(cost('model-waiting')).toContainText('ход идёт');
+  await expect(cost('model-waiting')).not.toContainText('нет данных');
+});
+
+test('a local command is shown as its own time and is not counted as the answer', async ({ page }) => {
+  await mockAdmin(page);
+  await serveEvents(page, [
     eventAt('t-command', -200, 'turn.begin', { model: 'model-command' }),
     eventAt('t-command', -200, 'upstream.usage_start', { attempt: 1 }),
     eventAt('t-command', -195, 'upstream.text_start'),
@@ -341,19 +376,11 @@ test('turn rows tell a turn that never reached upstream, an unpriced one and a r
     eventAt('t-command', -163, 'upstream.usage_start', { attempt: 2 }),
     eventAt('t-command', -160, 'upstream.usage', { credits: 0.25, attempt: 2, credits_reported: true }),
     eventAt('t-command', -160, 'turn.end', { reason: 'stop', duration_ms: 40000 }),
-    eventAt('t-running', -20, 'turn.begin', { model: 'model-running' }),
-    eventAt('t-running', -20, 'upstream.usage_start', { attempt: 1 }),
   ]);
   await login(page);
   await nav(page, 'Активность');
-  const cost = (model) => page.locator('.trace', { hasText: model }).locator('.trace-cost');
-  await expect(cost('model-failed')).toContainText('0,00');
-  await expect(cost('model-failed')).not.toContainText('нет данных');
-  await expect(cost('model-unpriced')).toContainText('нет данных');
-  await expect(cost('model-running')).toContainText('ход идёт');
-  await expect(cost('model-running')).not.toContainText('нет данных');
   const command = page.locator('.trace', { hasText: 'model-command' });
-  await expect(cost('model-command')).toContainText('0,75');
+  await expect(command.locator('.trace-cost')).toHaveText('0,75');
   await expect(command.locator('.trace-phases')).toContainText('команды 30,0 с');
   // 2 s of text, then 30 s of command: only the 2 s are the answer
   await expect(command.locator('.tape')).toHaveAttribute('aria-label', /ответ 2,00\sс.*без детализации 30,0\sс/);

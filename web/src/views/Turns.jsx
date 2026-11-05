@@ -11,6 +11,12 @@ import { TurnsArt } from '../stage/Art.jsx';
 
 const LIVE_PHASE = { wait: 'ждём upstream', think: 'upstream: thinking', tools: 'аргументы инструмента', out: 'пишет ответ', exec: 'выполняет команду' };
 
+// "нет данных" and the unknown-cost marks are for a finished turn that lacks a price; a running turn just has none yet
+const costNote = (cost) => (!cost.final ? 'ход идёт' : cost.credits === null ? 'нет данных' : cost.complete ? '' : 'неполные данные');
+const costTitle = (cost) => (!cost.final ? 'Ход ещё идёт: стоимость будет известна, когда upstream ответит'
+  : cost.credits === null ? 'Стоимость не сообщена' : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена');
+const lowerBound = (cost) => cost.credits !== null && (!cost.final || !cost.complete);
+
 function Steps({ trace }) {
   const start = trace.started;
   return (
@@ -90,9 +96,9 @@ export default function Turns({ journal, overview, embedded }) {
                 </span>
                 <span className="trace-num">{fmtMs(trace.ttft)}</span>
                 <span className="trace-num">{fmtTokens(trace.cacheRead)}{hit !== null && <small> · {Math.round(hit * 100)}%</small>}</span>
-                <span className="trace-num trace-cost" title={cost.credits === null ? cost.pending ? 'Стоимость будет известна, когда upstream ответит' : 'Стоимость не сообщена' : !cost.complete ? 'Часть стоимости не сообщена' : 'Сообщённая стоимость'}>
-                  {cost.credits !== null && !cost.complete ? '≥ ' : ''}{fmtFixed(cost.credits, 2)}
-                  <small>{cost.credits === null ? cost.pending ? 'ход идёт' : 'нет данных' : !cost.complete ? 'неполные данные' : ''}</small>
+                <span className="trace-num trace-cost" title={costTitle(cost)}>
+                  {lowerBound(cost) ? '≥ ' : ''}{fmtFixed(cost.credits, 2)}
+                  <small>{costNote(cost)}</small>
                 </span>
                 <time className="trace-when" title={fmtClock(trace.started)}>
                   {fmtAgo(trace.started)}
