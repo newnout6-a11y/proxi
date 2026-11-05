@@ -10,6 +10,8 @@ async function login(page, { remember = false } = {}) {
 }
 
 const nav = (page, name) => page.getByRole('navigation').getByRole('button', { name: new RegExp(name) }).click();
+// Settings adds its own group index with role=navigation, so leaving it needs the section rail by name.
+const section = (page, name) => page.getByRole('navigation', { name: 'Разделы' }).getByRole('button', { name: new RegExp(name) });
 
 async function openEvents(page) {
   await nav(page, 'Активность');
@@ -367,6 +369,51 @@ test('typing during a pending save is preserved as a new draft', async ({ page }
   await expect(input).toHaveValue('3');
   await expect(page.locator('.savebar')).toBeVisible();
   expect(state.settings.rate_limit_rps).toBe(2);
+});
+
+test('leaving the settings with unsaved edits asks first and keeps them when declined', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  const input = page.locator('#setting-rate_limit_rps');
+  await input.fill('7');
+  await expect(page.locator('.savebar')).toContainText('1 несохранённых');
+  const asked = [];
+  const decline = (dialog) => { asked.push(dialog.message()); dialog.dismiss(); };
+  page.on('dialog', decline);
+  await section(page, 'Аккаунты').click();
+  await expect.poll(() => asked.length).toBe(1);
+  expect(asked[0]).toContain('несохранённые настройки (1)');
+  await expect(page.getByRole('heading', { name: 'Настройки' })).toBeVisible();
+  await expect(input).toHaveValue('7');
+  // The keyboard shortcuts and signing out ask the same question.
+  await page.getByRole('heading', { name: 'Настройки' }).click();
+  await page.keyboard.press('2');
+  await expect.poll(() => asked.length).toBe(2);
+  await page.getByRole('button', { name: 'Выйти' }).click();
+  await expect.poll(() => asked.length).toBe(3);
+  await expect(page.getByRole('heading', { name: 'Настройки' })).toBeVisible();
+  await expect(input).toHaveValue('7');
+  await expect(page.locator('.savebar')).toBeVisible();
+
+  // Agreeing drops the draft.
+  page.off('dialog', decline);
+  page.once('dialog', (dialog) => dialog.accept());
+  await section(page, 'Аккаунты').click();
+  await expect(page.getByRole('heading', { name: 'Аккаунты' })).toBeVisible();
+  await nav(page, 'Настройки');
+  await expect(page.locator('#setting-rate_limit_rps')).toHaveValue('0');
+  await expect(page.locator('.savebar')).toHaveCount(0);
+
+  // Nothing is asked once the edits are saved.
+  const unexpected = [];
+  page.on('dialog', (dialog) => { unexpected.push(dialog.message()); dialog.dismiss(); });
+  await page.locator('#setting-rate_limit_rps').fill('3');
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(page.locator('.savebar')).toHaveCount(0);
+  await section(page, 'Аккаунты').click();
+  await expect(page.getByRole('heading', { name: 'Аккаунты' })).toBeVisible();
+  expect(unexpected).toEqual([]);
 });
 
 test('incomplete usage is not shown as free inference or a reliable forecast', async ({ page }) => {

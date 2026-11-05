@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { RotateCcw, Save, Search, SlidersHorizontal } from 'lucide-react';
 import { api } from '../api.js';
@@ -190,7 +190,7 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
   );
 }
 
-export default function SettingsView({ apiKey, overview, onUnauthorized }) {
+export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved }) {
   const toast = useToast();
   const [state, setState] = useState(null);
   const [draft, setDraft] = useState({});
@@ -212,6 +212,12 @@ export default function SettingsView({ apiKey, overview, onUnauthorized }) {
     .filter(([key, value]) => state && value !== state.settings[key]
       && (value !== '' || state.schema[key]?.type === 'string'))), [draft, state]);
   const dirty = Object.keys(changes).length;
+  // The draft lives here, so the shell asks before a section change would drop it.
+  useEffect(() => {
+    if (!unsaved) return undefined;
+    unsaved.current = dirty;
+    return () => { unsaved.current = 0; };
+  }, [dirty, unsaved]);
 
   async function save() {
     const submitted = { ...changes };
