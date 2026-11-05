@@ -180,9 +180,12 @@ def test_a_structured_request_gets_the_contract(tmp_path):
     result = store.preview(body, "chat", {})
     assert result["head"].startswith("SYS\n\n[STRUCTURED OUTPUT FORMAT]") and "Schema name: answer" in result["head"]
     assert result["parts"][-1]["source"] == "relay:structured"
-    wrapped = make_store(tmp_path / "w", document(profiles={"p": {"head": "{{client_system}}"}}, default_profile="p",
-                                                  relay_texts={"structured": "JSON for {{schema_name}} please"}))
-    assert wrapped.preview(body, "chat", {})["head"] == "SYS\n\nJSON for answer please"
+    wrapped = make_store(tmp_path / "w", document(
+        profiles={"p": {"head": "{{client_system}}"}}, default_profile="p",
+        relay_texts={"structured": "JSON for {{schema_name}} please: {{schema}}"}))
+    assert wrapped.errors() == []
+    assert wrapped.preview(body, "chat", {})["head"] == (
+        'SYS\n\nJSON for answer please: {"type":"object","properties":{"x":{"type":"string"}}}')
 
 
 def test_a_missing_text_is_not_confused_with_an_empty_one(tmp_path):

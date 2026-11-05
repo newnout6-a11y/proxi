@@ -367,11 +367,19 @@ def test_the_wrapper_is_filled_in_one_pass(tmp_path):
     assert contract.startswith("{{default}}|[STRUCTURED OUTPUT FORMAT]")
 
 
-def test_a_wrapper_that_comes_out_blank_falls_back_to_the_default(tmp_path):
-    snapshot = compile_doc(document(relay_texts={"structured": "{{schema_name}}"}), tmp_path)
-    spec = {**SCHEMA, "name": ""}
-    assert pp.structured_contract(snapshot, spec, tools=False, tool_choice="auto") == structured.instructions(
-        spec, tools=False, tool_choice="auto")
+@pytest.mark.parametrize("wrapper", ["{{schema_name}}", "Reply with JSON.", "x {{schema_name}} y", "\\{{default}}"])
+def test_a_wrapper_that_tells_nothing_of_the_contract_is_refused(tmp_path, wrapper):
+    with pytest.raises(pp.PromptConfigError) as raised:
+        compile_doc(document(relay_texts={"structured": wrapper}), tmp_path)
+    assert raised.value.path == "relay_texts.structured"
+    assert "{{default}} or {{schema}}" in raised.value.message
+
+
+@pytest.mark.parametrize("wrapper", ["{{default}}", "{{schema}}", "{{schema_name}}{{schema}}", "  {{default}}  "])
+def test_a_wrapper_with_the_default_or_the_schema_never_comes_out_blank(tmp_path, wrapper):
+    snapshot = compile_doc(document(relay_texts={"structured": wrapper}), tmp_path)
+    for spec in (SCHEMA, {**SCHEMA, "name": ""}, {**SCHEMA, "name": None}, OBJECT):
+        assert pp.structured_contract(snapshot, spec, tools=False, tool_choice="auto").strip()
 
 
 def test_a_snapshot_without_a_wrapper_gives_the_default(tmp_path):

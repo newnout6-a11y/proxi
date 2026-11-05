@@ -112,33 +112,59 @@ def test_remove_tag_removes_a_block_that_fills_whole_lines(tmp_path):
     assert edited(tmp_path, "a\n\n<t>x</t>\n\nb", {"op": "remove_tag", "tag": "t"}) == "a\n\nb"
 
 
-def test_remove_tag_inline_and_with_attributes(tmp_path):
-    assert edited(tmp_path, 'a <t k="v">x</t> b', {"op": "remove_tag", "tag": "t"}) == "a  b"
-    assert edited(tmp_path, "a <t\n  k='v'\n>x</t >b", {"op": "remove_tag", "tag": "t"}) == "a b"
+def test_remove_tag_takes_a_block_with_attributes_and_an_indented_one(tmp_path):
+    assert edited(tmp_path, '<t k="v">x</t> b', {"op": "remove_tag", "tag": "t"}) == " b"
+    assert edited(tmp_path, "<t\n  k='v'\n>x</t >b", {"op": "remove_tag", "tag": "t"}) == "b"
+    assert edited(tmp_path, "a\n   <t>\nx\n   </t>\nb", {"op": "remove_tag", "tag": "t"}) == "a\nb"
+    assert edited(tmp_path, "a\n\t<t>x</t> tail\nb", {"op": "remove_tag", "tag": "t"}) == "a\n tail\nb"
 
 
-def test_remove_tag_removes_the_outermost_of_nested_elements(tmp_path):
+def test_a_tag_that_is_only_mentioned_in_a_line_is_not_a_block(tmp_path):
+    for text in ('a <t k="v">x</t> b', "Wrap it in <t> and </t> tags.", "- <t>item</t>", "x<t>1</t>y<t>2</t>z",
+                 "see `<t>` and\nthe closing `</t>` later", "a<t/>b"):
+        assert matched(tmp_path, text, {"op": "remove_tag", "tag": "t"}) == [False], text
+        assert edited(tmp_path, text, {"op": "remove_tag", "tag": "t"}) == text
+        assert matched(tmp_path, text, {"op": "keep_tag_inner", "tag": "t"}) == [False], text
+
+
+def test_a_mention_in_a_sentence_does_not_swallow_the_text_up_to_a_later_closing_tag(tmp_path):
+    text = "Use <env> for the environment.\n\nMore rules.\n\n<env>\nreal block\n</env>\nEnd"
+    assert edited(tmp_path, text, {"op": "remove_tag", "tag": "env"}) == "Use <env> for the environment.\n\nMore rules.\n\nEnd"
+    assert edited(tmp_path, text, {"op": "keep_tag_inner", "tag": "env"}) == (
+        "Use <env> for the environment.\n\nMore rules.\n\nreal block\nEnd")
+
+
+def test_remove_tag_removes_the_outermost_of_nested_blocks(tmp_path):
     assert edited(tmp_path, "<t>1<t>2</t>3</t>after", {"op": "remove_tag", "tag": "t"}) == "after"
-    assert edited(tmp_path, "x<t>1</t>y<t>2</t>z", {"op": "remove_tag", "tag": "t"}) == "xyz"
+    assert edited(tmp_path, "<t>\n1\n<t>\n2\n</t>\n3\n</t>\nafter", {"op": "remove_tag", "tag": "t"}) == "after"
+    assert edited(tmp_path, "<t>1</t>y\n<t>2</t>z", {"op": "remove_tag", "tag": "t"}) == "y\nz"
+
+
+def test_an_inline_opening_tag_still_counts_for_the_nesting_of_a_block(tmp_path):
+    text = "<t>\nouter, with an inline <t>mention</t> inside\n</t>\nafter"
+    assert edited(tmp_path, text, {"op": "remove_tag", "tag": "t"}) == "after"
 
 
 def test_remove_tag_handles_self_closing_tags_and_leaves_unbalanced_ones(tmp_path):
-    assert edited(tmp_path, "a<t/>b<t />c", {"op": "remove_tag", "tag": "t"}) == "abc"
+    assert edited(tmp_path, "<t/>b\n<t />c", {"op": "remove_tag", "tag": "t"}) == "b\nc"
     assert matched(tmp_path, "x <t> y", {"op": "remove_tag", "tag": "t"}) == [False]
+    assert matched(tmp_path, "<t>\nnever closed", {"op": "remove_tag", "tag": "t"}) == [False]
     assert matched(tmp_path, "x </t> y", {"op": "remove_tag", "tag": "t"}) == [False]
-    assert edited(tmp_path, "<t>unclosed <t>closed</t>", {"op": "remove_tag", "tag": "t"}) == "<t>unclosed "
+    assert edited(tmp_path, "<t>unclosed\n<t>closed</t>", {"op": "remove_tag", "tag": "t"}) == "<t>unclosed"
 
 
 def test_remove_tag_does_not_confuse_tags_that_share_a_prefix(tmp_path):
-    text = "<ab>x</ab> <a>y</a> <a-b>z</a-b>"
-    assert edited(tmp_path, text, {"op": "remove_tag", "tag": "a"}) == "<ab>x</ab>  <a-b>z</a-b>"
+    text = "<ab>x</ab>\n<a>y</a>\n<a-b>z</a-b>"
+    assert edited(tmp_path, text, {"op": "remove_tag", "tag": "a"}) == "<ab>x</ab>\n<a-b>z</a-b>"
 
 
-def test_keep_tag_inner_drops_only_the_tags(tmp_path):
+def test_keep_tag_inner_drops_only_the_tags_of_blocks(tmp_path):
     assert edited(tmp_path, "a\n<env>\nWD\n</env>\nb", {"op": "keep_tag_inner", "tag": "env"}) == "a\nWD\nb"
-    assert edited(tmp_path, "<t>a<t>b</t>c</t>", {"op": "keep_tag_inner", "tag": "t"}) == "abc"
-    assert edited(tmp_path, 'x<t k="1">y</t>z', {"op": "keep_tag_inner", "tag": "t"}) == "xyz"
-    assert edited(tmp_path, "a<t/>b", {"op": "keep_tag_inner", "tag": "t"}) == "ab"
+    assert edited(tmp_path, "a\n  <t>\n  x\n  </t>\nb", {"op": "keep_tag_inner", "tag": "t"}) == "a\n  x\nb"
+    assert edited(tmp_path, "<t>\na\n<t>\nb\n</t>\nc\n</t>", {"op": "keep_tag_inner", "tag": "t"}) == "a\nb\nc"
+    assert edited(tmp_path, '<t k="1">y</t>z', {"op": "keep_tag_inner", "tag": "t"}) == "yz"
+    assert edited(tmp_path, "<t/>b", {"op": "keep_tag_inner", "tag": "t"}) == "b"
+    assert edited(tmp_path, "<t>a<t>b</t>c</t>", {"op": "keep_tag_inner", "tag": "t"}) == "a<t>b</t>c"
     assert matched(tmp_path, "no tags", {"op": "keep_tag_inner", "tag": "t"}) == [False]
 
 

@@ -42,6 +42,12 @@ INVALID = [
     (document(relay_texts={"reminder": "{{text}} {{role}}"}), "relay_texts.reminder", "unknown variable {{role}}"),
     (document(relay_texts={"structured": "  "}), "relay_texts.structured", "must not be empty"),
     (document(relay_texts={"structured": "{{text}}"}), "relay_texts.structured", "unknown variable {{text}}"),
+    (document(relay_texts={"structured": "Reply with JSON."}), "relay_texts.structured",
+     "must contain {{default}} or {{schema}}"),
+    (document(relay_texts={"structured": "{{schema_name}} only"}), "relay_texts.structured",
+     "must contain {{default}} or {{schema}}"),
+    (document(relay_texts={"structured": "\\{{default}} escaped"}), "relay_texts.structured",
+     "must contain {{default}} or {{schema}}"),
     (document(relay_texts={"role": 5}), "relay_texts.role", "string or"),
     (document(relay_texts={"codex_base": 5}), "relay_texts.codex_base", "string"),
     (document(relay_texts={"codex_base": {"file": "a.md", "gpt-*": "x"}}), "relay_texts.codex_base.file", "mixed"),
@@ -126,6 +132,18 @@ INVALID = [
      "profiles.p.tools.edits[0].tool", "is required"),
     (document(profiles={"p": {"tools": {"edits": [{"tool": 5, "op": "append", "text": "x"}]}}}),
      "profiles.p.tools.edits[0].tool", "glob"),
+    (document(profiles={"p": {"tools": {"edits": [{"tool": [], "op": "append", "text": "x"}]}}}),
+     "profiles.p.tools.edits[0].tool", "empty list"),
+    (document(profiles={"p": {"tools": {"edits": [{"tool": ["a", 5], "op": "append", "text": "x"}]}}}),
+     "profiles.p.tools.edits[0].tool[1]", "glob"),
+    (document(profiles={"p": {"tools": {"edits": [{"tool": ["a", ""], "hide": True}]}}}),
+     "profiles.p.tools.edits[0].tool[1]", "glob"),
+    (document(profiles={"p": {"tools": {"edits": [{"tool": [["a"]], "op": "append", "text": "x"}]}}}),
+     "profiles.p.tools.edits[0].tool[0]", "glob"),
+    (document(profiles={"p": {"tools": {"edits": [{"tool": {"a": 1}, "op": "append", "text": "x"}]}}}),
+     "profiles.p.tools.edits[0].tool", "glob"),
+    (document(profiles={"p": {"tools": {"edits": [{"tool": ["a" * 201], "op": "append", "text": "x"}]}}}),
+     "profiles.p.tools.edits[0].tool[0]", "200"),
     (document(profiles={"p": {"tools": {"edits": [{"tool": "a"}]}}}), "profiles.p.tools.edits[0].op", "is required"),
     (document(profiles={"p": {"tools": {"edits": [{"tool": "a", "op": "explode"}]}}}),
      "profiles.p.tools.edits[0].op", "must be one of"),
@@ -467,6 +485,33 @@ def test_a_profile_is_normalized_with_every_section(tmp_path):
     assert full["publish_as_model"] == ["gpt-*", "claude-*"]
 
 
+@pytest.mark.parametrize("given, expected", [({}, True), ({"all": True}, True), ({"all": False}, False)])
+def test_replace_text_all_is_an_explicit_bool_in_every_section(tmp_path, given, expected):
+    edit = {"op": "replace_text", "find": "a", "with": "b", **given}
+    doc = document(profiles={"p": {
+        "client_system": {"edits": [dict(edit)]}, "history": {"user_blocks": [dict(edit)]},
+        "tools": {"edits": [{"tool": "t", **edit}]}}})
+    profile = compile_doc(doc, tmp_path).profile("p")
+    found = [profile["client_system"]["edits"][0], profile["history"]["user_blocks"][0], profile["tools"]["edits"][0]]
+    assert [item["all"] for item in found] == [expected] * 3
+    assert all(type(item["all"]) is bool for item in found)
+
+
+def test_a_tool_edit_takes_a_glob_or_a_list_of_globs(tmp_path):
+    doc = document(profiles={"p": {"tools": {"edits": [
+        {"tool": ["bash", "shell*"], "op": "append", "text": "A"},
+        {"tool": ["only"], "hide": True},
+        {"tool": "single", "op": "prepend", "text": "B"}]}}})
+    snapshot = compile_doc(doc, tmp_path)
+    edits = snapshot.profile("p")["tools"]["edits"]
+    assert edits == [{"tool": ["bash", "shell*"], "hide": False, "op": "append", "text": "A"},
+                     {"tool": ["only"], "hide": True},
+                     {"tool": "single", "hide": False, "op": "prepend", "text": "B"}]
+    edits[0]["tool"].append("changed")
+    doc["profiles"]["p"]["tools"]["edits"][0]["tool"].append("changed too")
+    assert snapshot.profile("p")["tools"]["edits"][0]["tool"] == ["bash", "shell*"]
+
+
 @pytest.mark.parametrize("value", [False, True, [], ["gpt-*"]])
 def test_publish_as_model_forms(tmp_path, value):
     doc = document(profiles={"p": {"publish_as_model": value}})
@@ -585,10 +630,9 @@ def test_default_profile_may_be_null_a_document_profile_or_passthrough(tmp_path)
 # -- warnings the admin shows ---------------------------------------------------------------------------------------
 
 
-def test_warnings_for_disabled_protection_overrides_hidden_tools_and_bare_wrappers(tmp_path):
+def test_warnings_for_disabled_protection_overrides_hidden_tools_and_unknown_condition_values(tmp_path):
     doc = document(
         protected={"enabled": False},
-        relay_texts={"structured": "Reply with JSON."},
         profiles={"p": {"tools": {"edits": [{"tool": "x", "hide": True}]}}},
         rules=[{"name": "loud", "use": "p", "override_protected": True},
                {"name": "off", "use": "p", "override_protected": True, "enabled": False},
@@ -599,7 +643,7 @@ def test_warnings_for_disabled_protection_overrides_hidden_tools_and_bare_wrappe
     assert any("'loud' overrides the protection" in line for line in warnings)
     assert not any("'off'" in line for line in warnings)
     assert any("hides a tool" in line and "profiles.p" in line for line in warnings)
-    assert any("relay_texts.structured does not use" in line for line in warnings)
+    assert not any("relay_texts" in line for line in warnings)
     assert any(line.startswith("rules[2].if.client:") and "'claude'" in line for line in warnings)
     assert any(line.startswith("rules[2].if.dialect[1]:") and "'soap'" in line for line in warnings)
     assert any(line.startswith("rules[2].if.purpose:") for line in warnings)
@@ -721,12 +765,12 @@ def test_compile_warnings_say_what_is_wrong_and_never_quote_a_text(tmp_path):
     secret = "SECRET-TEXT-0451"
     doc = document(
         protected={"enabled": False}, texts={"s": secret},
-        relay_texts={"structured": "Reply " + secret + " with JSON"},
+        relay_texts={"structured": "Reply " + secret + " with JSON: {{default}}"},
         profiles={"p": {"head": "{{text:s}}", "tools": {"edits": [{"tool": "x", "hide": True}]},
                         "client_system": {"edits": [{"op": "append", "text": secret}]}}},
         rules=[{"name": "loud", "use": "p", "override_protected": True}])
     warnings = compile_doc(doc, tmp_path).warnings
-    assert len(warnings) == 4 and all(isinstance(line, str) for line in warnings)
+    assert len(warnings) == 3 and all(isinstance(line, str) for line in warnings)
     assert secret not in " ".join(warnings)
     assert len(set(warnings)) == len(warnings)
 
