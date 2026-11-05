@@ -588,14 +588,14 @@ def make_handler(runtime: Runtime):
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:
                 compatibility_headers['x-proxi-ignored-parameters'] = ','.join(parsed.declared_ignored)
-                # Claude Code sends temperature and metadata.user_id on every request; dropping
-                # sampling hints and client metadata is routine, so it is not a journal warning.
-                routine = set(parsed.declared_ignored) <= {'temperature', 'top_p', 'top_k', 'seed',
-                                                           'presence_penalty', 'frequency_penalty', 'metadata'}
+                # Claude Code sends temperature and metadata.user_id on every request and keeps its
+                # late tool announcements in the history, so none of that is a journal warning.
+                names, tool_changes = set(parsed.declared_ignored), set(parsed.inline_tool_changes)
+                routine = {'temperature', 'top_p', 'top_k', 'seed', 'presence_penalty', 'frequency_penalty', 'metadata'}
+                level = 'warn' if names - routine - tool_changes else 'info' if names & tool_changes else 'debug'
                 journal.emit('request.compatibility',
                              'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
-                             'debug' if routine else 'warn', request_id=self.request_id,
-                             parameters=parsed.declared_ignored)
+                             level, request_id=self.request_id, parameters=parsed.declared_ignored)
             if parsed.system_messages_normalized:
                 compatibility_headers['x-proxi-system-messages'] = 'inline-as-user-text'
                 journal.emit('request.compatibility',

@@ -35,14 +35,15 @@ def user_content(body):
 
 
 @pytest.mark.parametrize('dialect', DIALECTS)
-@pytest.mark.parametrize('shape', ['text', 'blocks'])
+@pytest.mark.parametrize('shape', ['text', 'blocks', 'tool-changes'])
 def test_reminder_after_a_tool_round_trip_keeps_head_signature_and_cache_key(tmp_path, monkeypatch, dialect, shape):
     log = journal.Journal()
     monkeypatch.setattr(journal, 'JOURNAL', log)
     pool, runner, sent = harness(tmp_path, monkeypatch, [tool_reply(), tool_reply('c2', 'opaque-two'),
                                                         [text('done'), *END]])
-    reminder = (MARKER + '. Reply in Russian.' if shape == 'text' else
-                [{'type': 'text', 'text': MARKER + '. Reply in Russian.', 'cache_control': {'type': 'ephemeral'}}])
+    block = {'type': 'text', 'text': MARKER + '. Reply in Russian.', 'cache_control': {'type': 'ephemeral'}}
+    reminder = {'text': MARKER + '. Reply in Russian.', 'blocks': [block],
+                'tool-changes': [block, copy.deepcopy(BY_VALUE), copy.deepcopy(BY_REFERENCE)]}[shape]
 
     async def scenario():
         messages = copy.deepcopy(FIRST)
@@ -77,6 +78,7 @@ def test_reminder_after_a_tool_round_trip_keeps_head_signature_and_cache_key(tmp
     kinds = {event['kind'] for event in log.query()}
     assert 'native_history.resume' in kinds
     assert not kinds & {'native_history.reset', 'cache.head_changed', 'cache.key_changed'}
+    assert not any(leak in json.dumps(sent) for leak in ('db_query', 'tool_removal', 'tool_addition'))
 
 
 @pytest.mark.parametrize('dialect', DIALECTS)
@@ -217,31 +219,57 @@ def test_normalization_flag_names_only_reminders_that_were_really_converted(dial
     assert parse(dialect, messages).system_messages_normalized is flag
 
 
-@pytest.mark.parametrize('block', [
-    {'type': 'tool_removal', 'tool': {'type': 'tool_reference', 'name': 'Bash'}},
-    {'type': 'tool_addition', 'tool': {'type': 'tool_definition', 'definition': {'name': 'db_query'}}}])
+BY_REFERENCE = {'type': 'tool_removal', 'tool': {'type': 'tool_reference', 'name': 'Bash'}}
+BY_NAME = {'type': 'tool_addition', 'tool': {'type': 'tool_reference', 'name': 'deploy'}}
+BY_VALUE = {'type': 'tool_addition', 'tool': {'type': 'tool_definition', 'definition': {
+    'name': 'db_query', 'description': 'Run SQL', 'input_schema': {'type': 'object'}}}}
+
+
+@pytest.mark.parametrize('block,name', [(BY_REFERENCE, 'tool_removal'), (BY_NAME, 'tool_addition'),
+                                        (BY_VALUE, 'tool_addition.tool_definition')])
 @pytest.mark.parametrize('position', ['later', 'leading'])
 @pytest.mark.parametrize('dialect', DIALECTS)
-def test_inline_tool_changes_are_rejected_instead_of_becoming_text_in_the_head(dialect, position, block):
+def test_inline_tool_changes_are_dropped_from_the_text_and_named_as_ignored(dialect, position, block, name):
     system = {'role': 'system', 'content': [{'type': 'text', 'text': 'Tools changed.'}, copy.deepcopy(block)]}
     messages = ([system] if position == 'leading' else []) + [{'role': 'user', 'content': 'hi'}]
     messages += [system] if position == 'later' else []
-    with pytest.raises(ApiError) as caught:
-        parse(dialect, messages)
-    error = caught.value
-    index = 0 if position == 'leading' else 1
-    assert error.status == 422 and error.param == 'messages[%d].content[1]' % index
-    assert block['type'] in error.message and "'tools'" in error.message
+    request = parse(dialect, messages)
+    wire = json.dumps([request.system, request.prompt, request.message_chunks, request.native_messages])
+    assert 'Tools changed.' in wire
+    for leaked in ('tool_removal', 'tool_addition', 'tool_reference', 'tool_definition', 'Bash', 'db_query', 'deploy'):
+        assert leaked not in wire
+    assert request.inline_tool_changes == [name] and name in request.declared_ignored
+    assert request.native_messages is not None
 
 
-def test_http_inline_tool_change_is_a_clear_422_and_nothing_reaches_the_runner(relay):
-    payload = {'model': 'claude-opus-5-5', 'max_tokens': 64, 'system': 'G', 'messages': [
+@pytest.mark.parametrize('dialect', DIALECTS)
+def test_a_system_message_of_tool_changes_only_leaves_no_trace_but_is_named(dialect):
+    plain = [{'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'ok'}]
+    changed = [plain[0], {'role': 'system', 'content': [copy.deepcopy(BY_REFERENCE), copy.deepcopy(BY_VALUE)]},
+               plain[1]]
+    base, request = parse(dialect, plain, system='G'), parse(dialect, changed, system='G')
+    assert request.system == base.system == 'G'
+    assert request.message_chunks == base.message_chunks and request.native_messages == base.native_messages
+    assert request.system_messages_normalized is False
+    assert request.inline_tool_changes == ['tool_removal', 'tool_addition.tool_definition']
+
+
+@pytest.mark.parametrize('extra,level', [({}, 'info'), ({'logprobs': True}, 'warn')])
+def test_http_inline_tool_changes_are_ignored_with_a_header_and_a_quiet_event(relay, monkeypatch, extra, level):
+    log = journal.Journal()
+    monkeypatch.setattr(journal, 'JOURNAL', log)
+    payload = {'model': 'claude-opus-5-5', 'max_tokens': 64, 'system': 'G', 'temperature': 1, **extra, 'messages': [
         {'role': 'user', 'content': 'hi'},
-        {'role': 'system', 'content': [{'type': 'tool_removal',
-                                        'tool': {'type': 'tool_reference', 'name': 'Bash'}}]}]}
-    status, body = relay.json_any('/v1/messages', payload)
-    assert status == 422 and 'messages[1].content[0]' in body['error']['message']
-    assert 'tool_removal' in body['error']['message'] and not relay.fake.seen
+        {'role': 'system', 'content': [{'type': 'text', 'text': MARKER}, copy.deepcopy(BY_VALUE),
+                                       copy.deepcopy(BY_REFERENCE)]}]}
+    with relay.request('/v1/messages', payload) as response:
+        assert response.status == 200
+        names = response.headers['x-proxi-ignored-parameters'].split(',')
+    assert set(names) == {'temperature', 'tool_addition.tool_definition', 'tool_removal', *extra}
+    entries = [e for e in log.query() if e['kind'] == 'request.compatibility' and 'parameters' in e['data']]
+    assert len(entries) == 1 and entries[0]['level'] == level and entries[0]['data']['parameters'] == names
+    seen = relay.fake.seen[-1]
+    assert MARKER in seen.prompt and 'db_query' not in seen.prompt + seen.system
 
 
 def test_http_header_and_journal_describe_reminders_without_warning(relay, monkeypatch):

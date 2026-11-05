@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 
 INSTRUCTION_ROLES = ("system", "developer")
+INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
 _TEXT_BLOCKS = ("text", "input_text", "output_text", "summary_text")
 _REMINDER_OPEN, _REMINDER_CLOSE = "<system-reminder>", "</system-reminder>"
 
@@ -55,7 +56,7 @@ def client_messages(messages, image_converter, *, lead=None):
                 parts.append(block)
             elif block.get("type") in _TEXT_BLOCKS:
                 parts.append(block["text"])
-            else:
+            elif block.get("type") not in INLINE_TOOL_BLOCKS:
                 raise ValueError("unsupported instruction block")
         return "\n".join(part for part in parts if part)
 

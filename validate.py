@@ -81,6 +81,7 @@ class Parsed:
         self.structured_title = False
         self.system = ""
         self.declared_ignored = []
+        self.inline_tool_changes = []
         self.system_messages_normalized = False
         self.wants_usage = False
         self.show_thinking = True
@@ -227,8 +228,12 @@ def _extract_image_data(block, where):
     return {"type": "image", "imageData": data_b64, "mimeType": mime_type}
 
 
-def _parse_content(content, index, role):
-    """Render content blocks to text and extract any native image blocks."""
+def _parse_content(content, index, role, ignored=None):
+    """Render content blocks to text and extract any native image blocks.
+
+    Inline tool changes carry no text: they are skipped and, when `ignored` is
+    given, their names are appended to it.
+    """
     if content is None:
         return "", []
     if isinstance(content, str):
@@ -258,7 +263,7 @@ def _parse_content(content, index, role):
             images.append(img)
         elif btype == "tool_result":
             call_id = block.get("tool_use_id") or block.get("tool_call_id") or "call"
-            sub_text, sub_images = _parse_content(block.get("content"), index, "tool")
+            sub_text, sub_images = _parse_content(block.get("content"), index, "tool", ignored)
             chunks.append(f"[tool_result id={call_id}: {sub_text}]")
             images.extend(sub_images)
         elif btype in ("tool_use", "tool_call"):
@@ -268,10 +273,11 @@ def _parse_content(content, index, role):
             chunks.append(f"[tool_call {name} id={call_id}: {json.dumps(args, ensure_ascii=False)}]")
         elif btype in ("thinking", "redacted_thinking"):
             continue
-        elif btype in ("tool_addition", "tool_removal"):
-            raise unprocessable(
-                f"{where}: inline tool changes ({btype}) are not supported by the Retool route; "
-                "declare the full tool set in 'tools' on every request", param=where)
+        elif btype in native_history.INLINE_TOOL_BLOCKS:
+            # The tool set comes from `tools`; a late change cannot be applied inside the history.
+            if ignored is not None:
+                by_value = isinstance(block.get("tool"), dict) and block["tool"].get("type") == "tool_definition"
+                ignored.append(btype + (".tool_definition" if by_value else ""))
         else:
             chunks.append(f"[{btype or 'block'}: {json.dumps(block, ensure_ascii=False)[:200]}]")
     return "\n".join(c for c in chunks if c), images
@@ -288,7 +294,7 @@ def _instruction_text(*parts):
     return "\n\n".join(part for part in parts if part and part.strip())
 
 
-def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, converted=None):
+def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, converted=None, ignored=None):
     """Return (system_text, [chunk per conversation message]).
 
     Chunks keep one message per element so the direct transport can place cache
@@ -308,7 +314,7 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
             role = "assistant"
         if not isinstance(role, str):
             raise unprocessable(f"messages[{index}].{role_key} must be a string", param=f"messages[{index}].{role_key}")
-        text, images = _parse_content(message.get("content"), index, role)
+        text, images = _parse_content(message.get("content"), index, role, ignored)
         if role in ("system", "developer") and allow_system:
             if index < lead:
                 system_parts.append(text)
@@ -453,6 +459,7 @@ def _finish(data, parsed, dialect):
     parsed.structured_title = generation.is_structured_title(data, parsed.system, dialect)
     parsed.verbosity, parsed.declared_ignored = generation.controls(
         data, parsed.entry, dialect, structured_title=parsed.structured_title)
+    parsed.declared_ignored += [name for name in parsed.inline_tool_changes if name not in parsed.declared_ignored]
     stream_options = data.get("stream_options")
     if stream_options is None:
         stream_options = data.get("streamOptions")
@@ -650,11 +657,12 @@ def parse_chat(data, cfg):
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     _reject_images_unsupported(entry, data)
     messages = _messages(data)
-    lead, converted = native_history.leading_instructions(messages), []
-    system, chunks = _render_chunks(messages, lead=lead, converted=converted)
+    lead, converted, ignored = native_history.leading_instructions(messages), [], []
+    system, chunks = _render_chunks(messages, lead=lead, converted=converted, ignored=ignored)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.system, parsed.prompt, parsed.message_chunks = system, "\n\n".join(text_chunks), chunks
     parsed.system_messages_normalized = bool(converted)
+    parsed.inline_tool_changes = list(dict.fromkeys(ignored))
     parsed.message_fingerprints = _message_fingerprints(messages, lead)
     parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
     parsed.stream = _opt_bool(data, "stream")
@@ -682,13 +690,14 @@ def parse_responses(data, cfg):
         raise bad_request("'input' is required", param="input")
     else:
         raise bad_request("'input' must be a string or an array", param="input")
-    lead, converted = native_history.leading_instructions(messages), []
-    system, chunks = _render_chunks(messages, lead=lead, converted=converted)
+    lead, converted, ignored = native_history.leading_instructions(messages), [], []
+    system, chunks = _render_chunks(messages, lead=lead, converted=converted, ignored=ignored)
     instructions = _opt_str(data, "instructions") or ""
     parsed.system = _instruction_text(instructions, system)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     parsed.system_messages_normalized = bool(converted)
+    parsed.inline_tool_changes = list(dict.fromkeys(ignored))
     parsed.message_fingerprints = _message_fingerprints(messages, lead)
     native_input = ([message for item, message in zip(raw_input, messages)
                      if item.get("type") != "reasoning" or "role" in item]
@@ -713,14 +722,15 @@ def parse_anthropic(data, cfg):
     # Retool rejects several system messages and a changed head drops the signed
     # prefix, so only the leading instructions join the top-level system text.
     # Later ones keep their place as user-turn reminders.
-    lead, converted = native_history.leading_instructions(messages), []
-    system, chunks = _render_chunks(messages, lead=lead, converted=converted)
+    lead, converted, ignored = native_history.leading_instructions(messages), [], []
+    system, chunks = _render_chunks(messages, lead=lead, converted=converted, ignored=ignored)
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     declared_system = data.get("system")
     declared_text = _blocks_to_text(declared_system, 0, 'system') if declared_system else ''
     parsed.system = _instruction_text(declared_text, system)
     parsed.system_messages_normalized = bool(converted)
+    parsed.inline_tool_changes = list(dict.fromkeys(ignored))
     parsed.message_fingerprints = _message_fingerprints(messages, lead)
     parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
     parsed.stream = _opt_bool(data, "stream")
