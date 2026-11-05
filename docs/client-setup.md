@@ -355,9 +355,9 @@ valid reply is sent; an invalid one is a `502` with type `api_error` (a stream e
 an SSE `error` event, with no content), and its credits stay accounted. The 502 carries
 `x-should-retry: false` so that Claude Code does not repeat the paid request; a stream
 cannot carry that header, and Claude Code's own retries of server errors can repeat it.
-A live check on
-2026-11-05 (Haiku 4.5, Sonnet 5.5) returned valid JSON for the title, memory recall
-and hook schemas; Haiku wrapped both replies in a ` ```json ` fence, which is removed.
+A live check on 2026-11-05 (Haiku 4.5, Sonnet 5.5) returned valid JSON for the title,
+memory recall and hook schemas; Haiku wrapped both replies in a ` ```json ` fence,
+which is removed.
 
 If a model keeps failing the check, set `CLAUDE_CODE_DISABLE_STRUCTURED_OUTPUTS=1`
 (Claude Code 2.1.288 or newer). Claude Code then stops sending `output_config.format`
@@ -370,14 +370,14 @@ emulation (`validated-json-schema`, `validated-session-title`).
 A title request is recognised by its schema, exactly `{title: string}` without tools,
 whatever the prompt says (Messages only: the same schema from an OpenAI-style client,
 for example ai-sdk `generateObject`, is an ordinary request). Without a schema (the
-variable above) the start of the
-prompt block decides, after the `x-anthropic-billing-header` and identity lines. Both
-wordings are known: "You are naming a coding session…" (Claude Code 2.1.234 and newer,
-the Agent SDK) and "Generate a concise, sentence-case title…" (older). A system prompt
-that only quotes the phrase further down stays an ordinary request and gets the
-configured relay policy. `output_config.task_budget` is accepted, not enforced, and
-named in `x-proxi-ignored-parameters`. A rejected request now carries the Messages
-error type `invalid_request_error` instead of `unprocessable_entity`.
+variable above) the start of the prompt block decides, after the
+`x-anthropic-billing-header` and identity lines. Both wordings are known: "You are
+naming a coding session…" (Claude Code 2.1.234 and newer, the Agent SDK) and "Generate
+a concise, sentence-case title…" (older). A system prompt that only quotes the phrase
+further down stays an ordinary request and gets the configured relay policy.
+`output_config.task_budget` is accepted, not enforced, and named in
+`x-proxi-ignored-parameters`. A rejected request now carries the Messages error type
+`invalid_request_error` instead of `unprocessable_entity`.
 
 #### Request classes
 
