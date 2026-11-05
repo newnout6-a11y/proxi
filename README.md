@@ -522,7 +522,9 @@ Windows PowerShell 5.1 через `*>>`, могут быть в UTF-16 или с
   Пустые записи (например, `output_config.effort` с `content: []`) ничего не
   добавляют, effort берётся из последней. Ответ несёт `x-proxi-system-messages:
   inline-as-user-text`, приоритет оператора не сохраняется. Inline-блоки
-  `tool_addition` и `tool_removal` отклоняются с 422.
+  `tool_addition` и `tool_removal` (поздние объявления и отзыв tools у Claude Code)
+  не применяются и не попадают в текст: они названы в `x-proxi-ignored-parameters`
+  и в журнале, запрос не отклоняется.
 - **Только пробелы в `relay_system_prompt`** означают «без роли», как `""`.
 
 Подробности, живые проверки и границы доказательств описаны в
