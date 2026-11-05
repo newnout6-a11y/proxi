@@ -1,4 +1,5 @@
 """Admin settings and pool conversion: provider access, role budget, journal hygiene, honest route reasons."""
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ import pytest
 import admin
 import config
 import context
+import journal
 import models
 import orchestrator
 from session import Backend, SessionPool
@@ -80,6 +82,7 @@ def test_settings_publish_every_built_in_role_with_the_path_it_serves(admin_rela
     assert roles["native_tools"]["text"] == orchestrator.DEFAULT_NATIVE_TOOLS_ROLE
     assert roles["relay"]["text"] != roles["native_tools"]["text"]
     assert all(item["title"] and item["applies_to"] for item in roles.values())
+    assert "multiline" not in body["schema"]["relay_system_prompt"]
 
 
 def test_published_roles_are_the_texts_the_relay_really_sends(tmp_path):
@@ -90,6 +93,66 @@ def test_published_roles_are_the_texts_the_relay_really_sends(tmp_path):
     assert orchestrator.TurnRunner._instructions(runner, native_tools=True) == texts["native_tools"]
     runner.cfg["relay_system_prompt"] = "custom role"
     assert orchestrator.TurnRunner._instructions(runner, native_tools=True) == "custom role"
+
+
+# -- role budget ---------------------------------------------------------------------
+def test_role_is_bounded_in_bytes_and_by_max_prompt_bytes(admin_relay):
+    cap = admin.ROLE_MAX_BYTES
+    schema = admin_relay.request("/admin/api/settings")[1]["schema"]["relay_system_prompt"]
+    assert (schema["max_bytes"], schema["max_prompt_share"]) == (cap, admin.ROLE_PROMPT_SHARE)
+    before = admin_relay.path.read_bytes()
+    status, body, _ = admin_relay.patch({"relay_system_prompt": "ж" * (cap // 2 + 1)})  # two bytes per character
+    assert status == 400 and body["error"]["param"] == "relay_system_prompt" and str(cap) in body["error"]["message"]
+    assert admin_relay.path.read_bytes() == before
+    assert admin_relay.patch({"relay_system_prompt": "ж" * (cap // 2)})[0] == 200
+
+    # With a prompt cap the role may take half of it, judged on the pair that would be saved.
+    assert admin_relay.patch({"max_prompt_bytes": 100_000})[0] == 200
+    status, body, _ = admin_relay.patch({"max_prompt_bytes": 40_000})  # the saved role no longer fits
+    assert status == 400 and body["error"]["param"] == "max_prompt_bytes"
+    assert admin_relay.patch({"relay_system_prompt": "x" * 20_001, "max_prompt_bytes": 40_000})[0] == 400
+    assert admin_relay.patch({"relay_system_prompt": "x" * 20_000, "max_prompt_bytes": 40_000})[0] == 200
+    assert admin_relay.patch({"max_prompt_bytes": 0})[0] == 200
+    assert json.loads(admin_relay.path.read_text(encoding="utf-8"))["max_prompt_bytes"] == 0
+
+
+def test_an_old_over_long_role_does_not_block_other_settings(admin_relay):
+    saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
+    saved["relay_system_prompt"] = "x" * (admin.ROLE_MAX_BYTES + 1000)  # hand-edited
+    admin_relay.path.write_text(json.dumps(saved), encoding="utf-8")
+    assert admin_relay.patch({"show_thinking": False})[0] == 200
+    assert admin_relay.patch({"max_prompt_bytes": 1_000_000})[0] == 400
+    assert admin_relay.patch({"relay_system_prompt": None})[0] == 200
+    assert admin_relay.patch({"max_prompt_bytes": 1_000_000})[0] == 200
+
+
+# -- journal -------------------------------------------------------------------------
+def test_journal_keeps_the_role_text_out_and_records_length_and_hash(admin_relay):
+    journal.JOURNAL.reset()
+    role = "Приватное правило: " + "x" * 5000  # longer than the journal's own string limit
+    assert admin_relay.patch({"relay_system_prompt": role})[0] == 200
+    assert admin_relay.patch({"relay_system_prompt": "Второе правило", "rate_limit_rps": 2})[0] == 200
+    first, second = [event for event in journal.JOURNAL.query(order="asc") if event["kind"] == "admin.settings"]
+
+    def digest(text):
+        return {"length": len(text), "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]}
+
+    assert first["data"]["changed"]["relay_system_prompt"] == {"from": None, "to": digest(role)}
+    changed = second["data"]["changed"]
+    assert changed["relay_system_prompt"] == {"from": digest(role), "to": digest("Второе правило")}
+    assert changed["rate_limit_rps"] == {"from": 0.0, "to": 2.0}  # ordinary values stay readable
+    encoded = json.dumps(journal.JOURNAL.query(), ensure_ascii=False)
+    assert "Приватное правило" not in encoded and "Второе правило" not in encoded
+
+
+def test_only_free_text_settings_are_summarised(admin_relay):
+    adm = admin_relay.runtime.admin
+    assert [key for key, field in adm.schema.items() if admin._free_text(field)] == ["relay_system_prompt"]
+    adm.schema["note"] = {"type": "string"}  # a future free-text setting follows the same rule
+    assert adm._loggable("note", "abc") == {"length": 3, "sha256": hashlib.sha256(b"abc").hexdigest()[:12]}
+    assert adm._loggable("relay_system_prompt", None) is None
+    assert adm._loggable("model", "claude-opus-5-5") == "claude-opus-5-5"
+    assert adm._loggable("max_workers", 8) == 8
 
 
 # -- why a model is hidden -----------------------------------------------------------

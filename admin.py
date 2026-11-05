@@ -1,6 +1,7 @@
 """Local administration: public build assets and authenticated, bounded APIs."""
 import contextlib
 import copy
+import hashlib
 import json
 import math
 import os
@@ -39,6 +40,10 @@ NEW_ACCOUNT_OPTIONAL = ("label", "provider_resource_name", "openai_provider_reso
 # provider_access (like enabled, priority and label) only from the account record, never the root.
 ACCOUNT_RECORD_KEYS = ("base", "page_uuid", "cookie", "xsrf", "account_id", "thread_id", "label", "enabled",
                        "priority", "provider_access", *models.PROVIDER_RESOURCE_KEY.values())
+# The role is sent with every request: capped outright and, when max_prompt_bytes is set, to a
+# share of it so the conversation itself still fits.
+ROLE_MAX_BYTES = 32 * 1024
+ROLE_PROMPT_SHARE = 0.5
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balance|renew))?")
@@ -181,8 +186,15 @@ def _schema():
             field["enum"] = enum
         fields[key] = field
     fields['relay_system_prompt']['nullable'] = True
-    fields['relay_system_prompt']['multiline'] = True
+    fields['relay_system_prompt'].update(max_bytes=ROLE_MAX_BYTES, max_prompt_share=ROLE_PROMPT_SHARE)
     return fields
+
+
+def _role_limit(max_prompt_bytes):
+    """Largest relay_system_prompt in UTF-8 bytes under the given max_prompt_bytes (0 = unlimited)."""
+    if type(max_prompt_bytes) is int and max_prompt_bytes > 0:
+        return min(ROLE_MAX_BYTES, int(max_prompt_bytes * ROLE_PROMPT_SHARE))
+    return ROLE_MAX_BYTES
 
 
 def _default_roles():
@@ -194,6 +206,11 @@ def _default_roles():
         {"id": "native_tools", "title": "Роль для клиентов с инструментами", "text": DEFAULT_NATIVE_TOOLS_ROLE,
          "applies_to": "Клиент со своими инструментами (IDE), который не прислал собственные инструкции"},
     ]
+
+
+def _free_text(field):
+    """Free-form text, as opposed to a choice or a number: the journal records its size, not its content."""
+    return field["type"] == "string" and "enum" not in field
 
 
 def is_admin_path(path):
@@ -758,6 +775,27 @@ class Admin:
                 raise apierr.service_unavailable("Relay settings are busy: configuration storage is locked")
             yield path, self._saved()
 
+    @staticmethod
+    def _check_role_budget(candidate, changes):
+        """The role travels with every request, so it must leave room under max_prompt_bytes.
+
+        Judged only when this save touches the role or the cap: an old over-long role never blocks other settings.
+        """
+        role, cap = candidate.get("relay_system_prompt"), candidate.get("max_prompt_bytes")
+        if not isinstance(role, str) or not {"relay_system_prompt", "max_prompt_bytes"} & set(changes):
+            return
+        size, limit = len(role.encode("utf-8")), _role_limit(cap)
+        if size > limit:
+            param = "relay_system_prompt" if "relay_system_prompt" in changes else "max_prompt_bytes"
+            capped = f" with max_prompt_bytes={cap}" if limit < ROLE_MAX_BYTES else ""
+            raise apierr.bad_request(f"relay_system_prompt is {size} bytes; at most {limit} fit{capped}", param=param)
+
+    def _loggable(self, key, value):
+        """Free text (a role can hold private rules) is journaled as its length and a short hash, never verbatim."""
+        if isinstance(value, str) and _free_text(self.schema[key]):
+            return {"length": len(value), "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]}
+        return value
+
     def _update(self, changes):
         self._validate(changes)
         with self._transaction() as (path, saved):
@@ -770,6 +808,7 @@ class Admin:
             if candidate["reasoning_effort"] != "auto":
                 models.resolve_tolerant(candidate["model"], candidate["reasoning_effort"], strict=True,
                                         allow_downgrade=candidate["allow_effort_downgrade"])
+            self._check_role_budget(candidate, changes)
             changed = [key for key, value in changes.items() if desired[key] != value]
             temporary = None
             try:
@@ -790,7 +829,8 @@ class Admin:
                     os.unlink(temporary)
             applied = [key for key in changes if key in LIVE_SETTINGS]
             journal.emit("admin.settings", "Настройки сохранены: %s" % (", ".join(changed) or "без изменений"),
-                         "success", changed={key: {"from": desired[key], "to": changes[key]} for key in changed},
+                         "success", changed={key: {"from": self._loggable(key, desired[key]),
+                                                   "to": self._loggable(key, changes[key])} for key in changed},
                          applied=applied, restart_required=[key for key in changed if key not in LIVE_SETTINGS])
             if applied:
                 limiter = self.runtime.limiter
