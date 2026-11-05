@@ -741,17 +741,19 @@ def make_handler(runtime: Runtime):
                 try:
                     rewritten, changes = prompt_body.rewrite(data, dialect, plan.snapshot.profile(plan.profile),
                                                              plan.snapshot)
+                    if not isinstance(changes, list) or not all(isinstance(change, dict) for change in changes):
+                        raise TypeError("prompt_body.rewrite returned changes that are not a list of dicts")
                     parse = {"anthropic": validate.parse_anthropic,
                              "responses": validate.parse_responses}.get(dialect, validate.parse_chat)
                     parsed = parse(rewritten, cfg)
+                    for name in _CARRIED_OVER:
+                        if hasattr(first, name):
+                            setattr(parsed, name, getattr(first, name))
+                    _carry_compatibility(first, parsed, changes)
                 except Exception as exc:
                     self._prompt_failure("rewrite", exc)
                     first.prompt_plan = prompt_policy.Plan()
                     return first
-                for name in _CARRIED_OVER:
-                    if hasattr(first, name):
-                        setattr(parsed, name, getattr(first, name))
-                _carry_compatibility(first, parsed, changes)
                 self._journal_skipped_edits(changes)
             self._apply_generation(parsed, plan, warnings)
             parsed.prompt_plan, parsed.prompt_input = plan, plan_input

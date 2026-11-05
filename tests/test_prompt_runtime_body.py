@@ -265,11 +265,14 @@ def test_an_edit_the_rewrite_left_out_is_one_warning_per_kind_and_a_flagged_line
     assert [(g["op"], g["skipped"], g["reason"]) for g in tools] == [("append", True, "no such tool")]
 
 
-@pytest.mark.parametrize("failure", ["raises", "unparsable"])
+@pytest.mark.parametrize("failure", ["raises", "unparsable", "unreadable changes"])
 def test_a_failing_rewrite_serves_the_request_on_the_legacy_path(prompt_relay, monkeypatch, failure):
     def result(data, dialect, profile_, snapshot):
         if failure == "raises":
             raise RuntimeError("synthetic failure of the rewrite")
+        if failure == "unreadable changes":
+            # `any` in the compatibility check stops at the first wrap: only a check of the whole list sees the second entry
+            return copy.deepcopy(data), [{"scope": "history", "op": "mid_system", "mode": "wrap"}, "not a change"]
         return {"model": data["model"]}, []  # no messages: the second parse refuses it
 
     relay = fake_relay(prompt_relay)
