@@ -259,7 +259,6 @@ class ChatAdapter(_Base):
         if self.writer:
             self.writer.data(self._chunk({}, finish))
             prompt, completion = self.usage(prompt_text)
-            reasoning = self._reasoning_usage()
             usage_dict = {
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
@@ -294,7 +293,6 @@ class ChatAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
-        reasoning = self._reasoning_usage()
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
                 "choices": [{"index": 0, "message": {"role": "assistant",
