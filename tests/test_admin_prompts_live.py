@@ -82,6 +82,15 @@ def test_one_setting_saved_alone_is_live_too(admin_relay):
     assert admin_relay.cfg["relay_system_prompt"] is None and admin_relay.cfg["relay_system_prompt_mode"] == "replace"
 
 
+def test_the_prompts_screen_reads_the_live_mode_and_role_length_at_once(admin_relay):
+    assert admin_relay.request("/admin/api/prompts")[1]["legacy"] == {
+        "mode": "standalone", "role_chars": len(context.DEFAULT_RELAY_SYSTEM_PROMPT)}
+    assert admin_relay.patch({"relay_system_prompt_mode": "append", "relay_system_prompt": ROLE})[0] == 200
+    assert admin_relay.request("/admin/api/prompts")[1]["legacy"] == {"mode": "append", "role_chars": len(ROLE)}
+    assert admin_relay.patch({"relay_system_prompt": ""})[0] == 200
+    assert admin_relay.request("/admin/api/prompts")[1]["legacy"] == {"mode": "append", "role_chars": 0}
+
+
 def test_the_next_request_goes_upstream_with_the_new_head(live):
     assert ask(live) == CLIENT  # standalone: a client that brings its own instructions keeps them
     assert live.patch({"relay_system_prompt_mode": "append", "relay_system_prompt": ROLE})[0] == 200

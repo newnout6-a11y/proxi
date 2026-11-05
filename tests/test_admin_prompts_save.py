@@ -323,6 +323,14 @@ def test_the_save_answers_with_the_warnings_of_the_document_and_those_of_the_eng
     assert body["warnings"] == [body["warnings"][0]] and len(body["warnings"]) == 1
 
 
+def test_saving_prompts_does_not_wait_for_a_settings_transaction(api):
+    # A settings save holds Admin.lock while it waits for a session renewal; the prompts have a lock of their own.
+    with api.runtime.admin.lock:
+        status, body, _ = put(api, DOC)
+        assert status == 200 and body["rev"] == 1
+        assert get(api)[0] == 200
+
+
 def test_saves_that_start_from_one_revision_are_serialised_and_only_one_wins(api):
     assert put(api, DOC)[0] == 200
     results = []
