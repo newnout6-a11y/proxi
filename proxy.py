@@ -386,8 +386,8 @@ def make_handler(runtime: Runtime):
                 elif route == "models":
                     self._models()
                 elif route == "codex_models":
-                    self._json(200, model_catalog.codex_catalog(
-                        [entry for entry in model_catalog.catalog() if self._model_routable(entry)]))
+                    entries = [entry for entry in model_catalog.catalog() if self._model_routable(entry)]
+                    self._json(200, self._with_prompts(lambda snapshot: model_catalog.codex_catalog(entries, snapshot)))
                 elif route == "balance":
                     report = self._balance_report()
                     self._json(200 if report["available"] is not None else 503, report)
@@ -500,6 +500,7 @@ def make_handler(runtime: Runtime):
 
         def _models(self):
             entries = [model for model in model_catalog.catalog() if self._model_routable(model)]
+            published = self._with_prompts(lambda snapshot: entries + model_catalog.virtual_entries(entries, snapshot))
             data = [{
                 "id": model["id"],
                 "object": "model",
@@ -515,11 +516,24 @@ def make_handler(runtime: Runtime):
                                  "reasoning_effort_levels": model.get("reasoning_effort_levels", []),
                                  "default_reasoning_effort": model.get("default_reasoning_effort"),
                                  "reasoning_effort_control": model.get("reasoning_effort_control", "selectable")},
-            } for model in entries]
+                **model_catalog.virtual_fields(model),
+            } for model in published]
             self._json(200, {"object": "list", "data": data})
 
         def _model_routable(self, model) -> bool:
             return model_catalog.catalog_routable(model, cfg, runtime.accounts.backends)
+
+        def _with_prompts(self, build):
+            """build(current prompts snapshot or None); a failing prompt layer must not take model discovery down."""
+            snapshot = runtime.prompts.snapshot()
+            try:
+                return build(snapshot)
+            except Exception as exc:
+                if snapshot is None:
+                    raise
+                journal.emit("prompt.runtime_error", "Каталог моделей собран без слоя промптов: %s: %s" % (
+                    type(exc).__name__, str(exc)[:200]), "error", request_id=self.request_id)
+                return build(None)
 
         def _balance_report(self):
             return account_report.balance_report(account_report.collect(runtime, force_refresh=True))

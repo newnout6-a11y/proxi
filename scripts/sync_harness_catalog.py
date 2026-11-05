@@ -6,7 +6,10 @@ before sharing it. --write requires an explicit same-volume backup directory and
 does nothing when the catalog is already current. Other providers, credentials,
 plugin configuration and the selected model remain unchanged. Reasoning models keep
 the existing default and selectors; a separate retool-text provider avoids
-inheriting that default for models without selectors.
+inheriting that default for models without selectors. Prompt profiles that publish
+themselves as models (publish_as_model) are listed as <model>@<profile> beside the
+catalog models, with the base model's limits and selectors (scripts/sync_virtual_models.py);
+--no-virtual-models leaves them out.
 """
 import argparse
 import bisect
@@ -19,6 +22,7 @@ import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts import sync_virtual_models
 from scripts.probe_client_settings import routable_entries
 from scripts.sync_opencode_catalog import (MASK, is_environment_list, is_secret_flag, is_secret_key, mask_string,
                                            mask_text, read_file, write_backed_up, write_preview)
@@ -345,6 +349,7 @@ def run(args):
     original = read_file(path, 'Harness profile')
     document = load_profile(decode_profile(original, str(path)).removeprefix('\ufeff'), str(path))
     entries = routable_entries(args.relay_config)
+    entries, virtual = sync_virtual_models.with_virtual_models(entries, args)
     result = update_document(document, entries)
     unchanged = _semantic(result) == _semantic(document)
     encoded = original if unchanged else encode_document(original, document, result)
@@ -353,7 +358,8 @@ def run(args):
     backup = write_backed_up(path, original, encoded, args.backup_dir) if args.write and not unchanged else None
     print(json.dumps({'settings': str(path), 'models': len(entries), 'written': backup is not None,
                       'changed': not unchanged, 'backup': str(backup) if backup else None, 'preview': args.output,
-                      'preview_redacted': bool(args.output) and not args.include_secrets}, ensure_ascii=False))
+                      'preview_redacted': bool(args.output) and not args.include_secrets, **virtual},
+                     ensure_ascii=False))
     return 0
 
 
@@ -366,6 +372,7 @@ def main(argv=None):
                         help='Keep credentials and comments in the --output preview; both are masked as *** by default')
     parser.add_argument('--write', action='store_true')
     parser.add_argument('--backup-dir')
+    sync_virtual_models.add_arguments(parser)
     args = parser.parse_args(argv)
     if args.write and not args.backup_dir:
         parser.error('--write requires --backup-dir')
