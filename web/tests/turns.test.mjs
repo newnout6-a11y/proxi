@@ -279,7 +279,15 @@ test('the shared scale is the longest finished turn: a running one never stretch
   assert.equal(traces[0].id, 'live');
   assert.equal(scaleOf(traces, 111 + 600), 5000);
   assert.equal(scaleOf(traces, 111 + STALE_AFTER + 1), 5000);
-  assert.equal(scaleOf([traces[0]], 111 + 600), 1);
+});
+
+test('with no finished turn to measure by, the running turns set the scale: a short one stays shorter than a long one', () => {
+  const traces = buildTraces([...forTurn('short', [ev(100, 'turn.begin')]), ...forTurn('long', [ev(90, 'turn.begin')])]);
+  assert.equal(scaleOf(traces, 110), 20000);
+  const [short, long] = [traces.find((t) => t.id === 'short'), traces.find((t) => t.id === 'long')];
+  assert.equal(phasesOf(short, 110).total / scaleOf(traces, 110), 0.5);
+  assert.equal(phasesOf(long, 110).total / scaleOf(traces, 110), 1);
+  assert.equal(scaleOf([], 110), 1);
 });
 
 test('time spent in a local command is not counted as output', () => {

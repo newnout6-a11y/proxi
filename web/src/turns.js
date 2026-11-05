@@ -252,10 +252,12 @@ export function phasesOf(trace, now = Date.now() / 1000) {
 }
 
 /**
- * The shared scale of the turn tapes is the longest finished turn: a running one grows with the clock
- * and would squeeze every other tape as it ticks.
+ * The shared scale of the turn tapes is the longest finished turn: a running one grows with the clock and would
+ * squeeze every other tape as it ticks. With nothing finished to measure by, the running turns set the scale
+ * themselves, so that a short one is still shorter than a long one instead of every tape being full.
  */
 export function scaleOf(traces, now = Date.now() / 1000) {
-  const finished = traces.map((trace) => phasesOf(trace, now)).filter((phases) => !phases.open);
-  return Math.max(1, ...finished.map((phases) => phases.total));
+  const all = traces.map((trace) => phasesOf(trace, now));
+  const finished = all.filter((phases) => !phases.open);
+  return Math.max(1, ...(finished.length ? finished : all).map((phases) => phases.total));
 }
