@@ -384,18 +384,50 @@ def account_config(root, record):
     return merged
 
 
-def discovery_configs(cfg, backends):
-    """Configs of the accounts that can serve a request for the shared-mode main path or any pool path."""
+def serving(items, cfg, shared_main=True):
+    """The accounts a request can be routed to, switched-off ones included.
+
+    This is the one list that discovery, SessionPool.model_refusal and acquire() read. In
+    shared mode a request without a context scope (`shared_main`) runs on the shared session, which only the
+    pool's first account serves; every other request may use any account. `items` are backends or configs.
+    """
+    items = list(items)
+    return items[:1] if shared_main and cfg.get('session_mode') == 'shared' else items
+
+
+def serving_configs(cfg, backends=None, shared_main=True):
+    """Configs of `serving`: from the live backends, or from the account records when there are none yet."""
     if backends is not None:
         configs = [backend.cfg for backend in backends]
     else:
         records = cfg.get('accounts')
         configs = ([account_config(cfg, record) for record in records if isinstance(record, dict)]
                    if isinstance(records, list) and records else [cfg])
-    if cfg.get('session_mode') == 'shared':
-        # Without a context scope only the pool's first account serves requests.
-        configs = configs[:1]
-    return [item for item in configs if item.get('enabled', True)]
+    return serving(configs, cfg, shared_main)
+
+
+def discovery_configs(cfg, backends):
+    """Configs of the enabled accounts discovery is judged against."""
+    return [item for item in serving_configs(cfg, backends) if item.get('enabled', True)]
+
+
+def pool_configured(configs):
+    """False for a pool in which no account has any provider resource.
+
+    Such a pool is shown in full and its requests explain the missing resource themselves (see refusal_reasons);
+    switched-off accounts count, so the answer does not depend on who is enabled right now.
+    """
+    return any(item.get(key) for item in configs for key in PROVIDER_RESOURCE_KEY.values())
+
+
+def refusal_reasons(entry, configs, configured=True):
+    """Why each account refuses the model for good, in order; None for an account that may serve it.
+
+    Route facts always count. A missing provider resource counts only when `configured`: callers pass
+    pool_configured(...) so that an empty pool leaves the explanation to the request, and acquire() passes True.
+    """
+    return [route_block_reason(entry, item) or (resource_block_reason(entry, item) if configured else None)
+            for item in configs]
 
 
 def catalog_visibility(entry, cfg, backends=None):
@@ -404,7 +436,8 @@ def catalog_visibility(entry, cfg, backends=None):
     Resource configuration is separate from model availability or account health:
     a temporarily empty balance does not erase an installed model's metadata.
     """
-    configs = discovery_configs(cfg, backends)
+    everyone = serving_configs(cfg, backends)
+    configs = [item for item in everyone if item.get('enabled', True)]
     if not configs:
         return False, 'no enabled account'
     refusals = [route_block_reason(entry, item) for item in configs]
@@ -413,7 +446,7 @@ def catalog_visibility(entry, cfg, backends=None):
         return False, '; '.join(dict.fromkeys(refusals))
     if cfg.get('show_unrouted_models'):
         return True, None
-    if not any(item.get(key) for item in configs for key in PROVIDER_RESOURCE_KEY.values()):
+    if not pool_configured(everyone):
         return True, None  # Unconfigured setup still exposes metadata; requests explain missing resources.
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
     if key and any(item.get(key) for item in eligible):

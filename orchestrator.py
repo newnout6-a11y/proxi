@@ -1,5 +1,6 @@
 """Turn orchestration: context injection, execution loop, event fan-out."""
 import asyncio
+import collections
 import hashlib
 
 import direct
@@ -160,6 +161,66 @@ def _may_be_balance_related(error):
     return status >= 500 and code != "upstream_timeout"
 
 
+def _can_exec(cfg, steps: int) -> bool:
+    """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
+    if cfg["exec_policy"] == "off":
+        return False
+    max_steps = int(cfg.get("max_exec_turns", 0) or 0)
+    return max_steps <= 0 or steps < max_steps
+
+
+def _purpose(parsed):
+    return getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
+
+
+def _client_system(parsed):
+    """The client's own system text; a blank one (an effort-only entry, a lone newline) is no instruction at all."""
+    return parsed.system if (parsed.system or "").strip() else ""
+
+
+def _client_owns_instructions(parsed, purpose, native_tools):
+    """True when the client brings the instructions of this job, so the relay adds no project context or shell protocol.
+
+    A JSON-only reply has no room for the relay's workspace or shell protocol;
+    a client that supplies tools keeps the relay's native-tools role as before."""
+    return (purpose in client_context.CLIENT_TEXT_KINDS or bool(_client_system(parsed))
+            or (bool(getattr(parsed, "structured_output", None)) and not native_tools))
+
+
+# kind: "text" (the persistent text chat), "isolated" (a standalone job) or "session" (the conversation's own one).
+AcquirePlan = collections.namedtuple("AcquirePlan", "kind kwargs")
+
+
+def acquire_plan(cfg, parsed):
+    """Which pool session a turn asks for, as SessionPool.acquire()'s `isolated` / `context_scope` keywords.
+
+    TurnRunner acquires with exactly this plan, and the HTTP layer puts the same keywords to the pool
+    (model_refusal) before a response starts: the check and the acquire read the same accounts.
+    """
+    native_tools = getattr(parsed, "tools", None) or []
+    direct_mode = cfg.get("transport") == "direct"
+    mode = cfg.get("session_mode")
+    purpose = _purpose(parsed)
+    key = getattr(parsed, "conversation_key", None)
+    parent_key = getattr(parsed, "parent_conversation_key", None)
+    can_exec = (_can_exec(cfg, 0) and not native_tools
+                and not _client_owns_instructions(parsed, purpose, native_tools))
+    persistent_text = (direct_mode and not native_tools and mode != "per_request"
+                       and purpose not in client_context.SERVICE_KINDS and (key or mode == "shared"))
+    isolated = (not native_tools and not persistent_text
+                and (direct_mode or purpose in client_context.CLIENT_TEXT_KINDS or (key and not can_exec)))
+    child_scope = ("subagent", key) if parent_key and key and mode == "shared" else None
+    if persistent_text:
+        # Ordinary text chats retain idle keepwarm, with state separate from native
+        # tools even when their conversation ID is the same.
+        return AcquirePlan("text", {"context_scope": (child_scope, "text") if child_scope else "text"})
+    if isolated:
+        # A standalone job can share account affinity, never the main chat's tools, head,
+        # implicit history, cache breakpoints or idle keepwarm.
+        return AcquirePlan("isolated", {"isolated": True})
+    return AcquirePlan("session", {"context_scope": child_scope} if child_scope else {})
+
+
 class TurnRunner:
     def __init__(self, cfg, credits, pool):
         self.cfg = cfg
@@ -169,11 +230,7 @@ class TurnRunner:
         self.accounts = None
 
     def _can_exec(self, steps: int) -> bool:
-        """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
-        if self.cfg["exec_policy"] == "off":
-            return False
-        max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
-        return max_steps <= 0 or steps < max_steps
+        return _can_exec(self.cfg, steps)
 
     def _looks_looping(self, command: str, history) -> bool:
         """True when this command already ran three times in the recent window."""
@@ -494,15 +551,11 @@ class TurnRunner:
                 tool_names = [choice["function"]["name"]]
             direct_mode = self.cfg.get("transport") == "direct"
             is_native = bool(native_tools)
-            purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
+            purpose = _purpose(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
             output_spec = getattr(parsed, "structured_output", None)
-            # A blank system (an effort-only entry, a lone newline) is no instruction at all.
-            client_system = parsed.system if (parsed.system or "").strip() else ""
-            # A JSON-only reply has no room for the relay's workspace or shell protocol;
-            # a client that supplies tools keeps the relay's native-tools role as before.
-            client_owns_instructions = (client_text or bool(client_system)
-                                        or (bool(output_spec) and not native_tools))
+            client_system = _client_system(parsed)
+            client_owns_instructions = _client_owns_instructions(parsed, purpose, native_tools)
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
@@ -583,29 +636,12 @@ class TurnRunner:
             try:
                 key = getattr(parsed, "conversation_key", None)
                 parent_key = getattr(parsed, "parent_conversation_key", None)
-                can_exec = self._can_exec(0) and not native_tools and not client_owns_instructions
-                persistent_text = (direct_mode and not native_tools
-                                   and self.cfg.get("session_mode") != "per_request"
-                                   and purpose not in client_context.SERVICE_KINDS
-                                   and (key or self.cfg.get("session_mode") == "shared"))
-                isolated = not native_tools and not persistent_text and (direct_mode or client_text or (key and not can_exec))
+                plan = acquire_plan(self.cfg, parsed)
+                persistent_text, isolated = plan.kind == "text", plan.kind == "isolated"
                 failover = {"exclude": exclude} if exclude else {}
                 if parent_key and parent_key != key:
                     failover["parent_key"] = parent_key
-                child_scope = (("subagent", key) if parent_key and key
-                               and self.cfg.get("session_mode") == "shared" else None)
-                if persistent_text:
-                    # Ordinary text chats retain idle keepwarm, with state separate
-                    # from native tools even when their conversation ID is the same.
-                    session = await self.pool.acquire(key, context_scope=(child_scope, "text") if child_scope else "text",
-                                                      model_entry=parsed.entry, **failover)
-                elif isolated:
-                    # A standalone job can share account affinity, never the main chat's
-                    # tools, head, implicit history, cache breakpoints or idle keepwarm.
-                    session = await self.pool.acquire(key, isolated=True, model_entry=parsed.entry, **failover)
-                else:
-                    scoped = {"context_scope": child_scope} if child_scope else {}
-                    session = await self.pool.acquire(key, model_entry=parsed.entry, **scoped, **failover)
+                session = await self.pool.acquire(key, model_entry=parsed.entry, **plan.kwargs, **failover)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
                 # Every later event of this turn, errors included, names the account serving it.

@@ -30,7 +30,7 @@ import models
 import validate
 from accounts import AccountDispatcher
 from credits import CreditsManager
-from orchestrator import TurnRunner
+from orchestrator import TurnRunner, acquire_plan
 from session import Backend, SessionPool
 from upstream_diagnostics import WireTrace
 from io_workers import DaemonIOExecutor
@@ -581,7 +581,10 @@ def make_handler(runtime: Runtime):
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
-            refusal = runtime.pool.model_refusal(parsed.entry)
+            parsed.request_purpose = client_context.request_kind(parsed)
+            # The pool is asked about the accounts this very request would run on (acquire reads the same plan).
+            scope = acquire_plan(cfg, parsed).kwargs
+            refusal = runtime.pool.model_refusal(parsed.entry, **scope)
             if refusal is not None:
                 raise refusal
 
@@ -590,7 +593,6 @@ def make_handler(runtime: Runtime):
                 "provider" if parsed.entry.get("reasoning") and
                 parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
 
-            parsed.request_purpose = client_context.request_kind(parsed)
             compatibility_headers = {}
             if parsed.structured_output:
                 compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']

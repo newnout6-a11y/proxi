@@ -907,8 +907,7 @@ class SessionPool:
         """Why this account can never serve the model (a settled fact, unlike its health), or None."""
         if model_entry is None:
             return None
-        return (model_catalog.route_block_reason(model_entry, backend.cfg)
-                or model_catalog.resource_block_reason(model_entry, backend.cfg))
+        return model_catalog.refusal_reasons(model_entry, [backend.cfg])[0]
 
     @staticmethod
     def _check_route(backend, model_entry):
@@ -963,50 +962,72 @@ class SessionPool:
             return apierr.insufficient_credits(threshold or 0, exhausted)
         return apierr.service_unavailable("no usable account: Retool sessions need a new sign-in")
 
-    def model_refusal(self, model_entry):
-        """The settled 404 when no account can serve the model, else None.
+    def _on_shared_session(self, isolated=False, context_scope=None):
+        """True for a request that runs on the one shared session: shared mode, no isolation, no context scope."""
+        return self.mode == "shared" and not isolated and not context_scope
+
+    def _serving(self, isolated=False, context_scope=None):
+        """The accounts a request of this kind can be routed to (models.serving over the pool's accounts)."""
+        return model_catalog.serving(self.backends, self.cfg, self._on_shared_session(isolated, context_scope))
+
+    def model_refusal(self, model_entry, isolated=False, context_scope=None):
+        """The settled 404 when no account that serves this request can serve the model, else None.
 
         The HTTP layer calls this before a response starts, so a stream gets a real status instead of
-        an SSE error. With no provider resource anywhere, only the model's own route facts count and
-        acquire() explains the missing resource, the same way discovery treats an unconfigured setup.
+        an SSE error. `isolated` and `context_scope` are acquire()'s and decide which accounts serve (_serving).
+        With no provider resource on any of them, only the model's own route facts count and acquire() explains
+        the missing resource, the same way discovery treats an unconfigured setup.
         """
         if model_entry is None:
             return None
-        configured = any(backend.cfg.get(key) for backend in self.backends
-                         for key in model_catalog.PROVIDER_RESOURCE_KEY.values())
-        refusals = [self._route_refusal(backend, model_entry) if configured
-                    else model_catalog.route_block_reason(model_entry, backend.cfg)
-                    for backend in self.backends]
-        return model_catalog.model_unavailable(model_entry, refusals) if all(refusals) else None
+        configs = [backend.cfg for backend in self._serving(isolated, context_scope)]
+        refusals = model_catalog.refusal_reasons(model_entry, configs, model_catalog.pool_configured(configs))
+        return model_catalog.model_unavailable(model_entry, refusals) if refusals and all(refusals) else None
 
-    def _next_backend(self, model_entry=None, exclude=()) -> Backend:
-        routable, refusals = [], []
-        for backend in self.backends:
-            reason = self._route_refusal(backend, model_entry)
-            if reason:
-                refusals.append(reason)
-            else:
-                routable.append(backend)
+    def _candidates(self, backends, model_entry, exclude=()):
+        """The accounts a request can go to right now as (kind, accounts); acquire()'s error when there are none.
+
+        kind is "ready" (usable accounts), "reserve" (every one is below min_account_balance: the richest serves)
+        or "signed_out" (a session that needs a new sign-in is still tried). Reads state only: nothing is
+        reserved, awaited or counted.
+        """
+        reasons = (model_catalog.refusal_reasons(model_entry, [backend.cfg for backend in backends])
+                   if model_entry is not None else [None] * len(backends))
+        routable = [backend for backend, reason in zip(backends, reasons) if not reason]
+        refusals = [reason for reason in reasons if reason]
         if refusals and not routable:
             # Every account refuses this model by configuration (unsupported, retired, gated, no
             # resource): a settled 4xx that names the reason, never a retryable 503.
             raise model_catalog.model_unavailable(model_entry, refusals)
-        if not any(account_enabled(b) for b in routable) and any(account_enabled(b) for b in self.backends):
+        if not any(account_enabled(b) for b in routable) and any(account_enabled(b) for b in backends):
             raise apierr.service_unavailable("no enabled account has a route for the requested model")
         eligible = [backend for backend in routable if self._usable(backend, exclude)]
-        if not eligible:
-            spare = self._reserve(routable, exclude)
-            if spare:
-                # Every account is below the reserve: spend the richest one down to zero.
-                return max(spare, key=lambda b: float("inf") if b.unavailable.get("available") is None
-                           else b.unavailable["available"])
-        if not eligible:
-            # A signed-out account is still better than no account: its 401 makes the
-            # refresher re-read config.json, so a fresh sign-in is adopted at once.
-            eligible = [backend for backend in routable if backend not in exclude and account_enabled(backend)
-                        and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"]
-        if not eligible:
-            raise self._unusable_error(routable)
+        if eligible:
+            return "ready", eligible
+        spare = self._reserve(routable, exclude)
+        if spare:
+            return "reserve", spare
+        # A signed-out account is still better than no account: its 401 makes the
+        # refresher re-read config.json, so a fresh sign-in is adopted at once.
+        signed_out = [backend for backend in routable if backend not in exclude and account_enabled(backend)
+                      and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"]
+        if signed_out:
+            return "signed_out", signed_out
+        raise self._unusable_error(routable)
+
+    def _check_shared(self, model_entry, exclude=()):
+        """What the shared session needs of its one account; acquire()'s error when it cannot serve."""
+        self._check_route(self.backend, model_entry)
+        if not account_enabled(self.backend):
+            raise apierr.service_unavailable("the shared-mode account is switched off")
+        self._candidates([self.backend], model_entry, exclude)
+
+    def _next_backend(self, model_entry=None, exclude=()) -> Backend:
+        kind, candidates = self._candidates(self.backends, model_entry, exclude)
+        if kind == "reserve":
+            # Every account is below the reserve: spend the richest one down to zero.
+            return max(candidates, key=lambda b: float("inf") if b.unavailable.get("available") is None
+                       else b.unavailable["available"])
         counts = {b: 0 for b in self.backends}
         for s in self._conversations.values():
             if getattr(s, "backend", None) in counts:
@@ -1017,8 +1038,8 @@ class SessionPool:
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % len(self.backends)
         # Operator priority first (lower wins), then the least loaded, then round-robin.
-        return min(eligible, key=lambda b: (account_priority(b), counts[b],
-                                            (self.backends.index(b) - idx) % len(self.backends)))
+        return min(candidates, key=lambda b: (account_priority(b), counts[b],
+                                              (self.backends.index(b) - idx) % len(self.backends)))
 
     @property
     def mode(self):
@@ -1122,14 +1143,8 @@ class SessionPool:
                 affinity_backend = None
             if context_scope and (conversation_key or self.mode == "shared"):
                 conversation_key = (None if self.mode == "shared" else conversation_key, context_scope)
-            if not isolated and self.mode == "shared" and not context_scope:
-                self._check_route(self.backend, model_entry)
-                if not account_enabled(self.backend):
-                    raise apierr.service_unavailable("the shared-mode account is switched off")
-                reason = (getattr(self.backend, "unavailable", None) or {}).get("reason")
-                if (self.backend in exclude or reason == "rate_limited" or
-                        (reason == "exhausted" and not self._reserve([self.backend], exclude))):
-                    raise self._unusable_error([self.backend])
+            if self._on_shared_session(isolated, context_scope):
+                self._check_shared(model_entry, exclude)
                 lock = self._lock
                 await lock.acquire()
                 locked = True
