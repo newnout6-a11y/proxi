@@ -26,6 +26,10 @@ def events(mark, kind):
             if e["kind"] == kind]
 
 
+def messages(mark, kind):
+    return [e["message"] for e in journal.JOURNAL.query(since=mark, limit=1000) if e["kind"] == kind]
+
+
 def failing(*_args):
     raise OSError("synthetic failure")
 
@@ -101,12 +105,10 @@ def test_a_failed_ping_is_retried_only_while_the_retry_starts_inside_the_window(
     assert (stop["reason"], stop["pings"], stop["failures"], stop["after_failure"], stop["limit"], stop["level"]) == (
         "cache_expired", 3, 3, True, direct.PING_DEADLINE, "info")
     assert stop["touch_age_seconds"] == pytest.approx(pings[-1] - touch, abs=2)
-    failures = [e for e in events(mark, "cache.keepwarm") if e["level"] == "warn"]
-    assert len(failures) == 3 and "повтор через 10 с" in " ".join(
-        e["message"] if "message" in e else "" for e in journal.JOURNAL.query(since=mark, limit=1000)
-        if e["kind"] == "cache.keepwarm")
-    assert "не успевает до истечения кэша" in [e["message"] for e in journal.JOURNAL.query(since=mark, limit=1000)
-                                                if e["kind"] == "cache.keepwarm"][-1]
+    texts = messages(mark, "cache.keepwarm")
+    assert len(texts) == 3, "one warning for every failed ping"
+    assert "повтор через 10 с" in texts[0] and "повтор через 20 с" in texts[1]
+    assert "повтор не успевает до истечения кэша" in texts[2]
 
 
 def test_a_ping_that_times_out_is_not_followed_by_a_paid_rewrite(monkeypatch):
@@ -274,7 +276,7 @@ def test_one_rewrite_is_the_most_a_cycle_ever_pays_for(monkeypatch):
     [ping_event] = events(mark, "cache.keepwarm")
     assert ping_event["level"] == "warn" and ping_event["cache_verified"] is True
     assert ping_event["touch_age_seconds"] == pytest.approx(240, abs=2)
-    assert direct._STOP_TEXT["cache_rewritten"] in [e["message"] for e in journal.JOURNAL.query(since=mark, limit=100)]
+    assert direct._STOP_TEXT["cache_rewritten"] in messages(mark, "cache.keepwarm_stop")
 
 
 def test_a_healthy_cycle_is_not_cut_by_pings_that_read(monkeypatch):
