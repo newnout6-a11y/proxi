@@ -312,11 +312,8 @@ class Admin:
         return models.catalog_routable(entry, self.cfg, self._route_backends())
 
     def _route_configs(self):
-        """Configs of the accounts models.catalog_routable weighs: the enabled ones."""
-        backends = self._route_backends()
-        if backends is None:
-            return [item for item in (self.cfg.get('accounts') or [self.cfg]) if item.get('enabled', True)]
-        return [backend.cfg for backend in backends if backend.cfg.get('enabled', True)]
+        """Configs of the accounts models.catalog_routable weighs, shared-mode narrowing included."""
+        return models.discovery_configs(self.cfg, self._route_backends())
 
     def _unrouted(self, entry):
         """(code, reason) of a model catalog_routable hides; the same inputs, checked in the same order."""

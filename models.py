@@ -384,7 +384,7 @@ def account_config(root, record):
     return merged
 
 
-def _discovery_configs(cfg, backends):
+def discovery_configs(cfg, backends):
     """Configs of the accounts that can serve a request for the shared-mode main path or any pool path."""
     if backends is not None:
         configs = [backend.cfg for backend in backends]
@@ -404,7 +404,7 @@ def catalog_visibility(entry, cfg, backends=None):
     Resource configuration is separate from model availability or account health:
     a temporarily empty balance does not erase an installed model's metadata.
     """
-    configs = _discovery_configs(cfg, backends)
+    configs = discovery_configs(cfg, backends)
     if not configs:
         return False, 'no enabled account'
     refusals = [route_block_reason(entry, item) for item in configs]

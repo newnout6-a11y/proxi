@@ -135,6 +135,22 @@ def test_shared_mode_publishes_only_what_the_serving_account_can_call(multi, pat
     assert glm_published()
 
 
+def test_shared_mode_admin_names_the_first_accounts_missing_resource(multi):
+    first, second = multi.backends
+    for backend in (first, second):
+        for resource in models.PROVIDER_RESOURCE_KEY.values():
+            backend.cfg.pop(resource, None)
+        backend.cfg['provider_resource_name'] = 'anthropic'
+    second.cfg['retool_fast_provider_resource_name'] = 'second-only'
+    multi.runner_.runtime.cfg['session_mode'] = 'shared'
+    status, body, _ = multi.call('/admin/api/models')
+    assert status == 200
+    glm = next(row for row in body['data'] if row['id'] == 'zai-org/GLM-5.3')
+    # Not the generic fallback: the reason is about the account shared mode actually serves.
+    assert glm['routable'] is False and glm['route_blocker'] == 'no_resource'
+    assert 'retool_fast_provider_resource_name' in glm['route_reason']
+
+
 def test_shared_mode_discovery_follows_the_first_account_even_when_it_is_switched_off():
     first = SimpleNamespace(cfg={'enabled': False, 'provider_resource_name': 'a'})
     second = SimpleNamespace(cfg={'enabled': True, 'provider_resource_name': 'a'})

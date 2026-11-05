@@ -606,6 +606,9 @@ def make_handler(runtime: Runtime):
                 routine = {'temperature', 'top_p', 'top_k', 'seed', 'presence_penalty', 'frequency_penalty', 'metadata',
                            'prompt_cache_key', 'prompt_cache_retention', 'prompt_cache_options', 'include',
                            'client_metadata', 'verbosity', 'text.verbosity', 'output_config.task_budget'}
+                # A route that accepts and ignores effort (Haiku 4.5, GLM) gets the level clients send to every model.
+                routine |= {name for name in names if name.lower().endswith('effort') or name.endswith('.budget_tokens')
+                            or name == 'thinking.type'}
                 level = 'warn' if names - routine - tool_changes else 'info' if names & tool_changes else 'debug'
                 journal.emit('request.compatibility',
                              'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
