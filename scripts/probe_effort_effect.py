@@ -131,7 +131,7 @@ def summarize(rows):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--allow-paid', action='store_true', help='Required: requests can spend provider credits')
-    parser.add_argument('--config', default='config.json')
+    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1] / 'config.json'))
     parser.add_argument('--models', nargs='+', default=list(DEFAULT_MODELS))
     parser.add_argument('--efforts', nargs='+', help='Raw levels; "omit" sends none. Default: per-provider list')
     parser.add_argument('--question', choices=sorted(QUESTIONS), default='count',

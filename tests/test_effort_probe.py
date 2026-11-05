@@ -1,6 +1,7 @@
 """The paid effort probe: explicit opt-in, read-only accounts, no retry, redacted evidence. Offline fixtures only."""
 import io
 import json
+from pathlib import Path
 import urllib.error
 
 import pytest
@@ -103,6 +104,17 @@ def test_the_credit_limit_stops_the_run_after_the_request_that_reached_it(tmp_pa
                          '--output', str(tmp_path / 'e.jsonl')])
     rows = (tmp_path / 'e.jsonl').read_text(encoding='utf-8').splitlines()
     assert result == 1 and len(rows) == 1
+
+
+def test_the_default_config_is_the_repository_one_whatever_the_working_directory(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(probe, 'load_accounts', lambda path: seen.append(path) or [])
+    monkeypatch.setattr(probe.urllib.request, 'urlopen', lambda *a, **k: pytest.fail('must not spend'))
+    monkeypatch.chdir(tmp_path)
+    assert probe.main(['--allow-paid', '--models', GLM, '--output', str(tmp_path / 'e.jsonl')]) == 0
+    assert seen == [str(Path(probe.__file__).resolve().parents[1] / 'config.json')]
+    probe.main(['--allow-paid', '--models', GLM, '--config', 'elsewhere.json', '--output', str(tmp_path / 'f.jsonl')])
+    assert seen[-1] == 'elsewhere.json'
 
 
 def test_a_model_without_a_provider_resource_is_skipped_not_probed(tmp_path, monkeypatch):
