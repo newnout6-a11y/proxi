@@ -220,7 +220,7 @@ def test_title_format_policy_reaches_upstream_with_own_system(tmp_path, monkeypa
     import asyncio
     from session import RelaySession
     from test_native_context_reuse import run, setup
-    _, _, runner = setup(tmp_path, transport='direct', relay_system_mode='replace',
+    _, _, runner = setup(tmp_path, transport='direct', relay_system_prompt_mode='replace',
                          relay_system_prompt='UNRELATED RELAY POLICY', cookie_values=[])
     sent = []
 
