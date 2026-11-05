@@ -192,6 +192,43 @@ export function newRule(use = '') {
   return { name: 'Новое правило', if: {}, use };
 }
 
+/** Set one field of a rule; `enabled: true` and `override_protected: false` are the defaults and are not written. */
+export function setRuleField(rule, key, value) {
+  const next = { ...rule };
+  const drop = value === undefined || value === null || (key === 'enabled' && value === true) || (key === 'override_protected' && value === false);
+  if (drop) delete next[key];
+  else next[key] = value;
+  return next;
+}
+
+/** The index of the first enabled rule that matches every request; whatever follows it can never be reached. */
+export function catchAllIndex(rules) {
+  const matchesAll = (rule) => !rule?.if || (isObject(rule.if) && !Object.keys(rule.if).length);
+  return rules.findIndex((rule) => rule?.enabled !== false && matchesAll(rule));
+}
+
+// What a new profile starts from; {{client_system}}{{relay_task}}{{exec_reminder}} keeps both kinds of request
+// as they are today: the client's own system, or the task the relay builds when the client sends none.
+const KEEP = '{{client_system}}{{relay_task}}{{exec_reminder}}';
+export const STARTERS = [
+  { id: 'same', label: 'Как сейчас', hint: 'System клиента и задачи relay без изменений: точка отсчёта для правок', head: KEEP },
+  { id: 'rules-first', label: 'Мои правила в начале', hint: 'Свой текст перед system клиента', head: `Отвечай по-русски. Не трогай файлы без явной просьбы.\n\n${KEEP}` },
+  { id: 'exact', label: 'Только мой текст', hint: 'System клиента выбрасывается, инструменты и заголовки продолжают работать', head: 'Ты — ассистент по программированию. Отвечай кратко и проверяй изменения.' },
+];
+
+export function starterProfile(id) {
+  const starter = STARTERS.find((item) => item.id === id) || STARTERS[0];
+  return { head: starter.head };
+}
+
+/** `base`, or `base-2`, `base-3` … when the name is taken. */
+export function uniqueName(base, taken) {
+  if (!taken.includes(base)) return base;
+  let n = 2;
+  while (taken.includes(`${base}-${n}`)) n += 1;
+  return `${base}-${n}`;
+}
+
 // --- what changed ----------------------------------------------------------------------------------------------
 
 const GROUPED = ['profiles', 'texts', 'relay_texts'];
