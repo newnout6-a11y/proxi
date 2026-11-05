@@ -1,26 +1,40 @@
 """Sync only the relay catalog in OpenCode's shared legacy JSON configuration.
 
 OpenCode 1 reads this schema directly; installed OpenCode 2 migrates it on load.
-Preview is read-only. --write requires a backup directory and preserves other
-providers, authentication and unrelated settings.
+The file may be JSONC (comments, trailing commas). Its BOM, line endings and
+indentation are kept, and nothing is written when the catalog is already current.
+Preview is read-only and masks credentials unless --include-secrets is given.
+--write requires a backup directory and preserves other providers, authentication
+and unrelated settings; a file with comments is rewritten only with --allow-reformat.
 """
 import argparse
+import codecs
 import copy
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import sys
 import tempfile
-import shutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import models
 from apierr import ApiError
-from scripts.audit_models import load_accounts
-from scripts.probe_client_settings import catalog_policy, effort_controls
+from scripts.probe_client_settings import catalog_policy, effort_controls, routable_entries
 
 PROVIDER = 'retool-relay'
+# Hidden OpenCode agents that run on their own (titles, summaries, compaction).
+BACKGROUND_AGENTS = ('title', 'summary', 'compaction')
+# Retool credits have no verified USD price here, so "cheap" means the small/fast
+# tier, in the order OpenCode itself prefers for small_model (Haiku, Flash, nano).
+SMALL_MODELS = ('claude-haiku-4-5-20251001', 'gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview',
+                'gemini-3.5-flash', 'gemini-2.5-flash', 'gpt-5-nano', 'gpt-5-mini', 'zai-org/GLM-5.3-Flash')
+MASK = '***'
+# Mappings whose values are credentials (a list under `env` names variables instead).
+SECRET_CONTAINERS = ('headers', 'environment', 'env', 'cookies')
+SECRET_KEY = re.compile(r'apikey|secret|token|password|passwd|authorization|cookie|credential|privatekey|bearer')
 
 
 def _clear_effort(value):
@@ -45,6 +59,10 @@ def _clear_effort(value):
             value['thinking'].pop(key, None)
         if not value['thinking']:
             value.pop('thinking')
+
+
+def _named_objects(section):
+    return [(name, item) for name, item in section.items() if isinstance(item, dict)] if isinstance(section, dict) else []
 
 
 def update_document(document, entries, default_model='claude-opus-5-5'):
@@ -81,50 +99,201 @@ def update_document(document, entries, default_model='claude-opus-5-5'):
     provider.pop('blacklist', None)
     provider['whitelist'] = list(new_models)
     fallback = default_model if default_model in new_models else next(iter(new_models))
+    small = next((name for name in SMALL_MODELS if name in new_models), None)
 
-    def update_reference(container, key):
+    def update_reference(container, key, replacement):
+        """Canonicalize a relay model reference; a removed model gets `replacement`, or no override at all."""
         item = container.get(key)
-        if isinstance(item, str) and item.startswith(PROVIDER + '/'):
-            raw = item[len(PROVIDER) + 1:]
-            try:
-                name = models.resolve(raw)[0]['id']
-            except ApiError:
-                name = fallback
-            container[key] = PROVIDER + '/' + (name if name in new_models else fallback)
-    for key in ('model', 'small_model'):
-        update_reference(result, key)
-    for agent in (result.get('agent') or {}).values():
-        if isinstance(agent, dict):
-            update_reference(agent, 'model')
+        if not isinstance(item, str) or not item.startswith(PROVIDER + '/'):
+            return
+        raw, _, variant = item[len(PROVIDER) + 1:].partition('#')
+        try:
+            name = models.resolve(raw)[0]['id']
+        except ApiError:
+            name = None
+        if name in new_models:
+            suffix = '#' + variant if variant in new_models[name]['variants'] else ''
+            container[key] = PROVIDER + '/' + name + suffix
+        elif replacement:
+            container[key] = PROVIDER + '/' + replacement
+        else:
+            del container[key]
+    update_reference(result, 'model', fallback)
+    update_reference(result, 'small_model', small)
+    for section in ('agent', 'mode'):
+        for name, agent in _named_objects(result.get(section)):
+            update_reference(agent, 'model', small if name in BACKGROUND_AGENTS else fallback)
+    for _, command in _named_objects(result.get('command')):
+        update_reference(command, 'model', fallback)
     listed = '\n'.join(PROVIDER + '/' + name for name in new_models)
     if not catalog_policy(result, listed, 'opencode', allowed_entries=entries, require_complete=True)['passed']:
         raise ValueError('Generated client catalog failed validation')
     return result
 
 
+def read_file(path, label, hint=''):
+    try:
+        return Path(path).read_bytes()
+    except FileNotFoundError:
+        raise ValueError('%s not found: %s%s' % (label, path, hint)) from None
+    except OSError as error:
+        raise ValueError('cannot read %s %s: %s' % (label, path, error.strerror or error)) from None
+
+
+def _strip_jsonc(text):
+    """Blank comments and trailing commas outside strings, keeping every offset and line break."""
+    chars = list(text)
+    size, index, comma, commented = len(text), 0, None, False
+
+    def blank(start, end):
+        for position in range(start, end):
+            if chars[position] not in '\r\n':
+                chars[position] = ' '
+    while index < size:
+        char = text[index]
+        if char == '"':
+            index += 1
+            while index < size and text[index] != '"':
+                index += 2 if text[index] == '\\' else 1
+            index += 1
+            comma = None
+        elif text.startswith('//', index):
+            end = index
+            while end < size and text[end] not in '\r\n':
+                end += 1
+            blank(index, end)
+            index, commented = end, True
+        elif text.startswith('/*', index):
+            end = text.find('*/', index + 2)
+            if end < 0:
+                raise ValueError('unterminated /* comment at line %d' % (text.count('\n', 0, index) + 1))
+            blank(index, end + 2)
+            index, commented = end + 2, True
+        else:
+            if char == ',':
+                comma = index
+            elif char in '}]':
+                if comma is not None:
+                    chars[comma] = ' '
+                comma = None
+            elif char not in ' \t\r\n':
+                comma = None
+            index += 1
+    return ''.join(chars), commented
+
+
+def parse_settings(original, label):
+    """Read JSONC bytes: returns the document, its text style and whether it holds comments."""
+    bom = codecs.BOM_UTF8 if original.startswith(codecs.BOM_UTF8) else b''
+    try:
+        text = original[len(bom):].decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise ValueError('%s is not valid UTF-8 (byte offset %d); OpenCode configuration must be UTF-8'
+                         % (label, error.start + len(bom))) from None
+    try:
+        clean, commented = _strip_jsonc(text)
+    except ValueError as error:
+        raise ValueError('%s is not valid JSONC: %s' % (label, error)) from None
+    try:
+        document = json.loads(clean)
+    except json.JSONDecodeError as error:
+        raise ValueError('%s is not valid JSON or JSONC: %s at line %d, column %d'
+                         % (label, error.msg, error.lineno, error.colno)) from None
+    if not isinstance(document, dict):
+        raise ValueError('%s must contain a JSON object' % label)
+    crlf = text.count('\r\n')
+    indent = re.search(r'^([ \t]+)\S', clean, re.M)
+    unit = indent.group(1) if indent else '  '
+    style = {'bom': bom, 'newline': '\r\n' if crlf > text.count('\n') - crlf else '\n',
+             'indent': '\t' if '\t' in unit else (unit if len(unit) <= 8 else '  '),
+             'final_newline': text.endswith(('\n', '\r'))}
+    return document, style, commented
+
+
+def encode_settings(document, style):
+    text = json.dumps(document, ensure_ascii=False, indent=style['indent'])
+    text = text.replace('\n', style['newline']) + (style['newline'] if style['final_newline'] else '')
+    return style['bom'] + text.encode('utf-8')
+
+
+def is_secret_key(name, mapping=False):
+    """Whether a key's value holds credentials; `mapping` says the value is a mapping."""
+    key = re.sub(r'[^a-z0-9]', '', str(name).lower())
+    if key in SECRET_CONTAINERS:
+        return mapping
+    # A name ending in "env" (apiKeyEnv) refers to an environment variable, it is not a credential.
+    return bool(SECRET_KEY.search(key)) and not key.endswith('env')
+
+
+def mask_document(value, secret=False):
+    """Copy of a JSON document with credential strings replaced by MASK."""
+    if isinstance(value, dict):
+        return {key: mask_document(item, secret or is_secret_key(key, isinstance(item, dict)))
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [mask_document(item, secret) for item in value]
+    return MASK if secret and isinstance(value, str) and value else value
+
+
+def write_preview(path, data):
+    """Create a new owner-only file; an existing preview is never overwritten."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
+    except FileExistsError:
+        raise ValueError('preview file already exists: %s' % path) from None
+    with os.fdopen(fd, 'wb') as output:
+        output.write(data)
+
+
+def _replace_windows(path, replacement, backup):
+    import ctypes
+    from ctypes import wintypes
+    replace = ctypes.WinDLL('kernel32', use_last_error=True).ReplaceFileW
+    replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                        wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID]
+    replace.restype = wintypes.BOOL
+    if not replace(str(path), str(replacement), str(backup), 0, None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _replace_posix(path, replacement, backup):
+    """Back up first, then publish with one atomic rename: the destination never disappears."""
+    try:
+        os.link(path, backup)
+    except FileExistsError:
+        raise
+    except OSError:
+        # No hard links on this filesystem; the exclusive open still refuses to reuse a backup name.
+        with open(path, 'rb') as source, open(backup, 'xb') as target:
+            shutil.copyfileobj(source, target)
+    try:
+        os.replace(replacement, path)
+    except BaseException:
+        try:
+            if Path(backup).read_bytes() == Path(path).read_bytes():
+                os.unlink(backup)
+        except OSError:
+            pass
+        raise
+
+
 def _replace_with_backup(path, replacement, backup):
     """Save the version displaced at commit time, not an earlier read snapshot."""
     if os.name == 'nt':
-        import ctypes
-        from ctypes import wintypes
-        replace = ctypes.WinDLL('kernel32', use_last_error=True).ReplaceFileW
-        replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
-                            wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID]
-        replace.restype = wintypes.BOOL
-        if not replace(str(path), str(replacement), str(backup), 0, None, None):
-            raise ctypes.WinError(ctypes.get_last_error())
+        _replace_windows(path, replacement, backup)
     else:
-        # Conservative portable fallback: preserve the actual destination, then
-        # publish only if nobody created a newer file during the short gap.
-        os.replace(path, backup)
-        try:
-            os.link(replacement, path)
-        except BaseException:
-            try:
-                os.link(backup, path)
-            except FileExistsError:
-                pass
-            raise
+        _replace_posix(path, replacement, backup)
+
+
+def _restore_original(path, backup):
+    """After a failed replacement, ReplaceFileW (error 1177) can leave the original only as the backup."""
+    if path.exists() or not backup.exists():
+        return
+    try:
+        os.rename(backup, path)
+    except OSError as error:
+        raise RuntimeError('Could not restore the client configuration; the original is saved as %s (%s)'
+                           % (backup, error.strerror or error)) from error
 
 
 def write_backed_up(path, original, updated, backup_dir):
@@ -145,7 +314,11 @@ def write_backed_up(path, original, updated, backup_dir):
             output.write(updated)
         if path.read_bytes() != original:
             raise RuntimeError('Client configuration changed before replacement')
-        _replace_with_backup(path, Path(temporary), backup)
+        try:
+            _replace_with_backup(path, Path(temporary), backup)
+        except BaseException:
+            _restore_original(path, backup)
+            raise
         if backup.read_bytes() != original:
             # A late edit was atomically displaced. Keep it in the recovery
             # backup and restore it when the destination is still our version.
@@ -154,7 +327,12 @@ def write_backed_up(path, original, updated, backup_dir):
                 displaced = backup.with_suffix('.displaced.bak')
                 try:
                     shutil.copyfile(backup, recovery)
-                    _replace_with_backup(path, recovery, displaced)
+                    try:
+                        _replace_with_backup(path, recovery, displaced)
+                    except BaseException:
+                        if not path.exists():
+                            shutil.copyfile(backup, path)
+                        raise
                 finally:
                     if recovery.exists():
                         recovery.unlink()
@@ -165,31 +343,47 @@ def write_backed_up(path, original, updated, backup_dir):
     return backup
 
 
+def run(args):
+    path = Path(args.settings)
+    original = read_file(path, 'OpenCode settings file', ' (use --settings; OpenCode also reads opencode.json)')
+    document, style, commented = parse_settings(original, str(path))
+    entries = routable_entries(args.relay_config)
+    result = update_document(document, entries)
+    unchanged = result == document
+    encoded = original if unchanged else encode_settings(result, style)
+    if args.write and commented and not unchanged and not args.allow_reformat:
+        raise ValueError('%s contains comments that rewriting would remove; remove them or add --allow-reformat '
+                         '(the backup keeps the original)' % path)
+    if args.output:
+        preview = encoded if args.include_secrets else encode_settings(mask_document(result), style)
+        write_preview(args.output, preview)
+    backup = write_backed_up(path, original, encoded, args.backup_dir) if args.write and not unchanged else None
+    print(json.dumps({'models': len(entries), 'written': backup is not None, 'changed': not unchanged,
+                      'backup': str(backup) if backup else None, 'preview': args.output,
+                      'preview_redacted': bool(args.output) and not args.include_secrets,
+                      'comments_dropped': commented and not unchanged}, ensure_ascii=False))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--relay-config', default=str(Path(__file__).resolve().parents[1] / 'config.json'))
     parser.add_argument('--settings', default=str(Path.home() / '.config/opencode/opencode.jsonc'))
     parser.add_argument('--output', help='New private preview JSON file; never overwritten')
+    parser.add_argument('--include-secrets', action='store_true',
+                        help='Keep credentials in the --output preview; they are masked as *** by default')
     parser.add_argument('--write', action='store_true')
     parser.add_argument('--backup-dir')
+    parser.add_argument('--allow-reformat', action='store_true',
+                        help='Allow --write to rewrite a file with comments, which are then removed')
     args = parser.parse_args(argv)
     if args.write and not args.backup_dir:
         parser.error('--write requires --backup-dir')
-    accounts = load_accounts(args.relay_config)
-    entries = [entry for entry in models.catalog() if models.catalog_routable(entry, {'accounts': accounts})]
-    path = Path(args.settings)
-    original = path.read_bytes()
-    document = json.loads(original.decode('utf-8-sig'))
-    result = update_document(document, entries)
-    encoded = (json.dumps(result, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
-    if args.output:
-        with Path(args.output).open('xb') as output:
-            output.write(encoded)
-    backup = write_backed_up(path, original, encoded, args.backup_dir) if args.write else None
-    print(json.dumps({'models': len(entries), 'written': bool(args.write),
-                      'backup': str(backup) if backup else None,
-                      'preview': args.output}, ensure_ascii=False))
-    return 0
+    try:
+        return run(args)
+    except (ValueError, RuntimeError, OSError) as error:
+        print('error: %s' % error, file=sys.stderr)
+        return 1
 
 
 if __name__ == '__main__':
