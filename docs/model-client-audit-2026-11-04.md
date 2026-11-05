@@ -133,6 +133,12 @@ prefix; the following unchanged tool round trip preserves the new prefix again.
 Latest inline effort updates are retained. Conflicting thinking controls and
 unsupported turn-scoped `clear_at` are rejected before inference.
 
+Superseded after the PR review: only leading system messages form the head. Later
+non-empty ones stay in place as `<system-reminder>` user text with
+`x-proxi-system-messages: inline-as-user-text`, so the head, the signed prefix and
+the cache survive them; blank effort records add nothing. Details and live checks:
+[relay-quality-and-prompts.md](relay-quality-and-prompts.md).
+
 Three isolated live gateway checks returned the expected markers for standalone
 custom policy (Chat), unknown-client instructions (Responses), and inline system
 guidance (Messages). All three HTTP 200; reported total 0.02656 credits. The real
