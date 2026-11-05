@@ -121,7 +121,11 @@ export const RESET_DATE = nextReset();
 
 const pseudo = (i) => Math.abs((Math.sin((i + 1) * 12.9898) * 43758.5453) % 1);
 
-/** Deterministic metrics for a window: buckets plus totals that match them. */
+/**
+ * Deterministic metrics for a window: buckets plus totals that match them, in the shape of the relay's journal.metrics():
+ * the credits include the cache refresh pings (keepwarm_* is their part), a window is covered completely, no attempt
+ * is unknown and no turn waits for its price. A test overrides what it needs through mockAdmin's metricsPatch.
+ */
 export function metricsFor(windowSec) {
   const count = windowSec <= 3600 ? 60 : windowSec <= 21600 ? 72 : 96;
   const step = windowSec / count;
@@ -131,9 +135,11 @@ export function metricsFor(windowSec) {
     const wave = 0.55 + 0.45 * Math.sin(i / (count / 9) + 1);
     const load = idle ? 0 : Math.max(0.15, wave * (0.5 + pseudo(i)));
     const requests = Math.round(load * 3.4 * (step / 60) ** 0.5);
+    const credits = Number((load * 0.075 * (step / 60)).toFixed(4));
     return {
-      t, requests,
-      credits: Number((load * 0.075 * (step / 60)).toFixed(4)),
+      t, requests, credits,
+      keepwarm_credits: i % 7 === 3 ? Number((credits * 0.25).toFixed(4)) : 0,
+      credits_unknown: 0, credits_complete: true,
       cache_read: Math.round(load * 4200 * (step / 60)),
       cache_write: (i === Math.floor(count * 0.55) || i === Math.floor(count * 0.82)) && !idle
         // The cache went cold: the whole prefix is written again
@@ -154,10 +160,15 @@ export function metricsFor(windowSec) {
     totals: {
       requests: sum('requests'), errors: Math.round(3 * scale), turns: Math.round(12 * scale), tools: Math.round(5 * scale),
       commands: Math.round(2 * scale), credits: Number(sum('credits').toFixed(4)), cache_read: read, cache_write: write,
+      keepwarm_credits: Number(sum('keepwarm_credits').toFixed(4)), keepwarm_pings: buckets.filter((b) => b.keepwarm_credits > 0).length,
+      keepwarm_unknown: 0, credits_unknown: 0, credits_complete: true, credits_in_progress: 0,
       input_tokens: input, cache_hit_ratio: read / (read + write + input), latency_p50: 3500, latency_p95: 7000,
       ttft_p50: 2100, ttft_p95: 4000,
     },
     models: { 'claude-opus-5-5': Math.round(9 * scale), 'gpt-5.5': Math.round(3 * scale) },
+    // The journal reaches back past the window: covered_from <= now - window is what "complete" means
+    coverage: { complete: true, window_start: Math.floor((NOW - windowSec) / 60) * 60, covered_from: NOW - windowSec - 600,
+      covered_seconds: windowSec, oldest_event_ts: NOW - windowSec - 600, buffer_oldest_ts: NOW - 2400, buffer_events: 0, buffer_capacity: 20000 },
   };
 }
 

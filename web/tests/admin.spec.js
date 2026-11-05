@@ -490,10 +490,10 @@ test('incomplete usage is not shown as free inference or a reliable forecast', a
 });
 
 test('periods without a complete price are marked on the spend chart and summed as a lower bound', async ({ page }) => {
-  // Period 21 holds a known part of its price, period 31 none at all
-  const buckets = metricsFor(3600).buckets.map((bucket, i) => (i === 20 ? { ...bucket, credits: 0.2, credits_complete: false }
-    : i === 30 ? { ...bucket, credits: 0, credits_complete: false } : bucket));
-  await mockAdmin(page, { metricsPatch: { buckets, totals: { credits_complete: false } } });
+  // Period 21 holds a known part of its price, period 31 none at all; the relay counts the unpriced requests in both
+  const buckets = metricsFor(3600).buckets.map((bucket, i) => (i === 20 ? { ...bucket, credits: 0.2, credits_unknown: 1, credits_complete: false }
+    : i === 30 ? { ...bucket, credits: 0, credits_unknown: 1, credits_complete: false } : bucket));
+  await mockAdmin(page, { metricsPatch: { buckets, totals: { credits_complete: false, credits_unknown: 2 } } });
   await login(page);
   const chart = page.getByRole('slider', { name: /Расход кредитов/ });
   await expect(chart).toHaveAttribute('aria-label', /всего не менее \d+,\d\d, максимум не менее \d+,\d\d\. В 2 периодах стоимость сообщена не полностью/);
@@ -508,10 +508,12 @@ test('periods without a complete price are marked on the spend chart and summed 
   for (let i = 0; i < 20; i += 1) await chart.press('ArrowRight');
   await expect(chart).toHaveAttribute('aria-valuenow', '21');
   await expect(chart).toHaveAttribute('aria-valuetext', /кредиты не менее 0,20/);
+  await expect(chart).toHaveAttribute('aria-valuetext', /без цены 1/);
   await expect(page.locator('.chart-tip')).toContainText('≥ 0,20');
   for (let i = 0; i < 10; i += 1) await chart.press('ArrowRight');
   await expect(chart).toHaveAttribute('aria-valuenow', '31');
   await expect(chart).toHaveAttribute('aria-valuetext', /кредиты не сообщены/);
+  await expect(chart).toHaveAttribute('aria-valuetext', /без цены 1/);
   await expect(page.locator('.chart-tip dd').first()).toContainText('—');
 });
 
@@ -527,17 +529,16 @@ test('a spend chart whose prices are all reported has no lower-bound marks', asy
 
 const clock = (ts) => new Date(ts * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', hour12: false });
 
-test('a window the journal covers only in part says from when, greys out the charts before that and withholds the forecast', async ({ page }) => {
+test('a window the journal covers only in part says how much it covers and greys out the charts before that', async ({ page }) => {
   const from = NOW - 600;
   await mockAdmin(page, { metricsPatch: { coverage: { complete: false, window_start: NOW - 3600, covered_from: from, covered_seconds: 600,
     oldest_event_ts: from + 12, buffer_oldest_ts: from - 100, buffer_events: 40, buffer_capacity: 20000 } } });
   await login(page);
   const notice = page.locator('.banner.tone-warn');
   await expect(notice).toContainText('Журнал покрывает окно не полностью');
-  await expect(notice).toContainText(`данные с ${clock(from)}`);
-  await expect(notice).toContainText('10 мин из 60 мин');
-  await expect(page.locator('.forecast')).toContainText('журнал покрывает только часть окна');
-  await expect(page.locator('.forecast')).not.toContainText('хватит примерно');
+  await expect(notice).toContainText('данные за 10 мин из окна 60 мин');
+  await expect(notice).toContainText(`(с ${clock(from)})`);
+  await expect(notice).toContainText('Суммы за окно неполные');
   // Both charts grey out what the journal does not cover: 49 of the 60 one-minute periods end before it began
   await expect(page.locator('.c-uncovered')).toHaveCount(2);
   const spend = page.locator('svg.chart').first();
@@ -567,9 +568,9 @@ test('the gap follows the window that is chosen', async ({ page }) => {
   const from = NOW - 600;
   await mockAdmin(page, { metricsPatch: { coverage: { complete: false, covered_from: from, covered_seconds: 600 } } });
   await login(page);
-  await expect(page.locator('.banner.tone-warn')).toContainText('10 мин из 60 мин');
+  await expect(page.locator('.banner.tone-warn')).toContainText('данные за 10 мин из окна 60 мин');
   await page.getByRole('group', { name: 'Окно метрик' }).getByRole('button', { name: '6 ч' }).click();
-  await expect(page.locator('.banner.tone-warn')).toContainText('10 мин из 6 ч');
+  await expect(page.locator('.banner.tone-warn')).toContainText('данные за 10 мин из окна 6 ч');
   await expect(page.locator('.c-uncovered')).toHaveCount(2);
   const spend = page.locator('svg.chart').first();
   await expect(spend).toHaveAttribute('aria-valuemax', '72');
@@ -578,6 +579,89 @@ test('the gap follows the window that is chosen', async ({ page }) => {
   await spend.press('ArrowLeft');
   await expect(spend).toHaveAttribute('aria-valuenow', '71');
   await expect(spend).not.toHaveAttribute('aria-valuetext', /журнал начат позже/);
+});
+
+// The spend of a half covered window is that of its covered half: dividing by the whole window would halve the rate
+for (const [name, coverage, figure, basis] of [
+  ['completely', { complete: true, covered_seconds: 3600, covered_from: NOW - 4200 }, '86,40', 'последний час'],
+  ['for half of it', { complete: false, covered_seconds: 1800, covered_from: NOW - 1800 }, '172,80', '30 мин'],
+  ['for exactly the shortest stretch a forecast needs', { complete: false, covered_seconds: 300, covered_from: NOW - 300 }, '1 036,80', '5 мин'],
+]) {
+  test(`the burn rate divides the spend by what the journal covers: window covered ${name}`, async ({ page }) => {
+    await mockAdmin(page, { metricsPatch: { totals: { credits: 3.6 }, coverage } });
+    await login(page);
+    await expect(page.locator('.forecast')).toContainText(`При темпе за ${basis}`);
+    await expect(page.locator('.forecast b').first()).toHaveText(figure);
+    await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+  });
+}
+
+for (const [name, coverage, reason] of [
+  ['shorter than the shortest stretch a forecast needs', { complete: false, covered_seconds: 299, covered_from: NOW - 299 }, 'журнал покрывает меньше 5 минут'],
+  ['of an unknown length', { complete: false, covered_from: NOW - 900 }, 'неизвестно, какую часть окна покрывает журнал'],
+]) {
+  test(`no forecast from a window covered ${name}`, async ({ page }) => {
+    await mockAdmin(page, { metricsPatch: { totals: { credits: 3.6 }, coverage } });
+    await login(page);
+    await expect(page.locator('.forecast')).toContainText(`Прогноз недоступен: ${reason}`);
+    await expect(page.locator('.forecast')).not.toContainText('хватит примерно');
+  });
+}
+
+test('a gap in the price withholds the forecast even when the whole window is covered', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { credits: 3.6, credits_complete: false, credits_unknown: 1 } } });
+  await login(page);
+  await expect(page.locator('.forecast')).toContainText('Прогноз недоступен: часть стоимости не сообщена');
+});
+
+test('the spend figure is the relay\'s total: the cache refresh is named beside it, never added to it', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { credits: 2, keepwarm_credits: 0.5, keepwarm_pings: 3, credits_in_progress: 2 } } });
+  await login(page);
+  const spent = page.locator('.stat', { hasText: 'Потрачено за окно' });
+  await expect(spent.locator('.stat-value')).toHaveText('2,00');
+  // The note stays one short line: a turn still waiting for its price is named, the refresh is not
+  await expect(spent.locator('.stat-note')).toContainText('ждём цену: 2 хода');
+  await expect(spent.locator('.stat-note')).not.toContainText('часть стоимости');
+  await expect(spent.locator('.stat-note')).not.toContainText('прогрев');
+  const warm = page.locator('.cache-facts dl div', { hasText: 'прогрев кэша' });
+  await expect(warm.locator('dd')).toHaveText('0,50');
+  await expect(warm.locator('dd')).toHaveAttribute('title', /Входит в расход за окно\. Обращений для прогрева: 3/);
+});
+
+test('without a cache refresh in the window there is no row for it', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { keepwarm_credits: 0, keepwarm_pings: 0 } } });
+  await login(page);
+  await expect(page.locator('.cache-facts dl div')).toHaveCount(3);
+  await expect(page.locator('.cache-facts')).not.toContainText('прогрев кэша');
+});
+
+test('a lower-bound spend names how many requests have no price; an unpriced cache refresh makes its share a lower bound too', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { credits: 2, credits_complete: false, credits_unknown: 3, keepwarm_unknown: 1, keepwarm_credits: 0.5, keepwarm_pings: 2 } } });
+  await login(page);
+  const spent = page.locator('.stat', { hasText: 'Потрачено за окно' });
+  await expect(spent.locator('.stat-value')).toHaveText('≥ 2,00');
+  await expect(spent.locator('.stat-note')).toContainText('часть стоимости не сообщена (без цены: 3)');
+  const warm = page.locator('.cache-facts dl div', { hasText: 'прогрев кэша' });
+  await expect(warm.locator('dd')).toHaveText('≥ 0,50');
+  await expect(warm.locator('dd')).toHaveAttribute('title', /без цены: 1/);
+});
+
+test('a period of the spend chart names its cache refresh and its unpriced requests', async ({ page }) => {
+  const buckets = metricsFor(3600).buckets.map((bucket, i) => (i === 20
+    ? { ...bucket, credits: 0.3, keepwarm_credits: 0.05, credits_unknown: 2, credits_complete: false } : bucket));
+  await mockAdmin(page, { metricsPatch: { buckets, totals: { credits_complete: false, credits_unknown: 2 } } });
+  await login(page);
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
+  await chart.focus();
+  await chart.press('Home');
+  for (let i = 0; i < 20; i += 1) await chart.press('ArrowRight');
+  await expect(chart).toHaveAttribute('aria-valuetext', /кредиты не менее 0,30, в т\. ч\. прогрев кэша 0,05, без цены 2, запросы /);
+  await expect(page.locator('.chart-tip')).toContainText('в т. ч. прогрев кэша');
+  await expect(page.locator('.chart-tip')).toContainText('без цены');
+  // The figure is the bucket's credits as the relay sent them: the refresh is not added on top
+  await expect(page.locator('.chart-tip dd').first()).toContainText('≥ 0,30');
+  await chart.press('ArrowRight');
+  await expect(chart).not.toHaveAttribute('aria-valuetext', /прогрев кэша|без цены/);
 });
 
 for (const [name, coverage] of [

@@ -161,7 +161,10 @@ const diamond = (x, y, r = 4) => `M${x.toFixed(1)},${(y - r).toFixed(1)}L${(x + 
 const spendRows = (bucket) => {
   const credits = bucket.credits_complete === false
     ? bucket.credits > 0 ? [`≥ ${fmtFixed(bucket.credits, 2)}`] : ['—', 'не сообщены'] : [fmtFixed(bucket.credits, 2)];
-  return [['кредиты', ...credits], ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
+  // The credits already contain the cache refresh pings: their part is named, never added to the figure
+  const warm = bucket.keepwarm_credits > 0 ? [['в т. ч. прогрев кэша', fmtFixed(bucket.keepwarm_credits, 2)]] : [];
+  const unpriced = bucket.credits_unknown > 0 ? [['без цены', fmtInt(bucket.credits_unknown)]] : [];
+  return [['кредиты', ...credits], ...warm, ...unpriced, ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
 };
 
 const NO_DATA = 'нет данных: журнал начат позже';

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { STALE_AFTER, buildTraces, costOf, phasesOf, scaleOf, statusAt } from '../src/turns.js';
-import { coverageOf, fmtSince, fmtSpan, uncoveredBuckets } from '../src/coverage.js';
+import { MIN_FORECAST_SECONDS, burnRate, coverageOf, coveredSeconds, fmtSince, fmtSpan, uncoveredBuckets } from '../src/coverage.js';
 
 const ev = (ts, kind, data = {}) => ({ ts, kind, data, turn_id: 'test-turn' });
 const finish = (ts, duration, reason = 'stop') => ev(ts, 'turn.end', { reason, duration_ms: duration });
@@ -361,6 +361,48 @@ test('the coverage start falls back to the oldest event; invalid numbers are ign
   assert.equal(seconds(99999), 3600);
   assert.equal(seconds('600'), null);
   assert.equal(seconds(undefined), null);
+});
+
+test('the covered seconds are what the relay reports within the window; only an explicit gap shortens the window', () => {
+  assert.equal(coveredSeconds(undefined, 3600), 3600);
+  assert.equal(coveredSeconds({}, 3600), 3600);
+  assert.equal(coveredSeconds({ coverage: { complete: true, covered_seconds: 3600 } }, 3600), 3600);
+  // Without an explicit complete: false the figure the relay sent is not a gap, whatever else it says
+  assert.equal(coveredSeconds({ coverage: { covered_seconds: 100 } }, 3600), 3600);
+  assert.equal(coveredSeconds({ coverage: { complete: true, covered_seconds: 100 } }, 3600), 3600);
+  assert.equal(coveredSeconds({ coverage: { complete: false, covered_seconds: 600 } }, 3600), 600);
+  assert.equal(coveredSeconds({ coverage: { complete: false, covered_seconds: 99999 } }, 3600), 3600);
+  assert.equal(coveredSeconds({ coverage: { complete: false, covered_seconds: -4 } }, 3600), 0);
+  assert.equal(coveredSeconds({ coverage: { complete: false } }, 3600), null);
+  assert.equal(coveredSeconds({ coverage: { complete: false, covered_seconds: '600' } }, 3600), null);
+});
+
+const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} is not ${expected}`);
+const rateOf = (credits, coverage, windowSec = 3600) => burnRate({ totals: { credits }, coverage }, windowSec);
+
+test('the burn rate is credits * 86400 / min(window, covered seconds): the spend of the covered part, per day', () => {
+  near(rateOf(3.6, undefined).perDay, 86.4);
+  near(rateOf(3.6, { complete: true, covered_seconds: 3600 }).perDay, 86.4);
+  // Half of the window is covered: the same spend is twice the rate, not half of it
+  near(rateOf(3.6, { complete: false, covered_seconds: 1800 }).perDay, 172.8);
+  assert.equal(rateOf(3.6, { complete: false, covered_seconds: 1800 }).seconds, 1800);
+  // A longer covered stretch than the window is cut to the window, a shorter window to its own length
+  assert.equal(rateOf(3.6, { complete: false, covered_seconds: 21600 }, 3600).seconds, 3600);
+  assert.equal(rateOf(3.6, { complete: false, covered_seconds: 21600 }, 86400).seconds, 21600);
+  near(rateOf(36, { complete: false, covered_seconds: 21600 }, 86400).perDay, 144);
+});
+
+test('no burn rate is told from a stretch shorter than the minimum, an unknown one, or no spend', () => {
+  assert.equal(MIN_FORECAST_SECONDS, 300);
+  const short = rateOf(3.6, { complete: false, covered_seconds: MIN_FORECAST_SECONDS - 1 });
+  assert.deepEqual(short, { seconds: MIN_FORECAST_SECONDS - 1, short: true, perDay: null });
+  const enough = rateOf(3.6, { complete: false, covered_seconds: MIN_FORECAST_SECONDS });
+  assert.equal(enough.short, false);
+  near(enough.perDay, 1036.8);
+  assert.deepEqual(rateOf(3.6, { complete: false }), { seconds: null, short: false, perDay: null });
+  for (const credits of [0, -1, NaN, Infinity, undefined, null, '3.6']) assert.equal(rateOf(credits, undefined).perDay, null);
+  assert.equal(burnRate(null, 3600).perDay, null);
+  assert.equal(burnRate(undefined, 3600).seconds, 3600);
 });
 
 test('buckets that end before the coverage begins are no data; the newest bucket always is data', () => {

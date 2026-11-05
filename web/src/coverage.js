@@ -17,6 +17,34 @@ export function coverageOf(metrics, windowSec) {
   };
 }
 
+/** The shortest stretch of data a burn-rate forecast is worth making from, in seconds. */
+export const MIN_FORECAST_SECONDS = 300;
+
+/**
+ * How many seconds of the window the figures cover: what the relay reports, never more than the window. The whole
+ * window when the coverage is complete or not sent at all; null when the relay reports a gap without saying how
+ * long the covered part is (only an explicit `complete: false` is a gap).
+ */
+export function coveredSeconds(metrics, windowSec) {
+  const raw = metrics?.coverage;
+  if (!raw || raw.complete !== false) return windowSec;
+  return isNum(raw.covered_seconds) ? Math.min(windowSec, Math.max(0, raw.covered_seconds)) : null;
+}
+
+/**
+ * The burn rate in credits per day: `credits * 86400 / min(window, covered seconds)`. The spend is that of the part
+ * of the window the journal covers, so dividing it by the whole window would understate the rate of a journal that
+ * began a few minutes ago. `perDay` stays null when no rate can be told: the covered stretch is unknown (`seconds`
+ * null) or shorter than MIN_FORECAST_SECONDS (`short`), or nothing was spent.
+ */
+export function burnRate(metrics, windowSec) {
+  const seconds = coveredSeconds(metrics, windowSec);
+  const credits = metrics?.totals?.credits;
+  const short = seconds !== null && seconds < MIN_FORECAST_SECONDS;
+  const perDay = seconds !== null && !short && isNum(credits) && credits > 0 ? (credits * 86400) / seconds : null;
+  return { seconds, short, perDay };
+}
+
 /**
  * How many leading buckets end before the coverage begins: nothing is known about them, they are not zeros.
  * The newest bucket never counts, it takes every event up to now.
