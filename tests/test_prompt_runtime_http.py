@@ -7,7 +7,8 @@ import pytest
 import apierr
 import prompt_policy
 import validate
-from prompt_bodies import OPENCODE_TITLE_V2, service_body
+from prompt_bodies import (CODEX_BASE, CODEX_COLLABORATION, CODEX_HEADERS, CODEX_PERMISSIONS, OPENCODE_TITLE_V2,
+                           codex_body, service_body)
 from prompt_support import FakePlan, client_request, fake_relay, head_of, profile, prompt_relay  # noqa: F401
 
 DIALECTS = ["chat", "anthropic", "responses"]
@@ -334,3 +335,66 @@ def test_the_structured_contract_is_part_of_every_composed_head(prompt_relay):
     head = head_of(relay.posts[0])
     assert head.startswith(RULES + "\n\nCLIENT_SYSTEM\n\n[STRUCTURED OUTPUT FORMAT]")
     assert head.count("[STRUCTURED OUTPUT FORMAT]") == 1
+
+
+def test_a_codex_request_carries_its_system_in_the_leading_developer_items(prompt_relay):
+    # codex-rs 0.164 sends no `instructions`: the base text is the first developer item of `input`, others follow it
+    relay = fake_relay(prompt_relay)
+    mine(relay.prompts)
+    body = codex_body()
+    body["stream"] = False
+    assert relay.post("responses", body, CODEX_HEADERS)[0] == 200
+    (inp,) = relay.prompts.inputs
+    assert inp == prompt_policy.PlanInput(
+        dialect="responses", client="codex", agent="", purpose="client-tools", request_class="",
+        model="gpt-6-sol", requested_model="gpt-6-sol", virtual_profile=None, header_profile=None,
+        tools=True, structured=False, has_client_system=True, conversation_key="header:synthetic-codex-session")
+    system = "\n\n".join([CODEX_BASE, CODEX_PERMISSIONS, CODEX_COLLABORATION])
+    assert head_of(relay.posts[0]) == RULES + "\n\n" + system
+    assert [message["role"] for message in relay.posts[0]["messages"]] == ["system", "user", "user", "user"]
+    (entry,) = relay.prompts.records
+    assert entry["client"] == "codex" and entry["request"]["body"]["input"][0]["role"] == "developer"
+    assert "instructions" not in entry["request"]["body"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_a_virtual_profile_the_parse_found_reaches_the_plan_and_its_refusal_the_client(
+        prompt_relay, monkeypatch, dialect, stream):
+    # validate.parse_* reads <model>@<profile> into parsed.virtual_profile and the name the client wrote into
+    # parsed.requested_model; the store answers a profile it does not have with a 404, a stream included
+    for name in ("parse_chat", "parse_anthropic", "parse_responses"):
+        original = getattr(validate, name)
+
+        def parse(data, cfg, _original=original):
+            parsed = _original(data, cfg)
+            parsed.virtual_profile, parsed.requested_model = "ghost", "claude-opus-5-5@ghost"
+            return parsed
+
+        monkeypatch.setattr(validate, name, parse)
+    relay = fake_relay(prompt_relay)
+    relay.prompts.refuse = lambda inp: apierr.ApiError(
+        404, "not_found_error", "the model names the profile '%s', which does not exist" % inp.virtual_profile,
+        param="model") if inp.virtual_profile == "ghost" else None
+    status, body, headers = relay.post(dialect, client_request(dialect, USER, stream=stream), affinity())
+    assert status == 404 and "json" in headers["content-type"]
+    assert "'ghost'" in body["error"]["message"]
+    if dialect == "anthropic":
+        assert body["error"]["type"] == "not_found_error"
+    else:
+        assert body["error"]["param"] == "model"
+    (inp,) = relay.prompts.inputs
+    assert (inp.virtual_profile, inp.requested_model) == ("ghost", "claude-opus-5-5@ghost")
+    assert relay.posts == [] and not relay.runtime.pool._active
+
+
+def test_a_browser_client_may_send_the_profile_header_and_the_other_proxi_headers(relay):
+    with relay.request("/v1/chat/completions", method="OPTIONS",
+                       headers={"Origin": "http://client.invalid",
+                                "Access-Control-Request-Headers": "x-proxi-profile"}) as response:
+        allowed = [name.strip() for name in response.headers["access-control-allow-headers"].split(",")]
+    assert "x-proxi-profile" in allowed
+    assert {"x-proxi-client", "x-proxi-agent", "x-proxi-session-id", "authorization", "content-type"} <= set(allowed)
+    with relay.request("/v1/chat/completions", {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]},
+                       headers={"Origin": "http://client.invalid", "x-proxi-profile": "mine"}) as response:
+        assert "x-proxi-profile" in response.headers["access-control-allow-headers"]

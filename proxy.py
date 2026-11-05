@@ -195,8 +195,8 @@ def make_handler(runtime: Runtime):
                              "authorization, x-api-key, anthropic-version, anthropic-beta, content-type, "
                              "x-request-id, x-session-affinity, x-session-id, x-opencode-session, "
                              "x-proxi-client, x-proxi-session-id, x-proxi-chat-title, x-proxi-agent, "
-                             "x-proxi-parent-session-id, x-opencode-session-id, x-opencode-parent-session-id, "
-                             "x-claude-code-session-id, x-claude-code-agent-id")
+                             "x-proxi-parent-session-id, x-proxi-profile, x-opencode-session-id, "
+                             "x-opencode-parent-session-id, x-claude-code-session-id, x-claude-code-agent-id")
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
             self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after, "
                              "x-proxi-ignored-parameters, x-proxi-system-messages, "
