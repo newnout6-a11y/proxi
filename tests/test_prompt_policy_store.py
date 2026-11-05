@@ -798,3 +798,86 @@ def test_the_example_of_the_plan_is_saved_and_served(tmp_path):
     assert store.plan(inp(client="codex")).legacy
     reloaded = pp.PromptStore({"prompts_file": str(tmp_path / "prompts.json")})
     assert reloaded.snapshot().document == snapshot.document and reloaded.errors() == []
+
+
+# -- a file that cannot be read at this instant is tried again, not given up on -----------------------------------------------
+
+
+def test_a_prompts_file_that_is_locked_for_a_moment_is_read_on_a_later_look(tmp_path, monkeypatch):
+    clock = Clock()
+    store = make_store(tmp_path, doc(), clock=clock)
+    rewrite(tmp_path / "prompts.json", doc("V2"))
+    real, failures = pathlib.Path.read_bytes, []
+
+    def locked(self):
+        if self == store.path and len(failures) < 3:
+            failures.append(1)
+            raise PermissionError(13, "The process cannot access the file because it is being used")
+        return real(self)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", locked)
+    since = mark()
+    tick(store, clock)
+    assert store.snapshot().rev == 1 and "cannot read the prompts file" in store.errors()[0]["message"]
+    tick(store, clock)
+    tick(store, clock)
+    assert len(failures) == 3 and store.snapshot().rev == 1
+    assert [event["kind"] for event in events(since)] == ["prompt.config_error"]     # the repeat is journaled once
+    tick(store, clock)
+    assert store.snapshot().rev == 2 and store.errors() == []
+    assert [event["kind"] for event in events(since)] == ["prompt.config_error", "prompt.reload"]
+
+
+def test_a_text_file_that_is_locked_for_a_moment_is_read_on_a_later_look(tmp_path, monkeypatch):
+    clock = Clock()
+    (tmp_path / "t.md").write_text("one", encoding="utf-8")
+    store = make_store(tmp_path, text_document(), clock=clock)
+    (tmp_path / "t.md").write_text("two!", encoding="utf-8")
+    real, failures = open, []
+
+    def locked(file, *args, **kwargs):
+        if str(file).endswith("t.md") and len(failures) < 2:
+            failures.append(1)
+            raise PermissionError(13, "in use")
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(pp, "open", locked, raising=False)
+    since = mark()
+    tick(store, clock)
+    assert store.snapshot().rev == 1 and "cannot read the file" in store.errors()[0]["message"]
+    assert store.errors()[0]["param"] == "texts.t.file"
+    tick(store, clock)
+    assert len(events(since)) == 1
+    tick(store, clock)
+    assert store.snapshot().rev == 2 and store.snapshot()._data.texts["t"] == "two!" and store.errors() == []
+
+
+def test_a_file_rewritten_while_it_is_being_read_is_not_judged_by_its_old_bytes(tmp_path, monkeypatch):
+    clock = Clock()
+    store = make_store(tmp_path, doc(), clock=clock)
+    (tmp_path / "prompts.json").write_text('{"version": 1, "profiles": ', encoding="utf-8")
+    info = (tmp_path / "prompts.json").stat()
+    os.utime(tmp_path / "prompts.json", ns=(info.st_atime_ns, info.st_mtime_ns + 5_000_000_000))
+    real = pp.json.loads
+
+    def loads_while_the_editor_finishes(text, **kwargs):
+        monkeypatch.setattr(pp.json, "loads", real)
+        rewrite(tmp_path / "prompts.json", doc("DONE"))
+        return real(text, **kwargs)
+
+    monkeypatch.setattr(pp.json, "loads", loads_while_the_editor_finishes)
+    tick(store, clock)
+    assert store.snapshot().rev == 1 and "invalid JSON" in store.errors()[0]["message"]
+    tick(store, clock)
+    assert store.snapshot().rev == 2 and store.errors() == []
+    assert store.snapshot().document["profiles"]["a"]["head"] == "DONE"
+
+
+def test_every_new_judgement_of_a_bad_file_is_journaled(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, doc(), clock=clock)
+    since = mark()
+    for index in range(3):
+        rewrite(tmp_path / "prompts.json", document(profiles={"p": {"head": "{{nope}}" + " " * index}}))
+        tick(store, clock)
+    assert [event["kind"] for event in events(since)] == ["prompt.config_error"] * 3
