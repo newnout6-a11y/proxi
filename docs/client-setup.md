@@ -356,10 +356,17 @@ Markdown fence is removed, the JSON is parsed and validated against the common
 subset of the schema (`type`, `properties`, `required`, `additionalProperties`,
 `items`, `enum`, `anyOf`, nullable, local `$ref`; unknown keywords never reject).
 Nothing of that reply reaches Codex before the check passes. An invalid reply ends
-the stream with an SSE `error` event (non-stream: `502 upstream_invalid_output`
-with `x-should-retry: false`) and its credits stay accounted. Codex then decides how
-often to ask again within its own `stream_max_retries`; every retry is a paid
-request. `x-proxi-output-format: validated-json-schema` marks the emulation, and a
+the stream with an SSE `error` event and then `response.failed` with code
+`invalid_prompt` (non-stream: `502 upstream_invalid_output` with
+`x-should-retry: false`), and its credits stay accounted. Codex ignores the `error`
+event but handles `response.failed`: it stops at once and prints the message (the
+schema path that failed). Without `response.failed` it saw the stream end before
+`response.completed` and asked again up to `stream_max_retries` (5) times, each a paid
+request, never showing the reason; a live run of codex-cli 0.164.0 sent 6 requests
+before and sends 1 now. Temporary failures (`upstream_error`, a timeout, a rate limit)
+get a code Codex retries, and `insufficient_credits` becomes `insufficient_quota`,
+for which Codex prints its own fixed quota text. The README lists the mapping.
+`x-proxi-output-format: validated-json-schema` marks the emulation, and a
 format combined with a required tool call is rejected with 422. This is
 post-validation, not constrained decoding: a live check on 2026-11-05 (`gpt-6-sol`,
 `gpt-5.5`, a `project_name`/`programming_languages` schema) returned valid bare JSON,

@@ -759,6 +759,40 @@ relay переводится, и клиент не встречает тип, к
 `billing_error`, 403 `permission_error`, 404 `not_found_error`, 409 `conflict_error`, 413
 `request_too_large`, 429 `rate_limit_error`, 503 `overloaded_error`, 504 `timeout_error`, прочие
 5xx `api_error`, прочие 4xx `invalid_request_error`.
+
+### Ошибка после начала потока Responses
+
+Если запрос Responses упал, когда поток уже открыт (невалидный structured-ответ, обрыв
+upstream, таймаут хода, отказ по кредитам или лимиту), relay присылает `event: error`, затем
+терминальное `response.failed` и `data: [DONE]`. У `response.failed` тот же `id`, что у
+`response.created`, `status: "failed"` и `error: {code, message}`; у обоих событий есть
+`sequence_number`, а у `error` ещё `relay_code` (собственный код relay), `request_id` и,
+если есть, `diagnostic_id`. Форматы ошибок потока Chat и Messages не менялись.
+
+Код (`error.code`) решает, повторит ли клиент запрос. Codex 0.164.0 игнорирует `error` и без
+`response.failed` видел обрыв до `response.completed`, молча повторял запрос до
+`stream_max_retries` (5) раз, а повторы оплачиваются. Теперь он классифицирует код
+(`codex-api/src/sse/responses_error.rs`, `protocol/src/error.rs`, `core/src/responses_retry.rs`):
+
+| код relay | код Responses | Codex |
+| --- | --- | --- |
+| `upstream_invalid_output`, `upstream_empty_turn`, `upstream_attempt_limit`, `upstream_tool_choice_ignored`, `invalid_request_error`, `unprocessable_entity`, `prompt_too_large` и прочие 4xx | `invalid_prompt` | не повторяет, печатает сообщение |
+| `insufficient_credits` | `insufficient_quota` | не повторяет, печатает свой текст «Quota exceeded…» |
+| `rate_limit_error` | `rate_limit_exceeded` | повторяет; ждёт столько, сколько названо в сообщении |
+| `upstream_error`, `upstream_auth_error`, `upstream_timeout`, `service_unavailable`, `internal_error` | `server_error` | повторяет с собственной паузой 0,2 с × 2ⁿ (до 5 раз) |
+
+Для лимита, который закончится не позже чем через 60 с, сообщение получает хвост
+`Please try again in 20s.` в форме, которую разбирает Codex. Длиннее подсказки нет: Codex
+выдерживает названную паузу целиком перед каждым из своих пяти повторов, верхней границы у
+него нет (живая проверка: с подсказкой 900 с он через 25 с всё ещё спал). Без подсказки
+запросы идут быстро и мгновенно получают тот же отказ, пока все аккаунты в лимите (до
+апстрима они не доходят и ничего не стоят), и Codex печатает сообщение с оставшимся
+временем. Живая проверка codex-cli 0.164.0 (запросов к relay до исправления → после):
+невалидный structured-ответ, `prompt_too_large`, поздний 422 и нехватка кредитов — 6 → 1;
+сбой upstream — 6 → 6, но с настоящей причиной вместо «stream closed before
+response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) получает оба события и
+чисто завершает поток; `responses.stream().get_final_response()` по-прежнему бросает
+`RuntimeError`, потому что `response.completed` не приходил.
 ## Ограничения (важно)
 
 - Retool на прямом транспорте (`copilotStreamGPT`) принимает клиентские инструменты

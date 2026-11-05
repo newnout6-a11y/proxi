@@ -560,11 +560,13 @@ def test_http_a_timed_out_structured_turn_is_a_504_and_keeps_its_cost(relay, dia
     relay.fake.script = [{'type': 'text', 'delta': '{"selected_memories":['},
                          {'type': 'credits', 'value': .5}, {'type': 'end', 'reason': 'timeout'}]
     status, headers, raw = post(relay, dialect, body(dialect, stream=stream))
-    expected = 'timeout_error' if dialect == 'anthropic' else 'upstream_timeout'
     if stream:
+        # A Responses stream names the failure with the code a client retries by, and keeps its own in relay_code.
+        expected = {'anthropic': 'timeout_error', 'responses': 'server_error'}.get(dialect, 'upstream_timeout')
         assert status == 200 and error_type(dialect, dict(sse_events(raw))['error']) == expected
         assert emitted_text(dialect, sse_events(raw)) == ''
     else:
+        expected = 'timeout_error' if dialect == 'anthropic' else 'upstream_timeout'
         assert status == 504 and json.loads(raw)['error']['type'] == expected
     assert relay.credits.used == [('turn', .5)]
 

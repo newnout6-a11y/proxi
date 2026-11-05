@@ -308,6 +308,7 @@ def make_handler(runtime: Runtime):
             self._error_code = None
             self._response_started = False
             self._client_trace = None
+            self._adapter = None
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -370,11 +371,7 @@ def make_handler(runtime: Runtime):
                 if err.status >= 400:
                     console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
                 if getattr(self, "_streaming", False):
-                    writer = self._writer
-                    writer.event("error", self._error_payload(dialect, err))
-                    # Journal must not report a mid-stream failure as 200/success.
-                    self._stream_status = err.status
-                    writer.done()
+                    self._stream_failure(dialect, err)
                 else:
                     self._respond_error(err, dialect)
             except Exception as exc:  # never leak a bare traceback
@@ -384,10 +381,7 @@ def make_handler(runtime: Runtime):
                              request_id=self.request_id, path=self.path)
                 err = apierr.internal(str(exc) or exc.__class__.__name__)
                 if getattr(self, "_streaming", False):
-                    writer = self._writer
-                    writer.event("error", self._error_payload(dialect, err))
-                    self._stream_status = err.status
-                    writer.done()
+                    self._stream_failure(dialect, err)
                 else:
                     self._respond_error(err, dialect)
             finally:
@@ -405,6 +399,17 @@ def make_handler(runtime: Runtime):
                             journal.emit("client.trace_failed", "Не удалось сохранить подробную трассу клиента",
                                          "warn", request_id=self.request_id)
                     client_context.reset(context_token)
+
+        def _stream_failure(self, dialect, err):
+            """End a stream that failed after it started. Only Responses has a terminal failure event."""
+            payload = self._error_payload(dialect, err)
+            if dialect == "responses":
+                self._adapter.fail(err, payload)  # error, then response.failed (see ResponsesAdapter.fail)
+            else:
+                self._writer.event("error", payload)
+            # Journal must not report a mid-stream failure as 200/success.
+            self._stream_status = err.status
+            self._writer.done()
 
         def _log_error(self, err):
             journal.emit("http.error", err.message, "error" if err.status >= 500 else "warn",
@@ -636,14 +641,16 @@ def make_handler(runtime: Runtime):
                 return
 
             writer = sse.StreamWriter(self)
+            # Built before the first byte: once the stream is open, any failure ends it through this adapter.
+            adapter = adapters.for_dialect(dialect, parsed, writer)
             self._writer = writer
+            self._adapter = adapter
             self._streaming = True
             writer.start({"x-request-id": self.request_id, "request-id": self.request_id,
                           **compatibility_headers})
             self._response_started = True
             self._model = parsed.model
             self._stream_status = 200
-            adapter = adapters.for_dialect(dialect, parsed, writer)
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)

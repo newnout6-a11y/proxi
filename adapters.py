@@ -332,6 +332,7 @@ class ResponsesAdapter(_Base):
         self.id = "resp_" + uuid.uuid4().hex[:20]
         self.created = int(time.time())
         self.seq = 0
+        self._begun = False
         self.item_id = "msg_" + uuid.uuid4().hex[:20]
         self.reasoning_id = "rs_" + uuid.uuid4().hex[:20]
         self._items = []
@@ -350,9 +351,28 @@ class ResponsesAdapter(_Base):
         self.writer.event(name, payload)
 
     def begin(self):
+        self._begun = True
         self._emit("response.created", {"response": {"id": self.id, "object": "response",
                                                      "created_at": self.created, "model": self.parsed.model,
                                                      "status": "in_progress", "output": []}})
+
+    def fail(self, error, extra=None):
+        """End a stream that failed after it started: an `error` event, then the terminal response.failed.
+
+        codex-rs ignores `error`; without response.failed it sees the stream end before response.completed,
+        asks again up to stream_max_retries times (every attempt paid) and never shows the message. Both events
+        carry the same code, so a client that stops at the first one, as ai-sdk does, classifies it alike. The
+        relay's own code stays in `relay_code`.
+        """
+        if not self.writer:
+            return
+        if not self._begun:
+            self.begin()  # response.failed needs the id that response.created announces
+        failure = error.responses_error()
+        self._emit("error", {**error.responses_envelope(), **(extra or {}), **failure, "relay_code": error.code})
+        self._emit("response.failed", {"response": {"id": self.id, "object": "response",
+                                                    "created_at": self.created, "model": self.parsed.model,
+                                                    "status": "failed", "output": [], "error": failure}})
 
     def _ensure_item(self, kind, item_id, call=None):
         if item_id in self._indices:
@@ -651,6 +671,9 @@ class StructuredOutputAdapter:
 
     def begin(self):
         self.adapter.begin()
+
+    def fail(self, error, extra=None):
+        self.adapter.fail(error, extra)
 
     def _release(self):
         self.released = True
