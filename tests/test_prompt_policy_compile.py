@@ -302,6 +302,14 @@ def test_a_file_cannot_leave_the_folder_of_the_prompts_file(tmp_path, name):
     assert "SECRET" not in str(raised.value)
 
 
+@pytest.mark.parametrize("name", ["NUL", "CON", "COM1", "LPT1", "aux.md", "prompts/NUL", "prompts/con.txt", "CONIN$",
+                                  "prompts/a.md:stream", "prompts/*.md", "prompts/a?.md", "prompts/.", "prompts/",
+                                  "\\\\?\\C:\\Windows\\win.ini", "\\\\.\\pipe\\x"])
+def test_devices_streams_wildcards_and_special_names_are_never_read_as_texts(tmp_path, name):
+    (tmp_path / "prompts").mkdir()
+    error = rejected(file_doc(name), tmp_path)
+    assert error.path == "texts.t.file"
+
 def test_an_absolute_path_inside_the_folder_is_still_refused(tmp_path):
     (tmp_path / "a.md").write_text("A", encoding="utf-8")
     error = rejected(file_doc(str(tmp_path / "a.md")), tmp_path)
