@@ -1,5 +1,6 @@
 """Local administration: public build assets and authenticated, bounded APIs."""
 import contextlib
+import copy
 import json
 import math
 import os
@@ -33,9 +34,10 @@ STREAM_HEARTBEAT = 10.0
 POOL_FIELDS = {"enabled", "priority", "label"}
 NEW_ACCOUNT_REQUIRED = ("base", "page_uuid", "cookie", "xsrf")
 NEW_ACCOUNT_OPTIONAL = ("label", "provider_resource_name", "openai_provider_resource_name")
-# Moved into accounts[0] when a single-account configuration becomes a pool.
+# Moved into accounts[0] when a single-account configuration becomes a pool. SessionPool reads
+# provider_access (like enabled, priority and label) only from the account record, never the root.
 ACCOUNT_RECORD_KEYS = ("base", "page_uuid", "cookie", "xsrf", "account_id", "thread_id", "label", "enabled",
-                       "priority", *models.PROVIDER_RESOURCE_KEY.values())
+                       "priority", "provider_access", *models.PROVIDER_RESOURCE_KEY.values())
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balance|renew))?")
@@ -552,7 +554,7 @@ class Admin:
                 if not (saved.get("cookie") and saved.get("xsrf")) or not self.cfg.get("_persist_auth", True):
                     raise apierr.conflict("The current account's session comes from RETOOL_COOKIE/RETOOL_XSRF, "
                                           "not config.json; move it into the file before adding accounts")
-                first = {key: saved[key] for key in ACCOUNT_RECORD_KEYS if key in saved}
+                first = {key: copy.deepcopy(saved[key]) for key in ACCOUNT_RECORD_KEYS if key in saved}
                 if not first.get("account_id") and self.cfg.get("account_id"):
                     first["account_id"] = self.cfg["account_id"]
                 for key in ("cookie", "xsrf"):
@@ -619,6 +621,11 @@ class Admin:
         for key in models.PROVIDER_RESOURCE_KEY.values():
             if first.get(key):
                 saved[key] = first[key]
+        # An access descriptor is bound to one account's resource and never inherited, so unlike a
+        # resource it is not handed to same-tenant accounts; the root must not keep the removed one's.
+        saved.pop("provider_access", None)
+        if first.get("provider_access"):
+            saved["provider_access"] = copy.deepcopy(first["provider_access"])
 
     def _pool_route(self, handler, path, match):
         allowed = ("GET", "POST") if match is None else ("POST",) if match.group(2) else ("PATCH", "DELETE")
