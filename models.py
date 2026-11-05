@@ -581,9 +581,9 @@ def codex_catalog(entries=None, snapshot=None):
     others as copies of their base (same text and overrides): Codex looks a model up by its exact slug in
     a provider catalog, so a virtual model needs its own entry. Without a snapshot the catalog is unchanged.
     """
-    models = list(CATALOG if entries is None else entries)
+    listed = list(CATALOG if entries is None else entries)
     result = []
-    for index, entry in enumerate(models + virtual_entries(models, snapshot)):
+    for index, entry in enumerate(listed + virtual_entries(listed, snapshot)):
         model = entry['virtual']['base'] if 'virtual' in entry else entry['id']
         instructions = _codex_text(snapshot, model)
         overrides = _codex_overrides(snapshot, model)
