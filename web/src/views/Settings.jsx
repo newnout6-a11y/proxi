@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { RotateCcw, Save, Search, SlidersHorizontal } from 'lucide-react';
 import { api } from '../api.js';
 import { usePolling } from '../useJournal.js';
 import { Dot, Page, ease } from '../motion.jsx';
 import { Button, CopyButton, Tag, Toggle, useToast } from '../ui.jsx';
-import { fmtInt, fmtTokens } from '../format.js';
+import { fmtInt, fmtTokens, isNum } from '../format.js';
 
 // Each group answers one question an operator actually has.
 export const GROUPS = [
@@ -75,8 +75,25 @@ const PROMPT_MODES = [
   { id: 'replace', title: 'Заменить роль клиента', text: 'Использовать свою роль вместо системных инструкций IDE' },
 ];
 
-function SystemInstructions({ settings, defaultPrompt, onChange, pending, disabled }) {
-  const standard = settings.relay_system_prompt === null;
+const ROLE_KEY = 'relay_system_prompt';
+const textBytes = (text) => new TextEncoder().encode(text).length;
+// The server judges the same pair (role bytes against max_prompt_bytes) and has the last word.
+const roleLimit = (field, promptCap) => {
+  const cap = field?.max_bytes ?? Infinity;
+  return promptCap > 0 ? Math.min(cap, Math.floor(promptCap * (field?.max_prompt_share ?? 1))) : cap;
+};
+
+function SystemInstructions({ settings, saved, roles, field, bytes, limit, onChange, pending, disabled }) {
+  const relay = roles.find((item) => item.id === 'relay');
+  const others = roles.filter((item) => item.id !== 'relay');
+  const standard = settings[ROLE_KEY] === null;
+  const text = standard ? relay?.text || '' : settings[ROLE_KEY] ?? '';
+  const blank = !standard && !text.trim();
+  const over = !standard && bytes > limit;
+  const capped = isNum(field?.max_bytes) && limit < field.max_bytes;
+  const scope = relay ? `${relay.title}. ${relay.applies_to}. ` : '';
+  // Clearing the box starts from a text to edit, never from an empty (disabled) role.
+  const customise = (checked) => onChange(ROLE_KEY, checked ? null : (typeof saved === 'string' && saved) || relay?.text || '');
   return (
     <div className="prompt-editor">
       <fieldset className="prompt-modes" disabled={disabled}>
@@ -91,18 +108,45 @@ function SystemInstructions({ settings, defaultPrompt, onChange, pending, disabl
       </fieldset>
       <div className="prompt-toolbar">
         <label className="check"><input type="checkbox" checked={standard} disabled={disabled}
-          onChange={(e) => onChange('relay_system_prompt', e.target.checked ? null : '')} />Стандартная роль relay</label>
+          onChange={(e) => customise(e.target.checked)} />Стандартная роль relay</label>
         {pending && <Tag tone="warn">ждёт перезапуска</Tag>}
       </div>
       <label className="prompt-label" htmlFor="system-instructions">Инструкции для модели</label>
-      <textarea id="system-instructions" rows={standard ? 3 : 7} value={standard ? defaultPrompt || '' : settings.relay_system_prompt ?? ''} disabled={disabled || standard}
-        aria-describedby="system-instructions-hint" spellCheck={false}
+      <textarea id="system-instructions" rows={standard ? 3 : 7} value={text} disabled={disabled || standard}
+        aria-describedby="system-instructions-hint" aria-invalid={over || undefined} spellCheck={false}
         placeholder={standard ? 'Используется встроенная роль relay' : 'Ты — инженер моего проекта. Отвечай по-русски. Проверяй изменения тестами. Перед удалением данных запрашивай подтверждение.'}
-        onChange={(e) => onChange('relay_system_prompt', e.target.value)} />
+        onChange={(e) => onChange(ROLE_KEY, e.target.value)} />
+      {blank && (
+        <div className="banner tone-warn" role="status">
+          Роль отключена: модель получит запросы без роли relay. Вернуть встроенную роль можно флажком «Стандартная роль relay»
+        </div>
+      )}
       <div className="prompt-footer" id="system-instructions-hint">
-        <p>{standard ? 'Снимите флажок, чтобы задать собственные инструкции' : 'Пустой текст убирает собственную роль relay. Служебные проверки и заголовки IDE сохраняют свои инструкции'}</p>
-        <span className="mono">{fmtInt((settings.relay_system_prompt || '').length)} символов</span>
+        {standard ? (
+          <p>{scope}Снимите флажок, чтобы задать собственные инструкции: они заменят обе стандартные роли</p>
+        ) : over ? (
+          <p className="neg-text" role="alert">
+            {capped
+              ? `Роль не помещается: при лимите «Размер промпта» ей отведено не больше ${fmtInt(limit)} байт. Сократите роль или увеличьте лимит`
+              : `Роль слишком длинная: допустимо не больше ${fmtInt(limit)} байт`}
+          </p>
+        ) : (
+          <p>Этот текст заменяет обе стандартные роли relay. Служебные проверки и заголовки IDE сохраняют свои инструкции</p>
+        )}
+        {!standard && (
+          <span className={`mono ${over ? 'neg-text' : ''}`}>
+            {fmtInt(text.length)} симв. · {fmtInt(bytes)}{Number.isFinite(limit) ? ` из ${fmtInt(limit)}` : ''} байт
+          </span>
+        )}
       </div>
+      {standard && others.map((item) => (
+        <Fragment key={item.id}>
+          <label className="prompt-label" htmlFor={`system-default-${item.id}`}>{item.title}</label>
+          <textarea id={`system-default-${item.id}`} rows={3} value={item.text} readOnly spellCheck={false}
+            aria-describedby={`system-default-${item.id}-hint`} />
+          <div className="prompt-footer" id={`system-default-${item.id}-hint`}><p>{item.applies_to}</p></div>
+        </Fragment>
+      ))}
     </div>
   );
 }
@@ -258,6 +302,13 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
   const warnEffort = unsupportedEffort && !approximate;
   const effortChoices = approximate && schema.reasoning_effort?.enum ? schema.reasoning_effort.enum
     : effortOptions && [...new Set([...effortOptions, ...(unsupportedEffort ? [effortValue] : [])])];
+  const role = merged[ROLE_KEY];
+  const roleBytes = useMemo(() => (typeof role === 'string' ? textBytes(role) : 0), [role]);
+  const limit = roleLimit(schema[ROLE_KEY], Number(merged.max_prompt_bytes));
+  // Like the server, judge the role only when this save touches the role or the cap.
+  const roleBlocked = roleBytes > limit && (ROLE_KEY in changes || 'max_prompt_bytes' in changes);
+  const roles = state?.default_system_prompts
+    || (state?.default_system_prompt ? [{ id: 'relay', title: 'Роль relay по умолчанию', text: state.default_system_prompt }] : []);
   const byGroup = {};
   for (const [key, field] of Object.entries(schema)) (byGroup[groupOf(field)] ||= []).push(key);
 
@@ -291,7 +342,8 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
           <section id={`settings-${group.id}`} key={group.id} className="panel settings-group" aria-label={group.title}>
             <h2>{group.title}</h2>
             <p className="settings-hint">{group.hint}</p>
-            {group.id === 'instructions' ? <SystemInstructions settings={{ ...state.settings, ...draft }} defaultPrompt={state.default_system_prompt}
+            {group.id === 'instructions' ? <SystemInstructions settings={merged} saved={state.settings[ROLE_KEY]} roles={roles}
+              field={schema[ROLE_KEY]} bytes={roleBytes} limit={limit}
               onChange={(key, value) => setDraft((d) => ({ ...d, [key]: value }))}
               pending={keys.some((key) => state.pending_restart.includes(key))} disabled={!state.writable} /> : keys.map((key) => (
               <Field key={key} name={key} field={key === 'reasoning_effort' && effortChoices
@@ -310,9 +362,10 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
         {dirty > 0 && (
           <motion.div className="savebar" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}
             transition={{ duration: 0.2, ease }}>
-            <span><b className="num">{dirty}</b> несохранённых: <span className="savebar-keys">{Object.keys(changes).map((k) => schema[k]?.label || k).join(', ')}</span></span>
+            <span><b className="num">{dirty}</b> несохранённых: <span className="savebar-keys">{Object.keys(changes).map((k) => schema[k]?.label || k).join(', ')}</span>
+              {roleBlocked && <span className="neg-text"> · роль не помещается в лимит</span>}</span>
             <Button icon={RotateCcw} onClick={() => setDraft({})}>Отменить</Button>
-            <Button icon={Save} tone="primary" onClick={save} disabled={saving || !state?.writable}>{saving ? 'Сохранение' : 'Сохранить'}</Button>
+            <Button icon={Save} tone="primary" onClick={save} disabled={saving || !state?.writable || roleBlocked}>{saving ? 'Сохранение' : 'Сохранить'}</Button>
           </motion.div>
         )}
       </AnimatePresence>

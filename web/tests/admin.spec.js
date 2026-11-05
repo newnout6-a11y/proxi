@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { API_KEY, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
+import { API_KEY, DEFAULT_ROLES, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
 
 async function login(page, { remember = false } = {}) {
   await page.goto('./');
@@ -369,6 +369,90 @@ test('typing during a pending save is preserved as a new draft', async ({ page }
   await expect(input).toHaveValue('3');
   await expect(page.locator('.savebar')).toBeVisible();
   expect(state.settings.rate_limit_rps).toBe(2);
+});
+
+test('the standard role shows both built-in roles and the requests each one serves', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  const [relay, nativeTools] = DEFAULT_ROLES;
+  const main = page.getByLabel('Инструкции для модели', { exact: true });
+  await expect(main).toBeDisabled();
+  await expect(main).toHaveValue(relay.text);
+  await expect(page.locator('#system-instructions-hint')).toContainText(relay.applies_to);
+  const tools = page.getByLabel(nativeTools.title, { exact: true });
+  await expect(tools).toHaveValue(nativeTools.text);
+  await expect(page.locator('#system-default-native_tools-hint')).toContainText(nativeTools.applies_to);
+  // A custom role replaces both of them, so the previews give way to the editor.
+  await page.getByLabel('Стандартная роль relay').uncheck();
+  await expect(tools).toHaveCount(0);
+  await expect(main).toBeEnabled();
+});
+
+test('clearing the standard role starts from its text and an empty role is shown as disabled', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  const editor = page.getByLabel('Инструкции для модели', { exact: true });
+  const standard = page.getByLabel('Стандартная роль relay');
+  const disabled = page.getByText('Роль отключена');
+  const save = page.getByRole('button', { name: 'Сохранить', exact: true });
+  await standard.uncheck();
+  await expect(editor).toHaveValue(DEFAULT_ROLES[0].text);
+  await expect(page.locator('.savebar')).toContainText('1 несохранённых');
+  await expect(disabled).toHaveCount(0);
+  await editor.fill('');
+  await expect(disabled).toBeVisible();
+  await editor.fill('Своя роль');
+  await expect(disabled).toHaveCount(0);
+  await standard.check();
+  await expect(page.locator('.savebar')).toHaveCount(0);
+
+  // Saving right after clearing the box keeps the template, not an empty role.
+  await standard.uncheck();
+  await save.click();
+  await expect.poll(() => state.settings.relay_system_prompt).toBe(DEFAULT_ROLES[0].text);
+  await editor.fill('Сохранённая роль');
+  await save.click();
+  await expect.poll(() => state.settings.relay_system_prompt).toBe('Сохранённая роль');
+  // Toggling the box off again brings back the saved text rather than the template.
+  await standard.check();
+  await standard.uncheck();
+  await expect(editor).toHaveValue('Сохранённая роль');
+  await expect(page.locator('.savebar')).toHaveCount(0);
+});
+
+test('the role counter counts bytes against the server limit and blocks a role that cannot fit', async ({ page }) => {
+  const state = await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  await page.getByLabel('Стандартная роль relay').uncheck();
+  const editor = page.getByLabel('Инструкции для модели', { exact: true });
+  const footer = page.locator('#system-instructions-hint');
+  const save = page.getByRole('button', { name: 'Сохранить', exact: true });
+  await editor.fill('ж'.repeat(100));
+  await expect(footer).toContainText('100 симв. · 200 из 32 768 байт');
+  await expect(save).toBeEnabled();
+
+  await editor.fill('ж'.repeat(16385)); // 32 770 bytes: Cyrillic takes two per character
+  await expect(footer).toContainText('32 770 из 32 768 байт');
+  await expect(footer.getByRole('alert')).toContainText('не больше 32 768 байт');
+  await expect(save).toBeDisabled();
+
+  // With a prompt cap the role may take half of it, judged on the draft just as the server will.
+  await editor.fill('ж'.repeat(100));
+  const cap = page.locator('#setting-max_prompt_bytes');
+  await cap.fill('300');
+  await expect(footer).toContainText('200 из 150 байт');
+  await expect(footer.getByRole('alert')).toContainText('«Размер промпта»');
+  await expect(page.locator('.savebar')).toContainText('роль не помещается');
+  await expect(save).toBeDisabled();
+  await cap.fill('1000');
+  await expect(footer).toContainText('200 из 500 байт');
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect.poll(() => state.settings.max_prompt_bytes).toBe(1000);
+  expect(state.settings.relay_system_prompt).toBe('ж'.repeat(100));
 });
 
 test('an effort level the model lacks is an error only while approximation is off', async ({ page }) => {
