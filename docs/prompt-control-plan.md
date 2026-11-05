@@ -216,7 +216,7 @@
 
 ## 4. Контракт модулей
 
-Координатор коммитит скелет до запуска роя. Источник истины — сами файлы скелета `prompt_policy.py` и `prompt_body.py` в ветке `feat/prompt-control`; ниже краткая выжимка. Сигнатуры менять только через координатора. В скелете у `Plan` есть ещё поле `snapshot` (ревизия, по которой принят план) и свойство `legacy`.
+Координатор коммитит скелет до запуска роя. Источник истины — сами файлы скелета `prompt_policy.py` и `prompt_body.py` в ветке `feat/prompt-control`; ниже краткая выжимка, дополнения — в разделе 4.3. Сигнатуры менять только через координатора. В скелете у `Plan` есть ещё поле `snapshot` (ревизия, по которой принят план) и свойство `legacy`.
 
 ```python
 # prompt_policy.py — P1
@@ -300,6 +300,35 @@ def rewrite(data: dict, dialect: str, profile: dict, snapshot: Snapshot) -> tupl
 - `prompt.config_error` (error): `{message, param}`.
 - `prompt.edit_skipped` (warn): `{op, reason}`.
 - `admin.prompts` (info): `{rev, changed_paths, sha8}`.
+- `prompt.runtime_error` (error, P2): `{message}` — сбой слоя промптов на запросе; запрос ушёл legacy-путём.
+
+### 4.3 Уточнения контракта (координатор, до запуска роя)
+
+Источник истины — `prompt_policy.py` в ветке. Эти пункты дополняют разделы 2–4 и имеют приоритет над ними.
+
+1. **Отказы `plan()`.** `PromptStore.plan()` отказывает исключением `apierr.ApiError` до любого обращения к upstream:
+   - `$header` называет профиль, которого нет в ревизии → `400 invalid_request_error`, `param: "x-proxi-profile"`;
+   - `<модель>@<профиль>` называет профиль, которого нет (в том числе когда файла промптов нет вовсе) → `404 not_found_error`, `param: "model"`, текст называет профиль. Для stream — настоящий HTTP-статус до начала потока.
+   - P2 пропускает `ApiError` к клиенту. Любое другое исключение слоя промптов → legacy-путь и событие `prompt.runtime_error`: сбой движка не ломает запрос (как I8).
+2. **`PlanInput.from_request(parsed, identity, headers, dialect)`** — единственное отображение запроса во вход плана; им пользуются и runtime (P2), и предпросмотр (P1). Реализовано координатором; P1 владеет и может уточнять, не меняя сигнатуры.
+3. **`prompt_client`** — базовая реализация координатора: явный `x-proxi-client` с именем семейства, затем клиент, распознанный `client_context.describe()`, затем Codex по `originator` / user-agent. P1 сверяет признаки Codex с исходниками codex-rs, добавляет Harness и закрепляет всё тестами.
+4. **Части head.** `head == "".join(p.text for p in parts)`: литералы шаблона и разделители — части `literal`. `part_spans(parts)` и `sha8(text)` реализованы в скелете и общие для предпросмотра (P1), кольца `record` и события `prompt.plan` (P2).
+5. **Аксессоры `Snapshot`** (реализует P1; пользуются P2, P3, P6):
+   - `profile(name)` — нормализованный профиль: все разделы с умолчаниями, тексты — литералы, `{{text:…}}` раскрыт в полях `text` / `with` правок, но не в `head` (его рендерит `compose_head`); `KeyError` для неизвестного имени; встроенный `passthrough` включён;
+   - `profile_names()`; `relay_text(name)` → текст пользователя или `None` (встроенный); `regex(pattern, flags)` → паттерн, скомпилированный при компиляции ревизии (I11); `codex_base(model)`; `codex_overrides(model)`.
+6. **Имя профиля** — `PROFILE_NAME` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, fullmatch): оно же суффикс модели. `passthrough` переопределить нельзя; имена на `$` — только служебные `use`.
+7. **Виртуальная модель.** Каноническая запись — `<модель>@<профиль>`, effort идёт после профиля: `claude-opus-5-5@mine#high` (или `:high`). validate (P6) кладёт в `parsed.model` разрешённую базовую модель, в `parsed.virtual_profile` — профиль, в `parsed.requested_model` — имя клиента без суффиксов, до разрешения алиасов.
+8. **`publish_as_model`**: `false` (по умолчанию) | `true` (все модели каталога) | список glob моделей.
+9. **Переопределения Codex** — новый верхний ключ документа (P1 проверяет, P6 применяет):
+   ```jsonc
+   "codex": {"models": {"gpt-6*": {"persistent_instructions": "…",          // или {"file": "prompts/…"}
+                                   "include_skills_usage_instructions": true}}}
+   ```
+   Допустимые ключи — `CODEX_OVERRIDE_KEYS`; выигрывает первый подходящий glob в порядке документа. `relay_texts.codex_base` остаётся источником `base_instructions` и `model_messages.instructions_template`.
+10. **Пины без файла.** Пока файл не загружен, `plan()` всё равно закрепляет `(conversation_key, purpose)` за ревизией `LEGACY_REV = 0` и возвращает legacy-план. Появился файл → новые диалоги получают текущую ревизию, начатые раньше остаются на legacy до «открепить» / «применить ко всем». Пины ограничены (LRU и время простоя), живут в памяти и после перезапуска пропадают. Если закреплённую ревизию вытеснили из 32 снимков, диалог получает текущую (один reset); пины в админке это показывают.
+11. **Загрузка и перезагрузка.** Путь: явный `path` > `cfg["prompts_file"]` > `prompts.json`; относительный — от папки `cfg["_config_path"]`, если он задан, иначе от рабочей папки. Конструктор загружает существующий файл. `maybe_reload()` замечает появление, изменение и удаление файла и его текстов: удаление файла возвращает новые диалоги к legacy и пишет `prompt.reload`. P2 вызывает `maybe_reload()` перед `plan()` на каждом запросе, сам `maybe_reload` делает stat не чаще раза в `RELOAD_INTERVAL`. `PromptStore.errors()` — ошибки файла на диске для админки (`[]`, если файл валиден).
+12. **Head в не-legacy пути** — ровно результат `compose_head`; транспорт добавляет вне head только то, что добавляет сейчас. `[LOCAL EXEC REMINDER]` автоматически не дописывается: он доступен как `{{exec_reminder}}`, и `{{relay_task}}{{exec_reminder}}` повторяет legacy-head для запросов relay. Контракт structured (I10) и billing header (I5) обязательны в любом шаблоне.
+13. **`.gitignore`**: `/prompts.json` и `/prompts/` (P4) — личные промпты не попадают в git случайно; пример для документации — `prompts.example.json` (P7).
 
 ## 5. Пакеты роя
 

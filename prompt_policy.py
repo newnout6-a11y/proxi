@@ -1,16 +1,18 @@
 """User control over the system prompt the model sees (prompts.json).
 
 Contract-first skeleton committed by the coordinator; the full design is in
-docs/prompt-control-plan.md. Without a prompts file every request takes the
-existing path unchanged: PromptStore.plan() returns a legacy Plan (profile None)
-and nothing here touches the request.
+docs/prompt-control-plan.md (section 4 and the contract clarifications in 4.3). Without
+a prompts file every request takes the existing path unchanged: PromptStore.plan()
+returns a legacy Plan (profile None) and nothing here touches the request.
 
 Signatures and dataclass fields are a contract between work packages: change them
 only through the coordinator.
 """
 from __future__ import annotations
 
+import hashlib
 import pathlib
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -23,6 +25,9 @@ MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 SNAPSHOT_HISTORY = 32
 RECENT_LIMIT = 100
 RELOAD_INTERVAL = 1.0
+# The revision a conversation is pinned to while no prompts file is loaded (plan 4.3): when a file
+# appears, conversations that started without one stay on the legacy path until unpinned.
+LEGACY_REV = 0
 
 CLIENTS = ("opencode", "claude-code", "claude-desktop", "codex", "harness", "unknown")
 VARIABLES = ("client_system", "client_system_raw", "role", "native_role", "relay_task", "local_exec",
@@ -37,6 +42,12 @@ TOOL_EDIT_OPS = ("append", "prepend", "replace_text", "replace_regex", "set")
 CONDITIONS = ("client", "agent", "purpose", "request_class", "model", "tools", "structured",
               "has_client_system", "dialect", "header_profile", "virtual_profile")
 SPECIAL_USES = ("$header", "$virtual", "$legacy")
+RELAY_TEXT_NAMES = ("role", "native_role", "structured", "reminder", "codex_base")
+# Keys of codex.models.<glob> (plan 4.3): what /codex/models may override per model besides codex_base.
+CODEX_OVERRIDE_KEYS = ("persistent_instructions", "include_skills_usage_instructions",
+                       "include_plugin_usage_instructions", "include_apps_usage_instructions")
+# A profile name is also a model id suffix (<model>@<profile>), so it is kept to these characters.
+PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 BUILTIN_PROFILES = {"passthrough": {"description": "the client's system prompt, unchanged",
                                     "head": "{{client_system}}"}}
 # Service requests keep their own instructions unless the user disables protection (plan I6).
@@ -58,6 +69,33 @@ class PromptConfigError(ValueError):
         self.message = message
 
 
+def _lower_headers(headers) -> dict:
+    return {str(key).lower(): value for key, value in (headers or {}).items()}
+
+
+def prompt_client(identity: dict, headers: dict) -> str:
+    """The client family used by rules: one of CLIENTS.
+
+    It never changes identity["client"] or client_context.request_kind (plan I1).
+    Coordinator baseline: an explicit x-proxi-client naming a family, then the family
+    client_context.describe() recognised, then Codex by its originator / user-agent prefix.
+    P1 owns this function: it verifies the Codex signals against the codex-rs sources,
+    adds Harness when it is distinguishable and pins every branch with tests.
+    """
+    headers = _lower_headers(headers)
+    explicit = str(headers.get("x-proxi-client") or "").strip().lower()
+    if explicit in CLIENTS:
+        return explicit
+    client = str((identity or {}).get("client") or "").strip().lower()
+    if client in CLIENTS:
+        return client
+    originator = str(headers.get("originator") or "").strip().lower()
+    agent = str(headers.get("user-agent") or "").strip().lower()
+    if originator.startswith("codex") or agent.startswith("codex"):
+        return "codex"
+    return "unknown"
+
+
 @dataclass(frozen=True)
 class PlanInput:
     """What rule matching may look at; built once per request from pass-1 parsing."""
@@ -75,12 +113,60 @@ class PlanInput:
     has_client_system: bool
     conversation_key: str | None
 
+    @classmethod
+    def from_request(cls, parsed, identity: dict, headers: dict, dialect: str | None = None) -> "PlanInput":
+        """The one mapping from a parsed request to the matching input, shared by the runtime and preview.
+
+        parsed.requested_model (set by validate, P6) is the client's model name without the
+        @profile and #effort suffixes and before alias resolution; it falls back to parsed.model.
+        parsed.virtual_profile (P6) is the @profile suffix or None.
+        """
+        headers = _lower_headers(headers)
+        identity = identity or {}
+        model = str(getattr(parsed, "model", "") or "")
+        header_profile = str(headers.get("x-proxi-profile") or "").strip()
+        return cls(
+            dialect=str(dialect or getattr(parsed, "dialect", "") or ""),
+            client=prompt_client(identity, headers),
+            agent=str(identity.get("agent") or ""),
+            purpose=str(getattr(parsed, "request_purpose", "") or ""),
+            request_class=str(identity.get("request_class") or ""),
+            model=model,
+            requested_model=str(getattr(parsed, "requested_model", "") or model),
+            virtual_profile=getattr(parsed, "virtual_profile", None) or None,
+            header_profile=header_profile or None,
+            tools=bool(getattr(parsed, "tools", None)),
+            structured=bool(getattr(parsed, "structured_output", None)),
+            has_client_system=bool((getattr(parsed, "system", "") or "").strip()),
+            conversation_key=getattr(parsed, "conversation_key", None) or None,
+        )
+
 
 @dataclass(frozen=True)
 class Part:
-    """One piece of the composed head with the place it came from (journal and preview)."""
+    """One piece of the composed head with the place it came from (journal and preview).
+
+    compose_head keeps head == "".join(part.text for part in parts): template literals and
+    separators are "literal" parts, so offsets follow from the order (see part_spans).
+    """
     source: str
     text: str
+
+
+def sha8(text: str) -> str:
+    """Short stable fingerprint used by the journal, preview and recent heads."""
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+
+
+def part_spans(parts) -> list[dict]:
+    """[{"source", "start", "end", "chars", "sha8"}] for the parts of one head, offsets in characters."""
+    spans, offset = [], 0
+    for part in parts:
+        size = len(part.text)
+        spans.append({"source": part.source, "start": offset, "end": offset + size, "chars": size,
+                      "sha8": sha8(part.text)})
+        offset += size
+    return spans
 
 
 class HeadSources(Protocol):
@@ -127,7 +213,8 @@ class Plan:
         """Return (head, parts, warnings) for this plan's profile.
 
         Applies the profile's client_system.edits, renders its head template with the closed
-        variable set, keeps a Claude Code billing header line first (plan I5) and appends the
+        variable set, keeps a Claude Code billing header line first (plan I5: head starts with
+        that line and "\\n", which direct.build_body splits into its own block) and appends the
         structured contract when the template does not place {{structured}} (plan I10).
         """
         raise NotImplementedError
@@ -142,10 +229,34 @@ class Snapshot:
         self.source_path = source_path
 
     def profile(self, name: str) -> dict:
+        """The normalized profile: KeyError for an unknown name.
+
+        Every section is present with its default (history.mid_system "keep", empty
+        user_blocks / tools.edits / client_system.edits, generation {} with only non-null
+        values, publish_as_model False); every text is a literal string ({"file": ...} read,
+        {{text:<name>}} expanded inside edit "text" / "with" fields, but not inside "head",
+        which compose_head renders). The built-in passthrough profile is included.
+        """
+        raise NotImplementedError
+
+    def profile_names(self) -> list[str]:
+        """Built-in and document profiles, in a stable order (built-ins first, then document order)."""
+        raise NotImplementedError
+
+    def relay_text(self, name: str) -> str | None:
+        """The user's text for relay_texts[name] (one of RELAY_TEXT_NAMES except codex_base), None = built-in."""
+        raise NotImplementedError
+
+    def regex(self, pattern: str, flags: str = "") -> re.Pattern:
+        """The pattern compiled when the revision was compiled (plan I11); flags is a subset of "ims"."""
         raise NotImplementedError
 
     def codex_base(self, model: str) -> str | None:
         """The base instructions /codex/models publishes for model, or None for the built-in text."""
+        raise NotImplementedError
+
+    def codex_overrides(self, model: str) -> dict:
+        """codex.models overrides for model: the first matching glob in document order, {} when none."""
         raise NotImplementedError
 
 
@@ -154,21 +265,21 @@ def compile_document(doc: dict, base_dir: pathlib.Path, *, rev: int) -> Snapshot
     raise NotImplementedError
 
 
-def prompt_client(identity: dict, headers: dict) -> str:
-    """The client family used by rules: one of CLIENTS.
-
-    It never changes identity["client"] or client_context.request_kind (plan I1).
-    """
-    raise NotImplementedError
-
-
 class PromptStore:
-    """Revisions, conversation pins, live reload and the in-memory record of recent heads."""
+    """Revisions, conversation pins, live reload and the in-memory record of recent heads.
+
+    The file is explicit path > cfg["prompts_file"] > DEFAULT_FILE; a relative path is resolved
+    against the folder of cfg["_config_path"] when that is set, otherwise against the working
+    directory. The constructor loads the file when it exists; maybe_reload() also picks up a
+    file that appears, changes or disappears later (plan 4.3).
+    """
 
     def __init__(self, cfg: dict, path: str | None = None, clock=time.monotonic):
         self.cfg = cfg
-        configured = path or cfg.get("prompts_file") or DEFAULT_FILE
-        self.path = pathlib.Path(configured)
+        configured = pathlib.Path(path or cfg.get("prompts_file") or DEFAULT_FILE)
+        if not configured.is_absolute() and cfg.get("_config_path"):
+            configured = pathlib.Path(cfg["_config_path"]).parent / configured
+        self.path = configured
         self.clock = clock
         self._lock = threading.Lock()
         self._snapshot: Snapshot | None = None
@@ -178,7 +289,12 @@ class PromptStore:
             return self._snapshot
 
     def plan(self, inp: PlanInput) -> Plan:
-        """Select the rule and profile for a request, honouring the conversation pin (plan I3)."""
+        """Select the rule and profile for a request, honouring the conversation pin (plan I3).
+
+        Refusals are apierr.ApiError raised before any upstream call (plan 4.3): 400 with
+        param "x-proxi-profile" when $header names a missing profile, 404 not_found_error with
+        param "model" when <model>@<profile> names a missing profile (also with no file loaded).
+        """
         if self.snapshot() is None:
             return Plan()
         raise NotImplementedError
@@ -191,6 +307,10 @@ class PromptStore:
 
     def save(self, document: dict, base_rev: int | None) -> Snapshot:
         raise NotImplementedError
+
+    def errors(self) -> list[dict]:
+        """Problems of the file on disk that kept the previous revision: [{"message", "param", "ts"}], [] when valid."""
+        return []
 
     def pins(self) -> list[dict]:
         return []

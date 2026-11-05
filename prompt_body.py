@@ -13,5 +13,9 @@ def rewrite(data: dict, dialect: str, profile: dict, snapshot) -> tuple[dict, li
     The input body is never mutated: the result is a deep copy. The same input and the same
     profile always produce the same bytes (plan I2), and rewrite(rewrite(x)) == rewrite(x).
     Each change is a dict such as {"index": 12, "op": "drop_tag", "removed_chars": 431}.
+
+    profile is Snapshot.profile(name): normalized, texts already literal (plan 4.3). Patterns
+    come from snapshot.regex(pattern, flags) and the mid_system "wrap" template from
+    snapshot.relay_text("reminder") (None = the built-in "<system-reminder>\\n{{text}}\\n</system-reminder>").
     """
     raise NotImplementedError
