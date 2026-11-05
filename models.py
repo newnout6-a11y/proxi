@@ -597,6 +597,21 @@ def effective_effort(entry, effort=None, configured=None):
     return configured if configured in levels else nearest_effort(levels, configured)
 
 
+def _setting_hint(effort, allowed):
+    """Names the setting that would replace a known level this route lacks; nothing for any other value."""
+    level = effort.lower() if isinstance(effort, str) else ''
+    if level not in EFFORT_ORDER:
+        return ''  # a level no provider defines is never guessed, so the setting could not help
+    enable = 'Set allow_effort_downgrade to true in config.json or the admin settings to '
+    if not allowed:
+        return '. ' + enable + 'drop the control instead'
+    nearest = nearest_effort(allowed, level)
+    if level == 'none':
+        return ('; this model cannot turn reasoning off (thinking disabled and effort none ask for that). '
+                + enable + 'use its lowest level, %s, instead' % nearest)
+    return '. ' + enable + 'use the nearest level, %s, instead' % nearest
+
+
 def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False):
     """Resolve exactly; explicit compatibility permits known-level mapping.
 
@@ -678,7 +693,8 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
         allowed = entry.get('reasoning_effort_levels', EFFORTS_BY_PROVIDER.get(entry['provider'], ()))
         if not isinstance(effort, str) or effort.lower() not in allowed:
             raise bad_request(
-                f"reasoning effort for {name} must be one of {', '.join(allowed) or 'no supported levels'}",
+                f"reasoning effort for {name} must be one of {', '.join(allowed) or 'no supported levels'}"
+                + _setting_hint(effort, allowed),
                 param='reasoning_effort')
         effort = effort.lower()
         if not entry.get('reasoning', True):

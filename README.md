@@ -262,6 +262,12 @@ relay в начале мышления отправляет метку `thinking
 возвращает 400 до обращения к upstream. Явный `allow_effort_downgrade: true`
 разрешает приближение известных уровней; журнал хранит requested/effective effort
 и причину выбора. Неизвестные `extra`/`ultra` отклоняются в обоих режимах.
+Выключить рассуждение (`thinking: {type: disabled}` или effort `none`) умеют не все
+модели: у Opus 5.5, Sonnet 5.5, GPT-5.5 и GPT-5 уровня `none` нет. Без настройки это 400,
+и его текст называет `allow_effort_downgrade`; с настройкой берётся самый низкий уровень
+маршрута (`low`, у GPT-5 `minimal`), а замена видна в журнале (`turn.begin`:
+`requested_effort: none`, `effective_effort`, `effort_resolution: compatibility`) и в консоли.
+Модели с `none` (GPT-6 Sol, GPT-5.1, GPT-5.2) выполняют просьбу как есть в обоих режимах.
 На 3 ноября Retool принимает для Opus 5.5 `high`/`max`, а сырой `xhigh` даёт 422.
 GPT-6-sol и GPT-6.1-sol принимают `max`, но также отвергают `xhigh` с 422;
 этот уровень не предлагается их каталогом Codex.
