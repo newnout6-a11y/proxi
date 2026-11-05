@@ -371,6 +371,28 @@ test('typing during a pending save is preserved as a new draft', async ({ page }
   expect(state.settings.rate_limit_rps).toBe(2);
 });
 
+test('an effort level the model lacks is an error only while approximation is off', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const effort = page.locator('#setting-reasoning_effort');
+  const banner = page.getByRole('status').filter({ hasText: 'не поддерживается моделью' });
+  await effort.selectOption('max');
+  await page.locator('#setting-model').selectOption('gpt-5.5'); // low, medium and high only
+  await expect(banner).toContainText('GPT 5.5');
+  await expect(effort.locator('option[value="xhigh"]')).toHaveCount(0);
+
+  const approximate = page.getByRole('switch', { name: 'Подбирать ближайший effort' });
+  await approximate.click();
+  await expect(banner).toHaveCount(0);
+  // Every level the relay knows can be chosen: it takes the nearest one the model has.
+  await expect(effort.locator('option[value="xhigh"]')).toHaveCount(1);
+  await effort.selectOption('xhigh');
+  await expect(banner).toHaveCount(0);
+  await approximate.click();
+  await expect(banner).toContainText('xhigh');
+});
+
 test('leaving the settings with unsaved edits asks first and keeps them when declined', async ({ page }) => {
   await mockAdmin(page);
   await login(page);

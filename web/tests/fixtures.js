@@ -40,8 +40,11 @@ export const baseSchema = {
 
 const richSchema = {
   ...baseSchema,
-  reasoning_effort: { type: 'string', label: 'Уровень мышления', group: 'model', enum: ['auto', 'low', 'medium', 'high', 'max'], restart_required: true,
+  reasoning_effort: { type: 'string', label: 'Уровень мышления', group: 'model', restart_required: true,
+    enum: ['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     description: 'Уровень мышления, если клиент его не передал; auto оставляет выбор модели' },
+  allow_effort_downgrade: { type: 'boolean', label: 'Подбирать ближайший effort', group: 'model', restart_required: true,
+    description: 'Если модель не поддерживает запрошенный уровень мышления, взять ближайший вместо ошибки' },
   session_mode: { type: 'string', label: 'Режим сессий', group: 'routing', enum: ['per_conversation', 'per_request', 'shared'], restart_required: true,
     description: 'Как диалоги клиентов привязываются к тредам Retool: свой тред на диалог, новый на каждый запрос или один общий' },
   min_account_balance: { type: 'number', label: 'Порог резерва', group: 'routing', unit: 'кредитов', min: 0, max: 1000000, restart_required: false,
@@ -194,6 +197,7 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
   const initial = { model: 'claude-opus-5-5', show_thinking: true, max_workers: 4, rate_limit_rps: 0,
     relay_system_prompt_mode: 'standalone', relay_system_prompt: null,
     ...(rich ? { reasoning_effort: 'high', session_mode: 'per_conversation', enable_anthropic: true, enable_chat: true,
+      allow_effort_downgrade: false,
       min_account_balance: 20, cache_keepwarm_seconds: 240, upstream_empty_retries: 1, turn_timeout: 900 } : {}) };
   const events = empty ? [] : rich ? richJournal() : journal;
   const models = rich ? [...catalog, ...extraCatalog] : catalog;

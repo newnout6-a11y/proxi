@@ -240,10 +240,16 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
   }
 
   const schema = state?.schema || {};
-  const selectedModel = models?.data.find((model) => model.id === (draft.model ?? state?.settings.model));
-  const effortValue = draft.reasoning_effort ?? state?.settings.reasoning_effort;
+  const merged = { ...state?.settings, ...draft };
+  const selectedModel = models?.data.find((model) => model.id === merged.model);
+  const effortValue = merged.reasoning_effort;
+  // With approximation on, the relay takes the nearest level itself, so no level is an error.
+  const approximate = !!merged.allow_effort_downgrade;
   const effortOptions = selectedModel ? ['auto', ...(selectedModel.reasoning_effort_levels || [])] : null;
   const unsupportedEffort = effortOptions && effortValue && !effortOptions.includes(effortValue);
+  const warnEffort = unsupportedEffort && !approximate;
+  const effortChoices = approximate && schema.reasoning_effort?.enum ? schema.reasoning_effort.enum
+    : effortOptions && [...new Set([...effortOptions, ...(unsupportedEffort ? [effortValue] : [])])];
   const byGroup = {};
   for (const [key, field] of Object.entries(schema)) (byGroup[groupOf(field)] ||= []).push(key);
 
@@ -269,7 +275,7 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
       {loadError && <div className="banner tone-neg" role="alert">Не удалось загрузить настройки: {loadError}</div>}
       {!state && !loadError && <div className="panel empty" role="status">Загружаем настройки</div>}
       {state && !state.writable && <div className="banner tone-warn">Файл конфигурации недоступен для записи</div>}
-      {unsupportedEffort && <div className="banner tone-warn" role="status">Уровень {effortValue} не поддерживается моделью {selectedModel.label}. Выберите доступный уровень или «по умолчанию модели»</div>}
+      {warnEffort && <div className="banner tone-warn" role="status">Уровень {effortValue} не поддерживается моделью {selectedModel.label}. Выберите доступный уровень или «по умолчанию модели», либо включите «{schema.allow_effort_downgrade?.label || 'Подбирать ближайший effort'}»</div>}
       {state && GROUPS.map((group) => {
         const keys = byGroup[group.id] || [];
         if (!keys.length) return null;
@@ -280,8 +286,8 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
             {group.id === 'instructions' ? <SystemInstructions settings={{ ...state.settings, ...draft }} defaultPrompt={state.default_system_prompt}
               onChange={(key, value) => setDraft((d) => ({ ...d, [key]: value }))}
               pending={keys.some((key) => state.pending_restart.includes(key))} disabled={!state.writable} /> : keys.map((key) => (
-              <Field key={key} name={key} field={key === 'reasoning_effort' && effortOptions
-                ? { ...schema[key], enum: [...new Set([...effortOptions, ...(unsupportedEffort ? [effortValue] : [])])] } : schema[key]}
+              <Field key={key} name={key} field={key === 'reasoning_effort' && effortChoices
+                ? { ...schema[key], enum: effortChoices } : schema[key]}
                 value={key in draft ? draft[key] : state.settings[key]}
                 pending={state.pending_restart.includes(key)}
                 dirty={key in changes}
