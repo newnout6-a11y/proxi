@@ -190,6 +190,22 @@ def test_the_scheduler_returns_the_account_when_the_pause_is_over(capsys):
     assert "снова в пуле" in capsys.readouterr().out
 
 
+def test_the_real_scheduler_thread_releases_the_account_by_itself():
+    account = Account("a")
+    value = AccountDispatcher([account], {"session_refresh_interval": 0, "min_account_balance": 20}, {})
+    before = journal.JOURNAL.last_seq
+    value.start()
+    try:
+        value.mark_rate_limited(account, retry_after=1)
+        deadline = time.monotonic() + 8
+        while account.unavailable is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert account.unavailable is None
+    finally:
+        value.stop()
+    assert len(_events("account.available", before)) == 1
+
+
 def test_turns_that_fail_together_share_one_pause_and_one_journal_line():
     account = Account("a")
     value, _ = dispatcher([account])
