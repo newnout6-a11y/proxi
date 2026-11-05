@@ -268,3 +268,80 @@ def test_every_prefix_of_a_conversation_rewrites_to_a_prefix_of_the_whole(dialec
         assert final_parsed.native_messages[:len(parsed.native_messages)] == parsed.native_messages
         checked += 1
     assert checked >= 3
+
+
+# --- OpenCode chat requests: the shape the real traces show -----------------------------------------
+
+PLAN = "<system-reminder>\nPlan mode is active. The user indicated that they do not want you to execute yet.\n</system-reminder>"
+BUILD = "<system-reminder>\nYour operational mode has changed from plan to build.\n</system-reminder>"
+AGENTS = "<system-reminder>\nInstructions from: C:\\repo\\AGENTS.md\nUse tabs.\n</system-reminder>"
+OPENCODE_SYSTEM = ("You are an AI agent running in OpenCode, a coding agent harness.\n# Harness\n...\n"
+                   "<env>\n  Working directory: C:\\repo\n  Platform: win32\n</env>\n"
+                   "<available_skills>\n  <skill><name>review</name></skill>\n</available_skills>")
+
+
+def opencode_assistant(call_id, reasoning=None):
+    message = {"role": "assistant", "content": None, "tool_calls": [{
+        "id": call_id, "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "a.py"})}}]}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return message
+
+
+def opencode_body(history, last_user_parts):
+    """history: the stored conversation; the newest user message is re-sent with the mode reminders as extra parts
+    (OpenCode adds them to the in-memory copy of that message on every request, as parts when there are several)."""
+    messages = [{"role": "system", "content": OPENCODE_SYSTEM}]
+    for item in history:
+        messages.append(copy.deepcopy(item))
+    if last_user_parts:
+        last = max(i for i, m in enumerate(messages) if m["role"] == "user")
+        messages[last]["content"] = [{"type": "text", "text": messages[last]["content"]}] + [
+            {"type": "text", "text": part} for part in last_user_parts]
+    return {"model": "claude-opus-5-5", "messages": messages, "stream": True, "name": "build",
+            "max_completion_tokens": 32000, "reasoning_effort": "high", "settings": {"temperature": 0},
+            "stream_options": {"include_usage": True}, "tools": [{"type": "function", "function": {
+                "name": "read", "description": "Read a file.", "parameters": {
+                    "type": "object", "properties": {"filePath": {"type": "string"}}}}}]}
+
+
+OPENCODE_RULES = profile(user_blocks=[drop_tag(contains="Plan mode"), drop_tag(contains="operational mode"),
+                                      drop_tag(contains="Instructions from")])
+
+
+def test_the_opencode_shape_is_rewritten_and_only_the_text_of_user_and_tool_messages_changes():
+    history = [{"role": "user", "content": "Fix the failing test."}, opencode_assistant("call_1", "I will read it."),
+               {"role": "tool", "tool_call_id": "call_1", "content": "<file>\n00001| x = 1\n</file>\n\n" + AGENTS}]
+    body = opencode_body(history, [PLAN, BUILD])
+    result, changes = prompt_body.rewrite(body, "chat", OPENCODE_RULES, FakeSnapshot())
+    assert result["messages"][0] == body["messages"][0]
+    assert result["messages"][2] == body["messages"][2]            # reasoning_content and tool_calls stay as sent
+    assert result["messages"][1]["content"] == [{"type": "text", "text": "Fix the failing test."}]
+    assert result["messages"][3]["content"] == "<file>\n00001| x = 1\n</file>"
+    for key in ("model", "stream", "name", "max_completion_tokens", "reasoning_effort", "settings",
+                "stream_options", "tools"):
+        assert result[key] == body[key]
+    assert [(c["target"], c["op"]) for c in changes] == [("user", "drop_tag"), ("user", "drop_tag"),
+                                                        ("tool_result", "drop_tag")]
+    parsed = validate.parse_chat(copy.deepcopy(result), PARSE_CFG)
+    assert parsed.system == OPENCODE_SYSTEM and parsed.native_messages is not None
+    assert "Plan mode" not in parsed.prompt and "Instructions from" not in parsed.prompt
+
+
+def test_a_reminder_that_opencode_keeps_on_the_newest_user_message_only_no_longer_moves_the_prefix():
+    first = [{"role": "user", "content": "Fix the failing test."}]
+    call = [opencode_assistant("call_1", "I will read it."),
+            {"role": "tool", "tool_call_id": "call_1", "content": "contents\n\n" + AGENTS}]
+    answer = [{"role": "assistant", "content": "It passes now."}, {"role": "user", "content": "Now add a test."}]
+    requests = [opencode_body(first, [PLAN]), opencode_body(first + call, [PLAN]),
+                # the second user message arrives: the first one loses its reminder, the new one gets it
+                opencode_body(first + call + answer, [PLAN, BUILD])]
+    plain = [validate.parse_chat(copy.deepcopy(body), PARSE_CFG) for body in requests]
+    rewritten = [prepare("chat", body, OPENCODE_RULES) for body in requests]
+    for earlier, later in zip(plain, plain[1:]):
+        held = later.message_fingerprints[:len(earlier.message_fingerprints)] == earlier.message_fingerprints
+        assert held == (later is plain[1])           # without the rewrite the third request breaks the prefix
+    for earlier, later in zip(rewritten, rewritten[1:]):
+        assert later.message_fingerprints[:len(earlier.message_fingerprints)] == earlier.message_fingerprints
+        assert later.native_messages[:len(earlier.native_messages)] == earlier.native_messages
+        assert later.system == earlier.system == OPENCODE_SYSTEM
