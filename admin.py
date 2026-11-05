@@ -56,7 +56,13 @@ ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balanc
 SETTING_GROUPS = ("routing", "model", "instructions", "retries", "cache", "exec", "limits", "api")
 # Prompt control (docs/prompt-control-plan.md 4.1): the routes and the methods each one answers.
 PROMPTS_PATH = "/admin/api/prompts"
-PROMPT_ROUTES = {PROMPTS_PATH: ("GET",)}
+PROMPT_ROUTES = {PROMPTS_PATH: ("GET", "PUT")}
+# A document is at most MAX_DOCUMENT_BYTES of UTF-8. A client that escapes non-ASCII text (Python's json.dumps does)
+# sends it up to three times as long, so saving takes four times that; max_body_bytes still caps every body as well.
+PROMPTS_BODY_LIMIT = 4 * prompt_policy.MAX_DOCUMENT_BYTES
+# profiles.<name>.history.user_blocks[0].op is the deepest valid path (six levels): more is hostile or a mistake.
+PROMPTS_MAX_DEPTH = 24
+CHANGED_PATHS_LIMIT = 64  # the journal keeps 64 items of a list anyway
 DIALECTS = ("chat", "responses", "anthropic")
 # What a rule may name as `purpose`: client_context.request_kind() and the prompt layer's own client-service (plan 2.1).
 PURPOSES = ("client-tools", "client-text", "generation", "session-title", "auto-mode-check", "connection-probe",
@@ -272,6 +278,69 @@ def _builtin_prompts():
     }
 
 
+def _canonical(document):
+    """Compact JSON with sorted keys: the form a document's size and fingerprint are judged on."""
+    return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _utf8(text, param):
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # JSON can carry half of a surrogate pair ("\ud800"); it is not text UTF-8 can store.
+        raise apierr.bad_request("The document contains an unpaired surrogate (half of a Unicode pair), "
+                                 "which cannot be saved as UTF-8 text", param=param)
+
+
+def _checked_document(document):
+    """Refuse what no prompts document needs before the engine sees it; return the canonical JSON text.
+
+    The walk is iterative, so a hostile nesting cannot exhaust the stack. Nesting beyond PROMPTS_MAX_DEPTH, a number
+    JSON cannot carry and text UTF-8 cannot store are 400s whose `param` is the path of the field (as the engine's
+    own errors name it, relative to the document); a document over MAX_DOCUMENT_BYTES is a 413.
+    """
+    todo = [(document, "", 1)]
+    while todo:
+        value, path, depth = todo.pop()
+        if depth > PROMPTS_MAX_DEPTH:
+            raise apierr.bad_request("The document is nested deeper than %d levels" % PROMPTS_MAX_DEPTH,
+                                     param=path or None)
+        if isinstance(value, str):
+            _utf8(value, path or None)
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise apierr.bad_request("The document contains a number that is not finite (NaN or Infinity)",
+                                     param=path or None)
+        elif isinstance(value, dict):
+            children = []
+            for key, item in value.items():
+                _utf8(key, path or None)  # a key's own text is never echoed
+                children.append((item, path + "." + key if path else key, depth + 1))
+            todo.extend(reversed(children))
+        elif isinstance(value, list):
+            todo.extend(reversed([(item, "%s[%d]" % (path, index), depth + 1) for index, item in enumerate(value)]))
+    text = _canonical(document)
+    size = len(text.encode("utf-8"))
+    if size > prompt_policy.MAX_DOCUMENT_BYTES:
+        raise apierr.ApiError(413, "payload_too_large", "The prompts document is %d bytes; at most %d are allowed"
+                              % (size, prompt_policy.MAX_DOCUMENT_BYTES))
+    return text
+
+
+def _changed_paths(old, new, prefix=""):
+    """Dotted paths where two documents differ, sorted: objects are compared key by key, any other value (a text, a
+    list such as `rules`) as a whole, and a key that appeared or disappeared names the root of what came or went."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        paths = []
+        for key in sorted(set(old) | set(new)):
+            path = prefix + "." + key if prefix else key
+            if key in old and key in new:
+                paths += _changed_paths(old[key], new[key], path)
+            else:
+                paths.append(path)
+        return paths
+    return [] if _canonical(old) == _canonical(new) else [prefix]
+
+
 def _document_warnings(document):
     """What the operator should know about a valid document that lowers what the relay protects (plan I6)."""
     warnings = []
@@ -285,6 +354,11 @@ def _document_warnings(document):
             warnings.append("Правило «%s» перекрывает защиту служебных запросов (override_protected)"
                             % (rule.get("name") or "№%d" % (index + 1)))
     return warnings
+
+
+def _config_error(error):
+    """The 400 for a document the engine refused: its message and, as `param`, the path of the offending field."""
+    return apierr.bad_request(error.message or str(error), param=error.path or None)
 
 
 def is_admin_path(path):
@@ -308,6 +382,8 @@ class Admin:
         self.runtime = runtime
         self.cfg = runtime.cfg
         self.lock = threading.Lock()
+        # Saving the prompts document: read the revision it replaces, save, journal what changed, as one step.
+        self.prompts_lock = threading.Lock()
         self.schema = _schema()
 
     def _account_secrets(self):
@@ -948,11 +1024,33 @@ class Admin:
                 raise apierr.ApiError(403, "forbidden", "Administration requires a same-origin request")
 
     # -- prompt control (docs/prompt-control-plan.md 4.1) ---------------------------------------------
+    def _prompts_body(self, handler, limit=None):
+        """The JSON object of a prompts request. The checks are those of every admin mutation (_read_body: length,
+        JSON content type, max_body_bytes); `limit` adds a bound of the route's own, judged before a byte is read."""
+        try:
+            declared = int(handler.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0  # _read_body refuses a length it cannot read
+        if limit is not None and declared > limit:
+            handler.close_connection = True
+            raise apierr.payload_too_large(limit)
+        try:
+            return validate.load_json(handler._read_body())
+        except RecursionError:
+            raise apierr.bad_request("invalid JSON body: nested too deeply")
+        except ValueError:
+            raise apierr.bad_request("invalid JSON body")
+
     def _prompts_route(self, handler, path):
         if handler.command not in PROMPT_ROUTES[path]:
             raise apierr.method_not_allowed()
         store = self.runtime.prompts
-        return self._prompts_state(store)
+        if handler.command == "GET":
+            return self._prompts_state(store)
+        # Guard failures must close a connection whose body was not consumed.
+        handler.close_connection = True
+        self._mutation_guard(handler)
+        return self._prompts_save(handler, store)
 
     def _prompts_state(self, store):
         store.maybe_reload()
@@ -964,6 +1062,42 @@ class Admin:
                 "legacy": {"mode": self.cfg.get("relay_system_prompt_mode", "standalone"),
                            "role_chars": len(relay_policy(self.cfg.get("relay_system_prompt")))},
                 "builtin": _builtin_prompts()}
+
+    def _prompts_save(self, handler, store):
+        data = self._prompts_body(handler, PROMPTS_BODY_LIMIT)
+        unknown = set(data) - {"document", "base_rev"}
+        if unknown:
+            raise apierr.bad_request("Unknown field in the request", param=sorted(unknown)[0])
+        document, base_rev = data.get("document"), data.get("base_rev")
+        if not isinstance(document, dict):
+            raise apierr.bad_request("'document' must be the prompts document, an object", param="document")
+        if base_rev is not None and (type(base_rev) is not int or base_rev < 0):
+            raise apierr.bad_request("'base_rev' must be the revision the edit started from, or null",
+                                     param="base_rev")
+        text = _checked_document(document)
+        with self.prompts_lock:
+            store.maybe_reload()
+            previous = store.snapshot()
+            current = None if previous is None else previous.rev
+            if base_rev != current:
+                named = ["none" if rev is None else str(rev) for rev in (base_rev, current)]
+                raise apierr.conflict("The prompts are not at the revision the edit started from (edit: %s, now: %s): "
+                                      "reload them and repeat the edit" % tuple(named))
+            try:
+                snapshot = store.save(document, base_rev)
+            except prompt_policy.PromptConfigError as error:
+                raise _config_error(error)
+            except OSError:
+                raise apierr.service_unavailable("Cannot save the prompts file")
+            before = previous.document if previous is not None and isinstance(previous.document, dict) else {}
+            changed = _changed_paths(before, document)
+            shown = ", ".join(changed[:5]) + (" …" if len(changed) > 5 else "")
+            journal.emit("admin.prompts", "Промпты сохранены, ревизия %s: %s" % (snapshot.rev, shown or "без изменений"),
+                         "info", rev=snapshot.rev, changed_paths=changed[:CHANGED_PATHS_LIMIT],
+                         sha8=prompt_policy.sha8(text))
+        warnings = _document_warnings(document)
+        warnings += [str(item) for item in getattr(snapshot, "warnings", None) or () if str(item) not in warnings]
+        return {"rev": snapshot.rev, "warnings": warnings}
 
     def _static(self, handler, path):
         relative = "index.html" if path in ("/admin", "/admin/") else unquote(path[len("/admin/"):])
