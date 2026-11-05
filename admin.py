@@ -30,7 +30,10 @@ from orchestrator import DEFAULT_NATIVE_TOOLS_ROLE
 
 
 BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
-LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval"}
+# The role and its mode are read from the shared cfg by every request (orchestrator._instructions and
+# _client_instructions), so the next request already sends the new head.
+LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
+                 "relay_system_prompt", "relay_system_prompt_mode"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 POOL_FIELDS = {"enabled", "priority", "label"}
