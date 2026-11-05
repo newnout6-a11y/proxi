@@ -35,6 +35,16 @@ def priority(backend):
     return value if type(value) is int else 0
 
 
+def cfg_tag(cfg):
+    """Journal label of an account config: a short hash, never the raw ID; None without an identity."""
+    cfg = cfg or {}
+    return journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
+
+
+def account_tag(backend):
+    return cfg_tag(getattr(backend, "cfg", None))
+
+
 class AccountDispatcher:
     def __init__(self, backends, cfg, managers, *, clock=time.monotonic, rng=None):
         self.backends = list(backends)
@@ -115,8 +125,7 @@ class AccountDispatcher:
 
     # -- scheduling ----------------------------------------------------------
     def _tag(self, backend):
-        cfg = getattr(backend, "cfg", None) or {}
-        return journal.tag(cfg.get("account_id") or cfg.get("page_uuid")) or "account"
+        return account_tag(backend) or "account"
 
     def _jitter(self, seconds):
         return seconds * self.rng.uniform(0.9, 1.1)

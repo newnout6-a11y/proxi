@@ -18,7 +18,7 @@ import websockets
 import apierr
 import journal
 import models as model_catalog
-from accounts import enabled as account_enabled, priority as account_priority
+from accounts import account_tag, enabled as account_enabled, priority as account_priority
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -1143,6 +1143,7 @@ class SessionPool:
                             # The new account must write the prefix cache once.
                             journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
                                          conversation=journal.tag(key),
+                                         from_account=account_tag(old.backend), to_account=account_tag(replacement),
                                          reason=(getattr(old.backend, "unavailable", None) or {}).get(
                                              "reason", "failover" if self._routable(old.backend, model_entry)
                                              else "no_route"))
@@ -1153,7 +1154,7 @@ class SessionPool:
                         self._conversations[key] = session
                         journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),
-                                     pool=len(self._conversations))
+                                     account=account_tag(backend), pool=len(self._conversations))
                     keep = True
                     self._check_route(session.backend, model_entry)
             else:

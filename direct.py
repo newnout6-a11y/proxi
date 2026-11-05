@@ -24,7 +24,7 @@ import client_context
 import console_log
 import native_history
 import models as model_catalog
-from accounts import enabled as account_enabled
+from accounts import account_tag, enabled as account_enabled
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
 
@@ -747,6 +747,7 @@ def _ping(session, body):
                     console_log.write(console_log.balance_line(request_id, snapshot(), actual_credits) + " [keepwarm]")
                 journal.emit("cache.keepwarm_usage", "Стоимость запроса прогрева", "info",
                              billing_id=billing_id, model=body.get("model"), source="relay",
+                             account=account_tag(session.backend),
                              request_purpose="cache-keepwarm", actual_credits=actual_credits,
                              complete=complete, usage=warm_usage)
             except Exception:  # noqa: BLE001 - reporting must not mask the ping's own outcome
@@ -770,6 +771,7 @@ async def _keepwarm(session, cfg):
     during_turns = bool(cfg.get("cache_keepwarm_during_turns", True))
     turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), 285.0)
     active_interval = min(interval, 240.0)
+    account = account_tag(getattr(session, "backend", None))
     scheduled_seq = None
     next_turn_ping = 0.0
     retry_at = 0.0
@@ -839,6 +841,7 @@ async def _keepwarm(session, cfg):
                          "Запрос прогрева завершён; использование кэша не подтверждено",
                          "info" if busy else "debug",
                          model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
+                         account=account,
                          during_turn=busy, turn_age_seconds=round(ping_started - started) if busy else None,
                          prefix_tokens=prefix_tokens, est_credits=round(estimate, 4),
                          actual_credits=actual, credits_total=getattr(session, "_keepwarm_cost", 0.0),
@@ -851,12 +854,13 @@ async def _keepwarm(session, cfg):
             failures = getattr(session, "_warm_failures", 0) + 1
             session._warm_failures = failures
             if failures >= 5:
-                journal.emit("cache.keepwarm", "Прогрев остановлен после пяти неудач", "warn")
+                journal.emit("cache.keepwarm", "Прогрев остановлен после пяти неудач", "warn", account=account)
                 console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire")
                 return
             retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
             next_turn_ping = retry_at
-            journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn")
+            journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn",
+                         account=account)
             console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" % str(exc)[:200])
         finally:
             client_context.reset(context_token)

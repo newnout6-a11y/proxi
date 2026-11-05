@@ -18,6 +18,7 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
+from accounts import account_tag
 from context import DEFAULT_RELAY_SYSTEM_PROMPT, build_system_instructions
 from redact import redact
 from session import SessionLease
@@ -581,6 +582,8 @@ class TurnRunner:
                     session = await self.pool.acquire(key, model_entry=parsed.entry, **scoped, **failover)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
+                # Every later event of this turn, errors included, names the account serving it.
+                trace["account"] = account_tag(getattr(acquired, "backend", None))
                 # Debit the account that actually served the turn.
                 account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
                 acquired._credits_manager = account_credits

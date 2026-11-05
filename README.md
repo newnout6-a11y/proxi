@@ -253,6 +253,16 @@ OpenCode. Основной чат этих клиентов всегда при�
 В памяти хранится 5000 последних событий, на диск они дописываются в `journal.jsonl`
 (ротация на 10 МиБ) и восстанавливаются после перезапуска.
 
+Событие, у которого известен аккаунт, несёт его тег в `data.account`: первые 8 символов
+SHA-256 от `account_id` (или `page_uuid`); сам идентификатор в журнал не попадает. Тот же
+тег стоит в `accounts[].account` ответа `GET /v1/balance`, поэтому по нему можно найти все
+события одного аккаунта. Тег есть у `session.acquire`, `session.create`, `upstream.request`,
+`upstream.attempt`, `upstream.usage` и остальных событий хода после получения сессии
+(включая `turn.error` и `turn.end`), у `cache.keepwarm` и `cache.keepwarm_usage`, а также у
+`auth.refresh`, `account.exhausted`, `account.failover` и `admin.account`. У `account.migrate`
+два тега: `from_account` (откуда переехал диалог) и `to_account` (куда). Ход, которому не
+удалось получить сессию, тега не имеет: аккаунт ещё не выбран.
+
 Для локальных Claude Code/Desktop и OpenCode журнал добавляет название приложения,
 имя чата, ID сессии и агента. Имена читаются из локальных метаданных только этих
 клиентов; `title_source` показывает источник названия (`claude-custom-title`,
