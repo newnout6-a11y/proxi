@@ -9,6 +9,16 @@ from scripts import probe_client_settings as probe
 from scripts.probe_client_settings import catalog_policy
 
 
+@pytest.fixture(autouse=True)
+def fresh_probe_state():
+    """The fake server's request log and child-agent flag are module globals; never let a test inherit them."""
+    probe.records.clear()
+    probe.task_sent = False
+    yield
+    probe.records.clear()
+    probe.task_sent = False
+
+
 def wrap(models, mode):
     if mode == "opencode2":
         return [{"type": "document", "info": {"providers": {"retool-relay": {"models": models}}}},
