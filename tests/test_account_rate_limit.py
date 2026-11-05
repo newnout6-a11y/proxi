@@ -712,11 +712,23 @@ def test_when_every_account_is_parked_the_http_answer_is_429_with_retry_after_no
     assert health["accounts"]["routable"] == 0 and health["upstream"] == "degraded"
 
 
-def test_a_streaming_client_gets_the_same_explanation_in_its_error_event(served):
+def test_a_streaming_client_gets_the_real_429_while_every_account_is_parked(served):
+    served.dispatcher.mark_rate_limited(served.backends[0])
+    served.dispatcher.mark_rate_limited(served.backends[1])
+    status, body, headers = served.call("/v1/chat/completions", {**CHAT, "stream": True})
+    assert status == 429 and 1 <= int(headers["retry-after"]) <= 900
+    assert body["error"]["type"] == "rate_limit_error"
+    assert "все аккаунты упёрлись в часовой лимит Retool" in body["error"]["message"]
+    assert served.posts == []
+
+
+def test_an_account_parked_after_the_check_still_ends_in_an_error_event(served, monkeypatch):
+    # The race the pre-flight check cannot close: acquire() fails once the stream has begun.
+    monkeypatch.setattr(served.runtime.pool, "unavailable_error", lambda *args, **kwargs: None)
     served.dispatcher.mark_rate_limited(served.backends[0])
     served.dispatcher.mark_rate_limited(served.backends[1])
     status, body, _ = served.call("/v1/chat/completions", {**CHAT, "stream": True})
-    assert "rate_limit_error" in body and "все аккаунты упёрлись в часовой лимит Retool" in body
+    assert status == 200 and "rate_limit_error" in body and "все аккаунты упёрлись в часовой лимит Retool" in body
     assert served.posts == []
 
 

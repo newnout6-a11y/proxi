@@ -387,7 +387,7 @@ def account_config(root, record):
 def serving(items, cfg, shared_main=True):
     """The accounts a request can be routed to, switched-off ones included.
 
-    This is the one list that discovery, SessionPool.model_refusal and acquire() read. In
+    This is the one list that discovery, SessionPool.model_refusal/unavailable_error and acquire() read. In
     shared mode a request without a context scope (`shared_main`) runs on the shared session, which only the
     pool's first account serves; every other request may use any account. `items` are backends or configs.
     """

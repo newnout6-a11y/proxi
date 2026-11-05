@@ -984,14 +984,14 @@ class SessionPool:
         refusals = model_catalog.refusal_reasons(model_entry, configs, model_catalog.pool_configured(configs))
         return model_catalog.model_unavailable(model_entry, refusals) if refusals and all(refusals) else None
 
-    def _candidates(self, backends, model_entry, exclude=()):
+    def _candidates(self, backends, model_entry, exclude=(), configured=True):
         """The accounts a request can go to right now as (kind, accounts); acquire()'s error when there are none.
 
         kind is "ready" (usable accounts), "reserve" (every one is below min_account_balance: the richest serves)
         or "signed_out" (a session that needs a new sign-in is still tried). Reads state only: nothing is
-        reserved, awaited or counted.
+        reserved, awaited or counted. `configured` is refusal_reasons': acquire() always judges the resource.
         """
-        reasons = (model_catalog.refusal_reasons(model_entry, [backend.cfg for backend in backends])
+        reasons = (model_catalog.refusal_reasons(model_entry, [backend.cfg for backend in backends], configured)
                    if model_entry is not None else [None] * len(backends))
         routable = [backend for backend, reason in zip(backends, reasons) if not reason]
         refusals = [reason for reason in reasons if reason]
@@ -1015,12 +1015,33 @@ class SessionPool:
             return "signed_out", signed_out
         raise self._unusable_error(routable)
 
-    def _check_shared(self, model_entry, exclude=()):
+    def _check_shared(self, model_entry, exclude=(), configured=True):
         """What the shared session needs of its one account; acquire()'s error when it cannot serve."""
-        self._check_route(self.backend, model_entry)
+        reasons = (model_catalog.refusal_reasons(model_entry, [self.backend.cfg], configured)
+                   if model_entry is not None else [None])
+        if reasons[0]:
+            raise model_catalog.model_unavailable(model_entry, reasons)
         if not account_enabled(self.backend):
             raise apierr.service_unavailable("the shared-mode account is switched off")
-        self._candidates([self.backend], model_entry, exclude)
+        self._candidates([self.backend], model_entry, exclude, configured)
+
+    def unavailable_error(self, model_entry, isolated=False, context_scope=None, exclude=()):
+        """The error acquire() raises right now because no account can take this request, or None.
+
+        Reads state only (see _candidates). The HTTP layer asks before a stream starts, so the client gets the real
+        status and Retry-After instead of an error event inside a 200. Like model_refusal, a pool without any provider
+        resource leaves the explanation to acquire(). Room in the conversation pool is not part of the answer, and an
+        account that fails between this check and acquire() still ends in an error event.
+        """
+        configured = model_catalog.pool_configured([b.cfg for b in self._serving(isolated, context_scope)])
+        try:
+            if self._on_shared_session(isolated, context_scope):
+                self._check_shared(model_entry, exclude, configured)
+            else:
+                self._candidates(self.backends, model_entry, exclude, configured)
+        except apierr.ApiError as error:
+            return error
+        return None
 
     def _next_backend(self, model_entry=None, exclude=()) -> Backend:
         kind, candidates = self._candidates(self.backends, model_entry, exclude)

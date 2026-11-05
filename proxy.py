@@ -633,6 +633,13 @@ def make_handler(runtime: Runtime):
                              request_id=self.request_id, retry_after=round(wait, 2))
                 raise apierr.too_many_requests("relay rate limit reached", wait)
 
+            if parsed.stream:
+                # A stream opens with a 200 and can only report an error as an event. What the pool already
+                # knows (no account can take the request now) is answered here, with its real status and Retry-After.
+                unavailable = self._pool_unavailable(parsed.entry, scope)
+                if unavailable is not None:
+                    raise unavailable
+
             events = queue.Queue()
             holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
             self._holder = holder
@@ -659,6 +666,17 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _pool_unavailable(self, entry, scope):
+            """acquire()'s error for this request if it were asked now, after the one balance recheck a 402 gets."""
+            error = runtime.pool.unavailable_error(entry, **scope)
+            if error is not None and error.code == "insufficient_credits":
+                # TurnRunner confirms excluded balances once before it answers 402, so a top-up does not
+                # wait for the timer; a stream is refused only after the same confirmation.
+                recheck = getattr(runtime.accounts, "recheck_exhausted", None)
+                if recheck is not None and recheck():
+                    error = runtime.pool.unavailable_error(entry, **scope)
+            return error
 
         def _collect(self, fut, events, adapter, prompt_text, holder_session=None):
             holder_session = holder_session or {}

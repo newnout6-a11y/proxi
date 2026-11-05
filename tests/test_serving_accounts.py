@@ -83,10 +83,10 @@ def relay_pool(tmp_path, monkeypatch):
         port = server.server_address[1]
         started.append((runtime, server))
 
-        def call(path, payload):
+        def call(path, payload, headers=None):
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
             connection.request("POST", path, json.dumps(payload).encode(),
-                               {"content-type": "application/json", "authorization": "Bearer " + KEY})
+                               {"content-type": "application/json", "authorization": "Bearer " + KEY, **(headers or {})})
             reply = connection.getresponse()
             raw = reply.read().decode()
             connection.close()

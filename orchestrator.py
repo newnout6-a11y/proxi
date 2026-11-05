@@ -195,7 +195,7 @@ def acquire_plan(cfg, parsed):
     """Which pool session a turn asks for, as SessionPool.acquire()'s `isolated` / `context_scope` keywords.
 
     TurnRunner acquires with exactly this plan, and the HTTP layer puts the same keywords to the pool
-    (model_refusal) before a response starts: the check and the acquire read the same accounts.
+    (model_refusal, unavailable_error) before a response starts: the check and the acquire read the same accounts.
     """
     native_tools = getattr(parsed, "tools", None) or []
     direct_mode = cfg.get("transport") == "direct"
