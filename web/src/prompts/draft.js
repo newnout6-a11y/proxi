@@ -248,7 +248,7 @@ export function changedPaths(saved, draft) {
       const was = isObject(before[key]) ? before[key] : {};
       const now = isObject(after[key]) ? after[key] : {};
       for (const name of new Set([...Object.keys(was), ...Object.keys(now)])) {
-        if (!equalJson(was[name], now[name])) paths.push(`${key}.${name}`);
+        if (!same(was[name], now[name])) paths.push(`${key}.${name}`);
       }
     } else {
       paths.push(key);

@@ -373,6 +373,9 @@ test('changes are counted per section, profile and text, and the version is not 
   assert.deepEqual(changedPaths(null, null), []);
   assert.deepEqual(changedPaths(null, blankDocument()), []);
   assert.deepEqual(changedPaths({ version: 1, default_profile: null, rules: [] }, { version: 1, rules: [], texts: {} }), []);
+  // a built-in relay text is null or missing, the same thing; an empty named text is not nothing
+  assert.deepEqual(changedPaths({ relay_texts: { role: null, reminder: 'x' } }, { relay_texts: { reminder: 'x' } }), []);
+  assert.deepEqual(changedPaths({ texts: { a: 'x' } }, { texts: { a: 'x', b: '' } }), ['texts.b']);
   assert.deepEqual(changedPaths(null, { version: 1, profiles: { mine: { head: 'h' } }, rules: [{ name: 'r' }] }).sort(), ['profiles.mine', 'rules']);
   assert.equal(pathLabel('profiles.mine'), 'профиль mine');
   assert.equal(pathLabel('relay_texts.role'), 'текст relay: role');
