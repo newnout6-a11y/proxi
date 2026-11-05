@@ -648,6 +648,77 @@ def test_cli_keeps_the_users_list_and_reports_what_changed(tmp_path, monkeypatch
     assert report['default_model'] == 'claude-opus-5-5' and rows[1]['name'] == 'claude-sonnet-5-5'
 
 
+OWNED_DRIFT = {'name': 'claude-opus-5-5', 'labelOverride': 'mine', 'maxEffort': 'xhigh', 'isFamilyDefault': False,
+               'anthropicFamilyTier': 'sonnet', 'custom': {'keep': True}}
+OWNED_IN_SYNC = {'name': 'claude-sonnet-5-5', 'isFamilyDefault': True, 'anthropicFamilyTier': 'sonnet',
+                 'maxEffort': 'high'}
+OWNED_OBSOLETE = {'name': 'claude-haiku-4-5-20251001', 'maxEffort': 'high', 'isFamilyDefault': True,
+                  'anthropicFamilyTier': 'haiku'}
+OVERWRITES = {('claude-opus-5-5', 'maxEffort'): ('xhigh', 'high'), ('claude-opus-5-5', 'isFamilyDefault'): (False, True),
+              ('claude-opus-5-5', 'anthropicFamilyTier'): ('sonnet', 'opus'),
+              ('claude-haiku-4-5-20251001', 'maxEffort'): ('high', None)}
+
+
+def overwrites(report):
+    return {(item['model'], item['field']): (item['was'], item['now']) for item in report['changed_fields']}
+
+
+def test_summary_lists_each_overwritten_field_of_an_existing_row_in_a_preview(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary', [OWNED_DRIFT, OWNED_IN_SYNC, OWNED_OBSOLETE])
+    report, rows = preview(capsys, tmp_path, '--config-library', path.parent,
+                           '--desktop-catalog', anthropic_catalog(tmp_path))
+    assert overwrites(report) == OVERWRITES and len(report['changed_fields']) == len(OVERWRITES)
+    assert all(set(item) == {'model', 'field', 'was', 'now'} for item in report['changed_fields'])
+    assert path.read_bytes() == data and rows[0]['custom'] == {'keep': True} and rows[0]['labelOverride'] == 'mine'
+
+
+def test_summary_lists_the_same_overwrites_when_writing_and_none_for_a_current_list(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary', [OWNED_DRIFT, OWNED_IN_SYNC, OWNED_OBSOLETE])
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--config-library', path.parent, '--write', '--backup-dir', tmp_path / 'backups']
+    code, report, error = cli(capsys, *arguments)
+    assert code == 0 and report['written'] is True, error
+    assert overwrites(report) == OVERWRITES
+    code, report, error = cli(capsys, *arguments)
+    assert code == 0 and report['written'] is False and report['changed_fields'] == []
+
+
+def test_a_toggled_effort_mapping_shows_up_as_overwritten_max_effort_values(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary', [OWNED_IN_SYNC])
+    catalog = anthropic_catalog(tmp_path)
+    relay = relay_config(tmp_path, allow_effort_downgrade=True)
+    report, rows = preview(capsys, tmp_path, '--config-library', path.parent, '--desktop-catalog', catalog, relay=relay)
+    assert overwrites(report) == {('claude-sonnet-5-5', 'maxEffort'): ('high', 'max')}
+
+
+def test_new_rows_are_additions_not_overwrites():
+    previous = [OWNED_IN_SYNC]
+    result = build_catalog(entries(), previous)
+    assert len(result) > 1 and sync.changed_fields(previous, result) == []
+
+
+def test_only_the_fields_the_script_owns_can_change_in_an_existing_row():
+    previous = [{'name': name, 'labelOverride': 'mine', 'supports1m': True, 'behavesAs': 'x', 'custom': {'a': [1]},
+                 'isFamilyDefault': 'junk', 'anthropicFamilyTier': 'junk', 'maxEffort': 'junk'}
+                for name in sorted(claude_ids())]
+    result = build_catalog(entries(), previous)
+    assert {change['field'] for change in sync.changed_fields(previous, result)} == set(sync.OWNED_FIELDS)
+    for before, after in zip(previous, result):
+        assert {key: value for key, value in after.items() if key not in sync.OWNED_FIELDS} == {
+            key: value for key, value in before.items() if key not in sync.OWNED_FIELDS}
+
+
+def test_string_rows_become_objects_and_every_added_field_is_listed():
+    previous = ['claude-opus-5-5']
+    changes = sync.changed_fields(previous, build_catalog(entries(), previous))
+    assert {(change['field'], change['was']) for change in changes} == {
+        ('isFamilyDefault', None), ('anthropicFamilyTier', None), ('maxEffort', None)}
+    assert {change['model'] for change in changes} == {'claude-opus-5-5'}
+
+
 # Bug 39: models Desktop knows for Code and Cowork
 
 def test_desktop_catalog_limits_the_list_to_models_it_knows_for_code_and_cowork(tmp_path, monkeypatch, capsys):

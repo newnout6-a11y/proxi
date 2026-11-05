@@ -46,6 +46,10 @@ APP_BEHAVIOR_KEYS = frozenset(name.casefold() for name in (
     'relaunchEnforcementHours', 'configRecheckIntervalMinutes', 'egressProxyUrl', 'egressProxyPacUrl'))
 SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 DESKTOP_EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+# Row fields the script computes again at every run and overwrites whatever the file holds: it
+# cannot tell its own earlier value from the user's. Everything else in a row is kept, and the
+# summary lists each overwrite (changed_fields). docs/client-setup.md names the same fields.
+OWNED_FIELDS = ('isFamilyDefault', 'anthropicFamilyTier', 'maxEffort')
 # Sections of Anthropic's model catalog for Code in Desktop, the Code engine and Cowork.
 DESKTOP_SURFACES = ('ccd', 'cc', 'cowork')
 # Claude Code's effort table (https://code.claude.com/docs/en/model-config) is what Desktop
@@ -98,23 +102,29 @@ def claude_routes(entries):
     return [entry for entry in entries if entry.get('provider') == 'anthropic' and entry['id'].startswith('claude-')]
 
 
+def _rows_by_name(previous):
+    """Existing rows by model name; a bare string row stands for {'name': string}. The first row of a name wins."""
+    rows = {}
+    for item in previous:
+        item = {'name': item} if isinstance(item, str) else item
+        if isinstance(item.get('name'), str):
+            rows.setdefault(item['name'], item)
+    return rows
+
+
 def build_catalog(entries, previous, *, default_model=None, desktop=None, include_unlisted=False,
                   allow_downgrade=False):
     """Existing rows keep their order and every field the script does not derive.
 
     New models go to the end. The first row is Desktop's default model, so it changes
-    only for an explicit default_model. Derived fields (isFamilyDefault, anthropicFamilyTier,
-    maxEffort) are recomputed; labelOverride is set for new rows only. A desktop mapping
-    (see load_desktop_catalog) limits the list to models Desktop knows for Code/Cowork
-    unless include_unlisted.
+    only for an explicit default_model. Derived fields (OWNED_FIELDS: isFamilyDefault,
+    anthropicFamilyTier, maxEffort) are recomputed and overwrite the file; labelOverride
+    is set for new rows only. A desktop mapping (see load_desktop_catalog) limits the
+    list to models Desktop knows for Code/Cowork unless include_unlisted.
     """
     if not isinstance(previous, list) or any(not isinstance(item, (dict, str)) for item in previous):
         raise ValueError('Expected an existing Claude Desktop model policy list')
-    old = {}
-    for item in previous:
-        item = {'name': item} if isinstance(item, str) else item
-        if isinstance(item.get('name'), str):
-            old.setdefault(item['name'], item)
+    old = _rows_by_name(previous)
     routes = claude_routes(entries)
     if desktop is not None and not include_unlisted:
         listed = [entry for entry in routes if entry['id'] in desktop]
@@ -166,6 +176,24 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
             item.pop('maxEffort', None)
         result.append(item)
     return result
+
+
+def changed_fields(previous, result):
+    """Every field an existing row loses or changes: [{model, field, was, now}]; null stands for absent.
+
+    Rows the script adds are not listed (see the summary's `added`).
+    """
+    old, absent, changes = _rows_by_name(previous), object(), []
+    for row in result:
+        before = old.get(row['name'])
+        if before is None:
+            continue
+        for field in dict.fromkeys([*before, *row]):
+            was, now = before.get(field, absent), row.get(field, absent)
+            if was != now:
+                changes.append({'model': row['name'], 'field': field,
+                                'was': None if was is absent else was, 'now': None if now is absent else now})
+    return changes
 
 
 def _picker_levels(model):
@@ -492,6 +520,7 @@ def run(args):
                       'source': effective, 'target': target, 'default_model': after[0],
                       'added': [name for name in after if name not in before],
                       'removed': [name for name in before if name not in after],
+                      'changed_fields': changed_fields(previous, result),
                       'unlisted_skipped': skipped, 'warnings': warnings}, ensure_ascii=False))
     return 0
 
