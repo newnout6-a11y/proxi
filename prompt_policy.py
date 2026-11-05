@@ -2593,17 +2593,21 @@ class PromptStore:
             return self._preview_legacy(plan, inp, parsed, identity, cfg, snapshot)
         warnings = []
         history_changes, tools_changes, after = [], [], parsed
+        body_unmatched = []
         if plan.body_edits:
             try:
                 import prompt_body
-                rewritten, changes = prompt_body.rewrite(data, dialect, snapshot.profile(plan.profile), snapshot)
+                profile = snapshot.profile(plan.profile)
+                rewritten, changes = prompt_body.rewrite(data, dialect, profile, snapshot)
             except NotImplementedError:
                 warnings.append("history and tool edits are not available in this build: the preview shows none "
                                 "of them")
             else:
                 for change in changes:
-                    (tools_changes if "tool" in change or change.get("section") == "tools" else history_changes
-                     ).append(change)
+                    scope = change.get("scope")
+                    tools = scope == "tools" if scope else ("tool" in change or change.get("section") == "tools")
+                    (tools_changes if tools else history_changes).append(change)
+                body_unmatched = list(prompt_body.unmatched_edits(profile, changes))
                 after = parse(rewritten, cfg)
                 for name in ("dialect", "conversation_key", "parent_conversation_key", "request_purpose",
                              "prompt_purpose"):
@@ -2618,18 +2622,20 @@ class PromptStore:
         warnings = notes + warnings
         if sources.placeholders:
             warnings.append(_PLACEHOLDER_WARNING)
-        return self._preview_result(plan, inp, head, parts, history_changes, tools_changes, report, warnings)
+        return self._preview_result(plan, inp, head, parts, history_changes, tools_changes, report, warnings,
+                                    body_unmatched)
 
     @staticmethod
-    def _preview_result(plan, inp, head, parts, history_changes, tools_changes, report, warnings):
+    def _preview_result(plan, inp, head, parts, history_changes, tools_changes, report, warnings, body_unmatched=()):
         head_bytes = len(head.encode("utf-8", "surrogatepass"))
         unmatched = []
         if plan.profile is not None and plan.snapshot is not None:
             edits = plan.snapshot._data.profiles[plan.profile].system_edits
             for entry in report:
                 if not entry["matched"]:
-                    unmatched.append({"index": entry["index"], "op": entry["op"],
+                    unmatched.append({"scope": "client_system", "index": entry["index"], "op": entry["op"],
                                       "target": _edit_target(edits[entry["index"]])})
+        unmatched.extend(body_unmatched)
         return {"rule": plan.rule, "profile": plan.profile, "rev": plan.rev, "protected": plan.protected,
                 "purpose": inp.purpose, "client": inp.client, "model": inp.model, "head": head,
                 "parts": part_spans(parts), "history_changes": history_changes, "tools_changes": tools_changes,

@@ -78,7 +78,7 @@ def test_the_head_is_the_composed_template(store):
     result = store.preview(chat(), "chat", OPENCODE)
     expected = OPENCODE_SYSTEM.replace("# Code comments\nBy default, match the surrounding comment density.\n\n", "")
     assert result["head"] == "My rules.\n\n" + expected
-    assert result["edits_unmatched"] == [{"index": 1, "op": "remove_tag", "target": "missing"}]
+    assert result["edits_unmatched"] == [{"scope": "client_system", "index": 1, "op": "remove_tag", "target": "missing"}]
     assert [e["matched"] for e in result["edits"]] == [True, False]
     assert any("client_system.edits[1] (remove_tag missing) matched nothing" == line for line in result["warnings"])
     assert any("{{relay_task}} is empty" in line for line in result["warnings"])
@@ -386,11 +386,35 @@ def body_doc():
                     default_profile="p")
 
 
-def test_without_the_body_editor_the_preview_says_so_and_still_works(tmp_path):
+def test_without_the_body_editor_the_preview_says_so_and_still_works(tmp_path, monkeypatch):
+    import prompt_body
+
+    def missing(*args):
+        raise NotImplementedError
+
+    monkeypatch.setattr(prompt_body, "rewrite", missing)
     store = make_store(tmp_path, body_doc())
     result = store.preview(chat(system="S"), "chat", {})
     assert result["head"] == "S" and result["history_changes"] == [] and result["tools_changes"] == []
     assert any("not available" in line for line in result["warnings"])
+
+
+def test_the_real_body_editor_reports_its_changes_and_the_rules_that_found_nothing(tmp_path):
+    doc = document(profiles={"p": {"head": "{{client_system}}",
+                                   "history": {"mid_system": "drop",
+                                               "user_blocks": [{"op": "drop_tag", "tag": "absent-tag"}]},
+                                   "tools": {"edits": [{"tool": "nope*", "op": "append", "text": "x"}]}}},
+                   default_profile="p")
+    store = make_store(tmp_path, doc)
+    body = chat(system="S")
+    body["messages"].insert(2, {"role": "system", "content": "MID"})
+    body["messages"].append({"role": "user", "content": "again"})
+    result = store.preview(body, "chat", {})
+    assert [change["op"] for change in result["history_changes"]] == ["mid_system"]
+    assert result["tools_changes"] == []
+    assert {"scope": "history", "op": "drop_tag", "edit": 0} in result["edits_unmatched"]
+    assert {"scope": "tools", "op": "append", "edit": 0} in result["edits_unmatched"]
+    assert not any("not available" in line for line in result["warnings"])
 
 
 def test_changes_from_the_body_editor_are_split_into_history_and_tools(tmp_path, monkeypatch):
