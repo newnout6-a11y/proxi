@@ -200,6 +200,13 @@ def test_hide_removes_the_tools_and_keeps_the_order_of_the_rest(dialect):
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)
+def test_hide_may_be_written_as_an_op_too(dialect):
+    result, changes = edit(dialect, {"tool": "web*", "op": "hide"}, {"tool": "read", "op": "hide", "hide": True})
+    assert names(result["tools"], dialect) == ["bash"]
+    assert [(c["op"], c["tool"]) for c in changes] == [("hide", "webfetch"), ("hide", "read")]
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
 def test_a_hidden_tool_is_not_edited_by_the_rules_that_follow_and_edits_before_it_still_count(dialect):
     result, changes = edit(dialect, {"tool": "bash", "op": "append", "text": "Note."},
                            {"tool": "bash", "hide": True}, {"tool": "bash", "op": "set", "text": "Never."})

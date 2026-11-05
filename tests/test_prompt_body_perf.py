@@ -100,6 +100,22 @@ def test_a_huge_text_with_tens_of_thousands_of_tags_is_cut_in_linear_time(shape)
         assert len(changes) == 2 and changes[0]["removed_chars"] > 0
 
 
+def test_tens_of_thousands_of_blocks_in_a_row_on_one_line_are_cut_in_one_pass():
+    text = "<note>x</note>" * 60_000 + "\ntail"
+    data = {"model": "claude-opus-5-5", "messages": [
+        {"role": "system", "content": "HEAD"}, {"role": "user", "content": "go"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
+                                                                "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": text}, {"role": "user", "content": "more"}]}
+    rules = profile(user_blocks=[{"op": "drop_tag", "tag": "note"}])
+    start = time.perf_counter()
+    result, changes = prompt_body.rewrite(data, "chat", rules, FakeSnapshot())
+    elapsed = time.perf_counter() - start
+    assert elapsed < 3, "60000 blocks in a row took %.1f s" % elapsed
+    assert result["messages"][3]["content"] == "tail" and changes[0]["removed_chars"] == len(text) - len("tail")
+    assert prompt_body.rewrite(result, "chat", rules, FakeSnapshot())[1] == []
+
+
 @pytest.mark.parametrize("dialect", ["responses", "anthropic"])
 def test_the_other_dialects_are_as_fast(dialect):
     chat = agent_body(2000, 3_200_000)

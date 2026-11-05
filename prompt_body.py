@@ -73,9 +73,11 @@ def rewrite(data: dict, dialect: str, profile: dict, snapshot) -> tuple[dict, li
     like the replacement alone, so running it twice changes nothing. append and prepend add nothing
     that the description already contains.
 
-    Order: history.mid_system and history.user_blocks go over the messages once, in order (a
-    system message that mid_system turns into user text is then a user message for user_blocks,
-    which is why a second run changes nothing), then tools.edits in order.
+    Order: history.mid_system goes over every message first, then history.user_blocks over the result
+    (a system message that mid_system turned into user text is edited like any user message, and a
+    deletion sees the conversation as it will be, which is why a second run changes nothing), then
+    tools.edits in order. The history entries of changes are listed by the position of the message in
+    the body the client sent.
 
     Deleting a message (a user message every edit emptied, a dropped system message) is refused,
     and recorded as skipped, when it would leave two assistant messages next to each other, start
@@ -274,14 +276,14 @@ def _replace_text_fn(find, replacement, replace_all):
     return apply
 
 
-def _tag_blocks(text, rx):
-    """Spans [start, end) of the outermost <tag ...>...</tag> blocks whose opening tag starts a line.
+def _tag_pairs(text, rx):
+    """Every matched <tag ...>...</tag> pair as (start, end, line_start | None), sorted by start.
 
-    Blocks nest, an unclosed opening tag is ignored, and a mention in the middle of a line (a code
-    listing, a sentence about the tag) is not a block. start is moved back over the indentation.
-    The scan is linear: the line start is tracked from one tag to the next, never searched from scratch.
+    line_start is where the opening tag's line begins when only blanks stand in front of the tag on that
+    line, None for a mention in the middle of a line. An unclosed opening tag pairs with nothing and
+    nested tags pair like brackets. The scan is linear: the line start is tracked from one tag to the next.
     """
-    spans, stack = [], []
+    pairs, stack = [], []
     line, seen = 0, 0
     for match in rx.finditer(text):
         begin = match.start()
@@ -291,21 +293,37 @@ def _tag_blocks(text, rx):
         seen = begin
         if match.group(1):
             if stack:
-                start = stack.pop()
-                if start is not None:
-                    spans.append((start, match.end()))
+                start, anchor = stack.pop()
+                pairs.append((start, match.end(), anchor))
             continue
         indent = begin
         while indent > line and text[indent - 1] in " \t":
             indent -= 1
-        stack.append(line if indent == line else None)
-    spans.sort()
-    outer, last = [], -1
-    for start, end in spans:
-        if start >= last:
-            outer.append((start, end))
-            last = end
-    return outer
+        stack.append((begin, line if indent == line else None))
+    pairs.sort()
+    return pairs
+
+
+def _select_blocks(text, pairs, accept):
+    """Spans [start, end) of the outermost blocks to cut: they start a line (or follow a cut block on its
+    line, since that is where they will stand once it is gone) and accept(block text) holds."""
+    spans, covered = [], -1
+    for start, end, anchor in pairs:
+        if start < covered:
+            continue
+        if anchor is not None:
+            begin = anchor
+        else:
+            scan = covered
+            while 0 <= scan < start and text[scan] in " \t":
+                scan += 1
+            if scan != start or covered < 0:
+                continue
+            begin = covered
+        if accept(text[start:end]):
+            spans.append((begin, end))
+            covered = end
+    return spans
 
 
 def _line_end(text, position):
@@ -352,18 +370,21 @@ def _drop_tag_fn(tag, contains, pattern):
     rx = _tag_regex(tag)
     opener = "<" + tag
 
+    def accept(block):
+        return (not contains or contains in block) and (pattern is None or pattern.search(block) is not None)
+
     def apply(text):
         if opener not in text or (contains and contains not in text):
             return None
-        spans = _tag_blocks(text, rx)
-        if contains:
-            spans = [span for span in spans if contains in text[span[0]:span[1]]]
-        if pattern is not None:
-            spans = [span for span in spans if pattern.search(text[span[0]:span[1]])]
-        if not spans:
-            return None
-        new = _cut(text, spans)
-        return (new, len(text) - len(new), 0) if new != text else None
+        current = text
+        for _ in range(3):
+            spans = _select_blocks(current, _tag_pairs(current, rx), accept)
+            if not spans:
+                break
+            current = _cut(current, spans)
+            if opener not in current:
+                break
+        return (current, len(text) - len(current), 0) if current != text else None
     return apply
 
 
@@ -549,18 +570,20 @@ def _history_list(out, dialect):
 
 
 class _Walk:
-    """One pass over the conversation: the messages kept so far and what a deletion would break."""
+    """One pass over the conversation: the messages kept so far and what a deletion would break.
 
-    def __init__(self, context, messages, mode, edits):
-        self.context, self.messages, self.mode, self.edits = context, messages, mode, edits
+    origins[i] is the position message i had in the body the client sent; changes report that one."""
+
+    def __init__(self, context, messages, origins, mode, edits):
+        self.context, self.messages, self.origins, self.mode, self.edits = context, messages, origins, mode, edits
         self.dialect, self.changes = context.dialect, context.changes
         self.lead = native_history.leading_instructions(messages)
-        self.result, self.seen, self.rebuilt = [], [], False
+        self.result, self.seen, self.origin_out, self.rebuilt = [], [], [], False
 
     def run(self):
         for index, message in enumerate(self.messages):
             if index < self.lead or not isinstance(message, dict):
-                self.keep(message, None if index < self.lead else "U")
+                self.keep(message, None if index < self.lead else "U", index)
                 continue
             kind = _kind(message, self.dialect)
             if kind == "S":
@@ -572,12 +595,13 @@ class _Walk:
                 message = self.edit(index, message, kind)
                 if message is None:
                     continue
-            self.keep(message, "U" if kind == "X" else kind)
+            self.keep(message, "U" if kind == "X" else kind, index)
         return self.result
 
-    def keep(self, message, seen):
+    def keep(self, message, seen, index):
         self.result.append(message)
         self.seen.append(seen)
+        self.origin_out.append(self.origins[index])
 
     def blocker(self, index):
         """Why message `index` cannot leave the conversation, or None when it can."""
@@ -604,24 +628,24 @@ class _Walk:
     def system(self, index, message):
         """A system message after the head: None when it stays, goes or is a blank entry, else the user message
         that replaces it."""
+        origin, mode = self.origins[index], self.mode
         text = _instruction_text(message.get("content"))
         if text is not None and not text.strip():
-            self.keep(message, None)
+            self.keep(message, None, index)
             return None
-        mode = self.mode
         if mode == "keep" or text is None:
             if text is None and mode != "keep":
                 self.context.skipped("history", "mid_system", "unsupported system content", mode=mode,
-                                     index=index, target="system")
-            self.keep(message, "U")
+                                     index=origin, target="system")
+            self.keep(message, "U", index)
             return None
-        change = {"scope": "history", "op": "mid_system", "mode": mode, "index": index, "target": "system"}
+        change = {"scope": "history", "op": "mid_system", "mode": mode, "index": origin, "target": "system"}
         kept = [name for name in _CONTROL_KEYS if name in message]
         if mode == "drop":
             reason = self.blocker(index)
             if reason is not None:
-                self.context.skipped("history", "mid_system", reason, mode=mode, index=index, target="system")
-                self.keep(message, "U")
+                self.context.skipped("history", "mid_system", reason, mode=mode, index=origin, target="system")
+                self.keep(message, "U", index)
                 return None
             change.update(removed_chars=len(text), added_chars=0, deleted=True)
             replacement = None
@@ -631,7 +655,7 @@ class _Walk:
             replacement = _as_user_message(message, rendered, self.dialect)
         if kept:
             # The effort and the output format of the entry are not text: a blank entry carries them on.
-            self.keep(dict(message, content=[]), None)
+            self.keep(dict(message, content=[]), None, index)
             change["kept"] = kept
         self.changes.append(change)
         self.rebuilt = True
@@ -639,6 +663,7 @@ class _Walk:
 
     def edit(self, index, message, kind):
         """Apply the user_blocks rules to a user message or a tool result; None when the message is deleted."""
+        origin = self.origins[index]
         target = "user" if kind == "U" else "tool_result"
         field = "output" if self.dialect == "responses" and kind == "T" and message.get("output") is not None \
             else "content"
@@ -647,12 +672,12 @@ class _Walk:
             if res is None:
                 continue
             value, removed, added, empty = res
-            change = {"scope": "history", "op": op, "edit": position, "index": index, "target": target,
+            change = {"scope": "history", "op": op, "edit": position, "index": origin, "target": target,
                       "removed_chars": removed, "added_chars": added}
             if empty and kind == "U":
                 reason = self.blocker(index)
                 if reason is not None:
-                    self.context.skipped("history", op, reason, edit=position, index=index, target=target)
+                    self.context.skipped("history", op, reason, edit=position, index=origin, target=target)
                     continue
                 self.changes.append(dict(change, deleted=True))
                 self.rebuilt = True
@@ -678,14 +703,21 @@ def _rewrite_history(out, context, history):
     key, messages, scalar = _history_list(out, context.dialect)
     if messages is None:
         return
-    first = len(context.changes)
-    walk = _Walk(context, messages, mode, edits)
-    result = walk.run()
+    first, origins, rebuilt = len(context.changes), list(range(len(messages))), False
+    # The system messages go first, so that the text rules and the deletion rules see the conversation as it
+    # will be: a system message turned into user text is edited like one, and is not a head to protect.
+    for walk_mode, walk_edits in ((mode, []), ("keep", edits)):
+        if walk_mode == "keep" and not walk_edits:
+            continue
+        walk = _Walk(context, messages, origins, walk_mode, walk_edits)
+        messages, origins, rebuilt = walk.run(), walk.origin_out, rebuilt or walk.rebuilt
+    context.changes[first:] = sorted(context.changes[first:], key=lambda c: (c.get("index") is not None,
+                                                                              c.get("index") or 0))
     if scalar:
         if len(context.changes) > first:
-            out[key] = result[0]["content"]
-    elif walk.rebuilt:
-        out[key] = result
+            out[key] = messages[0]["content"]
+    elif rebuilt:
+        out[key] = messages
 
 
 # ---------------------------------------------------------------------------------------------
@@ -835,7 +867,7 @@ def _rewrite_tools(out, context, tools_config):
         patterns = [_glob(g) for g in ([globs] if isinstance(globs, str) else globs or []) if isinstance(g, str) and g]
         if not patterns:
             continue
-        hiding = spec.get("hide") is True
+        hiding = spec.get("hide") is True or spec.get("op") == "hide"
         op, fn = "hide" if hiding else spec.get("op"), None
         if not hiding:
             fn, reason = _description_fn(context, spec)

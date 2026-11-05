@@ -112,6 +112,24 @@ def test_drop_tag_with_pattern_filters_blocks_by_regex_and_flags():
     assert edited("chat", both, drop_tag(contains="Plan", pattern=r"on"))[0] == "rest"
 
 
+@pytest.mark.parametrize("text,rule,expected", [
+    ("<n>a</n><n>b</n>\nrest", drop_tag("n"), "rest"),
+    ("<n>a</n> <n>b</n>\nrest", drop_tag("n"), "rest"),
+    ("A\n<n>a</n><n>b</n><n>c</n>\nB", drop_tag("n"), "A\nB"),
+    ("A\n<n>a</n>  <n>b</n>\nB", drop_tag("n"), "A\nB"),
+    ("<n>a</n>text<n>b</n>", drop_tag("n"), "text<n>b</n>"),
+    ("<n>a</n><n>keep</n>", drop_tag("n", contains="a"), "<n>keep</n>"),
+    ("<n>keep</n><n>a</n>", drop_tag("n", contains="a"), "<n>keep</n><n>a</n>"),
+    ("<n>a</n><n>b</n><n>a</n>\nrest", drop_tag("n", contains="a"), "<n>b</n><n>a</n>\nrest"),
+], ids=["adjacent", "blank-between", "three-in-a-line", "indented-second", "text-between", "filtered-second",
+        "filtered-first-keeps-second", "filtered-middle"])
+def test_blocks_that_follow_a_cut_block_on_its_line_go_too_so_a_second_run_finds_nothing(text, rule, expected):
+    data = conversation("chat", [("user", text), ("assistant", "ok"), ("user", "more")])
+    result, _ = rewrite(data, "chat", rule)
+    assert neutral(result, "chat")[0][1] == expected
+    assert rewrite(result, "chat", rule) == (result, [])
+
+
 @pytest.mark.parametrize("dialect", DIALECTS)
 def test_remove_regex_applies_flags_in_every_dialect(dialect):
     text = "Keep.\nSECRET-TOKEN-1\nsecret-token-2\nEnd."
@@ -381,3 +399,13 @@ def test_edits_over_the_whole_json_never_change_what_they_do_not_name():
     for key in ("model", "tools", "temperature", "stream", "metadata", "tool_choice", "reasoning_effort"):
         assert result[key] == data[key]
     assert list(result) == list(data)
+
+
+def test_a_block_that_only_qualifies_once_the_blocks_inside_it_are_gone_goes_in_the_same_run():
+    # The outer block is not a single word, so the rule skips it at first; its inner block is, and when that
+    # is cut the outer one becomes one.
+    text = "<n>\nouter\n<n>inner</n>\n</n>\nrest"
+    rule = drop_tag("n", pattern=r"\A<n>\s*\S+\s*</n>\Z")
+    once, changes = rewrite(conversation("chat", [("user", text), ("assistant", "ok"), ("user", "more")]), "chat", rule)
+    assert neutral(once, "chat")[0][1] == "rest" and len(changes) == 1
+    assert rewrite(once, "chat", rule) == (once, [])

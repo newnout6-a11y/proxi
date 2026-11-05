@@ -8,7 +8,7 @@ import native_history
 import prompt_body
 from apierr import ApiError
 from test_prompt_body_support import (
-    DIALECTS, FakeSnapshot, conversation, drop_tag, history_of, neutral, parse, profile)
+    DIALECTS, REMINDER, FakeSnapshot, conversation, drop_tag, history_of, neutral, parse, profile)
 
 LATE = "Late rule: answer in Russian."
 CONTROL = {"output_config": {"effort": "low"}}
@@ -300,3 +300,50 @@ def test_a_string_content_stays_a_string_and_parts_stay_parts(dialect):
     assert history_of(rewrite(as_string, dialect, "plain")[0], dialect)[index]["content"] == LATE
     plain_parts = history_of(rewrite(as_parts, dialect, "plain")[0], dialect)[index]["content"]
     assert plain_parts == [{"type": "input_text" if dialect == "responses" else "text", "text": LATE}]
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("mode,deleted", [("plain", True), ("wrap", True), ("drop", True), ("keep", False)])
+def test_a_system_message_the_same_run_converts_or_drops_is_not_a_head_to_protect(dialect, mode, deleted):
+    # [user with only a reminder, system message, ...]: while the system message stays one, deleting the
+    # user message in front of it would make it part of the head; once it is user text or gone it is not.
+    data = conversation(dialect, [("user", REMINDER), ("system", LATE), ("user", "next"), ("assistant", "ok"),
+                                  ("user", "more")])
+    rules = [drop_tag("system-reminder", contains="Plan mode")]
+    result, changes = rewrite(data, dialect, mode, user_blocks=rules)
+    turns = neutral(result, dialect)
+    assert (("user", REMINDER) not in turns) == deleted
+    assert any(c.get("skipped") for c in changes) == (not deleted)
+    assert parse(dialect, result).system == "HEAD"
+    again, more = rewrite(result, dialect, mode, user_blocks=rules)
+    assert again == result and [c for c in more if not c.get("skipped")] == []
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_a_dropped_system_message_that_leaves_a_blank_entry_still_blocks_that_deletion(dialect):
+    data = conversation(dialect, [("user", REMINDER), ("system", LATE, CONTROL), ("user", "next"),
+                                  ("assistant", "ok"), ("user", "more")])
+    result, changes = rewrite(data, dialect, "drop", user_blocks=[drop_tag("system-reminder")])
+    assert neutral(result, dialect)[0] == ("user", REMINDER)
+    assert [(c["op"], c.get("skipped")) for c in changes] == [("drop_tag", True), ("mid_system", None)]
+    assert rewrite(result, dialect, "drop", user_blocks=[drop_tag("system-reminder")])[0] == result
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_the_changes_of_both_passes_are_listed_by_the_position_in_the_clients_body(dialect):
+    turns = [("user", "go\n\n" + REMINDER), ("assistant", "a"), ("system", LATE), ("user", "next\n\n" + REMINDER),
+             ("system", "Second late rule."), ("assistant", "b"), ("user", "more")]
+    _, changes = rewrite(conversation(dialect, turns), dialect, "plain", user_blocks=[drop_tag()])
+    shift = 1 if dialect == "chat" else 0
+    assert [(c["op"], c["index"] - shift) for c in changes] == [
+        ("drop_tag", 0), ("mid_system", 2), ("drop_tag", 3), ("mid_system", 4)]
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_positions_in_the_changes_stay_those_of_the_clients_body_after_system_messages_were_dropped(dialect):
+    turns = [("user", "go"), ("system", "Rule one."), ("system", "Rule two."), ("assistant", "a"),
+             ("user", "next\n\n" + REMINDER), ("assistant", "b"), ("user", "more")]
+    shift = 1 if dialect == "chat" else 0
+    result, changes = rewrite(conversation(dialect, turns), dialect, "drop", user_blocks=[drop_tag()])
+    assert len(history_of(result, dialect)) == len(turns) - 2 + shift
+    assert [(c["op"], c["index"] - shift) for c in changes] == [("mid_system", 1), ("mid_system", 2), ("drop_tag", 4)]
