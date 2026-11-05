@@ -17,7 +17,12 @@ compose_head renders) and a "with" of replace_regex is a ready re.sub template. 
     history.user_blocks  drop_tag {tag, contains=None, pattern=None, flags=""} | remove_regex {pattern, flags=""} |
                          replace_text {find, with, all=True}
     tools.edits          {tool, hide=False, op, ...} with op append | prepend | set {text} | replace_text {find, with, all} |
-                         replace_regex {pattern, flags="", with}; a hidden tool is just {tool, hide: True}
+                         replace_regex {pattern, flags="", with}; "tool" is a glob or a list of globs; a hidden tool is
+                         just {tool, hide: True}
+
+A tag block (remove_tag, keep_tag_inner) is one whose opening tag begins a line, as <env> and <available_skills> do in a
+prompt: a tag mentioned inside a sentence is not a block. Every pattern of every section is checked and compiled with the
+revision, and every "with" of replace_regex is checked against its pattern.
 
 Signatures and dataclass fields are a contract between work packages: change them only through the coordinator.
 """
@@ -892,18 +897,36 @@ def _tag_pattern(tag):
     return re.compile(r"<(/?)%s(?=[\s/>])[^>]*>" % re.escape(tag))
 
 
+def _starts_a_line(text, position):
+    """True when only spaces and tabs stand between the start of the line and `position`."""
+    return not text[text.rfind("\n", 0, position) + 1:position].strip(" \t")
+
+
+def _with_indent(text, position):
+    """`position`, moved back to the start of its line when only indentation stands before it (so it goes with a tag)."""
+    return text.rfind("\n", 0, position) + 1 if _starts_a_line(text, position) else position
+
+
 def _tag_elements(text, tag):
-    """[(open start, open end, close start, close end)] of the complete <tag>…</tag> elements, nested ones included."""
+    """[(open start, open end, close start, close end)] of the complete <tag>…</tag> blocks, nested ones included.
+
+    A block is a block only when its opening tag begins a line (after indentation), the way <env> and
+    <available_skills> stand in a prompt; the closing tag may stand anywhere. A tag that is merely mentioned in a sentence
+    or in the middle of a line is left alone, and so is what lies between its tags. Opening tags that are not at the
+    start of a line still count for the nesting of blocks of the same name.
+    """
     elements, stack = [], []
     for match in _tag_pattern(tag).finditer(text):
         if match.group(1):
             if stack:
-                opened = stack.pop()
-                elements.append((opened.start(), opened.end(), match.start(), match.end()))
+                opened, block = stack.pop()
+                if block:
+                    elements.append((opened.start(), opened.end(), match.start(), match.end()))
         elif match.group(0).endswith("/>"):
-            elements.append((match.start(), match.end(), match.end(), match.end()))
+            if _starts_a_line(text, match.start()):
+                elements.append((match.start(), match.end(), match.end(), match.end()))
         else:
-            stack.append(match)
+            stack.append((match, _starts_a_line(text, match.start())))
     return elements
 
 
@@ -914,7 +937,7 @@ def _op_remove_tag(text, edit, snapshot):
     spans = []
     for start, _open_end, _close_start, end in sorted(elements):
         if not spans or start >= spans[-1][1]:
-            spans.append((start, end))
+            spans.append((_with_indent(text, start), end))
     return _delete_spans(text, spans), True
 
 
@@ -924,9 +947,9 @@ def _op_keep_tag_inner(text, edit, snapshot):
         return text, False
     spans = []
     for start, open_end, close_start, end in elements:
-        spans.append((start, open_end))
+        spans.append((_with_indent(text, start), open_end))
         if close_start < end:
-            spans.append((close_start, end))
+            spans.append((_with_indent(text, close_start), end))
     return _delete_spans(text, _merge_spans(spans)), True
 
 
@@ -1355,8 +1378,8 @@ class _Compiler:
                     _err(path, "must not be empty: the structured-output contract is always sent")
                 template = _parse_template(text, path, variables=_STRUCTURED_VARIABLES)
                 if not template.variables & {"default", "schema"}:
-                    self.warnings.append("relay_texts.structured does not use {{default}} or {{schema}}: the model "
-                                         "will not be told the schema")
+                    _err(path, "must contain {{default}} or {{schema}}: the model has to be told the contract, and "
+                               "the reply is judged against the schema")
             else:
                 template = None
             data.relay[name] = text
@@ -1568,9 +1591,17 @@ class _Compiler:
     def _tool_edit(self, raw, path, ops, specs):
         _object(raw, path)
         tool = raw.get("tool")
+        tool_path = _path(path, "tool")
         if tool is None:
-            _err(_path(path, "tool"), "is required: a glob over tool names")
-        _check_glob(tool, _path(path, "tool"))
+            _err(tool_path, "is required: a glob over tool names, or a list of them")
+        if isinstance(tool, list):
+            if not tool:
+                _err(tool_path, "must not be an empty list")
+            for index, item in enumerate(tool):
+                _check_glob(item, "%s[%d]" % (tool_path, index))
+            tool = list(tool)
+        else:
+            _check_glob(tool, tool_path)
         hide = raw.get("hide", False)
         if not isinstance(hide, bool):
             _err(_path(path, "hide"), "must be true or false")
@@ -1954,8 +1985,7 @@ def structured_contract(snapshot: Snapshot | None, output_spec: dict | None, *, 
         schema = json.dumps(output_spec["schema"], ensure_ascii=False, separators=(",", ":"))
     else:
         schema = '{"type":"object"}'
-    text = _fill(template, {"default": default, "schema": schema, "schema_name": str(output_spec.get("name") or "")})
-    return text if text.strip() else default
+    return _fill(template, {"default": default, "schema": schema, "schema_name": str(output_spec.get("name") or "")})
 
 
 # -- the store ------------------------------------------------------------------------------------------------------------
@@ -2528,7 +2558,12 @@ class PromptStore:
         """What the model would see for `body` (plan 4.1), without writing pins and without any upstream call.
 
         `document` is a draft compiled for this call only; without it the current revision is used (the pins of live
-        conversations are not consulted: preview shows what a new conversation would get).
+        conversations are not consulted: preview shows what a new conversation would get). The result has the fields of
+        plan 4.1 and, besides them, "edits": what each client_system edit did ({"index", "op", "matched", "chars_before",
+        "chars_after"}); "edits_unmatched" lists the ones that matched nothing. "tokens_estimate" is a rough guess of one
+        token per four UTF-8 bytes of the head. A request that takes the legacy path (profile None) shows the head the
+        existing code builds, with the blocks of a relay task left out. ApiError and PromptConfigError are raised as at
+        runtime (bad body, a profile that does not exist, an invalid draft).
         """
         import client_context
         import config
