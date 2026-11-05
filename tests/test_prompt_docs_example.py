@@ -1,8 +1,8 @@
-"""The prompt control guide and its example stay valid.
+"""The prompt control guide, the README snippet and the example stay valid.
 
-Every json / jsonc block of docs/prompt-control.md parses (jsonc after dropping comments), the documents among
-them and prompts.example.json follow the closed lists of prompt_policy, and they compile through
-prompt_policy.compile_document (skipped while the engine is only the contract skeleton).
+Every json / jsonc block of docs/prompt-control.md parses (jsonc after dropping comments); the prompts documents
+among them, the one in the README and prompts.example.json follow the closed lists of prompt_policy and compile
+through prompt_policy.compile_document (skipped while the engine is only the contract skeleton).
 """
 import json
 import re
@@ -14,6 +14,7 @@ import prompt_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 GUIDE = ROOT / "docs" / "prompt-control.md"
+README = ROOT / "README.md"
 EXAMPLE = ROOT / "prompts.example.json"
 FENCE = re.compile(r"^```(json|jsonc)[ \t]*\r?\n(.*?)^```[ \t]*\r?$", re.S | re.M)
 RECIPES = "\n## Рецепты\n"
@@ -79,6 +80,17 @@ def guide_documents():
 
 def named_texts(document):
     return set(document.get("texts") or {})
+
+
+def readme_documents():
+    """[(line, document)] for the prompts documents the README shows."""
+    text = README.read_text(encoding="utf-8")
+    documents = []
+    for match in FENCE.finditer(text):
+        value = parse(match.group(1), match.group(2))
+        if isinstance(value, dict) and "version" in value:
+            documents.append((text.count("\n", 0, match.start()) + 1, value))
+    return documents
 
 
 def contract_problems(document):
@@ -213,6 +225,13 @@ def test_the_guide_and_the_example_carry_no_personal_data():
     assert found == []
 
 
+def test_the_readme_example_follows_the_contract():
+    documents = readme_documents()
+    assert documents, "the README lost its prompts.json example"
+    problems = [f"README.md:{line}: {problem}" for line, document in documents for problem in contract_problems(document)]
+    assert problems == []
+
+
 def test_the_example_compiles(tmp_path):
     document = json.loads(EXAMPLE.read_text(encoding="utf-8"))
     snapshot = compile_or_skip(document, tmp_path)
@@ -231,3 +250,8 @@ def test_every_document_of_the_guide_compiles(tmp_path):
         except prompt_policy.PromptConfigError as error:
             failures.append(f"docs/prompt-control.md:{line}: {error}")
     assert failures == []
+
+
+def test_the_readme_example_compiles(tmp_path):
+    for line, document in readme_documents():
+        compile_or_skip(document, tmp_path / f"line{line}")
