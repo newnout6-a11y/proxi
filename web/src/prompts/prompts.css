@@ -202,7 +202,7 @@
 .rule-no { display: inline-grid; place-items: center; font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); }
 .rule-grip { display: inline-grid; place-items: center; width: 20px; height: 32px; color: var(--muted); cursor: grab; touch-action: none; border-radius: var(--radius-key); }
 .rule-grip:hover { color: var(--ink); background: var(--raised); }
-.is-dragging-list, .is-dragging-list * { cursor: grabbing; }
+.is-dragging-list, .is-dragging-list * { cursor: grabbing; user-select: none; }
 .rule-main { display: grid; grid-template-columns: 16px minmax(0, 1fr); column-gap: var(--space-2); align-items: center; min-width: 0; padding: var(--space-1) 0; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; border-radius: var(--radius-key); }
 .rule-main .chev { grid-row: 1 / 3; color: var(--muted); transition: transform var(--duration) var(--ease); }
 .rule-main[aria-expanded="true"] .chev { transform: rotate(90deg); }
