@@ -711,6 +711,14 @@ zero active requests and still belonged to the known relay process. New PID
 Health is good, discovery advertises 27 routes, and Haiku exposes its verified
 `none` level. No unrelated client process was stopped.
 
+> **Correction (2026-11-05, PR #24 review).** "Haiku exposes its verified `none`
+> level" is withdrawn. The effort probe of the same day found that Retool accepts
+> and ignores every level for Haiku 4.5, so it now publishes no levels at all,
+> `none` included: its `reasoning_effort_levels` is empty and the control is
+> `accepted-ignored`. An explicit `none` or `thinking: {type: "disabled"}` is
+> still accepted, because Haiku is listed as not reasoning. See
+> `model-route-availability-2026-11-05.md`.
+
 The two commands below run local evidence scripts from the git-ignored `.agents/`
 directory. Neither script is in the repository: they record what was run on the
 author's machine and cannot be reproduced from a clone.

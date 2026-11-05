@@ -68,3 +68,22 @@ def test_the_audit_corrects_the_harness_split_it_recorded():
     correction = audit.index('so a sync now puts %d models in `retool` and %d in `retool-text`' % (
         len(retool), len(text_group)))
     assert recorded < correction and audit.rfind('**Correction', recorded, correction) > recorded
+
+
+def test_the_opencode_cli_examples_name_models_that_publish_the_variant_they_show():
+    text = section('OpenCode')
+    shown = re.findall(r'--model retool-relay/([^\s`#]+)(?:#(\w+)| --variant (\w+))', text)
+    assert len(shown) == 2  # one example per installed CLI syntax
+    for name, suffix, flag in shown:
+        assert (suffix or flag) in models.resolve(name)[0]['reasoning_effort_levels'], name
+
+
+def test_the_audit_withdraws_the_claim_that_haiku_publishes_a_none_level():
+    haiku = models.resolve('claude-haiku-4-5-20251001')[0]
+    assert haiku['reasoning_effort_levels'] == [] and haiku['reasoning_effort_control'] == 'accepted-ignored'
+    audit = flat((DOCS / 'model-client-audit-2026-11-04.md').read_text(encoding='utf-8'))
+    claim = audit.index('Haiku exposes its verified `none` level')
+    note = audit.index('**Correction', claim)
+    assert note - claim < 300  # right behind the dated sentence, not somewhere else in the file
+    withdrawn = audit[note:note + 700]
+    assert 'withdrawn' in withdrawn and 'publishes no levels' in withdrawn and 'accepted-ignored' in withdrawn

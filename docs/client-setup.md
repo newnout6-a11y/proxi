@@ -105,10 +105,15 @@ name the old reference and what was done. A compaction model you chose that is s
 published is kept as it is, even if its window is smaller: check that yourself.
 
 The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
-retool-relay/zai-org/GLM-5.3 --variant high`; OpenCode 2.2.5 uses `--model
-retool-relay/zai-org/GLM-5.3#high`. Version 2 rejects `--variant` before sending a
-model request. Both exact clients passed a real GLM high request through an
-isolated current-source relay; their timings and evidence are in the audit.
+retool-relay/claude-opus-5-5 --variant high`; OpenCode 2.2.5 uses `--model
+retool-relay/claude-opus-5-5#high`. Version 2 rejects `--variant` before sending a
+model request. Only a model that publishes levels has variants. GLM-5.3, GLM-5.3
+Flash and Haiku 4.5 publish none, because Retool accepts an effort level for them
+and ignores it: the sync gives them no variants and drops a `#high` suffix from a
+reference to them (the relay itself still accepts such a request). The audit
+records real GLM `high` requests through both exact clients; they were made before
+that decision, when GLM still published levels, and show the clients' syntax, not a
+selector GLM has today.
 
 `scripts/probe_client_settings.py` runs the installed clients against a local fake
 server with a deliberately invalid key. It finds the newest OpenCode Desktop CLI
