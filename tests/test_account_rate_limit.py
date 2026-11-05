@@ -67,17 +67,26 @@ def test_a_non_json_429_body_with_the_hourly_text_is_flagged_too():
     assert apierr.is_account_quota(direct._api_error(429, "upstream: " + MESSAGE, None))
 
 
-@pytest.mark.parametrize("header,expected", [("120", 120.0), ("1.5", 1.5), ("0", None), ("-5", None),
-                                             ("soon", None), ("nan", None)])
-def test_retry_after_header_is_kept_when_it_is_a_usable_number(header, expected):
+@pytest.mark.parametrize("header,expected", [("120", 120), ("1.5", 2), ("90.0", 90), ("90.2", 91), ("0.2", 1),
+                                             ("0", None), ("-5", None), ("soon", None), ("nan", None),
+                                             ("inf", None)])
+def test_retry_after_header_is_kept_as_whole_seconds_rounded_up(header, expected):
     error = direct._api_error(429, HOURLY_BODY, _headers(retry_after=header))
     assert error.retry_after == expected and apierr.is_account_quota(error)
+    assert expected is None or type(error.retry_after) is int
 
 
 def test_retry_after_may_be_an_http_date():
     seconds = apierr.retry_after_seconds("Wed, 21 Oct 2099 07:28:00 GMT")
-    assert seconds is not None and seconds > 3600
+    assert type(seconds) is int and seconds > 3600
     assert apierr.retry_after_seconds("Wed, 21 Oct 1999 07:28:00 GMT") is None
+
+
+@pytest.mark.parametrize("seconds,header", [(90, "90"), (90.0, "90"), (90.2, "91"), (1.5, "2"), (0.05, "1"),
+                                            (3600, "3600"), (None, None), (0, None), (-3, None),
+                                            (float("nan"), None), (float("inf"), None), (True, None), ("90", None)])
+def test_the_retry_after_header_is_whole_seconds_or_absent(seconds, header):
+    assert apierr.retry_after_header(seconds) == header
 
 
 def test_an_ordinary_short_lived_429_is_not_an_account_quota():
@@ -905,3 +914,19 @@ def test_an_ordinary_429_reaches_the_client_and_parks_nothing(served):
     assert all(backend.unavailable is None for backend in served.backends)
     status, health, _ = served.call("/health", key=None)
     assert "rate_limited_until" not in health["accounts"] and health["accounts"]["states"] == {"active": 2}
+
+
+@pytest.mark.parametrize("hint,sent", [("90", "90"), ("90.0", "90"), ("90.2", "91"), ("1.5", "2")])
+def test_the_clients_retry_after_is_whole_seconds_when_the_upstream_hint_reaches_it(served, monkeypatch, hint, sent):
+    # With no attempt left the account is parked and Retool's own 429 is what the client gets.
+    monkeypatch.setattr(upstream_attempts, "MAX_ATTEMPTS", 1)
+
+    def hinted(request_):
+        raise urllib.error.HTTPError(request_.full_url, 429, "Too Many Requests", _headers(retry_after=hint),
+                                     io.BytesIO(HOURLY_BODY.encode()))
+
+    served.script["acc-a"] = hinted
+    status, body, headers = served.call("/v1/chat/completions", CHAT)
+    assert status == 429 and body["error"]["type"] == "rate_limit_error"
+    assert headers["retry-after"] == sent
+

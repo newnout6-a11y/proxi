@@ -442,8 +442,9 @@ def make_handler(runtime: Runtime):
             # and responses routes; the flat responses shape is for SSE events only.
             body = self._error_payload("chat" if dialect == "responses" else dialect, err)
             extra = dict(getattr(err, "headers", None) or {})
-            if err.retry_after:
-                extra["retry-after"] = err.retry_after
+            retry_after = apierr.retry_after_header(err.retry_after)
+            if retry_after:
+                extra["retry-after"] = retry_after
             self._json(err.status, body, extra or None)
 
         def _throttle_auth_failure(self):
