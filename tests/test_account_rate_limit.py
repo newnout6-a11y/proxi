@@ -219,7 +219,7 @@ def test_turns_that_fail_together_share_one_pause_and_one_journal_line():
     assert events[0]["data"]["until"] == pytest.approx(first, abs=0.01)
 
 
-def test_a_failure_right_after_the_return_doubles_the_pause_up_to_an_hour(capsys):
+def test_a_failure_right_after_the_return_adds_five_minutes_up_to_twenty(capsys):
     account = Account("a")
     value, clock = dispatcher([account], session_refresh_interval=0)
     pauses = []
@@ -229,8 +229,28 @@ def test_a_failure_right_after_the_return_doubles_the_pause_up_to_an_hour(capsys
         clock.now += account.unavailable["pause"]
         assert value.release_rate_limited()
         clock.now += gap
-    assert pauses == [(900.0, "cooldown"), (1800.0, "escalated"), (3600.0, "escalated"), (3600.0, "escalated")]
+    assert pauses == [(900.0, "cooldown"), (1200.0, "escalated"), (1200.0, "escalated"), (1200.0, "escalated")]
     assert "повторный лимит подряд" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("cooldown,ladder", [
+    (600, [600, 900, 1200, 1200]),
+    (900, [900, 1200, 1200, 1200]),
+    (1200, [1200, 1200, 1200]),
+    (1800, [1800, 1800, 1800]),  # a longer cooldown is its own ceiling: the ladder never shortens it
+    (3600, [3600, 3600]),
+])
+def test_the_ladder_starts_at_the_cooldown_and_stops_at_the_larger_of_it_and_twenty_minutes(cooldown, ladder):
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0, account_rate_limit_cooldown=cooldown)
+    seen = []
+    for _ in ladder:
+        value.mark_rate_limited(account)
+        seen.append(account.unavailable["pause"])
+        clock.now += account.unavailable["pause"]
+        value.release_rate_limited()
+        clock.now += 1
+    assert seen == [float(step) for step in ladder]
 
 
 def test_an_account_that_held_longer_than_it_was_parked_starts_over():
@@ -241,10 +261,10 @@ def test_an_account_that_held_longer_than_it_was_parked_starts_over():
     value.release_rate_limited()
     clock.now += 100
     value.mark_rate_limited(account)
-    assert account.unavailable["pause"] == 1800.0
-    clock.now += 1800
+    assert account.unavailable["pause"] == 1200.0
+    clock.now += 1200
     value.release_rate_limited()
-    clock.now += 1801  # held longer than the last pause: a new incident, not a streak
+    clock.now += 1201  # held longer than the last pause: a new incident, not a streak
     value.mark_rate_limited(account)
     assert (account.unavailable["pause"], account.unavailable["source"]) == (900.0, "cooldown")
 
@@ -255,7 +275,119 @@ def test_a_late_mark_after_the_deadline_counts_as_a_failure_right_after_the_retu
     value.mark_rate_limited(account)
     clock.now += 905  # the scheduler has not ticked yet
     value.mark_rate_limited(account)
-    assert (account.unavailable["pause"], account.unavailable["source"]) == (1800.0, "escalated")
+    assert (account.unavailable["pause"], account.unavailable["source"]) == (1200.0, "escalated")
+
+
+# -- a limit reported by a request that was sent before the account came back is old news -----------------------
+def parked_and_returned(**cfg):
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0, **cfg)
+    value.mark_rate_limited(account)
+    clock.now += value.rate_limit_cooldown + 0.5
+    assert value.release_rate_limited()
+    return account, value, clock
+
+
+def test_a_429_of_a_request_sent_before_the_return_changes_nothing():
+    account, value, clock = parked_and_returned(account_rate_limit_cooldown=600)
+    before = journal.JOURNAL.last_seq
+    clock.now += 0.2  # the request was in flight all this time and only now reports its 429
+    assert value.mark_rate_limited(account, sent_at=1000.0) is None
+    assert account.unavailable is None
+    assert not _events("account.rate_limited", before)
+    # It is no streak either: the next real limit climbs one step from the first pause, not two.
+    clock.now += 50
+    value.mark_rate_limited(account, sent_at=clock.now - 1.0)
+    assert (account.unavailable["pause"], account.unavailable["source"]) == (900.0, "escalated")
+
+
+def test_a_429_of_a_request_sent_after_the_return_is_a_new_limit():
+    account, value, clock = parked_and_returned()
+    clock.now += 0.2
+    assert value.mark_rate_limited(account, sent_at=clock.now - 0.1) is not None
+    assert (account.unavailable["pause"], account.unavailable["source"]) == (1200.0, "escalated")
+
+
+def test_a_request_sent_at_the_very_moment_of_the_return_is_a_new_limit():
+    account, value, clock = parked_and_returned()
+    assert value.mark_rate_limited(account, sent_at=clock.now) is not None
+
+
+def test_a_stale_429_does_not_extend_a_pause_that_is_still_running():
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0)
+    until = value.mark_rate_limited(account)
+    clock.now += 300
+    assert value.mark_rate_limited(account, sent_at=1000.0) == until
+    assert account.unavailable["pause"] == 900.0
+
+
+def test_a_stale_429_after_the_deadline_but_before_the_scheduler_tick_is_ignored_too():
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0)
+    value.mark_rate_limited(account)
+    clock.now += 905  # past the deadline, not released yet
+    assert value.mark_rate_limited(account, sent_at=1000.0) is None
+    assert account.unavailable["reason"] == "rate_limited" and account.unavailable["pause"] == 900.0
+
+
+def test_a_limit_with_no_account_history_is_never_stale():
+    account = Account("a")
+    value, _ = dispatcher([account], session_refresh_interval=0)
+    assert value.mark_rate_limited(account, sent_at=-5.0) is not None
+
+
+@pytest.mark.parametrize("sent_at", [None, float("nan"), float("inf"), "later", True])
+def test_without_a_usable_send_time_a_limit_counts_as_fresh(sent_at):
+    account, value, clock = parked_and_returned()
+    clock.now += 0.2
+    assert value.mark_rate_limited(account, sent_at=sent_at) is not None
+    assert account.unavailable["source"] == "escalated"
+
+
+# -- Retry-After inside the ladder ---------------------------------------------------------------------------
+def test_a_hint_is_honoured_as_it_is_and_never_escalated():
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0)
+    for _ in range(3):
+        value.mark_rate_limited(account, retry_after=60)
+        assert (account.unavailable["pause"], account.unavailable["source"]) == (60.0, "retry_after")
+        clock.now += 61
+        value.release_rate_limited()
+        clock.now += 1
+
+
+def test_a_short_hint_does_not_make_the_next_unhinted_pause_short():
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0)
+    value.mark_rate_limited(account, retry_after=2)
+    clock.now += 3
+    value.release_rate_limited()
+    clock.now += 1
+    value.mark_rate_limited(account)
+    assert (account.unavailable["pause"], account.unavailable["source"]) == (900.0, "cooldown")
+
+
+def test_a_hint_in_the_middle_of_a_streak_neither_advances_nor_resets_the_ladder():
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0)
+    value.mark_rate_limited(account)
+    clock.now += 900
+    value.release_rate_limited()
+    clock.now += 10
+    value.mark_rate_limited(account)
+    assert account.unavailable["pause"] == 1200.0
+    clock.now += 1200
+    value.release_rate_limited()
+    clock.now += 10
+    value.mark_rate_limited(account, retry_after=30)
+    assert account.unavailable["source"] == "retry_after"
+    clock.now += 31
+    value.release_rate_limited()
+    clock.now += 10
+    value.mark_rate_limited(account)
+    assert (account.unavailable["pause"], account.unavailable["source"]) == (1200.0, "escalated")
+
 
 
 def test_a_parked_account_is_never_a_reserve_even_with_credits():
@@ -474,7 +606,40 @@ def test_the_first_real_request_after_the_pause_parks_the_account_again_for_long
     events = asyncio.run(scenario())
     assert retool.posts == ["acc-a", "acc-b", "acc-a", "acc-b"]
     assert {"type": "text", "delta": "OK"} in events and not any(event["type"] == "error" for event in events)
-    assert (retool.a.unavailable["pause"], retool.a.unavailable["source"]) == (1800.0, "escalated")
+    assert (retool.a.unavailable["pause"], retool.a.unavailable["source"]) == (1200.0, "escalated")
+
+
+def test_a_limit_reported_by_a_request_that_left_before_the_pause_is_not_a_second_limit(retool):
+    def late(request_):
+        # While this request is in flight another one parks the account and the pause runs out.
+        retool.dispatcher.mark_rate_limited(retool.a)
+        retool.clock.now += 901
+        retool.dispatcher.release_rate_limited()
+        return hourly(request_)
+
+    retool.script["acc-a"] = late
+    before = journal.JOURNAL.last_seq
+    events = asyncio.run(run(retool.runner, turn()))
+    # The request still moves to the other account and is answered ...
+    assert retool.posts == ["acc-a", "acc-b"]
+    assert {"type": "text", "delta": "OK"} in events and not any(event["type"] == "error" for event in events)
+    # ... but the old 429 neither parks the returned account again nor lengthens anything.
+    assert retool.a.unavailable is None
+    assert len(_events("account.rate_limited", before)) == 1
+    assert len(_events("account.failover", before)) == 1
+
+
+def test_a_limit_from_a_request_that_left_after_the_return_parks_the_account_again(retool):
+    retool.script["acc-a"] = hourly
+
+    async def scenario():
+        await run(retool.runner, turn("conv-1"))
+        retool.clock.now += 901
+        retool.dispatcher.release_rate_limited()
+        await run(retool.runner, turn("conv-2"))
+
+    asyncio.run(scenario())
+    assert retool.a.unavailable["reason"] == "rate_limited"
 
 
 def test_when_every_account_is_limited_the_client_gets_a_429_with_retry_after(retool):

@@ -455,7 +455,8 @@ class TurnRunner:
         # Exec steps are bounded only by max_exec_turns; each step (plus the summary
         # step) may spend up to MAX_ATTEMPTS POSTs, which is the hard cap per request.
         holder["_attempt_budget"] = AttemptBudget(
-            cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None)
+            cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None,
+            clock=getattr(getattr(self, "accounts", None), "clock", None))
         while True:
             relay = _FailoverOut(out)
             holder.pop("session", None)
@@ -479,8 +480,10 @@ class TurnRunner:
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):
+                        # A limit that a request sent before the account's last return reports is old news.
                         accounts.mark_rate_limited(backend, retry_after=getattr(error, "retry_after", None),
-                                                   request_id=getattr(parsed, "request_id", None))
+                                                   request_id=getattr(parsed, "request_id", None),
+                                                   sent_at=holder["_attempt_budget"].sent_at)
                     rate_limited = retryable and backend not in exclude
                 if (retryable and backend is None and error.code == "insufficient_credits"
                         and not rechecked and hasattr(accounts, "recheck_exhausted")):

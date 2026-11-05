@@ -17,7 +17,7 @@ class AttemptBudget:
     on all POSTs of the request, set only when max_exec_turns bounds the steps.
     """
 
-    def __init__(self, cancel_event=None, total_cap=None):
+    def __init__(self, cancel_event=None, total_cap=None, clock=None):
         self.used = 0
         self.step_used = 0
         self.total_cap = total_cap
@@ -29,6 +29,10 @@ class AttemptBudget:
         # The account that got the latest POST and how many POSTs in a row it got within this step.
         self.account = None
         self.account_streak = 0
+        # When the latest POST was claimed, on `clock`: the account dispatcher's, so that it can tell
+        # a limit reported by a request that left before an account's last return from a new one.
+        self.sent_at = None
+        self._clock = clock
         self._lock = threading.Lock()
 
     @property
@@ -79,6 +83,7 @@ class AttemptBudget:
             self.used += 1
             self.step_used += 1
             self.account_streak = streak + 1
+            self.sent_at = (self._clock or time.monotonic)()
             if account is not None:
                 self.account = account
             return self.used

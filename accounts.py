@@ -27,6 +27,8 @@ PRIORITY_MAX = 99
 LABEL_MAX = 40
 RATE_LIMIT_COOLDOWN = 900.0  # default pause after Retool's hourly managed-key limit
 RATE_LIMIT_MAX = 3600.0      # the limit is a sliding hour: parking an account longer never helps
+RATE_LIMIT_STEP = 300.0      # a limit right after the return adds five minutes to the pause ...
+RATE_LIMIT_CEILING = 1200.0  # ... up to twenty minutes, or the cooldown itself when that is longer
 
 
 def enabled(backend):
@@ -294,12 +296,15 @@ class AccountDispatcher:
             self._announce(backend, True, reason)
         return bool(revived)
 
-    def mark_rate_limited(self, backend, retry_after=None, request_id=None):
+    def mark_rate_limited(self, backend, retry_after=None, request_id=None, sent_at=None):
         """Park an account that spent Retool's hourly managed-key quota; returns when it comes back.
 
-        The pause is `Retry-After` when Retool sends one, else `account_rate_limit_cooldown`. An
-        account that fails again within as long as it was parked gets twice the previous pause, up
-        to an hour. Turns that fail together share one pause and one journal line.
+        The pause is `Retry-After` when Retool sends one, else `account_rate_limit_cooldown`. The limit slides, so an
+        account that fails again within as long as it was parked (the first real request after a return is its
+        probe) waits five minutes longer each time, up to the larger of the cooldown and twenty minutes. A hint is
+        honoured as it is and neither advances nor resets that ladder. Turns that fail together share one pause and
+        one journal line. A limit reported by a request that was sent (`sent_at`, on this dispatcher's clock)
+        before the account's last return is old news: it changes nothing and returns None.
         """
         if backend not in self.state:
             return None
@@ -311,15 +316,19 @@ class AccountDispatcher:
                 return hold["until_at"]
             # A hold the scheduler has not released yet still ended at its own deadline.
             returned = state.get("rl_released", float("-inf")) if hold is None else hold["until"]
+            if type(sent_at) in (int, float) and sent_at < returned:
+                return None
             previous = state.get("rl_pause", 0.0)
             hint = retry_after if isinstance(retry_after, (int, float)) and 0 < retry_after < math.inf else None
             if hint is not None:
                 pause, source = min(max(float(hint), 1.0), RATE_LIMIT_MAX), "retry_after"
             elif previous and now - returned < previous:
-                pause, source = min(previous * 2, RATE_LIMIT_MAX), "escalated"
+                ceiling = max(self.rate_limit_cooldown, RATE_LIMIT_CEILING)
+                pause, source = min(previous + RATE_LIMIT_STEP, ceiling), "escalated"
             else:
                 pause, source = self.rate_limit_cooldown, "cooldown"
-            state["rl_pause"] = pause
+            if source != "retry_after":
+                state["rl_pause"] = pause
             until_at = time.time() + pause
             self._set_reason(backend, "rate_limited", {"until": now + pause, "until_at": until_at,
                                                        "pause": pause, "source": source})
