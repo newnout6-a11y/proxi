@@ -73,6 +73,33 @@ def test_history_edits_on_an_800k_token_body_stay_within_the_budget(messages):
     assert timing <= BUDGET_MS * 1.5, "the whole rewrite took %.1f ms" % timing
 
 
+@pytest.mark.parametrize("shape", ["one-line", "many-lines"])
+def test_a_huge_text_with_tens_of_thousands_of_tags_is_cut_in_linear_time(shape):
+    # Minified HTML in a tool result: one line, 40K small blocks. Looking back for the line start of every
+    # tag, or gluing the pieces together one by one, would make this take minutes.
+    separator = "" if shape == "one-line" else "\n"
+    block = "<note>x</note>" + separator
+    text = ("<p>keep</p>" + separator + block) * 40_000
+    data = {"model": "claude-opus-5-5", "messages": [
+        {"role": "system", "content": "HEAD"}, {"role": "user", "content": "go"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
+                                                                "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": text}, {"role": "user", "content": "more"}]}
+    start = time.perf_counter()
+    result, changes = prompt_body.rewrite(data, "chat", profile(user_blocks=[
+        {"op": "drop_tag", "tag": "note"}, {"op": "drop_tag", "tag": "p", "contains": "keep"}]), FakeSnapshot())
+    elapsed = time.perf_counter() - start
+    assert elapsed < 3, "%d tags took %.1f s" % (80_000, elapsed)
+    after = result["messages"][3]["content"]
+    if shape == "one-line":
+        # Only the first tag starts the line; every other one is a mention in the middle of it.
+        assert after == text[len("<p>keep</p>"):]
+        assert [(c["edit"], c["removed_chars"]) for c in changes] == [(1, len("<p>keep</p>"))]
+    else:
+        assert "<note>" not in after and after.count("<p>keep</p>") == 0
+        assert len(changes) == 2 and changes[0]["removed_chars"] > 0
+
+
 @pytest.mark.parametrize("dialect", ["responses", "anthropic"])
 def test_the_other_dialects_are_as_fast(dialect):
     chat = agent_body(2000, 3_200_000)

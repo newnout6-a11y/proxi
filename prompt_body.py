@@ -279,17 +279,26 @@ def _tag_blocks(text, rx):
 
     Blocks nest, an unclosed opening tag is ignored, and a mention in the middle of a line (a code
     listing, a sentence about the tag) is not a block. start is moved back over the indentation.
+    The scan is linear: the line start is tracked from one tag to the next, never searched from scratch.
     """
     spans, stack = [], []
+    line, seen = 0, 0
     for match in rx.finditer(text):
+        begin = match.start()
+        newline = text.rfind("\n", seen, begin)
+        if newline >= 0:
+            line = newline + 1
+        seen = begin
         if match.group(1):
             if stack:
                 start = stack.pop()
                 if start is not None:
                     spans.append((start, match.end()))
             continue
-        line = text.rfind("\n", 0, match.start()) + 1
-        stack.append(line if not text[line:match.start()].strip(" \t") else None)
+        indent = begin
+        while indent > line and text[indent - 1] in " \t":
+            indent -= 1
+        stack.append(line if indent == line else None)
     spans.sort()
     outer, last = [], -1
     for start, end in spans:
@@ -314,26 +323,29 @@ def _line_end(text, position):
 
 def _cut(text, spans):
     """text without the spans and without the blank lines the removal would leave behind."""
-    result, position = "", 0
+    parts, tail, blank, position = [], "", True, 0
     for start, end in spans:
-        result += text[position:start]
+        piece = text[position:start]
+        parts.append(piece)
+        tail, blank = (tail + piece)[-4:], blank and not piece.strip()
         position = _line_end(text, end)
-        if not result.strip():
-            result = ""
+        if blank:
+            # The block opened the text: no blank lines stay in front of what follows it.
+            parts, tail = [], ""
             while True:
                 after = _line_end(text, position)
                 if after == position or text[position:after].strip():
                     break
                 position = after
-        elif result.endswith(("\n\n", "\r\n\r\n")):
+        elif tail.endswith(("\n\n", "\r\n\r\n")):
             if text.startswith("\r\n", position):
                 position += 2
             elif text.startswith("\n", position):
                 position += 1
-    tail = text[position:]
-    if not tail.strip():
-        return result.rstrip("\r\n")
-    return result + tail
+    rest = text[position:]
+    if not rest.strip():
+        return "".join(parts).rstrip("\r\n")
+    return "".join(parts) + rest
 
 
 def _drop_tag_fn(tag, contains, pattern):
