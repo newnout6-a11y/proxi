@@ -37,6 +37,13 @@ test.beforeEach(async ({ page }) => {
   page.on('pageerror', (error) => { throw error; });
 });
 
+// The app polls and debounces on timers. Left running while the test is torn down, a timer can fire after the routes
+// that answer for the page are gone and before the page is, and its request goes out to whatever the preview server
+// proxies to. A passing test has nothing left to show, so its page is closed here; a failing one keeps it for the screenshot.
+test.afterEach(async ({ page }, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) await page.close();
+});
+
 test('the section opens from the rail and with key 5, and shows the revision and the profiles', async ({ page }) => {
   await mockAdmin(page);
   await mockPrompts(page);
