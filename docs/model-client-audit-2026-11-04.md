@@ -650,3 +650,21 @@ uv run --python 3.14 --with-requirements requirements.txt --no-project python .a
 Final full Python suite: **1,962 passed in 211.82 seconds**. OpenCode label
 tests: **4 passed**. Follow-up service/catalog/CORS suite: **78 passed in
 4.37 seconds**. `git diff --check` passed. No design changes were included.
+
+### Final production acceptance
+
+Source commit `4e2b21d` was deployed after verifying that the old listener had
+zero active requests and still belonged to the known relay process. New PID
+2528 listens on `127.0.0.1:8787`; startup balance was 13,271.0479/15,000.
+Health is good, discovery advertises 27 routes, and Haiku exposes its verified
+`none` level. No unrelated client process was stopped.
+
+`python .agents/production-smoke-20261105.py protocol-smoke-4e2b21d.json`
+passed **all eight actual production requests**: stream/nonstream in each API,
+plus tool call/result continuation. Every response was HTTP 200, exact markers
+matched, and summed reported cost was 0.0716 credits (not an inferred USD price).
+`python .agents/capture-desktop-service-call.py .agents/model-audit-20261104/desktop-code-audit/service-production-final`
+also passed: exactly two generation calls, title/main, no SSE errors or retry;
+SDK main completed in 3.75 seconds. The expected `/api/hello` 404 is a separate
+capability probe, not a failed inference. Final stderr log was empty. Private
+manifests retain both the earlier failures and the final passing evidence.
