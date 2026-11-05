@@ -18,7 +18,7 @@ SZ, EXPAND_SZ, BINARY, DWORD, MULTI_SZ = 1, 2, 3, 4, 7
 KEY_SET_VALUE = 2
 FIVE = ('low', 'medium', 'high', 'xhigh', 'max')
 FOUR = ('low', 'medium', 'high', 'max')
-LIBRARY_ID = '71edc3b5-0000-4000-8000-000000000000'
+LIBRARY_ID = '00000000-0000-4000-8000-0000000000a1'
 USER_ROWS = [{'name': 'claude-opus-5-5', 'labelOverride': 'Opus 5.5 (relay)'},
              {'name': 'claude-sonnet-5-5', 'labelOverride': 'Sonnet 5.5 (relay)'},
              {'name': 'claude-haiku-4-5-20251001', 'labelOverride': 'Haiku 4.5 (relay)'}]
@@ -164,6 +164,11 @@ def preview(capsys, tmp_path, *argv, relay=None):
 
 def policy_values(rows, **extra):
     return {'inferenceProvider': ('gateway', SZ), 'inferenceModels': (json.dumps(rows), SZ), **extra}
+
+
+def test_the_configuration_id_is_visibly_synthetic():
+    # An id that opens like a real installation's would make a copied fixture look like private data.
+    assert LIBRARY_ID.startswith('00000000-')
 
 
 def test_desktop_contains_all_eligible_claude_models_and_no_fabricated_provider_tiers():
