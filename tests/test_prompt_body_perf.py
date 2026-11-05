@@ -9,7 +9,7 @@ import prompt_body
 from test_prompt_body_support import FakeSnapshot, profile
 
 BUDGET_MS = 50
-RUNS = 9
+RUNS = 15
 
 
 def agent_body(messages, characters):
