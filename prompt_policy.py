@@ -2356,6 +2356,8 @@ class PromptStore:
         body (plan 4.3); the ring keeps it only for the newest few entries and never journals it. The body is kept
         as given, not copied (it can be a megabyte): the caller must not change it afterwards.
         """
+        if not isinstance(entry, dict):
+            return
         item = {key: value if key == "request" else _copy(value) for key, value in entry.items()}
         item.setdefault("ts", round(time.time(), 3))
         if "request" in item and not isinstance(item["request"], dict):
@@ -2367,8 +2369,12 @@ class PromptStore:
 
     def recent(self, limit: int = 50) -> list[dict]:
         """The newest records, newest first; the request body is replaced by "has_request"."""
+        try:
+            count = max(0, min(int(limit), RECENT_LIMIT))
+        except (TypeError, ValueError):
+            count = 50
         with self._ring_lock:
-            items = list(self._ring)[::-1][:max(0, min(int(limit), RECENT_LIMIT))]
+            items = list(self._ring)[::-1][:count]
             rows = [{**{key: value for key, value in item.items() if key != "request"},
                      "has_request": "request" in item} for item in items]
         return [_copy(row) for row in rows]

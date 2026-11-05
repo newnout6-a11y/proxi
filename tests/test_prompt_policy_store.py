@@ -615,3 +615,13 @@ def test_recording_from_many_threads_keeps_the_bounds(tmp_path):
         thread.join()
     items = store.recent(10_000)
     assert len(items) == 100 and sum(item["has_request"] for item in items) == 10
+
+def test_a_limit_that_is_not_a_number_and_an_entry_that_is_not_a_dict_do_no_harm(tmp_path):
+    store = make_store(tmp_path)
+    for index in range(60):
+        store.record(entry(index))
+    for bad in (None, "x", 5, [1], ("a",)):
+        store.record(bad)
+    assert len(store.recent("3")) == 3 and len(store.recent("many")) == 50 and len(store.recent(None)) == 50
+    assert len(store.recent(2.9)) == 2 and len(store.recent()) == 50
+    assert store.recent(1)[0]["request_id"] == "r59"
