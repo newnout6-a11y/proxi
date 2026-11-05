@@ -86,8 +86,10 @@ def update_document(document, entries):
             updated.append(item)
         return updated
 
-    reasoning = [entry for entry in entries if entry.get('reasoning')]
-    text = [entry for entry in entries if not entry.get('reasoning')]
+    # The SDK rejects its inherited reasoning default for a model without selectors, so only
+    # models with selectable levels can share the reasoning provider.
+    reasoning = [entry for entry in entries if entry.get('reasoning') and entry.get('reasoning_effort_levels')]
+    text = [entry for entry in entries if entry not in reasoning]
     secondary = parent.get('retool-text')
     if secondary is not None:
         # Never overwrite a pre-existing provider belonging to someone else.

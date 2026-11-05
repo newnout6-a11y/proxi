@@ -41,7 +41,9 @@ def test_sync_replaces_only_relay_models_and_stale_relay_model_references():
     assert catalog['gpt-6-sol']['options'] == {'reasoningEffort': 'high', 'custom': True}
     assert 'cost' not in catalog['gpt-6-sol']
     assert catalog['zai-org/GLM-5.3-Flash']['reasoning'] is True
-    assert set(catalog['zai-org/GLM-5.3-Flash']['variants']) == {'low', 'medium', 'high', 'max'}
+    # Retool ignores effort on GLM, so the client gets neither selectors nor a default to send.
+    assert catalog['zai-org/GLM-5.3-Flash']['variants'] == {}
+    assert 'reasoningEffort' not in catalog['zai-org/GLM-5.3-Flash']['options']
     assert catalog['gpt-4.1']['variants'] == {} and catalog['gpt-4.1']['options']['reasoningEffort'] == 'none'
 
 

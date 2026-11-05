@@ -35,6 +35,60 @@ def is_structured_title(data, system, dialect):
             and output['format']['schema']['additionalProperties'] is False)
 
 
+def _effort_controls_sent(data):
+    """(client-facing name, value) for every effort or thinking control, where validate._effort reads it."""
+    found = []
+
+    def look(prefix, container):
+        if not isinstance(container, dict):
+            return
+        for key in ('reasoning_effort', 'reasoningEffort', 'effort'):
+            if container.get(key) is not None:
+                found.append((prefix + key, container[key]))
+        reasoning = container.get('reasoning')
+        if isinstance(reasoning, dict) and reasoning.get('effort') is not None:
+            found.append((prefix + 'reasoning.effort', reasoning['effort']))
+
+    look('', data)
+    for key in ('settings', 'options', 'body', 'extra_body'):
+        look(key + '.', data.get(key))
+    provider_options = data.get('providerOptions')
+    look('providerOptions.openai.', provider_options.get('openai') if isinstance(provider_options, dict) else None)
+    output = data.get('output_config')
+    if isinstance(output, dict) and output.get('effort') is not None:
+        found.append(('output_config.effort', output['effort']))
+    thinking = data.get('thinking')
+    if isinstance(thinking, dict):
+        for key in ('effort', 'budget_tokens'):
+            if thinking.get(key) is not None:
+                found.append(('thinking.' + key, thinking[key]))
+    messages = data.get('messages', data.get('input'))
+    for message in messages if isinstance(messages, list) else []:
+        inline = message.get('output_config') if isinstance(message, dict) else None
+        if (isinstance(message, dict) and message.get('role') in ('system', 'developer')
+                and isinstance(inline, dict) and inline.get('effort') is not None):
+            found.append(('messages.output_config.effort', inline['effort']))
+            break
+    return found
+
+
+def ignored_effort_controls(data, entry):
+    """Names of the controls a route with reasoning_effort_control "accepted-ignored" drops.
+
+    Retool takes these and changes nothing, so they are accepted (never a 400, which would break
+    clients that send one level to every model), not forwarded, and reported by name only.
+    """
+    reasons = bool(entry.get('reasoning', True))
+    # "none" asks for no reasoning: a route that never reasons already complies.
+    names = [name for name, value in _effort_controls_sent(data)
+             if reasons or str(value).lower() != 'none']
+    thinking = data.get('thinking')
+    kind = str(thinking.get('type') or '').lower() if isinstance(thinking, dict) else ''
+    if kind and (kind != 'disabled') != reasons:
+        names.append('thinking.type')  # an on/off switch this route cannot honour
+    return names
+
+
 def controls(data, entry, dialect, *, structured_title=False):
     """Return validated verbosity and ignored names; never echo sensitive values."""
     ignored = []
@@ -154,4 +208,6 @@ def controls(data, entry, dialect, *, structured_title=False):
         if not isinstance(data['metadata'], dict):
             raise unprocessable("'metadata' must be an object", param='metadata')
         ignored.append('metadata')
+    if entry.get('reasoning_effort_control') == 'accepted-ignored':
+        ignored.extend(name for name in ignored_effort_controls(data, entry) if name not in ignored)
     return (levels[0] if levels else None), ignored

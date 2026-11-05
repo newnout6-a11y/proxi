@@ -55,12 +55,13 @@ def test_supported_effort_is_preserved(effort):
                                          ("responses", "/v1/responses"),
                                          ("anthropic", "/v1/messages")])
 @pytest.mark.parametrize("model,configured,expected", [
-    ("zai-org/GLM-5.3", "auto", "medium"),
-    ("zai-org/GLM-5.3", "max", "max"),
-    ("gpt-5", "max", "high"),
-    ("gpt-5", "MAX", "high"),
-    ("gemini-3.5-flash", "max", "high"),
-    ("claude-haiku-4-5-20251001", "auto", "low"),
+    ("zai-org/GLM-5.3", "auto", "PROVIDER"),
+    ("zai-org/GLM-5.3", "max", "PROVIDER"),
+    ("gpt-5", "max", "HIGH"),
+    ("gpt-5", "MAX", "HIGH"),
+    ("gemini-3.5-flash", "max", "HIGH"),
+    ("claude-haiku-4-5-20251001", "auto", "NONE"),
+    ("claude-haiku-4-5-20251001", "max", "NONE"),
 ])
 def test_implicit_gateway_default_adapts_to_the_requested_model(relay, capsys, dialect, path, model, configured, expected):
     relay.cfg["reasoning_effort"] = configured
@@ -68,13 +69,13 @@ def test_implicit_gateway_default_adapts_to_the_requested_model(relay, capsys, d
     status, _ = relay.json_any(path, payload)
     assert status == 200
     assert len(relay.fake.seen) == 1
-    assert "EFFORT: " + expected.upper() in capsys.readouterr().out
+    assert "EFFORT: " + expected in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("dialect", ["chat", "responses", "anthropic"])
 @pytest.mark.parametrize("model,configured,expected", [
-    ("zai-org/GLM-5.3", "auto", "medium"),
-    ("zai-org/GLM-5.3", "max", "max"),
+    ("zai-org/GLM-5.3", "auto", None),
+    ("zai-org/GLM-5.3", "max", None),
     ("gpt-5", "max", "high"),
     ("gpt-5", "MAX", "high"),
     ("gemini-3.5-flash", "max", "high"),
@@ -100,13 +101,40 @@ def test_runner_sends_the_same_model_aware_default(tmp_path, monkeypatch, dialec
     assert begun["data"]["effective_effort"] == expected
 
 
-@pytest.mark.parametrize("model,explicit", [("zai-org/GLM-5.3", "xhigh"),
-                                           ("gemini-3.5-flash", "max"),
+@pytest.mark.parametrize("model", ["claude-haiku-4-5-20251001", "zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash"])
+@pytest.mark.parametrize("effort", [None, "low", "max"])
+def test_runner_never_sends_effort_to_a_route_that_ignores_it(tmp_path, monkeypatch, model, effort):
+    import asyncio
+    from test_native_context_reuse import run, setup
+    from test_service_requests import capture_direct
+
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[],
+                         reasoning_effort="max", retool_fast_provider_resource_name="r")
+    sent = capture_direct(monkeypatch)
+    parsed = validate.parse_chat(dict(body("chat", effort), model=model), CFG)
+    events = asyncio.run(run(runner, parsed))
+    assert events[-1] == {"type": "end", "reason": "stop"}
+    assert "reasoningEffort" not in sent[0][1]
+
+
+@pytest.mark.parametrize("model,explicit", [("gemini-3.5-flash", "max"),
                                            ("gpt-5", "max")])
 def test_implicit_fallback_does_not_weaken_explicit_effort_validation(relay, model, explicit):
     relay.cfg["reasoning_effort"] = "max"
     status, _ = relay.json_any("/v1/messages", dict(body("anthropic", explicit), model=model))
     assert status == 400 and not relay.fake.seen
+
+
+@pytest.mark.parametrize("model", ["claude-haiku-4-5-20251001", "zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash"])
+@pytest.mark.parametrize("path,dialect", [("/v1/chat/completions", "chat"), ("/v1/responses", "responses"),
+                                          ("/v1/messages", "anthropic")])
+def test_explicit_effort_for_an_ignoring_route_is_200_and_named_in_the_ignored_header(relay, model, path, dialect):
+    payload = dict(body(dialect, "high"), model=model)
+    with relay.request(path, payload) as response:
+        header = response.headers.get("x-proxi-ignored-parameters")
+        assert response.status == 200
+    assert header and header.split(",")[0] in ("reasoning_effort", "reasoning.effort")
+    assert relay.fake.seen[-1].effort is None and relay.fake.seen[-1].requested_effort == "high"
 
 
 @pytest.mark.parametrize("compatibility", [False, True])

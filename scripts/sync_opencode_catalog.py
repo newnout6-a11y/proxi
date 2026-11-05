@@ -73,7 +73,10 @@ def update_document(document, entries, default_model='claude-opus-5-5'):
         valid = [value for value in previous if isinstance(value, str) and value in levels]
         selected = valid[0] if len(set(valid)) == 1 else entry.get('default_reasoning_effort')
         _clear_effort(options)
-        options['reasoningEffort'] = selected if levels else 'none'
+        if levels:
+            options['reasoningEffort'] = selected
+        elif not entry.get('reasoning'):
+            options['reasoningEffort'] = 'none'  # a route that ignores effort never needs a client default
         new_models[name] = item
     if not new_models:
         raise ValueError('Refusing to replace the client catalog with an empty set')
