@@ -6,6 +6,10 @@ of it (tests that use the real engine skip while its accessors raise NotImplemen
 """
 import fnmatch
 
+import pytest
+
+import prompt_policy
+
 
 class FakeSnapshot:
     """A compiled revision with the profiles and Codex settings the test gives it.
@@ -75,3 +79,16 @@ class FakeStore:
             self.constructed.append((cfg, path))
             return self
         return build
+
+
+@pytest.fixture
+def store(monkeypatch, tmp_path):
+    """The PromptStore of everything built in the test (the relay's runtime.prompts, a sync script's store).
+
+    Set store.current to a snapshot to publish a revision. Its path is a file that does not exist, so a test
+    never reads a prompts file of the machine; create it to say that a file is there.
+    """
+    store = FakeStore(path=tmp_path / "prompts.json")
+    monkeypatch.setattr(prompt_policy, "PromptStore", store.factory())
+    return store
+

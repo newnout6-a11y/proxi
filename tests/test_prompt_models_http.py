@@ -9,19 +9,10 @@ import pytest
 
 import journal
 import models
-import prompt_policy
-from prompt_models_support import FakeSnapshot, FakeStore
+from prompt_models_support import FakeSnapshot, store  # noqa: F401  (store is a fixture)
 from test_prompt_models_catalog import CODEX_TEXT, dump, legacy_codex_catalog
 
 ROW_METADATA = ("metadata_checked_at", "metadata_source", "metadata_status", "metadata_notes")
-
-
-@pytest.fixture
-def store(monkeypatch):
-    """runtime.prompts of the relay under test; set store.current to a snapshot to publish a revision."""
-    store = FakeStore()
-    monkeypatch.setattr(prompt_policy, "PromptStore", store.factory())
-    return store
 
 
 @pytest.fixture
