@@ -519,8 +519,8 @@ collisions are refused before writing. It approved the exact two previews.
 The following writes completed, preserving an exact backup for each profile:
 
 ```powershell
-uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings C:/Users/Redmi/.dsh/profiles/desktop/cordis.patch.yml --write --backup-dir .agents/backups/harness-catalog-20261105/desktop
-uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings C:/Users/Redmi/.dsh/profiles/web/cordis.patch.yml --write --backup-dir .agents/backups/harness-catalog-20261105/web
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings "$env:USERPROFILE/.dsh/profiles/desktop/cordis.patch.yml" --write --backup-dir .agents/backups/harness-catalog-20261105/desktop
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings "$env:USERPROFILE/.dsh/profiles/web/cordis.patch.yml" --write --backup-dir .agents/backups/harness-catalog-20261105/web
 ```
 
 Post-write bytes equal the reviewed previews. Restoring the original Proxi
@@ -638,7 +638,11 @@ No actionable findings remained. Exact command:
 python -B -m pytest -p no:cacheprovider tests/test_desktop_service_protocol.py tests/test_native_history.py tests/test_cold_tool_history.py tests/test_native_context_reuse.py tests/test_prompt_ownership.py tests/test_generation_controls.py tests/test_client_context.py tests/test_models_hardening.py tests/test_model_catalog.py
 ```
 
-Root validation and live reproduction commands:
+Root validation and live reproduction commands. The last one runs a local
+evidence script from the git-ignored `.agents/` directory: that script and the
+`.agents/model-audit-20261104/` tree it writes into are not in the repository, so
+this command records what was run on the author's machine and cannot be
+reproduced from a clone. The first three can be.
 
 ```powershell
 uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest -o addopts= -q --tb=short
@@ -658,6 +662,10 @@ zero active requests and still belonged to the known relay process. New PID
 2528 listens on `127.0.0.1:8787`; startup balance was 13,271.0479/15,000.
 Health is good, discovery advertises 27 routes, and Haiku exposes its verified
 `none` level. No unrelated client process was stopped.
+
+The two commands below run local evidence scripts from the git-ignored `.agents/`
+directory. Neither script is in the repository: they record what was run on the
+author's machine and cannot be reproduced from a clone.
 
 `python .agents/production-smoke-20261105.py protocol-smoke-4e2b21d.json`
 passed **all eight actual production requests**: stream/nonstream in each API,
