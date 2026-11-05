@@ -661,6 +661,9 @@ def _error_from_event(event):
         message = message.get("message")
     status = event.get("statusCode")
     text = str(message or "upstream stream error")
+    if status in (429, None) and apierr.is_hourly_limit(text):
+        # The hourly managed-key quota belongs to the account, not to this one request.
+        return apierr.account_rate_limited(text)
     if status == 429:
         return apierr.too_many_requests(text)
     if status in (401, 403):
@@ -1160,7 +1163,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         error.upstream_status = exc.code
                         raise error
                     holder["response"] = exc
-                    error = apierr.ApiError(*_http_error(exc.code, detail))
+                    error = _api_error(exc.code, detail, exc.headers)
                     error.upstream_status = exc.code
                     error.diagnostic_id = diagnostic
                     raise error
@@ -1538,3 +1541,12 @@ def _http_error(status, detail):
     if status in (400, 422):
         return (400, "invalid_request_error", text)
     return (502, "upstream_error", text)
+
+
+def _api_error(status, detail, headers=None):
+    error = apierr.ApiError(*_http_error(status, detail))
+    if status == 429 and apierr.is_hourly_limit(detail):
+        # The hourly managed-key quota is spent: the orchestrator parks this account and moves the turn.
+        error.account_quota = True
+        error.retry_after = apierr.retry_after_seconds((headers or {}).get("retry-after"))
+    return error

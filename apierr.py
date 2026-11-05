@@ -1,4 +1,10 @@
 """Typed API errors with OpenAI/Anthropic-shaped envelopes."""
+import math
+import time
+from email.utils import parsedate_to_datetime
+
+# Retool answers 429 with this sentence once an organization has spent its hourly managed-key budget.
+HOURLY_LIMIT = "hourly limit of managed api key usage"
 
 
 class ApiError(Exception):
@@ -51,6 +57,55 @@ def payload_too_large(limit: int) -> ApiError:
 
 def too_many_requests(message: str = "relay is busy", retry_after: float = 1.0) -> ApiError:
     return ApiError(429, "rate_limit_error", message, retry_after=retry_after)
+
+
+def is_hourly_limit(text) -> bool:
+    """Retool's per-organization managed-key quota, as opposed to a short-lived 429."""
+    return HOURLY_LIMIT in " ".join(str(text or "").lower().split())
+
+
+def account_rate_limited(message: str, retry_after=None) -> ApiError:
+    """429 that says this account is out of its hourly quota: another account may still serve the turn."""
+    error = too_many_requests(message, retry_after)
+    error.account_quota = True
+    return error
+
+
+def is_account_quota(error) -> bool:
+    return getattr(error, "account_quota", False) is True
+
+
+def retry_after_seconds(value):
+    """Seconds from a Retry-After header (delta-seconds or an HTTP date); None when absent or unusable."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(text).timestamp() - time.time()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+
+def wait_text(seconds: float) -> str:
+    seconds = max(1, math.ceil(seconds))
+    return "%d мин" % math.ceil(seconds / 60) if seconds >= 60 else "%d с" % seconds
+
+
+def accounts_rate_limited(wait: float, limited: int = 0, total: int = 0) -> ApiError:
+    """Every account able to serve the request is parked after Retool's hourly limit."""
+    seconds = max(1, math.ceil(wait))
+    if limited >= total:
+        message = ("Нет доступных аккаунтов: все аккаунты упёрлись в часовой лимит Retool. "
+                   "Ближайший вернётся через %s." % wait_text(seconds))
+    else:
+        message = ("Нет доступных аккаунтов: %d из %d упёрлись в часовой лимит Retool, остальные исключены "
+                   "из пула (баланс или вход). Ближайший из упёршихся вернётся через %s."
+                   % (limited, total, wait_text(seconds)))
+    return ApiError(429, "rate_limit_error", message, retry_after=seconds)
 
 
 def upstream_auth_failed(detail: str = "") -> ApiError:
