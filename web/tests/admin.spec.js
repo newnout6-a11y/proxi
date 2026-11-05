@@ -641,6 +641,61 @@ test('an effort level the model lacks is an error only while approximation is of
   await expect(banner).toContainText('xhigh');
 });
 
+// The relay takes any known level for these routes and changes nothing (reasoning_effort_control "accepted-ignored").
+for (const id of ['zai-org/GLM-5.3', 'claude-haiku-4-5']) {
+  test(`a saved effort level on ${id}, whose route ignores it, raises no warning`, async ({ page }) => {
+    const state = await mockAdmin(page, { rich: true });
+    for (const values of [state.settings, state.effective]) Object.assign(values, { model: id, reasoning_effort: 'high' });
+    await login(page);
+    await nav(page, 'Настройки');
+    await expect(page.locator('#setting-model')).toHaveValue(id);
+    await expect(page.locator('#setting-reasoning_effort')).toHaveValue('high');
+    await expect(page.getByRole('status').filter({ hasText: 'не поддерживается моделью' })).toHaveCount(0);
+  });
+}
+
+test('a model that ignores effort offers every level, marks each as ignored, and still warns for one that refuses a level', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const effort = page.locator('#setting-reasoning_effort');
+  const banner = page.getByRole('status').filter({ hasText: 'не поддерживается моделью' });
+  await effort.selectOption('max');
+  await page.locator('#setting-model').selectOption('zai-org/GLM-5.3'); // lists no level, takes any
+  await expect(banner).toHaveCount(0);
+  const marked = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((level) => `${level} · модель игнорирует`);
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', ...marked]);
+  await expect(effort).toHaveValue('max');
+  await effort.selectOption('xhigh');
+  await expect(banner).toHaveCount(0);
+  // Approximation has nothing to do here: the list and the silence are the same with it on
+  const approximate = page.getByRole('switch', { name: 'Подбирать ближайший effort' });
+  await approximate.click();
+  await expect(banner).toHaveCount(0);
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', ...marked]);
+  await approximate.click();
+
+  // A route that lists levels is judged by them; one that lists none and does not take a level refuses it
+  await effort.selectOption('high');
+  await page.locator('#setting-model').selectOption('gpt-4.1');
+  await expect(banner).toContainText('GPT 4.1');
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', 'high']);
+  await page.locator('#setting-model').selectOption('gpt-5.5');
+  await expect(banner).toHaveCount(0);
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', 'low', 'medium', 'high']);
+});
+
+test('the catalog says that a route takes an effort level and ignores it, instead of leaving the choice to the provider', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const effort = (id) => page.locator('.model-card').filter({ has: page.getByText(id, { exact: true }) }).locator('.model-effort');
+  await expect(effort('zai-org/GLM-5.3')).toContainText('Effort: принимает уровень, игнорирует');
+  await expect(effort('zai-org/GLM-5.3')).not.toContainText('выбирает провайдер');
+  await expect(effort('claude-opus-5-5')).toContainText('Effort: low · medium · high · max');
+  await expect(effort('gpt-4.1')).toContainText('Effort: без мышления');
+});
+
 test('leaving the settings with unsaved edits asks first and keeps them when declined', async ({ page }) => {
   await mockAdmin(page);
   await login(page);

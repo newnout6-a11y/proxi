@@ -3,26 +3,38 @@ export const API_KEY = 'relay-e2e-placeholder-key';
 export const MEMORY_KEY = 'relay.admin.key.v1';
 export const NOW = Math.floor(Date.now() / 1000);
 
+// reasoning_effort_control is what the relay publishes: "selectable" levels are forwarded, "accepted-ignored" routes take
+// any level and drop it (they list none), "provider-managed" ones list none and refuse a level.
 export const catalog = [
   { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', provider: 'anthropic', context: 1000000, max_output: 128000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high', 'max'], routable: true,
-    metadata_status: 'verified' },
+    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high', 'max'], reasoning_effort_control: 'selectable',
+    routable: true, metadata_status: 'verified' },
   { id: 'gpt-5.5', label: 'GPT 5.5', provider: 'openai', context: 1050000, max_output: 128000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], routable: false,
-    metadata_status: 'verified', route_status: 'unrouted', route_blocker: 'no_resource',
+    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], reasoning_effort_control: 'selectable',
+    routable: false, metadata_status: 'verified', route_status: 'unrouted', route_blocker: 'no_resource',
     route_reason: "No enabled account that can serve this model has a Retool resource for openai ('openai_provider_resource_name')" },
 ];
 
 const extraCatalog = [
   { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', provider: 'anthropic', context: 1000000, max_output: 64000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], routable: true, metadata_status: 'verified' },
+    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], reasoning_effort_control: 'selectable',
+    routable: true, metadata_status: 'verified' },
   { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5', provider: 'anthropic', context: 200000, max_output: 32000,
-    reasoning: false, tools: true, reasoning_effort_levels: [], routable: true, metadata_status: 'verified' },
+    reasoning: false, tools: true, reasoning_effort_levels: [], reasoning_effort_control: 'accepted-ignored',
+    routable: true, metadata_status: 'verified' },
   { id: 'gpt-5.5-codex', label: 'GPT 5.5 Codex', provider: 'openai', context: 400000, max_output: 128000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], routable: true, metadata_status: 'verified' },
+    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], reasoning_effort_control: 'selectable',
+    routable: true, metadata_status: 'verified' },
   { id: 'gemini-3-pro', label: 'Gemini 3 Pro', provider: 'google', context: 2000000, max_output: 64000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'high'], routable: false, metadata_status: 'estimated',
+    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'high'], reasoning_effort_control: 'selectable',
+    routable: false, metadata_status: 'estimated',
     route_status: 'unverified', route_blocker: 'blocked', route_reason: 'Requires Google BYOK; no configured route was tested.' },
+  { id: 'zai-org/GLM-5.3', label: 'Retool Power (GLM 5.3)', provider: 'retool-fast', context: 1000000, max_output: 128000,
+    reasoning: true, tools: true, reasoning_effort_levels: [], reasoning_effort_control: 'accepted-ignored',
+    routable: true, metadata_status: 'partial' },
+  { id: 'gpt-4.1', label: 'GPT 4.1', provider: 'openai', context: 1047576, max_output: 32768,
+    reasoning: false, tools: true, reasoning_effort_levels: [], reasoning_effort_control: 'provider-managed',
+    routable: true, metadata_status: 'verified' },
 ];
 
 // Mirrors admin._default_roles: the texts the relay really sends while relay_system_prompt is null.
@@ -54,6 +66,8 @@ export const baseSchema = {
 
 const richSchema = {
   ...baseSchema,
+  // Any model of the catalog can be the default, as on the relay.
+  model: { ...baseSchema.model, enum: [...catalog, ...extraCatalog].map(({ id }) => id) },
   reasoning_effort: { type: 'string', label: 'Уровень мышления', group: 'model', restart_required: true,
     enum: ['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     description: 'Уровень мышления, если клиент его не передал; auto оставляет выбор модели' },
