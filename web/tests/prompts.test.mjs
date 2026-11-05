@@ -11,8 +11,9 @@ import {
   setProtected, setRelayText, setRuleField, STARTERS, starterProfile, textNameError, textUsage, uniqueName, updateAt,
 } from '../src/prompts/draft.js';
 import {
-  BASELINE_DOCUMENT, DEFAULT_VARIABLES, detectDialect, failureOf, forceProfile, normalizeBuiltin, normalizePins, normalizePreview,
-  normalizePrompts, normalizeRecent, normalizeVariables, parseBody, parseHeaders, previewRequest,
+  BASELINE_DOCUMENT, DEFAULT_VARIABLES, MAX_DOCUMENT_BYTES, RELAY_TASK_VARIABLES, compileProfileName, detectDialect, failureLead, failureOf, forceProfile,
+  normalizeBuiltin, normalizeLimits, normalizePins, normalizePreview, normalizePrompts, normalizeRecent, normalizeSaved, normalizeSpecialUses,
+  normalizeVariables, parseBody, parseHeaders, previewRequest,
 } from '../src/prompts/api.js';
 import { describeChange } from '../src/prompts/changes.js';
 import { emptySample, newestSample, recentLabel, resolveSample } from '../src/prompts/sample.js';
@@ -518,6 +519,83 @@ test('a failed call is read as status, message and the path the relay blames', (
 });
 
 // --- rules, starting points and samples ------------------------------------------------------------------------------
+
+test('the document answer of the relay is read as the relay sends it: names, typed conditions, limits, special targets and warnings', () => {
+  const answer = normalizePrompts({
+    document: null, rev: null, path: 'prompts.json', errors: [], warnings: ['protected.enabled: false: …', { message: 'rules[1]: override_protected' }],
+    legacy: { mode: 'standalone', role_chars: 329 },
+    builtin: {
+      relay_texts: { role: 'R', native_role: 'N', reminder: '<system-reminder>\n{{text}}\n</system-reminder>', structured: '{{default}}', codex_base: 'C' },
+      protected_rules: [], variables: ['client_system', 'role'],
+      edit_ops: { client_system: ['remove_tag'], mid_system: ['keep'], user_blocks: ['drop_tag'], tools: ['hide'] },
+      conditions: { client: { type: 'string', glob: true, values: ['opencode', 'codex'] }, tools: { type: 'boolean' }, model: { type: 'string', glob: true } },
+      profiles: ['passthrough'], structured_example: 'example', relay_task_variables: ['relay_task', 'local_exec'],
+      special_uses: ['$header', '$legacy'], profile_name: '[a-z][a-z0-9-]{0,15}', limits: { max_text_bytes: 1000, max_document_bytes: 5000 },
+    },
+  });
+  assert.deepEqual(answer.warnings, ['protected.enabled: false: …', 'rules[1]: override_protected']);
+  assert.equal(answer.hasWarnings, true);
+  assert.equal(normalizePrompts({}).hasWarnings, false);
+  assert.deepEqual(normalizePrompts({}).warnings, []);
+  const { builtin } = answer;
+  assert.deepEqual(builtin.variables.map((variable) => variable.name), ['client_system', 'role']);
+  assert.ok(builtin.variables.every((variable) => variable.description.length > 0));
+  assert.deepEqual(builtin.editOps.client_system, ['remove_tag']);
+  assert.equal(builtin.conditions.find((spec) => spec.name === 'tools').kind, 'bool');
+  assert.deepEqual(builtin.conditions.find((spec) => spec.name === 'client').values, ['opencode', 'codex']);
+  assert.equal(builtin.conditions.find((spec) => spec.name === 'model').kind, 'list');
+  assert.deepEqual(builtin.relayTaskVariables, ['relay_task', 'local_exec']);
+  assert.deepEqual(builtin.specialUses.map((item) => item.id), ['$header', '$legacy']);
+  assert.equal(builtin.specialUses[0].label, 'Профиль из заголовка');
+  assert.deepEqual(builtin.limits, { textBytes: 1000, documentBytes: 5000 });
+  assert.equal(builtin.structuredExample, 'example');
+  assert.equal(builtin.profileName.test('mine-1'), true);
+  assert.equal(builtin.profileName.test('Mine'), false);
+  assert.equal(builtin.profileName.test('a'.repeat(17)), false);
+});
+
+test('what the relay leaves out stays at the documented values', () => {
+  const builtin = normalizeBuiltin({});
+  assert.deepEqual(builtin.relayTaskVariables, RELAY_TASK_VARIABLES);
+  assert.deepEqual(builtin.specialUses.map((item) => item.id), ['$header', '$virtual', '$legacy']);
+  assert.deepEqual(builtin.limits, { textBytes: MAX_TEXT_BYTES, documentBytes: MAX_DOCUMENT_BYTES });
+  assert.equal(builtin.profileName, null);
+  assert.equal(builtin.structuredExample, '');
+  assert.deepEqual(normalizeLimits({ max_text_bytes: 'big', max_document_bytes: -1 }), { textBytes: MAX_TEXT_BYTES, documentBytes: MAX_DOCUMENT_BYTES });
+  assert.equal(normalizeLimits({ text: 77 }).textBytes, 77);
+  assert.equal(normalizeBuiltin({ structured_example: { a: 1 } }).structuredExample, '{\n  "a": 1\n}');
+  assert.equal(compileProfileName(''), null);
+  assert.equal(compileProfileName('(?P<bad>x)'), null);
+  assert.equal(compileProfileName('[a-z]+')?.test('abc'), true);
+  assert.equal(compileProfileName('[a-z]+')?.test('abc1'), false);
+});
+
+test('special targets come as names or objects, keep the descriptions the screen knows, and take a newer one from the relay', () => {
+  assert.deepEqual(normalizeSpecialUses(['$header', { id: '$virtual', description: 'своё описание' }, '$new', '$header', 5]).map((item) => [item.id, item.hint]),
+    [['$header', 'Берётся из x-proxi-profile; если такого профиля нет, запрос получит ошибку 400'], ['$virtual', 'своё описание'], ['$new', '']]);
+  assert.deepEqual(normalizeSpecialUses([]).map((item) => item.id), ['$header', '$virtual', '$legacy']);
+  assert.deepEqual(normalizeSpecialUses(undefined).map((item) => item.id), ['$header', '$virtual', '$legacy']);
+});
+
+test('the answer of a save is the revision and the warnings, and a refusal opens its message by its status', () => {
+  assert.deepEqual(normalizeSaved({ rev: 4, warnings: ['a', { message: 'b' }] }), { rev: 4, warnings: ['a', 'b'] });
+  assert.deepEqual(normalizeSaved(null), { rev: null, warnings: [] });
+  assert.equal(failureLead({ status: 400 }), 'Relay не принял документ');
+  assert.match(failureLead({ status: 413 }), /2 МиБ/);
+  assert.match(failureLead({ status: 503 }), /записать файл/);
+  assert.equal(failureLead({ status: 0 }), 'Relay недоступен');
+  assert.equal(failureLead({ status: 500 }), 'Ошибка');
+});
+
+test('a profile name is judged by the relay pattern when there is one', () => {
+  const strict = compileProfileName('[a-z][a-z0-9-]{0,7}');
+  assert.equal(profileNameError('mine', [], strict), null);
+  assert.match(profileNameError('Mine', [], strict), /латинские буквы/);
+  assert.match(profileNameError('toolongname', [], strict), /латинские буквы/);
+  assert.equal(profileNameError('Mine', []), null);
+  assert.match(profileNameError('passthrough', [], strict), /встроенный/);
+  assert.match(profileNameError('mine', ['mine'], strict), /уже есть/);
+});
 
 test('a rule field is written only when it differs from the default', () => {
   const rule = { name: 'r', if: {}, use: 'p' };

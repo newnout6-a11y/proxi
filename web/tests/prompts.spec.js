@@ -59,7 +59,7 @@ test('without a prompts file the screen says the legacy path is in force and sta
   const intro = page.getByRole('region', { name: 'Файл промптов не создан' });
   await expect(intro).toContainText('прежнем режиме (legacy)');
   await expect(intro).toContainText('Самостоятельные запросы (standalone)');
-  await expect(intro).toContainText('нет: действует встроенная');
+  await expect(intro).toContainText('329 симв. (встроенная)');
   await expect(intro).toContainText('C:\\relay\\prompts.json');
   await expect(savebar(page)).toHaveCount(0);
 
@@ -381,10 +381,19 @@ test('the preview is asked again only after typing pauses, and an answer that co
   await expect(live(page).locator('.head-text')).not.toContainText('SLOW');
   expect(failed).toContain('net::ERR_ABORTED');
   expect(prompts.previews.length).toBe(settled + 2);
-  // a burst of keystrokes is one request
+  // a burst of keystrokes inside one task is one request
   const burst = prompts.previews.length;
-  await field.pressSequentially('abcdef', { delay: 40 });
+  await field.evaluate((element) => {
+    const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    for (const letter of 'abcdef') {
+      setValue.call(element, element.value + letter);
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  });
+  await expect(field).toHaveValue('FAST {{client_system}}abcdef');
   await expect.poll(() => prompts.previews.length).toBe(burst + 1);
+  await page.waitForTimeout(600);
+  expect(prompts.previews.length).toBe(burst + 1);
 });
 
 test('a draft the relay refuses is said so in the live panel with the path it blames', async ({ page }) => {
@@ -982,6 +991,24 @@ test('saving sends the whole document with the revision it was read at and the C
   expect(prompts.saves[1].body.base_rev).toBe(4);
 });
 
+test('an open rule and an open section stay open after a save, so the next edit can follow at once', async ({ page }) => {
+  const { prompts } = await openPrompts(page, {}, 'Правила');
+  await userRule(page, 2).getByRole('button', { name: /opencode/ }).first().click();
+  await userRule(page, 2).getByLabel('Название').fill('все opencode');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  await expect(savebar(page)).toHaveCount(0);
+  await expect(userRule(page, 2).getByLabel('Название')).toHaveValue('все opencode');
+  await tab(page, 'Профили').click();
+  const history = section(page, 'История диалога');
+  await expect(history.locator('.p-edit')).toHaveCount(1);
+  await head(page).fill('x {{client_system}}');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(2);
+  await expect(history.locator('.p-edit')).toHaveCount(1);
+  await expect(section(page, 'Правки system клиента').locator('.p-edit')).toHaveCount(2);
+});
+
 test('cancelling drops every unsaved edit', async ({ page }) => {
   await openPrompts(page);
   await head(page).fill('Не сохранять');
@@ -1100,16 +1127,61 @@ test('any other failure of a save is shown with what the relay said, and the dra
   await expect(head(page)).toHaveValue('x {{client_system}}');
 });
 
-test('warnings of a successful save are listed until they are closed', async ({ page }) => {
+for (const [status, lead, message] of [
+  [413, 'Документ слишком большой: relay принимает не больше 2 МиБ', 'document is larger than 2097152 bytes'],
+  [503, 'Relay не смог записать файл на диск', 'prompts.json: [Errno 28] No space left on device'],
+]) {
+  test(`a save the relay answers with ${status} says why in words, and the draft stays`, async ({ page }) => {
+    const { prompts } = await openPrompts(page);
+    prompts.saveFails = { status, json: { error: { message } } };
+    await head(page).fill('x {{client_system}}');
+    await saveButton(page).click();
+    const banner = page.locator('.p-save-error');
+    await expect(banner).toContainText(`Не сохранено. ${lead}: ${message}`);
+    await expect(banner.locator('code')).toHaveCount(0);
+    await expect(savebar(page)).toBeVisible();
+    await expect(head(page)).toHaveValue('x {{client_system}}');
+    // nothing was marked in the document: this is not about a field
+    await expect(head(page)).not.toHaveAttribute('aria-invalid', 'true');
+  });
+}
+
+test('the relay\'s warnings about the document are shown for as long as they apply, and a save brings the new ones', async ({ page }) => {
   const { prompts } = await openPrompts(page);
-  prompts.warnings = ['profiles.exact-opus: размер head 300 КиБ близок к лимиту'];
-  await head(page).fill('x {{client_system}}');
-  await saveButton(page).click();
-  const warnings = page.locator('.p-save-warnings');
-  await expect(warnings).toContainText('Сохранено с предупреждениями');
-  await expect(warnings).toContainText('размер head 300 КиБ близок к лимиту');
-  await warnings.getByRole('button', { name: 'Закрыть' }).click();
+  const warnings = page.locator('.p-doc-warnings');
   await expect(warnings).toHaveCount(0);
+  await tab(page, 'Правила').click();
+  await page.getByRole('switch', { name: 'Защита служебных запросов' }).click();
+  await userRule(page, 2).getByRole('button', { name: /opencode/ }).first().click();
+  await userRule(page, 2).getByLabel('Применять и к защищённым запросам (override_protected)').check();
+  // an edit alone changes nothing here: the relay speaks about the document it holds
+  await expect(warnings).toHaveCount(0);
+  await saveButton(page).click();
+  await expect(warnings).toContainText('Предупреждения relay о документе');
+  await expect(warnings.locator('li')).toHaveCount(2);
+  await expect(warnings).toContainText('protected.enabled: false');
+  await expect(warnings).toContainText('rules[2] «opencode»: override_protected');
+  // the screen reloaded after the save: the list is the relay's own, and it is still there after another look at the file
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(warnings.locator('li')).toHaveCount(2);
+
+  await page.getByRole('switch', { name: 'Защита служебных запросов' }).click();
+  await userRule(page, 2).getByLabel('Применять и к защищённым запросам (override_protected)').uncheck();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(2);
+  await expect(warnings).toHaveCount(0);
+});
+
+test('a relay that lists no warnings with the document still has the warnings of its last save shown', async ({ page }) => {
+  const { prompts } = await openPrompts(page, { listWarnings: false });
+  await tab(page, 'Правила').click();
+  await page.getByRole('switch', { name: 'Защита служебных запросов' }).click();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  await expect(page.locator('.p-doc-warnings')).toContainText('protected.enabled: false');
+  // a document loaded afresh is not the one that was saved: the old answer goes
+  await page.getByRole('button', { name: 'Перезагрузить' }).click();
+  await expect(page.locator('.p-doc-warnings')).toHaveCount(0);
 });
 
 test('a changed document is picked up on its own while the draft is clean, and flagged when there are unsaved edits', async ({ page }) => {
@@ -1199,6 +1271,70 @@ test('lists the relay describes by name, in other shapes or only in part are sti
   await expect(page.getByRole('list', { name: 'Встроенные защитные правила' })).toContainText('Назначение: session-title → passthrough');
   await tab(page, 'Тексты').click();
   await expect(page.getByRole('article', { name: 'Роль relay' }).getByLabel('Встроенный текст: Роль relay')).toHaveValue('ROLE');
+});
+
+test('the name rule, the size limits, the special targets and the relay-only variables the relay publishes are the ones the screen applies', async ({ page }) => {
+  const builtin = { ...BUILTIN, profile_name: '[a-z][a-z0-9-]{0,15}', limits: { max_text_bytes: 120, max_document_bytes: 4096 },
+    special_uses: ['$header', '$legacy'], relay_task_variables: ['exec_reminder'] };
+  await openPrompts(page, { builtin });
+  // the limit of one text is the relay's, not the screen's
+  await head(page).fill('ж'.repeat(61));
+  await expect(page.getByText('61 симв. · 122 из 120 байт')).toBeVisible();
+  await expect(page.getByText('Текст больше 120 байт: relay его не примет')).toBeVisible();
+  await head(page).fill('{{relay_task}} {{client_system}}');
+  await expect(page.getByText('только для запросов, которыми владеет relay')).toHaveCount(0);
+  await head(page).fill('{{exec_reminder}} {{client_system}}');
+  await expect(page.getByText('{{exec_reminder}}: только для запросов, которыми владеет relay')).toBeVisible();
+
+  // a profile name is judged by the relay's own pattern
+  await page.getByRole('button', { name: 'Новый профиль' }).click();
+  await page.getByLabel('Имя профиля').fill('Mine2');
+  await expect(page.getByRole('button', { name: 'Создать профиль' })).toBeDisabled();
+  await page.getByLabel('Имя профиля').fill('a'.repeat(17));
+  await expect(page.getByRole('button', { name: 'Создать профиль' })).toBeDisabled();
+  await page.getByLabel('Имя профиля').fill('mine-two');
+  await expect(page.getByRole('button', { name: 'Создать профиль' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+
+  await tab(page, 'Правила').click();
+  await userRule(page, 2).getByRole('button', { name: /opencode/ }).first().click();
+  await expect(userRule(page, 2).getByLabel('Применить профиль').locator('option')).toHaveText(
+    ['passthrough', 'mine-first', 'exact-opus', '$header — Профиль из заголовка', '$legacy — Прежний путь']);
+  await tab(page, 'Тексты').click();
+  const structured = page.getByRole('article', { name: 'Обёртка структурированного ответа' });
+  await structured.getByText('Пример контракта, как он выглядит в head').click();
+  await expect(structured).toContainText('Reply with one JSON object that matches the schema "answer".');
+});
+
+test('a relay that names no limits, special targets or name rule leaves the documented ones', async ({ page }) => {
+  const { limits, special_uses, profile_name, relay_task_variables, structured_example, ...older } = BUILTIN;
+  void limits; void special_uses; void profile_name; void relay_task_variables; void structured_example;
+  await openPrompts(page, { builtin: older });
+  await head(page).fill('ж'.repeat(10));
+  await expect(page.getByText('10 симв. · 20 из 262 144 байт')).toBeVisible();
+  await tab(page, 'Правила').click();
+  await userRule(page, 2).getByRole('button', { name: /opencode/ }).first().click();
+  await expect(userRule(page, 2).getByLabel('Применить профиль').locator('option')).toHaveText(
+    ['passthrough', 'mine-first', 'exact-opus', '$header — Профиль из заголовка', '$virtual — Профиль из имени модели', '$legacy — Прежний путь']);
+  await tab(page, 'Тексты').click();
+  await expect(page.getByText('Пример контракта')).toHaveCount(0);
+});
+
+test('the role settings of the legacy path are applied at once: saving them asks for no restart', async ({ page }) => {
+  await mockAdmin(page);
+  await mockPrompts(page);
+  await login(page);
+  await rail(page, 'Настройки').click();
+  await page.getByLabel('Стандартная роль relay').uncheck();
+  await page.getByLabel('Инструкции для модели', { exact: true }).fill('Новая роль');
+  await page.getByRole('radio', { name: /Дополнить клиента/ }).check();
+  await expect(page.getByText('ждёт перезапуска')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(page.getByText('Настройки сохранены')).toBeVisible();
+  await expect(page.getByText(/Применено сразу: .*Инструкции для модели/)).toBeVisible();
+  await expect(page.getByText('Изменения вступят в силу после перезапуска relay')).toHaveCount(0);
+  await expect(page.getByText(/ждут перезапуска/)).toHaveCount(0);
+  await expect(page.getByText('ждёт перезапуска')).toHaveCount(0);
 });
 
 test('an operation the screen does not know is kept as it is and said so', async ({ page }) => {
@@ -1319,16 +1455,15 @@ test('no glow, gradient, uppercase, endless animation or heavy weight on any tab
     found[name] = await scan();
   }
   expect(found).toEqual(Object.fromEntries(TABS.map((name) => [name, []])));
-  // every banner of the screen as well: the file errors are up already; a refused save, a conflict and the warnings
+  // every banner of the screen as well: the file errors are up already; a refused save, the warnings of the document and a conflict
   await tab(page, 'Профили').click();
   await head(page).fill('{{typo}}');
-  prompts.warnings = ['предупреждение сохранения'];
   await saveButton(page).click();
   await expect(page.locator('.p-save-error')).toBeVisible();
   expect(await scan()).toEqual([]);
   await head(page).fill('{{client_system}}');
   await saveButton(page).click();
-  await expect(page.locator('.p-save-warnings')).toBeVisible();
+  await expect(page.locator('.p-doc-warnings')).toBeVisible();
   expect(await scan()).toEqual([]);
   prompts.rev = 9;
   await head(page).fill('{{client_system}} ещё');

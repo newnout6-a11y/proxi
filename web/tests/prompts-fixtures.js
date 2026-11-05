@@ -37,7 +37,8 @@ export const SYSTEM_CLAUDE_CODE = [
 ].join('\n');
 
 const BUILTIN_TEXTS = {
-  role: '[ROLE]\nYou are a coding assistant behind a local OpenAI/Anthropic relay. Follow the user\'s task and language.',
+  // 329 characters, like the role the relay really has: legacy.role_chars is this length while no role of its own is set
+  role: ('[ROLE]\nYou are a coding assistant behind a local OpenAI/Anthropic relay. Follow the user\'s task and language. '.repeat(4)).slice(0, 329),
   native_role: '[ROLE]\nYou are a coding assistant using the client\'s tools.',
   structured: '{{default}}',
   reminder: '<system-reminder>\n{{text}}\n</system-reminder>',
@@ -49,27 +50,17 @@ export const PROTECTED_RULES = [
   { name: 'protected: Claude Code compaction', if: { request_class: ['compaction', 'auxiliary'] }, use: 'passthrough' },
 ];
 
-const VARIABLES = {
-  client_system: 'system клиента после правок, без служебной строки Claude Code',
-  client_system_raw: 'system клиента без правок',
-  role: 'роль relay',
-  native_role: 'роль для клиента с tools',
-  relay_task: 'роль, локальные команды и контекст проекта; только для запросов relay',
-  local_exec: 'блок локальных команд',
-  project_context: 'блок контекста проекта',
-  exec_reminder: 'напоминание о командах',
-  structured: 'контракт структурированного ответа',
-  model: 'модель запроса',
-  client: 'клиент',
-  agent: 'агент',
-  purpose: 'назначение запроса',
-};
+const VARIABLES = [
+  'client_system', 'client_system_raw', 'role', 'native_role', 'relay_task', 'local_exec', 'project_context', 'exec_reminder',
+  'structured', 'model', 'client', 'agent', 'purpose',
+];
 const RELAY_ONLY = ['relay_task', 'local_exec', 'project_context', 'exec_reminder'];
 
+// The shapes the relay answers with (P4): variables are names, conditions say their type and values, and so on.
 export const BUILTIN = {
   relay_texts: BUILTIN_TEXTS,
   protected_rules: PROTECTED_RULES,
-  variables: Object.entries(VARIABLES).map(([name, description]) => ({ name, description })),
+  variables: VARIABLES,
   edit_ops: {
     client_system: ['remove_section', 'keep_sections', 'remove_tag', 'keep_tag_inner', 'remove_between', 'remove_regex', 'replace_regex', 'replace_text', 'prepend', 'append'],
     user_blocks: ['drop_tag', 'remove_regex', 'replace_text'],
@@ -77,14 +68,36 @@ export const BUILTIN = {
     mid_system: ['keep', 'wrap', 'plain', 'drop'],
   },
   conditions: {
-    client: { values: ['opencode', 'claude-code', 'claude-desktop', 'codex', 'harness', 'unknown'] },
-    agent: {}, request_class: {}, model: {},
-    purpose: { values: ['client-tools', 'client-text', 'generation', 'session-title', 'auto-mode-check', 'connection-probe', 'client-service'] },
-    tools: { type: 'bool' }, structured: { type: 'bool' }, has_client_system: { type: 'bool' },
-    dialect: { values: ['chat', 'responses', 'anthropic'] }, header_profile: {}, virtual_profile: {},
+    client: { type: 'string', glob: true, values: ['opencode', 'claude-code', 'claude-desktop', 'codex', 'harness', 'unknown'] },
+    agent: { type: 'string', glob: true },
+    purpose: { type: 'string', glob: true, values: ['client-tools', 'client-text', 'generation', 'session-title', 'auto-mode-check', 'connection-probe', 'client-service'] },
+    request_class: { type: 'string', glob: true },
+    model: { type: 'string', glob: true },
+    tools: { type: 'boolean' },
+    structured: { type: 'boolean' },
+    has_client_system: { type: 'boolean' },
+    dialect: { type: 'string', glob: true, values: ['chat', 'responses', 'anthropic'] },
+    header_profile: { type: 'string', glob: true },
+    virtual_profile: { type: 'string', glob: true },
   },
   profiles: ['passthrough'],
+  structured_example: 'Reply with one JSON object that matches the schema "answer".\n{"type": "object", "properties": {"ok": {"type": "boolean"}}}',
+  relay_task_variables: RELAY_ONLY,
+  special_uses: ['$header', '$virtual', '$legacy'],
+  profile_name: '[A-Za-z0-9][A-Za-z0-9._-]{0,63}',
+  limits: { max_text_bytes: 262144, max_document_bytes: 2097152 },
 };
+
+/** What the relay warns about in a document: protection off, rules that override it (plan I6). */
+export function warningsFor(doc) {
+  if (!doc) return [];
+  const warnings = [];
+  if (doc.protected?.enabled === false) warnings.push('protected.enabled: false: служебные запросы IDE (заголовки, сжатие, проба) получат ваш профиль вместо system клиента');
+  (doc.rules || []).forEach((rule, index) => {
+    if (rule.override_protected === true) warnings.push(`rules[${index}] «${rule.name}»: override_protected: правило применяется и к служебным запросам`);
+  });
+  return warnings;
+}
 
 export const initialDocument = () => ({
   version: 1,
@@ -137,7 +150,7 @@ function ruleMatches(rule, request) {
 }
 
 export function validateDocument(doc) {
-  const known = new Set(Object.keys(VARIABLES));
+  const known = new Set(VARIABLES);
   const texts = new Set(Object.keys(doc.texts || {}));
   const names = new Set(['passthrough', ...Object.keys(doc.profiles || {})]);
   for (const [name, profile] of Object.entries(doc.profiles || {})) {
@@ -313,7 +326,7 @@ export function recentRequests() {
 // --- the route --------------------------------------------------------------------------------------------------
 
 export async function mockPrompts(page, options = {}) {
-  const { legacy = false, errors = [], builtin = BUILTIN, previewDelay = 0, document: seed, recent } = options;
+  const { legacy = false, errors = [], builtin = BUILTIN, previewDelay = 0, document: seed, recent, listWarnings = true } = options;
   const state = {
     doc: legacy ? null : (seed || initialDocument()), rev: legacy ? null : 3, path: 'C:\\relay\\prompts.json', errors, saves: [], previews: [],
     pinActions: [], requests: [], saveFails: null, delays: [], previewDelay,
@@ -340,8 +353,8 @@ export async function mockPrompts(page, options = {}) {
     state.requests.push({ path: url.pathname, method, headers });
     const path = url.pathname.replace('/admin/api/prompts', '') || '/';
     if (path === '/' && method === 'GET') {
-      return reply(200, { document: state.doc, rev: state.rev, path: state.path, errors: state.errors,
-        legacy: { mode: 'standalone', role_chars: 0 }, builtin });
+      return reply(200, { document: state.doc, rev: state.rev, path: state.path, errors: state.errors, ...(listWarnings ? { warnings: warningsFor(state.doc) } : {}),
+        legacy: { mode: 'standalone', role_chars: BUILTIN_TEXTS.role.length }, builtin });
     }
     if (path === '/' && method === 'PUT') {
       const body = request.postDataJSON();
@@ -352,7 +365,7 @@ export async function mockPrompts(page, options = {}) {
       if (invalid) return reply(400, { error: { message: invalid.message, param: invalid.param, type: 'invalid_request_error' } });
       state.doc = body.document;
       state.rev = (state.rev ?? 0) + 1;
-      return reply(200, { rev: state.rev, warnings: state.warnings || [] });
+      return reply(200, { rev: state.rev, warnings: warningsFor(state.doc) });
     }
     if (path === '/preview' && method === 'POST') {
       const body = request.postDataJSON();
@@ -383,6 +396,9 @@ export async function mockPrompts(page, options = {}) {
     if (path === '/pins' && method === 'POST') {
       const body = request.postDataJSON();
       state.pinActions.push({ body, headers });
+      // as the relay does: unpin names a conversation, apply_all names none
+      if (body.action === 'unpin' && !body.conversation) return reply(400, { error: { message: 'unpin needs a conversation', param: 'conversation' } });
+      if (body.action === 'apply_all' && body.conversation) return reply(400, { error: { message: 'apply_all takes no conversation', param: 'conversation' } });
       const before = state.pins.length;
       if (body.action === 'apply_all') state.pins = [];
       else state.pins = state.pins.filter((pin) => pin.conversation !== body.conversation);
