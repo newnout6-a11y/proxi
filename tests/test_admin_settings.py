@@ -90,3 +90,40 @@ def test_published_roles_are_the_texts_the_relay_really_sends(tmp_path):
     assert orchestrator.TurnRunner._instructions(runner, native_tools=True) == texts["native_tools"]
     runner.cfg["relay_system_prompt"] = "custom role"
     assert orchestrator.TurnRunner._instructions(runner, native_tools=True) == "custom role"
+
+
+# -- why a model is hidden -----------------------------------------------------------
+def test_models_api_names_the_real_reason_a_model_is_hidden(admin_relay):
+    _, body, _ = admin_relay.request("/admin/api/models")
+    by_id = {item["id"]: item for item in body["data"]}
+    shown = by_id["claude-opus-5-5"]
+    assert shown["routable"] is True and "route_blocker" not in shown
+    assert (shown["route_status"], shown["route_reason"]) == ("verified", models.resolve("claude-opus-5-5")[0]["route_reason"])
+
+    # A verified route, but the only account has no OpenAI resource: the catalog's own reason would mislead.
+    hidden = by_id["gpt-6-sol"]
+    assert hidden["routable"] is False and hidden["route_blocker"] == "no_resource"
+    assert hidden["route_status"] == "unrouted" and "Synthetic" not in hidden["route_reason"]
+    assert "openai_provider_resource_name" in hidden["route_reason"]
+    assert hidden["catalog_route_status"] == "verified" and "Synthetic" in hidden["catalog_route_reason"]
+
+    gated = by_id["claude-fable-5"]
+    assert (gated["route_blocker"], gated["route_status"]) == ("blocked", "gated")
+    assert "retention" in gated["route_reason"] and "catalog_route_status" not in gated
+    unsupported = by_id["gpt-5.3-codex"]
+    assert (unsupported["route_blocker"], unsupported["route_status"]) == ("blocked", "unsupported")
+    assert unsupported["route_reason"] == models.resolve("gpt-5.3-codex")[0]["route_reason"]
+
+
+def test_reason_is_about_the_enabled_accounts_not_a_switched_off_one(pool):
+    second = pool.backends[1]
+    second.cfg["openai_provider_resource_name"] = "second-openai"
+    openai = lambda: {item["id"]: item for item in pool.call("/admin/api/models")[1]["data"]}["gpt-6-sol"]  # noqa: E731
+    assert openai()["routable"] is True
+    assert pool.call("/admin/api/accounts/" + pool.tags[1], {"enabled": False}, method="PATCH")[0] == 200
+    hidden = openai()
+    assert hidden["routable"] is False and hidden["route_blocker"] == "no_resource"
+    assert "No enabled account" in hidden["route_reason"]
+    pool.backends[0].cfg["enabled"] = False
+    nobody = openai()
+    assert nobody["route_blocker"] == "no_accounts" and nobody["route_status"] == "unrouted"

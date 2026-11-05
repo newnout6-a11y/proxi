@@ -284,9 +284,42 @@ class Admin:
         backends = getattr(getattr(runtime, 'accounts', None), 'backends', None)
         return models.catalog_routable(entry, self.cfg, backends)
 
+    def _route_configs(self):
+        """Configs of the accounts models.catalog_routable weighs: the enabled ones."""
+        backends = getattr(getattr(getattr(self, 'runtime', None), 'accounts', None), 'backends', None)
+        if backends is None:
+            return [item for item in (self.cfg.get('accounts') or [self.cfg]) if item.get('enabled', True)]
+        return [backend.cfg for backend in backends if backend.cfg.get('enabled', True)]
+
+    def _unrouted(self, entry):
+        """(code, reason) of a model catalog_routable hides; the same inputs, checked in the same order."""
+        configs = self._route_configs()
+        if not configs:
+            return "no_accounts", "No account is enabled"
+        reasons = [models.route_block_reason(entry, item) for item in configs]
+        if all(reasons):
+            return "blocked", reasons[0]
+        key = models.PROVIDER_RESOURCE_KEY.get(entry["provider"])
+        if key is None:
+            return "no_resource", f"Provider '{entry['provider']}' is not routed"
+        if not any(item.get(key) for item, reason in zip(configs, reasons) if not reason):
+            return "no_resource", (f"No enabled account that can serve this model has a Retool "
+                                   f"resource for {entry['provider']} ('{key}')")
+        return "other", "Not routable with the current account configuration"
+
     def _models(self):
-        return {"data": [{**entry, "routable": self._routable(entry), "available_verified": None}
-                         for entry in models.catalog()], "default_model": self.cfg.get("model")}
+        data = []
+        for entry in models.catalog():
+            item = {**entry, "routable": self._routable(entry), "available_verified": None}
+            if not item["routable"]:
+                code, reason = self._unrouted(entry)
+                if code != "blocked":
+                    # The catalog's status describes the route where a resource exists; here the pool is the cause.
+                    item.update(catalog_route_status=entry.get("route_status"),
+                                catalog_route_reason=entry.get("route_reason"), route_status="unrouted")
+                item.update(route_blocker=code, route_reason=reason)
+            data.append(item)
+        return {"data": data, "default_model": self.cfg.get("model")}
 
     def _accounts(self, entries, usage):
         accounts = []
