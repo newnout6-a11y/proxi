@@ -322,7 +322,7 @@ class Admin:
             return "no_accounts", "No account is enabled"
         reasons = [models.route_block_reason(entry, item) for item in configs]
         if all(reasons):
-            return "blocked", reasons[0]
+            return "blocked", "; ".join(dict.fromkeys(reasons))  # as models.catalog_visibility words it
         key = models.PROVIDER_RESOURCE_KEY.get(entry["provider"])
         if key is None:
             return "no_resource", f"Provider '{entry['provider']}' is not routed"

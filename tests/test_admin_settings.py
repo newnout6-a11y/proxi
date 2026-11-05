@@ -222,6 +222,24 @@ def test_reason_follows_the_account_list_discovery_is_judged_against(pool, monke
     assert narrowed["routable"] is False and narrowed["route_blocker"] == "no_resource"
 
 
+def test_blocked_reason_joins_every_distinct_refusal_like_discovery(pool):
+    entry = models.resolve("claude-fable-5")[0]
+    fable = lambda: {item["id"]: item for item in pool.call("/admin/api/models")[1]["data"]}["claude-fable-5"]  # noqa: E731
+    reasons = [models.route_block_reason(entry, backend.cfg) for backend in pool.backends]
+    assert all(reasons) and len(set(reasons)) == 1  # two private resources refuse with the same hint
+    shown = fable()
+    assert (shown["routable"], shown["route_blocker"], shown["route_reason"]) == (False, "blocked", reasons[0])
+
+    # A managed resource is refused with a hint of its own: the operator sees both, as discovery says it.
+    pool.backends[1].cfg["provider_resource_name"] = "__managed__"
+    reasons = [models.route_block_reason(entry, backend.cfg) for backend in pool.backends]
+    assert all(reasons) and len(set(reasons)) == 2
+    shown = fable()
+    published, discovery = models.catalog_visibility(entry, pool.runtime.cfg, pool.runtime.accounts.backends)
+    assert (shown["routable"], shown["route_blocker"], published) == (False, "blocked", False)
+    assert shown["route_reason"] == discovery == "; ".join(reasons)
+
+
 # -- overview ------------------------------------------------------------------------
 def test_overview_session_speaks_for_the_enabled_accounts_only(pool):
     first, second = pool.backends
