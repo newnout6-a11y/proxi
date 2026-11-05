@@ -21,7 +21,7 @@ import auth
 import config
 import journal
 import models
-from accounts import enabled as account_enabled, priority as account_priority
+from accounts import UNNAMED, account_tag, cfg_tag, enabled as account_enabled, priority as account_priority
 from redact import redact
 import sse
 import validate
@@ -352,7 +352,7 @@ class Admin:
             info, backend = entry["info"], entry["backend"]
             error = info.get("error") or info.get("stale_error")
             accounts.append({
-                "account": account_report.account_tag(backend), "state": entry["state"],
+                "account": account_tag(backend, UNNAMED), "state": entry["state"],
                 "routable": entry["routable"], "reserve": entry["reserve"],
                 "available": entry["available"],
                 "monthly_allocation": account_report.known(info.get("monthly_allocation")),
@@ -440,7 +440,7 @@ class Admin:
 
     @staticmethod
     def _record_tag(record):
-        return journal.tag(record.get("account_id") or record.get("page_uuid")) or "account"
+        return cfg_tag(record, UNNAMED)
 
     def _live_backends(self):
         return getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]

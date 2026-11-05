@@ -18,7 +18,7 @@ import websockets
 import apierr
 import journal
 import models as model_catalog
-from accounts import account_tag, enabled as account_enabled, priority as account_priority
+from accounts import UNNAMED, account_tag, enabled as account_enabled, priority as account_priority
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -955,7 +955,7 @@ class SessionPool:
             # The hourly limit clears by itself: say when, instead of a 402/503 that implies a manual fix.
             wait = min(max(0.0, r.get("until_at", 0.0) - time.time()) for r in limited)
             return apierr.accounts_rate_limited(wait, len(limited), len(backends))
-        exhausted = [(journal.tag(b.cfg.get("account_id") or b.cfg.get("page_uuid")), r.get("available"))
+        exhausted = [(account_tag(b, UNNAMED), r.get("available"))
                      for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
         if exhausted:
             threshold = next(r.get("threshold") for r in reasons if r.get("reason") == "exhausted")

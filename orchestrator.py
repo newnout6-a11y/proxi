@@ -20,7 +20,7 @@ import client_context
 import console_log
 import models as model_catalog
 import structured
-from accounts import account_tag
+from accounts import UNNAMED, account_tag
 from context import build_system_instructions, relay_policy
 from redact import redact
 from session import SessionLease
@@ -502,24 +502,20 @@ class TurnRunner:
                 raise
             if rate_limited:
                 exclude.append(backend)
-                cfg = getattr(backend, "cfg", None) or {}
-                tag = journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
                 journal.emit("account.failover", "Часовой лимит Retool — запрос повторён на другом аккаунте",
-                             "warn", account=tag, request_id=getattr(parsed, "request_id", None),
+                             "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code, reason="rate_limited")
                 console_log.write("[%s] [account] %s: часовой лимит Retool, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", tag))
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
                 holder["reason"] = "stop"
                 continue
             if exhausted:
                 exclude.append(backend)
-                cfg = getattr(backend, "cfg", None) or {}
-                tag = journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
                 journal.emit("account.failover", "Баланс аккаунта закончился — запрос повторён на другом",
-                             "warn", account=tag, request_id=getattr(parsed, "request_id", None),
+                             "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code)
                 console_log.write("[%s] [account] %s: баланс закончился, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", tag))
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
                 holder["reason"] = "stop"
                 continue
             if error is not None:

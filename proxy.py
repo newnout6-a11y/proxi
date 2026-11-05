@@ -28,7 +28,7 @@ import models as model_catalog
 import sse
 import models
 import validate
-from accounts import AccountDispatcher, account_tag
+from accounts import UNNAMED, AccountDispatcher, account_tag
 from credits import CreditsManager
 from orchestrator import TurnRunner, acquire_plan
 from session import Backend, SessionPool
@@ -266,7 +266,7 @@ def make_handler(runtime: Runtime):
                 backend, manager = self._serving_account()
                 snapshot = getattr(manager, "balance_snapshot", None)
                 if snapshot:
-                    tag = account_report.account_tag(backend) if backend is not None and len(runtime.accounts.backends) > 1 else None
+                    tag = account_tag(backend, UNNAMED) if backend is not None and len(runtime.accounts.backends) > 1 else None
                     console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used, account=tag))
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:

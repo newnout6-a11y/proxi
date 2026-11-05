@@ -6,6 +6,8 @@ import time
 import urllib.error
 from types import SimpleNamespace
 
+import pytest
+
 import direct
 import journal
 from keepwarm_harness import backend as warm_backend, drive, session as warm_session
@@ -255,3 +257,68 @@ def test_tag_helper_never_exposes_the_identity_and_survives_missing_config():
     assert account_tag(None) is None and account_tag(SimpleNamespace(cfg=None)) is None
     assert account_tag(SimpleNamespace(cfg={"account_id": ACCOUNT})) == TAG
     assert ACCOUNT not in TAG and len(TAG) == 8
+
+
+def test_the_default_says_what_an_account_without_identity_is_called():
+    from accounts import UNNAMED, account_tag, cfg_tag
+
+    assert UNNAMED == "account"
+    assert cfg_tag({}, UNNAMED) == account_tag(None, UNNAMED) == account_tag(SimpleNamespace(cfg=None), UNNAMED) == "account"
+    # An identity wins over the default, whatever it is.
+    assert cfg_tag({"account_id": ACCOUNT}, "x") == TAG and account_tag(SimpleNamespace(cfg={"page_uuid": PAGE}), "x") == journal.tag(PAGE)
+
+
+IDENTITIES = [({"account_id": ACCOUNT, "page_uuid": PAGE}, TAG), ({"page_uuid": PAGE}, journal.tag(PAGE)), ({}, None)]
+
+
+@pytest.mark.parametrize("cfg,tag", IDENTITIES)
+def test_every_surface_names_an_account_through_the_one_helper(cfg, tag):
+    import account_report
+    import admin
+    from accounts import AccountDispatcher
+    from session import SessionPool
+    from test_account_dispatcher import Account, Clock
+
+    label = tag or "account"
+    account = Account("x")
+    account.cfg = dict(cfg)
+
+    class Manager:
+        def get_balance(self, force_refresh=False):
+            return {"available": 3.0, "monthly_allocation": 500.0}
+
+        def balance_snapshot(self):
+            return {"available": 3.0}
+
+        def usage(self):
+            return {"session_used": 0.0, "turns": 0, "recent": []}
+
+    manager = Manager()
+    dispatcher = AccountDispatcher([account], {"session_refresh_interval": 0}, {account: manager}, clock=Clock())
+    runtime = SimpleNamespace(accounts=dispatcher, backend=account, credits=manager, cfg={})
+
+    # What a person reads: reports, status rows and messages call it by the tag, or by one placeholder.
+    assert dispatcher.status()[0]["account"] == label
+    assert account_report.balance_report(account_report.collect(runtime))["accounts"][0]["account"] == label
+    assert account_report.usage_report(runtime)["accounts"][0]["account"] == label
+    assert admin.Admin._record_tag(cfg) == label
+    account.unavailable = {"reason": "exhausted", "available": 3.0, "threshold": 20.0}
+    assert "%s: 3.0" % label in SessionPool._unusable_error([account]).message
+
+    # What a journal field holds: the tag, or nothing. The placeholder never lands in an event.
+    before = journal.JOURNAL.last_seq
+    account.unavailable = None
+    dispatcher.mark_rate_limited(account)
+    events = [e for e in journal.JOURNAL.query(since=before) if e["kind"] == "account.rate_limited"]
+    assert len(events) == 1 and events[0]["data"].get("account") == tag
+
+
+def test_the_identity_rule_is_written_once():
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    sources = [*root.glob("*.py"), *(root / "scripts").glob("*.py")]
+    offenders = [path.name for path in sources if path.name != "accounts.py"
+                 and re.search(r"journal\.tag\([^)\n]*(account_id|page_uuid)", path.read_text(encoding="utf-8"))]
+    assert offenders == []

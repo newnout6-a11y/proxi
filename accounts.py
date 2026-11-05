@@ -42,14 +42,22 @@ def priority(backend):
     return value if type(value) is int else 0
 
 
-def cfg_tag(cfg):
-    """Journal label of an account config: a short hash, never the raw ID; None without an identity."""
+UNNAMED = "account"  # what a report, a console line or a message calls an account that has no identity
+
+
+def cfg_tag(cfg, default=None):
+    """Journal label of an account config: a short hash, never the raw ID. The one place that says which
+    field names an account (`account_id`, else `page_uuid`).
+
+    `default` is what an account without an identity gets. Journal fields keep None, so that the event names
+    no account; anything a person reads (reports, status rows, console lines, messages) passes UNNAMED."""
     cfg = cfg or {}
-    return journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
+    return journal.tag(cfg.get("account_id") or cfg.get("page_uuid")) or default
 
 
-def account_tag(backend):
-    return cfg_tag(getattr(backend, "cfg", None))
+def account_tag(backend, default=None):
+    """`cfg_tag` of a backend's config."""
+    return cfg_tag(getattr(backend, "cfg", None), default)
 
 
 def idle_block(backend):
@@ -150,7 +158,8 @@ class AccountDispatcher:
 
     # -- scheduling ----------------------------------------------------------
     def _tag(self, backend):
-        return account_tag(backend) or "account"
+        """The account as a person reads it (status rows, console lines); journal fields use account_tag."""
+        return account_tag(backend, UNNAMED)
 
     def _jitter(self, seconds):
         return seconds * self.rng.uniform(0.9, 1.1)
@@ -197,7 +206,7 @@ class AccountDispatcher:
                 key = "next_refresh" if kind == "refresh" else "next_balance"
                 self.state[backend][key] = self.clock() + 60.0
             journal.emit("account.dispatcher", "Проверка аккаунта не удалась: %s" % type(exc).__name__, "warn",
-                         account=self._tag(backend), job=kind)
+                         account=account_tag(backend), job=kind)
         finally:
             with self._lock:
                 self.state[backend]["running"].discard(kind)
@@ -221,17 +230,17 @@ class AccountDispatcher:
         """`reason` is the state captured under the lock that changed it."""
         if not changed:
             return
-        tag = self._tag(backend)
+        label, tag = self._tag(backend), account_tag(backend)
         if reason is None:
-            text = "[account] %s снова в пуле" % tag
+            text = "[account] %s снова в пуле" % label
             journal.emit("account.available", text, "success", account=tag)
         elif reason["reason"] == "exhausted":
             text = "[account] %s исключён: баланс %s < %s" % (
-                tag, console_log.amount(reason.get("available"), signed=True), console_log.amount(self.threshold))
+                label, console_log.amount(reason.get("available"), signed=True), console_log.amount(self.threshold))
             journal.emit("account.exhausted", text, "warn", account=tag, available=reason.get("available"),
                          threshold=self.threshold)
         else:
-            text = "[account] %s исключён: сессия не продлевается, нужен новый вход" % tag
+            text = "[account] %s исключён: сессия не продлевается, нужен новый вход" % label
             journal.emit("account.auth_dead", text, "error", account=tag, error=reason.get("error"))
         console_log.write(text)
 
@@ -332,11 +341,10 @@ class AccountDispatcher:
             until_at = time.time() + pause
             self._set_reason(backend, "rate_limited", {"until": now + pause, "until_at": until_at,
                                                        "pause": pause, "source": source})
-        tag = self._tag(backend)
         text = "[account] %s исключён: часовой лимит Retool до %s (пауза %s%s)" % (
-            tag, time.strftime("%H:%M:%S", time.localtime(until_at)), apierr.wait_text(pause),
+            self._tag(backend), time.strftime("%H:%M:%S", time.localtime(until_at)), apierr.wait_text(pause),
             ", повторный лимит подряд" if source == "escalated" else "")
-        journal.emit("account.rate_limited", text, "warn", account=tag, until=round(until_at, 3),
+        journal.emit("account.rate_limited", text, "warn", account=account_tag(backend), until=round(until_at, 3),
                      retry_in=pause, source=source, **({"request_id": request_id} if request_id else {}))
         console_log.write(text)
         return until_at
