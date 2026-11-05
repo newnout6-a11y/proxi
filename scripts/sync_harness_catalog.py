@@ -191,16 +191,6 @@ def encode_document(original, document, result):
         yaml.dump(provider, output)
         return ''.join(' ' * indent + line + newline for line in output.getvalue().splitlines())
 
-    def block_end(node):
-        """Offset after the block's last line; comments and blanks left of its column belong to what follows."""
-        line = node.end_mark.line
-        while line > node.start_mark.line + 1:
-            text = lines[line - 1]
-            if text.strip() and not (text.lstrip().startswith('#') and len(text) - len(text.lstrip()) < node.start_mark.column):
-                break
-            line -= 1
-        return offsets[line]
-
     edits = []
     for name in ('retool', 'retool-text'):
         if name not in after:
@@ -209,10 +199,11 @@ def encode_document(original, document, result):
             node = nodes[name]
             if node.flow_style or node.start_mark.line == node.end_mark.line:
                 raise ValueError('Expand the Proxi provider to a block mapping before synchronizing')
-            edits.append((offsets[node.start_mark.line], block_end(node), block(after[name], node.start_mark.column)))
+            start, end = offsets[node.start_mark.line], offsets[node.end_mark.line]
+            edits.append((start, end, block(after[name], node.start_mark.column)))
         else:
             main = nodes['retool']
-            position = block_end(main)
+            position = offsets[main.end_mark.line]
             indent = main.start_mark.column - 2
             edits.append((position, position, ' ' * indent + name + ':' + newline
                           + block(after[name], main.start_mark.column)))

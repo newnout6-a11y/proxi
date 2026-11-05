@@ -293,35 +293,6 @@ def test_last_provider_block_without_a_final_newline_is_spliced_and_that_ending_
     assert [item['id'] for item in providers['retool-text']['models']] == ['gpt-4.1']
 
 
-def splice(text):
-    yaml = YAML()
-    yaml.preserve_quotes = True
-    document = yaml.load(text)
-    entries = [models.resolve(name)[0] for name in ('gpt-6-sol', 'gpt-4.1')]
-    return encode_document(text.encode('utf-8'), document, update_document(document, entries)).decode('utf-8')
-
-
-@pytest.mark.parametrize('tail', [
-    '\n      # about tail\n      tail:\n        a: 1\n',
-    '      # note\n\n      # about tail\n      tail:\n        a: 1\n',
-    '# comment at the end of the file\n',
-    '# comment at the end of the file'])
-def test_comments_and_blank_lines_after_the_proxi_block_survive_the_splice(tail):
-    result = splice('\n'.join(HEAD) + '\n' + tail)
-    assert result.endswith(tail)
-    assert result.count('about tail') == tail.count('about tail') and result.count('# note') == tail.count('# note')
-
-
-def test_comments_around_an_existing_text_provider_survive_a_resync():
-    text = ('\n'.join(HEAD) + "\n      # about text\n      retool-text:\n"
-            "        displayName: 'Retool Relay (без thinking)'\n        reasoning: 'off'\n        models: []\n"
-            "      # about tail\n      tail:\n        a: 1\n")
-    result = splice(text)
-    assert result.count('# about text') == 1 and result.count('# about tail') == 1
-    assert result.index('retool:') < result.index('# about text') < result.index('retool-text:') < result.index('# about tail')
-    assert result.endswith('      # about tail\n      tail:\n        a: 1\n')
-
-
 def test_cli_updates_a_profile_whose_last_block_has_no_final_newline(tmp_path, capsys):
     raw = '\n'.join(HEAD).encode('utf-8')
     code, summary, error, profile = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'), raw=raw)
