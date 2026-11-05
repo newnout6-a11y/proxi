@@ -107,25 +107,34 @@ def relay_pool(tmp_path, monkeypatch):
 
 
 # -- one answer for stream and non-stream, wherever acquire() would look ---------------------------------------
+# The first account cannot serve the model, the second can: it lacks only this model's resource, or any resource.
+UNEVEN = [pytest.param(FIRST_LACKS_GLM, GLM, "retool_fast_provider_resource_name", id="first-lacks-the-resource"),
+          pytest.param([account("acc-a"), account("acc-b", provider_resource_name=M)], "claude-opus-5-5",
+                       "provider_resource_name", id="first-has-no-resource-at-all")]
+
+
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("dialect", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("accounts,model,key", UNEVEN)
 def test_shared_mode_tools_request_is_refused_with_a_real_404_when_only_the_second_account_has_the_resource(
-        relay_pool, dialect, stream):
-    call = relay_pool(FIRST_LACKS_GLM, session_mode="shared")
+        relay_pool, accounts, model, key, dialect, stream):
+    call = relay_pool(accounts, session_mode="shared")
     path, build = DIALECTS[dialect]
-    status, body, headers = call(path, dict(build(GLM, True), stream=stream))
+    status, body, headers = call(path, dict(build(model, True), stream=stream))
     # Tools take the shared session, which only the first account serves.
     assert status == 404 and "json" in headers["content-type"], (status, body)
-    assert body["error"]["type"] == "not_found_error" and "retool_fast_provider_resource_name" in body["error"]["message"]
+    assert body["error"]["type"] == "not_found_error" and key in body["error"]["message"]
     assert call.posts == [] and not call.runtime.pool._active
 
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("dialect", ["chat", "anthropic", "responses"])
-def test_shared_mode_request_without_tools_is_served_by_the_second_account(relay_pool, dialect, stream):
-    call = relay_pool(FIRST_LACKS_GLM, session_mode="shared")
+@pytest.mark.parametrize("accounts,model,key", UNEVEN)
+def test_shared_mode_request_without_tools_is_served_by_the_second_account(relay_pool, accounts, model, key,
+                                                                            dialect, stream):
+    call = relay_pool(accounts, session_mode="shared")
     path, build = DIALECTS[dialect]
-    status, body, _ = call(path, dict(build(GLM, False), stream=stream))
+    status, body, _ = call(path, dict(build(model, False), stream=stream))
     # Without tools the pool routes by account, as discovery's per-account facts allow.
     assert status == 200, (status, body)
     assert call.posts == ["acc-b"]
@@ -134,10 +143,12 @@ def test_shared_mode_request_without_tools_is_served_by_the_second_account(relay
 @pytest.mark.parametrize("tools", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("dialect", ["chat", "anthropic", "responses"])
-def test_per_conversation_mode_routes_to_the_account_that_has_the_resource(relay_pool, dialect, stream, tools):
-    call = relay_pool(FIRST_LACKS_GLM, session_mode="per_conversation")
+@pytest.mark.parametrize("accounts,model,key", UNEVEN)
+def test_per_conversation_mode_routes_to_the_account_that_has_the_resource(relay_pool, accounts, model, key,
+                                                                          dialect, stream, tools):
+    call = relay_pool(accounts, session_mode="per_conversation")
     path, build = DIALECTS[dialect]
-    status, body, _ = call(path, dict(build(GLM, tools), stream=stream))
+    status, body, _ = call(path, dict(build(model, tools), stream=stream))
     assert status == 200, (status, body)
     assert call.posts == ["acc-b"]
 
@@ -224,16 +235,28 @@ def test_a_pool_with_a_resource_only_on_a_switched_off_account_is_configured_for
     assert models.catalog_routable(gpt, pool.cfg, pool.backends) is False
 
 
-def test_an_unconfigured_first_account_is_unconfigured_for_discovery_and_the_shared_path_alike():
+def test_a_shared_pool_whose_first_account_has_nothing_refuses_what_the_shared_session_cannot_serve():
     accounts = [account("a"), account("b", provider_resource_name=M)]
     pool = pool_of(accounts, session_mode="shared")
     opus = entry("claude-opus-5-5")
-    # The shared main path only has the first account, which has no resources at all: the request itself explains.
-    assert models.catalog_routable(opus, pool.cfg, pool.backends) is True
-    assert pool.model_refusal(opus) is None
-    # Any other path has both accounts: the pool is configured, and the first lacks the resource.
-    assert pool.model_refusal(opus, isolated=True) is None  # the second account can serve it
+    # The pool has a resource (on the second account), so no empty-pool explanation is left to acquire: the shared
+    # session, which is the first account alone, cannot serve the model. Discovery hides it and a stream gets a 404.
+    assert models.catalog_routable(opus, pool.cfg, pool.backends) is False
+    assert pool.model_refusal(opus).status == 404
+    # A text chat or a standalone job may use the second account.
+    assert pool.model_refusal(opus, isolated=True) is None
+    assert pool.model_refusal(opus, context_scope="text") is None
     assert pool.model_refusal(entry("gpt-6-sol"), isolated=True).status == 404
+
+
+def test_a_pool_without_any_resource_is_one_pool_for_discovery_and_every_path():
+    pool = pool_of([account("a"), account("b")], session_mode="shared")
+    opus = entry("claude-opus-5-5")
+    assert models.pool_configured([backend.cfg for backend in pool.backends]) is False
+    assert models.catalog_routable(opus, pool.cfg, pool.backends) is True
+    for isolated in (False, True):
+        assert pool.model_refusal(opus, isolated=isolated) is None  # the request itself explains the missing resource
+    assert pool.model_refusal(entry("gpt-5.3-codex")).status == 404  # a route fact holds without any resource
 
 
 def test_a_published_model_is_never_refused_over_a_grid_of_pools():

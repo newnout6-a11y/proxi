@@ -970,18 +970,22 @@ class SessionPool:
         """The accounts a request of this kind can be routed to (models.serving over the pool's accounts)."""
         return model_catalog.serving(self.backends, self.cfg, self._on_shared_session(isolated, context_scope))
 
+    def _pool_configured(self):
+        """False when no account of the pool has any provider resource (models.pool_configured)."""
+        return model_catalog.pool_configured([backend.cfg for backend in self.backends])
+
     def model_refusal(self, model_entry, isolated=False, context_scope=None):
         """The settled 404 when no account that serves this request can serve the model, else None.
 
         The HTTP layer calls this before a response starts, so a stream gets a real status instead of
         an SSE error. `isolated` and `context_scope` are acquire()'s and decide which accounts serve (_serving).
-        With no provider resource on any of them, only the model's own route facts count and acquire() explains
-        the missing resource, the same way discovery treats an unconfigured setup.
+        In a pool without a single provider resource only the model's own route facts count and acquire()
+        explains the missing resource, the same way discovery treats an unconfigured setup.
         """
         if model_entry is None:
             return None
         configs = [backend.cfg for backend in self._serving(isolated, context_scope)]
-        refusals = model_catalog.refusal_reasons(model_entry, configs, model_catalog.pool_configured(configs))
+        refusals = model_catalog.refusal_reasons(model_entry, configs, self._pool_configured())
         return model_catalog.model_unavailable(model_entry, refusals) if refusals and all(refusals) else None
 
     def _candidates(self, backends, model_entry, exclude=(), configured=True):
@@ -1033,7 +1037,7 @@ class SessionPool:
         resource leaves the explanation to acquire(). Room in the conversation pool is not part of the answer, and an
         account that fails between this check and acquire() still ends in an error event.
         """
-        configured = model_catalog.pool_configured([b.cfg for b in self._serving(isolated, context_scope)])
+        configured = self._pool_configured()
         try:
             if self._on_shared_session(isolated, context_scope):
                 self._check_shared(model_entry, exclude, configured)
