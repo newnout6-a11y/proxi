@@ -638,15 +638,20 @@ class _Shape:
             raise _RegexHazard("an optional alternative inside a repeated group can match what follows it")
 
     def adjacent(self, items, firsts, flags):
-        """Two unbounded repeats side by side are ambiguous when the end of one can look like the start of the other."""
+        """Two unbounded repeats side by side are ambiguous when they can match one and the same non-empty text.
+
+        Such a text starts with a character both can start with and ends with a character both can end with.
+        """
         for index, (op, av) in enumerate(items):
             if not self.unbounded(op, av):
                 continue
-            own = self.first(av[2], flags, True)[0]
+            starts = self.first(av[2], flags)[0]
+            ends = self.first(av[2], flags, True)[0]
             for other in range(index + 1, len(items)):
                 other_op, other_av = items[other]
-                if self.unbounded(other_op, other_av) and own & self.first(other_av[2], flags)[0]:
-                    raise _RegexHazard("neighbouring unbounded repeats can match the same characters")
+                if (self.unbounded(other_op, other_av) and starts & self.first(other_av[2], flags)[0]
+                        and ends & self.first(other_av[2], flags, True)[0]):
+                    raise _RegexHazard("neighbouring unbounded repeats can match the same text")
                 if not firsts[other][1]:
                     break
 
