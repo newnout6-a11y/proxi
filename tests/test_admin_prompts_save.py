@@ -193,7 +193,7 @@ def test_a_body_over_the_limit_of_the_save_route_is_a_413_whatever_max_body_byte
     assert api.cfg["max_body_bytes"] >= admin.PROMPTS_BODY_LIMIT  # the default would have let it in
     monkeypatch.setattr(admin, "PROMPTS_BODY_LIMIT", 3000)
     big = {"texts": {"t": "x" * 5000}}
-    status, body, _ = put(api, big)
+    status, body, _ = put(api, big, attempts=4)
     assert status == 413 and body["error"]["code"] == "payload_too_large" and "3000" in body["error"]["message"]
     assert api.store.calls == []
     assert put(api, {"texts": {"t": "x" * 100}})[0] == 200  # under the limit it is as before
@@ -221,7 +221,7 @@ def test_the_limit_is_judged_on_the_declared_length_before_a_byte_is_read(api):
 
 def test_max_body_bytes_still_caps_the_save(api):
     api.cfg["max_body_bytes"] = 1000
-    status, body, _ = put(api, {"texts": {"t": "x" * 2000}})
+    status, body, _ = put(api, {"texts": {"t": "x" * 2000}}, attempts=4)
     assert status == 413 and "1000" in body["error"]["message"]
     assert api.store.calls == []
 

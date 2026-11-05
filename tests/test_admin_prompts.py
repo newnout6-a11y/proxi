@@ -12,7 +12,7 @@ import native_history
 import orchestrator
 import prompt_policy
 import structured
-from admin_prompts_harness import DOC, api, check_needs_the_key, get  # noqa: F401 - api is a fixture
+from admin_prompts_harness import DOC, api, check_needs_the_key, get, send  # noqa: F401 - api is a fixture
 from test_admin import admin_relay  # noqa: F401 - the relay the api fixture builds on
 
 
@@ -28,8 +28,8 @@ def test_the_key_in_the_url_is_not_a_login(api):
 
 @pytest.mark.parametrize("method", ["POST", "PATCH", "DELETE"])
 def test_the_state_route_does_not_take_these_methods(api, method):
-    status, body, _ = api.request("/admin/api/prompts", {"x": 1} if method != "DELETE" else None, method=method,
-                                  headers={"x-admin-request": "1", "origin": api.url})
+    status, body, _ = send(api, "/admin/api/prompts", {"x": 1} if method != "DELETE" else None, method=method,
+                           headers={"x-admin-request": "1", "origin": api.url}, attempts=4)
     assert status == 405 and body["error"]["code"] == "method_not_allowed"
     assert api.store.calls == []
 

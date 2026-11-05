@@ -102,18 +102,32 @@ def guard(api):
     return {"x-admin-request": "1", "origin": api.url}
 
 
+def send(api, route, payload=None, **options):
+    """api.request. With attempts > 1 it repeats a request whose connection dropped: the relay refuses (401, 403, 405,
+    413, 415) without reading the body and closes the socket, and Windows may then reset it under the answer. Only
+    requests that are refused anyway are sent this way, so a repeat can change nothing."""
+    attempts = options.pop("attempts", 1)
+    while True:
+        try:
+            return api.request(route, payload, **options)
+        except (OSError, http.client.HTTPException):
+            attempts -= 1
+            if attempts <= 0:
+                raise
+
+
 def get(api, route="", **options):
-    return api.request("/admin/api/prompts" + route, **options)
+    return send(api, "/admin/api/prompts" + route, **options)
 
 
 def put(api, document, base_rev=None, **options):
     options.setdefault("headers", guard(api))
-    return api.request("/admin/api/prompts", {"document": document, "base_rev": base_rev}, method="PUT", **options)
+    return send(api, "/admin/api/prompts", {"document": document, "base_rev": base_rev}, method="PUT", **options)
 
 
 def post(api, route, payload, **options):
     options.setdefault("headers", guard(api))
-    return api.request("/admin/api/prompts/" + route, payload, method="POST", **options)
+    return send(api, "/admin/api/prompts/" + route, payload, method="POST", **options)
 
 
 def raw(api, method, route, body, headers=None):
@@ -154,8 +168,8 @@ def real_engine_or_skip():
 
 # -- checks every route shares ------------------------------------------------------------------
 def check_needs_the_key(api, method, route, payload, key):
-    status, body, headers = api.request(route, payload, method=method, key=key,
-                                        headers=guard(api) if method != "GET" else None)
+    status, body, headers = send(api, route, payload, method=method, key=key, attempts=4,
+                                 headers=guard(api) if method != "GET" else None)
     assert status == 401 and body["error"]["code"] == "unauthorized"
     assert headers["cache-control"] == "no-store" and "access-control-allow-origin" not in headers
     assert api.store.calls == []
@@ -163,7 +177,7 @@ def check_needs_the_key(api, method, route, payload, key):
 
 def check_csrf(api, method, route, payload, headers, status):
     before = api.store.snapshot()
-    assert api.request(route, payload, method=method, headers=headers)[0] == status
+    assert send(api, route, payload, method=method, headers=headers, attempts=4)[0] == status
     assert api.store.calls == [] and api.store.snapshot() is before
     assert events("admin.prompts") == [] and events("admin.prompt_pins") == []
 
