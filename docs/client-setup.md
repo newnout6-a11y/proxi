@@ -368,7 +368,9 @@ emulated and gets a 422 that names this variable. `x-proxi-output-format` shows 
 emulation (`validated-json-schema`, `validated-session-title`).
 
 A title request is recognised by its schema, exactly `{title: string}` without tools,
-whatever the prompt says. Without a schema (the variable above) the start of the
+whatever the prompt says (Messages only: the same schema from an OpenAI-style client,
+for example ai-sdk `generateObject`, is an ordinary request). Without a schema (the
+variable above) the start of the
 prompt block decides, after the `x-anthropic-billing-header` and identity lines. Both
 wordings are known: "You are naming a coding session…" (Claude Code 2.1.234 and newer,
 the Agent SDK) and "Generate a concise, sentence-case title…" (older). A system prompt

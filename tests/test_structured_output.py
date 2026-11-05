@@ -518,6 +518,41 @@ def test_model_output_cannot_trigger_local_execution_of_a_json_request(tmp_path,
     assert events[-1] == {'type': 'end', 'reason': 'stop'}
 
 
+def test_a_client_with_tools_and_no_system_keeps_the_native_tools_role_beside_the_contract(tmp_path, monkeypatch):
+    from test_native_context_reuse import request
+    _, _, runner = setup(tmp_path, transport='direct', project_context=False, exec_policy='off', cookie_values=[])
+    sent = capture_direct(monkeypatch)
+    parsed = request([{'role': 'user', 'content': 'Inspect ORIGINAL_TASK.'}], system='')
+    parsed.structured_output = parse('chat').structured_output
+    events = asyncio.run(run(runner, parsed))
+    assert events[-1] == {'type': 'end', 'reason': 'stop'}
+    head = sent[0][1]['messages'][0]['content'][0]['text']
+    assert head.startswith('[ROLE]\nYou are a coding assistant using the client\'s tools.')
+    assert '[STRUCTURED OUTPUT FORMAT]\nUse the supplied tools as usual.' in head
+    assert 'JSON Schema: ' + json.dumps(MEMORY, separators=(',', ':')) in head
+
+
+TITLE_SCHEMA = {'type': 'object', 'properties': {'title': {'type': 'string'}}, 'required': ['title'],
+                'additionalProperties': False}
+
+
+@pytest.mark.parametrize('dialect', ['chat', 'responses'])
+def test_title_shaped_schema_of_openai_clients_is_not_a_claude_service_title(dialect):
+    import client_context
+    # ai-sdk generateObject({title: string}) is an ordinary request, not a Claude session title.
+    p = parse(dialect, TITLE_SCHEMA)
+    assert p.structured_output['label'] == 'validated-json-schema' and not p.structured_title
+    assert client_context.request_kind(p, {'client': 'claude-code'}) != 'session-title'
+    assert client_context.request_kind(p, {}) == 'generation'
+
+
+def test_the_same_title_schema_on_messages_is_the_service_title():
+    import client_context
+    p = parse('anthropic', TITLE_SCHEMA)
+    assert p.structured_title and p.structured_output['label'] == 'validated-session-title'
+    assert client_context.request_kind(p, {'client': 'claude-code'}) == 'session-title'
+
+
 def test_json_object_and_tool_instructions_differ_from_the_schema_text():
     plain = structured.instructions({'kind': 'json_object', 'schema': None, 'name': None, 'description': None})
     assert 'exactly one JSON object' in plain and 'JSON Schema:' not in plain and 'Use the supplied tools' not in plain

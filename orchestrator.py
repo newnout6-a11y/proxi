@@ -476,8 +476,10 @@ class TurnRunner:
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
             output_spec = getattr(parsed, "structured_output", None)
-            # A JSON-only reply has no room for the relay's workspace or shell protocol.
-            client_owns_instructions = client_text or bool(parsed.system) or bool(output_spec)
+            # A JSON-only reply has no room for the relay's workspace or shell protocol;
+            # a client that supplies tools keeps the relay's native-tools role as before.
+            client_owns_instructions = (client_text or bool(parsed.system)
+                                        or (bool(output_spec) and not native_tools))
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.

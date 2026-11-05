@@ -91,7 +91,7 @@ def structured_output(data, dialect):
     if data.get('tools') and _forces_tool(data.get('tool_choice')):
         raise unprocessable(f"'{chosen['source']}' cannot be combined with a required tool call: the relay can "
                             "only validate a reply that is not a forced tool turn" + hint, param='tool_choice')
-    chosen['title'] = (chosen['kind'] == 'json_schema' and not data.get('tools')
+    chosen['title'] = (dialect == 'anthropic' and chosen['kind'] == 'json_schema' and not data.get('tools')
                        and _is_title_schema(chosen['schema']))
     chosen['label'] = ('validated-session-title' if chosen['title']
                        else 'validated-' + chosen['kind'].replace('_', '-'))
