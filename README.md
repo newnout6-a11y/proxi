@@ -262,6 +262,12 @@ relay в начале мышления отправляет метку `thinking
 возвращает 400 до обращения к upstream. Явный `allow_effort_downgrade: true`
 разрешает приближение известных уровней; журнал хранит requested/effective effort
 и причину выбора. Неизвестные `extra`/`ultra` отклоняются в обоих режимах.
+Выключить рассуждение (`thinking: {type: disabled}` или effort `none`) умеют не все
+модели: у Opus 5.5, Sonnet 5.5, GPT-5.5 и GPT-5 уровня `none` нет. Без настройки это 400,
+и его текст называет `allow_effort_downgrade`; с настройкой берётся самый низкий уровень
+маршрута (`low`, у GPT-5 `minimal`), а замена видна в журнале (`turn.begin`:
+`requested_effort: none`, `effective_effort`, `effort_resolution: compatibility`) и в консоли.
+Модели с `none` (GPT-6 Sol, GPT-5.1, GPT-5.2) выполняют просьбу как есть в обоих режимах.
 На 3 ноября Retool принимает для Opus 5.5 `high`/`max`, а сырой `xhigh` даёт 422.
 GPT-6-sol и GPT-6.1-sol принимают `max`, но также отвергают `xhigh` с 422;
 этот уровень не предлагается их каталогом Codex.
@@ -733,6 +739,66 @@ upstream/сессии, 503 upstream недоступен или нет акка�
 
 Таймаут upstream возвращается как 504.
 
+В диалекте Messages (JSON и SSE `event: error`) `error.type` всегда один из документированных
+типов Anthropic ([список](https://platform.claude.com/docs/en/api/errors)): собственный код
+relay переводится, и клиент не встречает тип, которого его обработчик ошибок не знает.
+Собственный код остаётся в `ApiError.code`, в журнале (`http.error`), в диалектах OpenAI и в
+самом ответе Messages: поле `error.relay_code` есть везде, где тип заменил код
+(`upstream_error` → `api_error`, `insufficient_credits` → `billing_error`), и отсутствует,
+когда они совпали (`rate_limit_error`).
+
+| код relay | тип Messages |
+| --- | --- |
+| `invalid_request_error`, `unprocessable_entity`, `unsupported_media_type`, `method_not_allowed` | `invalid_request_error` |
+| `unauthorized` | `authentication_error` |
+| `insufficient_credits` | `billing_error` |
+| `forbidden` | `permission_error` |
+| `not_found_error` | `not_found_error` |
+| `conflict` | `conflict_error` |
+| `payload_too_large`, `prompt_too_large` | `request_too_large` |
+| `rate_limit_error` | `rate_limit_error` |
+| `service_unavailable` | `overloaded_error` |
+| `upstream_timeout` | `timeout_error` |
+| `upstream_error`, `upstream_auth_error`, `upstream_invalid_output`, `upstream_empty_turn`, `upstream_attempt_limit`, `upstream_tool_choice_ignored`, `internal_error` | `api_error` |
+
+Код, которого нет в таблице, переводится по статусу: 401 `authentication_error`, 402
+`billing_error`, 403 `permission_error`, 404 `not_found_error`, 409 `conflict_error`, 413
+`request_too_large`, 429 `rate_limit_error`, 503 `overloaded_error`, 504 `timeout_error`, прочие
+5xx `api_error`, прочие 4xx `invalid_request_error`.
+
+### Ошибка после начала потока Responses
+
+Если запрос Responses упал, когда поток уже открыт (невалидный structured-ответ, обрыв
+upstream, таймаут хода, отказ по кредитам или лимиту), relay присылает `event: error`, затем
+терминальное `response.failed` и `data: [DONE]`. У `response.failed` тот же `id`, что у
+`response.created`, `status: "failed"` и `error: {code, message}`; у обоих событий есть
+`sequence_number`, а у `error` ещё `relay_code` (собственный код relay), `request_id` и,
+если есть, `diagnostic_id`. Форматы ошибок потока Chat и Messages не менялись.
+
+Код (`error.code`) решает, повторит ли клиент запрос. Codex 0.164.0 игнорирует `error` и без
+`response.failed` видел обрыв до `response.completed`, молча повторял запрос до
+`stream_max_retries` (5) раз, а повторы оплачиваются. Теперь он классифицирует код
+(`codex-api/src/sse/responses_error.rs`, `protocol/src/error.rs`, `core/src/responses_retry.rs`):
+
+| код relay | код Responses | Codex |
+| --- | --- | --- |
+| `upstream_invalid_output`, `upstream_empty_turn`, `upstream_attempt_limit`, `upstream_tool_choice_ignored`, `invalid_request_error`, `unprocessable_entity`, `prompt_too_large` и прочие 4xx | `invalid_prompt` | не повторяет, печатает сообщение |
+| `insufficient_credits` | `insufficient_quota` | не повторяет, печатает свой текст «Quota exceeded…» |
+| `rate_limit_error` | `rate_limit_exceeded` | повторяет; ждёт столько, сколько названо в сообщении |
+| `upstream_error`, `upstream_auth_error`, `upstream_timeout`, `service_unavailable`, `internal_error` | `server_error` | повторяет с собственной паузой 0,2 с × 2ⁿ (до 5 раз) |
+
+Для лимита, который закончится не позже чем через 60 с, сообщение получает хвост
+`Please try again in 20s.` в форме, которую разбирает Codex. Длиннее подсказки нет: Codex
+выдерживает названную паузу целиком перед каждым из своих пяти повторов, верхней границы у
+него нет (живая проверка: с подсказкой 900 с он через 25 с всё ещё спал). Без подсказки
+запросы идут быстро и мгновенно получают тот же отказ, пока все аккаунты в лимите (до
+апстрима они не доходят и ничего не стоят), и Codex печатает сообщение с оставшимся
+временем. Живая проверка codex-cli 0.164.0 (запросов к relay до исправления → после):
+невалидный structured-ответ, `prompt_too_large`, поздний 422 и нехватка кредитов — 6 → 1;
+сбой upstream — 6 → 6, но с настоящей причиной вместо «stream closed before
+response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) получает оба события и
+чисто завершает поток; `responses.stream().get_final_response()` по-прежнему бросает
+`RuntimeError`, потому что `response.completed` не приходил.
 ## Ограничения (важно)
 
 - Retool на прямом транспорте (`copilotStreamGPT`) принимает клиентские инструменты
@@ -834,6 +900,10 @@ upstream/сессии, 503 upstream недоступен или нет акка�
   upstream. Неизвестной (`credits_unknown`) считается только попытка, которая сообщила
   usage без допустимой цены (конечное число не меньше 0; NaN, минус и один лишь флаг
   `credits_reported` ценой не являются) или которую клиент отменил до телеметрии.
+  Прямой транспорт сообщает такую попытку пустым маркером usage; устаревший агентный
+  транспорт (WebSocket) делает то же, когда попытка дала текст, thinking или вызов инструмента,
+  а `run_credits_persisted` не пришёл (в том числе после таймаута): журнал и `usage` клиента
+  называют её неизвестной одинаково, а не журнал «бесплатной», а адаптер «неизвестной».
   Ход, отклонённый до upstream (413, 402, 503), попытка с отказом по HTTP (429, 500)
   и запрос, не покинувший relay (DNS, отказ соединения, TLS), ничего не стоят; таймаут
   чтения или обрыв после отправки может быть оплачен и остаётся неизвестным. Идущий ход

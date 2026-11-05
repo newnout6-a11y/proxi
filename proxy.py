@@ -24,6 +24,7 @@ import client_context
 import console_log
 from redact import redact
 import config as config_module
+import generation
 import models as model_catalog
 import sse
 import models
@@ -307,6 +308,7 @@ def make_handler(runtime: Runtime):
             self._error_code = None
             self._response_started = False
             self._client_trace = None
+            self._adapter = None
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -369,11 +371,7 @@ def make_handler(runtime: Runtime):
                 if err.status >= 400:
                     console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
                 if getattr(self, "_streaming", False):
-                    writer = self._writer
-                    writer.event("error", self._error_payload(dialect, err))
-                    # Journal must not report a mid-stream failure as 200/success.
-                    self._stream_status = err.status
-                    writer.done()
+                    self._stream_failure(dialect, err)
                 else:
                     self._respond_error(err, dialect)
             except Exception as exc:  # never leak a bare traceback
@@ -383,10 +381,7 @@ def make_handler(runtime: Runtime):
                              request_id=self.request_id, path=self.path)
                 err = apierr.internal(str(exc) or exc.__class__.__name__)
                 if getattr(self, "_streaming", False):
-                    writer = self._writer
-                    writer.event("error", self._error_payload(dialect, err))
-                    self._stream_status = err.status
-                    writer.done()
+                    self._stream_failure(dialect, err)
                 else:
                     self._respond_error(err, dialect)
             finally:
@@ -404,6 +399,17 @@ def make_handler(runtime: Runtime):
                             journal.emit("client.trace_failed", "Не удалось сохранить подробную трассу клиента",
                                          "warn", request_id=self.request_id)
                     client_context.reset(context_token)
+
+        def _stream_failure(self, dialect, err):
+            """End a stream that failed after it started. Only Responses has a terminal failure event."""
+            payload = self._error_payload(dialect, err)
+            if dialect == "responses":
+                self._adapter.fail(err, payload)  # error, then response.failed (see ResponsesAdapter.fail)
+            else:
+                self._writer.event("error", payload)
+            # Journal must not report a mid-stream failure as 200/success.
+            self._stream_status = err.status
+            self._writer.done()
 
         def _log_error(self, err):
             journal.emit("http.error", err.message, "error" if err.status >= 500 else "warn",
@@ -598,21 +604,10 @@ def make_handler(runtime: Runtime):
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:
                 compatibility_headers['x-proxi-ignored-parameters'] = ','.join(parsed.declared_ignored)
-                # Claude Code sends temperature and metadata.user_id on every request and keeps its
-                # late tool announcements in the history, so none of that is a journal warning.
-                names, tool_changes = set(parsed.declared_ignored), set(parsed.inline_tool_changes)
-                # Hints that clients send on every request and that the relay safely
-                # replaces with its own behaviour; material controls still warn.
-                routine = {'temperature', 'top_p', 'top_k', 'seed', 'presence_penalty', 'frequency_penalty', 'metadata',
-                           'prompt_cache_key', 'prompt_cache_retention', 'prompt_cache_options', 'include',
-                           'client_metadata', 'verbosity', 'text.verbosity', 'output_config.task_budget'}
-                # A route that accepts and ignores effort (Haiku 4.5, GLM) gets the level clients send to every model.
-                routine |= {name for name in names if name.lower().endswith('effort') or name.endswith('.budget_tokens')
-                            or name == 'thinking.type'}
-                level = 'warn' if names - routine - tool_changes else 'info' if names & tool_changes else 'debug'
                 journal.emit('request.compatibility',
                              'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
-                             level, request_id=self.request_id, parameters=parsed.declared_ignored)
+                             generation.compatibility_level(parsed), request_id=self.request_id,
+                             parameters=parsed.declared_ignored)
             if parsed.system_messages_normalized:
                 compatibility_headers['x-proxi-system-messages'] = 'inline-as-user-text'
                 journal.emit('request.compatibility',
@@ -646,14 +641,16 @@ def make_handler(runtime: Runtime):
                 return
 
             writer = sse.StreamWriter(self)
+            # Built before the first byte: once the stream is open, any failure ends it through this adapter.
+            adapter = adapters.for_dialect(dialect, parsed, writer)
             self._writer = writer
+            self._adapter = adapter
             self._streaming = True
             writer.start({"x-request-id": self.request_id, "request-id": self.request_id,
                           **compatibility_headers})
             self._response_started = True
             self._model = parsed.model
             self._stream_status = 200
-            adapter = adapters.for_dialect(dialect, parsed, writer)
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)

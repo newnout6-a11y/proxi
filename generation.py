@@ -57,6 +57,30 @@ def _forces_tool(choice):
     return choice == 'required'
 
 
+# A name is routine, and logged at debug, only when all three hold: mass clients send it with every
+# request, it changes neither the reply nor its price, and the response headers already name it
+# (`x-proxi-ignored-parameters`, `x-proxi-thinking-display`). Everything else warns. Effort and thinking
+# controls of a route that ignores them and `verbosity` of a model without levels are marked routine where
+# they are collected; `seed`, `prompt_cache_retention`, `output_config.task_budget`, logprobs, logit_bias
+# and any other `include` value are not.
+ROUTINE_IGNORED = frozenset({
+    'temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty', 'metadata',
+    'thinking.display', 'prompt_cache_key', 'prompt_cache_options', 'client_metadata',
+    'verbosity', 'text.verbosity'})
+# What codex-rs sends as `include` (core/src/client.rs, "reasoning.encrypted_content"; its
+# "output.encrypted_content" is an off-by-default feature of the OpenAI provider) and what the AI SDK adds
+# for `store: false` on a reasoning model.
+DEFAULT_INCLUDE = frozenset({'reasoning.encrypted_content'})
+
+
+def compatibility_level(parsed):
+    """Journal level of `request.compatibility`: warn for anything material, info for inline tool changes."""
+    names, changes = set(parsed.declared_ignored), set(parsed.inline_tool_changes)
+    if names - set(parsed.routine_ignored) - changes:
+        return 'warn'
+    return 'info' if names & changes else 'debug'
+
+
 def structured_output(data, dialect):
     """The JSON contract of the reply, or None for plain text.
 
@@ -100,8 +124,8 @@ def structured_output(data, dialect):
 
 
 def controls(data, entry, dialect):
-    """Return validated verbosity and ignored names; never echo sensitive values."""
-    ignored = []
+    """Return validated verbosity, the ignored names and which of them are routine; never echo values."""
+    ignored, routine = [], set()
     thinking = data.get('thinking')
     if isinstance(thinking, dict) and thinking.get('display') == 'updates':
         # Retool exposes summaries, not Anthropic's negotiated update cadence.
@@ -189,6 +213,8 @@ def controls(data, entry, dialect):
             raise unprocessable("'include' must be an array of strings", param='include')
         if data['include']:
             ignored.append('include')
+            if set(data['include']) <= DEFAULT_INCLUDE:
+                routine.add('include')
     if data.get('conversation') is not None:
         # Chat/Messages already use this string as LOCAL affinity, with full
         # history supplied by the client. Responses means server-managed state.
@@ -200,7 +226,10 @@ def controls(data, entry, dialect):
         _reject('modalities')
     if entry.get('reasoning_effort_control') == 'accepted-ignored':
         # Retool takes these and changes nothing: accepted, never forwarded, named without values.
-        ignored.extend(name for name in models.ignored_effort_controls(data, entry) if name not in ignored)
+        # Clients send one level to every model, so this is never a warning.
+        names = [name for name in models.ignored_effort_controls(data, entry) if name not in ignored]
+        ignored.extend(names)
+        routine.update(names)
 
     numeric = (('temperature', 0, 2, False), ('top_p', 0, 1, False), ('top_k', 0, 2**31-1, True),
                ('seed', -(2**63), 2**63-1, True), ('presence_penalty', -2, 2, False),
@@ -223,4 +252,5 @@ def controls(data, entry, dialect):
         if not isinstance(data['metadata'], dict):
             raise unprocessable("'metadata' must be an object", param='metadata')
         ignored.append('metadata')
-    return (levels[0] if levels and not unsupported else None), ignored
+    routine.update(name for name in ignored if name in ROUTINE_IGNORED)
+    return (levels[0] if levels and not unsupported else None), ignored, [name for name in ignored if name in routine]

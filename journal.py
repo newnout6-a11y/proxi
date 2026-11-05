@@ -15,6 +15,7 @@ import collections
 import hashlib
 import json
 import math
+import operator
 import os
 import threading
 import time
@@ -42,6 +43,9 @@ _LABEL_CHARS = 80
 _FINE_MAX = RETENTION // FINE + 8
 _COARSE_MAX = RETENTION // COARSE + 8
 _ROUTES = ("chat", "responses", "anthropic")
+# metrics() copies the slots it sums this many at a time under the journal lock, so emit() waits for one
+# portion (well under a millisecond even for the heaviest slots), never for the whole window.
+_PORTION = 64
 
 
 def tag(value):
@@ -166,6 +170,11 @@ class _Fine:
         self.latency_sum = self.ttft_sum = self.credits = self.keepwarm = 0.0
 
 
+# A frozen copy of a _Fine slot (same attribute names) that metrics() can read outside the journal lock.
+_FineView = collections.namedtuple("_FineView", _Fine.__slots__)
+_fine_values = operator.attrgetter(*_Fine.__slots__)
+
+
 class _Coarse:
     """Distributions of one COARSE-second interval; only whole-window figures use them."""
     __slots__ = ("statuses", "models", "categories", "levels", "latency", "ttft")
@@ -173,6 +182,13 @@ class _Coarse:
     def __init__(self):
         self.statuses, self.models, self.categories, self.levels = {}, {}, {}, {}
         self.latency, self.ttft = array.array("d"), array.array("d")
+
+    def copy(self):
+        clone = _Coarse.__new__(_Coarse)
+        clone.statuses, clone.models = dict(self.statuses), dict(self.models)
+        clone.categories, clone.levels = dict(self.categories), dict(self.levels)
+        clone.latency, clone.ttft = self.latency[:], self.ttft[:]
+        return clone
 
 
 def _count(counter, key):
@@ -198,6 +214,86 @@ def _trim(slots, limit, cutoff):
         del slots[index]
     for index in sorted(slots)[:max(0, len(slots) - limit + 1)]:
         del slots[index]
+
+
+def _aggregate(fine, coarse, start, bucket, count, in_progress):
+    """The rows, totals and label counts of copied slots.
+
+    ``fine`` is (index, _FineView) pairs and ``coarse`` is _Coarse copies, both already limited to the window.
+    It takes no lock and reads no live state, so it may take as long as it likes without holding emit() back.
+    """
+    rows = [{"t": int(start + index * bucket), "requests": 0, "errors": 0, "latency": None, "ttft": None,
+             "credits": 0.0, "keepwarm_credits": 0.0, "cache_read": 0, "cache_write": 0, "input": 0,
+             "output": 0, "turns": 0, "tools": 0, "commands": 0, "credits_unknown": 0}
+            for index in range(count)]
+    latency = [[0.0, 0] for _ in range(count)]
+    ttft = [[0.0, 0] for _ in range(count)]
+    pings = pings_unknown = 0
+    statuses, models, categories, levels = {}, {}, {}, {}
+    for index, slot in fine:
+        at = min(count - 1, int((index * FINE - start) // bucket))
+        row = rows[at]
+        row["requests"] += slot.requests
+        row["errors"] += slot.errors
+        row["cache_read"] += slot.cache_read
+        row["cache_write"] += slot.cache_write
+        row["input"] += slot.input
+        row["output"] += slot.output
+        row["turns"] += slot.turns
+        row["tools"] += slot.tools
+        row["commands"] += slot.commands
+        row["credits"] += slot.credits
+        row["keepwarm_credits"] += slot.keepwarm
+        row["credits_unknown"] += slot.unknown
+        pings += slot.keepwarm_pings
+        pings_unknown += slot.keepwarm_unknown
+        pair = latency[at]
+        pair[0] += slot.latency_sum
+        pair[1] += slot.latency_n
+        pair = ttft[at]
+        pair[0] += slot.ttft_sum
+        pair[1] += slot.ttft_n
+    for slot in coarse:
+        for source, target in ((slot.statuses, statuses), (slot.models, models),
+                               (slot.categories, categories), (slot.levels, levels)):
+            for key, number in source.items():
+                target[key] = target.get(key, 0) + number
+    latency_all, ttft_all = _thinned(coarse, "latency"), _thinned(coarse, "ttft")
+    # Totals come from the unrounded rows: summing per-bucket roundings drifts by up to 5e-5 per bucket.
+    credits_sum = sum(row["credits"] for row in rows)
+    keepwarm_sum = sum(row["keepwarm_credits"] for row in rows)
+    for row, (latency_sum, latency_n), (ttft_sum, ttft_n) in zip(rows, latency, ttft):
+        row["latency"] = round(latency_sum / latency_n) if latency_n else None
+        row["ttft"] = round(ttft_sum / ttft_n) if ttft_n else None
+        row["credits"] = round(row["credits"], 4)
+        row["keepwarm_credits"] = round(row["keepwarm_credits"], 4)
+        row["credits_unknown"] = max(0, row["credits_unknown"])
+        row["credits_complete"] = row["credits_unknown"] == 0
+
+    def total(field):
+        return sum(row[field] for row in rows)
+
+    def percentile(ordered, share):
+        return round(ordered[min(len(ordered) - 1, int(share * len(ordered)))]) if ordered else None
+
+    latency_all.sort()
+    ttft_all.sort()
+    cached = total("cache_read")
+    prompt = cached + total("input") + total("cache_write")
+    unknown = total("credits_unknown")
+    totals = {"requests": total("requests"), "errors": total("errors"), "turns": total("turns"),
+              "tools": total("tools"), "commands": total("commands"),
+              "credits": round(credits_sum, 4), "cache_read": cached,
+              "keepwarm_credits": round(keepwarm_sum, 4),
+              "keepwarm_pings": pings, "keepwarm_unknown": pings_unknown,
+              "credits_complete": unknown == 0, "credits_unknown": unknown,
+              "credits_in_progress": in_progress,
+              "cache_write": total("cache_write"), "input_tokens": total("input"),
+              "output_tokens": total("output"),
+              "cache_hit_ratio": round(cached / prompt, 4) if prompt else None,
+              "latency_p50": percentile(latency_all, 0.5), "latency_p95": percentile(latency_all, 0.95),
+              "ttft_p50": percentile(ttft_all, 0.5), "ttft_p95": percentile(ttft_all, 0.95)}
+    return rows, totals, statuses, models, categories, levels
 
 
 class _Rollup:
@@ -672,56 +768,18 @@ class Journal:
         valid prices of upstream attempts plus the cache refresh pings; an attempt that produced
         usage without a valid price counts as ``credits_unknown`` (``credits_complete`` is then
         false) and one that is still running is only listed in ``credits_in_progress``.
-        ``coverage`` reports how much of the window the aggregates can vouch for.
+        ``coverage`` reports how much of the window the aggregates can vouch for. The journal lock
+        is held only to copy slots, a portion at a time; the sums run without it, so a metrics call
+        never keeps emit() waiting for the calculation.
         """
         now = self._now()
         bucket = max(1, bucket)
         count = max(1, int(window // bucket))
         start = math.floor((now - window) / COARSE) * COARSE
         begin = max(start, math.floor((now - RETENTION) / COARSE) * COARSE)
-        rows = [{"t": int(start + index * bucket), "requests": 0, "errors": 0, "latency": None, "ttft": None,
-                 "credits": 0.0, "keepwarm_credits": 0.0, "cache_read": 0, "cache_write": 0, "input": 0,
-                 "output": 0, "turns": 0, "tools": 0, "commands": 0, "credits_unknown": 0}
-                for index in range(count)]
-        latency = [[0.0, 0] for _ in range(count)]
-        ttft = [[0.0, 0] for _ in range(count)]
-        pings = pings_unknown = 0
-        statuses, models, categories, levels = {}, {}, {}, {}
         with self._cond:
             rollup = self._rollup
-            for index, slot in rollup.fine.items():
-                moment = index * FINE
-                if moment < begin:
-                    continue
-                at = min(count - 1, int((moment - start) // bucket))
-                row = rows[at]
-                row["requests"] += slot.requests
-                row["errors"] += slot.errors
-                row["cache_read"] += slot.cache_read
-                row["cache_write"] += slot.cache_write
-                row["input"] += slot.input
-                row["output"] += slot.output
-                row["turns"] += slot.turns
-                row["tools"] += slot.tools
-                row["commands"] += slot.commands
-                row["credits"] += slot.credits
-                row["keepwarm_credits"] += slot.keepwarm
-                row["credits_unknown"] += slot.unknown
-                pings += slot.keepwarm_pings
-                pings_unknown += slot.keepwarm_unknown
-                pair = latency[at]
-                pair[0] += slot.latency_sum
-                pair[1] += slot.latency_n
-                pair = ttft[at]
-                pair[0] += slot.ttft_sum
-                pair[1] += slot.ttft_n
-            inside = [slot for index, slot in rollup.coarse.items() if index * COARSE >= begin]
-            for slot in inside:
-                for source, target in ((slot.statuses, statuses), (slot.models, models),
-                                       (slot.categories, categories), (slot.levels, levels)):
-                    for key, number in source.items():
-                        target[key] = target.get(key, 0) + number
-            latency_all, ttft_all = _thinned(inside, "latency"), _thinned(inside, "ttft")
+            fine_slots, coarse_slots = list(rollup.fine.items()), list(rollup.coarse.items())
             in_progress = sum(1 for turn in rollup.turns.values()
                               if turn.pending and turn.touched >= now - LIVE_TURN_TTL)
             covered_from = max(rollup.covered_from, now - RETENTION)
@@ -729,42 +787,15 @@ class Journal:
             buffered = len(self._events)
             buffer_oldest = self._events[0].get("ts") if buffered else None
             last_seq = self._seq
-        # Totals come from the unrounded rows: summing per-bucket roundings drifts by up to 5e-5 per bucket.
-        credits_sum = sum(row["credits"] for row in rows)
-        keepwarm_sum = sum(row["keepwarm_credits"] for row in rows)
-        for row, (latency_sum, latency_n), (ttft_sum, ttft_n) in zip(rows, latency, ttft):
-            row["latency"] = round(latency_sum / latency_n) if latency_n else None
-            row["ttft"] = round(ttft_sum / ttft_n) if ttft_n else None
-            row["credits"] = round(row["credits"], 4)
-            row["keepwarm_credits"] = round(row["keepwarm_credits"], 4)
-            row["credits_unknown"] = max(0, row["credits_unknown"])
-            row["credits_complete"] = row["credits_unknown"] == 0
-
-        def total(field):
-            return sum(row[field] for row in rows)
-
-        def percentile(ordered, share):
-            return round(ordered[min(len(ordered) - 1, int(share * len(ordered)))]) if ordered else None
-
-        latency_all.sort()
-        ttft_all.sort()
-        cached = total("cache_read")
-        prompt = cached + total("input") + total("cache_write")
-        unknown = total("credits_unknown")
+        # The slots are copied under the lock a portion at a time and summed without it.
+        fine = self._copy_slots([item for item in fine_slots if item[0] * FINE >= begin],
+                                lambda items: [(index, _FineView._make(_fine_values(slot))) for index, slot in items])
+        coarse = self._copy_slots([item for item in coarse_slots if item[0] * COARSE >= begin],
+                                  lambda items: [slot.copy() for _, slot in items])
+        rows, totals, statuses, models, categories, levels = _aggregate(fine, coarse, start, bucket, count,
+                                                                        in_progress)
         return {
-            "window_seconds": window, "bucket_seconds": bucket, "buckets": rows,
-            "totals": {"requests": total("requests"), "errors": total("errors"), "turns": total("turns"),
-                       "tools": total("tools"), "commands": total("commands"),
-                       "credits": round(credits_sum, 4), "cache_read": cached,
-                       "keepwarm_credits": round(keepwarm_sum, 4),
-                       "keepwarm_pings": pings, "keepwarm_unknown": pings_unknown,
-                       "credits_complete": unknown == 0, "credits_unknown": unknown,
-                       "credits_in_progress": in_progress,
-                       "cache_write": total("cache_write"), "input_tokens": total("input"),
-                       "output_tokens": total("output"),
-                       "cache_hit_ratio": round(cached / prompt, 4) if prompt else None,
-                       "latency_p50": percentile(latency_all, 0.5), "latency_p95": percentile(latency_all, 0.95),
-                       "ttft_p50": percentile(ttft_all, 0.5), "ttft_p95": percentile(ttft_all, 0.95)},
+            "window_seconds": window, "bucket_seconds": bucket, "buckets": rows, "totals": totals,
             "statuses": statuses, "models": dict(sorted(models.items(), key=lambda item: -item[1])[:12]),
             "categories": categories, "levels": levels,
             "coverage": {"complete": covered_from <= now - window, "window_start": int(start),
@@ -774,6 +805,14 @@ class Journal:
                          "buffer_events": buffered, "buffer_capacity": self._events.maxlen},
             "last_seq": last_seq, "buffered": buffered, "since": self.started,
         }
+
+    def _copy_slots(self, items, copy):
+        """Copy ``items`` under the lock one portion at a time: emit() waits for one portion at most."""
+        copies = []
+        for first in range(0, len(items), _PORTION):
+            with self._cond:
+                copies += copy(items[first:first + _PORTION])
+        return copies
 
 
 JOURNAL = Journal()

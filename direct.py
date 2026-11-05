@@ -23,7 +23,6 @@ import journal
 import client_context
 import console_log
 import native_history
-import models as model_catalog
 from accounts import account_tag, idle_block
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics

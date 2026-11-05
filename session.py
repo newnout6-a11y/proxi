@@ -446,12 +446,21 @@ class RelaySession:
             return
         completed = False
         self._output_started = False
+        priced = False
         turn = self._stream_turn(prompt, model_provider, tool_names)
         try:
             async for event in turn:
-                if event.get("type") in ("text", "thinking", "tool_call"):
+                kind = event.get("type")
+                if kind in ("text", "thinking", "tool_call"):
                     self._output_started = True
-                if event.get("type") == "end" and event.get("reason") in ("stop", "tool_calls"):
+                elif kind == "credits":
+                    priced = True
+                elif kind == "end" and self._output_started and not priced and self.cfg.get("transport") != "direct":
+                    # Content without a price: the attempt may have been billed. The direct transport says so
+                    # with an empty usage marker; without it the journal sees a free attempt while the client's
+                    # adapter, which counts any content as observed, reports the price as unknown.
+                    yield {"type": "usage", "usage": {}}
+                if kind == "end" and event.get("reason") in ("stop", "tool_calls"):
                     completed = True
                 yield event
         finally:
