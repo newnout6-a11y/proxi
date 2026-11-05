@@ -152,6 +152,13 @@ function nextReset() {
 }
 export const RESET_DATE = nextReset();
 
+// What aggregate_balance reports: the sums over the accounts whose balance is known, and how many were left out.
+export const COMPLETE_BALANCE = { available: 1495.09, monthly_allocation: 6000, used_month: 4504.91, reset_date: RESET_DATE, stale: false,
+  accounts_total: 2, unknown_accounts: 0, partial: false };
+// A pool whose second balance is unknown: the sums are those of the first account alone.
+export const PARTIAL_BALANCE = { ...COMPLETE_BALANCE, available: 1479.89, monthly_allocation: 3000, used_month: 1520.11,
+  unknown_accounts: 1, partial: true };
+
 const pseudo = (i) => Math.abs((Math.sin((i + 1) * 12.9898) * 43758.5453) % 1);
 
 /**
@@ -248,7 +255,8 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     pool: accounts.map((a, i) => ({ ...poolAccount(a.account, i ? 'запасной' : 'основной', i), ...a })) };
   const overview = {
     health: { ok: true, upstream: 'ok', error: null }, uptime_seconds: 5432,
-    balance: { available: 1495.09, monthly_allocation: 6000, used_month: 4504.91, reset_date: RESET_DATE, stale: false },
+    // The rich overview is the densest one: it carries the partial balance, the longest mark the summary can show.
+    balance: rich ? PARTIAL_BALANCE : COMPLETE_BALANCE,
     accounts, accounts_summary: { total: 2, routable: 1, reserve: 1, states: { active: 1, exhausted: 1 } },
     limits: { min_account_balance: 20, account_balance_interval: 60, upstream_empty_retries: 2, max_workers: 4, max_conversations: 64 },
     usage: { session_used: 2.75, turns: 2 },

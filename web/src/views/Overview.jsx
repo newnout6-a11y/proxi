@@ -30,10 +30,34 @@ function Segmented({ value, onChange, label }) {
   );
 }
 
+/**
+ * The pool balance sums only the accounts whose balance is known, and the overview says how many were left out
+ * (`partial`, `unknown_accounts`, `accounts_total`; the startup banner says the same): a lower total must not pass for
+ * the whole pool. `unknown` tells missing balances from a missing monthly limit, which leaves the total whole.
+ */
+function partialNote(balance, summary) {
+  if (balance?.partial !== true) return null;
+  const left = isNum(balance.unknown_accounts) ? balance.unknown_accounts : 0;
+  const total = isNum(balance.accounts_total) ? balance.accounts_total : summary?.total;
+  if (left > 0) {
+    return {
+      unknown: true,
+      text: isNum(total) ? `частично: ${fmtInt(left)} из ${fmtInt(total)} неизвестны` : 'частично: баланс известен не у всех',
+      title: 'Баланс известен не у всех аккаунтов: сумма, лимит месяца и прогноз считаются только по аккаунтам с известным балансом',
+    };
+  }
+  return {
+    unknown: false,
+    text: 'частично: лимит месяца известен не у всех',
+    title: 'У части аккаунтов неизвестен лимит месяца: «из …» и доля израсходованного неполны',
+  };
+}
+
 /** The pool balance as an instrument: figure, month scale with a today marker, and a burn-rate forecast. */
 function Balance({ overview, metrics, windowSec, go }) {
   const balance = overview?.balance;
   const summary = overview?.accounts_summary;
+  const partial = partialNote(balance, summary);
   const available = balance?.available;
   const allocation = balance?.monthly_allocation;
   const used = isNum(balance?.used_month) ? balance.used_month
@@ -56,7 +80,7 @@ function Balance({ overview, metrics, windowSec, go }) {
   else {
     forecast = (
       <>
-        При темпе за {basis} (<b className="num">{fmtFixed(perDay, 2)}</b> в сутки) хватит примерно на <b className="num">{fmtDuration(lasts)}</b>
+        При темпе за {basis} (<b className="num">{fmtFixed(perDay, 2)}</b> в сутки){partial?.unknown ? ' по известным балансам' : ''} хватит примерно на <b className="num">{fmtDuration(lasts)}</b>
         {daysLeft !== null && lasts > daysLeft ? ', дольше чем до сброса' : ''}
       </>
     );
@@ -74,6 +98,7 @@ function Balance({ overview, metrics, windowSec, go }) {
       <p className="figure-xl">
         <AnimatedNumber value={available} format={(v) => fmtFixed(v, 2)} />
         {isNum(allocation) && <span className="figure-unit">из {fmtInt(allocation)}</span>}
+        {partial && <Tag tone="warn" title={partial.title}>{partial.text}</Tag>}
       </p>
       <div className="scale" role="img"
         aria-label={`Израсходовано ${fmtPercent(usedShare)} лимита месяца, прошло ${fmtPercent(elapsed)} периода`}>

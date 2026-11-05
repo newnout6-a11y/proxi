@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { API_KEY, DEFAULT_ROLES, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
-import { NOW, metricsFor } from './fixtures.js';
+import { NOW, PARTIAL_BALANCE, RESET_DATE, metricsFor } from './fixtures.js';
 
 // Replaces the journal page the admin loads at start; the live stream stays empty.
 const serveEvents = (page, data) => page.route(/\/admin\/api\/events\?/, (route) => route.fulfill({
@@ -784,6 +784,55 @@ test('incomplete usage is not shown as free inference or a reliable forecast', a
   await expect(page.locator('.stat').first()).toContainText('—');
   await expect(page.getByText('есть неучтённый расход')).toBeVisible();
 });
+
+test('a balance known for only some of the accounts says how many are missing, and so does its forecast', async ({ page }) => {
+  await mockAdmin(page, { overviewPatch: { balance: PARTIAL_BALANCE } });
+  await login(page);
+  await expect(page.locator('.figure-xl')).toContainText('1 479,89');
+  await expect(page.locator('.figure-xl .tag')).toHaveText('частично: 1 из 2 неизвестны');
+  await expect(page.locator('.figure-xl .tag')).toHaveAttribute('title', /только по аккаунтам с известным балансом/);
+  await expect(page.locator('.forecast')).toContainText('по известным балансам хватит примерно на');
+});
+
+test('a balance with a known total but a missing monthly limit says so, and its forecast needs no qualifier', async ({ page }) => {
+  await mockAdmin(page, { overviewPatch: { balance: { ...PARTIAL_BALANCE, unknown_accounts: 0 } } });
+  await login(page);
+  await expect(page.locator('.figure-xl .tag')).toHaveText('частично: лимит месяца известен не у всех');
+  await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+  await expect(page.locator('.forecast')).not.toContainText('по известным балансам');
+});
+
+for (const [name, patch] of [
+  ['every balance is known', {}],
+  ['the relay does not report the pool\'s coverage', { balance: { available: 1495.09, monthly_allocation: 6000, used_month: 4504.91, reset_date: RESET_DATE } }],
+]) {
+  test(`a balance that covers the whole pool carries no partial mark: ${name}`, async ({ page }) => {
+    await mockAdmin(page, { overviewPatch: patch });
+    await login(page);
+    await expect(page.locator('.figure-xl')).toContainText('495,09');
+    await expect(page.locator('.figure-xl .tag')).toHaveCount(0);
+    await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+    await expect(page.locator('.forecast')).not.toContainText('по известным балансам');
+  });
+}
+
+for (const width of [280, 320]) {
+  test(`the partial mark stays inside the balance panel at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 850 });
+    await mockAdmin(page, { overviewPatch: { balance: { ...PARTIAL_BALANCE, accounts_total: 12, unknown_accounts: 10 } } });
+    await login(page);
+    const mark = page.locator('.figure-xl .tag');
+    await expect(mark).toHaveText('частично: 10 из 12 неизвестны');
+    const inside = await page.evaluate(() => {
+      const tag = document.querySelector('.figure-xl .tag').getBoundingClientRect();
+      const panel = document.querySelector('.instrument').getBoundingClientRect();
+      return { left: tag.left - panel.left, right: panel.right - tag.right, wide: document.documentElement.scrollWidth - innerWidth };
+    });
+    expect(inside.left).toBeGreaterThanOrEqual(0);
+    expect(inside.right).toBeGreaterThanOrEqual(0);
+    expect(inside.wide).toBeLessThanOrEqual(1);
+  });
+}
 
 test('periods without a complete price are marked on the spend chart and summed as a lower bound', async ({ page }) => {
   // Period 21 holds a known part of its price, period 31 none at all; the relay counts the unpriced requests in both
