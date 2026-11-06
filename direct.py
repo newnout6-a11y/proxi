@@ -11,6 +11,7 @@ import decimal
 import hashlib
 import http.client
 import json
+import math
 import pathlib
 import re
 import socket
@@ -855,6 +856,26 @@ def _error_from_event(event):
     return apierr.upstream_error(text)
 
 
+def _without_inf(value):
+    if isinstance(value, dict):
+        return {key: _without_inf(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_without_inf(item) for item in value]
+    return None if isinstance(value, float) and not math.isfinite(value) else value
+
+
+def _wire_json(body):
+    """The request body as the ASCII JSON that goes upstream.
+
+    A number past the range of a double (1e400) that the client's own history holds is inf here, and Python writes it as
+    Infinity, which is no JSON: the endpoint refused the whole request (ultracode audit of the relay, G3.2). It goes as
+    null, which is what a JavaScript client writes for it as well."""
+    try:
+        return json.dumps(body, ensure_ascii=True, allow_nan=False).encode("utf-8")
+    except ValueError:
+        return json.dumps(_without_inf(body), ensure_ascii=True).encode("utf-8")
+
+
 def _ping(session, body):
     """Cheap request that re-reads the cached prefix so its TTL does not lapse.
 
@@ -867,7 +888,7 @@ def _ping(session, body):
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
-                                     data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
+                                     data=_wire_json(payload),
                                      headers=headers, method="POST")
     response = urllib.request.urlopen(request, timeout=120)
     abort = lambda: _force_close_response(response)
@@ -1595,7 +1616,7 @@ def _dump_empty_once(payload, flags, cfg, session, model=None):
 
 async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     if payload is None:
-        payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
+        payload = _wire_json(body)
     elif json.loads(payload) != body:
         raise ValueError("replay payload does not match the supplied body")
     session._direct_reply = None

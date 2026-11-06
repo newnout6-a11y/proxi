@@ -8,6 +8,7 @@ import uuid
 import apierr
 import structured
 from credits import token_counter as _token_counter
+from native_history import loads_finite
 
 
 def approx_tokens(text: str) -> int:
@@ -617,7 +618,7 @@ class AnthropicAdapter(_Base):
                                                                  "name": call["name"], "input": {}}})
         block_index = self._tool_indices[call["id"]]
         try:
-            self._blocks[block_index]["input"] = json.loads(call["arguments"] or "{}")
+            self._blocks[block_index]["input"] = loads_finite(call["arguments"] or "{}")
         except ValueError:
             pass  # streamed JSON fragments are finalized by a subsequent delta
         if delta and block_index in self._open_indices:

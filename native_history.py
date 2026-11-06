@@ -2,6 +2,7 @@
 import copy
 from dataclasses import dataclass
 import json
+import math
 
 INSTRUCTION_ROLES = ("system", "developer")
 INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
@@ -231,6 +232,25 @@ def unsigned_tool_transcript(client):
     return copy.deepcopy(client) if has_results and not pending else None
 
 
+def _finite_float(text):
+    value = float(text)
+    return value if math.isfinite(value) else None
+
+
+def _no_constant(name):
+    return None
+
+
+def loads_finite(text):
+    """json.loads for the arguments of a tool call, with a number past the range of a double (1e400) read as null.
+
+    Python reads 1e400 as inf and writes it back as Infinity, which is no JSON: the next request upstream carried it
+    and was refused, and so was the Messages reply that held it (ultracode audit of the relay, G3.2). A JavaScript
+    client reads it as Infinity and writes null when it echoes the call, so null is also what its echo is compared
+    with. NaN and Infinity written out as words are read as null as well."""
+    return json.loads(text, parse_float=_finite_float, parse_constant=_no_constant)
+
+
 class ReplyCapture:
     """Keep raw NDJSON block order and opaque signatures before argument coercion."""
     def __init__(self):
@@ -306,7 +326,7 @@ class ReplyCapture:
                 # A call without arguments arrives as one empty partialInputs: the stream gives the client {} for it
                 # (coerce_arguments), so the kept reply must say {} too, or its next turn can never continue it.
                 if raw:
-                    call["toolInput"] = json.loads(raw)
+                    call["toolInput"] = loads_finite(raw)
                 if not isinstance(call["toolInput"], dict):
                     return None
             if any(b["type"] == "thinking" and not b["signature"] for b in self.blocks):
