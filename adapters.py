@@ -356,6 +356,14 @@ class ResponsesAdapter(_Base):
         self._custom_inputs = {}
         # Whether the reply being closed was cut (CUT_REASONS): a custom call the output stopped inside has no input.
         self._cut = False
+        # Items are closed as soon as nothing can change them, not all at the end (see _flush_ready). `_closed` maps the
+        # output index of every item whose done events are out to its status; `_frozen` is the text a closed message or
+        # reasoning item ended with; text and thinking that arrive after their item was closed begin a new item, which
+        # starts at `_bases` in the text (or the thinking) of the whole reply.
+        self._closed = {}
+        self._frozen = {}
+        self._bases = {}
+        self._text_end = self._thinking_end = 0
         self._tool_definitions = {
             tool.get("function", {}).get("name"): tool.get("function", {})
             for tool in getattr(parsed, "tools", [])
@@ -466,15 +474,22 @@ class ResponsesAdapter(_Base):
                     for index in range(count)]
         return ["completed"] * count
 
+    def _text_of(self, item_id, kind):
+        """The text of a message item (or the summary of a reasoning item): what it was closed with, else what it has so far."""
+        if item_id in self._frozen:
+            return self._frozen[item_id]
+        return (self.text if kind == "message" else self.thinking)[self._bases.get(item_id, 0):]
+
     def _item(self, index, *, started=False, status="completed"):
         kind, item_id, call = self._items[index]
         status = "in_progress" if started else status
         if kind == "reasoning":
             return {"id": item_id, "type": kind, "status": status,
-                    "summary": [] if started else [{"type": "summary_text", "text": self.thinking}]}
+                    "summary": [] if started else [{"type": "summary_text", "text": self._text_of(item_id, kind)}]}
         if kind == "message":
             return {"id": item_id, "type": kind, "role": "assistant", "status": status,
-                    "content": [] if started else [{"type": "output_text", "text": self.text, "annotations": []}]}
+                    "content": [] if started else [{"type": "output_text", "text": self._text_of(item_id, kind),
+                                                    "annotations": []}]}
         item = {"id": item_id, "type": kind, "call_id": call["id"], "name": call["name"], "status": status}
         definition = self._tool_definitions.get(call["name"], {})
         if definition.get("x-namespace"):
@@ -493,11 +508,18 @@ class ResponsesAdapter(_Base):
         return item
 
     def _text(self, delta):
+        if self._indices.get(self.item_id) in self._closed:
+            # A call that finished after this item closed it: the text that follows is a message of its own.
+            self.item_id = "msg_" + uuid.uuid4().hex[:20]
+            self._bases[self.item_id] = self._text_end
         index = self._ensure_item("message", self.item_id)
         self._emit("response.output_text.delta", {"item_id": self.item_id, "output_index": index,
                                                   "content_index": 0, "delta": delta})
 
     def _think(self, delta):
+        if self._indices.get(self.reasoning_id) in self._closed:
+            self.reasoning_id = "rs_" + uuid.uuid4().hex[:20]
+            self._bases[self.reasoning_id] = self._thinking_end
         index = self._ensure_item("reasoning", self.reasoning_id)
         self._emit("response.reasoning_summary_text.delta", {"item_id": self.reasoning_id,
                                                              "output_index": index,
@@ -518,6 +540,8 @@ class ResponsesAdapter(_Base):
         custom = call.get("tool_type") == "custom"
         kind = "custom_tool_call" if custom else "function_call"
         output_index = self._ensure_item(kind, call["id"], call)
+        if output_index in self._closed:
+            return  # its done events are out: nothing can be added to the item
         if custom:
             current = self._custom_streamable(call["arguments"])
             previous = self._custom_inputs.get(call["id"], "")
@@ -529,40 +553,72 @@ class ResponsesAdapter(_Base):
             self._emit("response.custom_tool_call_input.delta" if custom else "response.function_call_arguments.delta", {
                 "item_id": call["id"], "output_index": output_index, "delta": delta,
             })
+        if call.get("done"):
+            self._flush_ready()
+
+    def _flush_ready(self):
+        """Close the items that nothing can change any more, in output order, up to the last call upstream has ended.
+
+        codex-rs starts a tool the moment the done event of its item arrives and files the item into its history in the
+        order the done events arrive. Held to the end of the reply, the first call of a batch waited for all the others to
+        be written: 0.45 to 2.8 s for five to eight short calls, 11 to 21 s when each wrote a script (a4 F13, Opus
+        5 script-writing calls: the first one's done event came 20.9 s after the call was whole). Messages and reasoning
+        before the call are closed first, so that the history keeps the order of the output; a call that is not ended
+        holds back every call after it, because closing the later one would close it too, with half its arguments."""
+        last = -1
+        for index, (kind, _, call) in enumerate(self._items):
+            if index in self._closed or kind not in ("function_call", "custom_tool_call"):
+                continue
+            if not call.get("done"):
+                break
+            last = index
+        if last >= 0:
+            self._finish_through(last)
+
+    def _finish_through(self, last, statuses=None):
+        for index in range(last + 1):
+            if index not in self._closed:
+                self._finish_item(index, statuses[index] if statuses else "completed")
+
+    def _finish_item(self, index, status):
+        kind, item_id, call = self._items[index]
+        fields = {"item_id": item_id, "output_index": index}
+        if kind == "message":
+            text = self._frozen[item_id] = self._text_of(item_id, kind)
+            self._text_end = len(self.text)
+            fields["content_index"] = 0
+            self._emit("response.output_text.done", {**fields, "text": text})
+            self._emit("response.content_part.done", {
+                **fields, "part": {"type": "output_text", "text": text, "annotations": []},
+            })
+        elif kind == "reasoning":
+            text = self._frozen[item_id] = self._text_of(item_id, kind)
+            self._thinking_end = len(self.thinking)
+            fields["summary_index"] = 0
+            self._emit("response.reasoning_summary_text.done", {**fields, "text": text})
+            self._emit("response.reasoning_summary_part.done", {
+                **fields, "part": {"type": "summary_text", "text": text},
+            })
+        elif kind == "custom_tool_call":
+            final = self._item(index, status=status)["input"]
+            sent = self._custom_inputs.get(call["id"], "")
+            if len(final) > len(sent) and final.startswith(sent):
+                # What was held back while the envelope could still change: the deltas add up to the input.
+                self._emit("response.custom_tool_call_input.delta", {**fields, "delta": final[len(sent):]})
+                self._custom_inputs[call["id"]] = final
+            self._emit("response.custom_tool_call_input.done", {**fields, "input": final})
+        elif self._whole(index) or not self._cut:
+            self._emit("response.function_call_arguments.done", {**fields, "arguments": call["arguments"]})
+        self._emit("response.output_item.done", {
+            "output_index": index, "item": self._item(index, status=status),
+        })
+        self._closed[index] = status
 
     def end(self, reason, prompt_text=None):
         if not self._items:
             self._ensure_item("message", self.item_id)
         cut = self._cut = reason in CUT_REASONS
-        statuses = self._statuses(reason)
-        for index, (kind, item_id, call) in enumerate(self._items):
-            status = statuses[index]
-            fields = {"item_id": item_id, "output_index": index}
-            if kind == "message":
-                fields["content_index"] = 0
-                self._emit("response.output_text.done", {**fields, "text": self.text})
-                self._emit("response.content_part.done", {
-                    **fields, "part": {"type": "output_text", "text": self.text, "annotations": []},
-                })
-            elif kind == "reasoning":
-                fields["summary_index"] = 0
-                self._emit("response.reasoning_summary_text.done", {**fields, "text": self.thinking})
-                self._emit("response.reasoning_summary_part.done", {
-                    **fields, "part": {"type": "summary_text", "text": self.thinking},
-                })
-            elif kind == "custom_tool_call":
-                final = self._item(index, status=status)["input"]
-                sent = self._custom_inputs.get(call["id"], "")
-                if len(final) > len(sent) and final.startswith(sent):
-                    # What was held back while the envelope could still change: the deltas add up to the input.
-                    self._emit("response.custom_tool_call_input.delta", {**fields, "delta": final[len(sent):]})
-                    self._custom_inputs[call["id"]] = final
-                self._emit("response.custom_tool_call_input.done", {**fields, "input": final})
-            elif status == "completed" or not cut:
-                self._emit("response.function_call_arguments.done", {**fields, "arguments": call["arguments"]})
-            self._emit("response.output_item.done", {
-                "output_index": index, "item": self._item(index, status=status),
-            })
+        self._finish_through(len(self._items) - 1, self._statuses(reason))
         final = self.payload(reason, prompt_text)
         self._emit("response.incomplete" if cut else "response.completed", {"response": final})
         if self.writer:
@@ -582,7 +638,8 @@ class ResponsesAdapter(_Base):
                 # What Responses clients read as the reason of an incomplete reply (Codex stops at once, without a
                 # retry, and prints it): the output stopped at its limit. A timeout names none.
                 **({"incomplete_details": {"reason": "max_output_tokens"}} if reason == "length" else {}),
-                "output": [self._item(index, status=statuses[index]) for index in range(len(self._items))],
+                "output": [self._item(index, status=self._closed.get(index, statuses[index]))
+                           for index in range(len(self._items))],
                 "output_text": self.text,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "total_tokens": prompt + completion,
