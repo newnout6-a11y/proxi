@@ -623,7 +623,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
   .prompt-footer { flex-direction: column; gap: var(--space-2); }
   .settings-group, .connect, .model-table { scroll-margin-top: var(--space-16); }
   /* All five sections always visible: equal columns, icon above a short label. */
-  nav { order: 2; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; gap: 2px; }
+  nav { order: 2; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; gap: 2px; }
   .nav-group { display: contents; }
   .nav-label, .nav-item .keycap, .nav-item .nav-count { display: none; }
   .nav-item { width: auto; height: 44px; flex-direction: column; justify-content: center; gap: 2px; padding: 0 2px; font-size: var(--text-xs); text-align: center; }
@@ -664,7 +664,10 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
   .tabs button { flex: 1; justify-content: center; }
 }
 @media (max-width: 360px) {
-  .nav-item { font-size: 10px; }
+  .nav-item { font-size: 10px; padding: 0; }
+}
+@media (max-width: 310px) {
+  .nav-item { font-size: 9px; }
 }
 @media (max-width: 560px) {
   .page-head { align-items: flex-start; }

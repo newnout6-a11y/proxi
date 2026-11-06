@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Activity as ActivityIcon, Gauge, LogOut, Moon, Settings, Sun, Users } from 'lucide-react';
+import { Activity as ActivityIcon, Gauge, LogOut, Moon, ScrollText, Settings, Sun, Users } from 'lucide-react';
 import { api, clearKey, loadKey, saveKey } from './api.js';
 import { ToastProvider, useToast, Kbd } from './ui.jsx';
 import { Dot, ease } from './motion.jsx';
@@ -11,12 +11,14 @@ import Overview from './views/Overview.jsx';
 import Accounts from './views/Accounts.jsx';
 import Activity from './views/Activity.jsx';
 import SettingsView from './views/Settings.jsx';
+import PromptsView from './views/Prompts.jsx';
 
 const NAV = [
   { id: 'overview', label: 'Сводка', icon: Gauge, group: 'Наблюдение' },
   { id: 'activity', label: 'Активность', icon: ActivityIcon, group: 'Наблюдение' },
   { id: 'accounts', label: 'Аккаунты', icon: Users, group: 'Управление' },
   { id: 'settings', label: 'Настройки', icon: Settings, group: 'Управление' },
+  { id: 'prompts', label: 'Промпты', icon: ScrollText, group: 'Управление' },
 ];
 const GROUPS = ['Наблюдение', 'Управление'];
 
@@ -137,6 +139,7 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
         {view === 'activity' && <Activity key="activity" {...props} />}
         {view === 'accounts' && <Accounts key="accounts" {...props} />}
         {view === 'settings' && <SettingsView key="settings" {...props} unsaved={unsaved} />}
+        {view === 'prompts' && <PromptsView key="prompts" {...props} unsaved={unsaved} />}
       </main>
     </div>
   );

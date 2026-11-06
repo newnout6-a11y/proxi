@@ -141,6 +141,9 @@ function SystemInstructions({ settings, saved, roles, field, bytes, limit, onCha
           </span>
         )}
       </div>
+      <div className="prompt-footer" id="system-instructions-live">
+        <p>Роль и режим применяются сразу, в том числе к начатым диалогам: кэш промпта активных диалогов будет записан заново. Профили из раздела «Промпты» закрепляются за диалогом и этого не делают</p>
+      </div>
       {standard && others.map((item) => (
         <Fragment key={item.id}>
           <label className="prompt-label" htmlFor={`system-default-${item.id}`}>{item.title}</label>
