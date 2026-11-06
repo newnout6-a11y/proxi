@@ -30,6 +30,8 @@
   "max_workers": 32,
   "max_conversations": 128,
   "conversation_idle_timeout": 900,
+  "conversation_wait": 10,
+  "conversation_wait_note": "когда место нужно новому диалогу, а пул полон, вытесняется неактивный диалог, который дешевле всего собрать заново (токены префикса × число обслуженных запросов, не больше 5), а не самый давний. Если вытеснить некого (все диалоги заняты или закреплены работающим субагентом), новый диалог ждёт место до conversation_wait секунд (0 — сразу 503, до 300) и только потом получает 503. max_conversations и conversation_wait меняются в админке без перезапуска",
   "journal_max_file_bytes": 52428800,
   "journal_keep_files": 5,
   "journal_note": "журнал (journal.jsonl) начинает новый файл на journal_max_file_bytes и хранит journal_keep_files прежних (journal.jsonl.1 — самый новый): на диске не больше (journal_keep_files + 1) × journal_max_file_bytes, по умолчанию 300 МиБ, при нагрузке нескольких агентов это часы, а не минуты. 0 в journal_keep_files — прежние файлы не хранить",

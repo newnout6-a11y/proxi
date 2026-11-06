@@ -39,6 +39,7 @@ BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
 # TurnRunner._run_once reads when a client's compaction begins.
 LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
                  "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort",
+                 "max_conversations", "conversation_wait",
                  "journal_max_file_bytes", "journal_keep_files"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
@@ -120,8 +121,12 @@ def _schema():
         ("account_refresh_parallel", "integer", "Проверок одновременно", "routing",
          "Сколько аккаунтов можно проверять или продлевать одновременно", None, 1, 32, None),
         ("max_conversations", "integer", "Открытые диалоги", "routing",
-         "Сколько диалогов relay держит открытыми; при переполнении закрывается самый давний неактивный",
+         "Сколько диалогов relay держит открытыми; при переполнении закрывается неактивный диалог, который дешевле "
+         "всего собрать заново (маленький и малоиспользованный), а не просто самый давний. Применяется сразу",
          None, 1, 4096, None),
+        ("conversation_wait", "integer", "Ожидание места для диалога", "routing",
+         "Сколько секунд новый диалог ждёт место, если все открытые диалоги заняты и вытеснить некого, прежде чем "
+         "получить 503; 0 — отвечать 503 сразу. Применяется сразу", "с", 0, 300, None),
         ("conversation_idle_timeout", "integer", "Хранение неактивного диалога", "routing",
          "Через сколько секунд простоя диалог закрывается и следующий запрос начнёт новый тред Retool",
          "с", 1, 86400, None),
