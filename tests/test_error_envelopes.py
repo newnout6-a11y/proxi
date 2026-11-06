@@ -120,18 +120,18 @@ def fetch(relay, path, payload):
 
 
 def test_messages_route_reports_422_as_an_invalid_request(relay):
-    status, body = fetch(relay, '/v1/messages', _body('anthropic', stop_sequences=['END']))
+    status, body = fetch(relay, '/v1/messages', _body('anthropic', n=2))
     assert status == 422 and body['type'] == 'error'
     assert body['error']['type'] == 'invalid_request_error'
-    assert "'stop_sequences' is not supported" in body['error']['message']
+    assert "'n' is not supported" in body['error']['message']
     assert body['request_id'] and 'param' not in body['error']
 
 
 def test_openai_routes_keep_their_422_shape(relay):
-    status, body = fetch(relay, '/v1/chat/completions', _body('chat', stop=['END']))
+    status, body = fetch(relay, '/v1/chat/completions', _body('chat', n=2))
     assert status == 422
     assert body['error']['type'] == body['error']['code'] == 'unprocessable_entity'
-    assert body['error']['param'] == 'stop'
+    assert body['error']['param'] == 'n'
     status, body = fetch(relay, '/v1/responses', _body('responses', store=True))
     assert status == 422
     assert body['error']['type'] == body['error']['code'] == 'unprocessable_entity'

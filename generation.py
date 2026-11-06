@@ -81,6 +81,37 @@ def compatibility_level(parsed):
     return 'info' if names & changes else 'debug'
 
 
+# Retool has no stop sequences: the relay ends the reply at the first one itself (adapters.StopSequenceAdapter).
+MAX_STOP_SEQUENCES = 16
+MAX_STOP_LENGTH = 1000
+
+
+def stop_sequences(data, dialect):
+    """The stop sequences of a request: Chat's `stop` (a string or a list) and Messages' `stop_sequences`.
+
+    An empty one stops nothing. Responses has no such parameter, so a `stop` there is refused as before; the safety
+    classifier of Claude Desktop sends one on Messages, and refusing it blocked every check it makes."""
+    found = []
+    for name in ('stop', 'stop_sequences'):
+        value = data.get(name)
+        if value is None:
+            continue
+        if name == 'stop' and isinstance(value, str):
+            value = [value]
+        elif not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise unprocessable(f"'{name}' must contain strings", param=name)
+        value = [item for item in value if item]
+        if not value:
+            continue
+        if dialect == 'responses':
+            _reject(name)
+        if len(value) > MAX_STOP_SEQUENCES or any(len(item) > MAX_STOP_LENGTH for item in value):
+            raise unprocessable(f"'{name}' takes at most {MAX_STOP_SEQUENCES} sequences of at most "
+                                f"{MAX_STOP_LENGTH} characters", param=name)
+        found.extend(value)
+    return list(dict.fromkeys(found))
+
+
 def structured_output(data, dialect):
     """The JSON contract of the reply, or None for plain text.
 
@@ -154,17 +185,6 @@ def controls(data, entry, dialect):
         raise unprocessable('conflicting verbosity controls', param='verbosity')
     ignored.extend(unsupported)
 
-    for name in ('stop', 'stop_sequences'):
-        value = data.get(name)
-        if value is None:
-            continue
-        if name == 'stop' and isinstance(value, str):
-            if value:
-                _reject(name)
-        elif not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-            raise unprocessable(f"'{name}' must contain strings", param=name)
-        elif value:
-            _reject(name)
     n = data.get('n')
     if n is not None:
         if type(n) is not int or n < 1:
