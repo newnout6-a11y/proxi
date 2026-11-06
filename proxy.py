@@ -2,6 +2,7 @@
 import asyncio
 import argparse
 import concurrent.futures
+import fnmatch
 import json
 import os
 import queue
@@ -734,6 +735,7 @@ def make_handler(runtime: Runtime):
             self._carry_tools(parsed)
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
+            self._cap_effort(parsed)
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
             self._effort_str = effective_effort or (
                 "provider" if parsed.entry.get("reasoning") and
@@ -810,6 +812,30 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _cap_effort(self, parsed):
+            """Lower the effort of a client and model that effort_caps names (README, "effort_caps"); default: nothing.
+
+            A cap is a function of the client and the model alone, so it holds for a whole conversation and a signed
+            branch never sees an effort change (that resets the history and rewrites the cache). It lowers the effort the
+            client sent, or the configured default the request would otherwise get; an effort a prompt profile sets
+            (generation.effort) is the profile's own and is left as it is."""
+            rules = cfg.get("effort_caps") or ()
+            entry = parsed.entry
+            levels = entry.get("reasoning_effort_levels") or ()
+            if (not rules or getattr(parsed, "prompt_effort", None) or not levels or not entry.get("reasoning", True)
+                    or entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored")):
+                return
+            family = prompt_policy.prompt_client(client_context.current(), self.headers)
+            names = [name.lower() for name in (parsed.model, getattr(parsed, "requested_model", "")) if name]
+            for rule in rules:
+                if (fnmatch.fnmatchcase(family, rule.get("client", "*").lower())
+                        and any(fnmatch.fnmatchcase(name, rule.get("model", "*").lower()) for name in names)):
+                    wanted = models.effective_effort(entry, parsed.effort, cfg.get("reasoning_effort"))
+                    capped = models.capped_effort(levels, wanted, rule["max"])
+                    if capped != wanted:
+                        parsed.effort, parsed.effort_capped = capped, wanted
+                    return
 
         def _refuse_tool_search(self, data, dialect):
             """Turn down Claude Code's tool search so that it loads every tool up front (see tool_search_policy).

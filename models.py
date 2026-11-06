@@ -764,6 +764,15 @@ def nearest_effort(levels, requested):
                                           _EFFORT_RANK.get(level, wanted)))
 
 
+def capped_effort(levels, effort, ceiling):
+    """`effort`, or the highest level of `levels` that does not exceed `ceiling` when it does; the effort itself when the route
+    has no level that low or `ceiling` is no level (a cap lowers an effort, it never raises one)."""
+    if effort is None or _EFFORT_RANK.get(ceiling) is None or _EFFORT_RANK.get(effort, -1) <= _EFFORT_RANK[ceiling]:
+        return effort
+    below = [level for level in levels if _EFFORT_RANK.get(level, 99) <= _EFFORT_RANK[ceiling]]
+    return max(below, key=lambda level: _EFFORT_RANK[level]) if below else effort
+
+
 def _effort_controls_sent(data):
     """(client-facing name, value) for every effort or thinking control, where validate._effort reads it."""
     found = []

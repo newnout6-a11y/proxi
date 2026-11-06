@@ -614,6 +614,41 @@ a server comes up. What decides it:
 Claude Code's list changes with what its ToolSearch loads, and OpenCode's with the agent, and a union would give an agent tools
 it was not given.
 
+### Speed and effort in Codex
+
+Codex's wall time is the number of agent steps, not the reasoning effort: the same bugfix task on gpt-6.1-sol took 45.7 s at
+max, 52.7 s at high and 39.3 s at medium (9.0, 10.0 and 8.3 requests: 5.1, 5.3 and 4.7 s per request). Two thirds of a request
+is the wait for the first token and the relay adds 38 ms to it (median over 178 requests). The one place where the effort does
+matter is Claude: at the user's global `model_reasoning_effort = "max"` claude-opus-5-5 and claude-sonnet-5-5 think silently for
+15 to 66 s on a trivial step (opus: 15.0 s with 1 822 tokens on a question without tools, 38.0 s with 4 881 and 66.4 s with
+8 493 tokens on "call list_projects twice", 7.4 s at low; sonnet 21.4 and 39.0 s), where gpt-6.1-sol stays at about 3 s. On
+Claude Code the same model took 23 s on a realistic task at high and 130 s at max (thinking 105 s, 13.5k tokens, 8.2 credits).
+
+What the relay can and cannot do about it:
+
+- **The catalog cannot.** Codex sends an explicit effort whatever the model catalog lists (the catalog's `supported_reasoning_levels`
+  fill the picker, they do not clamp what the user set), and the catalog's `default_reasoning_level` applies only when the user has
+  set none; the relay already publishes `medium` (or `low`/`high` for a few models) as that default. With `model_reasoning_effort =
+  "max"` in `config.toml` it is never read. (Source: codex-rs `core/src/client.rs`, `protocol/src/openai_models`; `ultra` is sent as
+  `max`.)
+- **Changing the effort inside a conversation costs a rewrite.** The effort is part of the key of a signed branch and of the
+  provider's prompt, so the relay never changes it between two requests of one conversation (a change of effort is 1.2 credits
+  at 24k tokens and 31 at 330k).
+- **A cap can**, because it is a function of the client and the model alone and so holds for the whole conversation:
+  `effort_caps` in `config.json` lists rules `{"client": "codex", "model": "claude-*", "max": "high"}` (globs, case-insensitive,
+  the first matching rule applies; `client` and `model` default to `*`). It lowers the effort the client sent, or the default the
+  request would otherwise get, to the highest level of the route that does not exceed `max`; it never raises one, and an effort a
+  prompt profile sets (`generation.effort`) is the profile's own. The journal says what happened: `turn.begin` has
+  `requested_effort` (what the client asked), `effective_effort` and `effort_resolution: "capped"`. A client that switches
+  its effort in the middle of a conversation (Codex's picker) no longer resets the history of a capped model, because the relay's
+  effort does not move. The default is no rule, which is the behaviour of before.
+
+Whether to cap Claude through Codex, and at which level, is the user's decision: `max` is what the user chose for every model, and
+the cost is thinking time (and credits), not correctness. The same result is available without the relay: a Codex profile with
+`model_reasoning_effort = "high"` for the Claude models (`[profiles.claude]`, `codex -p claude`), or a prompts.json profile with
+`generation.effort` and a rule on `client: codex` and `model: claude-*`, which sets the effort for those requests (and raises a lower
+one, which a cap does not).
+
 ## Claude Code
 
 Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and
