@@ -279,6 +279,7 @@ def test_warm_anchor_is_the_turn_start_not_its_end(monkeypatch):
     session = _DirectSession()
 
     async def fake_stream(cfg, sess, body, param_types=None):
+        yield {"type": "text", "delta": "ok"}
         yield {"type": "end", "reason": "stop"}
 
     monkeypatch.setattr(direct, "_stream_body", fake_stream)

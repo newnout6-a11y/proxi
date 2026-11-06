@@ -49,6 +49,19 @@ EXEC_REMINDER = (
 )
 
 
+# What direct.native_scope lists, in order: the parts in which a request can differ from a signed branch.
+_SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")
+# Why a compaction restarts the history of its dialog, for the journal (cache.compaction_restart).
+_RESTART_REASONS = {
+    "no_branch": "у диалога нет подписанной ветки (первый запрос, перезапуск relay или вытеснение диалога)",
+    "history": "сообщения запроса не продолжают ветку диалога (история изменена или заменена)",
+    "effort": "effort ветки недопустим для этой модели",
+    "scope": "у запроса другие %s, чем у ветки",
+}
+_SCOPE_NAMES = {"conversation": "диалог", "provider": "модель или аккаунт", "head": "system (head)", "tools": "tools",
+                "tool_choice": "tool_choice"}
+
+
 def _b(text: str) -> int:
     """Limit in bytes, not characters (Cyrillic is 2 bytes each in UTF-8)."""
     return len((text or "").encode("utf-8"))
@@ -372,6 +385,81 @@ class TurnRunner:
         history.append((command, 0))
         if len(history) > 8:
             del history[0]
+
+    def _dialog_effort(self, parsed, head, choice, exclude):
+        """(the effort of the dialog, why the history restarts anyway) for a compaction.
+
+        The first is the effort of the dialog when asking for it makes the signed history of the dialog resume, else None
+        to leave the client's own effort alone. The second is None, or, when the request does not continue the dialog's
+        signed history on any effort, what to tell the journal: {"reason": "no_branch" | "history" | "effort"} or
+        {"reason": "scope", "differs": [...]} naming what differs from the newest branch (the parts of native_scope).
+
+        A signed branch is made under one reasoning effort and continues only a request that asks for that one: with
+        another the history starts again, and the provider drops its cached messages as well (Anthropic: a changed
+        output_config.effort always invalidates them). The compaction agent of a client can have a variant of its own, so
+        its request, the chat's own history and one more message, comes on another effort than the chat.
+
+        This asks the transport's own question, History.resume under the scope the request would have with the effort of
+        each live branch, so it says yes only when the history really continues: another head, tools, model or account, or a
+        history that is not the branch's own, are all a no. The effort must be valid for the model under the rules the
+        client's own obey (a nearest level is another prefix). A signature never comes from the client: the branches are
+        the relay's own, kept on the session of the dialog.
+        """
+        client, key = getattr(parsed, "native_messages", None), getattr(parsed, "conversation_key", None)
+        peek = getattr(self.pool, "peek", None)
+        if not client or not key or peek is None:
+            return None, None
+        session = peek(key, model_entry=parsed.entry, exclude=exclude, **acquire_plan(self.cfg, parsed).kwargs)
+        history = getattr(session, "_native_history", None)
+        if history is None or not history.branches:
+            return None, {"reason": "no_branch"}
+        try:
+            resource = model_catalog.provider_resource(
+                getattr(getattr(session, "backend", None), "cfg", None) or self.cfg, parsed.entry)
+        except apierr.ApiError:
+            return None, None  # acquire says why
+        wanted = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"))
+        tools = direct.tools_to_retool(parsed.tools)
+
+        def scope_of(effort):
+            provider = {"model": parsed.model}
+            if effort is not None:
+                provider["reasoningEffort"] = effort
+            if resource:
+                provider["providerResourceName"] = resource
+            return direct.native_scope(key, provider, head or "", tools, choice)
+
+        refused = False
+        for effort in dict.fromkeys(direct.scope_effort(branch.scope) for branch in reversed(list(history.branches))):
+            if effort is None:
+                continue
+            found, _ = history.resume(scope_of(effort), client)
+            if found is None:
+                continue
+            if effort == wanted:
+                return None, None  # the request resumes as it is
+            try:
+                _, resolved = model_catalog.resolve_tolerant(
+                    parsed.model, effort, strict=self.cfg.get("strict_models", True), default_model=self.cfg.get("model"),
+                    allow_downgrade=self.cfg.get("allow_effort_downgrade", False))
+            except apierr.ApiError:
+                resolved = None
+            if resolved == effort:
+                return effort, None
+            refused = True
+        # Nothing continues: say why when the newest branch is the one it should have been (a text for the journal).
+        newest = history.branches[-1]
+        try:
+            differs = [name for name, before, after in zip(_SCOPE_PARTS, json.loads(newest.scope),
+                                                           json.loads(scope_of(direct.scope_effort(newest.scope))))
+                       if before != after]
+        except ValueError:
+            differs = []
+        if differs:
+            return None, {"reason": "scope", "differs": differs}
+        if history.resume(newest.scope, client)[0] is None:
+            return None, {"reason": "history"}
+        return None, ({"reason": "effort"} if refused else None)
 
     def _check_prompt(self, prompt):
         limit = int(self.cfg.get("max_prompt_bytes", 0) or 0)
@@ -804,22 +892,58 @@ class TurnRunner:
             if requested_effort is None:
                 requested_effort = self.cfg.get("reasoning_effort") if parsed.entry.get("reasoning") else None
                 effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
+            task = getattr(parsed, "client_task", "")
+            # A client's compaction runs on the effort of its dialog when that is what makes the dialog's signed
+            # history resume (README, "Сжатие истории"); the journal still says what the client asked for.
+            kept, why = None, None
+            holder.pop("kept_effort", None)  # a retry on another account decides again
+            if (task == client_context.COMPACTION and native_tools and direct_mode
+                    and self.cfg.get("compaction_keep_effort", True)):
+                try:
+                    kept, why = self._dialog_effort(parsed, instructions, choice, exclude)
+                except Exception as exc:  # a lookup that only helps: without it the request runs on the client's effort
+                    log("cache.effort_check_failed", "Не удалось сверить effort сжатия с диалогом, запрос идёт как есть: "
+                        "%s: %s" % (type(exc).__name__, redact(str(exc)).replace("\n", " ")[:160]), "warn")
+            if kept:
+                effort, effort_source = kept, "dialog"
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
             if getattr(parsed, 'verbosity', None) is not None:
                 model_provider['verbosity'] = parsed.verbosity
-            log("turn.begin", "Ход %s · effort %s · %s" % (parsed.model, effort or "—",
-                                                          "direct" if direct_mode else "agent"),
+            log("turn.begin", "Ход %s · effort %s · %s%s%s" % (
+                    parsed.model, effort or "—", "direct" if direct_mode else "agent",
+                    " · сжатие истории" if task == client_context.COMPACTION else "",
+                    " (effort диалога, клиент просил %s)" % (requested_effort or "по умолчанию",) if kept else ""),
                 model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
                 requested_effort=requested_effort, effective_effort=effort,
                 effort_source=effort_source,
-                effort_resolution=("model_default" if requested_effort in (None, "auto") else
+                effort_resolution=("cache_continuity" if kept else
+                                   "model_default" if requested_effort in (None, "auto") else
                                    "provider_managed" if effort is None else
                                    "exact" if requested_effort == effort else "compatibility"),
                 dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
                 tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
                 prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
-                messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose)
+                messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose,
+                **({"client_task": task} if task else {}))
+            if kept:
+                holder["kept_effort"] = kept
+                log("cache.effort_kept", "Сжатие истории: effort диалога %s вместо запрошенного %s, подписанная история "
+                    "продолжится" % (kept, requested_effort or "по умолчанию"), "info",
+                    requested_effort=requested_effort, dialog_effort=kept)
+                console_log.write("[%s] [cache] compaction keeps the dialog's effort %s (the client asked for %s): "
+                                  "the signed history continues" % (getattr(parsed, "request_id", None) or "req", kept,
+                                                                    requested_effort or "the default"))
+            elif why:
+                # What the compaction cannot continue is what it costs: say which part of the dialog it does not match.
+                reason = _RESTART_REASONS[why["reason"]]
+                if why.get("differs"):
+                    reason = reason % ", ".join(_SCOPE_NAMES.get(name, name) for name in why["differs"])
+                log("cache.compaction_restart", "Сжатие не продолжает подписанную историю диалога: %s; история будет "
+                    "записана заново" % reason, "info", requested_effort=requested_effort, **why)
+                console_log.write("[%s] [cache] compaction does not continue the signed history (%s)" % (
+                    getattr(parsed, "request_id", None) or "req", why["reason"] + (
+                        ": " + ", ".join(why["differs"]) if why.get("differs") else "")))
 
             client_chunks = list(getattr(parsed, 'message_chunks', None) or ([parsed.prompt] if parsed.prompt else []))
             if direct_mode:

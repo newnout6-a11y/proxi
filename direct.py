@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 
 import apierr
+import conversation_state
 import credits
 import journal
 import client_context
@@ -31,6 +32,8 @@ ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
 # Billing and keep-alive events describe the attempt, not its content: never held back.
 _LIVE_EVENTS = frozenset({"credits", "usage", "thinking_heartbeat", "end"})
+# What an attempt that produced only reasoning looks like on the event stream (thinking_only, not content).
+_THINKING_EVENTS = frozenset({"thinking", "thinking_start", "thinking_signature", "thinking_heartbeat"})
 _EMPTY_DUMPED = set()  # (request_purpose, model) pairs whose empty answer is already saved this run
 
 
@@ -759,6 +762,28 @@ def _ping(session, body):
     return actual_credits
 
 
+# The provider keeps a cache entry for 5 minutes counted from the START of the request that last wrote or
+# read it (Anthropic prompt caching); only a read renews it. A ping that arrives later finds nothing to read
+# and pays to write the whole prefix again, 25 times the price of a read, for a conversation nobody asked
+# to keep warm.
+PROMPT_CACHE_TTL = 300.0
+# The scheduler's tick, the wait for a worker thread and the trip to the provider all come out of the TTL:
+# a ping may start at most TTL - margin after the last confirmed touch of the entry.
+PROMPT_CACHE_MARGIN = 20.0
+PING_DEADLINE = PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN
+# No setting may schedule a ping later than this: a few seconds of tick before the deadline.
+PING_LATEST = PING_DEADLINE - 5.0
+# A failed ping is retried this long after the failure (doubled for every further one), and only if the retry
+# still starts inside the window above.
+PING_RETRY = 10.0
+# A ping that WROTE the prefix instead of reading it found the entry gone. It counts as a rewrite when it wrote
+# half of the cached prefix (a miss on a small prompt) or REWRITE_TOKENS tokens: the console flags the same
+# size as [WRITE HIGH], and at the write price (1e-4 credits per token) it is 5 credits, as much as six
+# healthy pings of a 190k-token prefix (4e-6 per token). Below one cache block it is noise.
+REWRITE_SHARE = 0.5
+REWRITE_TOKENS = 50_000
+REWRITE_FLOOR = 1_024
+
 _STOP_TEXT = {
     "idle_limit": "Прогрев остановлен: диалог не запрашивали дольше лимита простоя",
     "subagent_done": "Прогрев остановлен: субагент ответил без вызова инструмента",
@@ -766,7 +791,34 @@ _STOP_TEXT = {
     "evicted": "Прогрев остановлен: диалог вытеснен из пула",
     "failures": "Прогрев остановлен после пяти неудач",
     "closed": "Прогрев остановлен: сессия закрыта",
+    "last_turn_failed": "Прогрев остановлен: последний ход не дал пригодного ответа",
+    "cache_expired": "Прогрев остановлен: кэш префикса уже истёк, пинг оплатил бы его полную перезапись",
+    "cache_rewritten": "Прогрев остановлен: пинг перезаписал префикс вместо чтения из кэша",
 }
+
+
+def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen):
+    """The class of one finished upstream attempt: cancelled, error, truncated, content, thinking_only or empty.
+
+    One definition for the attempt trace (_stream_body) and for the verdict on a whole turn (iter_events).
+    Only `content`, a non-blank text or a finished tool call delivered by a stream that reached its end, is an
+    answer; every other class is a paid attempt that gave the client nothing."""
+    return ("cancelled" if cancelled else "error" if failed else "truncated" if not ended else
+            "content" if usable else "thinking_only" if thinking_seen else "empty")
+
+
+def _rewrite_of(usage):
+    """The size of a rewrite when a ping wrote the cached prefix again instead of reading it, else None."""
+    if not isinstance(usage, dict):
+        return None
+    written = int(console_log.number(usage.get("promptTokensWrittenToCache")) or 0)
+    if written < REWRITE_FLOOR:
+        return None
+    read = int(console_log.number(usage.get("promptTokensReadFromCache")) or 0)
+    prefix = read + written
+    if written < REWRITE_TOKENS and written < prefix * REWRITE_SHARE:
+        return None
+    return {"written_tokens": written, "read_tokens": read, "prefix_tokens": prefix}
 
 
 class _WarmCycle:
@@ -793,7 +845,7 @@ class _WarmCycle:
         try:
             last = getattr(session, "_last_request_at", None)
             spent = float(getattr(session, "_keepwarm_cost", 0.0) or 0.0) - self.cost0
-            level = ("warn" if reason == "failures" else
+            level = ("warn" if reason in ("failures", "cache_rewritten") else
                      "debug" if reason == "account_unavailable" and not self.pings else "info")
             owner = getattr(session, "_turn_identity", None) or getattr(session, "_warm_identity", None) or {}
             token = client_context.bind(owner)
@@ -838,7 +890,8 @@ async def _keepwarm(session, cfg):
 
     Only one ping runs per session. Active turns get their first refresh at
     the configured offset, then at most every 240s (inside the 5-minute TTL).
-    Failures back off; an unknown cache result is never reported as a hit.
+    Failures retry soon, but only while the retry still starts inside the cache window;
+    an unknown cache result is never reported as a hit.
 
     Idle warming ends by limits that hold whatever the pool's bookkeeping says: after
     cache_keepwarm_idle seconds without a real request (pings do not count), after
@@ -846,6 +899,15 @@ async def _keepwarm(session, cfg):
     for a subagent that answered without one. A turn busy for longer than turn_timeout and
     a child request that went quiet keep nothing warm. The reason, the pings and the credits
     of the cycle are journaled as cache.keepwarm_stop.
+
+    A ping is paid for, so it is only sent while it can still read the cache. The guards:
+    - the last turn gave no usable answer (empty, thinking only, cut off, an error): last_turn_failed;
+    - the last confirmed touch of the cache, the start of a real request or of a successful ping
+      (a failed ping touches nothing: its result is unknown), is older than
+      PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN: cache_expired. This also ends a retry that no longer fits;
+    - a ping reported that it wrote the prefix instead of reading it: cache_rewritten, one rewrite is
+      the most the cycle ever pays for.
+    The same rules hold inside a running turn.
     """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
     if interval <= 0:
@@ -854,8 +916,9 @@ async def _keepwarm(session, cfg):
     subagent_idle = float(_int_setting(cfg, "cache_keepwarm_subagent_idle", 600))
     turn_timeout = float(_int_setting(cfg, "turn_timeout", 900) or 900)
     during_turns = bool(cfg.get("cache_keepwarm_during_turns", True))
-    turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), 285.0)
+    turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), PING_LATEST)
     active_interval = min(interval, 240.0)
+    idle_interval = min(interval, PING_LATEST)
     account = account_tag(getattr(session, "backend", None))
     cycle = _WarmCycle(session, account)
     scheduled_seq = None
@@ -863,7 +926,7 @@ async def _keepwarm(session, cfg):
     retry_at = 0.0
     try:
         while True:
-            busy, seq = False, None
+            busy, seq, touch_at = False, None, None
             context_token = client_context.bind({})
             try:
                 await asyncio.sleep(0.05)
@@ -877,6 +940,12 @@ async def _keepwarm(session, cfg):
                     next_turn_ping = started + turn_offset
                 last_req = getattr(session, "_last_request_at", getattr(session, "_warm_at", 0))
                 if not busy:
+                    outcome = getattr(session, "_turn_outcome", None)
+                    if outcome not in (None, "content"):
+                        # Nothing usable came back, so there is nothing a client returns to, and the prefix
+                        # behind it is not worth a paid refresh. The next good turn starts a new cycle.
+                        cycle.stop("last_turn_failed", turn_outcome=outcome)
+                        return
                     subagent = bool(getattr(session, "_parent_key", None))
                     limit = subagent_idle if subagent else idle
                     if subagent and getattr(session, "_turn_final", False):
@@ -893,6 +962,7 @@ async def _keepwarm(session, cfg):
                         return
                 body = getattr(session, "_warm_body", None)
                 identity = getattr(session, "_warm_identity", None) or {}
+                touch_at = getattr(session, "_warm_at", 0) or 0
                 if busy:
                     if not during_turns or not started:
                         await asyncio.sleep(0.95)
@@ -901,12 +971,19 @@ async def _keepwarm(session, cfg):
                     if turn_body:
                         body = turn_body
                         identity = getattr(session, "_turn_identity", None) or {}
+                        # The turn's own request read or wrote this prefix when it began.
+                        touch_at = max(touch_at, started)
                     due = max(next_turn_ping, retry_at)
                 else:
-                    due = max((getattr(session, "_warm_at", 0) or 0) + interval, retry_at)
+                    due = max(touch_at + idle_interval, retry_at)
                 if not body:
                     await asyncio.sleep(0.95)
                     continue
+                if now - touch_at > PING_DEADLINE:
+                    # The entry is gone or about to be: a ping now writes the whole prefix again.
+                    cycle.stop("cache_expired", touch_age_seconds=round(now - touch_at), limit=PING_DEADLINE,
+                               during_turn=busy)
+                    return
                 if now < due:
                     await asyncio.sleep(min(0.95, max(0.05, due - now)))
                     continue
@@ -935,18 +1012,27 @@ async def _keepwarm(session, cfg):
                     session._keepwarm_estimated_cost = round(
                         getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
                 usage = getattr(session, "_last_warm_usage", {})
+                rewrite = _rewrite_of(usage)
                 touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
                     "promptTokensReadFromCache", "promptTokensWrittenToCache"))
                 journal.emit("cache.keepwarm",
+                             "Прогрев перезаписал кэш: префикс записан заново, а не прочитан" if rewrite else
                              "Кэш прочитан или записан при прогреве" if touched else
                              "Запрос прогрева завершён; использование кэша не подтверждено",
-                             "info" if busy else "debug",
+                             "warn" if rewrite else "info" if busy else "debug",
                              model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
                              account=account,
                              during_turn=busy, turn_age_seconds=round(ping_started - started) if busy else None,
+                             touch_age_seconds=round(ping_started - touch_at),
                              prefix_tokens=prefix_tokens, est_credits=round(estimate, 4),
                              actual_credits=actual, credits_total=getattr(session, "_keepwarm_cost", 0.0),
                              cache_verified=touched, usage=usage)
+                if rewrite:
+                    # The cache the cycle was keeping alive was gone: whatever kept it from being read
+                    # (a lapse, an eviction, another shard) can happen again, and every miss pays a full write.
+                    cycle.stop("cache_rewritten", touch_age_seconds=round(ping_started - touch_at),
+                               ping_credits=actual, **rewrite)
+                    return
             except asyncio.CancelledError:
                 cycle.cancelled()
                 return
@@ -960,15 +1046,49 @@ async def _keepwarm(session, cfg):
                     console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire")
                     cycle.stop("failures", failures=failures)
                     return
-                retry_at = time.time() + min(active_interval * (2 ** (failures - 1)), 900.0)
+                failed_at = time.time()
+                retry_at = failed_at + PING_RETRY * 2 ** (failures - 1)
                 next_turn_ping = retry_at
-                journal.emit("cache.keepwarm", "Прогрев не удался; повтор с задержкой: %s" % str(exc)[:200], "warn",
-                             account=account)
+                # A failed ping touched nothing (its result is unknown): the retry has to start inside the
+                # window of the last confirmed touch, or it would pay for a cache that is gone.
+                fits = touch_at is None or retry_at - touch_at <= PING_DEADLINE
+                journal.emit("cache.keepwarm",
+                             ("Прогрев не удался; повтор через %d с: %s" % (round(retry_at - failed_at), str(exc)[:200]))
+                             if fits else
+                             "Прогрев не удался; повтор не успевает до истечения кэша: %s" % str(exc)[:200],
+                             "warn", account=account)
                 console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" % str(exc)[:200])
+                if not fits:
+                    cycle.stop("cache_expired", touch_age_seconds=round(failed_at - touch_at), limit=PING_DEADLINE,
+                               during_turn=busy, after_failure=True, failures=failures)
+                    return
             finally:
                 client_context.reset(context_token)
     finally:
         cycle.announce()
+
+
+def native_scope(conversation_key, model_provider, head, tools, tool_choice):
+    """What a signed branch is keyed by: it continues only a request that has all of these as it had them.
+
+    iter_events keys the branches it records and resumes by this, and the compaction check of the orchestrator asks
+    the same question before the turn begins. Output caps and verbosity control generation, not the signed input
+    prefix, and clients legitimately omit or change them between tool follow-ups, so verbosity is left out. The effort
+    is in: the provider renders it into the prompt, so another effort is another prefix."""
+    prefix_provider = {key: value for key, value in model_provider.items() if key != 'verbosity'}
+    return json.dumps([conversation_key, prefix_provider, head, tools, tool_choice], sort_keys=True, ensure_ascii=True)
+
+
+def scope_effort(scope):
+    """The reasoning effort a signed branch was made with, read from its scope; None when it has none.
+
+    The provider is the second part of the scope (native_scope): a request that asks for another effort starts a new
+    history instead of continuing the branch."""
+    try:
+        effort = json.loads(scope)[1].get("reasoningEffort")
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+        return None
+    return effort if isinstance(effort, str) and effort else None
 
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
@@ -976,11 +1096,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     """Yield normalised relay events from the direct NDJSON stream."""
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
-    # Output caps and verbosity control generation, not the signed input prefix.
-    # Clients legitimately omit or change them between tool follow-ups.
-    prefix_provider = {key: value for key, value in model_provider.items() if key != 'verbosity'}
-    scope = json.dumps([getattr(session, "_native_conversation_key", None), prefix_provider,
-                        head, tools, tool_choice], sort_keys=True, ensure_ascii=True)
+    scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
     parent, messages = history.resume(scope, client) if history is not None and client is not None else (None, None)
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
@@ -1027,13 +1143,23 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     rejected = False
     # A completed answer that asked for no tool is final: a subagent that gave one is done.
     asked_tool, ended = False, None
+    # What the turn delivered decides what it may become: only a usable answer is a keepwarm body.
+    wrote_text = thinking_seen = errored = False
+    failure = None
 
     def note(event):
-        nonlocal asked_tool, ended
-        if event.get("type") == "tool_call" and not event.get("partial"):
+        nonlocal asked_tool, ended, wrote_text, thinking_seen, errored
+        kind = event.get("type")
+        if kind == "tool_call" and not event.get("partial"):
             asked_tool = True
-        elif event.get("type") == "end":
+        elif kind == "end":
             ended = event.get("reason")
+        elif kind == "text":
+            wrote_text = wrote_text or bool(str(event.get("delta") or "").strip())
+        elif kind in _THINKING_EVENTS:
+            thinking_seen = True
+        elif kind == "error":
+            errored = True  # a stream that ended without end_of_stream: the consumer may stop reading here
 
     if body.get("openAICacheKey"):
         session._turn_body = body
@@ -1066,18 +1192,43 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 note(event)
                 yield event
         reply = getattr(session, "_direct_reply", None)
-        if client is not None and history is not None and reply is not None and not session._cancelled:
+        # The summary of a client's compaction is a side request: the client replaces its history by that summary and
+        # never continues this one. Recording it would put a branch nobody extends in place of the parent it resumed
+        # (a nudged or repeated compaction, a background one beside the chat, or the chat itself after an abandoned
+        # compaction would then start from nothing), so the dialog's branches stay as the chat left them.
+        side_request = identity.get("client_task") == client_context.COMPACTION
+        if client is not None and history is not None and reply is not None and not session._cancelled and not side_request:
             blocks, expected = reply
             history.record(scope, client, body["messages"], blocks, expected, parent)
     except apierr.ApiError as error:
+        if error.status in (400, 422) and parent is not None:
+            # A branch read back from disk is not replayed again once upstream has refused it: the next try
+            # takes the unsigned path instead of repeating the refusal until the stored copy expires.
+            conversation_state.refuse(session, parent, error.status)
         # A body upstream rejected (400/413/422) must not become the keepwarm body.
         rejected = 400 <= error.status < 500 and error.status not in (401, 403, 408, 429)
+        failure = error
+        raise
+    except BaseException as error:  # noqa: BLE001 - noted for the verdict on the turn, then raised again
+        failure = error
         raise
     finally:
         session._busy = False
         session._turn_body = None
         session._turn_identity = None
         session._turn_final = ended == "stop" and not asked_tool and not getattr(session, "_cancelled", False)
+        # The consumer may drop the generator right after an error event (a cut stream): that is not a cancel.
+        stopped_early = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) and not errored
+        outcome = "truncated" if errored else attempt_outcome(
+            cancelled=bool(getattr(session, "_cancelled", False)) or ended == "cancelled" or stopped_early,
+            failed=failure is not None, ended=ended is not None, usable=wrote_text or asked_tool,
+            thinking_seen=thinking_seen)
+        if rejected:
+            outcome = "rejected"
+        if body.get("openAICacheKey"):
+            # Only a usable answer (never an empty, thinking-only, cut off, failed or cancelled turn) may
+            # become the keepwarm body; any other verdict stops the cycle until a good turn comes.
+            session._turn_outcome = outcome
         if body.get("openAICacheKey") and not rejected:
             prior_key = getattr(session, "_last_cache_key", None)
             if prior_key and prior_key != body["openAICacheKey"]:
@@ -1088,18 +1239,26 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                              tools=len(body.get("tools") or []),
                              thread=journal.tag(getattr(session, "thread_id", None)))
             session._last_cache_key = body["openAICacheKey"]
-            session._warm_body = body
-            session._warm_identity = identity
-            # The TTL counts from the last cache touch: this request's start or a
-            # later during-turn ping, NOT the turn's end; otherwise a pause after
-            # a long turn outlives the 5-minute entry before the next idle ping.
-            session._warm_at = max(session._turn_started_at, getattr(session, "_warm_at", 0) or 0)
+            if outcome == "content":
+                session._warm_body = body
+                session._warm_identity = identity
+                # The TTL counts from the last cache touch: this request's start or a
+                # later during-turn ping, NOT the turn's end; otherwise a pause after
+                # a long turn outlives the 5-minute entry before the next idle ping.
+                session._warm_at = max(session._turn_started_at, getattr(session, "_warm_at", 0) or 0)
             session._last_request_at = time.time()
-            _ensure_keepwarm(session, cfg)
+            if outcome == "content":
+                _ensure_keepwarm(session, cfg)
 
 
 def _ensure_keepwarm(session, cfg):
     if getattr(session, "_cancelled", False) or getattr(asyncio.get_running_loop(), "_relay_closing", False):
+        return
+    if not getattr(session, "_busy", False) and (
+            getattr(session, "_turn_outcome", None) not in (None, "content")
+            or time.time() - (getattr(session, "_warm_at", 0) or 0) > PING_DEADLINE):
+        # Between turns a cycle is worth starting only for a usable answer whose cache is still alive. Any other
+        # would stop at its first look, and say so again at every lease of a child that pins this conversation.
         return
     task = getattr(session, "_warm_task", None)
     if task is None or task.done():
@@ -1401,9 +1560,9 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     pass
                 trace = holder.get("trace")
                 if trace is not None:
-                    outcome = ("cancelled" if is_cancelled() or isinstance(failure, asyncio.CancelledError) else
-                               "error" if failure else "truncated" if not flags.get("end") else
-                               "content" if usable else "thinking_only" if thinking_seen else "empty")
+                    outcome = attempt_outcome(
+                        cancelled=is_cancelled() or isinstance(failure, asyncio.CancelledError),
+                        failed=bool(failure), ended=flags.get("end"), usable=usable, thinking_seen=thinking_seen)
                     trace.finish(outcome)
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)

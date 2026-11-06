@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { STALE_AFTER, STALE_MARGIN, buildTraces, costOf, phasesOf, scaleOf, staleLimit, statusAt } from '../src/turns.js';
+import { STALE_AFTER, STALE_MARGIN, TASK_LABEL, buildTraces, costOf, effortText, phasesOf, scaleOf, staleLimit, statusAt } from '../src/turns.js';
 import { MIN_FORECAST_SECONDS, burnRate, coverageOf, coveredSeconds, fmtSince, fmtSpan, uncoveredBuckets } from '../src/coverage.js';
 
 const ev = (ts, kind, data = {}) => ({ ts, kind, data, turn_id: 'test-turn' });
@@ -56,6 +56,34 @@ for (const reverse of [false, true]) {
     assert.equal(trace.creditsComplete, true);
   });
 }
+
+test('a compaction is named on its turn, with the effort the client asked for when the relay kept the dialog\'s', () => {
+  const kept = { client_task: 'compaction', effort: 'max', requested_effort: 'high', effort_resolution: 'cache_continuity' };
+  const [compaction] = buildTraces([ev(100, 'turn.begin', kept), finish(101, 1000)]);
+  assert.equal(compaction.task, 'compaction');
+  assert.equal(TASK_LABEL[compaction.task], 'сжатие');
+  assert.equal(compaction.askedEffort, 'high');
+  assert.equal(effortText(compaction), 'effort max (клиент high)');
+  // the setting off (or nothing to continue): still a compaction, on the effort the client sent
+  const [plain] = buildTraces([ev(100, 'turn.begin', { client_task: 'compaction', effort: 'high', requested_effort: 'high',
+    effort_resolution: 'exact' }), finish(101, 1000)]);
+  assert.equal(plain.task, 'compaction');
+  assert.equal(plain.askedEffort, null);
+  assert.equal(effortText(plain), 'effort high');
+  // an ordinary turn has no task and reads as before
+  const [ordinary] = buildTraces([ev(100, 'turn.begin', { effort: 'max', requested_effort: 'max', effort_resolution: 'exact' }),
+    finish(101, 1000)]);
+  assert.equal(ordinary.task, null);
+  assert.equal(TASK_LABEL[ordinary.task], undefined);
+  assert.equal(effortText(ordinary), 'effort max');
+  assert.equal(effortText(buildTraces([ev(100, 'turn.begin', {}), finish(101, 1)])[0]), '');
+});
+
+test('the client asking for the default is not shown as a level', () => {
+  const [trace] = buildTraces([ev(100, 'turn.begin', { effort: 'max', requested_effort: 'auto', effort_resolution: 'cache_continuity' }),
+    finish(101, 1000)]);
+  assert.equal(effortText(trace), 'effort max (клиент по умолчанию)');
+});
 
 test('time between thinking and output stays unclassified', () => {
   const [trace] = buildTraces([ev(100, 'turn.begin'), ev(100, 'upstream.thinking_start'),

@@ -178,6 +178,7 @@ def test_cancelled_scheduler_still_accounts_for_its_inflight_ping(monkeypatch):
     value = manager()
     target = session(value)
     target._warm_body = {"model": "claude-opus-5-5"}
+    target._warm_at = time.time() - 250  # a ping is due and the cache is still alive
     target._last_request_at = time.time()
     entered, release = threading.Event(), threading.Event()
 

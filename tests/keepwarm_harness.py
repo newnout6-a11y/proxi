@@ -3,8 +3,12 @@ import asyncio
 from types import SimpleNamespace
 
 import direct
+import journal
 
 START = 1000.0
+# A cache touch old enough for the idle ping to be due at once, young enough for the cache to be alive:
+# a ping never goes out for an older one (direct.PING_DEADLINE seconds).
+DUE = START - 250
 REAL_SLEEP = asyncio.sleep
 CFG = {"cache_keepwarm_seconds": 240, "cache_keepwarm_idle": 900, "cache_keepwarm_subagent_idle": 600,
        "cache_keepwarm_during_turns": True, "cache_keepwarm_turn_offset": 200, "turn_timeout": 900}
@@ -63,3 +67,9 @@ def drive(monkeypatch, target, cfg=None, *, seconds=3600, **options):
     clock, pings = install(monkeypatch, seconds=seconds, **options)
     asyncio.run(direct._keepwarm(target, dict(CFG, **(cfg or {}))))
     return clock, pings
+
+
+def stops(mark):
+    """The cache.keepwarm_stop events journaled after `mark`: each one's data and its level."""
+    return [dict(event["data"], level=event["level"]) for event in journal.JOURNAL.query(since=mark, limit=1000)
+            if event["kind"] == "cache.keepwarm_stop"]

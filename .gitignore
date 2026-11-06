@@ -17,6 +17,7 @@ relay.pid
 crash.log
 journal.jsonl
 journal.jsonl.1
+/conversations/
 .session-*.tmp
 .pytest_cache/
 probes/chunks/

@@ -193,7 +193,8 @@ async def test_failed_keepwarm_retries_with_backoff_without_claiming_cache_hits(
     original_sleep = asyncio.sleep
     calls = []
     session = SimpleNamespace(_busy=True, _turn_started_at=1000.0, _turn_seq=1,
-                              _warm_body={"model": "fixture"}, _last_request_at=1000.0)
+                              _turn_body={"model": "fixture"}, _warm_body={"model": "fixture"},
+                              _last_request_at=1000.0)
 
     async def sleep(delay):
         clock.now += delay
@@ -213,8 +214,12 @@ async def test_failed_keepwarm_retries_with_backoff_without_claiming_cache_hits(
     monkeypatch.setattr(direct.asyncio, "to_thread", to_thread)
     monkeypatch.setattr(direct, "_ping", fail)
     await direct._keepwarm(session, {"cache_keepwarm_seconds": 240, "cache_keepwarm_turn_offset": 200})
-    assert len(calls) == 2
-    assert calls[1] - calls[0] >= 240
+    # The retries back off (10, 20, 40 s) and every one starts inside the 5-minute cache window of the turn start;
+    # the next one (80 s later) would not, so the cycle ends instead of paying for a cache that is gone.
+    assert len(calls) == 4
+    assert [b - a >= direct.PING_RETRY * 2 ** index for index, (a, b) in enumerate(zip(calls, calls[1:]))] == [True] * 3
+    assert calls[-1] - 1000.0 <= direct.PING_DEADLINE
+    assert clock.now < 1000.0 + direct.PROMPT_CACHE_TTL
     assert getattr(session, "_warm_at", 0) == 0
 
 
