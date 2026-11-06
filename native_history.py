@@ -424,19 +424,31 @@ def _complete_turns(messages, seen):
 
 
 def same_json(a, b):
-    """True when two parsed JSON values are the same values.
+    """True when two parsed JSON values are the same values, as a JSON client holds them.
 
     Python's == also says True == 1 and False == 0, so a history that held 1 where the model wrote true was taken for the
-    conversation the signed reply belongs to (bug summary of 2026-11-06, section 3, item 14)."""
+    conversation the signed reply belongs to (bug summary of 2026-11-06, section 3, item 14). And Python keeps an integer
+    exact where a JavaScript client (Claude Code, the AI SDK) holds a double: the id 9007199254740993 the model wrote
+    comes back from it as 9007199254740992, which was taken for another reply, and the whole conversation was sent
+    again, uncached (ultracode audit of the relay, G3.1). Numbers are compared as doubles."""
     try:
         return _same_json(a, b)
     except RecursionError:  # nested past what is worth comparing: not the same, and the turn goes the unsigned way
         return False
 
 
+def _double(number):
+    try:
+        return float(number)
+    except OverflowError:  # an integer past the range of a double is infinity to JavaScript
+        return float("inf") if number > 0 else float("-inf")
+
+
 def _same_json(a, b):
     if isinstance(a, bool) or isinstance(b, bool):
         return a is b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return _double(a) == _double(b)
     if isinstance(a, dict) and isinstance(b, dict):
         return len(a) == len(b) and all(key in b and _same_json(value, b[key]) for key, value in a.items())
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
