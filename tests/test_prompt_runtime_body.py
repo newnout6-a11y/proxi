@@ -289,7 +289,7 @@ def test_a_failing_rewrite_serves_the_request_on_the_legacy_path(prompt_relay, m
     assert not relay.events(mark, "prompt.plan") and not relay.prompts.records
 
 
-def test_hiding_every_tool_changes_the_session_the_request_asks_for(prompt_relay, monkeypatch):
+def test_hiding_every_tool_leaves_the_request_in_the_session_the_clients_tools_made(prompt_relay, monkeypatch):
     relay = fake_relay(prompt_relay)
     edited(relay.prompts, edits=True)
     Rewrites(monkeypatch, hide_every_tool)
@@ -297,9 +297,9 @@ def test_hiding_every_tool_changes_the_session_the_request_asks_for(prompt_relay
                               {"x-session-affinity": "dialog-1"})
     assert status == 200
     assert "tools" not in relay.posts[0]
-    # the request now asks the pool for the conversation's text session, which is what acquire() was given
+    # the plan follows the request as the client sent it (plan I9): its own session, not the text session
     conversations = relay.runtime.pool._conversations
-    assert ("header:dialog-1", "text") in conversations and "header:dialog-1" not in conversations
+    assert "header:dialog-1" in conversations and ("header:dialog-1", "text") not in conversations
 
 
 # -- generation ---------------------------------------------------------------------------------------------------
@@ -318,7 +318,9 @@ def test_the_effort_of_the_profile_replaces_the_clients(prompt_relay, dialect):
     assert relay.post(dialect, effort_requests(dialect))[0] == 200
     assert relay.posts[0]["reasoningEffort"] == "high"
     (begin,) = relay.events(mark, "turn.begin")
-    assert begin["data"]["effective_effort"] == "high" and begin["data"]["requested_effort"] == "high"
+    # the client asked for low: the journal says so, and says the effort that ran is the profile's
+    assert begin["data"]["effective_effort"] == "high" and begin["data"]["requested_effort"] == "low"
+    assert begin["data"]["effort_source"] == "profile"
     (event,) = relay.events(mark, "prompt.plan")
     assert event["data"]["generation"] == {"effort": "high"}
 
@@ -404,16 +406,17 @@ def spy_on_the_pool(relay, monkeypatch):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_the_pool_is_asked_again_when_pass_2_changes_the_session_the_request_takes(prompt_relay, monkeypatch, stream):
+def test_the_pool_is_asked_once_with_the_session_of_the_clients_own_request_whatever_pass_2_hides(
+        prompt_relay, monkeypatch, stream):
     relay = fake_relay(prompt_relay)
     edited(relay.prompts, edits=True)
     Rewrites(monkeypatch, hide_every_tool)
     refusals, unavailable = spy_on_the_pool(relay, monkeypatch)
     assert relay.post("chat", client_request("chat", USER, system="CLIENT_SYSTEM", stream=stream),
                       {"x-session-affinity": "dialog-1"})[0] == 200
-    # the request asked for the conversation's own session with its tools; without them it asks for the text session
-    assert refusals == [{}, {"context_scope": "text"}]
-    assert unavailable == ([{"context_scope": "text"}] if stream else [])
+    # the conversation's own session, with its tools or without them: the plan is the one the client's request makes
+    assert refusals == [{}]
+    assert unavailable == ([{}] if stream else [])
 
 
 def test_the_pool_is_not_asked_twice_when_pass_2_leaves_the_session_alone(prompt_relay, monkeypatch):

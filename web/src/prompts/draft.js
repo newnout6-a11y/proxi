@@ -61,6 +61,12 @@ export const rulesOf = (doc) => (Array.isArray(doc?.rules) ? doc.rules : []);
 export const textsOf = (doc) => (isObject(doc?.texts) ? doc.texts : {});
 export const protectedEnabled = (doc) => doc?.protected?.enabled !== false;
 
+/** The edits of the client's system of a profile as the document has them: the relay's report counts them from zero, in this order. */
+export function systemEditsOf(doc, profile) {
+  const edits = profilesOf(doc)[profile]?.client_system?.edits;
+  return Array.isArray(edits) ? edits : [];
+}
+
 /** `pattern` is the relay's own rule when it published one (builtin.profile_name), else the documented one. */
 export function profileNameError(name, taken = [], pattern = PROFILE_NAME) {
   const value = String(name ?? '');
@@ -71,10 +77,29 @@ export function profileNameError(name, taken = [], pattern = PROFILE_NAME) {
   return null;
 }
 
-export function textNameError(name, taken = []) {
+// The rule the relay publishes today for the name of a text, \w[\w.-]{0,63}, said in words; any other rule is shown as it is written
+const KNOWN_TEXT_NAME = '\\w[\\w.-]{0,63}';
+const KNOWN_WORDS = 'буквы, цифры, «_», «.» и «-», до 64 знаков; начинается с буквы, цифры или «_»';
+const NO_RULE_HINT = 'Имя без пробелов, фигурных скобок и двоеточий';
+
+/** What the form tells under the field for a new text name: the relay's rule when it published one. */
+export function textNameHint(rule) {
+  if (!rule) return NO_RULE_HINT;
+  return rule.source === KNOWN_TEXT_NAME ? `${KNOWN_WORDS.charAt(0).toUpperCase()}${KNOWN_WORDS.slice(1)}` : `Имя должно подходить под правило relay: ${rule.source}`;
+}
+
+/**
+ * `rule` is {pattern, source}, the relay's own rule when it published one (builtin.text_name); without it a name only has to keep
+ * clear of what would break the reference {{text:name}}: spaces, braces and colons.
+ */
+export function textNameError(name, taken = [], rule = null) {
   const value = String(name ?? '');
   if (!value) return 'Введите имя текста';
-  if (/[\s{}:]/.test(value)) return 'В имени нет пробелов, фигурных скобок и двоеточий';
+  if (rule) {
+    if (!rule.pattern.test(value)) return rule.source === KNOWN_TEXT_NAME ? `Имя текста: ${KNOWN_WORDS}` : `Имя текста не подходит под правило relay: ${rule.source}`;
+  } else if (/[\s{}:]/.test(value)) {
+    return 'В имени нет пробелов, фигурных скобок и двоеточий';
+  }
   if (taken.includes(value)) return 'Текст с таким именем уже есть';
   return null;
 }
@@ -208,11 +233,12 @@ export function catchAllIndex(rules) {
   return rules.findIndex((rule) => rule?.enabled !== false && matchesAll(rule));
 }
 
-// What a new profile starts from; {{client_system}}{{relay_task}}{{exec_reminder}} keeps both kinds of request
-// as they are today: the client's own system, or the task the relay builds when the client sends none.
+// What a new profile starts from; {{client_system}}{{relay_task}}{{exec_reminder}} keeps both kinds of request as they are
+// today: the client's own system, or the task the relay builds when the client sends none. The one request it does not keep
+// is a client with tools that sends no system: the old path gives it the role {{native_role}}, the template has nothing for it.
 const KEEP = '{{client_system}}{{relay_task}}{{exec_reminder}}';
 export const STARTERS = [
-  { id: 'same', label: 'Как сейчас', hint: 'System клиента и задачи relay без изменений: точка отсчёта для правок', head: KEEP },
+  { id: 'same', label: 'Как сейчас', hint: 'System клиента и задачи relay как сейчас: точка отсчёта для правок. Клиент с инструментами без system получит пустой head, а прежний путь дал бы ему роль {{native_role}}', head: KEEP },
   { id: 'rules-first', label: 'Мои правила в начале', hint: 'Свой текст перед system клиента', head: `Отвечай по-русски. Не трогай файлы без явной просьбы.\n\n${KEEP}` },
   { id: 'exact', label: 'Только мой текст', hint: 'System клиента выбрасывается, инструменты и заголовки продолжают работать', head: 'Ты — ассистент по программированию. Отвечай кратко и проверяй изменения.' },
 ];

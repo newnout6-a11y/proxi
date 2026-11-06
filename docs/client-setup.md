@@ -5,6 +5,13 @@ Current route availability and installed-client evidence are recorded in
 setup or historical benchmark below does not establish that today's installed
 profile contains the same provider or that an old model/effort is still accepted.
 
+To change what the model sees per client, model or request, use `prompts.json`
+([guide](prompt-control.md)). A client that can add request headers picks a profile
+with `x-proxi-profile`: the settings for Claude Code, Codex, Claude Desktop and
+OpenCode are in [recipe 6](prompt-control.md#рецепт-6-профиль-по-заголовку-x-proxi-profile);
+a client that cannot add headers picks one by model name (`<model>@<profile>`,
+[recipe 7](prompt-control.md#рецепт-7-виртуальные-модели)).
+
 ## OpenCode
 
 OpenCode Desktop and CLI configure custom providers via `~/.config/opencode/opencode.jsonc` (or project-level `opencode.json`).
@@ -157,10 +164,15 @@ model and account and the same messages. Only the new tail is then written. The 
 both efforts: `turn.begin` has `requested_effort` (the client's), `effective_effort` (the dialog's),
 `effort_source: dialog` and `effort_resolution: cache_continuity`, and every event of the request
 has `client_task: "compaction"`. `compaction_keep_effort: false` turns the substitution off; the
-label stays. A compaction with nothing to continue (after a relay restart, on another model, after
-the history was edited) runs on the effort the client sent, and the label shows why it was dear:
-`cache.compaction_restart` names the reason (`no_branch`, `history`, `effort`, or `scope` with
-`differs`: `provider` for a model or account, `head`, `tools`, `tool_choice`).
+label stays. A compaction with nothing to continue (the first request of a dialog, a restart whose
+stored state was not applied, another model, a history that was edited) runs on the effort the client
+sent, and the label shows why it was dear: `cache.compaction_restart` names the reason (`no_branch`,
+`history`, `effort`, or `scope` with `differs`: `conversation`, `provider` for a model or account,
+`head`, `tools`, `tool_choice`). A restart alone does not lose the branch: with stored conversations on
+(the default) the relay reads the dialog's file before it asks, so a compaction that comes first after a
+restart still continues the signed history (README, "Состояние диалогов после перезапуска"). It starts
+over when that state is off, was dropped (expired, damaged, written by other code) or cannot be applied
+(the account of the dialog is gone, disabled or has no route to the model).
 
 The summary a compaction gets back is not recorded as a branch of the dialog: the client replaces
 its history by it and does not continue that request. So the branch of the chat stays where it
@@ -188,6 +200,12 @@ Sonnet every compaction is written in full (the journal says `scope` and `provid
   }
 }
 ```
+
+With `prompts.json`, OpenCode 2.x compaction follows the chat's profile: it carries the chat's tools, so
+the protective rules do not take it (they catch the hidden tool-less agents of OpenCode 1.x, titles and
+probes, and the Claude Code request classes `compaction` and `auxiliary`), and its head stays the chat's
+own, which keeps the cache. The label `client_task: "compaction"` selects no profile
+([protective rules](prompt-control.md#защитные-правила)).
 
 If a later release rewords the instruction, a plugin can name the task instead: OpenCode 2.x's
 `model.request` hook carries `event.kind` (`"compaction"` for the checkpoint summary) and can
@@ -565,7 +583,9 @@ keep their own system prompt and output format. Sessions, isolation and cache sc
 stay as they are; only the policy changes. Other classes, and requests without the
 header, still get the configured policy. The class appears in the journal entries of
 the request. Without the header only the recognised service kinds (titles, Auto mode
-check, connection probe) are protected.
+check, connection probe) are protected. With `prompts.json` the same two classes are taken by the
+protected rule `protected: Claude Code compaction`, which gives them the profile `passthrough`
+([protective rules](prompt-control.md#защитные-правила)).
 
 A `compaction` request (with the `x-claude-code-compaction` header that says what
 triggered it: `auto`, `manual` or `reactive`) is also labelled `client_task: "compaction"` in

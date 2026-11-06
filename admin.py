@@ -19,6 +19,7 @@ import account_report
 import apierr
 import auth
 import config
+import direct
 import journal
 import models
 import native_history
@@ -162,8 +163,9 @@ def _schema():
         ("upstream_attempt_summaries_max", "integer", "Сводки попыток", "retries",
          "Сколько последних сводок попыток обращения к Retool хранить на диске; 0 — все", None, 0, 100_000, None),
         ("cache_keepwarm_seconds", "integer", "Интервал прогрева", "cache",
-         "Как часто перечитывать начало диалога, чтобы кэш промпта не остыл; 0 — прогрев выключен",
-         "с", 0, 3600, None),
+         "Как часто перечитывать начало диалога, чтобы кэш промпта не остыл; 0 — прогрев выключен. "
+         "Кэш живёт 5 минут, поэтому позже 275 с пинг уже не успевает",
+         "с", 0, int(direct.PING_LATEST), None),
         ("cache_keepwarm_idle", "integer", "Прогрев после запроса", "cache",
          "Сколько секунд после последнего запроса диалог ещё прогревают", "с", 1, 86400, None),
         ("cache_keepwarm_subagent_idle", "integer", "Прогрев субагента", "cache",
@@ -173,7 +175,7 @@ def _schema():
         ("cache_keepwarm_during_turns", "boolean", "Прогрев во время хода", "cache",
          "Прогревать кэш и во время длинного хода, пока модель ещё отвечает", None, None, None, None),
         ("cache_keepwarm_turn_offset", "integer", "Первый прогрев в ходе", "cache",
-         "Через сколько секунд от начала хода отправить первый прогрев", "с", 30, 285, None),
+         "Через сколько секунд от начала хода отправить первый прогрев", "с", 30, int(direct.PING_LATEST), None),
         ("exec_policy", "string", "Локальные команды", "exec",
          "Какие команды модель может выполнить на этой машине: никакие, из списка разрешённых или любые",
          None, None, None, ["off", "allowlist", "allow_all"]),
@@ -272,13 +274,16 @@ def _builtin_prompts():
         "relay_task_variables": list(prompt_policy.RELAY_TASK_VARIABLES),
         "edit_ops": {"client_system": list(prompt_policy.SYSTEM_EDIT_OPS),
                      "mid_system": list(prompt_policy.MID_SYSTEM_MODES),
-                     "user_blocks": list(prompt_policy.USER_BLOCK_OPS), "tools": list(prompt_policy.TOOL_EDIT_OPS)},
+                     "user_blocks": list(prompt_policy.USER_BLOCK_OPS),
+                     # A hidden tool is written {"tool": ..., "hide": true}; the form offers it as one more operation.
+                     "tools": list(dict.fromkeys([*prompt_policy.TOOL_EDIT_OPS, "hide"]))},
         "conditions": {name: {"type": "boolean"} if name in CONDITION_FLAGS else
                        {"type": "string", "glob": True, **({"values": list(values[name])} if name in values else {})}
                        for name in prompt_policy.CONDITIONS},
         "special_uses": list(prompt_policy.SPECIAL_USES),
         "profiles": list(prompt_policy.BUILTIN_PROFILES),
         "profile_name": prompt_policy.PROFILE_NAME.pattern,
+        "text_name": prompt_policy.TEXT_NAME.pattern,
         "limits": {"max_text_bytes": prompt_policy.MAX_TEXT_BYTES,
                    "max_document_bytes": prompt_policy.MAX_DOCUMENT_BYTES},
     }
@@ -359,6 +364,16 @@ def _document_warnings(document):
         if isinstance(rule, dict) and rule.get("override_protected") is True:
             warnings.append("Правило «%s» перекрывает защиту служебных запросов (override_protected)"
                             % (rule.get("name") or "№%d" % (index + 1)))
+    return warnings
+
+
+def _revision_warnings(document, snapshot):
+    """The warnings of a saved revision: what lowers the protection, then what the engine says about the compiled
+    revision (a profile that hides a tool, a text that is never used), each once. GET and PUT answer with this list."""
+    warnings = _document_warnings(document) if isinstance(document, dict) else []
+    for item in getattr(snapshot, "warnings", None) or ():
+        if str(item) not in warnings:
+            warnings.append(str(item))
     return warnings
 
 
@@ -1095,7 +1110,7 @@ class Admin:
         document = snapshot.document if snapshot is not None else None
         return {"document": document, "rev": snapshot.rev if snapshot is not None else None,
                 "path": str(getattr(store, "path", "") or ""), "errors": store.errors(),
-                "warnings": _document_warnings(document) if document else [],
+                "warnings": _revision_warnings(document, snapshot),
                 "legacy": {"mode": self.cfg.get("relay_system_prompt_mode", "standalone"),
                            "role_chars": len(relay_policy(self.cfg.get("relay_system_prompt")))},
                 "builtin": _builtin_prompts()}
@@ -1136,9 +1151,7 @@ class Admin:
             journal.emit("admin.prompts",
                          "Промпты сохранены, ревизия %s: %s" % (snapshot.rev, shown or "без изменений"), "info",
                          rev=snapshot.rev, changed_paths=changed[:CHANGED_PATHS_LIMIT], sha8=prompt_policy.sha8(text))
-        warnings = _document_warnings(document)
-        warnings += [str(item) for item in getattr(snapshot, "warnings", None) or () if str(item) not in warnings]
-        return {"rev": snapshot.rev, "warnings": warnings}
+        return {"rev": snapshot.rev, "warnings": _revision_warnings(document, snapshot)}
 
     def _prompts_preview(self, handler, store):
         data = self._prompts_body(handler)

@@ -80,7 +80,7 @@ def test_the_head_is_the_composed_template(store):
     assert result["head"] == "My rules.\n\n" + expected
     assert result["edits_unmatched"] == [{"scope": "client_system", "index": 1, "op": "remove_tag", "target": "missing"}]
     assert [e["matched"] for e in result["edits"]] == [True, False]
-    assert any("client_system.edits[1] (remove_tag missing) matched nothing" == line for line in result["warnings"])
+    assert any("client_system.edits[1] (remove_tag) matched nothing" == line for line in result["warnings"])
     assert any("{{relay_task}} is empty" in line for line in result["warnings"])
 
 
@@ -224,8 +224,10 @@ def test_an_invalid_draft_is_reported_with_its_path(store):
 
 def test_a_draft_reads_its_text_files_next_to_the_prompts_file(tmp_path):
     store = make_store(tmp_path)
-    (tmp_path / "t.md").write_text("FROM FILE", encoding="utf-8")
-    draft = document(texts={"t": {"file": "t.md"}}, profiles={"d": {"head": "{{text:t}}"}}, default_profile="d")
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "t.md").write_text("FROM FILE", encoding="utf-8")
+    draft = document(texts={"t": {"file": "prompts/t.md"}}, profiles={"d": {"head": "{{text:t}}"}},
+                     default_profile="d")
     assert store.preview(chat(), "chat", {}, document=draft)["head"] == "FROM FILE"
 
 

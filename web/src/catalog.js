@@ -7,6 +7,7 @@ export const CATEGORIES = {
   session: { label: 'Сессия' },
   auth: { label: 'Авторизация' },
   cache: { label: 'Кэш' },
+  prompt: { label: 'Промпты' },
   admin: { label: 'Админ' },
   relay: { label: 'Relay' },
 };

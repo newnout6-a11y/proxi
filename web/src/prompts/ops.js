@@ -8,7 +8,15 @@ const find = { key: 'find', label: 'Найти', kind: 'area', required: true };
 const replacement = { key: 'with', label: 'Заменить на', kind: 'area' };
 const pattern = { key: 'pattern', label: 'Регулярное выражение', placeholder: '(?s)<env>.*?</env>', required: true, mono: true };
 const flags = { key: 'flags', label: 'Флаги', kind: 'flags' };
-const all = { key: 'all', label: 'Все вхождения', kind: 'bool' };
+const all = { key: 'all', label: 'Все вхождения', kind: 'bool', hint: 'Без галочки заменяется только первое вхождение' };
+
+// What a yes/no field of an edit means while the edit does not say: false, except `all` of replace_text, which the relay
+// reads as true (every occurrence is replaced unless the edit says all: false).
+const FLAG_DEFAULTS = { all: true };
+const defaultOf = (key) => FLAG_DEFAULTS[key] === true;
+
+/** The state of a yes/no field: what the edit says, or the relay's default when it says nothing. */
+export const flagValue = (key, value) => (typeof value === 'boolean' ? value : defaultOf(key));
 
 export const SYSTEM_OPS = {
   remove_section: { label: 'Убрать раздел', hint: 'Заголовок и всё до следующего заголовка того же или более высокого уровня', fields: [heading] },
@@ -120,19 +128,33 @@ export function describeEdit(scope, edit) {
 
 /** A fresh edit with the fields of `op` empty, ready for the form. */
 export function newEdit(scope, op) {
-  if (scope === 'tools') return op === 'hide' ? { tool: '', hide: true } : { tool: '', op };
-  return { op };
+  if (scope === 'tools' && op === 'hide') return { tool: '', hide: true };
+  const fresh = scope === 'tools' ? { tool: '', op } : { op };
+  // The relay wants the replacement in an edit that replaces, though it may be nothing: an edit that starts without one could not delete a text
+  if (SCOPES[scope]?.ops[op]?.fields.some((field) => field.key === 'with')) fresh.with = '';
+  return fresh;
 }
 
 export function opOf(scope, edit) {
   return scope === 'tools' && edit?.hide === true ? 'hide' : edit?.op;
 }
 
-/** Set one field of an edit; an emptied optional field is removed so the saved file stays tidy. */
+// Fields an edit keeps when they are emptied: the relay refuses an edit without its tool, and without its replacement (an empty one deletes)
+const WRITTEN_EMPTY = new Set(['tool', 'with']);
+
+/**
+ * Set one field of an edit. An emptied optional field is removed so the saved file stays tidy; a yes/no field is written
+ * only when it differs from what the relay assumes without it, so unticking "Все вхождения" is an explicit `all: false`.
+ */
 export function setEditField(edit, key, value) {
   const next = { ...edit };
-  const empty = value === '' || value === undefined || value === null || value === false || (Array.isArray(value) && !value.length);
-  if (empty && key !== 'tool') delete next[key];
+  if (typeof value === 'boolean') {
+    if (value === defaultOf(key)) delete next[key];
+    else next[key] = value;
+    return next;
+  }
+  const empty = value === '' || value === undefined || value === null || (Array.isArray(value) && !value.length);
+  if (empty && !(value === '' && WRITTEN_EMPTY.has(key))) delete next[key];
   else next[key] = value;
   return next;
 }

@@ -28,6 +28,7 @@ import json
 import re
 
 import native_history
+import prompt_policy as policy
 
 DEFAULT_REMINDER = "<system-reminder>\n{{text}}\n</system-reminder>"
 SUMMARY_INDEXES = 8
@@ -50,7 +51,9 @@ def rewrite(data: dict, dialect: str, profile: dict, snapshot) -> tuple[dict, li
     """Return (new body, changes) for a profile's history and tools edits.
 
     The input body is never mutated: the result is a deep copy. The same input and the same
-    profile always produce the same bytes (plan I2), and rewrite(rewrite(x)) == rewrite(x).
+    profile always produce the same bytes (plan I2), and rewrite(rewrite(x)) == rewrite(x) except where a deletion joins
+    its neighbours into a new copy of the text it deletes (replace_text find="ab" with "" turns "aabb" into "ab", and a
+    second run into ""): the relay rewrites the history the client sent, once per request, never its own output.
     Each change is a dict such as {"scope": "history", "op": "drop_tag", "edit": 0, "index": 12,
     "target": "tool_result", "removed_chars": 431}.
 
@@ -102,8 +105,12 @@ def rewrite(data: dict, dialect: str, profile: dict, snapshot) -> tuple[dict, li
     * kept: a dropped or converted system message that carried output_config / clear_at leaves a
       blank entry with exactly those fields, so effort and structured output do not change; kept
       names them.
-    * skipped: True with a short reason when the edit was refused on this request. No change
-      entry at all means the edit did not match anything (the preview shows it as unmatched).
+    * skipped: True with a short reason when the edit was refused on this request: why a deletion would break the
+      conversation, or "timeout" (a pattern did not finish in policy.REGEX_TIMEOUT, or the regex time of the call,
+      policy.REGEX_BUDGET, was spent) or "too_large" (the edit would add more than policy.MAX_EDIT_GROWTH characters to
+      one text, or the edits of the section more than policy.MAX_BODY_GROWTH in all: history and tools count apart, in the
+      order of the messages and tools, so a conversation that grows keeps the decisions it had). The text is then left as
+      it was. No change entry at all means the edit did not match anything (the preview shows it as unmatched).
 
     summarize_changes() condenses the list when the journal should not carry one entry per message.
     """
@@ -183,10 +190,7 @@ def _clone(value):
 
 @functools.lru_cache(maxsize=512)
 def _compile_local(pattern, flags):
-    bits = 0
-    for flag in flags:
-        bits |= _FLAG_BITS[flag]
-    return re.compile(pattern, bits)
+    return policy.compile_pattern(pattern, flags)
 
 
 @functools.lru_cache(maxsize=256)
@@ -203,6 +207,19 @@ class _Context:
     def __init__(self, snapshot, dialect, changes):
         self.snapshot, self.dialect, self.changes = snapshot, dialect, changes
         self._template = _KEEP
+        # The time all the regular expressions of this rewrite may take together (see policy.Deadline).
+        self.deadline = policy.Deadline()
+        # How many characters the edits of the history, and apart from them those of the tools, may still add in all.
+        self.room = {"history": policy.MAX_BODY_GROWTH, "tools": policy.MAX_BODY_GROWTH}
+
+    def allowance(self, scope):
+        """How many characters one edit may add to a text now: its own limit, and what is left of the section's."""
+        return max(0, min(policy.MAX_EDIT_GROWTH, self.room[scope]))
+
+    def grew(self, scope, characters):
+        """An edit of `scope` made a text `characters` longer (or shorter, then nothing is used up)."""
+        if characters > 0:
+            self.room[scope] -= characters
 
     @property
     def template(self):
@@ -218,9 +235,13 @@ class _Context:
                 self._template = value if isinstance(value, str) and value else None
         return self._template
 
+    @staticmethod
+    def flags(flags):
+        return "".join(flags) if isinstance(flags, (list, tuple)) else flags if isinstance(flags, str) else ""
+
     def regex(self, pattern, flags):
         """Compiled once with the revision (snapshot.regex); a local cache when the snapshot cannot."""
-        flags = "".join(flags) if isinstance(flags, (list, tuple)) else flags if isinstance(flags, str) else ""
+        flags = self.flags(flags)
         getter = getattr(self.snapshot, "regex", None)
         if getter is not None:
             try:
@@ -235,65 +256,73 @@ class _Context:
 
 # ---------------------------------------------------------------------------------------------
 # text edits shared by history.user_blocks and tools.edits: fn(text) -> (new, removed, added) | None
+# A fn may raise policy.EditRefused (a pattern out of time): the rule is then skipped for that text.
 # ---------------------------------------------------------------------------------------------
 
-def _remove_regex_fn(rx):
+def _remove_regex_fn(rx, context):
     def apply(text):
-        new, count = rx.subn("", text)
+        new, count = policy.regex_remove(rx, text, context.deadline)
         if not count or new == text:
             return None
         return new, len(text) - len(new), 0
     return apply
 
 
-def _replace_regex_fn(rx, template):
+def _replace_regex_fn(rx, template, context, scope):
     def apply(text):
-        removed = added = 0
-
-        def swap(match):
-            nonlocal removed, added
-            value = match.expand(template)
-            removed += len(match.group(0))
-            added += len(value)
-            return value
-
-        new = rx.sub(swap, text)
+        new, _count, removed, added = policy.regex_replace(rx, template, text, context.deadline, context.allowance(scope))
         if new == text:
             return None
         return new, removed, added
     return apply
 
 
-def _replace_text_fn(find, replacement, replace_all):
+def _replace_text_fn(find, replacement, replace_all, context, scope):
     if find in replacement and replacement != find:
-        # A plain replace would grow the text on every run; text that already reads `replacement` is left alone.
-        both = re.compile(re.escape(replacement) + "|" + re.escape(find))
-
+        # A plain replace would grow the text on every run; text that already reads `replacement` is left alone. The
+        # first place that reads `find` or already reads `replacement` is the one that counts when only one is replaced.
+        # (Found with str.find hops: a pattern made of two long literals is slow on a text full of their prefixes, and
+        # `re` would hold the GIL for all of it.)
         def apply(text):
             if find not in text:
                 return None
-            removed = added = 0
-            done = False
-
-            def swap(match):
-                nonlocal removed, added, done
-                if done:
-                    return match.group(0)
-                done = not replace_all
-                if match.group(0) == replacement:
-                    return replacement
+            room = context.allowance(scope)
+            pieces, position, removed, added = [], 0, 0, 0
+            copy = text.find(replacement)                       # the next copy of the replacement, or -1
+            while True:
+                at = text.find(find, position)
+                if at < 0:
+                    break
+                if copy != -1 and copy < position:
+                    copy = text.find(replacement, position)
+                if copy != -1 and copy <= at:                  # a copy stands first: it stays as it is
+                    if not replace_all:
+                        break
+                    pieces.append(text[position:copy + len(replacement)])
+                    position = copy + len(replacement)
+                    continue
+                pieces.append(text[position:at])
+                pieces.append(replacement)
+                position = at + len(find)
                 removed += len(find)
                 added += len(replacement)
-                return replacement
-
-            new = both.sub(swap, text)
-            return None if new == text else (new, removed, added)
+                if added - removed > room:
+                    raise policy.EditTooLarge("the replacement would make the text more than %d characters longer" % room)
+                if not replace_all:
+                    break
+            if not removed:
+                return None
+            pieces.append(text[position:])
+            return "".join(pieces), removed, added
         return apply
 
     def apply(text):
         if find not in text:
             return None
         count = text.count(find) if replace_all else 1
+        if count * (len(replacement) - len(find)) > context.allowance(scope):
+            raise policy.EditTooLarge("the replacement would make the text more than %d characters longer"
+                                      % context.allowance(scope))
         new = text.replace(find, replacement, -1 if replace_all else 1)
         return new, count * len(find), count * len(replacement)
     return apply
@@ -329,23 +358,30 @@ def _tag_pairs(text, rx):
 
 def _select_blocks(text, pairs, accept):
     """Spans [start, end) of the outermost blocks to cut: they start a line (or follow a cut block on its
-    line, since that is where they will stand once it is gone) and accept(block text) holds."""
-    spans, covered = [], -1
+    line, since that is where they will stand once it is gone) and accept(block text) holds.
+
+    Whether only blanks lie between the last cut block and a block in the middle of a line is read once per cut block
+    (blanks_end), not once per block: a long run of blanks behind a cut would otherwise be read again for every block after it.
+    """
+    spans, covered, blanks_end = [], -1, None
     for start, end, anchor in pairs:
         if start < covered:
             continue
         if anchor is not None:
             begin = anchor
         else:
-            scan = covered
-            while 0 <= scan < start and text[scan] in " \t":
-                scan += 1
-            if scan != start or covered < 0:
+            if covered < 0:
+                continue
+            if blanks_end is None:
+                blanks_end = covered
+                while blanks_end < len(text) and text[blanks_end] in " \t":
+                    blanks_end += 1
+            if blanks_end != start:
                 continue
             begin = covered
         if accept(text[start:end]):
             spans.append((begin, end))
-            covered = end
+            covered, blanks_end = end, None
     return spans
 
 
@@ -389,12 +425,13 @@ def _cut(text, spans):
     return "".join(parts) + rest
 
 
-def _drop_tag_fn(tag, contains, pattern):
+def _drop_tag_fn(tag, contains, pattern, context):
     rx = _tag_regex(tag)
     opener = "<" + tag
 
     def accept(block):
-        return (not contains or contains in block) and (pattern is None or pattern.search(block) is not None)
+        return ((not contains or contains in block)
+                and (pattern is None or policy.regex_search(pattern, block, context.deadline) is not None))
 
     def apply(text):
         if opener not in text or (contains and contains not in text):
@@ -411,8 +448,8 @@ def _drop_tag_fn(tag, contains, pattern):
     return apply
 
 
-def _text_op(context, spec, ops):
-    """(fn, None) for one rule, or (None, reason) when the rule cannot be applied."""
+def _text_op(context, spec, ops, scope):
+    """(fn, None) for one rule of `scope` ("history" or "tools"), or (None, reason) when the rule cannot be applied."""
     op = spec.get("op")
     if op not in ops:
         return None, "unsupported op"
@@ -429,26 +466,35 @@ def _text_op(context, spec, ops):
                 # A filter this module cannot read must not widen the rule to every block.
                 return None, "invalid contains"
             compiled = context.regex(pattern, spec.get("flags")) if pattern else None
-            return _drop_tag_fn(tag, contains or None, compiled), None
+            return _drop_tag_fn(tag, contains or None, compiled, context), None
         if op in ("remove_regex", "replace_regex"):
             pattern = spec.get("pattern")
             if not isinstance(pattern, str) or not pattern:
                 return None, "missing pattern"
             rx = context.regex(pattern, spec.get("flags"))
             if op == "remove_regex":
-                return _remove_regex_fn(rx), None
+                return _remove_regex_fn(rx, context), None
             template = spec.get("with")
             template = template if isinstance(template, str) else ""
-            rx.sub(template, "")                # a replacement that cannot be expanded fails here, not on some message
-            return _replace_regex_fn(rx, template), None
+            _check_template(pattern, context.flags(spec.get("flags")), template)
+            return _replace_regex_fn(rx, template, context, scope), None
         find = spec.get("find")
         if not isinstance(find, str) or not find:
             return None, "missing find"
         replacement = spec.get("with")
         return _replace_text_fn(find, replacement if isinstance(replacement, str) else "",
-                                spec.get("all", True) is not False), None
-    except (re.error, KeyError, ValueError, TypeError, IndexError):
+                                spec.get("all", True) is not False, context, scope), None
+    except (*policy.REGEX_ERRORS, KeyError, ValueError, TypeError, IndexError):
         return None, "invalid pattern"
+
+
+def _check_template(pattern, flags, template):
+    """A replacement that cannot be expanded fails here, not on some message: the stdlib parser judges the template, since
+    the regex module looks at one only when something matches. A template it takes, the regex module expands the same way."""
+    bits = 0
+    for flag in flags:
+        bits |= _FLAG_BITS[flag]
+    re.compile(pattern, bits).sub(template, "")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -681,6 +727,11 @@ class _Walk:
             replacement = None
         else:
             rendered = _render_reminder(self.context.template, text) if mode == "wrap" else text
+            if len(rendered) - len(text) > self.context.room["history"]:
+                self.context.skipped("history", "mid_system", "too_large", mode=mode, index=origin, target="system")
+                self.keep(message, "U", index)
+                return None
+            self.context.grew("history", len(rendered) - len(text))
             change.update(removed_chars=0, added_chars=len(rendered) - len(text))
             replacement = _as_user_message(message, rendered, self.dialect)
         if kept:
@@ -698,7 +749,11 @@ class _Walk:
         field = "output" if self.dialect == "responses" and kind == "T" and message.get("output") is not None \
             else "content"
         for position, op, fn in self.edits:
-            res = _map_content(message.get(field), fn, self.dialect == "anthropic")
+            try:
+                res = _map_content(message.get(field), fn, self.dialect == "anthropic")
+            except policy.EditRefused as refused:
+                self.context.skipped("history", op, refused.reason, edit=position, index=origin, target=target)
+                continue
             if res is None:
                 continue
             value, removed, added, empty = res
@@ -713,6 +768,7 @@ class _Walk:
                 self.rebuilt = True
                 return None
             message[field] = "" if empty else value
+            self.context.grew("history", added - removed)
             self.changes.append(change)
         return message
 
@@ -723,7 +779,7 @@ def _rewrite_history(out, context, history):
     for position, spec in enumerate(history.get("user_blocks") or []):
         if not isinstance(spec, dict):
             continue
-        fn, reason = _text_op(context, spec, ("drop_tag", "remove_regex", "replace_text"))
+        fn, reason = _text_op(context, spec, ("drop_tag", "remove_regex", "replace_text"), "history")
         if fn is None:
             context.skipped("history", str(spec.get("op")), reason, edit=position)
         else:
@@ -844,11 +900,18 @@ def _called_names(out, dialect):
 def _description_fn(context, spec):
     op = spec.get("op")
     text = spec.get("text") if isinstance(spec.get("text"), str) else ""
+
+    def check(growth):
+        if growth > context.allowance("tools"):
+            raise policy.EditTooLarge("the text would make the description more than %d characters longer"
+                                      % context.allowance("tools"))
+
     if op == "append":
         def apply(old):
             if not text.strip() or text.strip() in old:
                 return None
             new = old + "\n\n" + text if old.strip() else text
+            check(len(new) - len(old))
             return new, 0, len(new) - len(old)
         return apply, None
     if op == "prepend":
@@ -856,13 +919,17 @@ def _description_fn(context, spec):
             if not text.strip() or text.strip() in old:
                 return None
             new = text + "\n\n" + old if old.strip() else text
+            check(len(new) - len(old))
             return new, 0, len(new) - len(old)
         return apply, None
     if op == "set":
         def apply(old):
-            return None if old == text else (text, len(old), len(text))
+            if old == text:
+                return None
+            check(len(text) - len(old))
+            return text, len(old), len(text)
         return apply, None
-    return _text_op(context, spec, ("replace_text", "replace_regex"))
+    return _text_op(context, spec, ("replace_text", "replace_regex"), "tools")
 
 
 class _Hide:
@@ -923,9 +990,14 @@ def _rewrite_tools(out, context, tools_config):
                                 "removed_chars": len(json.dumps(entry.item, ensure_ascii=False, default=str))})
                 continue
             old = entry.fields.get("description")
-            res = fn(old if isinstance(old, str) else "")
+            try:
+                res = fn(old if isinstance(old, str) else "")
+            except policy.EditRefused as refused:
+                context.skipped("tools", op, refused.reason, edit=position, index=entry.top, tool=entry.name)
+                continue
             if res is not None:
                 entry.fields["description"] = res[0]
+                context.grew("tools", res[2] - res[1])
                 changes.append({"scope": "tools", "op": op, "edit": position, "index": entry.top, "tool": entry.name,
                                 "removed_chars": res[1], "added_chars": res[2]})
     if hide is None or not hide.hidden:

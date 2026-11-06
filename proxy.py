@@ -34,7 +34,7 @@ import prompt_policy
 import validate
 from accounts import UNNAMED, AccountDispatcher, account_tag
 from credits import CreditsManager
-from orchestrator import TurnRunner, acquire_plan, journal_changes
+from orchestrator import TurnRunner, acquire_plan, client_origin, journal_changes
 from session import Backend, SessionPool
 from upstream_diagnostics import WireTrace
 from io_workers import DaemonIOExecutor
@@ -173,6 +173,11 @@ class Runtime:
         finally:
             # The writer finishes what is queued (bounded), so a normal stop loses nothing it was handed.
             self.pool.close_store()
+            # The conversation pins of prompts.json go to disk with the state they keep usable.
+            try:
+                getattr(self.prompts, "close", lambda: None)()
+            except Exception:  # noqa: BLE001 - a pins write must never keep the relay from stopping
+                pass
             self._io_executor.shutdown(wait=False, cancel_futures=True)
             self.loop.call_soon_threadsafe(self.loop.stop)
             self._loop_thread.join(timeout=2)
@@ -532,7 +537,17 @@ def make_handler(runtime: Runtime):
             return model_catalog.catalog_routable(model, cfg, runtime.accounts.backends)
 
         def _with_prompts(self, build):
-            """build(current prompts snapshot or None); a failing prompt layer must not take model discovery down."""
+            """build(current prompts snapshot or None); a failing prompt layer must not take model discovery down.
+
+            The catalogs are read by clients that never send a completion (a model picker, Codex at start), so they look
+            at the prompts file themselves: a file written, changed or removed shows in the next listing. The store
+            stats the disk at most once a second, so a busy catalog costs nothing."""
+            try:
+                runtime.prompts.maybe_reload()
+            except Exception as exc:
+                journal.emit("prompt.runtime_error", "Каталог моделей не перечитал файл промптов: %s: %s" % (
+                    type(exc).__name__, redact(str(exc)).replace("\n", " ")[:160]), "error",
+                             request_id=self.request_id, stage="reload")
             snapshot = runtime.prompts.snapshot()
             try:
                 return build(snapshot)
@@ -628,12 +643,14 @@ def make_handler(runtime: Runtime):
                 self._client_trace.event("client_request", method=self.command, path=self.path, dialect=dialect)
             data = validate.load_json(raw)
             self._bind_client(data)
-            if dialect == "anthropic":
-                parsed = validate.parse_anthropic(data, cfg)
-            elif dialect == "responses":
-                parsed = validate.parse_responses(data, cfg)
-            else:
-                parsed = validate.parse_chat(data, cfg)
+            fetches = validate.ImageFetches()
+            with fetches:
+                if dialect == "anthropic":
+                    parsed = validate.parse_anthropic(data, cfg)
+                elif dialect == "responses":
+                    parsed = validate.parse_responses(data, cfg)
+                else:
+                    parsed = validate.parse_chat(data, cfg)
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
                 data, self.headers, client_context.current())
             parsed.request_id = self.request_id
@@ -646,21 +663,15 @@ def make_handler(runtime: Runtime):
             parsed.client_task = client_context.client_task(parsed)
             if parsed.client_task:
                 client_context.bind({**client_context.current(), "client_task": parsed.client_task})
-            # The pool is asked about the accounts this very request would run on (acquire reads the same plan).
+            # The pool is asked about the accounts this very request would run on (acquire reads the same plan). The plan
+            # follows the request as the client sent it (plan I9): a profile that hides every tool does not move the
+            # conversation to another session, so what is asked here holds for the body a profile rewrites as well.
             scope = acquire_plan(cfg, parsed).kwargs
             refusal = runtime.pool.model_refusal(parsed.entry, **scope)
             if refusal is not None:
                 raise refusal
-            before = parsed
-            parsed = self._apply_prompts(data, parsed, dialect, len(raw))
-            if parsed is not before:
-                # An edited body can change what acquire() would plan (a profile that hides every tool).
-                changed = acquire_plan(cfg, parsed).kwargs
-                if changed != scope:
-                    scope = changed
-                    refusal = runtime.pool.model_refusal(parsed.entry, **scope)
-                    if refusal is not None:
-                        raise refusal
+            parsed = self._apply_prompts(data, parsed, dialect, len(raw), fetches)
+            fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
             self._effort_str = effective_effort or (
@@ -737,7 +748,7 @@ def make_handler(runtime: Runtime):
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
 
-        def _apply_prompts(self, data, parsed, dialect, size):
+        def _apply_prompts(self, data, parsed, dialect, size, fetches=None):
             """The prompt hooks of a completion (plan section 3): the plan, a second parse of an edited body, the generation.
 
             Returns the request the turn runs on: `parsed` itself, or the parse of the body a profile rewrote. A refusal
@@ -773,11 +784,21 @@ def make_handler(runtime: Runtime):
                         raise TypeError("prompt_body.rewrite returned changes that are not a list of dicts")
                     parse = {"anthropic": validate.parse_anthropic,
                              "responses": validate.parse_responses}.get(dialect, validate.parse_chat)
-                    parsed = parse(rewritten, cfg)
+                    if fetches is None:
+                        parsed = parse(rewritten, cfg)
+                    else:
+                        # The rewrite leaves the images alone: the second parse takes the ones the first downloaded.
+                        fetches.reuse = True
+                        with fetches:
+                            parsed = parse(rewritten, cfg)
                     for name in _CARRIED_OVER:
                         if hasattr(first, name):
                             setattr(parsed, name, getattr(first, name))
                     _carry_compatibility(first, parsed, changes)
+                    # Who owns the request, whether anything runs for it and which session it takes follow the body the
+                    # client sent, never the one the profile made of it (plan I9): hiding every tool must not turn a
+                    # client's job into a relay task.
+                    parsed.prompt_origin = client_origin(first)
                 except Exception as exc:
                     self._prompt_failure("rewrite", exc)
                     first.prompt_plan = prompt_policy.Plan()
@@ -786,7 +807,9 @@ def make_handler(runtime: Runtime):
             self._apply_generation(parsed, plan, warnings)
             parsed.prompt_plan, parsed.prompt_input = plan, plan_input
             parsed.prompt_changes, parsed.prompt_warnings = changes, warnings
-            if size <= RECORD_REQUEST_BYTES:
+            # The preview replays the few newest bodies. A protected service request (Claude Code's Auto mode asks
+            # a classifier at every tool call) would fill those places: its head and parts are recorded, its body is not.
+            if size <= RECORD_REQUEST_BYTES and not plan.protected:
                 parsed.prompt_request = {"body": data, "dialect": dialect,
                                          "headers": client_context.recorded_headers(self.headers)}
             return parsed
@@ -803,7 +826,9 @@ def make_handler(runtime: Runtime):
                 except apierr.ApiError as error:
                     raise apierr.bad_request("profile '%s' sets generation.effort to '%s': %s" % (
                         plan.profile, effort, error.message), param=where + "effort")
-                parsed.effort, parsed.requested_effort = resolved, str(effort).lower()
+                # requested_effort stays what the client sent: the journal tells the profile's effort apart from it
+                # (turn.begin: effort_source "profile"), and a compaction may still keep the dialog's own one after it.
+                parsed.effort, parsed.prompt_effort = resolved, str(effort).lower()
             if verbosity is not None:
                 if verbosity not in ("low", "medium", "high"):
                     raise apierr.bad_request("profile '%s' sets generation.verbosity to '%s': it must be low, medium "

@@ -251,8 +251,9 @@ def test_the_snapshot_keeps_a_copy_of_the_document_and_hands_out_copies(tmp_path
 
 
 def test_a_snapshot_can_be_built_directly_from_a_document(tmp_path):
-    (tmp_path / "t.md").write_text("FILE", encoding="utf-8")
-    doc = document(texts={"a": {"file": "t.md"}}, profiles={"p": {"client_system": {"edits": [
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "t.md").write_text("FILE", encoding="utf-8")
+    doc = document(texts={"a": {"file": "prompts/t.md"}}, profiles={"p": {"client_system": {"edits": [
         {"op": "append", "text": "{{text:a}}"}]}}})
     snapshot = pp.Snapshot(3, doc, str(tmp_path / "prompts.json"))
     assert snapshot.rev == 3 and snapshot.source_path == str(tmp_path / "prompts.json")
@@ -273,9 +274,16 @@ def file_doc(name):
         {"op": "append", "text": "{{text:t}}"}]}}})
 
 
+def put_text(tmp_path, name, content="A"):
+    """Write prompts/<name> next to the prompts file (the only place a {"file": ...} text is read from)."""
+    target = pathlib.Path(tmp_path) / "prompts" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content if isinstance(content, bytes) else content.encode("utf-8"))
+    return target
+
+
 def test_a_text_file_is_read_as_utf8_without_bom_with_unix_newlines(tmp_path):
-    (tmp_path / "prompts").mkdir()
-    (tmp_path / "prompts" / "a.md").write_bytes("\ufeffпервая\r\nвторая\rтретья\n".encode("utf-8"))
+    put_text(tmp_path, "a.md", "\ufeffпервая\r\nвторая\rтретья\n")
     snapshot = compile_doc(file_doc("prompts/a.md"), tmp_path)
     assert text_of(snapshot) == "первая\nвторая\nтретья\n"
     path, mtime, size = snapshot.files[0]
@@ -284,8 +292,9 @@ def test_a_text_file_is_read_as_utf8_without_bom_with_unix_newlines(tmp_path):
 
 
 def test_the_same_file_is_read_once_and_listed_once(tmp_path):
-    (tmp_path / "a.md").write_text("A", encoding="utf-8")
-    doc = document(texts={"x": {"file": "a.md"}, "y": {"file": "./a.md"}, "z": {"file": ".//a.md"}})
+    put_text(tmp_path, "a.md")
+    doc = document(texts={"x": {"file": "prompts/a.md"}, "y": {"file": "./prompts/a.md"},
+                          "z": {"file": ".//prompts//a.md"}})
     assert len(compile_doc(doc, tmp_path).files) == 1
 
 
@@ -295,14 +304,15 @@ def test_a_missing_file_is_an_error_at_its_path(tmp_path):
 
 
 def test_a_directory_is_not_a_text(tmp_path):
-    (tmp_path / "prompts").mkdir()
-    error = rejected(file_doc("prompts"), tmp_path)
+    (tmp_path / "prompts" / "folder.md").mkdir(parents=True)
+    error = rejected(file_doc("prompts/folder.md"), tmp_path)
     assert error.path == "texts.t.file" and "regular file" in error.message
+    assert "must name a .md or .txt file" in rejected(file_doc("prompts"), tmp_path).message
 
 
 def test_a_file_that_is_not_utf8_is_refused(tmp_path):
-    (tmp_path / "a.md").write_bytes(b"\xff\xfeh\x00i\x00")
-    error = rejected(file_doc("a.md"), tmp_path)
+    put_text(tmp_path, "a.md", b"\xff\xfeh\x00i\x00")
+    error = rejected(file_doc("prompts/a.md"), tmp_path)
     assert "UTF-8" in error.message
 
 
@@ -329,47 +339,47 @@ def test_devices_streams_wildcards_and_special_names_are_never_read_as_texts(tmp
     assert error.path == "texts.t.file"
 
 def test_an_absolute_path_inside_the_folder_is_still_refused(tmp_path):
-    (tmp_path / "a.md").write_text("A", encoding="utf-8")
-    error = rejected(file_doc(str(tmp_path / "a.md")), tmp_path)
+    put_text(tmp_path, "a.md")
+    error = rejected(file_doc(str(tmp_path / "prompts" / "a.md")), tmp_path)
     assert error.path == "texts.t.file" and "relative path" in error.message
 
 
 def test_a_symlink_that_leads_out_is_refused(tmp_path):
     inner, outside = tmp_path / "inner", tmp_path / "outside"
-    inner.mkdir()
+    (inner / "prompts").mkdir(parents=True)
     outside.mkdir()
     (outside / "secret.md").write_text("SECRET", encoding="utf-8")
     try:
-        os.symlink(outside / "secret.md", inner / "file-link.md")
-        os.symlink(outside, inner / "dir-link", target_is_directory=True)
+        os.symlink(outside / "secret.md", inner / "prompts" / "file-link.md")
+        os.symlink(outside, inner / "prompts" / "dir-link", target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("symbolic links are not available here")
-    for name in ("file-link.md", "dir-link/secret.md"):
+    for name in ("prompts/file-link.md", "prompts/dir-link/secret.md"):
         error = rejected(file_doc(name), inner)
-        assert error.path == "texts.t.file" and "inside the folder" in error.message
+        assert error.path == "texts.t.file" and "inside the prompts/ folder" in error.message
 
 
 def test_a_symlink_that_stays_inside_is_fine(tmp_path):
-    (tmp_path / "real.md").write_text("REAL", encoding="utf-8")
+    put_text(tmp_path, "real.md", "REAL")
     try:
-        os.symlink(tmp_path / "real.md", tmp_path / "alias.md")
+        os.symlink(tmp_path / "prompts" / "real.md", tmp_path / "prompts" / "alias.md")
     except (OSError, NotImplementedError):
         pytest.skip("symbolic links are not available here")
-    assert text_of(compile_doc(file_doc("alias.md"), tmp_path)) == "REAL"
+    assert text_of(compile_doc(file_doc("prompts/alias.md"), tmp_path)) == "REAL"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="junctions exist on Windows")
 def test_a_junction_that_leads_out_is_refused(tmp_path):
     inner, outside = tmp_path / "inner", tmp_path / "outside"
-    inner.mkdir()
+    (inner / "prompts").mkdir(parents=True)
     outside.mkdir()
     (outside / "secret.md").write_text("SECRET", encoding="utf-8")
-    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(inner / "junction"), str(outside)],
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(inner / "prompts" / "junction"), str(outside)],
                           capture_output=True, text=True)
     if made.returncode != 0:
         pytest.skip("cannot create a junction: " + made.stdout + made.stderr)
-    error = rejected(file_doc("junction/secret.md"), inner)
-    assert error.path == "texts.t.file" and "inside the folder" in error.message
+    error = rejected(file_doc("prompts/junction/secret.md"), inner)
+    assert error.path == "texts.t.file" and "inside the prompts/ folder" in error.message
 
 
 def test_a_text_limit_applies_to_strings_and_files_alike(tmp_path):
@@ -380,10 +390,10 @@ def test_a_text_limit_applies_to_strings_and_files_alike(tmp_path):
     assert rejected(document(texts={"a": "x" * (limit + 1)}), tmp_path).path == "texts.a"
     # the limit counts bytes, not characters
     assert rejected(document(texts={"a": "я" * (limit // 2 + 1)}), tmp_path).path == "texts.a"
-    (tmp_path / "big.md").write_bytes(b"x" * (limit + 1))
-    assert rejected(document(texts={"a": {"file": "big.md"}}), tmp_path).path == "texts.a.file"
-    (tmp_path / "ok.md").write_bytes(b"x" * limit)
-    compile_doc(document(texts={"a": {"file": "ok.md"}}), tmp_path)
+    put_text(tmp_path, "big.md", b"x" * (limit + 1))
+    assert rejected(document(texts={"a": {"file": "prompts/big.md"}}), tmp_path).path == "texts.a.file"
+    put_text(tmp_path, "ok.md", b"x" * limit)
+    compile_doc(document(texts={"a": {"file": "prompts/ok.md"}}), tmp_path)
     assert rejected(profile_doc(head="x" * (limit + 1)), tmp_path).path == "profiles.p.head"
 
 
@@ -393,8 +403,8 @@ def test_a_document_with_its_files_is_limited_to_two_mebibytes(tmp_path):
     assert rejected(document(texts=texts), tmp_path).path == ""
     files = {}
     for index in range(9):
-        (tmp_path / f"f{index}.md").write_bytes(b"y" * (255 * 1024))
-        files[f"t{index}"] = {"file": f"f{index}.md"}
+        put_text(tmp_path, f"f{index}.md", b"y" * (255 * 1024))
+        files[f"t{index}"] = {"file": f"prompts/f{index}.md"}
     error = rejected(document(texts=files), tmp_path)
     assert error.path == "texts.t8.file" and "together" in error.message
 
@@ -425,11 +435,11 @@ def test_the_expansion_of_texts_is_bounded(tmp_path):
 
 
 def test_head_may_come_from_a_file_and_keeps_its_variables(tmp_path):
-    (tmp_path / "head.md").write_text("A\n\n{{client_system}}\n", encoding="utf-8")
-    snapshot = compile_doc(profile_doc(head={"file": "head.md"}), tmp_path)
+    put_text(tmp_path, "head.md", "A\n\n{{client_system}}\n")
+    snapshot = compile_doc(profile_doc(head={"file": "prompts/head.md"}), tmp_path)
     assert snapshot.profile("p")["head"] == "A\n\n{{client_system}}\n"
-    (tmp_path / "bad.md").write_text("{{unknown}}", encoding="utf-8")
-    assert rejected(profile_doc(head={"file": "bad.md"}), tmp_path).path == "profiles.p.head"
+    put_text(tmp_path, "bad.md", "{{unknown}}")
+    assert rejected(profile_doc(head={"file": "prompts/bad.md"}), tmp_path).path == "profiles.p.head"
 
 
 # -- normalized profiles ---------------------------------------------------------------------------------------------
@@ -558,8 +568,8 @@ def test_an_empty_role_is_a_deliberate_text(tmp_path):
 
 
 def test_relay_texts_may_come_from_files(tmp_path):
-    (tmp_path / "role.md").write_bytes(b"FILE ROLE\r\n")
-    snapshot = compile_doc(document(relay_texts={"role": {"file": "role.md"}}), tmp_path)
+    put_text(tmp_path, "role.md", b"FILE ROLE\r\n")
+    snapshot = compile_doc(document(relay_texts={"role": {"file": "prompts/role.md"}}), tmp_path)
     assert snapshot.relay_text("role") == "FILE ROLE\n"
 
 
@@ -583,16 +593,17 @@ def test_codex_base_for_every_model_or_by_glob(tmp_path):
 
 
 def test_codex_base_from_a_file_or_a_file_per_model(tmp_path):
-    (tmp_path / "base.md").write_text("FROM FILE", encoding="utf-8")
-    assert compile_doc(document(relay_texts={"codex_base": {"file": "base.md"}}), tmp_path).codex_base("m") == "FROM FILE"
-    per_model = compile_doc(document(relay_texts={"codex_base": {"gpt-*": {"file": "base.md"}}}), tmp_path)
+    put_text(tmp_path, "base.md", "FROM FILE")
+    one = compile_doc(document(relay_texts={"codex_base": {"file": "prompts/base.md"}}), tmp_path)
+    assert one.codex_base("m") == "FROM FILE"
+    per_model = compile_doc(document(relay_texts={"codex_base": {"gpt-*": {"file": "prompts/base.md"}}}), tmp_path)
     assert per_model.codex_base("gpt-5") == "FROM FILE"
 
 
 def test_codex_overrides_come_from_the_first_matching_glob(tmp_path):
-    (tmp_path / "persist.md").write_text("PERSIST", encoding="utf-8")
+    put_text(tmp_path, "persist.md", "PERSIST")
     doc = document(codex={"models": {
-        "gpt-6*": {"persistent_instructions": {"file": "persist.md"}, "include_skills_usage_instructions": True},
+        "gpt-6*": {"persistent_instructions": {"file": "prompts/persist.md"}, "include_skills_usage_instructions": True},
         "gpt-*": {"include_plugin_usage_instructions": False, "include_apps_usage_instructions": True},
         "never": {}}})
     snapshot = compile_doc(doc, tmp_path)
@@ -779,9 +790,9 @@ def test_compile_warnings_say_what_is_wrong_and_never_quote_a_text(tmp_path):
 
 RICH = {
     "version": 1, "default_profile": "p", "protected": {"enabled": True},
-    "texts": {"t": "TXT", "f": {"file": "a.md"}},
-    "relay_texts": {"role": "R", "native_role": {"file": "a.md"}, "structured": "{{default}} {{schema}} {{schema_name}}",
-                    "reminder": "<r>{{text}}</r>", "codex_base": {"gpt-*": "x", "claude-*": {"file": "a.md"}}},
+    "texts": {"t": "TXT", "f": {"file": "prompts/a.md"}},
+    "relay_texts": {"role": "R", "native_role": {"file": "prompts/a.md"}, "structured": "{{default}} {{schema}} {{schema_name}}",
+                    "reminder": "<r>{{text}}</r>", "codex_base": {"gpt-*": "x", "claude-*": {"file": "prompts/a.md"}}},
     "profiles": {"p": {"description": "d", "head": "{{text:t}}\n{{client_system}}", "client_system": {"edits": [
         {"op": "remove_section", "heading": "# A"}, {"op": "keep_sections", "headings": ["# B"]},
         {"op": "remove_tag", "tag": "t"}, {"op": "keep_tag_inner", "tag": "u"},
@@ -831,7 +842,7 @@ def change(doc, path, value, delete=False):
 
 
 def test_no_mutation_of_a_valid_document_escapes_as_anything_but_a_config_error(tmp_path):
-    (tmp_path / "a.md").write_text("file text", encoding="utf-8")
+    put_text(tmp_path, "a.md", "file text")
     compile_doc(RICH, tmp_path)
     cases = 0
     for path in every_path(RICH):

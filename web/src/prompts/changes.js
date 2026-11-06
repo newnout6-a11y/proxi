@@ -1,7 +1,7 @@
 // How a change the relay reports reads on screen: the report on the edits of the client's system (edits), the edits that
 // matched nothing (edits_unmatched), and what was done to the history and the tools (history_changes, tools_changes).
 // The fields the relay documents are read by name; whatever else an item carries is still shown, never dropped.
-import { fmtInt, isNum } from '../format.js';
+import { fmtInt, isNum, plural } from '../format.js';
 import { MID_SYSTEM_MODES, SYSTEM_OPS, TOOL_OPS, USER_BLOCK_OPS } from './ops.js';
 import { isObject } from './draft.js';
 
@@ -17,7 +17,7 @@ const FIELDS = [
 const LABELS = new Map(FIELDS);
 const SHOWN = new Set(['op', 'message', 'reason', 'note', 'text', ...LABELS.keys()]);
 // The fields the relay documents for its items: each has its own place on screen, so the rest are listed without them
-const OWN = new Set(['scope', 'op', 'mode', 'edit', 'index', 'target', 'tool', 'removed_chars', 'added_chars', 'deleted', 'kept', 'skipped', 'reason', 'matched', 'message']);
+const OWN = new Set(['scope', 'op', 'mode', 'edit', 'index', 'target', 'tool', 'removed_chars', 'added_chars', 'chars_before', 'chars_after', 'deleted', 'kept', 'skipped', 'reason', 'matched', 'message']);
 
 const clip = (value, size = 80) => {
   const line = String(value).replace(/\s+/g, ' ').trim();
@@ -151,14 +151,48 @@ export function describeUnmatched(item) {
 }
 
 /**
- * {number, title, matched, details} for one entry of the report on the edits of the client's system. `unmatched` is
- * the list of edits that found nothing: it knows what the edit looked for when the report entry does not say.
+ * What an edit of the client's system looks for, from its form in the profile: the heading, the tag, the markers, the text to
+ * find, the pattern, the text to add. Empty when the edit names nothing the screen knows.
  */
-export function describeReport(row, unmatched = []) {
+export function editTarget(edit) {
+  if (!isObject(edit)) return '';
+  if (typeof edit.start === 'string' && edit.start && typeof edit.end === 'string' && edit.end) return `${edit.start} … ${edit.end}`;
+  for (const key of ['heading', 'tag', 'start', 'find', 'pattern', 'text']) {
+    const value = edit[key];
+    if (typeof value === 'string' && value) return value;
+    if (isObject(value) && typeof value.file === 'string' && value.file) return `файл ${value.file}`;
+  }
+  return Array.isArray(edit.headings) ? edit.headings.filter((item) => typeof item === 'string' && item).join(', ') : '';
+}
+
+// The edits that add a text rather than look for one
+const ADDS_TEXT = new Set(['prepend', 'append']);
+
+/** "вырезано 708 символов", "добавлено 1 символ": the change of the length of the system by one edit, from the lengths before and after. */
+function lengthChange(row) {
+  if (!isNum(row.chars_before) || !isNum(row.chars_after)) return '';
+  const delta = row.chars_before - row.chars_after;
+  if (delta === 0) return row.matched === true ? 'текст не изменился' : '';
+  const size = Math.abs(delta);
+  return `${delta > 0 ? 'вырезано' : 'добавлено'} ${fmtInt(size)} ${plural(size, ['символ', 'символа', 'символов'])}`;
+}
+
+/**
+ * {number, title, matched, details} for one entry of the report on the edits of the client's system. The relay's entry says
+ * which edit it is, whether it matched and the length of the system before and after, but not what the edit looks for:
+ * `unmatched` (the edits that found nothing) knows that for a miss, and `edits` (the edits of the profile that answered, in the
+ * order the relay counts them) for the rest. A detail with no name is a sentence of its own.
+ */
+export function describeReport(row, unmatched = [], edits = []) {
   const found = unmatched.find((item) => isObject(item) && item.scope === 'client_system' && item.index === row.index);
-  const target = row.target ?? found?.target;
+  const spec = Array.isArray(edits) ? edits[row.index] : null;
+  // an edit of the form at this place that is not the one the relay reported (the form has changed since) says nothing of it
+  const own = isObject(spec) && spec.op === row.op ? editTarget(spec) : '';
+  const target = [row.target, found?.target, own].find(present);
   const details = [];
-  if (present(target)) details.push([row.matched === false ? 'искали' : 'цель', show(target)]);
+  if (present(target)) details.push([row.matched === false ? 'искали' : ADDS_TEXT.has(row.op) ? 'текст' : 'цель', show(target)]);
+  const change = lengthChange(row);
+  if (change) details.push(['', change]);
   if (amount(row.removed_chars)) details.push(['убрано симв.', fmtInt(row.removed_chars)]);
   if (amount(row.added_chars)) details.push(['добавлено симв.', fmtInt(row.added_chars)]);
   details.push(...extraDetails(row));

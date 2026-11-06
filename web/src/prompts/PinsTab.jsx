@@ -51,13 +51,15 @@ export default function PinsTab({ apiKey, rev, onUnauthorized }) {
   }
 
   const items = pins || [];
+  // A conversation is pinned once for each purpose it has, and an unpin or an apply takes all of them: it is the conversations that are counted
+  const conversations = new Set(items.map((pin) => pin.conversation)).size;
   const now = Date.now() / 1000;
   return (
     <section className="panel p-pins" aria-label="Закреплённые диалоги" ref={root}>
       <div className="panel-head">
         <div>
           <h2>Закреплённые диалоги</h2>
-          <p className="panel-meta">Диалог остаётся на ревизии, с которой начался: смена head посреди диалога сбрасывает кэш. Закрепления живут в памяти relay</p>
+          <p className="panel-meta">Диалог остаётся на ревизии, с которой начался: смена head посреди диалога сбрасывает кэш. Закрепления сохраняются рядом с состоянием диалогов и переживают перезапуск, если сохранение состояния включено; иначе они живут в памяти relay</p>
         </div>
         <div className="head-actions">
           <Button icon={RefreshCw} data-act="refresh" onClick={load}>Обновить</Button>
@@ -73,7 +75,7 @@ export default function PinsTab({ apiKey, rev, onUnauthorized }) {
         <Notice tone="warn" icon={TriangleAlert} role="group" className="p-confirm">
           <h3 tabIndex={-1} ref={heading}>Применить текущую ревизию ко всем диалогам?</h3>
           <p>
-            Закрепления будут сняты у {fmtInt(items.length)} {plural(items.length, ['диалога', 'диалогов', 'диалогов'])}, и на следующем ходу каждый получит ревизию
+            Закрепления будут сняты у {fmtInt(conversations)} {plural(conversations, ['диалога', 'диалогов', 'диалогов'])}, и на следующем ходу каждый получит ревизию
             {rev === null ? '' : ` ${rev}`}. Это не бесплатно: смена head, истории или инструментов посреди диалога сбрасывает кэш промпта и подписи thinking,
             поэтому следующий ход каждого активного диалога заплатит за полную запись кэша. На большом диалоге это порядка 10–44 кредитов
           </p>
@@ -89,20 +91,26 @@ export default function PinsTab({ apiKey, rev, onUnauthorized }) {
       {items.length > 0 && (
         <ul className="pin-list">
           <li className="pin-cols" aria-hidden="true"><span>диалог</span><span>назначение</span><span>профиль</span><span>ревизия</span><span>возраст</span><span /></li>
-          {items.map((pin) => (
-            <li className="pin-row" key={`${pin.conversation}-${pin.purpose}`}>
-              <span className="mono pin-conversation" title="Тег диалога: не ключ">{pin.conversation || '—'}</span>
-              <span className="mono">{pin.purpose || '—'}</span>
-              <span className="mono">{pin.profile ?? 'legacy'}</span>
-              <span>
-                <Tag tone={rev !== null && pin.rev === rev ? 'pos' : 'warn'} title={rev !== null && pin.rev === rev ? 'Совпадает с текущей ревизией' : 'Отличается от текущей ревизии: диалог не видит новых правок'}>
-                  {pin.rev === 0 ? 'без файла' : String(pin.rev ?? '—')}
-                </Tag>
-              </span>
-              <span className="mono muted">{pin.age_s === null ? '—' : fmtAgo(now - pin.age_s, now)}</span>
-              <Button icon={PinOff} disabled={busy} aria-label={`Открепить диалог ${pin.conversation}`} onClick={() => run('unpin', pin.conversation)}>Открепить</Button>
-            </li>
-          ))}
+          {items.map((pin) => {
+            // an unpin names the conversation, not one of its purposes: the relay takes every pin the conversation has
+            const sameConversation = items.filter((other) => other.conversation === pin.conversation).length;
+            return (
+              <li className="pin-row" key={`${pin.conversation}-${pin.purpose}`}>
+                <span className="mono pin-conversation" title="Тег диалога: не ключ">{pin.conversation || '—'}</span>
+                <span className="mono">{pin.purpose || '—'}</span>
+                <span className="mono">{pin.profile ?? 'legacy'}</span>
+                <span>
+                  <Tag tone={rev !== null && pin.rev === rev ? 'pos' : 'warn'} title={rev !== null && pin.rev === rev ? 'Совпадает с текущей ревизией' : 'Отличается от текущей ревизии: диалог не видит новых правок'}>
+                    {pin.rev === 0 ? 'без файла' : String(pin.rev ?? '—')}
+                  </Tag>
+                </span>
+                <span className="mono muted">{pin.age_s === null ? '—' : fmtAgo(now - pin.age_s, now)}</span>
+                <Button icon={PinOff} disabled={busy} aria-label={`Открепить диалог ${pin.conversation}`}
+                  title={sameConversation > 1 ? `Снимет все закрепления этого диалога (${sameConversation}), не только это назначение` : undefined}
+                  onClick={() => run('unpin', pin.conversation)}>Открепить</Button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </section>
