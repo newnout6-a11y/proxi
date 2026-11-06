@@ -33,8 +33,9 @@ def anthropic_body(result):
 
 
 def test_a_document_and_a_search_result_read_as_text():
-    assert native_history.readable_block(PDF) == (
-        "[document report.pdf, application/pdf, 4 KB: this route does not pass the file to the model]")
+    note = native_history.readable_block(PDF)
+    assert note.startswith("[document report.pdf, application/pdf, 4 KB: the content of this file cannot be read "
+                           "through this route and was not given to the model.") and note.endswith("]")
     assert native_history.readable_block(SEARCH) == (
         "[search result: Release notes, https://example.com/a]\nVersion 2 adds streaming.\nFixes a crash.")
     plain = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "Hello."}}
@@ -46,9 +47,9 @@ def test_the_native_view_keeps_a_conversation_that_holds_them():
     parsed = validate.parse_anthropic(anthropic_body([{"type": "text", "text": "Page 1"}, PDF, SEARCH]), CFG)
     assert parsed.native_messages is not None
     result = parsed.native_messages[-1]["content"]["toolResult"]
-    assert [block["text"].split("\n")[0] for block in result] == [
-        "Page 1", "[document report.pdf, application/pdf, 4 KB: this route does not pass the file to the model]",
-        "[search result: Release notes, https://example.com/a]"]
+    lines = [block["text"].split("\n")[0] for block in result]
+    assert lines[0] == "Page 1" and lines[2] == "[search result: Release notes, https://example.com/a]"
+    assert lines[1].startswith("[document report.pdf, application/pdf, 4 KB: the content of this file cannot be read")
 
 
 def test_the_text_bridge_shows_their_text_instead_of_cut_json():

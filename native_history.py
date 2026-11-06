@@ -1,7 +1,9 @@
 """Session-local signed assistant history, bound to the prefix that produced it."""
+import base64
 import copy
 from dataclasses import dataclass
 import json
+import urllib.parse
 
 INSTRUCTION_ROLES = ("system", "developer")
 INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
@@ -35,13 +37,67 @@ def reminder(text):
     return _REMINDER_OPEN + "\n" + text + "\n" + _REMINDER_CLOSE
 
 
+def _withheld(where):
+    """What a note says of a file whose content cannot be given to the model, so that the model neither asks for it again
+    nor goes looking for it.
+
+    The Retool route has no file block, so a PDF never reaches the model (11 of 11 rows in user content, 0 of 8 loops in
+    tool results, in every dialect: a4 F12, 2026-11-06). The model got a stub of about 200 characters, took it for data lost
+    on the way, called the tool that returned the file again (7 of 8 loops, when the history had been turned into a flat
+    transcript) or, when the request had no tools of its own, ran `Get-ChildItem -Recurse` and `dir /s` on the host through
+    the relay's own exec feature (60b91554, 6ed0b785). Asked through the relay with a Read tool and a Bash tool, Sonnet 5.5,
+    Opus 5.5 and GPT-6.1-sol all reached for pdftotext after the old stub (11 of 11 runs); after the wording for a file that
+    came inside the request all three answered in text (9 of 9), and after the wording for a document a tool of the client
+    could try, each tried one command and none read the file again (9 of 9). A file that came inside the request exists
+    nowhere else, so no tool can find it; one that a local Read returned may well be on disk, and a tool of the client may
+    then be tried once."""
+    base = "the content of this file cannot be read through this route and was not given to the model"
+    if where == "inline":
+        return (base + "; it came inside the request and is not on disk, so no tool can find it. Do not look for it: tell "
+                "the user that it could not be read, and ask for its text.")
+    if where == "elsewhere":
+        return base + ". Do not look for it: tell the user that it could not be read, and ask for its text."
+    return (base + ". Do not read it again with this tool. If the file is on disk and another tool can extract its text, use "
+            "that once; otherwise tell the user that it could not be read.")
+
+
+def _readable_file(block):
+    """Text for a Chat `file` part or a Responses `input_file` item: the decoded text of a text file, else a note that the
+    route cannot pass the file. Before, the part became the first 200 characters of its JSON and the conversation lost its
+    native history for good, like the Anthropic document blocks (see readable_block)."""
+    spec = block.get("file") if isinstance(block.get("file"), dict) else block
+    name = spec.get("filename")
+    title = " %s" % name if isinstance(name, str) and name else ""
+    data = spec.get("file_data")
+    if isinstance(data, str) and data.startswith("data:") and "," in data:
+        header, _, payload = data.partition(",")
+        mime = header[5:].split(";")[0] or "file"
+        if mime.startswith("text/") or mime in ("application/json", "application/xml"):
+            try:
+                text = (base64.b64decode("".join(payload.split()), validate=True) if ";base64" in header
+                        else urllib.parse.unquote_to_bytes(payload)).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                text = None
+            if text is not None:
+                return "[file%s, %s]\n%s" % (title, mime, text)
+        kilobytes = len(payload) * 3 // 4 // 1024 if ";base64" in header else len(payload) // 1024
+        return "[file%s, %s%s: %s]" % (title, mime, ", %d KB" % kilobytes if kilobytes else "", _withheld("inline"))
+    if isinstance(spec.get("file_url"), str):
+        return "[file%s at %s: %s]" % (title, spec["file_url"], _withheld("elsewhere"))
+    uploaded = " (uploaded id %s)" % spec["file_id"] if spec.get("file_id") else ""
+    return "[file%s%s: %s]" % (title, uploaded, _withheld("inline" if isinstance(data, str) else "elsewhere"))
+
+
 def readable_block(block):
     """Text for an Anthropic document or search result, which the Retool route has no block for; None for others.
 
     Claude Code's Read answers a PDF with a document block, and search tools answer with search_result blocks. The
     model got the first 200 characters of their JSON instead, and the conversation lost its native history for good
-    because the block could not be read natively."""
+    because the block could not be read natively. A Chat `file` part and a Responses `input_file` item are the same case
+    (_readable_file)."""
     kind = block.get("type") if isinstance(block, dict) else None
+    if kind in ("file", "input_file"):
+        return _readable_file(block)
     if kind == "search_result":
         texts = [part.get("text") for part in block.get("content") or []
                  if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
@@ -58,10 +114,11 @@ def readable_block(block):
                  if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
         return "\n".join(["[document%s]" % title] + texts)
     if source.get("type") == "url":
-        return "[document%s at %s: this route does not pass the file to the model]" % (title, source.get("url"))
+        return "[document%s at %s: %s]" % (title, source.get("url"), _withheld("elsewhere"))
     kilobytes = len(source.get("data") or "") * 3 // 4 // 1024 if source.get("type") == "base64" else 0
-    return "[document%s, %s%s: this route does not pass the file to the model]" % (
-        title, source.get("media_type") or source.get("type") or "file", ", %d KB" % kilobytes if kilobytes else "")
+    return "[document%s, %s%s: %s]" % (
+        title, source.get("media_type") or source.get("type") or "file", ", %d KB" % kilobytes if kilobytes else "",
+        _withheld("document"))
 
 
 def client_messages(messages, image_converter, *, lead=None):
