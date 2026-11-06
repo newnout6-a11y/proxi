@@ -649,6 +649,38 @@ the cost is thinking time (and credits), not correctness. The same result is ava
 `generation.effort` and a rule on `client: codex` and `model: claude-*`, which sets the effort for those requests (and raises a lower
 one, which a cap does not).
 
+### The workspace-write sandbox on Windows
+
+`workspace-write sandbox has no writable root capability SIDs` is raised by codex-rs (`windows-sandbox-rs`, `spawn_prep.rs`, in the
+elevated and the unelevated implementation alike) when the list of effective write roots of a command is empty: the working
+folder and the other roots are dropped before their capability SIDs are made. One of the filters drops every root under the
+first folder of the user profile that a dependency of `~/.ssh/config` (`IdentityFile`, `ControlPath`, `Include`, known-hosts
+files, ...) lives in. The user's `~/.ssh/config` has an `IdentityFile` under `%USERPROFILE%\AppData\Roaming\boxd`, so every working
+folder under `%USERPROFILE%\AppData` (the test agents worked in `AppData\Local\Temp\opencode\...`) has no writable root.
+
+It was reproduced on the machine with codex-cli 0.167.0 and no model, no relay, no network, hidden and at low priority:
+`codex sandbox -c windows.sandbox="elevated" -c sandbox_mode="workspace-write" -- cmd.exe /d /c "echo ok>probe.txt"` from a folder
+under `%LOCALAPPDATA%\Temp` exits 1 with exactly that message; from a folder under `%USERPROFILE%\Documents` and from one outside
+the profile it exits 0 and writes the file. The sandbox log (`~/.codex/.sandbox/sandbox.<date>.log`) agrees: `setup refresh:
+processed 0 write roots` for the runs that failed, `granting write ACE to <the folder>` for the ones that worked. The one-time
+elevated setup is not the problem (its marker is there, version 5, from 2026-05-27) and nothing here needs elevation or a window.
+The relay and the model catalog are not involved: the roots are computed from the permissions, the working folder and
+`CODEX_HOME` on the machine.
+
+So: run Codex with a working folder outside `AppData` (for example `C:\work\<name>`; the user's own projects are not affected),
+or move the `boxd` identity file out of `AppData` and point `IdentityFile` at it. Anything else is a fallback that gives the
+sandbox up: `--dangerously-bypass-approvals-and-sandbox` or `sandbox_mode = "danger-full-access"`.
+
+### `update_plan` is off in Codex 0.152 and later
+
+Codex 0.152.0 made the `update_plan` tool opt-in: the tool is registered only when `[tools.update_plan] enabled = true` is in the
+effective configuration (`config.toml`, or `-c tools.update_plan.enabled=true` for one run). In the checked versions (0.160 to
+0.167) nothing else turns it on: not a model catalog field (`experimental_supported_tools` accepts only
+`request_user_input_async`, `send_user_message_async`, `send_message_to_user_async`, `clock` and `test_sync_tool`), not a feature
+flag, and the registration reads only that setting (`core/src/tools/spec_plan.rs`, `update_plan_enabled`). A provider's catalog
+cannot enable it for its models, and a tool the relay made up would never reach Codex's plan view. It works with the
+setting: the nested `plan[]` arguments arrive intact (4 calls in the test run).
+
 ## Claude Code
 
 Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and
