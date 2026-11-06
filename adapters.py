@@ -14,6 +14,41 @@ def approx_tokens(text: str) -> int:
     return max(0, len(text or "") // 4)
 
 
+# Characters per token of Claude's tokenizer over what Claude Desktop and Claude Code send (code, JSON, tool results,
+# a long system prompt): 2.67 to 2.68 on four saved Desktop requests of 779k to 829k characters that upstream counted at
+# 290k to 311k tokens (a5, 2026-11-06). The divisor 4 of approx_tokens said two thirds of that, so the context meter of
+# Claude Desktop showed half of the real tokens and nothing compacted on its own up to 492k real tokens.
+CHARS_PER_TOKEN = 2.7
+
+
+def estimate_tokens(chars) -> int:
+    return max(0, round(chars / CHARS_PER_TOKEN))
+
+
+def request_chars(parsed) -> int:
+    """The size of a client's request as count_tokens measures it: the system text, the flat messages, the tool schemas."""
+    size = len(getattr(parsed, "system", "") or "") + 1 + len(getattr(parsed, "prompt", "") or "")
+    tools = getattr(parsed, "tools", None)
+    if tools:
+        size += 1 + len(json.dumps(tools, ensure_ascii=False, separators=(",", ":")))
+    return size
+
+
+def count_input_tokens(chars, anchor=None):
+    """(tokens, basis) of a request of `chars` characters.
+
+    `anchor` is (characters, tokens) of the last request of the same conversation that upstream really counted. A request
+    that grew from it is that count plus an estimate of what was added: the real part includes what the relay added to the
+    prompt and what the estimate cannot see (images, the tokenizer's own habits). One that shrank (a compaction, an edit)
+    is scaled by the same ratio. Without an anchor it is the estimate for the whole request. basis says which."""
+    if anchor and anchor[0] > 0 and anchor[1] > 0:
+        anchor_chars, anchor_tokens = anchor
+        if chars >= anchor_chars:
+            return anchor_tokens + estimate_tokens(chars - anchor_chars), "last-usage"
+        return max(0, round(anchor_tokens * chars / anchor_chars)), "last-usage"
+    return estimate_tokens(chars), "estimate"
+
+
 FINISH_MAP = {"stop": "stop", "tool_calls": "tool_calls", "hitl": "stop", "timeout": "length", "length": "length",
               "cancelled": "stop", "max_exec": "length"}
 # The reasons a reply ends before it is whole: the turn ran out of time, or the output stopped (the cap, inside a call).

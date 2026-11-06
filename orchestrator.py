@@ -14,6 +14,7 @@ from datetime import datetime
 import uuid
 
 import apierr
+import adapters
 import executor
 import credits
 import journal
@@ -84,6 +85,16 @@ def _trim(text: str, budget: int) -> str:
     if len(raw) <= budget:
         return text
     return raw[:budget].decode("utf-8", "ignore")
+
+
+def _remember_prompt_size(session, parsed, tokens):
+    """What count_tokens scales from: the size of the client's request and the tokens upstream counted for it."""
+    if not tokens:
+        return
+    chars = getattr(parsed, "client_chars", None)
+    if chars is None:
+        chars = adapters.request_chars(parsed)
+    session._count_anchor = (chars, tokens, parsed.model)
 
 
 
@@ -1252,6 +1263,7 @@ class TurnRunner:
                                         **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
                                     if session is not None:
                                         acquired._last_prefix_tokens = breakdown['prompt_tokens']
+                                        _remember_prompt_size(acquired, parsed, breakdown['prompt_tokens'])
                                     out.put(event)
                                 elif event["type"] == "credits":
                                     # Each upstream attempt (retry, exec follow-up) is billed
@@ -1275,6 +1287,7 @@ class TurnRunner:
                                         # reads, so keepwarm (which holds the real session)
                                         # saw prefix_tokens=0 forever.
                                         acquired._last_prefix_tokens = breakdown["prompt_tokens"]
+                                        _remember_prompt_size(acquired, parsed, breakdown["prompt_tokens"])
                                     out.put(event)
                                 elif event["type"] == "hitl":
                                     out.put(event)

@@ -302,6 +302,9 @@ class RelaySession:
         self._native_conversation_key = None
         # What the stored copy of this conversation was last written from (conversation_state.capture).
         self._state_mark = None
+        # (characters of the client's request, tokens upstream counted for it, model) of the last request that was
+        # counted; count_tokens scales its answers from it (SessionPool.count_anchor).
+        self._count_anchor = None
 
     def set_direct(self, head, tools, tool_choice, max_tokens, chunks=None):
         """Direct transport: cacheable head, chunked history and native client tools."""
@@ -1363,6 +1366,22 @@ class SessionPool:
                 self._last_used[key] = time.monotonic()
             if session._warm_body and self._usable(session.backend):
                 direct._ensure_keepwarm(session, session.cfg)
+
+    def count_anchor(self, conversation_key=None, model=None, *, isolated=False, context_scope=None):
+        """(characters, tokens) of the last request of a live conversation that upstream really counted, else None.
+
+        count_tokens scales its answer from it (adapters.count_input_tokens). It only reads, and it runs on an HTTP
+        thread beside the loop: a conversation that is evicted or restarted meanwhile just has no anchor. The model
+        must be the one that was counted: another tokenizer counts the same text differently."""
+        if isolated:
+            return None
+        if self._on_shared_session(isolated, context_scope):
+            session = self._shared
+        else:
+            key = self._scoped_key(conversation_key, context_scope)
+            session = self._conversations.get(key) if key else None
+        anchor = getattr(session, "_count_anchor", None)
+        return (anchor[0], anchor[1]) if anchor and anchor[2] == model else None
 
     def peek(self, conversation_key=None, *, isolated=False, context_scope=None, model_entry=None, exclude=()):
         """The live session acquire() would give a request of this kind, or None: nothing is taken, created or waited for.

@@ -531,17 +531,21 @@ def make_handler(runtime: Runtime):
                 raise apierr.too_many_requests("too many auth failures", round(wait, 1))
 
         def _count_tokens(self):
-            """Claude Code asks for a token estimate before sending a turn."""
+            """Claude Code and Desktop ask for a token count before a turn (and Desktop for its context meter)."""
             data = validate.load_json(self._read_body())
             self._bind_client(data)
             client_context.bind({**client_context.current(), "request_purpose": "local-token-count"})
             # The real count_tokens endpoint does not require max_tokens.
             data.setdefault("max_tokens", 1)
             parsed = validate.parse_anthropic(data, cfg)
-            text = parsed.system + "\n" + parsed.prompt
-            if parsed.tools:
-                text += "\n" + json.dumps(parsed.tools, ensure_ascii=False, separators=(",", ":"))
-            self._json(200, {"input_tokens": adapters.approx_tokens(text)}, {"x-proxi-token-count": "estimated"})
+            # The conversation's last real count scales the answer; chars/4 said two thirds of the real size.
+            parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
+                data, self.headers, client_context.current())
+            anchor = runtime.pool.count_anchor(parsed.conversation_key, parsed.model,
+                                               **acquire_plan(cfg, parsed).kwargs)
+            tokens, basis = adapters.count_input_tokens(adapters.request_chars(parsed), anchor)
+            self._json(200, {"input_tokens": tokens},
+                       {"x-proxi-token-count": "estimated", "x-proxi-token-count-basis": basis})
 
         def _models(self):
             entries = [model for model in model_catalog.catalog() if self._model_routable(model)]
@@ -686,6 +690,9 @@ def make_handler(runtime: Runtime):
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
                 data, self.headers, client_context.current())
             parsed.request_id = self.request_id
+            # The size of the request as the client sent it, for count_tokens to scale from the real usage of this
+            # request (a profile may rewrite the body, which the next count_tokens of the client does not see).
+            client_chars = adapters.request_chars(parsed)
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
@@ -703,6 +710,7 @@ def make_handler(runtime: Runtime):
             if refusal is not None:
                 raise refusal
             parsed = self._apply_prompts(data, parsed, dialect, len(raw), fetches)
+            parsed.client_chars = client_chars
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
