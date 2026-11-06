@@ -572,7 +572,9 @@ def refusal(text):
 
 @pytest.mark.parametrize("text", BLOCK_REFUSALS + OTHER_REFUSALS)
 def test_a_restored_branch_is_forgotten_only_when_the_refusal_names_its_blocks(tmp_path, processes, text):
-    messages, after = restart(tmp_path, processes, scripts=[refusal(text)])
+    # A refusal that names nothing may be the refusal of a hint on a tool result: the relay asks once more without it
+    # (direct.iter_events), and upstream, which refused for another reason, refuses again.
+    messages, after = restart(tmp_path, processes, scripts=[refusal(text), refusal(text)])
     forgotten = text in BLOCK_REFUSALS
     seq = journal.JOURNAL.last_seq
     events = asyncio.run(after.turn(parsed(messages)))

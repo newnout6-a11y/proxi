@@ -25,6 +25,14 @@ def pinned_calendar(monkeypatch):
     monkeypatch.setattr(models, "_today", lambda: datetime.date(2026, 11, 5))
 
 
+@pytest.fixture(autouse=True)
+def tool_result_hints_unknown(monkeypatch):
+    """Whether upstream takes a cache hint on a tool result is learned once per run (direct._TOOL_RESULT_HINTS): a test
+    starts from not having learned it, whatever an earlier one made upstream refuse."""
+    import direct
+    monkeypatch.setattr(direct, "_TOOL_RESULT_HINTS", {"refused": False})
+
+
 class FakeCredits:
     def __init__(self):
         self.used = []

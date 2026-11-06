@@ -531,15 +531,57 @@ def _echo_difference(ours, theirs):
     return "text"
 
 
-def cache_messages(messages, enabled, tools, mark_tail=True):
+class _PlainResult:
+    """A tool result that is plain text, as a place for a cache hint: it becomes a list of one text block when it gets one."""
+
+    def __init__(self, content):
+        self.content = content
+
+    def __setitem__(self, key, value):
+        self.content["toolResult"] = [{"type": "text", "text": self.content["toolResult"], key: value}]
+
+
+def _result_slot(content):
+    """(the place of a tool result that can carry a hint, whether it carried one), or (None, False).
+
+    A result that is a list keeps its hint on a text block: every hint it had is taken off, and the last text block takes
+    a new one. One that is plain text has none, and is turned into a list of one block only when it is given one."""
+    result = content.get("toolResult")
+    if isinstance(result, str):
+        return (_PlainResult(content), False) if result.strip() else (None, False)
+    if not isinstance(result, list):
+        return None, False
+    texts = [block for block in result if isinstance(block, dict) and block.get("type") == "text"
+             and isinstance(block.get("text"), str) and block["text"].strip()]
+    had = False
+    for block in texts:
+        had = bool(block.pop("cache", False)) or had
+    return (texts[-1], had) if texts else (None, False)
+
+
+def cache_messages(messages, enabled, tools, mark_tail=True, tool_results=False):
     """Move only cache hints; signed thinking and the model prefix stay unchanged.
 
     mark_tail=False leaves the last message without the newest hint: a compaction's own instruction is read by nobody
-    (the client replaces its history by the summary), so writing it to the cache only costs the premium of a write."""
+    (the client replaces its history by the summary), so writing it to the cache only costs the premium of a write.
+
+    tool_results=True lets the result of a tool carry a hint (for a route that has breakpoints: Anthropic). A result
+    arrives as plain input, and the next request, whose newest hint stands after it, writes it to the cache: 43,703 tokens
+    of input and then a 43,918-token write (a3, 2026-11-06). With the hint where the result arrives it is written once and
+    the next request reads it. Without the flag a result carries none, and the hints an earlier body put on one are
+    taken off."""
     messages = copy.deepcopy(messages)
     eligible, previous, owner = [], [], []
     for position, message in enumerate(messages):
         value = message.get("content")
+        if isinstance(value, dict):
+            slot, had = _result_slot(value) if message.get("role") == "tool" else (None, False)
+            if slot is not None and tool_results:
+                eligible.append(slot)
+                owner.append(position)
+                if had:
+                    previous.append(len(eligible) - 1)
+            continue
         if not isinstance(value, list):
             continue
         for block in value:

@@ -28,6 +28,7 @@ import journal
 import client_context
 import console_log
 import native_history
+import models as model_catalog
 from accounts import account_tag, idle_block
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
@@ -49,6 +50,32 @@ def _int_setting(cfg, key, default):
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku", 'gpt-4.1',
                 'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2'}
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
+# Whether upstream refused a body that carried a cache hint on the result of a tool; once it did, no body carries one for
+# the rest of the run (see _hints_tool_results and the retry in iter_events).
+_TOOL_RESULT_HINTS = {"refused": False}
+
+
+def _hints_tool_results(model):
+    """Whether the result of a tool may carry a cache hint in a request for this model.
+
+    Only the Anthropic route has breakpoints (the others cache by themselves), and only until upstream has refused a body
+    that carried one: the shape of that hint was never seen accepted, which is why it can switch itself off."""
+    if _TOOL_RESULT_HINTS["refused"]:
+        return False
+    try:
+        return model_catalog.resolve(model, strict=True)[0].get("provider") == "anthropic"
+    except apierr.ApiError:
+        return False
+
+
+def _has_tool_result_hint(messages):
+    """Whether a tool result of these upstream messages carries a cache hint."""
+    for message in messages:
+        content = message.get("content")
+        result = content.get("toolResult") if isinstance(content, dict) and message.get("role") == "tool" else None
+        if isinstance(result, list) and any(isinstance(block, dict) and block.get("cache") for block in result):
+            return True
+    return False
 
 
 def _owning_socket(resp):
@@ -1416,6 +1443,15 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     # The summary of a client's compaction is a side request: the client replaces its history by that summary and
     # never continues this one (see where the branches are recorded below, and what keepwarm does after it).
     side_request = client_context.current().get("client_task") == client_context.COMPACTION
+    # A hint on the result of a tool is new to upstream: `rebuild` makes the same messages without one, for the retry that
+    # a refusal of it gets (see below). It stays None unless a body carries such a hint.
+    hint_results = _hints_tool_results(model_provider.get("model"))
+    rebuild = None
+
+    def without_result_hints(source):
+        return lambda: native_history.cache_messages(source, cfg.get("direct_cache", True), tools,
+                                                     mark_tail=not side_request)
+
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
     parent, messages = (conversation_state.resume(session, history, scope, client)
                         if history is not None and client is not None else (None, None))
@@ -1427,7 +1463,9 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
         body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools,
-                                                         mark_tail=not side_request)
+                                                         mark_tail=not side_request, tool_results=hint_results)
+        if _has_tool_result_hint(body["messages"]):
+            rebuild = without_result_hints(messages)
         body["rit"] = make_rit(body["messages"], tools)
         # A fork replays none of the last reply: no block of the parent is in this body.
         replayed = [] if forked else parent.assistant
@@ -1458,7 +1496,9 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             # Rebuild them without trusting any client-supplied thinking blocks.
             initial = body['messages'][:1] if head else []
             body['messages'] = native_history.cache_messages(initial + cold, cfg.get('direct_cache', True), tools,
-                                                             mark_tail=not side_request)
+                                                             mark_tail=not side_request, tool_results=hint_results)
+            if _has_tool_result_hint(body['messages']):
+                rebuild = without_result_hints(initial + cold)
             body['rit'] = make_rit(body['messages'], tools)
             journal.emit('native_history.cold', 'История инструментов восстановлена без старых thinking-подписей',
                          'info', messages=len(cold), signatures=0)
@@ -1479,7 +1519,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     # A completed answer that asked for no tool is final: a subagent that gave one is done.
     asked_tool, ended = False, None
     # What the turn delivered decides what it may become: only a usable answer is a keepwarm body.
-    wrote_text = thinking_seen = errored = False
+    wrote_text = thinking_seen = errored = began = False
     failure = None
     settled = False
 
@@ -1544,7 +1584,9 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 _ensure_keepwarm(session, cfg)
 
     def note(event):
-        nonlocal asked_tool, ended, wrote_text, thinking_seen, errored
+        nonlocal asked_tool, ended, wrote_text, thinking_seen, errored, began
+        # Every attempt announces itself with usage_start before upstream has said anything: not an answer.
+        began = began or event.get("type") != "usage_start"
         kind = event.get("type")
         if kind == "tool_call" and not event.get("partial") and not event.get("invalid"):
             asked_tool = True
@@ -1572,26 +1614,58 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                     note(event)
                     yield event
         except apierr.ApiError as error:
-            # Models absent from the App Builder list (legacy GPT-5, Haiku) live on
-            # the Assist list, which is the same route without the agent marker.
-            if (error.status != 400 or "metadata" not in body
-                    or "not available right now" not in (error.message or "").lower()):
-                raise
-            if len(_ASSIST_ONLY) > 200:
-                # Flush only self-learned names: wiping the proven seeds would make
-                # known assist models pay a 400 + retry cycle all over again.
-                _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
-            _ASSIST_ONLY.add(model_provider.get("model"))
-            print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
-            journal.emit("upstream.assist_retry", "╨Ь╨╛╨┤╨╡╨╗╤М ╤В╨╛╨╗╤М╨║╨╛ ╨▓ ╤Б╨┐╨╕╤Б╨║╨╡ Assist тАФ ╨┐╨╛╨▓╤В╨╛╤А ╨▒╨╡╨╖ ╨╝╨░╤А╨║╨╡╤А╨░", "warn",
-                         model=model_provider.get("model"))
-            body = {key: value for key, value in body.items() if key != "metadata"}
-            if body.get("openAICacheKey"):
-                session._turn_body = body
-            async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
-                async for event in stream:
-                    note(event)
-                    yield event
+            assist = (error.status == 400 and "metadata" in body
+                      and "not available right now" in (error.message or "").lower())
+            # What may be upstream's refusal of a hint on a tool result: a message that names the cache, or the route
+            # validator's own words, which name nothing ("Invalid request format", an empty body). One that names thinking,
+            # a signature or the blocks of the history is about the signed branch, whose own handling follows, and any
+            # other reason it names (a prompt too long, a tool schema, the content filter) is not the hint's.
+            said = (error.message or "").lower()
+            plausible = "cache" in said or said.strip() in ("", "{}") or "invalid request format" in said
+            about_branch = conversation_state.blocks_refused(error) and "cache" not in said
+            if rebuild is not None and not began and not assist and plausible and not about_branch \
+                    and error.status in (400, 422):
+                # Upstream refused a body that carries a cache hint on the result of a tool, a shape that was never seen
+                # accepted: ask again without those hints, and once that is answered stop sending them (this run).
+                body = {**body, "messages": rebuild()}
+                body["rit"] = make_rit(body["messages"], tools)
+                rebuild = None
+                upstream_status = getattr(error, "upstream_status", None) or error.status
+                if body.get("openAICacheKey"):
+                    session._turn_body = body
+                answered = False
+                async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+                    async for event in stream:
+                        if not answered and event.get("type") != "usage_start":
+                            answered = True
+                            _TOOL_RESULT_HINTS["refused"] = True
+                            journal.emit("upstream.tool_result_hint_refused",
+                                         "Upstream отклонил подсказку кэша на результате инструмента (HTTP %s): запрос "
+                                         "повторён без неё, дальше такие подсказки не ставятся" % upstream_status, "warn",
+                                         status=upstream_status, upstream_message=(error.message or "").replace("\n", " ")[:160],
+                                         model=model_provider.get("model"))
+                        note(event)
+                        yield event
+            else:
+                # Models absent from the App Builder list (legacy GPT-5, Haiku) live on
+                # the Assist list, which is the same route without the agent marker.
+                if not assist:
+                    raise
+                if len(_ASSIST_ONLY) > 200:
+                    # Flush only self-learned names: wiping the proven seeds would make
+                    # known assist models pay a 400 + retry cycle all over again.
+                    _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
+                _ASSIST_ONLY.add(model_provider.get("model"))
+                print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
+                journal.emit("upstream.assist_retry", "╨Ь╨╛╨┤╨╡╨╗╤М ╤В╨╛╨╗╤М╨║╨╛ ╨▓ ╤Б╨┐╨╕╤Б╨║╨╡ Assist тАФ ╨┐╨╛╨▓╤В╨╛╤А ╨▒╨╡╨╖ ╨╝╨░╤А╨║╨╡╤А╨░", "warn",
+                             model=model_provider.get("model"))
+                body = {key: value for key, value in body.items() if key != "metadata"}
+                if body.get("openAICacheKey"):
+                    session._turn_body = body
+                async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+                    async for event in stream:
+                        note(event)
+                        yield event
         reply = getattr(session, "_direct_reply", None)
         # Recording a compaction's summary would put a branch nobody extends in place of the parent it resumed
         # (a nudged or repeated compaction, a background one beside the chat, or the chat itself after an abandoned

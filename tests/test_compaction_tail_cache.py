@@ -19,12 +19,19 @@ CONVERSATION = "User: fix the parser\n\nAssistant: I read src/parser.py and chan
 
 
 def flags(body):
-    """One string per message of a body posted to Retool: F for a block with a cache hint, - for one without."""
+    """One string per message of a body posted to Retool: F for a block with a cache hint, - for one without.
+
+    A tool result is one message: F when a text block of its result carries the hint (item 16)."""
     rows = []
     for message in body["messages"]:
         content = message["content"]
-        rows.append("".join("F" if isinstance(block, dict) and block.get("cache") else "-" for block in content)
-                    if isinstance(content, list) else "-")
+        if isinstance(content, dict):
+            result = content.get("toolResult")
+            rows.append("F" if isinstance(result, list) and any(isinstance(block, dict) and block.get("cache")
+                                                                for block in result) else "-")
+        else:
+            rows.append("".join("F" if isinstance(block, dict) and block.get("cache") else "-" for block in content)
+                        if isinstance(content, list) else "-")
     return rows
 
 
