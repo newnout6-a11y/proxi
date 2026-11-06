@@ -170,7 +170,8 @@ def test_a_tool_inside_a_namespace_is_matched_by_its_name_or_by_namespace_dot_na
         assert result["tools"][0]["description"] == "Run." and result["tools"][1]["description"] == "A server."
         assert {c["tool"] for c in changes} <= {"mcp.search", "mcp.fetch"} and changes[0]["index"] == 1
     parsed = parse("responses", result)
-    assert [t["function"]["name"] for t in parsed.tools] == ["shell", "mcp.search", "mcp.fetch"]
+    # the profile names a namespaced tool by namespace.name; upstream it is namespace__name (tool_names.namespaced)
+    assert [t["function"]["name"] for t in parsed.tools] == ["shell", "mcp__search", "mcp__fetch"]
 
 
 def test_hiding_namespaced_tools_removes_an_emptied_namespace_and_nothing_else():
