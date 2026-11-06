@@ -1039,7 +1039,8 @@ test('a window that is not covered and has no spend says so instead of "no spend
 test('activity tabs and chart values work with the keyboard', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
-  const chart = page.locator('.chart').first();
+  // the chart takes keys once its periods are in: until the metrics arrive it is a picture, not a slider
+  const chart = page.getByRole('slider', { name: /Расход кредитов/ });
   await chart.focus();
   await chart.press('End');
   await expect(page.locator('.chart-tip')).toBeVisible();
