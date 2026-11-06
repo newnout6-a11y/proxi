@@ -7,6 +7,7 @@ context is billed once and reused, keeping time-to-first-token flat.
 import asyncio
 import contextlib
 import contextvars
+import decimal
 import hashlib
 import http.client
 import json
@@ -144,9 +145,58 @@ def loop_now():
     return time.time()
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _js_number(value):
+    """A double as JSON.stringify writes it (Number::toString): 3 for 3.0, 1e-7 for 1e-07, null for NaN and inf."""
+    if value != value or value in (float("inf"), float("-inf")):
+        return "null"
+    if value == 0:
+        return "0"
+    negative, digits, exponent = decimal.Decimal(repr(float(value))).normalize().as_tuple()
+    digits = "".join(map(str, digits))
+    k, n = len(digits), len(digits) + exponent
+    if k <= n <= 21:
+        text = digits + "0" * (n - k)
+    elif 0 < n <= 21:
+        text = digits[:n] + "." + digits[n:]
+    elif -6 < n <= 0:
+        text = "0." + "0" * -n + digits
+    else:
+        text = digits[0] + ("." + digits[1:] if k > 1 else "") + "e" + ("+" if n > 0 else "-") + str(abs(n - 1))
+    return ("-" if negative else "") + text
+
+
+def _js_delta(value):
+    """How much longer JSON.stringify(value) is than Python's compact dump of the same value, in UTF-16 units.
+
+    Python writes 3.0, 1e-07 and 1e+16 where JavaScript writes 3, 1e-7 and 10000000000000000, an integer past 2**53 in
+    full where JavaScript keeps a double, inf and nan as Infinity and NaN where JavaScript writes null, and a lone
+    surrogate as itself where JavaScript escapes it (\\udXXX)."""
+    stack, delta = [value], 0
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            stack.extend(item.values())
+            stack.extend(key for key in item if isinstance(key, str))
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+        elif isinstance(item, str):
+            delta += 5 * len(_SURROGATE.findall(item))
+        elif isinstance(item, bool) or item is None:
+            continue
+        elif isinstance(item, float):
+            delta += len(_js_number(item)) - len(json.dumps(item))
+        elif isinstance(item, int) and abs(item) >= 2 ** 53:
+            delta += len(_js_number(float(item))) - len(str(item))
+    return delta
+
+
 def _js_length(value):
     """JSON.stringify(value).length in UTF-16 code units."""
-    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-16-le")) // 2
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2 + _js_delta(value)
 
 
 def _hash32(length):
