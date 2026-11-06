@@ -1428,9 +1428,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
         body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools)
         body["rit"] = make_rit(body["messages"], tools)
+        reminders = native_history.dropped(parent, client, messages)
         journal.emit("native_history.resume", "Сохранённые assistant/thinking blocks возвращены upstream", "info",
                      blocks=len(parent.assistant), messages=len(body["messages"]),
-                     signatures=sum(b["type"] == "thinking" for b in parent.assistant))
+                     signatures=sum(b["type"] == "thinking" for b in parent.assistant),
+                     **({"reminders_kept": reminders} if reminders else {}))
         req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
         console_log.write("[%s] [history] native continuation restored thinking=%d tool_calls=%d" % (
             req_id, sum(b["type"] in ("thinking", "redacted_thinking") for b in parent.assistant),
