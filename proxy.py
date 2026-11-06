@@ -32,6 +32,7 @@ import sse
 import models
 import prompt_body
 import prompt_policy
+import prompt_stabilizer
 import validate
 from accounts import UNNAMED, AccountDispatcher, account_tag
 from credits import CreditsManager
@@ -132,6 +133,10 @@ class Runtime:
         self.admin = admin_module.Admin(self)
         # After the journal is configured: scanning the stored conversations reports what it removed.
         self.pool.attach_store(conversation_state.open_store(cfg))
+        # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
+        folder = cfg.get("conversation_state_dir") if cfg.get("conversation_state", True) else None
+        self.stabilizer = prompt_stabilizer.Stabilizer(
+            cfg, os.path.join(os.fspath(folder), prompt_stabilizer.FILE_NAME) if folder and os.path.isdir(folder) else None)
 
     def submit(self, coroutine):
         with self._lifecycle_lock:
@@ -717,6 +722,7 @@ def make_handler(runtime: Runtime):
             if refusal is not None:
                 raise refusal
             parsed = self._apply_prompts(data, parsed, dialect, len(raw), fetches)
+            self._stabilize_prompt(parsed)
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
@@ -795,6 +801,25 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _stabilize_prompt(self, parsed):
+            """The client's system prompt with the parts that change between requests held as the conversation has them.
+
+            Last, on the request the turn runs on: a profile that rewrites the body parses it again, and the head the model
+            gets is built from this text. See prompt_stabilizer."""
+            stabilizer = getattr(runtime, "stabilizer", None)
+            if stabilizer is None or not parsed.system:
+                return
+            try:
+                system, done = stabilizer.apply(parsed.system, parsed.conversation_key)
+            except Exception as exc:  # noqa: BLE001 - a prompt left as the client wrote it is what it was before
+                journal.emit("prompt.runtime_error", "Стабилизация system клиента не выполнена: %s" % type(exc).__name__,
+                             "error", request_id=self.request_id, stage="stabilize")
+                return
+            if done:
+                parsed.system = system
+                journal.emit("prompt.stabilized", "System клиента приведён к прежнему виду диалога: %s" % ", ".join(done),
+                             "debug", request_id=self.request_id, done=done)
 
         def _infer_conversation(self, parsed):
             """A request with tools and no identity of its own takes the key of the conversation its history extends.

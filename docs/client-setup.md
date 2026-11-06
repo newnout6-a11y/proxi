@@ -116,6 +116,32 @@ is not a relay model and its window is unknown. Either way the summary's `warnin
 name the old reference and what was done. A compaction model you chose that is still
 published is kept as it is, even if its window is smaller: check that yourself.
 
+### A system prompt that changes by itself
+
+The head of a request is the start of the cached prefix, so one changed character in the client's system prompt writes the
+whole conversation to the cache again and drops its signed history (`cache.head_changed`, `native_history.reset`). OpenCode
+1.x changes it between processes without the conversation changing: `<available_skills>` gives each skill a `<location>`, a
+skill that exists in two scanned folders (the user's `boxd-cli` and `boxd-setup-hermes` are junctions, `stageshow` and
+`unslop` are real copies, in `~/.agents/skills` and `~/.claude/skills`) is listed from the folder the process met first,
+and that differs from process to process. Six fresh `opencode run` processes in one folder sent five different system
+prompts, and in the Opus dialog of 2026-11-06 seven of twelve turns started with a reset and a rewrite of 68k to 196k tokens
+(7 to 21 credits each, 47% of what the build agent cost). The long-lived OpenCode Desktop server keeps one prompt and is not
+hit; its 2.x prompt has no `<location>` at all.
+
+The relay holds such a location where it first saw it (`prompt_stabilizer.SkillLocations`): the first location of a skill
+(by working folder, name and description) is written into every later prompt, so the head stays put. The name and the
+description are the skill and are never touched, and `skill({name})` loads by name, so the model can still load every skill.
+A remembered file that is gone while the new one exists gives way to the new one, so the model is never pointed at a file that
+does not exist; an entry is forgotten after a week. The memory is written to `<conversation_state_dir>/client-prompts.json`
+and survives a relay restart. `prompt.stabilized` (debug) names what was held. `stabilize_client_prompts: false` in
+`config.json` switches this off.
+
+The same prompt carries `Today's date: ...`, regenerated on every request, so a conversation that crosses midnight rewrites its
+cache once (30 credits at 300k tokens). That is a choice, not a repair: `stable_prompt_date: true` keeps the date a conversation
+was first shown for as long as it stays active (a gap longer than the idle timeout plus five minutes ends it, since the cache
+is gone by then anyway), and the model is told yesterday's date for that stretch of work. It is off by default. Claude Code
+keeps its date in the first user message, Codex in the environment context of the history, so neither changes its head.
+
 ### Compaction and the effort of its agent
 
 OpenCode 2.x (every tag from v2.0.0 to v2.2.5) compacts by resending the chat's own

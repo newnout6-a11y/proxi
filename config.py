@@ -83,6 +83,13 @@ DEFAULTS = {
     # A request with tools and no conversation identity (DeepSeek Harness sends no session header) takes the conversation
     # whose request its history extends, so its signed history continues; False gives each such request a session of its own.
     "infer_conversations": True,
+    # Parts of a client's system prompt that change between requests with no change in the conversation, which rewrite
+    # the whole cache (prompt_stabilizer): the location of a skill that exists in two folders (OpenCode 1.x) is held at
+    # the first one seen. stable_prompt_date also holds OpenCode's "Today's date" at the date a conversation began while
+    # it stays active, so a chat that crosses midnight is not rewritten; the model is then told that date, which is why
+    # it is off by default.
+    "stabilize_client_prompts": True,
+    "stable_prompt_date": False,
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
     "transport": "direct",
     "direct_cache": True,
@@ -515,6 +522,9 @@ def _load(path):
         raise service_unavailable("compaction_keep_effort must be a boolean")
     if type(cfg["infer_conversations"]) is not bool:
         raise service_unavailable("infer_conversations must be a boolean")
+    for key in ("stabilize_client_prompts", "stable_prompt_date"):
+        if type(cfg[key]) is not bool:
+            raise service_unavailable(f"{key} must be a boolean")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
                 "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
                 "trace_max_folders"):
