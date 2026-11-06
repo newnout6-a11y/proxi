@@ -164,6 +164,10 @@ def client_messages(messages, image_converter, *, lead=None):
                     fn = item.get("function") or item
                     calls.append(call(item.get("id") or item.get("tool_call_id"), fn.get("name"),
                                       fn.get("arguments", "{}")))
+                legacy = message.get("function_call")
+                if isinstance(legacy, dict) and legacy.get("name"):
+                    # The deprecated form of one call; its "function" message carries the name, not an id (see below).
+                    calls.append(call(legacy["name"], legacy["name"], legacy.get("arguments", "{}")))
                 blocks = ([{"type": "text", "text": "".join(text)}] if any(text) else []) + calls
                 if not blocks:
                     continue
@@ -173,7 +177,8 @@ def client_messages(messages, image_converter, *, lead=None):
                 else:
                     result.append({"role": "assistant", "content": blocks})
             elif role in ("tool", "function"):
-                result.append(tool_result(message.get("tool_call_id") or message.get("call_id"), value,
+                result.append(tool_result(message.get("tool_call_id") or message.get("call_id")
+                                          or (message.get("name") if role == "function" else None), value,
                                           message.get("is_error", False)))
             elif role == "user":
                 pending = []

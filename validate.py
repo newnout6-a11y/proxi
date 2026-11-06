@@ -389,6 +389,11 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
             continue
         if role == "assistant":
             calls = message.get("tool_calls") or []
+            legacy = message.get("function_call")
+            if isinstance(calls, list) and isinstance(legacy, dict) and legacy.get("name"):
+                # The deprecated form of one call. Its result is a "function" message that names the function and
+                # carries no id, so the name stands for the id here as it does for that result.
+                calls = calls + [{"id": legacy["name"], "function": legacy}]
             if isinstance(calls, list) and calls:
                 for call in calls:
                     if not isinstance(call, dict):
