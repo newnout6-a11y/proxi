@@ -161,10 +161,11 @@ def test_main_handles_repeated_stop_signals_once(tmp_path, monkeypatch, capsys):
         runtime.close()
 
 
-def test_server_shutdown_unblocks_a_saturated_request_slot(monkeypatch):
-    slots = threading.BoundedSemaphore(1)
-    slots.acquire()
-    server = proxy.BoundedServer(("127.0.0.1", 0), proxy.BaseHTTPRequestHandler, slots)
+def test_server_shutdown_unblocks_a_full_connection_cap(monkeypatch):
+    connections = threading.BoundedSemaphore(1)
+    connections.acquire()
+    server = proxy.BoundedServer(("127.0.0.1", 0), proxy.BaseHTTPRequestHandler, threading.BoundedSemaphore(1),
+                                 connections)
     request, peer = socket.socketpair()
     worker = threading.Thread(target=server.process_request, args=(request, ("127.0.0.1", 0)), daemon=True)
     monkeypatch.setattr(proxy.ThreadingHTTPServer, "shutdown", lambda _self: None)
@@ -174,7 +175,7 @@ def test_server_shutdown_unblocks_a_saturated_request_slot(monkeypatch):
         worker.join(2)
         assert not worker.is_alive()
     finally:
-        slots.release()
+        connections.release()
         request.close()
         peer.close()
         server.server_close()
