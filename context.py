@@ -161,10 +161,17 @@ def build_project_context(workspace_root: str, limit: int = 6000, cookie_values=
     return text.encode("utf-8")[:max(0, limit)].decode("utf-8", "ignore")
 
 
+def relay_policy(value):
+    """The configured role text: null is the default role, a blank string means no role of our own."""
+    if value is None:
+        return DEFAULT_RELAY_SYSTEM_PROMPT
+    return value if value.strip() else ""
+
+
 def build_system_instructions(workspace_root: str, enable_context=True, enable_local_exec=True,
                               limit: int = 6000, cookie_values=(), exec_policy="allowlist",
                               system_prompt=None) -> str:
-    policy = DEFAULT_RELAY_SYSTEM_PROMPT if system_prompt is None else system_prompt
+    policy = relay_policy(system_prompt)
     parts = [policy] if policy else []
 
     if enable_local_exec and workspace_root:

@@ -1,9 +1,13 @@
 # Runtime dependency of the relay (pinned: WS client API differs between majors).
 websockets==13.1
 
-# Test-only
+# Test-only. They live here, not in a separate dev file, because the documented
+# test commands (`uv run --with-requirements requirements.txt ...`) and CI install
+# only this file; moving them would break every one of those commands.
 pytest>=8,<9
 pytest-asyncio==1.3.0
 
-# Client catalog maintenance: preserve YAML comments, quoting and unrelated profiles.
+# Not imported by the relay. Used only by scripts/sync_harness_catalog.py (YAML
+# comments, quoting and unrelated profiles are preserved) and its tests, so the
+# relay runs without it. It stays in this file for the same reason as pytest.
 ruamel.yaml>=0.18.6,<0.19

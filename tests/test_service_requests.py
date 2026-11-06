@@ -246,6 +246,44 @@ def test_http_logs_distinguish_a_long_title_from_primary_chat(relay, capsys):
     assert "PURPOSE: session-title" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("extra,level", [
+    ({"temperature": 1, "metadata": {"user_id": json.dumps({"session_id": "S", "device_id": "D"})}}, "debug"),
+    ({"temperature": 0.2, "top_p": 0.9, "top_k": 5, "metadata": {"k": "v"}}, "debug"),
+    ({"temperature": 1, "logprobs": True}, "warn"),
+    ({"logit_bias": {"50256": -100}}, "warn"),
+    ({"temperature": 1, "prompt_cache_key": "PRIVATE-KEY"}, "debug"),
+    ({"temperature": 1, "output_config": {"task_budget": {"type": "tokens", "total": 1000}}}, "debug"),
+], ids=["claude-code", "sampling-only", "logprobs", "logit-bias", "cache-key", "task-budget"])
+def test_routine_ignored_parameters_are_quiet_but_material_ones_still_warn(relay, monkeypatch, extra, level):
+    log = journal.Journal()
+    monkeypatch.setattr(journal, "JOURNAL", log)
+    payload = {"model": "claude-opus-5-5", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}], **extra}
+    with relay.request("/v1/messages", payload) as response:
+        assert response.status == 200
+        names = response.headers["x-proxi-ignored-parameters"].split(",")
+    expected = {"output_config.task_budget" if key == "output_config" else key for key in extra}
+    assert set(names) == expected
+    entries = [e for e in log.query() if e["kind"] == "request.compatibility"]
+    assert len(entries) == 1 and entries[0]["level"] == level
+    assert entries[0]["data"]["parameters"] == names
+    assert "PRIVATE-KEY" not in json.dumps(entries) and '"D"' not in json.dumps(entries)
+
+
+def test_codex_per_request_hints_do_not_warn_on_every_turn(relay, monkeypatch):
+    log = journal.Journal()
+    monkeypatch.setattr(journal, "JOURNAL", log)
+    payload = {"model": "gpt-6-sol", "input": "hi", "store": False, "include": ["reasoning.encrypted_content"],
+               "prompt_cache_key": "PRIVATE-KEY", "client_metadata": {"k": "v"},
+               "prompt_cache_options": {"mode": "auto"}}
+    with relay.request("/v1/responses", payload) as response:
+        assert response.status == 200
+        names = set(response.headers["x-proxi-ignored-parameters"].split(","))
+    assert {"include", "prompt_cache_key", "client_metadata", "prompt_cache_options"} <= names
+    entries = [e for e in log.query() if e["kind"] == "request.compatibility"]
+    assert entries and all(e["level"] == "debug" for e in entries)
+    assert "PRIVATE-KEY" not in json.dumps(entries)
+
+
 def test_token_estimate_includes_large_tool_schema_and_remains_local(relay):
     payload = {"model": "claude-opus-5-5", "system": "System instructions",
                "messages": [{"role": "user", "content": "hi"}]}
@@ -258,3 +296,43 @@ def test_token_estimate_includes_large_tool_schema_and_remains_local(relay):
         assert response.headers["x-proxi-token-count"] == "estimated"
     assert counted["input_tokens"] > plain["input_tokens"] + 4000
     assert not relay.fake.seen and relay.credits.used == []
+
+
+TEXT_SEGMENTS = {
+    "plain": (["text:a", "text:b"], 1),
+    "thinking-first": (["think", "text:a"], 1),
+    "text-thinking-text": (["text:a", "think", "text:b"], 2),
+    "three-segments": (["text:a", "think", "text:b", "think", "text:c"], 3),
+    "heartbeat-is-no-boundary": (["text:a", "beat", "text:b"], 1),
+    "text-tool-text": (["text:a", "call", "text:b"], 2),
+    "empty-delta-opens-nothing": (["text:", "text:a"], 1),
+}
+
+
+@pytest.mark.parametrize("name", sorted(TEXT_SEGMENTS))
+def test_each_text_segment_opens_its_own_answer_span(tmp_path, monkeypatch, name):
+    script, expected = TEXT_SEGMENTS[name]
+    log = journal.Journal()
+    monkeypatch.setattr(journal, "JOURNAL", log)
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[])
+
+    async def stream(session, prompt, provider, tool_names=None):
+        for item in script:
+            kind, _, value = item.partition(":")
+            if kind == "text":
+                yield {"type": "text", "delta": value}
+            elif kind == "think":
+                yield {"type": "thinking_start"}
+                yield {"type": "thinking", "delta": "planning"}
+                yield {"type": "thinking_signature"}
+            elif kind == "beat":
+                yield {"type": "thinking_heartbeat", "elapsed": 5.0}
+            else:
+                yield {"type": "tool_call", "id": "call-1", "name": "read_file", "arguments": "{}"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(RelaySession, "stream", stream)
+    events = asyncio.run(run(runner, request(FIRST)))
+    assert not any(event["type"] == "error" for event in events)
+    starts = [e for e in log.query() if e["kind"] == "upstream.text_start"]
+    assert len(starts) == expected

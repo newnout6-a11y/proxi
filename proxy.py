@@ -436,8 +436,10 @@ def make_handler(runtime: Runtime):
             # Non-stream HTTP errors use the standard OpenAI envelope for both chat
             # and responses routes; the flat responses shape is for SSE events only.
             body = self._error_payload("chat" if dialect == "responses" else dialect, err)
-            extra = {"retry-after": err.retry_after} if err.retry_after else None
-            self._json(err.status, body, extra)
+            extra = dict(getattr(err, "headers", None) or {})
+            if err.retry_after:
+                extra["retry-after"] = err.retry_after
+            self._json(err.status, body, extra or None)
 
         def _throttle_auth_failure(self):
             # rate_limit_rps is off by default and covers only completions, so key
@@ -582,22 +584,31 @@ def make_handler(runtime: Runtime):
 
             parsed.request_purpose = client_context.request_kind(parsed)
             compatibility_headers = {}
-            if parsed.structured_title:
-                compatibility_headers['x-proxi-output-format'] = 'validated-session-title'
+            if parsed.structured_output:
+                compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
             if 'thinking.display' in parsed.declared_ignored:
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:
                 compatibility_headers['x-proxi-ignored-parameters'] = ','.join(parsed.declared_ignored)
+                # Claude Code sends temperature and metadata.user_id on every request and keeps its
+                # late tool announcements in the history, so none of that is a journal warning.
+                names, tool_changes = set(parsed.declared_ignored), set(parsed.inline_tool_changes)
+                # Hints that clients send on every request and that the relay safely
+                # replaces with its own behaviour; material controls still warn.
+                routine = {'temperature', 'top_p', 'top_k', 'seed', 'presence_penalty', 'frequency_penalty', 'metadata',
+                           'prompt_cache_key', 'prompt_cache_retention', 'prompt_cache_options', 'include',
+                           'client_metadata', 'verbosity', 'text.verbosity', 'output_config.task_budget'}
+                level = 'warn' if names - routine - tool_changes else 'info' if names & tool_changes else 'debug'
                 journal.emit('request.compatibility',
                              'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
-                             'warn', parameters=parsed.declared_ignored)
+                             level, request_id=self.request_id, parameters=parsed.declared_ignored)
             if parsed.system_messages_normalized:
-                compatibility_headers['x-proxi-system-messages'] = 'merged-into-head'
+                compatibility_headers['x-proxi-system-messages'] = 'inline-as-user-text'
                 journal.emit('request.compatibility',
-                             'Системные напоминания объединены в один head: Retool не принимает несколько system. '
-                             'Изменение head сбрасывает прежний подписанный префикс.', 'warn',
+                             'Системные сообщения внутри диалога переданы user-текстом на своих местах: '
+                             'Retool не принимает несколько system, head и подписи не меняются.', 'debug',
                              request_id=self.request_id, control='mid_conversation_system',
-                             handling='merged_into_head')
+                             handling='inline_user_text')
             if self._client_trace:
                 self._client_trace.event("validated_request", parsed=vars(parsed), effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})

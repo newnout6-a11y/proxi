@@ -227,3 +227,93 @@ def test_session_id_routes_affinity_while_display_labels_do_not(relay):
     relay.json("/v1/chat/completions", chat, headers={"x-proxi-client": "opencode",
                "x-proxi-chat-title": "display only", "x-proxi-agent": "explore"})
     assert relay.fake.seen[-1].conversation_key is None
+
+
+ATTRIBUTION = "x-anthropic-billing-header: cc_version=2.1.317.1a2; cc_entrypoint=cli; cch=e87ef;"
+CLI_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+SDK_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+CURRENT_TITLE = client_context.SDK_TITLE_PREFIX + " The title is a name for what the session is about.\nReturn JSON."
+LEGACY_TITLE = ("Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of "
+                "this coding session.\n\nReturn JSON with a single \"title\" field.")
+DESKTOP_TITLE = "You write short session titles. Reply with only the tagged fields the prompt asks for."
+
+
+def kind_of(system, client="claude-code", **extra):
+    from types import SimpleNamespace
+    parsed = SimpleNamespace(system=system, prompt="User: x", max_tokens=64, tools=[], **extra)
+    return client_context.request_kind(parsed, {"client": client} if client else {})
+
+
+@pytest.mark.parametrize("wording", [CURRENT_TITLE, LEGACY_TITLE, DESKTOP_TITLE], ids=["current", "legacy", "desktop"])
+@pytest.mark.parametrize("preamble", [
+    "", "\n  ", ATTRIBUTION + "\n", ATTRIBUTION + "\n" + CLI_IDENTITY + "\n", CLI_IDENTITY + "\n",
+    ATTRIBUTION + "\n" + SDK_IDENTITY + "\n\n", ATTRIBUTION + "\r\n" + CLI_IDENTITY + "\r\n",
+], ids=["bare", "blank", "attribution", "attribution+cli", "cli", "attribution+sdk", "crlf"])
+def test_title_prompt_is_recognised_when_it_opens_its_block(wording, preamble):
+    assert kind_of(preamble + wording) == "session-title"
+    assert kind_of(preamble + wording, client="") == "session-title"
+
+
+@pytest.mark.parametrize("system", [
+    "Be concise.\n" + CURRENT_TITLE, "You are a helpful assistant.\n" + CURRENT_TITLE,
+    ATTRIBUTION + "\nBe concise.\n" + CURRENT_TITLE, ATTRIBUTION + "\n" + CLI_IDENTITY + "\nBe concise.\n" + LEGACY_TITLE,
+    'The SDK title prompt starts with "' + client_context.SDK_TITLE_PREFIX + '" and nothing else.',
+    "> " + CURRENT_TITLE, "Rule one.\n" * 300 + CURRENT_TITLE + "\nRule two.\n" * 5,
+    "Quote:\n\n" + LEGACY_TITLE, "  Notes:\n" + DESKTOP_TITLE,
+], ids=["quoted-line", "role-line", "after-rule-attribution", "after-rule-legacy", "inline-quote", "markdown-quote",
+        "deep-in-long-system", "legacy-after-label", "desktop-after-label"])
+def test_a_system_that_merely_quotes_the_title_wording_is_an_ordinary_request(system):
+    assert kind_of(system) == "client-text"
+    assert kind_of(system, client="") == "generation"
+    assert not client_context.is_sdk_title_system(system)
+
+
+def test_title_is_recognised_by_its_schema_when_the_prompt_is_unrecognisable():
+    schema_only = {"title": True, "kind": "json_schema"}
+    assert kind_of("Name this session in two words.", structured_output=schema_only) == "session-title"
+    assert kind_of("Name this session in two words.", structured_output={"title": False}) == "client-text"
+    assert kind_of("Name this session in two words.") == "client-text"
+    from types import SimpleNamespace
+    with_tools = SimpleNamespace(system="Name it.", prompt="", tools=[{"type": "function"}], structured_output=schema_only)
+    assert client_context.request_kind(with_tools, {"client": "claude-code"}) == "client-tools"
+
+
+def test_title_wording_still_classifies_when_structured_outputs_are_switched_off():
+    # CLAUDE_CODE_DISABLE_STRUCTURED_OUTPUTS=1 sends the prompt but no output_config.format.
+    import validate
+    from test_client_contracts import CFG
+    body = {"model": "claude-haiku-4-5-20251001", "max_tokens": 64, "thinking": {"type": "disabled"},
+            "system": [{"type": "text", "text": ATTRIBUTION}, {"type": "text", "text": CLI_IDENTITY},
+                       {"type": "text", "text": LEGACY_TITLE}],
+            "messages": [{"role": "user", "content": "<session>fix the login bug</session>"}]}
+    parsed = validate.parse_anthropic(body, CFG)
+    assert parsed.structured_output is None
+    assert client_context.request_kind(parsed, {"client": "claude-code"}) == "session-title"
+
+
+@pytest.mark.parametrize("mode", ["append", "replace"])
+@pytest.mark.parametrize("system,expected", [
+    (ATTRIBUTION + "\n" + CLI_IDENTITY + "\n" + LEGACY_TITLE, "session-title"),
+    (CURRENT_TITLE, "session-title"),
+    ("Be concise.\n" + CURRENT_TITLE, "client-text"),
+], ids=["legacy-title", "current-title", "quote"])
+def test_relay_policy_follows_the_classification_not_a_quoted_phrase(tmp_path, monkeypatch, mode, system, expected):
+    from test_native_context_reuse import request, run, setup
+    from test_service_requests import capture_direct
+    policy = "RELAY ROLE AND RULES"
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, exec_policy="off",
+                         cookie_values=[], relay_system_prompt=policy, relay_system_prompt_mode=mode)
+    sent = capture_direct(monkeypatch)
+    parsed = request([{"role": "user", "content": "hi"}], tools=[], system=system)
+    token = client_context.bind({"client": "claude-code"})
+    try:
+        asyncio.run(run(runner, parsed))
+    finally:
+        client_context.reset(token)
+    head = sent[0][1]["messages"][0]["content"]
+    text = "\n".join(block["text"] for block in head)
+    assert client_context.request_kind(parsed, {"client": "claude-code"}) == expected
+    if expected == "session-title":
+        assert policy not in text and system.split("\n", 1)[-1] in text
+    else:
+        assert policy in text
