@@ -587,10 +587,39 @@ class AnthropicAdapter(_Base):
         self._blocks = []
         self._open_indices = set()
         self._tool_indices = {}
+        self._deferred = []
 
     def _emit(self, name, payload):
         if self.writer:
             self.writer.event(name, payload)
+
+    def _open_tools(self):
+        return [index for index in self._tool_indices.values() if index in self._open_indices]
+
+    def _wait(self, method, *args):
+        """True when this event has to wait for the tool calls that are still being written.
+
+        Text or thinking that arrives inside an open call used to close its block, and the rest of its arguments had
+        nowhere to go: the protocol has no re-open, and a delta for a stopped block is dropped, so the client got a
+        tool_use that ended in the middle (ultracode audit of the relay, C22). What waits is the interleaved text: it
+        goes out as the next block, in the order it came, once the open calls have stopped. A reply that is not
+        streamed has no stops to respect and is built as the events come."""
+        if self.writer is None or not self._open_tools():
+            return False
+        self._deferred.append((method, args))
+        return True
+
+    def _release(self):
+        held, self._deferred = self._deferred, []
+        for method, args in held:
+            method(*args)
+
+    def _settle_tools(self):
+        """Stop the tool blocks still open, then let out what waited for them."""
+        for index in sorted(self._open_tools()):
+            self._emit("content_block_stop", {"type": "content_block_stop", "index": index})
+            self._open_indices.discard(index)
+        self._release()
 
     def begin(self):
         self._emit("message_start", {"type": "message_start", "message": {
@@ -625,9 +654,13 @@ class AnthropicAdapter(_Base):
     def _think_start(self):
         # An open thinking block lets the client show "thinking" while the
         # provider reasons silently; the later signature attaches to it.
+        if self._wait(self._think_start):
+            return
         self._open("thinking")
 
     def _think(self, delta):
+        if self._wait(self._think, delta):
+            return
         block = self._open("thinking")
         block["thinking"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
@@ -640,12 +673,16 @@ class AnthropicAdapter(_Base):
             self._close_blocks()
 
     def _signature(self, signature):
+        if self._wait(self._signature, signature):
+            return
         if signature and self.open_kind == "thinking":
             self._blocks[self.index]["signature"] += signature
             self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                                "delta": {"type": "signature_delta", "signature": signature}})
 
     def _text(self, delta):
+        if self._wait(self._text, delta):
+            return
         block = self._open("text")
         block["text"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
@@ -676,6 +713,8 @@ class AnthropicAdapter(_Base):
             # to the end of the message, every call of a parallel batch waited for the last one to be written.
             self._emit("content_block_stop", {"type": "content_block_stop", "index": block_index})
             self._open_indices.discard(block_index)
+            if not self._open_tools():
+                self._release()
 
     def _stop_reason(self, reason):
         if reason == "timeout":
@@ -692,6 +731,7 @@ class AnthropicAdapter(_Base):
         usage = {"input_tokens": non_cached, "output_tokens": completion,
                  "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_write,
                  **self._price_usage()}
+        self._settle_tools()
         if not self._blocks:
             self._open("text")
         self._close_blocks()
