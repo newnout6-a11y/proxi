@@ -342,6 +342,7 @@ class ResponsesAdapter(_Base):
         self._items = []
         self._indices = {}
         self._custom_inputs = {}
+        self._cut_off = False
         self._tool_definitions = {
             tool.get("function", {}).get("name"): tool.get("function", {})
             for tool in getattr(parsed, "tools", [])
@@ -427,7 +428,11 @@ class ResponsesAdapter(_Base):
         if kind == "custom_tool_call":
             value = "" if started else self._custom_input(call)
             if value is None:
-                raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                if not self._cut_off:
+                    raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                # The client left or the turn timed out before the envelope of the input was whole: the call is
+                # incomplete, which no upstream fault caused, and no fragment of a patch is passed on as its input.
+                value, item["status"] = "", "incomplete"
             item["input"] = value
         else:
             item["arguments"] = "" if started else call["arguments"]
@@ -466,6 +471,7 @@ class ResponsesAdapter(_Base):
             })
 
     def end(self, reason, prompt_text=None):
+        self._cut_off = reason in ("cancelled", "timeout")
         if not self._items:
             self._ensure_item("message", self.item_id)
         status = "incomplete" if reason == "timeout" else "completed"
@@ -497,6 +503,7 @@ class ResponsesAdapter(_Base):
         return final
 
     def payload(self, reason, prompt_text=None):
+        self._cut_off = reason in ("cancelled", "timeout")
         prompt, completion = self.usage(prompt_text)
         reasoning_details = self._reasoning_details()
         if not self._items:
