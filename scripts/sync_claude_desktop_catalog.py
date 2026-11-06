@@ -15,6 +15,12 @@ Credentials and all other keys stay untouched. Writing requires a backup directo
 (it holds the old gateway settings: keep it private). Nothing is written and no
 backup is made when the list is already current. Quit Desktop before writing: it
 reads the configuration at launch.
+
+Prompt profiles that publish themselves as models (publish_as_model) add rows named
+<model>@<profile> for the Claude routes they cover (scripts/sync_virtual_models.py);
+--no-virtual-models leaves them out. Desktop keeps only names that look like an Anthropic
+model, judged by substrings of the whole name: avoid profile names that contain another
+vendor's name anywhere (gpt, glm, gemini, codex, solar, qwen and the like).
 """
 import argparse
 import base64
@@ -30,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config
 import models
 from apierr import ApiError
+from scripts import sync_virtual_models
 from scripts.audit_models import load_accounts
 from scripts.sync_opencode_catalog import write_backed_up
 
@@ -102,6 +109,11 @@ def claude_routes(entries):
     return [entry for entry in entries if entry.get('provider') == 'anthropic' and entry['id'].startswith('claude-')]
 
 
+def _base_id(entry):
+    """The catalog model behind an entry: itself, or the base of a virtual <model>@<profile> entry."""
+    return entry.get('virtual', {}).get('base', entry['id'])
+
+
 def _rows_by_name(previous):
     """Existing rows by model name; a bare string row stands for {'name': string}. The first row of a name wins."""
     rows = {}
@@ -121,13 +133,17 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
     anthropicFamilyTier, maxEffort) are recomputed and overwrite the file; labelOverride
     is set for new rows only. A desktop mapping (see load_desktop_catalog) limits the
     list to models Desktop knows for Code/Cowork unless include_unlisted.
+
+    A virtual entry <model>@<profile> (models.virtual_entries) is a row of its own that follows its
+    base model everywhere it matters: Anthropic's catalog lists it when it lists the base, the picker
+    levels are the base's, and it is never a family default.
     """
     if not isinstance(previous, list) or any(not isinstance(item, (dict, str)) for item in previous):
         raise ValueError('Expected an existing Claude Desktop model policy list')
     old = _rows_by_name(previous)
     routes = claude_routes(entries)
     if desktop is not None and not include_unlisted:
-        listed = [entry for entry in routes if entry['id'] in desktop]
+        listed = [entry for entry in routes if _base_id(entry) in desktop]
         if routes and not listed:
             raise ValueError("Anthropic's model catalog lists none of the relay's Claude routes for "
                              'Code or Cowork; use --include-unlisted to list them anyway')
@@ -142,7 +158,7 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
     current = next(iter(old), None)
     if default_model is not None:
         try:
-            wanted = models.resolve(default_model)[0]['id']
+            wanted = models.canonical_name(default_model)
         except ApiError:
             wanted = default_model
         if wanted not in by_id:
@@ -155,9 +171,10 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
                          'entry changes only on request: pass --default-model to choose the new '
                          'default (or --include-unlisted to keep it)' % current)
     result = []
+    bases = [entry for entry in listed if 'virtual' not in entry]
     for name in names:
         entry = by_id[name]
-        metadata = models.desktop_metadata(entry, listed)
+        metadata = models.desktop_metadata(entry, bases)
         item = copy.deepcopy(old.get(name) or {})
         item['name'] = name
         if name not in old:
@@ -169,7 +186,7 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
         else:
             item.pop('anthropicFamilyTier', None)
         cap = compatible_effort_cap(entry.get('reasoning_effort_levels') or [],
-                                    native_efforts(name, desktop), allow_downgrade)
+                                    native_efforts(_base_id(entry), desktop), allow_downgrade)
         if cap:
             item['maxEffort'] = cap
         else:
@@ -488,16 +505,24 @@ def run(args):
                         'settings and may serve the model list itself')
     relay = load_relay_config(args.relay_config)
     entries = [entry for entry in models.catalog() if models.catalog_routable(entry, relay)]
+    entries, virtual = sync_virtual_models.with_virtual_models(entries, args)
     desktop = _catalog_hint(args, warnings)
     result = build_catalog(entries, previous, default_model=args.default_model, desktop=desktop,
                            include_unlisted=args.include_unlisted,
                            allow_downgrade=relay['allow_effort_downgrade'])
     before, after = _names(previous), [item['name'] for item in result]
-    skipped = ([entry['id'] for entry in claude_routes(entries) if entry['id'] not in desktop]
+    skipped = ([entry['id'] for entry in claude_routes(entries) if _base_id(entry) not in desktop]
                if desktop is not None and not args.include_unlisted else [])
     if any(name in skipped for name in before):
         warnings.append('Removed rows the Anthropic catalog does not list for Code/Cowork: %s; '
                         '--include-unlisted keeps them' % ', '.join(name for name in before if name in skipped))
+    virtual_names = {entry['id'] for entry in entries if 'virtual' in entry}
+    virtual_rows = [name for name in after if name in virtual_names]
+    if virtual_rows:
+        warnings.append('Virtual models are listed as <model>@<profile>: Desktop removes list entries whose name does '
+                        'not look like an Anthropic model, judging the whole name by substrings, so a profile name '
+                        "that contains another vendor's name anywhere (gpt, glm, gemini, codex, solar, qwen and the "
+                        'like) loses its row')
     encoded = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
     if args.output:
         try:
@@ -521,7 +546,9 @@ def run(args):
                       'added': [name for name in after if name not in before],
                       'removed': [name for name in before if name not in after],
                       'changed_fields': changed_fields(previous, result),
-                      'unlisted_skipped': skipped, 'warnings': warnings}, ensure_ascii=False))
+                      'unlisted_skipped': skipped, 'warnings': warnings,
+                      **({'virtual_models': len(virtual_rows), 'prompts': virtual['prompts']} if virtual else {})},
+                     ensure_ascii=False))
     return 0
 
 
@@ -544,6 +571,7 @@ def main(argv=None):
     parser.add_argument('--write', action='store_true')
     parser.add_argument('--backup-dir',
                         help='Required for --write; for configLibrary it must be on the same volume')
+    sync_virtual_models.add_arguments(parser)
     args = parser.parse_args(argv)
     if args.write and not args.backup_dir:
         parser.error('--write requires --backup-dir')

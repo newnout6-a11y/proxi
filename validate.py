@@ -90,6 +90,10 @@ class Parsed:
         self.tools = []
         self.tool_choice = "auto"
         self.conversation_key = None
+        # The client's model name without @profile and #effort, before alias resolution, and the @profile
+        # of a virtual model <model>@<profile>; the prompt layer reads both (prompt_policy.PlanInput).
+        self.requested_model = ""
+        self.virtual_profile = None
 
 
 def load_json(raw: bytes):
@@ -120,6 +124,18 @@ def _opt_bool(data, key, default=False):
     if not isinstance(value, bool):
         raise unprocessable(f"'{key}' must be a boolean", param=key)
     return value
+
+
+def _client_model(model, cfg):
+    """(the client's model name without @profile and #effort, its @profile or None).
+
+    An empty name, or one that is only an effort suffix, stands for the configured default model, as
+    models.resolve reads it. The profile is only named here: that it exists is the prompt layer's check.
+    """
+    named = model_catalog.parse_model_name(model)
+    if not named.base:
+        named = model_catalog.parse_model_name(cfg.get("model"))
+    return named.base, named.profile
 
 
 def _opt_int(data, key, low=1, high=MAX_TOKENS_CAP):
@@ -451,13 +467,7 @@ def _messages(data, *, min_items=1):
 def _finish(data, parsed, dialect):
     parsed.requested_effort = _effort(data)
     if parsed.requested_effort is None:
-        for separator in ("#", ":"):
-            name = data.get("model") or ""
-            if separator in name:
-                candidate = name.split(separator, 1)[1].strip().lower()
-                if candidate in model_catalog.EFFORT_ORDER:
-                    parsed.requested_effort = candidate
-                break
+        parsed.requested_effort = model_catalog.parse_model_name(data.get("model")).effort
     parsed.structured_output = generation.structured_output(data, dialect)
     parsed.structured_title = bool(parsed.structured_output and parsed.structured_output['title'])
     parsed.verbosity, parsed.declared_ignored, parsed.routine_ignored = generation.controls(
@@ -658,6 +668,7 @@ def parse_chat(data, cfg):
         _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
         allow_downgrade=cfg.get("allow_effort_downgrade", False))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
+    parsed.requested_model, parsed.virtual_profile = _client_model(_opt_str(data, "model"), cfg)
     _reject_images_unsupported(entry, data)
     messages = _messages(data)
     lead, converted, ignored = native_history.leading_instructions(messages), [], []
@@ -682,6 +693,7 @@ def parse_responses(data, cfg):
         _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
         allow_downgrade=cfg.get("allow_effort_downgrade", False))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
+    parsed.requested_model, parsed.virtual_profile = _client_model(_opt_str(data, "model"), cfg)
     _reject_images_unsupported(entry, data)
 
     raw_input = data.get("input")
@@ -720,6 +732,7 @@ def parse_anthropic(data, cfg):
         model, _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
         allow_downgrade=cfg.get("allow_effort_downgrade", False))
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
+    parsed.requested_model, parsed.virtual_profile = _client_model(model, cfg)
     _reject_images_unsupported(entry, data)
     messages = _messages(data)
     # Retool rejects several system messages and a changed head drops the signed
