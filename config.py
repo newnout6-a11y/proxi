@@ -76,6 +76,9 @@ DEFAULTS = {
     "enable_responses": True,
     "reasoning_effort": "auto",
     "allow_effort_downgrade": False,
+    # Retool's Claude routes have no xhigh. A request for it is served at this level instead of failing: high (what the
+    # nearest-level rule picks too) or max. Read from the config like allow_effort_downgrade, so a change needs a restart.
+    "claude_xhigh_effort": "high",
     # A client's compaction (the request that summarizes its history so that the client can replace it) runs on the effort
     # of the signed branch it resends: another effort restarts that history and the provider's cached messages, and the
     # whole conversation is written again. False lets the effort the client sends decide, as for any other request.
@@ -528,6 +531,8 @@ def _load(path):
         raise service_unavailable("account_rate_limit_cooldown must be between 1 and 3600 seconds")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
+    if cfg["claude_xhigh_effort"] not in models.XHIGH_REPLACEMENTS:
+        raise service_unavailable("claude_xhigh_effort must be one of: " + ", ".join(models.XHIGH_REPLACEMENTS))
     if type(cfg["compaction_keep_effort"]) is not bool:
         raise service_unavailable("compaction_keep_effort must be a boolean")
     if type(cfg["infer_conversations"]) is not bool:
@@ -627,9 +632,9 @@ def _load(path):
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
         raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
     if cfg.get("reasoning_effort") not in (None, "auto"):
-        import models
         models.resolve_tolerant(cfg["model"], cfg["reasoning_effort"],
-                                strict=cfg["strict_models"], allow_downgrade=cfg["allow_effort_downgrade"])
+                                strict=cfg["strict_models"], allow_downgrade=cfg["allow_effort_downgrade"],
+                                xhigh_as=cfg["claude_xhigh_effort"])
 
     workspace = cfg.get("workspace_root") or os.getcwd()
     # Resolve symlinks/junctions so escapes are visible.

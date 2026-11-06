@@ -455,7 +455,8 @@ class TurnRunner:
                 getattr(getattr(session, "backend", None), "cfg", None) or self.cfg, parsed.entry)
         except apierr.ApiError:
             return None, None  # acquire says why
-        wanted = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"))
+        wanted = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"),
+                                                self.cfg.get("claude_xhigh_effort", "high"))
         tools = direct.tools_to_retool(parsed.tools)
 
         def scope_of(effort):
@@ -955,7 +956,8 @@ class TurnRunner:
             # resolved from the acquired session's backend cfg below. Resolving it
             # from the global cfg here would 503 account-only configurations.
             model_provider = {"model": parsed.model}
-            effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"))
+            effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"),
+                                                    self.cfg.get("claude_xhigh_effort", "high"))
             # The effort of the request is the client's, then the profile's when the profile sets one (proxy applied it
             # to parsed.effort); requested_effort is always what the client sent, effort_source says who decided.
             profile_effort = getattr(parsed, "prompt_effort", None)

@@ -859,8 +859,9 @@ lists for Code or Cowork are included: 9 of the 11 in catalog version 4008.
 selector for them. `--include-unlisted` keeps them. Without a catalog file all 11
 are listed, with a warning.
 
-`maxEffort` hides every level above it, so a cap cannot skip a level. The relay
-rejects `xhigh` unless `allow_effort_downgrade` is true in its configuration:
+`maxEffort` hides every level above it, so a cap cannot skip a level. The relay serves `xhigh` on a Claude route as
+`high` (or as `max`: the setting `claude_xhigh_effort`) whatever `allow_effort_downgrade` says, so Desktop's own picker is
+safe at any cap. The script's cap rule is older than that and still reads the downgrade setting:
 
 | Model | Desktop picker | `maxEffort`, downgrade off | downgrade on |
 | --- | --- | --- | --- |
@@ -868,10 +869,10 @@ rejects `xhigh` unless `allow_effort_downgrade` is true in its configuration:
 | Opus 4.6, Sonnet 4.6 | low, medium, high, max | `max` | `max` |
 | Haiku 4.5, Opus 4.5, Sonnet 4.5 | no effort selector | not set | not set |
 
-With the setting off, five-level rows stop at `high`: Desktop does not offer `max`
-even though the relay accepts it, because a `max` cap would also expose `xhigh`.
-With it on, the script sets `max`; the relay serves `xhigh` as `high` and `max` as
-`max`. Haiku 4.5, Opus 4.5 and Sonnet 4.5 have no native effort. Claude Code's
+With the setting off, five-level rows stop at `high`: Desktop does not offer `max` even though the relay accepts it,
+because a `max` cap would also expose `xhigh`, and the script still assumes the relay refuses that level. It no longer
+does on Claude routes, so the cap is lower than it needs to be, not wrong. With the setting on, the script sets `max`;
+the relay serves `xhigh` as `high` (or `max`) and `max` as `max`. Haiku 4.5, Opus 4.5 and Sonnet 4.5 have no native effort. Claude Code's
 [effort table](https://code.claude.com/docs/en/model-config#adjust-effort-level)
 says "Models not listed here do not support effort" and Anthropic's Haiku 4.5
 page says "Default effort: Not supported". A readable catalog's effort levels

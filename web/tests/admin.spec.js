@@ -667,6 +667,42 @@ test('an effort level the model lacks is an error only while approximation is of
   await expect(banner).toContainText('xhigh');
 });
 
+test('the level that xhigh becomes on Claude is a choice of high and max, saved with the rest and held for a restart', async ({ page }) => {
+  const state = await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const choice = page.locator('#setting-claude_xhigh_effort');
+  await expect(page.getByText('Уровень вместо xhigh у Claude')).toBeVisible();
+  await expect(choice).toHaveValue('high');
+  await expect(choice.locator('option')).toHaveText(['high (по умолчанию)', 'max']);
+  await choice.selectOption('max');
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect.poll(() => state.patches.length).toBe(1);
+  expect(state.patches[0].body).toEqual({ settings: { claude_xhigh_effort: 'max' } });
+  // Saved, not applied: like the other effort settings, it waits for a restart
+  await expect(page.locator('.setting.pending').filter({ has: page.locator('#setting-claude_xhigh_effort') })).toHaveCount(1);
+});
+
+test('xhigh is offered for a model that replaces it, labelled with the level it becomes, and not for one that does not', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const effort = page.locator('#setting-reasoning_effort');
+  const banner = page.getByRole('status').filter({ hasText: 'не поддерживается моделью' });
+  // The default model is Claude Opus 5.5: low, medium, high and max, and xhigh served as another level
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', 'low', 'medium', 'high', 'xhigh · станет high', 'max']);
+  await page.locator('#setting-claude_xhigh_effort').selectOption('max');
+  await expect(effort.locator('option[value="xhigh"]')).toHaveText('xhigh · станет max');
+  await effort.selectOption('xhigh');
+  await expect(banner).toHaveCount(0);
+  // A model with no replacement has no xhigh to offer while approximation is off, and the saved level is a warning
+  await page.locator('#setting-model').selectOption('gpt-5.5');
+  await expect(banner).toContainText('GPT 5.5');
+  await effort.selectOption('high');
+  await expect(banner).toHaveCount(0);
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', 'low', 'medium', 'high']);
+});
+
 // The relay takes any known level for these routes and changes nothing (reasoning_effort_control "accepted-ignored").
 for (const id of ['zai-org/GLM-5.3', 'claude-haiku-4-5']) {
   test(`a saved effort level on ${id}, whose route ignores it, raises no warning`, async ({ page }) => {

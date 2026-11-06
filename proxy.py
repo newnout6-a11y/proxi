@@ -735,7 +735,8 @@ def make_handler(runtime: Runtime):
             self._carry_tools(parsed)
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
-            effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
+            effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"),
+                                                       cfg.get("claude_xhigh_effort", "high"))
             self._effort_str = effective_effort or (
                 "provider" if parsed.entry.get("reasoning") and
                 parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
@@ -981,7 +982,8 @@ def make_handler(runtime: Runtime):
                 try:
                     _, resolved = models.resolve_tolerant(
                         parsed.model, effort, strict=cfg["strict_models"], default_model=cfg.get("model"),
-                        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+                        allow_downgrade=cfg.get("allow_effort_downgrade", False),
+                        xhigh_as=cfg.get("claude_xhigh_effort", "high"))
                 except apierr.ApiError as error:
                     raise apierr.bad_request("profile '%s' sets generation.effort to '%s': %s" % (
                         plan.profile, effort, error.message), param=where + "effort")

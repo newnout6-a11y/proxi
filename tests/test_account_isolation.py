@@ -104,7 +104,7 @@ def test_duplicate_ids_are_rejected_without_rewriting_config(tmp_path):
 def test_configured_unsupported_effort_requires_explicit_compatibility(tmp_path, compatibility):
     _, path = stored_pool(tmp_path)
     saved = json.loads(path.read_text(encoding="utf-8"))
-    saved.update(reasoning_effort="xhigh", allow_effort_downgrade=compatibility)
+    saved.update(reasoning_effort="minimal", allow_effort_downgrade=compatibility)
     path.write_text(json.dumps(saved), encoding="utf-8")
     if compatibility:
         assert config.load(path)["allow_effort_downgrade"] is True

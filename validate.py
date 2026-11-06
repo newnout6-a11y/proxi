@@ -731,11 +731,16 @@ def conversation_key(data, header_value=None, allow_content_fallback=False):
     return None
 
 
+def _effort_of(data, cfg):
+    """(entry, effort) of a request's model and effort controls under the config's effort rules."""
+    return model_catalog.resolve_tolerant(
+        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
+        allow_downgrade=cfg.get("allow_effort_downgrade", False), xhigh_as=cfg.get("claude_xhigh_effort", "high"))
+
+
 def parse_chat(data, cfg):
     parsed = Parsed()
-    entry, effort = model_catalog.resolve_tolerant(
-        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
-        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+    entry, effort = _effort_of(data, cfg)
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     parsed.requested_model, parsed.virtual_profile = _client_model(_opt_str(data, "model"), cfg)
     _reject_images_unsupported(entry, data)
@@ -758,9 +763,7 @@ def parse_chat(data, cfg):
 
 def parse_responses(data, cfg):
     parsed = Parsed()
-    entry, effort = model_catalog.resolve_tolerant(
-        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
-        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+    entry, effort = _effort_of(data, cfg)
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     parsed.requested_model, parsed.virtual_profile = _client_model(_opt_str(data, "model"), cfg)
     _reject_images_unsupported(entry, data)
@@ -803,9 +806,7 @@ def parse_responses(data, cfg):
 def parse_anthropic(data, cfg):
     parsed = Parsed()
     model = _opt_str(data, "model")
-    entry, effort = model_catalog.resolve_tolerant(
-        model, _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
-        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+    entry, effort = _effort_of(data, cfg)
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     parsed.requested_model, parsed.virtual_profile = _client_model(model, cfg)
     _reject_images_unsupported(entry, data)

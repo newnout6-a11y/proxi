@@ -129,7 +129,7 @@ def test_labels_are_scoped_across_async_requests_and_redacted():
 
 def test_invalid_effort_has_chat_title_and_correlated_error(relay):
     payload = {"model": "claude-opus-5-5", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}],
-               "output_config": {"effort": "xhigh"}}
+               "output_config": {"effort": "minimal"}}
     before = journal.JOURNAL.last_seq
     conn = http.client.HTTPConnection(relay.url.removeprefix("http://"))
     headers = {"authorization": "Bearer " + relay.key, "content-type": "application/json",
@@ -153,7 +153,7 @@ def test_invalid_effort_has_chat_title_and_correlated_error(relay):
         time.sleep(0.01)
     error = next(event for event in events if event["kind"] == "http.error")
     assert error["data"]["chat_title"] == "Сломанный чат"
-    assert error["data"]["effort"] == "xhigh"
+    assert error["data"]["effort"] == "minimal"
     assert error["data"]["stage"] == "relay"
     assert error["request_id"] == body["request_id"]
     health = next(event for event in events if event["kind"] == "http.request" and event["data"]["path"] == "/health")
