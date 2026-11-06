@@ -665,7 +665,16 @@ def test_planning_reloading_saving_and_recording_together_never_break_the_store(
         for index in range(8):
             if stop.is_set():
                 return
-            rewrite(tmp_path / "prompts.json", doc("E%d" % index))
+            # Windows does not let an editor open the file while the store replaces it (or a scanner holds it):
+            # like an editor, this one tries again
+            for attempt in range(50):
+                try:
+                    rewrite(tmp_path / "prompts.json", doc("E%d" % index))
+                    break
+                except PermissionError:
+                    if attempt == 49:
+                        raise
+                    stop.wait(0.01)
 
     def planner(name):
         def run():
