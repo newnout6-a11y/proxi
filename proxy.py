@@ -24,6 +24,7 @@ import client_context
 import console_log
 from redact import redact
 import config as config_module
+import conversation_state
 import generation
 import models as model_catalog
 import sse
@@ -48,7 +49,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RECORD_REQUEST_BYTES = 1024 * 1024
 # What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
 _CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
-                 "dialect", "thinking_placeholder", "virtual_profile", "requested_model")
+                 "dialect", "thinking_placeholder", "virtual_profile", "requested_model", "client_task")
 
 
 def _carry_compatibility(first, parsed, changes):
@@ -126,6 +127,8 @@ class Runtime:
         self.journal = journal.JOURNAL
         self.journal.configure(cfg, cfg.get("journal_path"))
         self.admin = admin_module.Admin(self)
+        # After the journal is configured: scanning the stored conversations reports what it removed.
+        self.pool.attach_store(conversation_state.open_store(cfg))
 
     def submit(self, coroutine):
         with self._lifecycle_lock:
@@ -136,6 +139,8 @@ class Runtime:
 
     async def _shutdown_tasks(self):
         self.loop._relay_closing = True
+        # Conversations that moved since their last stored copy go to the writer before turns are cancelled.
+        self.pool.persist_pending()
         sessions = {record[0] for record in self.pool._active.values()}
         sessions.update(self.pool._conversations.values())
         if self.pool._shared is not None:
@@ -166,6 +171,8 @@ class Runtime:
             future.cancel()
             journal.emit("relay.shutdown", "Истекло время завершения задач relay", "warn")
         finally:
+            # The writer finishes what is queued (bounded), so a normal stop loses nothing it was handed.
+            self.pool.close_store()
             self._io_executor.shutdown(wait=False, cancel_futures=True)
             self.loop.call_soon_threadsafe(self.loop.stop)
             self._loop_thread.join(timeout=2)
@@ -281,7 +288,8 @@ def make_handler(runtime: Runtime):
             status = getattr(self, "_status", 0) or getattr(self, "_stream_status", 0)
             took = (time.time() - self._started) * 1000
             model = getattr(self, "_model", "-")
-            effort = getattr(self, "_effort_str", "")
+            # A compaction can run on the dialog's effort instead of the one its client asked for (orchestrator).
+            effort = (getattr(self, "_holder", None) or {}).get("kept_effort") or getattr(self, "_effort_str", "")
             effort_tag = f" [{effort}]" if effort and model != "-" else ""
             route = getattr(self, "_log_route", None)
             local_note = {"count_tokens": "[local-token-count]", "models": "[local-model-catalog]"}.get(route, "")
@@ -633,6 +641,11 @@ def make_handler(runtime: Runtime):
             parsed.dialect = dialect
             self._model = parsed.model
             parsed.request_purpose = client_context.request_kind(parsed)
+            # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
+            # identity, so that every event of the request, the transport's included, says what it is.
+            parsed.client_task = client_context.client_task(parsed)
+            if parsed.client_task:
+                client_context.bind({**client_context.current(), "client_task": parsed.client_task})
             # The pool is asked about the accounts this very request would run on (acquire reads the same plan).
             scope = acquire_plan(cfg, parsed).kwargs
             refusal = runtime.pool.model_refusal(parsed.entry, **scope)
@@ -679,7 +692,8 @@ def make_handler(runtime: Runtime):
                                                  if not key.startswith("prompt_")},
                                          effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
-            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}")
+            task_note = " | TASK: " + parsed.client_task if parsed.client_task else ""
+            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}{task_note}")
 
             wait = runtime.limiter.take()
             if wait:
@@ -986,13 +1000,15 @@ class BoundedServer(ThreadingHTTPServer):
 def startup_config(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=config_module.CONFIG_PATH, help="Path to the existing relay config")
-    parser.add_argument("--state-dir", help="Directory for journal, command log and rejected upstream bodies")
+    parser.add_argument("--state-dir", help="Directory for journal, command log, rejected upstream bodies "
+                                            "and stored conversation state")
     args = parser.parse_args(argv)
     cfg = config_module.load(os.path.abspath(args.config))
     state = os.path.abspath(args.state_dir or HERE)
     os.makedirs(state, exist_ok=True)
     for key, relative in (("command_log", "commands.log"), ("journal_path", "journal.jsonl"),
-                          ("upstream_error_dir", os.path.join("logs", "upstream-400"))):
+                          ("upstream_error_dir", os.path.join("logs", "upstream-400")),
+                          ("conversation_state_dir", "conversations")):
         if args.state_dir or not cfg.get(key):
             cfg[key] = os.path.join(state, relative)
     return cfg

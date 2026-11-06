@@ -5,7 +5,7 @@ import { Section, ease } from '../motion.jsx';
 import { Empty, Tag } from '../ui.jsx';
 import { TapeLegend, TurnTape } from '../charts.jsx';
 import { LEVELS, STATUS_TONE, TURN_STATUS } from '../catalog.js';
-import { buildTraces, costOf, phasesOf, scaleOf, staleLimit, statusAt } from '../turns.js';
+import { TASK_LABEL, buildTraces, costOf, effortText, phasesOf, scaleOf, staleLimit, statusAt } from '../turns.js';
 import { fmtAgo, fmtClock, fmtFixed, fmtInt, fmtMs, fmtTokens } from '../format.js';
 import { TurnsArt } from '../stage/Art.jsx';
 
@@ -83,7 +83,13 @@ export default function Turns({ journal, overview, embedded }) {
                 </span>
                 <span className="trace-model">
                   <strong>{trace.model || '—'}</strong>
-                  <small>{[trace.effort && `effort ${trace.effort}`, trace.transport, trace.dialect].filter(Boolean).join(' · ')}</small>
+                  <small>
+                    {TASK_LABEL[trace.task] && (
+                      <span className="trace-task" title="Клиент сжимает историю диалога: дорогой ход, если подписанная история и кэш не продолжились">
+                        {TASK_LABEL[trace.task]} · </span>
+                    )}
+                    {[effortText(trace), trace.transport, trace.dialect].filter(Boolean).join(' · ')}
+                  </small>
                 </span>
                 <span className="trace-tape">
                   <TurnTape trace={trace} max={max} now={now} phases={phases} />

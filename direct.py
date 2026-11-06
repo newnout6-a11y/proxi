@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 
 import apierr
+import conversation_state
 import credits
 import journal
 import client_context
@@ -1067,16 +1068,35 @@ async def _keepwarm(session, cfg):
         cycle.announce()
 
 
+def native_scope(conversation_key, model_provider, head, tools, tool_choice):
+    """What a signed branch is keyed by: it continues only a request that has all of these as it had them.
+
+    iter_events keys the branches it records and resumes by this, and the compaction check of the orchestrator asks
+    the same question before the turn begins. Output caps and verbosity control generation, not the signed input
+    prefix, and clients legitimately omit or change them between tool follow-ups, so verbosity is left out. The effort
+    is in: the provider renders it into the prompt, so another effort is another prefix."""
+    prefix_provider = {key: value for key, value in model_provider.items() if key != 'verbosity'}
+    return json.dumps([conversation_key, prefix_provider, head, tools, tool_choice], sort_keys=True, ensure_ascii=True)
+
+
+def scope_effort(scope):
+    """The reasoning effort a signed branch was made with, read from its scope; None when it has none.
+
+    The provider is the second part of the scope (native_scope): a request that asks for another effort starts a new
+    history instead of continuing the branch."""
+    try:
+        effort = json.loads(scope)[1].get("reasoningEffort")
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+        return None
+    return effort if isinstance(effort, str) and effort else None
+
+
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
     """Yield normalised relay events from the direct NDJSON stream."""
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
-    # Output caps and verbosity control generation, not the signed input prefix.
-    # Clients legitimately omit or change them between tool follow-ups.
-    prefix_provider = {key: value for key, value in model_provider.items() if key != 'verbosity'}
-    scope = json.dumps([getattr(session, "_native_conversation_key", None), prefix_provider,
-                        head, tools, tool_choice], sort_keys=True, ensure_ascii=True)
+    scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
     parent, messages = history.resume(scope, client) if history is not None and client is not None else (None, None)
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
@@ -1172,10 +1192,19 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 note(event)
                 yield event
         reply = getattr(session, "_direct_reply", None)
-        if client is not None and history is not None and reply is not None and not session._cancelled:
+        # The summary of a client's compaction is a side request: the client replaces its history by that summary and
+        # never continues this one. Recording it would put a branch nobody extends in place of the parent it resumed
+        # (a nudged or repeated compaction, a background one beside the chat, or the chat itself after an abandoned
+        # compaction would then start from nothing), so the dialog's branches stay as the chat left them.
+        side_request = identity.get("client_task") == client_context.COMPACTION
+        if client is not None and history is not None and reply is not None and not session._cancelled and not side_request:
             blocks, expected = reply
             history.record(scope, client, body["messages"], blocks, expected, parent)
     except apierr.ApiError as error:
+        if error.status in (400, 422) and parent is not None:
+            # A branch read back from disk is not replayed again once upstream has refused it: the next try
+            # takes the unsigned path instead of repeating the refusal until the stored copy expires.
+            conversation_state.refuse(session, parent, error.status)
         # A body upstream rejected (400/413/422) must not become the keepwarm body.
         rejected = 400 <= error.status < 500 and error.status not in (401, 403, 408, 429)
         failure = error
