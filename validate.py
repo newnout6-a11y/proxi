@@ -483,6 +483,10 @@ def _responses_item(item):
         raise unprocessable("item_reference is not supported; send the full conversation items", param="input")
     if kind == "reasoning" and "role" not in item:
         return {"role": "assistant", "content": item.get("summary") or ""}
+    if kind == "agent_message" and "role" not in item:
+        # Codex's multi-agent v2: a message between the agents of one task (author -> recipient), such as a task or
+        # a sub-agent's final answer. Upstream has no such item; to the agent that holds it, it is a turn it received.
+        return {"role": "user", "content": item.get("content") if item.get("content") is not None else ""}
     return item
 
 
@@ -741,6 +745,12 @@ def parse_responses(data, cfg):
         messages = [{"role": "user", "content": raw_input}]
     elif isinstance(raw_input, list):
         messages = [_responses_item(item) for item in raw_input]
+        for index, message in enumerate(messages):
+            if (isinstance(message, dict) and message.get("role") is None and not message.get("tool_calls")
+                    and message.get("type") not in (None, "message")):
+                # Without this the item failed later as "messages[N].role must be a string", which names no type.
+                raise unprocessable("input[%d]: input items of type %r are not supported by the Retool route"
+                                    % (index, message.get("type")), param="input[%d].type" % index)
     elif raw_input is None:
         raise bad_request("'input' is required", param="input")
     else:
