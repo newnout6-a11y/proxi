@@ -286,15 +286,53 @@ def _param_schema(schema, required):
         elif kind == "array":
             node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False)}
         elif kind == "object" or schema.get("properties") or schema.get("additionalProperties"):
+            properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
             node = {"type": "object", "properties": {
-                name: _param_schema(sub, name in (schema.get("required") or []))
-                for name, sub in (schema.get("properties") or {}).items()}}
-    description = " ".join(part for part in (str(schema["description"]) if schema.get("description") else "", note)
-                           if part)
+                name: _param_schema(sub, name in _required_names(schema)) for name, sub in properties.items()}}
+    description = " ".join(part for part in (str(schema["description"]) if schema.get("description") else "", note,
+                                             _limits(schema)) if part)
     if description:
         node["description"] = description
     node["required"] = bool(required)
     return node
+
+
+def _required_names(schema):
+    """The required property names of an object schema; a draft-3 boolean or another odd value counts as none.
+
+    Before, `required: true` or a list of properties raised TypeError while the tools were converted, and the client
+    got a 500 instead of its answer (ultracode audit of the relay, C15)."""
+    names = schema.get("required")
+    return [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
+
+
+_LIMITS = (("minLength", "at least %s character"), ("maxLength", "at most %s character"),
+           ("minimum", ">= %s"), ("maximum", "<= %s"), ("exclusiveMinimum", "> %s"), ("exclusiveMaximum", "< %s"),
+           ("multipleOf", "a multiple of %s"), ("minItems", "at least %s item"), ("maxItems", "at most %s item"))
+
+
+def _limits(schema):
+    """The validation limits of a field, in words for its description; None when it has none.
+
+    Retool's param shape has no place for them, so the model never saw them and broke them, and the client's tool or
+    its MCP server refused the call: a wait above its 60-second maximum, a SendMessage recipient on several lines.
+    Limits written inside allOf (as Claude Code writes its patterns) count as well. The safe-integer bounds a schema
+    library adds to every integer (+-9007199254740991) say nothing and are left out."""
+    parts = []
+    for source in [schema] + [item for item in schema.get("allOf") or [] if isinstance(item, dict)]:
+        for key, words in _LIMITS:
+            value = source.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and abs(value) < 2 ** 53 - 1:
+                number = int(value) if float(value).is_integer() else value
+                parts.append(words % number + ("s" if words.endswith(("character", "item")) and number != 1 else ""))
+        if source.get("uniqueItems") is True:
+            parts.append("no duplicate items")
+        if isinstance(source.get("pattern"), str) and 0 < len(source["pattern"]) <= 160:
+            parts.append("matching the regular expression " + source["pattern"])
+        if isinstance(source.get("format"), str) and source["format"]:
+            parts.append("in %s format" % source["format"])
+    parts = list(dict.fromkeys(parts))
+    return "Limits: %s." % "; ".join(parts) if parts else None
 
 
 def tools_to_retool(tools):
@@ -315,9 +353,9 @@ def tools_to_retool(tools):
         if not isinstance(function, dict) or not function.get("name"):
             continue
         params = {}
-        schema = function.get("parameters") or {}
-        required = set(schema.get("required") or [])
-        properties = schema.get("properties") or {}
+        schema = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
+        required = set(_required_names(schema))
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
         for name in sorted(properties.keys()):
             params[name] = _param_schema(properties[name], name in required)
         converted.append({"name": function["name"],
