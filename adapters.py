@@ -8,6 +8,7 @@ import uuid
 import apierr
 import structured
 from credits import token_counter as _token_counter
+from native_history import loads_finite
 
 
 def approx_tokens(text: str) -> int:
@@ -250,6 +251,12 @@ class ChatAdapter(_Base):
     def _tool_call(self, index, call, delta, new=False):
         if not self.writer:
             return
+        if call.get("tool_type") == "custom":
+            # The input is written inside the JSON envelope the model was offered the tool as, and is unwrapped only
+            # when that is whole (the Responses custom tool waits for it too): the call goes out whole, as soon as it is.
+            if call.get("done"):
+                self._send_custom(index, call)
+            return
         item = {"index": index}
         if new:
             item.update({"id": call["id"], "type": "function"})
@@ -258,9 +265,53 @@ class ChatAdapter(_Base):
             item["function"]["name"] = call["name"]
         self.writer.data(self._chunk({"tool_calls": [item]}))
 
+    @staticmethod
+    def _custom_text(call):
+        """The input of a call to a custom tool of Chat: the string inside the envelope {"input": ...} the model was
+        offered the tool as; None while that envelope is not whole."""
+        arguments = call["arguments"]
+        try:
+            value = json.loads(arguments)
+        except (ValueError, TypeError):
+            return None if re.match(r'^\s*\{\s*"input"\s*:', arguments) else arguments
+        return value["input"] if isinstance(value, dict) and isinstance(value.get("input"), str) else arguments
+
+    def _send_custom(self, index, call):
+        if call.get("sent"):
+            return call["arguments"]
+        value = self._custom_text(call)
+        if value is not None:
+            call["sent"] = True
+            self.writer.data(self._chunk({"tool_calls": [{"index": index, "id": call["id"], "type": "custom",
+                                                           "custom": {"name": call["name"], "input": value}}]}))
+        return value
+
+    def _wire_calls(self, reason):
+        """The calls of the reply as Chat writes them: a function call, or a custom one with its one input string.
+
+        A custom call whose input is cut off is dropped when the client left or the turn timed out, and an upstream
+        fault when upstream said the turn was complete: half a patch is never passed on."""
+        calls = []
+        for call in self.tool_calls:
+            if call.get("tool_type") != "custom":
+                calls.append({"id": call["id"], "type": "function",
+                              "function": {"name": call["name"], "arguments": call["arguments"]}})
+                continue
+            value = self._custom_text(call)
+            if value is None:
+                if reason not in ("cancelled", "timeout"):
+                    raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                continue
+            calls.append({"id": call["id"], "type": "custom", "custom": {"name": call["name"], "input": value}})
+        return calls
+
     def end(self, reason, prompt_text=None):
         finish = FINISH_MAP.get(reason, "stop")
         if self.writer:
+            for index, call in enumerate(self.tool_calls):
+                if call.get("tool_type") == "custom" and not call.get("sent"):
+                    if self._send_custom(index, call) is None and reason not in ("cancelled", "timeout"):
+                        raise apierr.upstream_error("Retool returned incomplete custom tool input")
             self.writer.data(self._chunk({}, finish))
             prompt, completion = self.usage(prompt_text)
             usage_dict = {
@@ -297,17 +348,14 @@ class ChatAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
+        calls = self._wire_calls(reason)
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
                 "choices": [{"index": 0, "message": {"role": "assistant",
-                                                     "content": self.text or (None if self.tool_calls else ""),
+                                                     "content": self.text or (None if calls else ""),
                                                      **({"reasoning_content": self.thinking} if (self.thinking and self.parsed.show_thinking) else {}),
-                                                     **({"tool_calls": [{"id": call["id"], "type": "function",
-                                                                          "function": {"name": call["name"],
-                                                                                       "arguments": call["arguments"]}}
-                                                                        for call in self.tool_calls]}
-                                                        if self.tool_calls else {})},
-                             "finish_reason": FINISH_MAP.get(reason, "tool_calls" if self.tool_calls else "stop")}],
+                                                     **({"tool_calls": calls} if calls else {})},
+                             "finish_reason": FINISH_MAP.get(reason, "tool_calls" if calls else "stop")}],
                 "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
                           "total_tokens": prompt + completion,
                           "cached_tokens": self.cache_read or 0,
@@ -342,6 +390,7 @@ class ResponsesAdapter(_Base):
         self._items = []
         self._indices = {}
         self._custom_inputs = {}
+        self._cut_off = False
         self._tool_definitions = {
             tool.get("function", {}).get("name"): tool.get("function", {})
             for tool in getattr(parsed, "tools", [])
@@ -427,7 +476,11 @@ class ResponsesAdapter(_Base):
         if kind == "custom_tool_call":
             value = "" if started else self._custom_input(call)
             if value is None:
-                raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                if not self._cut_off:
+                    raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                # The client left or the turn timed out before the envelope of the input was whole: the call is
+                # incomplete, which no upstream fault caused, and no fragment of a patch is passed on as its input.
+                value, item["status"] = "", "incomplete"
             item["input"] = value
         else:
             item["arguments"] = "" if started else call["arguments"]
@@ -466,6 +519,7 @@ class ResponsesAdapter(_Base):
             })
 
     def end(self, reason, prompt_text=None):
+        self._cut_off = reason in ("cancelled", "timeout")
         if not self._items:
             self._ensure_item("message", self.item_id)
         status = "incomplete" if reason == "timeout" else "completed"
@@ -497,6 +551,7 @@ class ResponsesAdapter(_Base):
         return final
 
     def payload(self, reason, prompt_text=None):
+        self._cut_off = reason in ("cancelled", "timeout")
         prompt, completion = self.usage(prompt_text)
         reasoning_details = self._reasoning_details()
         if not self._items:
@@ -532,10 +587,39 @@ class AnthropicAdapter(_Base):
         self._blocks = []
         self._open_indices = set()
         self._tool_indices = {}
+        self._deferred = []
 
     def _emit(self, name, payload):
         if self.writer:
             self.writer.event(name, payload)
+
+    def _open_tools(self):
+        return [index for index in self._tool_indices.values() if index in self._open_indices]
+
+    def _wait(self, method, *args):
+        """True when this event has to wait for the tool calls that are still being written.
+
+        Text or thinking that arrives inside an open call used to close its block, and the rest of its arguments had
+        nowhere to go: the protocol has no re-open, and a delta for a stopped block is dropped, so the client got a
+        tool_use that ended in the middle (ultracode audit of the relay, C22). What waits is the interleaved text: it
+        goes out as the next block, in the order it came, once the open calls have stopped. A reply that is not
+        streamed has no stops to respect and is built as the events come."""
+        if self.writer is None or not self._open_tools():
+            return False
+        self._deferred.append((method, args))
+        return True
+
+    def _release(self):
+        held, self._deferred = self._deferred, []
+        for method, args in held:
+            method(*args)
+
+    def _settle_tools(self):
+        """Stop the tool blocks still open, then let out what waited for them."""
+        for index in sorted(self._open_tools()):
+            self._emit("content_block_stop", {"type": "content_block_stop", "index": index})
+            self._open_indices.discard(index)
+        self._release()
 
     def begin(self):
         self._emit("message_start", {"type": "message_start", "message": {
@@ -570,9 +654,13 @@ class AnthropicAdapter(_Base):
     def _think_start(self):
         # An open thinking block lets the client show "thinking" while the
         # provider reasons silently; the later signature attaches to it.
+        if self._wait(self._think_start):
+            return
         self._open("thinking")
 
     def _think(self, delta):
+        if self._wait(self._think, delta):
+            return
         block = self._open("thinking")
         block["thinking"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
@@ -585,12 +673,16 @@ class AnthropicAdapter(_Base):
             self._close_blocks()
 
     def _signature(self, signature):
+        if self._wait(self._signature, signature):
+            return
         if signature and self.open_kind == "thinking":
             self._blocks[self.index]["signature"] += signature
             self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                                "delta": {"type": "signature_delta", "signature": signature}})
 
     def _text(self, delta):
+        if self._wait(self._text, delta):
+            return
         block = self._open("text")
         block["text"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
@@ -610,7 +702,7 @@ class AnthropicAdapter(_Base):
                                                                  "name": call["name"], "input": {}}})
         block_index = self._tool_indices[call["id"]]
         try:
-            self._blocks[block_index]["input"] = json.loads(call["arguments"] or "{}")
+            self._blocks[block_index]["input"] = loads_finite(call["arguments"] or "{}")
         except ValueError:
             pass  # streamed JSON fragments are finalized by a subsequent delta
         if delta and block_index in self._open_indices:
@@ -621,6 +713,8 @@ class AnthropicAdapter(_Base):
             # to the end of the message, every call of a parallel batch waited for the last one to be written.
             self._emit("content_block_stop", {"type": "content_block_stop", "index": block_index})
             self._open_indices.discard(block_index)
+            if not self._open_tools():
+                self._release()
 
     def _stop_reason(self, reason):
         if reason == "timeout":
@@ -637,6 +731,7 @@ class AnthropicAdapter(_Base):
         usage = {"input_tokens": non_cached, "output_tokens": completion,
                  "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_write,
                  **self._price_usage()}
+        self._settle_tools()
         if not self._blocks:
             self._open("text")
         self._close_blocks()
@@ -813,7 +908,11 @@ class StopSequenceAdapter:
             self._flush(final=True)
             return reason
         # The reply ended at the sequence: whatever ended the upstream turn after it is not the client's affair.
-        return 'cancelled' if reason == 'cancelled' else 'stop'
+        if reason == 'cancelled':
+            return reason
+        # A call made before the sequence is still to be run: Chat says so with its finish_reason (a client that
+        # decides by it took the turn for final), Messages keeps stop_sequence and the tool_use block in the content.
+        return 'tool_calls' if self._base().tool_calls else 'stop'
 
     def end(self, reason, prompt_text=None):
         return self.adapter.end(self._reason(reason), prompt_text)
