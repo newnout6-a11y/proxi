@@ -315,7 +315,8 @@ def _parse_content(content, index, role, ignored=None):
         elif btype == "tool_result":
             call_id = block.get("tool_use_id") or block.get("tool_call_id") or "call"
             sub_text, sub_images = _parse_content(block.get("content"), index, "tool", ignored)
-            chunks.append(f"[tool_result id={call_id}: {sub_text}]")
+            failed = " is_error=true" if block.get("is_error") else ""
+            chunks.append(f"[tool_result id={call_id}{failed}: {sub_text}]")
             images.extend(sub_images)
         elif btype in ("tool_use", "tool_call"):
             name = block.get("name") or "tool"
