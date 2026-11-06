@@ -493,24 +493,29 @@ def make_handler(runtime: Runtime):
         def _health(self):
             # An account counts when the dispatcher routes to it and its own balance
             # check is fresh; one healthy account keeps the relay serving.
-            summary = account_report.summarize(account_report.collect(runtime))
+            entries = account_report.collect(runtime)
+            summary = account_report.summarize(entries)
             ok = summary["ok"]
             # /health is the only unauthenticated route and carries CORS *: it must
             # expose readiness booleans, not organization financials or raw
             # upstream error text — those live behind /v1/balance with the key.
-            session = {key: value for key, value in runtime.backend.refresher.status().items()
+            refresher = getattr(account_report.serving_entry(entries)["backend"], "refresher", None)
+            session = {key: value for key, value in (refresher or runtime.backend.refresher).status().items()
                        if not isinstance(value, str)}
             payload = {
                 "ok": ok,
                 "uptime_seconds": round(time.time() - runtime.started, 1),
                 "session_mode": cfg["session_mode"],
-                "models": len(model_catalog.catalog()),
+                "models": sum(1 for model in model_catalog.catalog() if self._model_routable(model)),
                 "upstream": "ok" if ok else "degraded",
                 "balance_known": summary["balance_known"],
                 "session": session,
                 "accounts": {"total": summary["total"], "routable": summary["routable"],
                              "reserve": summary["reserve"], "states": summary["states"]},
             }
+            if summary["rate_limited_until"]:
+                # The earliest return of an account parked after Retool's hourly limit.
+                payload["accounts"]["rate_limited_until"] = summary["rate_limited_until"]
             self._json(200 if ok else 503, payload)
 
         # -- completions --------------------------------------------------
@@ -576,11 +581,14 @@ def make_handler(runtime: Runtime):
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
+            refusal = runtime.pool.model_refusal(parsed.entry)
+            if refusal is not None:
+                raise refusal
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
             self._effort_str = effective_effort or (
                 "provider" if parsed.entry.get("reasoning") and
-                parsed.entry.get("reasoning_effort_control") == "provider-managed" else "none")
+                parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
 
             parsed.request_purpose = client_context.request_kind(parsed)
             compatibility_headers = {}
@@ -598,6 +606,9 @@ def make_handler(runtime: Runtime):
                 routine = {'temperature', 'top_p', 'top_k', 'seed', 'presence_penalty', 'frequency_penalty', 'metadata',
                            'prompt_cache_key', 'prompt_cache_retention', 'prompt_cache_options', 'include',
                            'client_metadata', 'verbosity', 'text.verbosity', 'output_config.task_budget'}
+                # A route that accepts and ignores effort (Haiku 4.5, GLM) gets the level clients send to every model.
+                routine |= {name for name in names if name.lower().endswith('effort') or name.endswith('.budget_tokens')
+                            or name == 'thinking.type'}
                 level = 'warn' if names - routine - tool_changes else 'info' if names & tool_changes else 'debug'
                 journal.emit('request.compatibility',
                              'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
@@ -821,12 +832,44 @@ def startup_balance(runtime):
     return account_report.balance_report(account_report.collect(runtime, force_refresh=True))
 
 
+def startup_warnings(runtime):
+    """Conditions that make requests fail later without any other hint, in banner order."""
+    backends = getattr(runtime.accounts, "backends", None)
+    hidden = model_catalog.default_model_warning(runtime.cfg, backends)
+    return ([hidden] if hidden else []) + list(runtime.cfg.get("config_warnings") or [])
+
+
+def banner_lines(cfg, balance, warnings=()):
+    lines = ["=" * 64, " Retool AI relay", " listen:        http://" + cfg["host"] + ":" + str(cfg["port"]) + "/v1"]
+    if cfg["host"] not in ("127.0.0.1", "localhost", "::1"):
+        lines.append(" WARNING:       non-loopback address: /health and admin static are reachable from outside")
+    lines += [" relay key:     " + auth.mask(cfg["relay_api_key"]) + "  (from " + auth.relay_key_source() + ")",
+              " model default: " + cfg["model"] + " | effort: " + cfg["reasoning_effort"],
+              " session mode:  " + cfg["session_mode"] + " | workspace: " + cfg["workspace_root"],
+              " exec policy:   " + cfg["exec_policy"] + " | max turns: " + str(cfg["max_exec_turns"])]
+    if balance.get("available") is not None:
+        line = " balance:       " + str(balance["available"]) + " / " + str(balance.get("monthly_allocation"))
+        if balance.get("partial"):
+            unknown = balance.get("unknown_accounts") or 0
+            line += (("  (partial: %d of %d accounts unknown)" % (unknown, balance.get("accounts_total", unknown)))
+                     if unknown else "  (partial: monthly allocation unknown for some accounts)")
+        lines.append(line)
+    else:
+        lines.append(" upstream:      DEGRADED " + str(balance.get("error")))
+    lines += [" WARNING:       " + text for text in warnings]
+    lines.append("=" * 64)
+    return lines
+
+
 def main(argv=None):
     cfg = startup_config(argv)
     runtime = Runtime(cfg)
     journal.emit("relay.start", "Relay запущен на %s:%s" % (cfg["host"], cfg["port"]), "success",
                  host=cfg["host"], port=cfg["port"], model=cfg["model"], transport=cfg.get("transport"),
                  session_mode=cfg["session_mode"], exec_policy=cfg["exec_policy"])
+    warnings = startup_warnings(runtime)
+    for text in warnings:
+        journal.emit("relay.warning", text, "warn")
     handler = make_handler(runtime)
     slots = threading.BoundedSemaphore(cfg["max_workers"])
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
@@ -837,20 +880,8 @@ def main(argv=None):
     for r in refreshers:
         r.start()  # no-op for accounts the dispatcher schedules
     balance = startup_balance(runtime)
-    print("=" * 64)
-    print(" Retool AI relay")
-    print(" listen:        http://" + cfg["host"] + ":" + str(cfg["port"]) + "/v1")
-    if cfg["host"] not in ("127.0.0.1", "localhost", "::1"):
-        print(" WARNING:       non-loopback address: /health and admin static are reachable from outside")
-    print(" relay key:     " + auth.mask(cfg["relay_api_key"]) + "  (from " + auth.relay_key_source() + ")")
-    print(" model default: " + cfg["model"] + " | effort: " + cfg["reasoning_effort"])
-    print(" session mode:  " + cfg["session_mode"] + " | workspace: " + cfg["workspace_root"])
-    print(" exec policy:   " + cfg["exec_policy"] + " | max turns: " + str(cfg["max_exec_turns"]))
-    if balance.get("available") is not None:
-        print(" balance:       " + str(balance["available"]) + " / " + str(balance.get("monthly_allocation")))
-    else:
-        print(" upstream:      DEGRADED " + str(balance.get("error")))
-    print("=" * 64)
+    for line in banner_lines(cfg, balance, warnings):
+        print(line)
 
     stop_requested = threading.Event()
 

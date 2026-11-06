@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import { usePolling } from '../useJournal.js';
 import { AnimatedNumber, Dot, Page } from '../motion.jsx';
 import { CacheChart, RankedList, SpendChart, bucketLabel } from '../charts.jsx';
+import { MIN_FORECAST_SECONDS, burnRate, coverageOf, fmtSince, fmtSpan } from '../coverage.js';
 import { Button, Tag } from '../ui.jsx';
 import {
   fmtDay, fmtDuration, fmtFixed, fmtInt, fmtMs, fmtPercent, fmtTokens, fmtUptime, isNum, parseDay, plural,
@@ -41,19 +42,21 @@ function Balance({ overview, metrics, windowSec, go }) {
   const daysLeft = reset ? Math.max(0, (reset.getTime() - Date.now()) / 86400000) : null;
   const elapsed = daysLeft !== null ? Math.max(0, Math.min(1, 1 - daysLeft / 30)) : null;
   const usedShare = isNum(used) && allocation ? used / allocation : null;
-  const credits = metrics?.totals?.credits;
-  const perDay = isNum(credits) && credits > 0 ? (credits * 86400) / windowSec : null;
+  const { seconds, short, perDay } = burnRate(metrics, windowSec);
   const lasts = perDay && isNum(available) ? available / perDay : null;
   const window = WINDOWS.find((w) => w.id === windowSec)?.long || 'окно';
+  const basis = seconds !== null && seconds < windowSec ? fmtSpan(seconds) : window;
 
   let forecast;
   if (!metrics) forecast = 'Прогноз появится после загрузки метрик';
   else if (metrics.totals?.credits_complete === false || balance?.unreported_usage) forecast = 'Прогноз недоступен: часть стоимости не сообщена';
-  else if (!perDay) forecast = `За ${window} кредиты не тратились, прогноза нет`;
+  else if (seconds === null) forecast = 'Прогноз недоступен: неизвестно, какую часть окна покрывает журнал';
+  else if (short) forecast = `Прогноз недоступен: журнал покрывает меньше ${MIN_FORECAST_SECONDS / 60} минут`;
+  else if (!perDay) forecast = `За ${basis} кредиты не тратились, прогноза нет`;
   else {
     forecast = (
       <>
-        При темпе за {window} (<b className="num">{fmtFixed(perDay, 2)}</b> в сутки) хватит примерно на <b className="num">{fmtDuration(lasts)}</b>
+        При темпе за {basis} (<b className="num">{fmtFixed(perDay, 2)}</b> в сутки) хватит примерно на <b className="num">{fmtDuration(lasts)}</b>
         {daysLeft !== null && lasts > daysLeft ? ', дольше чем до сброса' : ''}
       </>
     );
@@ -99,7 +102,15 @@ function Balance({ overview, metrics, windowSec, go }) {
   );
 }
 
+/**
+ * The cache facts of the window. The cache refresh (`keepwarm_*`) is a part of the window's credits, so it is named
+ * here and never added to them; a ping without a price makes its share a lower bound.
+ */
 function CacheFacts({ totals }) {
+  const count = (value) => (isNum(value) && value > 0 ? value : 0);
+  const warm = count(totals.keepwarm_credits);
+  const pings = count(totals.keepwarm_pings);
+  const unpriced = count(totals.keepwarm_unknown);
   return (
     <section className="panel cache-facts" aria-label="Попадание в кэш">
       <div className="panel-head"><h2>Попадание в кэш</h2><span className="figure">{fmtPercent(totals.cache_hit_ratio)}</span></div>
@@ -107,10 +118,35 @@ function CacheFacts({ totals }) {
         <div><dt>прочитано из кэша</dt><dd className="num">{fmtTokens(totals.cache_read)}</dd></div>
         <div><dt>записано в кэш</dt><dd className="num">{fmtTokens(totals.cache_write)}</dd></div>
         <div><dt>без кэша</dt><dd className="num">{fmtTokens(totals.input_tokens)}</dd></div>
+        {(warm > 0 || pings > 0) && (
+          <div>
+            <dt>прогрев кэша, кредиты</dt>
+            <dd className="num" title={`Входит в расход за окно. Обращений для прогрева: ${fmtInt(pings)}${unpriced ? `, без цены: ${fmtInt(unpriced)}` : ''}`}>
+              {unpriced ? '≥ ' : ''}{fmtFixed(warm, 2)}
+            </dd>
+          </div>
+        )}
       </dl>
       <p className="muted small">Всплеск записи — рост объёма записанного кэша. Причину проверяйте по событиям конкретного хода</p>
     </section>
   );
+}
+
+/**
+ * What the window's spend figure says besides its value, kept to one short line: a request without a valid price is a
+ * gap (`credits_unknown`, cache refresh pings included) and a turn still waiting for its price is not one
+ * (`credits_in_progress`, the figure will still grow). The cache refresh share is shown with the cache facts.
+ */
+function spendNote(totals, busy, span) {
+  const count = (value) => (isNum(value) && value > 0 ? value : 0);
+  const unknown = count(totals.credits_unknown);
+  const waiting = count(totals.credits_in_progress);
+  return [
+    totals.credits_complete === false
+      ? `часть стоимости не сообщена${unknown ? ` (без цены: ${fmtInt(unknown)})` : ''}`
+      : busy ? `в среднем ${fmtFixed(totals.credits / busy, 2)} за активные ${span}` : 'расхода не было',
+    waiting > 0 && `ждём цену: ${fmtInt(waiting)} ${plural(waiting, ['ход', 'хода', 'ходов'])}`,
+  ].filter(Boolean).join(' · ');
 }
 
 function Stat({ label, value, note, tone }) {
@@ -151,6 +187,8 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
   const label = WINDOWS.find((w) => w.id === windowSec).long;
   const span = bucketLabel(windowSec, buckets.length);
   const busy = buckets.filter((b) => (b.credits || 0) > 0).length;
+  const unsure = buckets.some((b) => b.credits_complete === false);
+  const coverage = coverageOf(current, windowSec);
 
   return (
     <Page className="overview">
@@ -170,11 +208,23 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
 
       {problem && <div className="banner tone-neg" role="alert"><TriangleAlert size={16} strokeWidth={1.5} /> {problem}</div>}
 
+      {coverage && (
+        <div className="banner tone-warn">
+          <TriangleAlert size={16} strokeWidth={1.5} aria-hidden="true" />
+          <span>
+            Журнал покрывает окно не полностью
+            {coverage.seconds !== null && <>: данные за <b className="num">{fmtSpan(coverage.seconds)}</b> из окна {fmtSpan(windowSec)}</>}
+            {coverage.from !== null && ` (с ${fmtSince(coverage.from)})`}.
+            Суммы за окно неполные
+          </span>
+        </div>
+      )}
+
       <div className="ov-top">
         <Balance overview={overview} metrics={current} windowSec={windowSec} go={go} />
         <section className="panel stats" aria-label="Показатели за окно">
           <Stat label="Потрачено за окно" value={totals.credits_complete === false ? totals.credits > 0 ? `≥ ${fmtFixed(totals.credits, 2)}` : '—' : fmtFixed(totals.credits, 2)}
-            note={totals.credits_complete === false ? 'часть стоимости не сообщена' : busy ? `в среднем ${fmtFixed(totals.credits / busy, 2)} за активные ${span}` : 'расхода не было'} />
+            note={spendNote(totals, busy, span)} />
           <Stat label="Запросы" value={fmtInt(totals.requests)}
             note={totals.errors ? `${fmtInt(totals.errors)} ${plural(totals.errors, ['ошибка', 'ошибки', 'ошибок'])}` : 'без ошибок'}
             tone={totals.errors ? 'neg' : undefined} />
@@ -191,9 +241,15 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
               <li><i className="lg-spend" />за каждые {span || '—'}</li>
               <li><i className="lg-peak" />пик</li>
               <li><i className="lg-average" />среднее по активным</li>
+              {unsure && (
+                <li>
+                  <svg className="lg-unsure" width="14" height="4" viewBox="0 0 14 4" aria-hidden="true"><path d="M0 2H14" /></svg>
+                  стоимость сообщена не полностью
+                </li>
+              )}
             </ul>
           </div>
-          <SpendChart buckets={buckets} windowSec={windowSec} />
+          <SpendChart buckets={buckets} windowSec={windowSec} coveredFrom={coverage?.from ?? null} />
         </section>
         <div className="ov-side">
           <section className="panel" aria-label="Модели">
@@ -216,7 +272,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
               <li><i className="lg-spike" />всплеск записи</li>
             </ul>
           </div>
-          <CacheChart buckets={buckets} windowSec={windowSec} />
+          <CacheChart buckets={buckets} windowSec={windowSec} coveredFrom={coverage?.from ?? null} />
         </section>
     </Page>
   );
