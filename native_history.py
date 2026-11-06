@@ -73,6 +73,10 @@ def client_messages(messages, image_converter, *, lead=None):
                 blocks.append({"type": "text", "text": block["text"]})
             elif block.get("type") in ("image", "image_url", "input_image") or "imageData" in block:
                 blocks.append(image_converter(block, "native history"))
+            elif block.get("type") == "tool_reference" and isinstance(block.get("tool_name"), str) and block["tool_name"]:
+                # Claude Code's ToolSearch answers with references to the tools it loaded. Upstream has no such block,
+                # and the loaded tools are in the request's tool list already, so the result names them.
+                blocks.append({"type": "text", "text": "Tool loaded: " + block["tool_name"]})
             else:
                 raise ValueError("unsupported content")
         return blocks
