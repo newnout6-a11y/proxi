@@ -360,7 +360,54 @@ def _instruction_text(*parts):
     return "\n\n".join(part for part in parts if part and part.strip())
 
 
-def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, converted=None, ignored=None):
+def _marked_text_blocks(content, role):
+    """The blocks of a user message whose client marked a block that is not the last one, else None.
+
+    Claude Code's permission classifier (auto-mode-check) sends the whole transcript as one user message of text blocks
+    and marks, with cache_control, the part that stays the same from one request to the next; what follows the mark (the
+    pending action, the instruction) is new every time. Joined into one text, that message got one breakpoint at its
+    very end, which no later request can read: every check wrote the growing transcript again (a5, 2026-11-06: 35 checks
+    read 64.7k tokens of system prompt and nothing of the transcript, and wrote 28k tokens each).
+
+    The blocks keep the text the join made of them (the role before the first one, the trailing whitespace of the whole
+    message stripped, empty blocks left out, a block of only whitespace joined to the block before it, as no such block
+    can go upstream; the newline of the join is the private "sep" that build_body adds back), so that the text sent
+    upstream, parsed.prompt and the fingerprints do not change. The last marked block, and only it, carries `cache`:
+    upstream has taken a flag on a block that is not the last of its message, but never two in one. A mark on the last
+    block is where build_body flags a message anyway: such a message stays one text.
+    """
+    if not isinstance(content, list) or len(content) < 2:
+        return None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str):
+            return None
+    kept = []
+    for block in content:
+        text, mark = block["text"], bool(block.get("cache_control"))
+        if not text:
+            if mark and kept:
+                kept[-1][1] = True  # an empty block cannot carry the mark upstream: the block before it ends in the same place
+        elif kept and not text.strip():
+            kept[-1][0] += "\n" + text
+            kept[-1][1] = kept[-1][1] or mark
+        else:
+            kept.append([text, mark])
+    if len(kept) < 2:
+        return None
+    kept[-1][0] = kept[-1][0].rstrip()
+    marked = [index for index, (_, mark) in enumerate(kept) if mark]
+    if not marked or marked[-1] == len(kept) - 1:
+        return None
+    blocks = [{"type": "text", "text": text} for text, _ in kept]
+    blocks[0]["text"] = f"{role.capitalize()}: {blocks[0]['text']}"
+    blocks[marked[-1]]["cache"] = True
+    for block in blocks[:-1]:
+        block["sep"] = "\n"
+    return blocks
+
+
+def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, converted=None, ignored=None,
+                   keep_marked_blocks=False):
     """Return (system_text, [chunk per conversation message]).
 
     Chunks keep one message per element so the direct transport can place cache
@@ -368,6 +415,9 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
     leading system/developer messages form the head; a later non-empty one keeps
     its place as a user-turn reminder (its index is appended to `converted`),
     and a blank one, such as an effort-only entry, produces nothing.
+
+    keep_marked_blocks: a user message of text blocks that the client marked with cache_control stays a list of blocks
+    where the mark was (_marked_text_blocks), instead of one text with the mark lost.
     """
     if lead is None:
         lead = native_history.leading_instructions(messages, role_key) if allow_system else 0
@@ -433,7 +483,10 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
                 convo.append(images)
             continue
         user_text = f"{role.capitalize()}: {text}".strip()
-        if images:
+        marked = _marked_text_blocks(message.get("content"), role) if keep_marked_blocks and not images else None
+        if marked is not None:
+            convo.append(marked)
+        elif images:
             blocks = []
             if text:
                 blocks.append({"type": "text", "text": user_text})
@@ -807,7 +860,9 @@ def parse_anthropic(data, cfg):
     # prefix, so only the leading instructions join the top-level system text.
     # Later ones keep their place as user-turn reminders.
     lead, converted, ignored = native_history.leading_instructions(messages), [], []
-    system, chunks = _render_chunks(messages, lead=lead, converted=converted, ignored=ignored)
+    # A request without tools (the permission classifier of Claude Code) keeps the cache marks of its text blocks.
+    system, chunks = _render_chunks(messages, lead=lead, converted=converted, ignored=ignored,
+                                    keep_marked_blocks=not data.get("tools"))
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     declared_system = data.get("system")

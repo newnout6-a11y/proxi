@@ -786,9 +786,14 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             should_cache = index in cache_indices
             if isinstance(part, list):
                 blocks = [dict(b) if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in part]
-                if should_cache:
+                for block in blocks:
+                    sep = block.pop("sep", None)  # the newline that joined the blocks of one client message (validate._marked_text_blocks)
+                    if sep:
+                        block["text"] += sep
+                if should_cache and not any(b.get("cache") for b in blocks):
                     # Only text blocks carry the cache flag; an image-only chunk has no
                     # cacheable text and upstream may reject the unknown placement.
+                    # A message whose client marked a block keeps that breakpoint instead.
                     target = next((b for b in reversed(blocks) if b.get("type") == "text"), None)
                     if target is not None:
                         target["cache"] = True
