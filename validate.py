@@ -547,7 +547,11 @@ def _tools(data):
         where = f"tools[{index}]"
         if not isinstance(tool, dict):
             raise unprocessable(f"{where} must be an object", param=where)
-        kind = tool.get("type", "function")
+        kind = tool.get("type")
+        if kind is None or (kind == "custom" and isinstance(tool.get("input_schema"), dict)):
+            # The Messages API writes a client tool as "type": "custom", null, or no type at all; only a custom tool
+            # of OpenAI has no input_schema, and only that one takes the freeform input.
+            kind = "function"
         if kind == "namespace":
             namespace = tool.get("name")
             if not isinstance(namespace, str) or not namespace.strip() or not isinstance(tool.get("tools"), list):
