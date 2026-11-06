@@ -410,6 +410,22 @@ class ResponsesAdapter(_Base):
             return value["input"]
         return arguments
 
+    @staticmethod
+    def _custom_streamable(arguments):
+        """The part of a custom tool's input that no later fragment can change; None while that is not known yet.
+
+        The model writes the input inside a JSON envelope, {"input": "..."}, and the client gets the unwrapped text.
+        Text that starts an object (or is still blank) may yet turn out to be that envelope, so nothing of it is sent
+        before the JSON is complete: the first fragments, `{` or `{"inp`, used to go out as input and were followed by
+        the whole text again (Codex's apply_patch showed pieces of the wrapper while it streamed, C10). Anything
+        else is the input as it stands, and streams."""
+        try:
+            value = json.loads(arguments)
+        except (ValueError, TypeError):
+            stripped = arguments.lstrip()
+            return None if not stripped or stripped.startswith("{") else arguments
+        return value["input"] if isinstance(value, dict) and isinstance(value.get("input"), str) else arguments
+
     def _item(self, index, *, started=False, status="completed"):
         kind, item_id, call = self._items[index]
         status = "in_progress" if started else status
@@ -454,11 +470,11 @@ class ResponsesAdapter(_Base):
         kind = "custom_tool_call" if custom else "function_call"
         output_index = self._ensure_item(kind, call["id"], call)
         if custom:
-            current = self._custom_input(call)
-            if current is None:
-                return
+            current = self._custom_streamable(call["arguments"])
             previous = self._custom_inputs.get(call["id"], "")
-            delta = current[len(previous):] if current.startswith(previous) else current
+            if current is None or not current.startswith(previous):
+                return
+            delta = current[len(previous):]
             self._custom_inputs[call["id"]] = current
         if delta:
             self._emit("response.custom_tool_call_input.delta" if custom else "response.function_call_arguments.delta", {
@@ -484,7 +500,13 @@ class ResponsesAdapter(_Base):
                     **fields, "part": {"type": "summary_text", "text": self.thinking},
                 })
             elif kind == "custom_tool_call":
-                self._emit("response.custom_tool_call_input.done", {**fields, "input": self._item(index)["input"]})
+                final = self._item(index)["input"]
+                sent = self._custom_inputs.get(call["id"], "")
+                if len(final) > len(sent) and final.startswith(sent):
+                    # What was held back while the envelope could still change: the deltas add up to the input.
+                    self._emit("response.custom_tool_call_input.delta", {**fields, "delta": final[len(sent):]})
+                    self._custom_inputs[call["id"]] = final
+                self._emit("response.custom_tool_call_input.done", {**fields, "input": final})
             else:
                 self._emit("response.function_call_arguments.done", {**fields, "arguments": call["arguments"]})
             self._emit("response.output_item.done", {
