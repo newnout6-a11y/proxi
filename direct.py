@@ -382,14 +382,23 @@ def coerce_arguments(raw, params):
         # Infinity that would make the arguments invalid JSON.
         coerced = _coerce_value(value, spec) if isinstance(value, str) else None
         if coerced is not None:
-            data[key] = coerced
+            data[key] = None if coerced is _JSON_NULL else coerced
             changed = True
     return json.dumps(data, ensure_ascii=False) if changed else text
+
+
+# What _coerce_value returns for a string that stands for JSON null (None already means "leave the string").
+_JSON_NULL = object()
 
 
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
     kind = spec.get("type") if isinstance(spec, dict) else None
+    if value == "null" and kind in ("number", "boolean", "array", "object"):
+        # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
+        # writes the string "null" when it means null: the client's tool refused middle="null", active="null" (protocol
+        # test run of 2026-11-06). A field of these types never holds that text.
+        return _JSON_NULL
     if kind == "number":
         try:
             number = float(value) if "." in value else int(value)
@@ -426,7 +435,7 @@ class ArgStream:
         except ValueError:
             return False
         spec = self.params.get(name)
-        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean")
+        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean", "array", "object")
 
     def feed(self, chunk):
         out = []
@@ -454,7 +463,7 @@ class ArgStream:
                     except ValueError:
                         value = None
                     coerced = _coerce_value(value, self.params.get(self.key_name)) if isinstance(value, str) else None
-                    out.append(raw if coerced is None else json.dumps(coerced))
+                    out.append(raw if coerced is None else "null" if coerced is _JSON_NULL else json.dumps(coerced))
                     self.state = "after"
             elif state == "keystr":
                 out.append(char)
