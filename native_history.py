@@ -263,8 +263,11 @@ class ReplyCapture:
             return None
         try:
             for call_id, call in self.calls.items():
-                if self.inputs[call_id]:
-                    call["toolInput"] = json.loads("".join(self.inputs[call_id]))
+                raw = "".join(self.inputs[call_id])
+                # A call without arguments arrives as one empty partialInputs: the stream gives the client {} for it
+                # (coerce_arguments), so the kept reply must say {} too, or its next turn can never continue it.
+                if raw:
+                    call["toolInput"] = json.loads(raw)
                 if not isinstance(call["toolInput"], dict):
                     return None
             if any(b["type"] == "thinking" and not b["signature"] for b in self.blocks):
@@ -322,6 +325,53 @@ class History:
         self.branches.append(Snapshot(scope, copy.deepcopy(client), messages, blocks, expected))
         self.branches = self.branches[-8:]
         self.revision += 1
+
+    def mismatch(self, scope, client):
+        """Which check of resume() the newest branch fails for this request, for the journal of a reset.
+
+        Names only: a part of the scope, a message index and role, a part of the echo; never text."""
+        if not self.branches:
+            return "no_branch"
+        snapshot = self.branches[-1]
+        if scope != snapshot.scope:
+            return "scope:" + _scope_difference(scope, snapshot.scope)
+        offset = len(snapshot.client)
+        if len(client) <= offset + 1:
+            return "history:%d_of_%d_messages" % (len(client), offset + 2)
+        for index, (ours, theirs) in enumerate(zip(client, snapshot.client)):
+            if ours != theirs:
+                return "message:%d:%s" % (index, ours.get("role"))
+        if client[offset] != snapshot.echo:
+            return "echo:" + _echo_difference(client[offset], snapshot.echo)
+        return "tool_results"
+
+
+_SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")
+
+
+def _scope_difference(ours, theirs):
+    try:
+        ours, theirs = json.loads(ours), json.loads(theirs)
+    except (TypeError, ValueError):
+        return "unreadable"
+    parts = []
+    for name, a, b in zip(_SCOPE_PARTS, ours, theirs):
+        if a == b:
+            continue
+        if name == "provider" and isinstance(a, dict) and isinstance(b, dict):
+            name += "(" + ",".join(sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))) + ")"
+        parts.append(name)
+    return ",".join(parts) or "order"
+
+
+def _echo_difference(ours, theirs):
+    if ours.get("role") != theirs.get("role"):
+        return "role"
+    calls = [[b for b in m.get("content") or [] if b.get("type") == "tool_call"] for m in (ours, theirs)]
+    for field, label in (("toolCallId", "call_ids"), ("toolName", "names"), ("toolInput", "arguments")):
+        if [b.get(field) for b in calls[0]] != [b.get(field) for b in calls[1]]:
+            return label
+    return "text"
 
 
 def cache_messages(messages, enabled, tools):
