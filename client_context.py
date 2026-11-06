@@ -63,11 +63,14 @@ COMPACTION = "compaction"
 # read as well: "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools." in 2.1.316 (a community capture,
 # clawdipedia.cc/prompts/context-and-memory/compact; unofficial, the product is closed), and the opening it has had
 # since 2025 without that line, "Your task is to create a detailed summary of the conversation so far".
+# Codex's local compaction (the path of every provider but OpenAI's own) sends the history without tools and ends it with
+# its template, codex-rs/prompts/templates/compact/prompt.md: "You are performing a CONTEXT CHECKPOINT COMPACTION.".
 COMPACTION_INSTRUCTIONS = (
     "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the work.",
     "Update the existing checkpoint in the conversation above into one consolidated summary.",
     "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
     "Your task is to create a detailed summary of the conversation so far",
+    "You are performing a CONTEXT CHECKPOINT COMPACTION.",
 )
 # The reminder OpenCode 2.x adds as a further user message when the reply skipped the summary template.
 COMPACTION_NUDGE = "The previous response did not fill in the required summary template."
