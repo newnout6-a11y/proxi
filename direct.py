@@ -606,6 +606,24 @@ def _has_cacheable_text(chunk):
     return any(not isinstance(block, dict) or block.get("type") == "text" for block in blocks)
 
 
+_CHOICE_WORDS = ("none", "auto", "required")
+
+
+def _forced_alone(tools, tool_choice):
+    """(tools, tool_choice) with a forced tool whose name is one of Retool's own choices made unambiguous.
+
+    toolChoice is one string, and "none", "auto" and "required" mean what they say whoever a client tool is called: forcing
+    a tool named "none" asked for no tool at all, "auto" for nothing in particular and "required" for any tool (ultracode
+    audit of the relay, C20). Such a tool is forced the way a lone tool is: the model is offered only that one and the
+    choice is "required". The list the caller holds is not changed."""
+    function = tool_choice.get("function") if isinstance(tool_choice, dict) else None
+    name = function.get("name") if isinstance(function, dict) else None
+    if name not in _CHOICE_WORDS:
+        return tools, tool_choice
+    kept = [tool for tool in tools or [] if tool.get("name") == name]
+    return (kept, "required") if kept else (tools, tool_choice)
+
+
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
     """Assemble the request body.
 
@@ -614,6 +632,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     intermediate multi-tool turns do not discard prefix caches.
     """
     messages = []
+    tools, tool_choice = _forced_alone(tools, tool_choice)
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
     prefix_key = cache_key_for(head, model_provider.get("model"), tools) if cache and head else None
     if head:
@@ -1281,6 +1300,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
+    tools, tool_choice = _forced_alone(tools, tool_choice)
     parent, messages = (conversation_state.resume(session, history, scope, client)
                         if history is not None and client is not None else (None, None))
     if messages is not None:
