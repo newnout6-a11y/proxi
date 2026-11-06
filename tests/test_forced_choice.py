@@ -131,6 +131,19 @@ def test_gpt_and_glm_keep_the_native_choice_and_get_no_instruction(tmp_path, mon
     assert called(results[0]) == ["read_file"]
 
 
+@pytest.mark.parametrize("name", ["none", "auto", "required"])
+def test_a_tool_named_like_one_of_retools_choices_is_forced_by_name_in_words(tmp_path, monkeypatch, name):
+    # No choice goes upstream, so these three words are only names here: a tool called "none" is asked for like any other
+    odd = {"type": "function", "function": {"name": name, "description": "d", "parameters": {
+        "type": "object", "properties": {"x": {"type": "string"}}}}}
+    chosen = {"type": "function", "function": {"name": name}}
+    results, sent, _ = drive(tmp_path, monkeypatch, [[*call(name, "c1", x="1"), *END]],
+                             lambda _: forced(FIRST, chosen, tools=(odd, READ)))
+    assert len(sent) == 1 and "toolChoice" not in sent[0]
+    assert last_text(sent[0]) == forced_choice.instruction(Requirement(name, frozenset({name, "read_file"})))
+    assert called(results[0]) == [name]
+
+
 def test_auto_and_none_are_not_a_forced_choice():
     tools = [{"name": "read_file"}]
     for choice in ("auto", "none", None):
