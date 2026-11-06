@@ -1,6 +1,7 @@
 """Strict request parsing for every supported dialect."""
 import base64
 import contextvars
+import functools
 import hashlib
 import ipaddress
 import json
@@ -67,16 +68,17 @@ _IMAGE_FETCHES = contextvars.ContextVar("proxi_image_fetches", default=None)
 
 
 class ImageFetches:
-    """The remote images one request has downloaded, by URL, for the second parse of a body a prompt profile rewrote.
+    """The remote images one request has downloaded, by URL: every parse made inside the block takes them from here.
 
-    Used as a context manager it records, in the parses made inside it, what each download gave. Once `reuse` is set,
-    a parse made inside it takes those images from here instead of downloading them again: the rewrite leaves images
-    alone, so the second parse wants exactly the pictures the first one fetched (and must not fail on a link that has
-    stopped answering since). Outside any such block, and while `reuse` is off, every parse downloads as it always did."""
+    One parse reads a picture three times (it renders the text, fingerprints the messages and builds the native ones),
+    and a body a prompt profile rewrote is parsed once more. Each read used to download the picture again: three
+    downloads of the same link per request, so that one slow answer failed the request with a 422 and a picture that
+    changed between two of them made the native history differ from itself. The first download is kept, and the
+    other reads, of this parse and of the second one, get the same bytes (and a link that has stopped answering since
+    costs nothing). A parse outside any block opens one of its own (_in_fetch_scope)."""
 
     def __init__(self):
         self.found = {}
-        self.reuse = False
         self._tokens = []
 
     def __enter__(self):
@@ -86,6 +88,17 @@ class ImageFetches:
     def __exit__(self, *exc):
         _IMAGE_FETCHES.reset(self._tokens.pop())
         return False
+
+
+def _in_fetch_scope(parse):
+    """Run a parse inside the fetch scope of its request, or inside one of its own when it is called without."""
+    @functools.wraps(parse)
+    def scoped(data, cfg):
+        if _IMAGE_FETCHES.get() is not None:
+            return parse(data, cfg)
+        with ImageFetches():
+            return parse(data, cfg)
+    return scoped
 
 
 class Parsed:
@@ -247,7 +260,7 @@ def _extract_image_data(block, where):
                     data_b64 = rest.strip()
             elif url.startswith("http://") or url.startswith("https://"):
                 fetches = _IMAGE_FETCHES.get()
-                kept = fetches.found.get(url) if fetches is not None and fetches.reuse else None
+                kept = fetches.found.get(url) if fetches is not None else None
                 if kept is not None:
                     mime_type, data_b64 = kept
                 else:
@@ -708,6 +721,7 @@ def conversation_key(data, header_value=None, allow_content_fallback=False):
     return None
 
 
+@_in_fetch_scope
 def parse_chat(data, cfg):
     parsed = Parsed()
     entry, effort = model_catalog.resolve_tolerant(
@@ -733,6 +747,7 @@ def parse_chat(data, cfg):
     return _finish(data, parsed, 'chat')
 
 
+@_in_fetch_scope
 def parse_responses(data, cfg):
     parsed = Parsed()
     entry, effort = model_catalog.resolve_tolerant(
@@ -777,6 +792,7 @@ def parse_responses(data, cfg):
     return _finish(data, parsed, 'responses')
 
 
+@_in_fetch_scope
 def parse_anthropic(data, cfg):
     parsed = Parsed()
     model = _opt_str(data, "model")

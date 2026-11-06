@@ -820,7 +820,6 @@ def make_handler(runtime: Runtime):
                         parsed = parse(rewritten, cfg)
                     else:
                         # The rewrite leaves the images alone: the second parse takes the ones the first downloaded.
-                        fetches.reuse = True
                         with fetches:
                             parsed = parse(rewritten, cfg)
                     for name in _CARRIED_OVER:
