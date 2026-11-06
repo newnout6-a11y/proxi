@@ -16,6 +16,7 @@ import urllib.request
 from apierr import bad_request, unprocessable, ApiError
 import models as model_catalog
 import tool_names
+import web_search
 
 MAX_TOKENS_CAP = 1_000_000  # absolute ceiling when a model has no catalog value
 
@@ -115,6 +116,8 @@ class Parsed:
         self.requested_effort = None
         self.stream = False
         self.max_tokens = None
+        # The cap the relay enforces itself on a route that ignores it (generation.output_cap); None: the route's own.
+        self.output_cap = None
         self.temperature = None
         self.verbosity = None
         self.structured_title = False
@@ -128,6 +131,9 @@ class Parsed:
         self.show_thinking = True
         self.tools = []
         self.tool_choice = "auto"
+        # The server tool web_search of an Anthropic request, when the relay runs its searches itself (web_search.spec_of):
+        # {"name", "max_uses", "allowed_domains", "blocked_domains", "country"}. parsed.tools then holds it as a function.
+        self.web_search = None
         self.conversation_key = None
         # The client's model name without @profile and #effort, before alias resolution, and the @profile
         # of a virtual model <model>@<profile>; the prompt layer reads both (prompt_policy.PlanInput).
@@ -328,13 +334,19 @@ def _parse_content(content, index, role, ignored=None):
         elif btype == "tool_result":
             call_id = block.get("tool_use_id") or block.get("tool_call_id") or "call"
             sub_text, sub_images = _parse_content(block.get("content"), index, "tool", ignored)
-            chunks.append(f"[tool_result id={call_id}: {sub_text}]")
+            failed = " is_error=true" if block.get("is_error") else ""
+            chunks.append(f"[tool_result id={call_id}{failed}: {sub_text}]")
             images.extend(sub_images)
-        elif btype in ("tool_use", "tool_call"):
+        elif btype in ("tool_use", "tool_call", "server_tool_use"):
             name = block.get("name") or "tool"
             args = block.get("input", block.get("arguments", {}))
             call_id = block.get("id") or block.get("tool_call_id") or "call"
             chunks.append(f"[tool_call {name} id={call_id}: {json.dumps(args, ensure_ascii=False)}]")
+        elif btype == "web_search_tool_result":
+            # The results of a search the relay ran, echoed inside the assistant message: the model reads them as the
+            # result of the call before them, as it did when they arrived, not as 200 characters of JSON.
+            chunks.append(f"[tool_result id={block.get('tool_use_id') or 'call'}: "
+                          f"{web_search.render_block_content(block.get('content'))}]")
         elif btype in ("thinking", "redacted_thinking"):
             continue
         elif btype in native_history.INLINE_TOOL_BLOCKS:
@@ -444,16 +456,18 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
             call_id = message.get("tool_call_id") or message.get("call_id") or name
             convo_text = f"[tool result {name} id={call_id}]: {text}".strip()
             if images:
-                blocks = []
-                if text:
-                    blocks.append({"type": "text", "text": convo_text})
-                blocks.extend(images)
-                convo.append(blocks)
+                # The label stays when the result is nothing but the picture: it says which call the picture answers.
+                convo.append([{"type": "text", "text": convo_text}, *images])
             else:
                 convo.append(convo_text)
             continue
         if role == "assistant":
             calls = message.get("tool_calls") or []
+            legacy = message.get("function_call")
+            if isinstance(calls, list) and isinstance(legacy, dict) and legacy.get("name"):
+                # The deprecated form of one call. Its result is a "function" message that names the function and
+                # carries no id, so the name stands for the id here as it does for that result.
+                calls = calls + [{"id": legacy["name"], "function": legacy}]
             if isinstance(calls, list) and calls:
                 for call in calls:
                     if not isinstance(call, dict):
@@ -461,6 +475,10 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
                     fn = call.get("function") or {}
                     name = fn.get("name") or call.get("name") or "tool"
                     args = fn.get("arguments") or call.get("arguments") or ""
+                    if isinstance(call.get("custom"), dict):
+                        # A call to a custom tool of Chat: its one string is the input the model was offered the tool as.
+                        name = call["custom"].get("name") or "tool"
+                        args = json.dumps({"input": call["custom"].get("input", "")}, ensure_ascii=False)
                     call_id = call.get("id") or call.get("tool_call_id") or "call"
                     asst_text = f"Assistant: {text}\n[tool_call {name} id={call_id}: {str(args)}]".strip()
                     if images:
@@ -567,7 +585,7 @@ def _messages(data, *, min_items=1):
     return messages
 
 
-def _finish(data, parsed, dialect):
+def _finish(data, parsed, dialect, search=False):
     parsed.requested_effort = _effort(data)
     if parsed.requested_effort is None:
         parsed.requested_effort = model_catalog.parse_model_name(data.get("model")).effort
@@ -576,6 +594,7 @@ def _finish(data, parsed, dialect):
     parsed.verbosity, parsed.declared_ignored, parsed.routine_ignored = generation.controls(
         data, parsed.entry, dialect)
     parsed.stop_sequences = generation.stop_sequences(data, dialect)
+    parsed.output_cap = generation.output_cap(parsed.entry, parsed.max_tokens)
     parsed.declared_ignored += [name for name in parsed.inline_tool_changes if name not in parsed.declared_ignored]
     stream_options = data.get("stream_options")
     if stream_options is None:
@@ -589,7 +608,7 @@ def _finish(data, parsed, dialect):
         parsed.wants_usage = bool(inc)
     else:
         parsed.wants_usage = True
-    parsed.tools = _tools(data)
+    parsed.tools = _tools(data, parsed if search else None)
     parsed.tool_choice = _tool_choice(data.get("tool_choice"))
     names = [tool["function"]["name"] for tool in parsed.tools]
     if parsed.tool_choice == "required" and not names:
@@ -599,8 +618,12 @@ def _finish(data, parsed, dialect):
     return parsed
 
 
-def _tools(data):
-    """Validate and retain OpenAI/Anthropic-compatible function definitions."""
+def _tools(data, search=None):
+    """Validate and retain OpenAI/Anthropic-compatible function definitions.
+
+    `search` is the Parsed of an Anthropic request that the relay may run web searches for (a provider is configured): its
+    web_search server tool is declared as a function the model can call, and parsed.web_search keeps what the relay needs
+    to run the calls. Without it a server tool of the provider is refused."""
     tools = data.get("tools")
     if tools is None:
         return []
@@ -611,7 +634,11 @@ def _tools(data):
         where = f"tools[{index}]"
         if not isinstance(tool, dict):
             raise unprocessable(f"{where} must be an object", param=where)
-        kind = tool.get("type", "function")
+        kind = tool.get("type")
+        if kind is None or (kind == "custom" and isinstance(tool.get("input_schema"), dict)):
+            # The Messages API writes a client tool as "type": "custom", null, or no type at all; only a custom tool
+            # of OpenAI has no input_schema, and only that one takes the freeform input.
+            kind = "function"
         if kind == "namespace":
             namespace = tool.get("name")
             if not isinstance(namespace, str) or not namespace.strip() or not isinstance(tool.get("tools"), list):
@@ -626,22 +653,40 @@ def _tools(data):
                     raise unprocessable(f"duplicate tool name '{fn['name']}'", param=where + ".name")
                 result.append(nested)
             continue
+        if search is not None and isinstance(kind, str) and web_search.SERVER_TOOL.fullmatch(kind):
+            name = tool.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise unprocessable(f"{where}.name must be a non-empty string", param=where + ".name")
+            if any(item["function"]["name"] == name for item in result):
+                raise unprocessable(f"duplicate tool name '{name}'", param=where + ".name")
+            search.web_search = dict(web_search.spec_of(tool, where), name=name)
+            result.append(web_search.tool_definition(name, search.web_search))
+            continue
         if kind not in ("function", "custom"):
             if isinstance(kind, str) and re.fullmatch(r"[a-z][a-z_]*_\d{8}", kind):
                 # web_search_20250305 and the like: the provider runs these itself, and the Retool route has none of
                 # them. Claude Code's WebSearch sends one; naming it lets the model turn to a client tool at once.
+                how = ("; the relay runs web_search itself once web_search_provider and the key it names are configured "
+                       "(README)" if web_search.SERVER_TOOL.fullmatch(kind) else "")
                 raise unprocessable(f"{where} is a server tool of the provider ('{kind}'), which the Retool route "
                                     "cannot run: it runs client tools (functions) only. Use a client tool instead, "
-                                    "such as a search MCP server or WebFetch", param=where + ".type")
+                                    "such as a search MCP server or WebFetch" + how, param=where + ".type")
             raise unprocessable(f"{where}.type must be 'function' or 'custom'", param=where + ".type")
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if kind == "custom" and isinstance(tool.get("custom"), dict):
+            fn = tool["custom"]  # Chat nests a custom tool under "custom", as it nests a function under "function"
         name = fn.get("name")
         if not isinstance(name, str) or not name.strip():
             raise unprocessable(f"{where}.function.name must be a non-empty string",
                                 param=where + ".function.name")
         if any(item["function"]["name"] == name for item in result):
             raise unprocessable(f"duplicate tool name '{name}'", param=where + ".name")
-        parameters = fn.get("parameters", fn.get("input_schema", {}))
+        parameters = fn.get("parameters")
+        if parameters is None:
+            # Responses writes a tool without parameters as null (FunctionTool.parameters is nullable)
+            parameters = fn.get("input_schema")
+        if parameters is None:
+            parameters = {}
         if kind == "custom":
             parameters = {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}
         if not isinstance(parameters, dict):
@@ -657,10 +702,10 @@ def _tools(data):
         })
         if kind == "custom":
             result[-1]["function"]["x-client-type"] = "custom"
-            if tool.get("format") is not None:
-                if not isinstance(tool["format"], dict):
+            if fn.get("format") is not None:
+                if not isinstance(fn["format"], dict):
                     raise unprocessable("custom tool format must be an object", param=where + ".format")
-                result[-1]["function"]["x-format"] = tool["format"]
+                result[-1]["function"]["x-format"] = fn["format"]
         if fn.get("strict") is not None:
             result[-1]["function"]["strict"] = _opt_bool(fn, "strict")
     return result
@@ -682,6 +727,8 @@ def _tool_choice(value):
             return "none"
         if choice_type == "any":
             return "required"
+        if choice_type == "custom" and isinstance(value.get("custom"), dict) and isinstance(value["custom"].get("name"), str):
+            return {"type": "function", "function": {"name": value["custom"]["name"]}}  # Chat's own shape
         if choice_type in ("tool", "custom") and isinstance(value.get("name"), str):
             name = value["name"]
             if value.get("namespace"):
@@ -772,12 +819,17 @@ def conversation_key(data, header_value=None, allow_content_fallback=False):
     return None
 
 
+def _effort_of(data, cfg):
+    """(entry, effort) of a request's model and effort controls under the config's effort rules."""
+    return model_catalog.resolve_tolerant(
+        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
+        allow_downgrade=cfg.get("allow_effort_downgrade", False), xhigh_as=cfg.get("claude_xhigh_effort", "high"))
+
+
 @_in_fetch_scope
 def parse_chat(data, cfg):
     parsed = Parsed()
-    entry, effort = model_catalog.resolve_tolerant(
-        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
-        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+    entry, effort = _effort_of(data, cfg)
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     parsed.requested_model, parsed.virtual_profile = _client_model(_opt_str(data, "model"), cfg)
     _reject_images_unsupported(entry, data)
@@ -801,9 +853,7 @@ def parse_chat(data, cfg):
 @_in_fetch_scope
 def parse_responses(data, cfg):
     parsed = Parsed()
-    entry, effort = model_catalog.resolve_tolerant(
-        _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
-        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+    entry, effort = _effort_of(data, cfg)
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     parsed.requested_model, parsed.virtual_profile = _client_model(_opt_str(data, "model"), cfg)
     _reject_images_unsupported(entry, data)
@@ -849,9 +899,7 @@ def parse_responses(data, cfg):
 def parse_anthropic(data, cfg):
     parsed = Parsed()
     model = _opt_str(data, "model")
-    entry, effort = model_catalog.resolve_tolerant(
-        model, _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
-        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+    entry, effort = _effort_of(data, cfg)
     parsed.entry, parsed.model, parsed.effort = entry, entry["id"], effort
     parsed.requested_model, parsed.virtual_profile = _client_model(model, cfg)
     _reject_images_unsupported(entry, data)
@@ -881,7 +929,7 @@ def parse_anthropic(data, cfg):
     if stop is not None and not isinstance(stop, list):
         raise unprocessable("'stop_sequences' must be an array", param="stop_sequences")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed, 'anthropic')
+    return _finish(data, parsed, 'anthropic', search=web_search.provider(cfg) is not None)
 
 
 def _effort(data):

@@ -22,9 +22,10 @@ CFG = {"strict_models": True, "model": "claude-opus-5-5", "show_thinking": True}
 
 
 @pytest.mark.parametrize("dialect", ["chat", "responses", "anthropic"])
-@pytest.mark.parametrize("effort", ["xhigh", "none", "extra"])
+@pytest.mark.parametrize("effort", ["minimal", "none", "extra"])
 def test_strict_effort_rejects_unsupported_controls(dialect, effort):
-    # ultra is not among them: it is Codex's name for max with delegation (tests/test_codex_ultra.py)
+    # ultra is not among them: it is Codex's name for max with delegation (tests/test_codex_ultra.py);
+    # xhigh is not either: a Claude route serves it as another level (test_claude_xhigh.py)
     with pytest.raises(ApiError) as caught:
         getattr(validate, "parse_" + dialect)(body(dialect, effort), CFG)
     assert caught.value.status == 400
@@ -32,19 +33,19 @@ def test_strict_effort_rejects_unsupported_controls(dialect, effort):
 
 @pytest.mark.parametrize("dialect", ["chat", "responses", "anthropic"])
 def test_compatibility_is_explicit_and_retains_requested_level(dialect):
-    parsed = getattr(validate, "parse_" + dialect)(body(dialect, "xhigh"),
+    parsed = getattr(validate, "parse_" + dialect)(body(dialect, "minimal"),
                                                   dict(CFG, allow_effort_downgrade=True))
-    assert parsed.requested_effort == "xhigh"
-    assert parsed.effort == "high"
+    assert parsed.requested_effort == "minimal"
+    assert parsed.effort == "low"
 
 
-@pytest.mark.parametrize("suffix", ["#xhigh", ":xhigh"])
+@pytest.mark.parametrize("suffix", ["#minimal", ":minimal"])
 def test_model_suffix_cannot_bypass_strict_policy(suffix):
     data = {"model": "claude-opus-5-5" + suffix, "input": "OK"}
     with pytest.raises(ApiError):
         validate.parse_responses(data, CFG)
     parsed = validate.parse_responses(data, dict(CFG, allow_effort_downgrade=True))
-    assert (parsed.requested_effort, parsed.effort) == ("xhigh", "high")
+    assert (parsed.requested_effort, parsed.effort) == ("minimal", "low")
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
@@ -147,9 +148,10 @@ def test_unknown_effort_is_never_guessed(compatibility):
 @pytest.mark.parametrize("dialect,path", [("chat", "/v1/chat/completions"),
                                          ("responses", "/v1/responses"),
                                          ("anthropic", "/v1/messages")])
-@pytest.mark.parametrize("model", ["claude-opus-5-5", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"])
-def test_gateway_rejects_before_the_runner_is_called(relay, dialect, path, model):
-    data = dict(body(dialect, "xhigh"), model=model)
+@pytest.mark.parametrize("model,effort", [("claude-opus-5-5", "minimal"), ("gpt-6-sol", "xhigh"),
+                                          ("gpt-6.1-sol", "xhigh"), ("gpt-6-astra", "xhigh"), ("gpt-6-luna", "xhigh")])
+def test_gateway_rejects_before_the_runner_is_called(relay, dialect, path, model, effort):
+    data = dict(body(dialect, effort), model=model)
     status, _ = relay.json_any(path, data)
     assert status == 400
     assert relay.fake.seen == []
@@ -193,7 +195,7 @@ def test_gateway_probe_cleans_up_its_server_and_journal_without_upstream_calls(t
     monkeypatch.chdir(tmp_path)
     cfg = dict(config.DEFAULTS, base="https://fixture.invalid", ua="test", cookie="accessToken=synthetic",
                xsrf="synthetic-xsrf", provider_resource_name="__managed__")
-    results = list(probe_effort.gateway_probe(cfg, "claude-opus-5-5", ["xhigh"], ["chat"]))
+    results = list(probe_effort.gateway_probe(cfg, "claude-opus-5-5", ["minimal"], ["chat"]))
     assert results[0]["http"] == 400
     assert results[0]["sent_upstream_efforts"] == []
     assert list((tmp_path / ".agents").iterdir()) == []

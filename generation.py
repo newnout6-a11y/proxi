@@ -112,6 +112,21 @@ def stop_sequences(data, dialect):
     return list(dict.fromkeys(found))
 
 
+# Retool's Claude route takes maxCompletionTokens and ignores it: a cap of 300 returned 5,466 tokens and end_turn (protocol
+# test run of 2026-11-06), so the relay cuts the reply itself (adapters.OutputCapAdapter). It does that for the caps that
+# can bind: the route's answers end on their own after a few thousand tokens, and keeping a call of a client whole under a
+# cap means holding it back until it ends, which the callers with caps of 32,000 to 128,000 (Claude Code, Claude Desktop,
+# OpenCode) would pay for on every tool call with arguments they could not watch grow.
+OUTPUT_CAP_EMULATED_BELOW = 16384
+
+
+def output_cap(entry, max_tokens):
+    """The cap the relay enforces on the reply of a request, or None when the route keeps it or it cannot bind."""
+    if not max_tokens or max_tokens >= OUTPUT_CAP_EMULATED_BELOW or not models.ignores_output_cap(entry['id']):
+        return None
+    return max_tokens
+
+
 def structured_output(data, dialect):
     """The JSON contract of the reply, or None for plain text.
 
@@ -212,6 +227,17 @@ def controls(data, entry, dialect):
             raise unprocessable("'disable_parallel_tool_use' must be a boolean", param='tool_choice.disable_parallel_tool_use')
         if value and data.get('tools'):
             _reject('tool_choice.disable_parallel_tool_use')
+    if dialect == 'chat':
+        legacy = data.get('function_call')
+        if data.get('functions') or legacy not in (None, 'none', 'auto'):
+            # The deprecated form of tools and tool_choice: the model was offered no function, and its call would come
+            # back as message.function_call, which this route does not write (ultracode audit of the relay, C11).
+            raise unprocessable("'functions' and 'function_call' are the deprecated form of 'tools' and 'tool_choice', "
+                                "which the Retool route does not serve: send 'tools' and 'tool_choice'",
+                                param='functions' if data.get('functions') else 'function_call')
+        if legacy is not None:
+            ignored.append('function_call')  # "auto" or "none" with no function to call asks for nothing
+            routine.add('function_call')
     if data.get('service_tier') is not None and data['service_tier'] not in ('auto', 'default'):
         _reject('service_tier')
     if data.get('prompt_cache_key') is not None:

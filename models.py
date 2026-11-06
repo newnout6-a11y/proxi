@@ -240,6 +240,11 @@ _UNSUPPORTED_ROUTES = {
                                  'Retool Assist returns provider 404 not_found for this model.'),
     'gpt-6-luna': 'Unavailable on the Retool React route; Assist rejects this model.',
 }
+# A model a client names that no account serves (an unsupported route), and the model the relay serves in its place (the
+# owner's choice). Codex's memory jobs ask for gpt-6-luna by name; Retool refused it (404, request
+# 423d2c23bbc8 of 2026-11-06), so Codex never made a memory. A request for one is served by its substitute and says so in
+# the journal (request.model_substituted); /v1/models and the Codex catalog still list only what is served.
+SUBSTITUTES = {'gpt-6-luna': 'gpt-6.1-terra'}
 _BYOK_ROUTES = {'gpt-6-astra'}
 _RETENTION_ROUTES = {'claude-fable-5'}
 _VERIFIED_ROUTES = {
@@ -284,6 +289,26 @@ _ROUTE_INPUT_TOKENS = {
 }
 for _name, _limit in _ROUTE_INPUT_TOKENS.items():
     _BY_ID[_name]['route_input_tokens'] = _limit
+
+
+def _is_claude_route(model):
+    """A catalog id of the Anthropic provider; a name the catalog lacks (strict_models off) counts when it says claude."""
+    entry = _BY_ID.get(model)
+    return entry['provider'] == 'anthropic' if entry else str(model or '').startswith('claude')
+
+
+def refuses_forced_tool_choice(model):
+    """True when Retool answers 400 to tool_choice any/required/named for the route: every Claude model, with and
+    without thinking, at every effort (live probes of 2026-11-06). GPT and GLM take both natively. The relay asks for
+    the call in words instead (forced_choice)."""
+    return _is_claude_route(model)
+
+
+def ignores_output_cap(model):
+    """True when the route takes maxCompletionTokens and does not keep it: a cap of 300 returned 5,466 tokens and
+    end_turn from Claude (live probes of 2026-11-06). GPT and GLM keep it. The relay cuts the reply itself
+    (adapters.OutputCapAdapter)."""
+    return _is_claude_route(model)
 
 
 def _today():
@@ -640,6 +665,18 @@ def _canonical(name):
     return ALIASES.get(name, name)
 
 
+def substitute_for(name):
+    """The id of the model that serves a client's model name in its place, or None.
+
+    `name` is the base of the client's name (no @profile, no effort suffix). Only a model of an unsupported route has a
+    substitute (SUBSTITUTES): a model some account can serve is never replaced."""
+    named = _canonical(name)
+    if '/' in named and named not in _BY_ID:
+        named = _canonical(named.split('/', 1)[1])  # a provider prefix ("openai/gpt-6-luna") is read as resolve() reads it
+    served = SUBSTITUTES.get(named)
+    return served if served in _BY_ID and named in _UNSUPPORTED_ROUTES else None
+
+
 EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _EFFORT_RANK = {name: index for index, name in enumerate(EFFORT_ORDER)}
 
@@ -801,7 +838,7 @@ def ignored_effort_controls(data, entry):
     return names
 
 
-def effective_effort(entry, effort=None, configured=None):
+def effective_effort(entry, effort=None, configured=None, xhigh_as=None):
     """A global default is a preference; explicit client controls were validated by resolve."""
     if effort is not None or not configured or not entry.get("reasoning", True):
         return effort
@@ -814,7 +851,26 @@ def effective_effort(entry, effort=None, configured=None):
     if configured == "auto":
         preferred = entry.get("default_reasoning_effort")
         return preferred if preferred in levels else ("medium" if "medium" in levels else levels[0])
+    if configured == "xhigh" and xhigh_replacement(entry, xhigh_as):
+        return xhigh_replacement(entry, xhigh_as)
     return configured if configured in levels else nearest_effort(levels, configured)
+
+
+# What a route that has no xhigh serves a request for it at: Retool's Claude routes list low, medium, high and max, and
+# answer an unknown level with an error, while clients that send one level to every model (Claude Desktop sends xhigh)
+# have no way to know that. The operator picks the replacement (claude_xhigh_effort in config.json and the admin settings).
+XHIGH_REPLACEMENTS = ("high", "max")
+
+
+def replaces_xhigh(entry):
+    """True when xhigh is not an error on this route but another level: a Claude route whose levels the client can pick."""
+    return (entry.get('provider') == 'anthropic' and entry.get('reasoning_effort_control') == 'selectable'
+            and 'xhigh' not in (entry.get('reasoning_effort_levels') or ()))
+
+
+def xhigh_replacement(entry, xhigh_as):
+    """The level a request for xhigh is served at on this route, or None when xhigh is not replaced there."""
+    return xhigh_as if replaces_xhigh(entry) and xhigh_as in (entry.get('reasoning_effort_levels') or ()) else None
 
 
 def _setting_hint(effort, allowed):
@@ -832,7 +888,7 @@ def _setting_hint(effort, allowed):
     return '. ' + enable + 'use the nearest level, %s, instead' % nearest
 
 
-def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False):
+def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False, xhigh_as=None):
     """Resolve exactly; explicit compatibility permits known-level mapping.
 
     Compatibility mapping is opt-in. Clients copy one effort across models, so e.g. xhigh reaches
@@ -844,12 +900,34 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
     effort (reasoning_effort_control "accepted-ignored") take every known level
     and forward none.
 
+    xhigh on a Claude route is the one level that is never an error (xhigh_as, replaces_xhigh): it is served as the
+    level `xhigh_as` names, whether or not allow_downgrade is on. None leaves xhigh to the rules above.
+
     The name may select a prompt profile, <model>@<profile>[#effort]: the profile is not the catalog's
     business, so it is dropped here (validate keeps it in Parsed.virtual_profile, parse_model_name).
+
+    A model that no account serves but that has a substitute (SUBSTITUTES) comes back as the substitute. Its effort
+    is validated as the model the client asked for, so a level that model rejects is still a 400, and then moved to the
+    nearest level the substitute takes, when it lacks one (gpt-6-luna and gpt-6.1-terra take the same levels).
     """
+    entry, level = _resolve_requested(model, effort, strict=strict, default_model=default_model,
+                                      allow_downgrade=allow_downgrade, xhigh_as=xhigh_as)
+    served = substitute_for(entry['id'])
+    if served:
+        entry = _BY_ID[served]
+        levels = entry.get('reasoning_effort_levels') or []
+        if level is not None and level not in levels:
+            level = nearest_effort(levels, level) if levels else None
+    return entry, level
+
+
+def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade, xhigh_as=None):
     parsed = parse_model_name(model or default_model)
     extracted_effort = effort if effort is not None else parsed.effort
     base_name = parsed.base
+    if xhigh_as and isinstance(extracted_effort, str) and extracted_effort.lower() == 'xhigh':
+        entry, _ = resolve(base_name, None, strict=strict, default_model=default_model)
+        extracted_effort = xhigh_replacement(entry, xhigh_as) or extracted_effort
     try:
         return resolve(base_name, extracted_effort, strict=strict, default_model=default_model)
     except ApiError as error:

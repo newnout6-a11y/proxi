@@ -16,6 +16,7 @@ import urllib.error
 import pytest
 
 import direct
+import forced_choice
 import journal
 import native_history
 from test_conversation_state import stored
@@ -34,6 +35,13 @@ def reply(*calls, sig="opaque-one"):
     """Signed thinking, then the calls (each from `call`), as Retool streams it."""
     return [*THINKING, signature(sig[:3]), signature(sig[3:]), {"event": "content_block_end", "type": "thinking"},
             *[event for one in calls for event in one], *END]
+
+
+@pytest.fixture
+def native_choice(monkeypatch):
+    """Claude's forced choice is asked for in words and checked by the relay, with a second try (test_forced_choice). The
+    tests that use this are about the orchestrator's check of a route that takes the choice itself and ignores it."""
+    monkeypatch.setattr(forced_choice, "requirement", lambda *args, **kwargs: None)
 
 
 def asked(messages, dialect, tools, choice=None):
@@ -85,7 +93,9 @@ def test_the_next_step_continues_the_branch_when_the_other_call_of_the_reply_was
     held = assistant_of(sent[1])
     assert [block["type"] for block in held] == ["thinking", "tool_call"]
     assert held[0]["signature"] == "opaque-one" and held[1]["toolCallId"] == "c2"
-    assert sent[1]["messages"][-1]["role"] == "tool" and sent[1]["messages"][-1]["content"]["toolCallId"] == "c2"
+    # Under a named choice the relay asks Claude for the call in a user turn of its own, at the end (forced_choice).
+    result = sent[1]["messages"][-2] if choice else sent[1]["messages"][-1]
+    assert result["role"] == "tool" and result["content"]["toolCallId"] == "c2"
     assert len(stored(seq, "native_history.resume")) == 1
     assert not stored(seq, "native_history.reset") and not stored(seq, "native_history.cold")
     pruned = stored(seq, "native_history.pruned")
@@ -136,7 +146,7 @@ def test_on_another_route_the_branch_is_recorded_as_before(tmp_path, monkeypatch
 
 # --- a reply whose only call was dropped --------------------------------------------------------------------------
 
-def test_a_reply_that_only_calls_a_tool_the_client_cannot_receive_is_told_as_such_and_records_nothing(tmp_path, monkeypatch):
+def test_a_reply_that_only_calls_a_tool_the_client_cannot_receive_is_told_as_such_and_records_nothing(tmp_path, monkeypatch, native_choice):
     tools = TOOLS + [LIST_DIR]
     pool, runner, sent = harness(tmp_path, monkeypatch, [reply(call("c1", "list_dir", {"path": "."}))])
     seq = journal.JOURNAL.last_seq
@@ -162,7 +172,7 @@ def test_a_reply_that_only_calls_a_tool_the_client_cannot_receive_is_told_as_suc
     assert [event["data"]["kept"] for event in stored(seq, "native_history.pruned")] == [False]
 
 
-def test_the_message_of_the_error_names_every_call_that_was_dropped_once(tmp_path, monkeypatch):
+def test_the_message_of_the_error_names_every_call_that_was_dropped_once(tmp_path, monkeypatch, native_choice):
     tools = TOOLS + [LIST_DIR]
     pool, runner, _ = harness(tmp_path, monkeypatch, [reply(
         call("c1", "list_dir", {"path": "."}), call("c2", "list_dir", {"path": "x"}), call("c3", "grep", {"q": "y"}))])
@@ -177,7 +187,7 @@ def test_the_message_of_the_error_names_every_call_that_was_dropped_once(tmp_pat
     assert message.count("list_dir") == 1 and "grep" in message
 
 
-def test_a_reply_with_text_and_a_dropped_call_under_a_named_choice_keeps_its_text_and_the_old_error(tmp_path, monkeypatch):
+def test_a_reply_with_text_and_a_dropped_call_under_a_named_choice_keeps_its_text_and_the_old_error(tmp_path, monkeypatch, native_choice):
     tools = TOOLS + [LIST_DIR]
     pool, runner, _ = harness(tmp_path, monkeypatch, [
         [*THINKING, signature("opa"), signature("que"), {"event": "content_block_end", "type": "thinking"}, text("Let me look."),
@@ -195,7 +205,7 @@ def test_a_reply_with_text_and_a_dropped_call_under_a_named_choice_keeps_its_tex
     assert [block["type"] for block in branches[-1].assistant] == ["thinking", "text"]  # what the client was told, no call
 
 
-def test_an_empty_reply_under_a_named_choice_is_still_an_empty_turn(tmp_path, monkeypatch):
+def test_an_empty_reply_under_a_named_choice_is_still_an_empty_turn(tmp_path, monkeypatch, native_choice):
     pool, runner, _ = harness(tmp_path, monkeypatch, [[*END], [*END], [*END]])
 
     async def scenario():

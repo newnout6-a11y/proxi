@@ -8,10 +8,13 @@ import asyncio
 import contextlib
 import contextvars
 import decimal
+import functools
 import hashlib
 import http.client
 import json
+import math
 import pathlib
+import random
 import re
 import socket
 import threading
@@ -24,6 +27,7 @@ import urllib.request
 import apierr
 import conversation_state
 import credits
+import forced_choice
 import journal
 import client_context
 import console_log
@@ -47,6 +51,32 @@ def _int_setting(cfg, key, default):
         return max(0, int(cfg.get(key, default)))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+# Retool's "Retool models are rate limited right now. Please try again shortly." (HTTP 429, or an error event inside a 200): a
+# limit of the moment on the models, not the account's hourly quota (that one parks the account: apierr.is_account_quota).
+# The request is refused before anything is generated, so asking again on the same account costs nothing, and moving to
+# another account would start the conversation's history and cache from nothing (79,000 tokens in one measured case).
+# These are the pauses before the 1st, 2nd and 3rd retry, on top of the 0.5, 1 and 2 seconds that AttemptBudget.take
+# adds before any further POST of a step.
+RATE_LIMIT_WAITS = (1.5, 3.0, 6.0)
+
+
+def _refused_for_now(error):
+    return (isinstance(error, apierr.ApiError) and error.status == 429 and error.code == "rate_limit_error"
+            and not apierr.is_account_quota(error))
+
+
+async def _pause(seconds, is_cancelled):
+    """Wait `seconds` in short slices; False when the request was cancelled meanwhile."""
+    deadline = loop_now() + seconds
+    while loop_now() < deadline:
+        if is_cancelled():
+            return False
+        await asyncio.sleep(min(0.25, max(0.0, deadline - loop_now())))
+    return not is_cancelled()
+
+
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku", 'gpt-4.1',
                 'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2'}
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
@@ -360,8 +390,16 @@ MAP_NOTE = "This is a map with any keys: pass it as one string that holds a JSON
 
 
 def _marked(spec):
-    """Whether a Retool param node is a dictionary written as a string (MAP_NOTE ends its description)."""
-    return isinstance(spec, dict) and spec.get("type") == "string" and MAP_NOTE in str(spec.get("description") or "")
+    """Whether a Retool param node is a dictionary written as a string (MAP_NOTE ends its description).
+
+    A strict tool's field that may also be null is that string inside "X or null" (_with_null), whose outer node carries
+    the description: it is marked too."""
+    if not isinstance(spec, dict) or MAP_NOTE not in str(spec.get("description") or ""):
+        return False
+    if spec.get("type") == "anyOf":
+        branches = [branch for branch in spec.get("anyOf") or [] if isinstance(branch, dict) and branch.get("type") != "null"]
+        return len(branches) == 1 and branches[0].get("type") == "string"
+    return spec.get("type") == "string"
 
 
 def _has_marked(spec):
@@ -447,6 +485,57 @@ def _allowed_values(schema):
     return None
 
 
+_STRICT_TOOL = contextvars.ContextVar("proxi_strict_tool", default=False)
+
+
+def _allows_null(schema):
+    """True when a schema says "X or null": a union with a null branch and another, a type list that holds "null" and
+    another type, or an enum with null among other values."""
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        return "null" in kind and any(item != "null" for item in kind)
+    options = schema.get("anyOf") if isinstance(schema.get("anyOf"), list) else schema.get("oneOf")
+    if isinstance(options, list):
+        branches = [option for option in options if isinstance(option, dict)]
+        if any(option.get("type") == "null" for option in branches):
+            return any(option.get("type") != "null" for option in branches)
+    values = schema.get("enum")
+    return isinstance(values, list) and None in values and any(value is not None for value in values)
+
+
+def _with_null(schema, node):
+    """`node`, what _param_schema made of `schema`, as an anyOf that still has a null branch when the schema allows null."""
+    if not _allows_null(schema) or node.get("type") == "null":
+        return node
+    null = {"type": "null", "required": False}
+    if node.get("type") == "anyOf":
+        if any(isinstance(branch, dict) and branch.get("type") == "null" for branch in node["anyOf"]):
+            return node
+        return dict(node, anyOf=list(node["anyOf"]) + [null])
+    inner = {key: value for key, value in node.items() if key not in ("required", "description")}
+    outer = {"type": "anyOf", "anyOf": [dict(inner, required=False), null], "required": node["required"]}
+    if "description" in node:
+        outer["description"] = node["description"]
+    return outer
+
+
+def _keeps_null(convert):
+    """Declare a field that may be null as "X or null" in a strict tool, at every depth.
+
+    Retool's strict mode makes every parameter required, and a field declared as plain X left the model no way to say
+    "none": it gave a placeholder (live, 2026-11-06: max_results 10, order "desc", since "1970-01-01" for a search that
+    wanted none of them) or refused to call the tool. With the null branch, which Retool accepts, both said null
+    (ultracode audit of the relay, C7). The children of a field are converted by the same function, so one wrapper
+    covers the properties and items below it; a tool that is not strict keeps the plain type, as its optional field can
+    be left out."""
+    @functools.wraps(convert)
+    def wrapper(schema, required, *args, **kwargs):
+        node = convert(schema, required, *args, **kwargs)
+        return _with_null(schema, node) if _STRICT_TOOL.get() and isinstance(schema, dict) else node
+    return wrapper
+
+
+@_keeps_null
 def _param_schema(schema, required, root=None, trail=(), maps=False):
     """Convert one JSON-Schema property to Retool's typed param shape.
 
@@ -599,8 +688,12 @@ def tools_to_retool(tools):
         required = set(_required_names(schema))
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
         maps = bool(function.get("strict"))  # see _param_schema
-        for name in sorted(properties.keys()):
-            params[name] = _param_schema(properties[name], name in required, root, trail, maps)
+        token = _STRICT_TOOL.set(function.get("strict") is True)
+        try:
+            for name in sorted(properties.keys()):
+                params[name] = _param_schema(properties[name], name in required, root, trail, maps)
+        finally:
+            _STRICT_TOOL.reset(token)
         converted.append({"name": function["name"],
                           "description": function.get("description") or "",
                           "params": params, "strict": function.get("strict", False)})
@@ -638,11 +731,22 @@ def coerce_arguments(raw, params):
 _JSON_NULL = object()
 
 
+def _coerced_kind(spec):
+    """The type a string is coerced to for a field. A field that is "X or null" (an anyOf of X and null, how a strict
+    tool declares it) is an X, as it was before the null branch; a union of two types is not guessed at."""
+    kind = spec.get("type") if isinstance(spec, dict) else None
+    if kind == "anyOf":
+        kinds = {branch.get("type") for branch in spec.get("anyOf") or []
+                 if isinstance(branch, dict) and branch.get("type") != "null"}
+        return kinds.pop() if len(kinds) == 1 else None
+    return kind
+
+
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
     if _marked(spec):
         return _decode_map(value)
-    kind = spec.get("type") if isinstance(spec, dict) else None
+    kind = _coerced_kind(spec)
     if value == "null" and kind in ("number", "boolean", "array", "object"):
         # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
         # writes the string "null" when it means null: the client's tool refused middle="null", active="null" (protocol
@@ -688,7 +792,8 @@ class ArgStream:
         except ValueError:
             return False
         spec = self.params.get(name)
-        return isinstance(spec, dict) and (spec.get("type") in ("number", "boolean", "array", "object") or _marked(spec))
+        return isinstance(spec, dict) and (_coerced_kind(spec) in ("number", "boolean", "array", "object")
+                                           or _marked(spec))
 
     def feed(self, chunk):
         if self.buffer is not None:
@@ -866,6 +971,24 @@ def _has_cacheable_text(chunk):
     return any(not isinstance(block, dict) or block.get("type") == "text" for block in blocks)
 
 
+_CHOICE_WORDS = ("none", "auto", "required")
+
+
+def _forced_alone(tools, tool_choice):
+    """(tools, tool_choice) with a forced tool whose name is one of Retool's own choices made unambiguous.
+
+    toolChoice is one string, and "none", "auto" and "required" mean what they say whoever a client tool is called: forcing
+    a tool named "none" asked for no tool at all, "auto" for nothing in particular and "required" for any tool (ultracode
+    audit of the relay, C20). Such a tool is forced the way a lone tool is: the model is offered only that one and the
+    choice is "required". The list the caller holds is not changed."""
+    function = tool_choice.get("function") if isinstance(tool_choice, dict) else None
+    name = function.get("name") if isinstance(function, dict) else None
+    if name not in _CHOICE_WORDS:
+        return tools, tool_choice
+    kept = [tool for tool in tools or [] if tool.get("name") == name]
+    return (kept, "required") if kept else (tools, tool_choice)
+
+
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None,
                mark_tail=True):
     """Assemble the request body.
@@ -878,6 +1001,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     nobody reads again, and a hint there only makes the provider write it at the price of a write.
     """
     messages = []
+    tools, tool_choice = _forced_alone(tools, tool_choice)
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
     prefix_key = cache_key_for(head, model_provider.get("model"), tools) if cache and head else None
     if head:
@@ -1131,6 +1255,26 @@ def ping_body(body):
     return payload
 
 
+def _without_inf(value):
+    if isinstance(value, dict):
+        return {key: _without_inf(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_without_inf(item) for item in value]
+    return None if isinstance(value, float) and not math.isfinite(value) else value
+
+
+def _wire_json(body):
+    """The request body as the ASCII JSON that goes upstream.
+
+    A number past the range of a double (1e400) that the client's own history holds is inf here, and Python writes it as
+    Infinity, which is no JSON: the endpoint refused the whole request (ultracode audit of the relay, G3.2). It goes as
+    null, which is what a JavaScript client writes for it as well."""
+    try:
+        return json.dumps(body, ensure_ascii=True, allow_nan=False).encode("utf-8")
+    except ValueError:
+        return json.dumps(_without_inf(body), ensure_ascii=True).encode("utf-8")
+
+
 def _ping(session, body):
     """Cheap request that re-reads the cached prefix so its TTL does not lapse.
 
@@ -1142,7 +1286,7 @@ def _ping(session, body):
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
-                                     data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
+                                     data=_wire_json(payload),
                                      headers=headers, method="POST")
     response = urllib.request.urlopen(request, timeout=120)
     abort = lambda: _force_close_response(response)
@@ -1586,6 +1730,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 
     `session._native_callable_tools` names the tools whose calls reach the client (None: every call does); a call of
     another tool is dropped by the caller and is not part of what the turn delivered, nor of the branch recorded for it."""
+    # A route that refuses a forced choice is sent `auto` (forced_choice): the choice is neither sent nor part of the scope
+    # of the branch, which the next request continues whatever it forces.
+    required = forced_choice.requirement(model_provider.get("model"), tools, tool_choice)
+    if required is not None:
+        tool_choice = "auto"
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
     # The summary of a client's compaction is a side request: the client replaces its history by that summary and
@@ -1601,6 +1750,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                                                      mark_tail=not side_request)
 
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
+    tools, tool_choice = _forced_alone(tools, tool_choice)
     parent, messages = (conversation_state.resume(session, history, scope, client)
                         if history is not None and client is not None else (None, None))
     forked = False
@@ -1620,9 +1770,14 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         body["rit"] = make_rit(body["messages"], tools)
         # A fork replays none of the last reply: no block of the parent is in this body.
         replayed = [] if forked else parent.assistant
+        reminders = 0 if forked else native_history.dropped(parent, client, messages)
+        # A turn the client took back (an undo, an edit, a retry) continues the final answer of the turn before it.
+        rewound = (not forked and parent is not history.branches[-1]
+                   and any(parent is p for p in getattr(history, "points", ())))
         journal.emit("native_history.resume", "Сохранённые assistant/thinking blocks возвращены upstream", "info",
                      blocks=len(replayed), messages=len(body["messages"]),
-                     signatures=sum(b["type"] == "thinking" for b in replayed), fork=forked)
+                     signatures=sum(b["type"] == "thinking" for b in replayed), fork=forked,
+                     **({"reminders_kept": reminders} if reminders else {}), **({"rewound": True} if rewound else {}))
         req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
         console_log.write("[%s] [history] native continuation %s thinking=%d tool_calls=%d" % (
             req_id, "forked from the last request" if forked else "restored",
@@ -1760,9 +1915,15 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         # Start the scheduler with the turn, not after it: a session's first long
         # turn needs its anchored during-turn ping too.
         _ensure_keepwarm(session, cfg)
+
+    def open_stream(sent):
+        # Only a route that refuses a forced choice has a requirement: its reply is held until it holds the call.
+        return (_forced_stream(cfg, session, sent, param_types, required) if required is not None
+                else _stream_body(cfg, session, sent, param_types))
+
     try:
         try:
-            async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+            async with contextlib.aclosing(open_stream(body)) as stream:
                 async for event in stream:
                     note(event)
                     yield event
@@ -1807,7 +1968,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 if body.get("openAICacheKey"):
                     session._turn_body = body
                 answered = False
-                async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+                async with contextlib.aclosing(open_stream(body)) as stream:
                     async for event in stream:
                         if not answered and event.get("type") != "usage_start":
                             answered = True
@@ -1835,7 +1996,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 body = {key: value for key, value in body.items() if key != "metadata"}
                 if body.get("openAICacheKey"):
                     session._turn_body = body
-                async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+                async with contextlib.aclosing(open_stream(body)) as stream:
                     async for event in stream:
                         note(event)
                         yield event
@@ -1979,9 +2140,54 @@ def _dump_empty_once(payload, flags, cfg, session, model=None):
     return stamp
 
 
+def _asked_for_call(body, text):
+    """The body with `text` as one more user turn after its last message.
+
+    Nothing of the body moves: the turn carries no cache mark and is not in the history that gets stored, so a request that
+    continues this one finds the prefix the cache holds. Only the integrity hint is made again, as it covers the messages."""
+    messages = [*body["messages"], {"role": "user", "content": [{"type": "text", "text": text}]}]
+    return {**body, "messages": messages, "rit": make_rit(messages, body.get("tools"))}
+
+
+async def _forced_stream(cfg, session, body, param_types, required):
+    """_stream_body for a route that refuses a forced tool choice: the call is asked for in words, and the reply checked.
+
+    The reply is released once it holds the call (forced_choice.Gate). An attempt that ends without it is asked again once,
+    more firmly: nothing of it reaches the client (its thinking, its text and the calls of other tools are dropped) and its
+    cost still counts. A second miss is the error a route that ignored a native choice earns in the orchestrator. Only the
+    accepted attempt leaves its reply on the session for the history to keep."""
+    attempt = 0
+    while True:
+        attempt += 1
+        gate = forced_choice.Gate(required)
+        end = None
+        sent = _asked_for_call(body, forced_choice.instruction(required, firm=attempt > 1))
+        async with contextlib.aclosing(_stream_body(cfg, session, sent, param_types)) as stream:
+            async for event in stream:
+                if event.get("type") == "end":
+                    end = event  # judged below: an attempt that missed the call must not end the turn
+                    continue
+                for ready in gate.feed(event):
+                    yield ready
+        if end is None:
+            return  # the stream ended with its error event, which the gate let through
+        if gate.complied or end.get("reason") == "cancelled":
+            yield end
+            return
+        budget = getattr(session, "_attempt_budget", None) or AttemptBudget()
+        final = attempt > 1 or not budget.remaining
+        journal.emit("turn.forced_choice_missed",
+                     "Модель не вызвала требуемый инструмент%s" % ("" if final else ": повтор с усиленной просьбой"),
+                     "warn", model=body.get("model"), tool=required.named, called=gate.called, wrote_text=gate.text,
+                     attempt=attempt)
+        if final:
+            raise budget.error("upstream_tool_choice_ignored" if gate.text or gate.called else "upstream_empty_turn",
+                               "upstream did not honor the required client tool choice")
+
+
 async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     if payload is None:
-        payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
+        payload = _wire_json(body)
     elif json.loads(payload) != body:
         raise ValueError("replay payload does not match the supplied body")
     session._direct_reply = None
@@ -2140,9 +2346,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     try:
         max_empty_retries = _int_setting(cfg, "upstream_empty_retries", 1)
         empty_retries = 0
+        max_limit_retries = _int_setting(cfg, "upstream_rate_limit_retries", 3)
+        limit_retries = 0
         while True:
             usable = False
             thinking_seen = False
+            spoke = False  # whether this attempt gave the consumer anything but billing and display status
             # Events of an attempt are held back until it proves usable, so a retried
             # attempt can never leak thinking blocks, signatures or blank text.
             held = []
@@ -2175,8 +2384,10 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         for pending in held:
                             yield pending
                         held.clear()
+                        spoke = True
                         yield event
                     elif kind in _LIVE_EVENTS or not may_retry:
+                        spoke = spoke or kind not in _LIVE_EVENTS
                         yield event
                     elif live_thinking and kind in ("thinking", "thinking_start"):
                         # Reasoning text without a signature: the client may read it while the model is still at it.
@@ -2195,6 +2406,8 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 # Without a status the request may still be in flight, unless it provably never left.
                 possibly_billed = (current_trace is not None and (
                     200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
+                if _refused_for_now(failure) and not flags.get("usage_seen"):
+                    possibly_billed = False  # refused before anything was generated: it cost nothing, as an HTTP 429 never does
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
                     flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
@@ -2217,6 +2430,23 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             if flags.get('cost_unknown') and not flags.get('usage_seen'):
                 # Include possibly billed failures/truncations before failover.
                 yield {'type': 'usage', 'usage': {}}
+            if (_refused_for_now(failure) and not spoke and not usable and limit_retries < max_limit_retries
+                    and budget.remaining and not is_cancelled()):
+                wait = RATE_LIMIT_WAITS[min(limit_retries, len(RATE_LIMIT_WAITS) - 1)] * random.uniform(0.75, 1.25)
+                limit_retries += 1
+                journal.emit("upstream.rate_limited",
+                             "Retool ограничил частоту запросов к моделям (429): повтор на том же аккаунте через %.1f с "
+                             "(%d из %d)" % (wait, limit_retries, max_limit_retries), "warn", model=body.get("model"),
+                             attempt=budget.used, wait=round(wait, 2), retry=limit_retries, retries=max_limit_retries,
+                             account=account_tag(getattr(session, "backend", None)),
+                             thread=journal.tag(getattr(session, "thread_id", None)))
+                if not await _pause(wait, is_cancelled):
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                text.clear()
+                thinking.clear()
+                holder["response"] = None
+                continue
             if failure is not None:
                 raise failure
             saw_end = bool(flags.get("end"))
@@ -2279,6 +2509,16 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         yield {"type": "end", "reason": "length" if truncated else "stop"}
     finally:
         session._active_direct_abort = None
+
+
+def _delta_target(event, current):
+    """The call a tool-call delta belongs to: the one it names, else the newest open one.
+
+    ReplyCapture, which records the signed history, has always read a delta's toolCallId; this read the newest open
+    call whatever the delta said, so with two calls open the client and the history disagreed about their arguments
+    (ultracode audit of the relay, G1.1). Retool tags no delta today, and then the newest open call is the one."""
+    named = event.get("toolCallId")
+    return named if isinstance(named, str) and named else current
 
 
 async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None, *, cache_scope=None):
@@ -2423,8 +2663,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 think_started = None
                 if event.get("partialSignature"):
                     yield {"type": "thinking_signature", "signature": event["partialSignature"]}
-            elif block == "tool_call" and current in calls:
-                call = calls[current]
+            elif block == "tool_call" and (target := _delta_target(event, current)) in calls:
+                call = calls[target]
                 piece = event.get("partialInputs") or ""
                 call["args"].append(piece)
                 emitted = call["stream"].feed(piece)

@@ -143,6 +143,10 @@ def _schema():
         ("allow_effort_downgrade", "boolean", "Подбирать ближайший effort", "model",
          "Если модель не поддерживает запрошенный уровень мышления, взять ближайший вместо ошибки",
          None, None, None, None),
+        ("claude_xhigh_effort", "string", "Уровень вместо xhigh у Claude", "model",
+         "У моделей Claude в Retool нет уровня xhigh, а Claude Desktop и другие клиенты шлют его всем моделям. "
+         "Запрос с xhigh получает выбранный здесь уровень вместо ошибки, независимо от подбора ближайшего effort",
+         None, None, None, list(models.XHIGH_REPLACEMENTS)),
         ("compaction_keep_effort", "boolean", "Сжатие на effort диалога", "model",
          "Когда клиент сжимает историю, relay берёт effort диалога, если так продолжается его подписанная история: "
          "смена effort сбрасывает её и кэш сообщений, и весь диалог записывается заново. Effort диалога берётся, "
@@ -539,7 +543,9 @@ class Admin:
     def _models(self):
         data = []
         for entry in models.catalog():
-            item = {**entry, "routable": self._routable(entry), "available_verified": None}
+            item = {**entry, "routable": self._routable(entry), "available_verified": None,
+                    # xhigh is not an error on this route: it is served at the level claude_xhigh_effort names
+                    "xhigh_replaced": models.replaces_xhigh(entry)}
             if not item["routable"]:
                 code, reason = self._unrouted(entry)
                 if code != "blocked":
@@ -1028,7 +1034,8 @@ class Admin:
                 raise apierr.bad_request("shared mode requires a configured thread_id", param="session_mode")
             if candidate["reasoning_effort"] != "auto":
                 models.resolve_tolerant(candidate["model"], candidate["reasoning_effort"], strict=True,
-                                        allow_downgrade=candidate["allow_effort_downgrade"])
+                                        allow_downgrade=candidate["allow_effort_downgrade"],
+                                        xhigh_as=candidate["claude_xhigh_effort"])
             self._check_role_budget(candidate, changes)
             changed = [key for key, value in changes.items() if desired[key] != value]
             temporary = None

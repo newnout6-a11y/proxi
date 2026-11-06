@@ -116,6 +116,32 @@ is not a relay model and its window is unknown. Either way the summary's `warnin
 name the old reference and what was done. A compaction model you chose that is still
 published is kept as it is, even if its window is smaller: check that yourself.
 
+### A system prompt that changes by itself
+
+The head of a request is the start of the cached prefix, so one changed character in the client's system prompt writes the
+whole conversation to the cache again and drops its signed history (`cache.head_changed`, `native_history.reset`). OpenCode
+1.x changes it between processes without the conversation changing: `<available_skills>` gives each skill a `<location>`, a
+skill that exists in two scanned folders (the user's `boxd-cli` and `boxd-setup-hermes` are junctions, `stageshow` and
+`unslop` are real copies, in `~/.agents/skills` and `~/.claude/skills`) is listed from the folder the process met first,
+and that differs from process to process. Six fresh `opencode run` processes in one folder sent five different system
+prompts, and in the Opus dialog of 2026-11-06 seven of twelve turns started with a reset and a rewrite of 68k to 196k tokens
+(7 to 21 credits each, 47% of what the build agent cost). The long-lived OpenCode Desktop server keeps one prompt and is not
+hit; its 2.x prompt has no `<location>` at all.
+
+The relay holds such a location where it first saw it (`prompt_stabilizer.SkillLocations`): the first location of a skill
+(by working folder, name and description) is written into every later prompt, so the head stays put. The name and the
+description are the skill and are never touched, and `skill({name})` loads by name, so the model can still load every skill.
+A remembered file that is gone while the new one exists gives way to the new one, so the model is never pointed at a file that
+does not exist; an entry is forgotten after a week. The memory is written to `<conversation_state_dir>/client-prompts.json`
+and survives a relay restart. `prompt.stabilized` (debug) names what was held. `stabilize_client_prompts: false` in
+`config.json` switches this off.
+
+The same prompt carries `Today's date: ...`, regenerated on every request, so a conversation that crosses midnight rewrites its
+cache once (30 credits at 300k tokens). That is a choice, not a repair: `stable_prompt_date: true` keeps the date a conversation
+was first shown for as long as it stays active (a gap longer than the idle timeout plus five minutes ends it, since the cache
+is gone by then anyway), and the model is told yesterday's date for that stretch of work. It is off by default. Claude Code
+keeps its date in the first user message, Codex in the environment context of the history, so neither changes its head.
+
 ### Compaction and the effort of its agent
 
 OpenCode 2.x (every tag from v2.0.0 to v2.2.5) compacts by resending the chat's own
@@ -285,6 +311,30 @@ like the relay. One limit remains: a comment written directly after the Proxi bl
 before the next provider, can be dropped or repeated (ruamel attaches it to the block's
 last key), so compare the preview with the profile before `--write`: the preview shows
 each comment as `# ***` in its place, and `--include-secrets` shows the text.
+
+### Harness without a session ID
+
+The Harness 0.2.2 adapters send no session identity (`sendSessionAffinityHeaders` is withheld and the config refuses to
+set it), so a Harness request names no conversation. A client like that did get a throwaway session per request: in the
+test run of 2026-11-06 `native_history.cold` was journaled on 488 of 490 requests, signed thinking never came back and
+nothing was kept warm. The relay now finds the conversation from the request itself (`conversation_infer.py`): a request
+that carries tools and no identity takes the key of the conversation whose request its history extends, that is, when
+its model, system prompt and message list begin with exactly the messages of a request the relay has seen. The check is
+a hash over the model, the system text and a digest of every message, so two requests share a key only when one holds the
+whole history of the other. The conversations that can share a key are one conversation and its forks, and native
+history keeps each continuation on a branch of its own and resumes a branch only for exactly its messages. A history the
+client edits (a pruned tool result, a regenerated answer) starts a key of its own, as every request did before.
+The first request of each conversation is journaled as `conversation.inferred` (debug). `infer_conversations: false` in
+`config.json` restores one session per request. A client that does send an identity (a header, a session id in the
+metadata, a plugin that sets `x-proxi-session-id`) keeps it: nothing is inferred for it.
+
+An inferred conversation is a pool conversation like any other: it is kept 15 minutes after its last request, warmed
+by the cache keepwarm while it lasts, and stored for a restart. The index is in memory (24 hours, 20000 histories),
+so after a relay restart a Harness chat continues under a new key once and then as before.
+
+Harness 0.2.2-alpha.3 and later also offer the explicit way, the `llm-pi-ai/request-headers` plugin hook; a plugin that
+sets `x-proxi-session-id` to the hook's `request.sessionId` (and `x-proxi-client: harness`) gives an exact identity that
+survives an edited history and a relay restart. It is optional now.
 
 ### Historical Harness setup — 0.1.5-rc.2
 
@@ -493,6 +543,12 @@ An explicit `model_reasoning_effort` remains authoritative when set. The built-i
 server-side Responses web search is not implemented; client function tools for
 search use the ordinary tool bridge.
 
+Codex's memory jobs ask for `gpt-6-luna`, which Retool does not serve (404 on 2026-11-06, so no memory was
+ever made). The relay answers such a request with `gpt-6.1-terra` at the effort the client asked for (both models take
+the same levels). Each one is journaled as
+`request.model_substituted` (`requested`, `served`) and carries `x-proxi-model-substituted: gpt-6-luna=gpt-6.1-terra`;
+`/v1/models` and the Codex catalog still list only the models that are served. `models.SUBSTITUTES` is the table.
+
 `codex exec --output-schema FILE` sends the schema as Responses `text.format`
 (`json_schema`, `strict: true`). Retool cannot constrain decoding, so the relay
 emulates it: the schema goes into the instructions, tool turns pass through
@@ -527,6 +583,87 @@ limitations were in the review of
 [PR #1](https://github.com/newnout6-a11y/proxi/pull/1), `docs/pr-1-review.md`; the file
 was removed from the repository, its last version is `git show 60cc80f^:docs/pr-1-review.md`.
 
+### Tools that Codex declares late
+
+Codex starts its MCP servers after it has sent the first request (the grace period for optional servers is one second,
+`mcp_optional_startup_grace_ms`), so request 1 of a conversation carries 44 to 46 tools and request 2 carries 50 to 60: 27 of
+27 models of the test run of 2026-11-06 and every run on the default configuration. The tool list is part of the cached prefix
+and of the key of a signed branch, so each change was a cache rewrite and a reset: 4.4 credits at 44k tokens, 31 credits at
+334k (22 times a warm request), and `codex exec resume`, which is a new process on every turn, paid two rewrites per turn (the
+list shrinks to 46 when the process starts and grows back inside the turn). Codex Desktop does the same after `thread/start`
+and `thread/resume`. The setting that makes Codex itself wait (`mcp_optional_startup_grace_ms = 10000`) works and costs 3.5 to
+4 s before every first request; the relay does not need it.
+
+The relay keeps, per client and project, the tools a Codex has declared (`tool_union.py`) and gives each request the union of
+those and the ones it declares itself, so request 1 already carries what request 2 will bring and nothing changes upstream when
+a server comes up. What decides it:
+
+- **Whose list.** The client family (`tool_union_clients`, `["codex"]` by default, `[]` is off), the originator (the CLI and
+  the Desktop differ: 60 tools against 97), the model (the client builds a list per model), root agent or sub-agent
+  (`x-openai-subagent`, `x-codex-parent-thread-id`), the working folder (`<cwd>` of the environment context) and the prompt
+  profile and its revision. A conversation in another project, with another model, or a sub-agent does not inherit a list.
+- **Which definition.** A tool the client names in this request is the client's, in its newest definition; a tool it does not
+  name is carried with the definition it had last. The upstream order is by name, so the order of declaration never matters.
+- **How long.** A tool the client has not declared for `tool_union_ttl` seconds (six hours) is dropped, so a server the user
+  removes is gone from the list within hours; one union holds 400 tools at most, 64 clients are kept, a definition over 64 KB is
+  not carried. The memory is in the relay process: after a restart the first conversation learns the list again.
+- **When the model calls a tool the client did not declare in this request.** If the client declared it before, the call goes to
+  the client like any other (`tool.call` carries `"carried": true`). Codex 0.167 answers it with the tool result `unsupported
+  call: ...` and goes on with the turn, also when the server has come up since (it routes a call with the tool list of the request
+  that produced it); the model reads the error, and from the next request on the client declares the tool, so a retry works. A
+  name the client never declared stays what it was: it is not passed on, and `tool.call_dropped` names it.
+
+`tools.carried` (info) says once per change how many tools were carried and which. Only the family `codex` is listed by default:
+Claude Code's list changes with what its ToolSearch loads, and OpenCode's with the agent, and a union would give an agent tools
+it was not given.
+
+### Speed and effort in Codex
+
+Codex's wall time is the number of agent steps, not the reasoning effort: the same bugfix task on gpt-6.1-sol took 45.7 s at
+max, 52.7 s at high and 39.3 s at medium (9.0, 10.0 and 8.3 requests: 5.1, 5.3 and 4.7 s per request). Two thirds of a request
+is the wait for the first token and the relay adds 38 ms to it (median over 178 requests). The one place where the effort does
+matter is Claude: at the user's global `model_reasoning_effort = "max"` claude-opus-5-5 and claude-sonnet-5-5 think silently for
+15 to 66 s on a trivial step (opus: 15.0 s with 1 822 tokens on a question without tools, 38.0 s with 4 881 and 66.4 s with
+8 493 tokens on "call list_projects twice", 7.4 s at low; sonnet 21.4 and 39.0 s), where gpt-6.1-sol stays at about 3 s. On
+Claude Code the same model took 23 s on a realistic task at high and 130 s at max (thinking 105 s, 13.5k tokens, 8.2 credits).
+
+The relay never lowers the effort a client asks for: that is the owner's rule. The one mapping is `xhigh` on a route that has no
+such level, which the admin settings turn into `high` or `max`. A faster Claude through Codex is a choice made in Codex: a profile
+with `model_reasoning_effort = "high"` for the Claude models (`[profiles.claude]`, `codex -p claude`), or the effort picker of
+Codex Desktop. Changing the effort inside a conversation costs a rewrite (the effort is part of the key of a signed branch and of
+the provider's prompt: 1.2 credits at 24k tokens and 31 at 330k), so it is best set before a conversation starts.
+
+### The workspace-write sandbox on Windows
+
+`workspace-write sandbox has no writable root capability SIDs` is raised by codex-rs (`windows-sandbox-rs`, `spawn_prep.rs`, in the
+elevated and the unelevated implementation alike) when the list of effective write roots of a command is empty: the working
+folder and the other roots are dropped before their capability SIDs are made. One of the filters drops every root under the
+first folder of the user profile that a dependency of `~/.ssh/config` (`IdentityFile`, `ControlPath`, `Include`, known-hosts
+files, ...) lives in. The user's `~/.ssh/config` has an `IdentityFile` under `%USERPROFILE%\AppData\Roaming\boxd`, so every working
+folder under `%USERPROFILE%\AppData` (the test agents worked in `AppData\Local\Temp\opencode\...`) has no writable root.
+
+It was reproduced on the machine with codex-cli 0.167.0 and no model, no relay, no network, hidden and at low priority:
+`codex sandbox -c windows.sandbox="elevated" -c sandbox_mode="workspace-write" -- cmd.exe /d /c "echo ok>probe.txt"` from a folder
+under `%LOCALAPPDATA%\Temp` exits 1 with exactly that message; from a folder under `%USERPROFILE%\Documents` and from one outside
+the profile it exits 0 and writes the file. The sandbox log (`~/.codex/.sandbox/sandbox.<date>.log`) agrees: `setup refresh:
+processed 0 write roots` for the runs that failed, `granting write ACE to <the folder>` for the ones that worked. The one-time
+elevated setup is not the problem (its marker is there, version 5, from 2026-05-27) and nothing here needs elevation or a window.
+The relay and the model catalog are not involved: the roots are computed from the permissions, the working folder and
+`CODEX_HOME` on the machine.
+
+So: run Codex with a working folder outside `AppData` (for example `C:\work\<name>`; the user's own projects are not affected),
+or move the `boxd` identity file out of `AppData` and point `IdentityFile` at it. Anything else is a fallback that gives the
+sandbox up: `--dangerously-bypass-approvals-and-sandbox` or `sandbox_mode = "danger-full-access"`.
+
+### `update_plan` is off in Codex 0.152 and later
+
+Codex 0.152.0 made the `update_plan` tool opt-in: the tool is registered only when `[tools.update_plan] enabled = true` is in the
+effective configuration (`config.toml`, or `-c tools.update_plan.enabled=true` for one run). In the checked versions (0.160 to
+0.167) nothing else turns it on: not a model catalog field (`experimental_supported_tools` accepts only
+`request_user_input_async`, `send_user_message_async`, `send_message_to_user_async`, `clock` and `test_sync_tool`), not a feature
+flag, and the registration reads only that setting (`core/src/tools/spec_plan.rs`, `update_plan_enabled`). A provider's catalog
+cannot enable it for its models, and a tool the relay made up would never reach Codex's plan view. It works with the
+setting: the nested `plan[]` arguments arrive intact (4 calls in the test run).
 ## Claude Code
 
 Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and
@@ -538,6 +675,49 @@ Claude Code 2.1.310 passed real Read/Edit/Bash plus three fixture tests. Thinkin
 blocks are collapsed by default: `Ctrl+O` expands them;
 `showThinkingSummaries: true` enables summaries. This cannot reveal text that
 Retool has redacted or omitted.
+
+### Tool search of Claude Code 2.1.304 and later
+
+Since 2.1.304 Claude Code defers its MCP tools (and some of its own) behind `ToolSearch` when `ANTHROPIC_BASE_URL` is a
+gateway. The first request lists 14 tools (the user's own count was 15 to 26): the built-in ones, `ToolSearch` and a
+`DeferredToolPlaceholder` with `defer_loading: true`; every tool the model loads is added to `tools` afterwards (and a
+`tool_reference` to the result). The relay puts `tools` first in the prompt it sends upstream, so each load rewrote the whole
+cached conversation: four loads were 41% of all tokens written in the Claude Code dialog of 2026-11-06 (14.6, 29, 31 and
+33.8 credits, the last one at 336k tokens). Anthropic's own API does not pay this (a deferred tool is not part of the cached
+prefix there); a translating layer cannot copy it, and nothing in `/v1/models`, in a response header or in `anthropic-beta`
+tells the client not to defer (checked in the docs, code.claude.com gateway protocol and MCP pages): the decision is the
+client's, made from `ENABLE_TOOL_SEARCH`, the model name and the host.
+
+What the client does document is the other direction: from 2.1.305 on a 400 or 422 to a request that carries tool search
+makes it send the request again without `defer_loading` and `tool_reference`, with every tool loaded up front, and keep it that
+way for the conversation. The relay answers such a request with a 400 (`claude_tool_search: "eager"`, the default), and
+nothing is spent upstream. Checked against the installed 2.1.310 on a fake gateway and then on this relay's code with a
+scripted model:
+
+- A new conversation: the first request is refused, the client repeats it once, is refused again, and then sends the same
+  request with all 26 tools and no deferral. Two refused requests per conversation; the refusal is not stored between
+  processes (`.claude.json` holds nothing about it).
+- A resumed conversation whose history holds `tool_reference` blocks gets them stripped by the client, and goes on with every
+  tool loaded.
+- Status 422, a message that does not name tool search, and `x-should-retry: false` all take the same way.
+
+Only a recognised Claude Code or Claude Desktop whose user agent names a version of 2.1.305 or later is refused (2.1.304
+failed every request it was refused; a client with no version is served as it asks), and a conversation that is refused
+more than six times in ten minutes is served as it asks and journaled as `tool_search.refusal_loop`. `tool_search.refused`
+(info) names each refusal. `claude_tool_search: "native"` serves the deferral as before.
+
+The price of loading everything up front is the size of the prefix: the tools the user has (51 with three MCP servers) are
+about 23k more tokens in every request, read from the cache at 0.09 credits more per request, and the first request that
+writes them is one-off for a new tool set (4.8 credits instead of 2.5, shared by every later session). One late load costs
+as much as about 375 requests of that reading, and loads happen in most sessions, so the long dialog of 2026-11-06 would have
+spent about 40 of its 343 credits less. A session that never loads a tool and lasts a few requests is a little dearer.
+It also removes the known failure of 2.1.304 and later in which a subagent or a `claude -p` process is left with `ToolSearch`
+as its only tool (anthropics/claude-code#104309). The other way to the same list is on the client: `ENABLE_TOOL_SEARCH=false`
+in `~/.claude/settings.json` `env`, which makes the client send no deferral at all (no refused requests); the relay
+needs neither.
+
+A conversation that was running with tool search when the relay started refusing it pays one cache rewrite: the history loses
+its tool references and the tool list changes once.
 
 ### Structured outputs, titles and side requests
 
@@ -682,8 +862,9 @@ lists for Code or Cowork are included: 9 of the 11 in catalog version 4008.
 selector for them. `--include-unlisted` keeps them. Without a catalog file all 11
 are listed, with a warning.
 
-`maxEffort` hides every level above it, so a cap cannot skip a level. The relay
-rejects `xhigh` unless `allow_effort_downgrade` is true in its configuration:
+`maxEffort` hides every level above it, so a cap cannot skip a level. The relay serves `xhigh` on a Claude route as
+`high` (or as `max`: the setting `claude_xhigh_effort`) whatever `allow_effort_downgrade` says, so Desktop's own picker is
+safe at any cap. The script's cap rule is older than that and still reads the downgrade setting:
 
 | Model | Desktop picker | `maxEffort`, downgrade off | downgrade on |
 | --- | --- | --- | --- |
@@ -691,10 +872,10 @@ rejects `xhigh` unless `allow_effort_downgrade` is true in its configuration:
 | Opus 4.6, Sonnet 4.6 | low, medium, high, max | `max` | `max` |
 | Haiku 4.5, Opus 4.5, Sonnet 4.5 | no effort selector | not set | not set |
 
-With the setting off, five-level rows stop at `high`: Desktop does not offer `max`
-even though the relay accepts it, because a `max` cap would also expose `xhigh`.
-With it on, the script sets `max`; the relay serves `xhigh` as `high` and `max` as
-`max`. Haiku 4.5, Opus 4.5 and Sonnet 4.5 have no native effort. Claude Code's
+With the setting off, five-level rows stop at `high`: Desktop does not offer `max` even though the relay accepts it,
+because a `max` cap would also expose `xhigh`, and the script still assumes the relay refuses that level. It no longer
+does on Claude routes, so the cap is lower than it needs to be, not wrong. With the setting on, the script sets `max`;
+the relay serves `xhigh` as `high` (or `max`) and `max` as `max`. Haiku 4.5, Opus 4.5 and Sonnet 4.5 have no native effort. Claude Code's
 [effort table](https://code.claude.com/docs/en/model-config#adjust-effort-level)
 says "Models not listed here do not support effort" and Anthropic's Haiku 4.5
 page says "Default effort: Not supported". A readable catalog's effort levels

@@ -6,8 +6,10 @@ import time
 import uuid
 
 import apierr
+import journal
 import structured
 from credits import token_counter as _token_counter
+from native_history import loads_finite
 
 
 def approx_tokens(text: str) -> int:
@@ -125,6 +127,9 @@ class _Base:
         elif kind == "tool_call":
             self._attempt_observed = True
             self._feed_tool_call(event)
+        elif kind == "server_tool_result":
+            self._attempt_observed = True
+            self._server_result(event)
         elif kind == "credits":
             self._attempt_observed = True
             value = event.get('value')
@@ -225,6 +230,9 @@ class _Base:
             current = {"id": call_id, "name": name, "arguments": ""}
             if event.get("tool_type") == "custom" or name in self._custom_tools:
                 current["tool_type"] = "custom"
+            if event.get("server"):
+                # A tool the provider runs for the client (web_search): its own block type, never a call to answer.
+                current["server"] = str(event["server"])
             self.tool_calls.append(current)
         if arguments.startswith(current["arguments"]):
             delta = arguments[len(current["arguments"]):]
@@ -246,6 +254,9 @@ class _Base:
     def _streams_arguments(call):
         """Whether the adapter sends the text of this call's arguments to the client as it arrives."""
         return True
+
+    def _server_result(self, event):
+        pass
 
     def payload(self, reason, prompt_text=None):
         raise NotImplementedError
@@ -297,6 +308,12 @@ class ChatAdapter(_Base):
     def _tool_call(self, index, call, delta, new=False):
         if not self.writer:
             return
+        if call.get("tool_type") == "custom":
+            # The input is written inside the JSON envelope the model was offered the tool as, and is unwrapped only
+            # when that is whole (the Responses custom tool waits for it too): the call goes out whole, as soon as it is.
+            if call.get("done"):
+                self._send_custom(index, call)
+            return
         item = {"index": index}
         if new:
             item.update({"id": call["id"], "type": "function"})
@@ -305,9 +322,53 @@ class ChatAdapter(_Base):
             item["function"]["name"] = call["name"]
         self.writer.data(self._chunk({"tool_calls": [item]}))
 
+    @staticmethod
+    def _custom_text(call):
+        """The input of a call to a custom tool of Chat: the string inside the envelope {"input": ...} the model was
+        offered the tool as; None while that envelope is not whole."""
+        arguments = call["arguments"]
+        try:
+            value = json.loads(arguments)
+        except (ValueError, TypeError):
+            return None if re.match(r'^\s*\{\s*"input"\s*:', arguments) else arguments
+        return value["input"] if isinstance(value, dict) and isinstance(value.get("input"), str) else arguments
+
+    def _send_custom(self, index, call):
+        if call.get("sent"):
+            return call["arguments"]
+        value = self._custom_text(call)
+        if value is not None:
+            call["sent"] = True
+            self.writer.data(self._chunk({"tool_calls": [{"index": index, "id": call["id"], "type": "custom",
+                                                           "custom": {"name": call["name"], "input": value}}]}))
+        return value
+
+    def _wire_calls(self, reason):
+        """The calls of the reply as Chat writes them: a function call, or a custom one with its one input string.
+
+        A custom call whose input is cut off is dropped when the client left or the turn timed out, and an upstream
+        fault when upstream said the turn was complete: half a patch is never passed on."""
+        calls = []
+        for call in self.tool_calls:
+            if call.get("tool_type") != "custom":
+                calls.append({"id": call["id"], "type": "function",
+                              "function": {"name": call["name"], "arguments": call["arguments"]}})
+                continue
+            value = self._custom_text(call)
+            if value is None:
+                if reason not in ("cancelled", "timeout"):
+                    raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                continue
+            calls.append({"id": call["id"], "type": "custom", "custom": {"name": call["name"], "input": value}})
+        return calls
+
     def end(self, reason, prompt_text=None):
         finish = FINISH_MAP.get(reason, "stop")
         if self.writer:
+            for index, call in enumerate(self.tool_calls):
+                if call.get("tool_type") == "custom" and not call.get("sent"):
+                    if self._send_custom(index, call) is None and reason not in ("cancelled", "timeout"):
+                        raise apierr.upstream_error("Retool returned incomplete custom tool input")
             self.writer.data(self._chunk({}, finish))
             prompt, completion = self.usage(prompt_text)
             usage_dict = {
@@ -344,17 +405,14 @@ class ChatAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
+        calls = self._wire_calls(reason)
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
                 "choices": [{"index": 0, "message": {"role": "assistant",
-                                                     "content": self.text or (None if self.tool_calls else ""),
+                                                     "content": self.text or (None if calls else ""),
                                                      **({"reasoning_content": self.thinking} if (self.thinking and self.parsed.show_thinking) else {}),
-                                                     **({"tool_calls": [{"id": call["id"], "type": "function",
-                                                                          "function": {"name": call["name"],
-                                                                                       "arguments": call["arguments"]}}
-                                                                        for call in self.tool_calls]}
-                                                        if self.tool_calls else {})},
-                             "finish_reason": FINISH_MAP.get(reason, "tool_calls" if self.tool_calls else "stop")}],
+                                                     **({"tool_calls": calls} if calls else {})},
+                             "finish_reason": FINISH_MAP.get(reason, "tool_calls" if calls else "stop")}],
                 "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
                           "total_tokens": prompt + completion,
                           "cached_tokens": self.cache_read or 0,
@@ -399,6 +457,8 @@ class ResponsesAdapter(_Base):
         self._frozen = {}
         self._bases = {}
         self._text_end = self._thinking_end = 0
+        # Whether the reply ended because the client left or the turn timed out (f3, G2.1).
+        self._cut_off = False
         self._tool_definitions = {
             tool.get("function", {}).get("name"): tool.get("function", {})
             for tool in getattr(parsed, "tools", [])
@@ -533,10 +593,13 @@ class ResponsesAdapter(_Base):
         if kind == "custom_tool_call":
             value = "" if started else self._custom_input(call)
             if value is None:
-                if not self._cut:
+                if not (self._cut or self._cut_off):
                     raise apierr.upstream_error("Retool returned incomplete custom tool input")
-                # The output stopped inside the envelope: nothing of the input is final, so it is what was sent.
-                value = self._custom_inputs.get(call["id"], "")
+                # The output stopped inside the envelope, or the client left or the turn timed out before it was
+                # whole: nothing of the input is final, so it is what was sent (nothing, while the envelope could
+                # still change), and the call is incomplete. No upstream fault caused it, and no fragment of a
+                # patch is passed on as its input.
+                value, item["status"] = self._custom_inputs.get(call["id"], ""), "incomplete"
             item["input"] = value
         else:
             item["arguments"] = "" if started else call["arguments"]
@@ -650,6 +713,7 @@ class ResponsesAdapter(_Base):
         self._closed[index] = status
 
     def end(self, reason, prompt_text=None):
+        self._cut_off = reason in ("cancelled", "timeout")
         if not self._items:
             self._ensure_item("message", self.item_id)
         cut = self._cut = reason in CUT_REASONS
@@ -661,6 +725,7 @@ class ResponsesAdapter(_Base):
         return final
 
     def payload(self, reason, prompt_text=None):
+        self._cut_off = reason in ("cancelled", "timeout")
         prompt, completion = self.usage(prompt_text)
         reasoning_details = self._reasoning_details()
         if not self._items:
@@ -701,10 +766,41 @@ class AnthropicAdapter(_Base):
         self._blocks = []
         self._open_indices = set()
         self._tool_indices = {}
+        self._deferred = []
+        # Searches the relay ran for the client (web_search_tool_result blocks that hold results): usage.server_tool_use.
+        self.web_searches = 0
 
     def _emit(self, name, payload):
         if self.writer:
             self.writer.event(name, payload)
+
+    def _open_tools(self):
+        return [index for index in self._tool_indices.values() if index in self._open_indices]
+
+    def _wait(self, method, *args):
+        """True when this event has to wait for the tool calls that are still being written.
+
+        Text or thinking that arrives inside an open call used to close its block, and the rest of its arguments had
+        nowhere to go: the protocol has no re-open, and a delta for a stopped block is dropped, so the client got a
+        tool_use that ended in the middle (ultracode audit of the relay, C22). What waits is the interleaved text: it
+        goes out as the next block, in the order it came, once the open calls have stopped. A reply that is not
+        streamed has no stops to respect and is built as the events come."""
+        if self.writer is None or not self._open_tools():
+            return False
+        self._deferred.append((method, args))
+        return True
+
+    def _release(self):
+        held, self._deferred = self._deferred, []
+        for method, args in held:
+            method(*args)
+
+    def _settle_tools(self):
+        """Stop the tool blocks still open, then let out what waited for them."""
+        for index in sorted(self._open_tools()):
+            self._emit("content_block_stop", {"type": "content_block_stop", "index": index})
+            self._open_indices.discard(index)
+        self._release()
 
     def begin(self):
         self._emit("message_start", {"type": "message_start", "message": {
@@ -739,9 +835,13 @@ class AnthropicAdapter(_Base):
     def _think_start(self):
         # An open thinking block lets the client show "thinking" while the
         # provider reasons silently; the later signature attaches to it.
+        if self._wait(self._think_start):
+            return
         self._open("thinking")
 
     def _think(self, delta):
+        if self._wait(self._think, delta):
+            return
         block = self._open("thinking")
         block["thinking"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
@@ -754,12 +854,16 @@ class AnthropicAdapter(_Base):
             self._close_blocks()
 
     def _signature(self, signature):
+        if self._wait(self._signature, signature):
+            return
         if signature and self.open_kind == "thinking":
             self._blocks[self.index]["signature"] += signature
             self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                                "delta": {"type": "signature_delta", "signature": signature}})
 
     def _text(self, delta):
+        if self._wait(self._text, delta):
+            return
         block = self._open("text")
         block["text"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
@@ -771,15 +875,16 @@ class AnthropicAdapter(_Base):
                 self._close_blocks()
             self.open_kind = "tool"
             self.index = len(self._blocks)
-            self._blocks.append({"type": "tool_use", "id": call["id"], "name": call["name"], "input": {}})
+            kind = "server_tool_use" if call.get("server") else "tool_use"
+            self._blocks.append({"type": kind, "id": call["id"], "name": call["name"], "input": {}})
             self._tool_indices[call["id"]] = self.index
             self._open_indices.add(self.index)
             self._emit("content_block_start", {"type": "content_block_start", "index": self.index,
-                                               "content_block": {"type": "tool_use", "id": call["id"],
+                                               "content_block": {"type": kind, "id": call["id"],
                                                                  "name": call["name"], "input": {}}})
         block_index = self._tool_indices[call["id"]]
         try:
-            self._blocks[block_index]["input"] = json.loads(call["arguments"] or "{}")
+            self._blocks[block_index]["input"] = loads_finite(call["arguments"] or "{}")
         except ValueError:
             pass  # streamed JSON fragments are finalized by a subsequent delta
         if delta and block_index in self._open_indices:
@@ -790,22 +895,40 @@ class AnthropicAdapter(_Base):
             # to the end of the message, every call of a parallel batch waited for the last one to be written.
             self._emit("content_block_stop", {"type": "content_block_stop", "index": block_index})
             self._open_indices.discard(block_index)
+            if not self._open_tools():
+                self._release()
+
+    def _server_result(self, event):
+        """The result of a server tool the relay ran: one block, delivered whole (Anthropic streams it in its start event)."""
+        self._close_blocks()
+        content = event.get("content")
+        block = {"type": "web_search_tool_result", "tool_use_id": str(event.get("tool_use_id")), "content": content}
+        self.index = len(self._blocks)
+        self._blocks.append(block)
+        self._emit("content_block_start", {"type": "content_block_start", "index": self.index, "content_block": block})
+        self._emit("content_block_stop", {"type": "content_block_stop", "index": self.index})
+        if isinstance(content, list):
+            self.web_searches += 1  # a search that failed is not billed, nor counted
 
     def _stop_reason(self, reason):
         if reason in CUT_REASONS:
             return "max_tokens"
         if self.stop_sequence is not None:
             return "stop_sequence"
-        if reason == "tool_calls" or self.tool_calls:
+        if reason == "tool_calls" or any(not call.get("server") for call in self.tool_calls):
             return "tool_use"
         return "end_turn"
+
+    def _usage_extras(self):
+        return {"server_tool_use": {"web_search_requests": self.web_searches}} if self.web_searches else {}
 
     def end(self, reason, prompt_text=None):
         raw_prompt, completion = self.usage(prompt_text)
         non_cached = self.input_tokens if self.input_tokens is not None else max(0, raw_prompt - (self.cache_read or 0) - (self.cache_write or 0))
         usage = {"input_tokens": non_cached, "output_tokens": completion,
                  "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_write,
-                 **self._price_usage()}
+                 **self._usage_extras(), **self._price_usage()}
+        self._settle_tools()
         if not self._blocks:
             self._open("text")
         self._close_blocks()
@@ -827,7 +950,7 @@ class AnthropicAdapter(_Base):
                 "usage": {"input_tokens": non_cached, "output_tokens": completion,
                           "cache_read_input_tokens": self.cache_read,
                           "cache_creation_input_tokens": self.cache_write,
-                          **self._price_usage(), "estimated": True}}
+                          **self._usage_extras(), **self._price_usage(), "estimated": True}}
 
 
 _THINKING_EVENTS = ('thinking', 'thinking_start', 'thinking_status', 'thinking_signature')
@@ -874,6 +997,8 @@ class StructuredOutputAdapter:
             self.parts.append(event['delta'])
         elif kind == 'tool_call' and self.tools:
             self._release()
+            self.adapter.feed(event)
+        elif kind == 'server_tool_result' and self.tools:
             self.adapter.feed(event)
         elif kind in ('tool_call', 'tool_call_delta', 'tool_start', 'hitl', 'exec_start', 'exec_result'):
             raise apierr.invalid_structured_output('structured output unexpectedly requested an action')
@@ -982,9 +1107,144 @@ class StopSequenceAdapter:
             self._flush(final=True)
             return reason
         # The reply ended at the sequence: whatever ended the upstream turn after it is not the client's affair.
-        return 'cancelled' if reason == 'cancelled' else 'stop'
+        if reason == 'cancelled':
+            return reason
+        # A call made before the sequence is still to be run: Chat says so with its finish_reason (a client that
+        # decides by it took the turn for final), Messages keeps stop_sequence and the tool_use block in the content.
+        return 'tool_calls' if self._base().tool_calls else 'stop'
 
     def end(self, reason, prompt_text=None):
+        return self.adapter.end(self._reason(reason), prompt_text)
+
+    def payload(self, reason, prompt_text=None):
+        return self.adapter.payload(self._reason(reason), prompt_text)
+
+
+def output_tokens(ascii_chars, other_chars):
+    """What that much output counts against a cap: Claude's tokenizer takes about 3.5 characters of ASCII per token and
+    about 2 of any other (Cyrillic, CJK, symbols). An estimate, like every count the relay makes when upstream is silent."""
+    return math.ceil(ascii_chars / 3.5 + other_chars / 2)
+
+
+class OutputCapAdapter:
+    """End the reply at the client's output cap, as the provider would: Retool's Claude route takes the cap and ignores it.
+
+    The cap counts what the client gets: text, and a tool call by its name and arguments. Thinking is left out: the route
+    hides most of it, and a cap that paid for it would turn a small cap into an empty reply. Text is cut where the cap is
+    reached. A tool call is delivered whole or not at all: its events wait until upstream ends the call, and one that does
+    not fit is dropped with everything after it, so the client never meets half of a call. The reply then ends as the
+    provider ends one that reached its cap: stop_reason max_tokens, finish_reason length, status incomplete. The upstream
+    generation runs on, as with a stop sequence: what the model writes past the cap is paid for and dropped, and its usage
+    and cost still arrive.
+    """
+    _ACCOUNTING = ('usage_start', 'usage', 'credits')
+
+    def __init__(self, adapter, cap):
+        self.adapter = adapter
+        self.cap = cap
+        self.ascii = self.other = 0  # the characters delivered so far, by how many tokens they cost
+        self.calls = {}  # the calls upstream has not ended yet, by id: their latest event
+        self.capped = False
+        self.dropped = 0
+        self.delivered = set()  # the ids of the server tool calls that reached the client: only their results follow
+
+    def __getattr__(self, name):
+        if name == 'adapter':
+            raise AttributeError(name)
+        return getattr(self.adapter, name)
+
+    def begin(self):
+        self.adapter.begin()
+
+    def fail(self, error, extra=None):
+        self.adapter.fail(error, extra)
+
+    @staticmethod
+    def _count(text):
+        ascii_chars = sum(1 for char in text if char < '\x80')
+        return ascii_chars, len(text) - ascii_chars
+
+    def _fit(self, text):
+        """How many leading characters of `text` still fit; they are counted as delivered."""
+        ascii_chars, other = self.ascii, self.other
+        for index, char in enumerate(text):
+            more = (ascii_chars + 1, other) if char < '\x80' else (ascii_chars, other + 1)
+            if output_tokens(*more) > self.cap:
+                self.ascii, self.other = ascii_chars, other
+                return index
+            ascii_chars, other = more
+        self.ascii, self.other = ascii_chars, other
+        return len(text)
+
+    def _text(self, event):
+        delta = event.get('delta') or ''
+        keep = self._fit(delta)
+        if keep:
+            self.adapter.feed(event if keep == len(delta) else {**event, 'delta': delta[:keep]})
+        if keep < len(delta):
+            self.capped = True
+
+    def _call(self, event):
+        key = str(event.get('id') or event.get('name') or 'call')
+        self.calls[key] = event
+        if not event.get('done', True):
+            return  # upstream is still writing its arguments: the client gets the call once it is whole, or not at all
+        self._admit(self.calls.pop(key))
+
+    def _admit(self, event):
+        arguments = event.get('arguments', '')
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False, separators=(',', ':'))
+        name_ascii, name_other = self._count(str(event.get('name') or ''))
+        args_ascii, args_other = self._count(arguments)
+        ascii_chars, other = self.ascii + name_ascii + args_ascii, self.other + name_other + args_other
+        if output_tokens(ascii_chars, other) > self.cap:
+            self.capped = True
+            self.dropped += 1
+            return
+        self.ascii, self.other = ascii_chars, other
+        if event.get('server'):
+            self.delivered.add(str(event.get('id')))
+        self.adapter.feed(event)
+
+    def _release_open_calls(self):
+        """A call the stream ended inside was cut by upstream, not by the cap: it goes on as it stands and the adapter below
+        tells it as cut, like any other. It is still held to the cap, and a server tool call is never half-delivered."""
+        for event in list(self.calls.values()):
+            if self.capped or event.get('server'):
+                self.dropped += 1
+            else:
+                self._admit(event)
+        self.calls.clear()
+
+    def feed(self, event):
+        kind = event.get('type')
+        if kind in self._ACCOUNTING:
+            self.adapter.feed(event)
+        elif kind == 'server_tool_result':
+            if str(event.get('tool_use_id')) in self.delivered:
+                self.adapter.feed(event)
+        elif self.capped:
+            return
+        elif kind == 'text':
+            self._text(event)
+        elif kind == 'tool_call':
+            self._call(event)
+        else:
+            self.adapter.feed(event)
+
+    def _reason(self, reason):
+        return 'length' if self.capped and reason in ('stop', 'tool_calls') else reason
+
+    def end(self, reason, prompt_text=None):
+        if reason != 'cancelled':
+            self._release_open_calls()
+        if self.capped:
+            journal.emit('reply.cut_at_cap', 'Ответ обрезан по max_tokens=%d: клиент получил около %d токенов%s' % (
+                self.cap, output_tokens(self.ascii, self.other),
+                ', вызовов инструментов отброшено: %d' % self.dropped if self.dropped else ''),
+                'info', cap=self.cap, delivered_tokens=output_tokens(self.ascii, self.other),
+                dropped_calls=self.dropped)
         return self.adapter.end(self._reason(reason), prompt_text)
 
     def payload(self, reason, prompt_text=None):
@@ -1006,6 +1266,10 @@ def for_dialect(dialect, parsed, writer=None):
     if stops:
         # Outside the structured check: the reply is cut at its stop sequence first, and what is left is validated.
         adapter = StopSequenceAdapter(adapter, stops)
+    cap = getattr(parsed, 'output_cap', None)
+    if cap:
+        # Outermost: the cap counts what the model wrote, and a stop sequence that came first still ends the reply.
+        adapter = OutputCapAdapter(adapter, cap)
     return adapter
 
 def error_payload(dialect, err):

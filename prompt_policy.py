@@ -189,6 +189,8 @@ _HEADING = re.compile(r"#{1,6}[ \t]+\S.*")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _HEX8 = re.compile(r"[0-9a-f]{8}")
 _BOOL_CONDITIONS = ("tools", "structured", "has_client_system")
+# A rule with one of these conditions cannot take the tool rules of a client's system prompt away (see _warn_dropped_client_system).
+_LOSES_NO_TOOL_RULES = (("has_client_system", True, False), ("tools", True, False))
 
 
 class PromptConfigError(ValueError):
@@ -1823,6 +1825,7 @@ class _Compiler:
         self._compile_default_profile()
         self._compile_protected()
         self._compile_rules()
+        self._warn_dropped_client_system()
         self._compile_codex()
         data.patterns = self.patterns
         data.files = tuple(self.files)
@@ -2218,6 +2221,33 @@ class _Compiler:
             found.append((key, False, tuple(_glob_regex(pattern) for pattern in patterns)))
         return tuple(found)
 
+    def _warn_dropped_client_system(self):
+        """A warning for each profile that a rule or the default gives requests without the client's system prompt in it.
+
+        Claude Code, Codex, OpenCode and DeepSeek Harness keep the rules for their own tools, edits and permissions in that
+        prompt, so a head without {{client_system}} takes them from every request the rule matches. A user's profile did
+        that to Harness on 2026-11-06 (its 2.7k characters swapped for a 39k persona, +85% credits in short sessions) and
+        nothing said so. A rule for requests that have no system prompt of their own (has_client_system: false) loses
+        nothing, and one that only matches requests without tools (tools: false) takes no tool rules away: both are left
+        out. The names are the operator's own; no text is quoted."""
+        data = self.data
+        served = {}
+        for rule in (*data.override_rules, *data.user_rules):
+            if rule.use in data.profiles and not any(found in rule.conditions for found in _LOSES_NO_TOOL_RULES):
+                served.setdefault(rule.use, []).append("rule %r" % _clip(rule.name, 40))
+        if data.default_profile is not None:
+            served.setdefault(data.default_profile, []).append("the default profile")
+        for name, users in served.items():
+            if {"client_system", "client_system_raw"} & set(data.profiles[name].template.variables):
+                continue
+            self.warnings.append(
+                "profiles.%s: the head does not use {{client_system}}, so %s%s hand%s the model a prompt without the "
+                "client's own: the rules of Claude Code, Codex, OpenCode and DeepSeek Harness for their tools, edits and "
+                "permissions are dropped. Put {{client_system}} in the head (after the profile's text, for example) or "
+                "narrow the rule (tools: false, client: ...)"
+                % (name, ", ".join(users[:3]), " and %d more" % (len(users) - 3) if len(users) > 3 else "",
+                   "s" if len(users) == 1 else ""))
+
     def _compile_codex(self):
         data = self.data
         raw = self.document.get("codex")
@@ -2292,6 +2322,20 @@ class Plan:
         """
         head, parts, warnings, _report = _compose(self, client_system, sources)
         return head, parts, warnings
+
+
+def dropped_client_system(plan, client_system):
+    """How many characters of the client's system prompt the head of this plan leaves out; 0 when it keeps it or there is none.
+
+    The same test as the warning _compose makes, for the runtime to say so once, loudly, for a request that carries tools."""
+    snapshot = getattr(plan, "snapshot", None)
+    profiles = getattr(getattr(snapshot, "_data", None), "profiles", None) or {}
+    profile = profiles.get(plan.profile) if plan.profile is not None else None
+    variables = getattr(getattr(profile, "template", None), "variables", None)
+    text = str(client_system or "")
+    if variables is None or not text.strip() or {"client_system", "client_system_raw"} & set(variables):
+        return 0
+    return len(text)
 
 
 def _compose(plan, client_system, sources):

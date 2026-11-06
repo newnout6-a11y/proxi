@@ -459,7 +459,9 @@ def _blocks(items):
 
 def _reply_block(block):
     """A block of an assistant turn the way ReplyCapture records it: typed, with the fields the transport reads."""
-    shape = _REPLY_BLOCKS.get(block.get("type"))
+    block_type = block.get("type")
+    # A type that is no string (a list, an object) is no key to look up: it raised TypeError out of decode().
+    shape = _REPLY_BLOCKS.get(block_type) if isinstance(block_type, str) else None
     return shape is not None and all(
         isinstance(block.get(field), kind) and (block[field] or field not in _NOT_EMPTY)
         for field, kind in shape.items())

@@ -24,13 +24,18 @@ import client_context
 import console_log
 from redact import redact
 import config as config_module
+import conversation_infer
 import conversation_state
+import forced_choice
 import generation
 import models as model_catalog
 import sse
 import models
 import prompt_body
 import prompt_policy
+import prompt_stabilizer
+import tool_search_policy
+import tool_union
 import validate
 from accounts import UNNAMED, AccountDispatcher, account_tag
 from credits import CreditsManager
@@ -122,6 +127,12 @@ class Runtime:
         self.runner.accounts = self.accounts
         self.prompts = prompt_policy.PromptStore(cfg)
         self.runner.prompts = self.prompts
+        # Requests that carry no conversation identity find theirs by their history (conversation_infer).
+        self.conversations = conversation_infer.ConversationIndex()
+        # The tools a client declared before, for a client that declares them late (tool_union).
+        self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL))
+        # Conversations Claude Code's tool search was refused for (tool_search_policy).
+        self.tool_search_guard = tool_search_policy.LoopGuard()
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
         self.journal = journal.JOURNAL
@@ -129,6 +140,10 @@ class Runtime:
         self.admin = admin_module.Admin(self)
         # After the journal is configured: scanning the stored conversations reports what it removed.
         self.pool.attach_store(conversation_state.open_store(cfg))
+        # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
+        folder = cfg.get("conversation_state_dir") if cfg.get("conversation_state", True) else None
+        self.stabilizer = prompt_stabilizer.Stabilizer(
+            cfg, os.path.join(os.fspath(folder), prompt_stabilizer.FILE_NAME) if folder and os.path.isdir(folder) else None)
 
     def submit(self, coroutine):
         with self._lifecycle_lock:
@@ -260,7 +275,7 @@ def make_handler(runtime: Runtime):
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
             self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after, "
                              "x-proxi-ignored-parameters, x-proxi-system-messages, "
-                             "x-proxi-thinking-display, x-proxi-output-format")
+                             "x-proxi-thinking-display, x-proxi-output-format, x-proxi-tool-choice")
 
         def _json(self, status, payload, extra=None):
             self._status = status
@@ -443,7 +458,7 @@ def make_handler(runtime: Runtime):
             except apierr.ApiError as err:
                 self._error_code = err.code
                 self._log_error(err)
-                if err.status >= 400:
+                if err.status >= 400 and not getattr(err, "expected", False):
                     console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
                 if getattr(self, "_streaming", False):
                     self._stream_failure(dialect, err)
@@ -487,7 +502,8 @@ def make_handler(runtime: Runtime):
             self._writer.done()
 
         def _log_error(self, err):
-            journal.emit("http.error", err.message, "error" if err.status >= 500 else "warn",
+            journal.emit("http.error", err.message, "debug" if getattr(err, "expected", False)
+                         else "error" if err.status >= 500 else "warn",
                          status=err.status, code=err.code, param=err.param, model=self._model,
                          effort=self._effort_str or None,
                          stage=getattr(err, "stage", "upstream" if hasattr(err, "upstream_status") else "relay"),
@@ -679,6 +695,7 @@ def make_handler(runtime: Runtime):
                 self._client_trace.event("client_request", method=self.command, path=self.path, dialect=dialect)
             data = validate.load_json(raw)
             self._bind_client(data)
+            self._refuse_tool_search(data, dialect)
             fetches = validate.ImageFetches()
             with fetches:
                 if dialect == "anthropic":
@@ -689,6 +706,7 @@ def make_handler(runtime: Runtime):
                     parsed = validate.parse_chat(data, cfg)
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
                 data, self.headers, client_context.current())
+            self._infer_conversation(parsed)
             parsed.request_id = self.request_id
             # The size of the request as the client sent it, for count_tokens to scale from the real usage of this
             # request (a profile may rewrite the body, which the next count_tokens of the client does not see).
@@ -696,6 +714,16 @@ def make_handler(runtime: Runtime):
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
+            substituted = model_catalog.substitute_for(parsed.requested_model)
+            if substituted != parsed.model:
+                substituted = None
+            if substituted:
+                # The client named a model no account serves (Codex's memory jobs ask for gpt-6-luna): the nearest served
+                # one answers, and the journal and the response headers say which.
+                journal.emit("request.model_substituted",
+                             "Модель %s не обслуживается маршрутом Retool: запрос выполняет %s" % (
+                                 parsed.requested_model, substituted), "info",
+                             request_id=self.request_id, requested=parsed.requested_model, served=substituted)
             parsed.request_purpose = client_context.request_kind(parsed)
             # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
             # identity, so that every event of the request, the transport's included, says what it is.
@@ -711,16 +739,23 @@ def make_handler(runtime: Runtime):
                 raise refusal
             parsed = self._apply_prompts(data, parsed, dialect, len(raw), fetches)
             parsed.client_chars = client_chars
+            self._stabilize_prompt(parsed)
+            self._carry_tools(parsed)
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
-            effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
+            effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"),
+                                                       cfg.get("claude_xhigh_effort", "high"))
             self._effort_str = effective_effort or (
                 "provider" if parsed.entry.get("reasoning") and
                 parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
 
             compatibility_headers = {}
+            if substituted:
+                compatibility_headers['x-proxi-model-substituted'] = '%s=%s' % (parsed.requested_model, substituted)
             if parsed.structured_output:
                 compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
+            if forced_choice.requirement(parsed.model, parsed.tools, parsed.tool_choice) is not None:
+                compatibility_headers['x-proxi-tool-choice'] = 'emulated'
             if 'thinking.display' in parsed.declared_ignored:
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:
@@ -787,6 +822,99 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _refuse_tool_search(self, data, dialect):
+            """Turn down Claude Code's tool search so that it loads every tool up front (see tool_search_policy).
+
+            Every tool a ToolSearch loads changes the tool list, which the relay puts first in the cached prompt, so each
+            load rewrote the whole conversation (33.8 credits at 336k tokens). A 400 makes Claude Code 2.1.305 and later send
+            the request again with all tools loaded and no deferral; that costs two rejected requests per conversation and
+            nothing upstream. Only a recognised Claude Code of a version that does this is refused, and a conversation that
+            goes on sending tool search after it has been refused LOOP_LIMIT times is served as it asks."""
+            if dialect != "anthropic" or cfg.get("claude_tool_search", "eager") != "eager":
+                return
+            identity = client_context.current()
+            if identity.get("client") not in ("claude-code", "claude-desktop"):
+                return
+            version = tool_search_policy.client_version(self.headers.get("user-agent"))
+            where = tool_search_policy.deferral(data) if version and version >= tool_search_policy.MIN_VERSION else None
+            if where is None:
+                return
+            conversation = (identity.get("client_session_id") or "", identity.get("agent") or "")
+            if not runtime.tool_search_guard.allow(conversation):
+                journal.emit("tool_search.refusal_loop",
+                             "Claude Code продолжает слать tool search после отказов: запрос обслужен как есть", "warn",
+                             request_id=self.request_id, version=".".join(map(str, version)))
+                return
+            journal.emit("tool_search.refused",
+                         "Tool search Claude Code отклонён: клиент пришлёт тот же запрос со всеми инструментами сразу", "info",
+                         request_id=self.request_id, version=".".join(map(str, version)), where=where)
+            error = apierr.bad_request(tool_search_policy.message(where))
+            error.expected = True
+            raise error
+
+        def _carry_tools(self, parsed):
+            """Give a client of the listed families the union of the tools it has declared before and this request's.
+
+            Codex starts its MCP servers after its first request, so request 1 carries 44-46 tools and request 2 50-60, and
+            every such change rewrites the cached prefix (31 credits at 334k tokens). See tool_union."""
+            union = getattr(runtime, "tool_union", None)
+            families = cfg.get("tool_union_clients") or ()
+            if union is None or not families or not parsed.tools:
+                return
+            family = prompt_policy.prompt_client(client_context.current(), self.headers)
+            if family not in families:
+                return
+            key = tool_union.client_key(family, self.headers, parsed)
+            if key is None:
+                return
+            merged, carried = union.apply(key, parsed.tools)
+            if union.announce(key, carried) and carried:
+                journal.emit("tools.carried",
+                             "Клиент объявил %d инструментов, ещё %d взяты из его прежних запросов: список для модели не меняется"
+                             % (len(parsed.tools), len(carried)), "info", request_id=self.request_id,
+                             declared=len(parsed.tools), carried=len(carried), names=sorted(carried)[:12],
+                             client=family)
+            if carried:
+                parsed.tools = merged
+                parsed.carried_tools = frozenset(carried)
+
+        def _stabilize_prompt(self, parsed):
+            """The client's system prompt with the parts that change between requests held as the conversation has them.
+
+            Last, on the request the turn runs on: a profile that rewrites the body parses it again, and the head the model
+            gets is built from this text. See prompt_stabilizer."""
+            stabilizer = getattr(runtime, "stabilizer", None)
+            if stabilizer is None or not parsed.system:
+                return
+            try:
+                system, done = stabilizer.apply(parsed.system, parsed.conversation_key)
+            except Exception as exc:  # noqa: BLE001 - a prompt left as the client wrote it is what it was before
+                journal.emit("prompt.runtime_error", "Стабилизация system клиента не выполнена: %s" % type(exc).__name__,
+                             "error", request_id=self.request_id, stage="stabilize")
+                return
+            if done:
+                parsed.system = system
+                journal.emit("prompt.stabilized", "System клиента приведён к прежнему виду диалога: %s" % ", ".join(done),
+                             "debug", request_id=self.request_id, done=done)
+
+        def _infer_conversation(self, parsed):
+            """A request with tools and no identity of its own takes the key of the conversation its history extends.
+
+            Such a client (DeepSeek Harness sends no session header) used to get a throwaway session per request, and its
+            native history never continued. See conversation_infer for what makes a match exact."""
+            index = getattr(runtime, "conversations", None)
+            digests = getattr(parsed, "message_fingerprints", None)
+            if parsed.conversation_key is not None or index is None or not cfg.get("infer_conversations", True):
+                return
+            if not parsed.tools or not digests:
+                return
+            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests)
+            if how == "new":
+                journal.emit("conversation.inferred",
+                             "Запрос без идентификатора диалога: начат диалог по его истории (%d сообщений)" % len(digests),
+                             "debug", request_id=self.request_id, messages=len(digests),
+                             conversation=journal.tag(parsed.conversation_key))
 
         def _apply_prompts(self, data, parsed, dialect, size, fetches=None):
             """The prompt hooks of a completion (plan section 3): the plan, a second parse of an edited body, the generation.
@@ -861,7 +989,8 @@ def make_handler(runtime: Runtime):
                 try:
                     _, resolved = models.resolve_tolerant(
                         parsed.model, effort, strict=cfg["strict_models"], default_model=cfg.get("model"),
-                        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+                        allow_downgrade=cfg.get("allow_effort_downgrade", False),
+                        xhigh_as=cfg.get("claude_xhigh_effort", "high"))
                 except apierr.ApiError as error:
                     raise apierr.bad_request("profile '%s' sets generation.effort to '%s': %s" % (
                         plan.profile, effort, error.message), param=where + "effort")

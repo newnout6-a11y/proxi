@@ -3,9 +3,11 @@ import base64
 import copy
 from dataclasses import dataclass
 import json
+import math
 import urllib.parse
 import weakref
 
+import web_search
 INSTRUCTION_ROLES = ("system", "developer")
 INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
 _TEXT_BLOCKS = ("text", "input_text", "output_text", "summary_text")
@@ -201,31 +203,54 @@ def client_messages(messages, image_converter, *, lead=None):
                 continue
             if role == "assistant":
                 text, calls = [], []
+
+                def flush():
+                    """The assistant message so far (its text, then its calls), merged into the one before it if any."""
+                    nonlocal text, calls
+                    blocks = ([{"type": "text", "text": "".join(text)}] if any(text) else []) + calls
+                    text, calls = [], []
+                    if not blocks:
+                        return
+                    if result and result[-1]["role"] == "assistant":
+                        result[-1]["content"].extend(blocks)
+                        result[-1] = canonical_assistant(result[-1]["content"])
+                    else:
+                        result.append({"role": "assistant", "content": blocks})
+
                 for block in ([{"type": "text", "text": value}] if isinstance(value, str) else value or []):
                     kind = block.get("type")
                     if kind in ("thinking", "redacted_thinking"):
                         continue
                     if kind in ("text", "output_text", "summary_text"):
                         text.append(block["text"])
-                    elif kind in ("tool_use", "tool_call"):
+                    elif kind in ("tool_use", "tool_call", "server_tool_use"):
                         calls.append(call(block.get("id") or block.get("tool_call_id"),
                                           block.get("name"), block.get("input", block.get("arguments", {}))))
+                    elif kind == "web_search_tool_result":
+                        # A search the relay ran for the client: its result sits inside the assistant message the client
+                        # echoes, and upstream saw it as the result of the call before the reply went on.
+                        flush()
+                        result.append(tool_result(block.get("tool_use_id"), web_search.render_block_content(
+                            block.get("content"))))
                     else:
                         raise ValueError("unsupported assistant block")
                 for item in message.get("tool_calls") or []:
+                    if isinstance(item.get("custom"), dict):
+                        # A call to a custom tool of Chat: its one string is the input the model was offered the tool as.
+                        calls.append(call(item.get("id"), item["custom"].get("name"),
+                                          {"input": item["custom"].get("input", "")}))
+                        continue
                     fn = item.get("function") or item
                     calls.append(call(item.get("id") or item.get("tool_call_id"), fn.get("name"),
                                       fn.get("arguments", "{}")))
-                blocks = ([{"type": "text", "text": "".join(text)}] if any(text) else []) + calls
-                if not blocks:
-                    continue
-                if result and result[-1]["role"] == "assistant":
-                    result[-1]["content"].extend(blocks)
-                    result[-1] = canonical_assistant(result[-1]["content"])
-                else:
-                    result.append({"role": "assistant", "content": blocks})
+                legacy = message.get("function_call")
+                if isinstance(legacy, dict) and legacy.get("name"):
+                    # The deprecated form of one call; its "function" message carries the name, not an id (see below).
+                    calls.append(call(legacy["name"], legacy["name"], legacy.get("arguments", "{}")))
+                flush()
             elif role in ("tool", "function"):
-                result.append(tool_result(message.get("tool_call_id") or message.get("call_id"), value,
+                result.append(tool_result(message.get("tool_call_id") or message.get("call_id")
+                                          or (message.get("name") if role == "function" else None), value,
                                           message.get("is_error", False)))
             elif role == "user":
                 pending = []
@@ -287,6 +312,25 @@ def unsigned_tool_transcript(client):
             elif role != 'user':
                 return None
     return copy.deepcopy(client) if has_results and not pending else None
+
+
+def _finite_float(text):
+    value = float(text)
+    return value if math.isfinite(value) else None
+
+
+def _no_constant(name):
+    return None
+
+
+def loads_finite(text):
+    """json.loads for the arguments of a tool call, with a number past the range of a double (1e400) read as null.
+
+    Python reads 1e400 as inf and writes it back as Infinity, which is no JSON: the next request upstream carried it
+    and was refused, and so was the Messages reply that held it (ultracode audit of the relay, G3.2). A JavaScript
+    client reads it as Infinity and writes null when it echoes the call, so null is also what its echo is compared
+    with. NaN and Infinity written out as words are read as null as well."""
+    return json.loads(text, parse_float=_finite_float, parse_constant=_no_constant)
 
 
 class ReplyCapture:
@@ -364,7 +408,7 @@ class ReplyCapture:
                 # A call without arguments arrives as one empty partialInputs: the stream gives the client {} for it
                 # (coerce_arguments), so the kept reply must say {} too, or its next turn can never continue it.
                 if raw:
-                    call["toolInput"] = json.loads(raw)
+                    call["toolInput"] = loads_finite(raw)
                 if not isinstance(call["toolInput"], dict):
                     return None
             if any(b["type"] == "thinking" and not b["signature"] for b in self.blocks):
@@ -413,27 +457,39 @@ class Snapshot:
     restored: bool = False
 
 
+LIVE_BRANCHES = 8
+# The turns a user can take back and still continue: the newest final answers whose conversation went on.
+REWIND_POINTS = 3
+
+
 class History:
     """Bounded live branches; sequential tool turns replace their parent snapshot.
+
+    A final answer (a reply without a tool call) is kept when the next turn continues it, for REWIND_POINTS turns: it is
+    where a client's undo goes back to (OpenCode's /undo and Revert, Claude Code's /rewind and double Esc, Codex's
+    double Esc, Claude Desktop's edit and retry). The request after an undo is the conversation up to the end of an
+    earlier turn plus a new message; with the final answer of that turn gone, it was sent cold, every message written
+    to the cache again (30 credits at 300k tokens) though the provider still held the prefix it had cached minutes
+    before. Points give way to other branches when the live bound is reached.
 
     `revision` counts the recorded snapshots: the stored copy of a conversation is rewritten when it moves. `pruned`
     holds the branches that were recorded without a call the model made (deliverable): a shape upstream may refuse."""
     def __init__(self):
         self.branches = []
+        self.points = []
         self.revision = 0
         self.pruned = weakref.WeakSet()
 
     def resume(self, scope, client, defaults=None):
         for snapshot in reversed(self.branches):
-            offset = len(snapshot.client)
-            if (scope != snapshot.scope or len(client) <= offset + 1
-                    or client[:offset] != snapshot.client or not same_echo(client[offset], snapshot.echo, defaults)):
+            at = _echo_index(snapshot.client, client) if scope == snapshot.scope else None
+            if at is None or len(client) <= at + 1 or not same_echo(client[at], snapshot.echo, defaults):
                 continue
-            tail = client[offset + 1:]
+            tail = client[at + 1:]
             calls = [b["toolCallId"] for b in snapshot.assistant if b["type"] == "tool_call"]
             results = [m["content"]["toolCallId"] for m in tail[:len(calls)] if m["role"] == "tool"]
             if (len(results) != len(calls) or len(set(results)) != len(results) or set(results) != set(calls)
-                    or any(m["role"] != "user" for m in tail[len(calls):])):
+                    or not _complete_turns(tail[len(calls):], set(calls))):
                 continue
             return snapshot, snapshot.messages + [{"role": "assistant", "content": snapshot.assistant}] + tail
         return None, None
@@ -451,18 +507,30 @@ class History:
         signature is attached to anything it does not belong to. The caller records nothing for the fork."""
         for snapshot in reversed(self.branches):
             offset = len(snapshot.client)
-            if (scope == snapshot.scope and len(client) > offset and client[:offset] == snapshot.client
+            if (scope == snapshot.scope and len(client) > offset and same_json(client[:offset], snapshot.client)
                     and all(message.get("role") == "user" for message in client[offset:])):
                 return snapshot, snapshot.messages + client[offset:]
         return None, None
 
     def record(self, scope, client, messages, blocks, expected, parent=None, pruned=False):
-        self.branches = [s for s in self.branches if s is not parent]
+        points = [p for p in getattr(self, "points", []) if p is not parent and any(p is s for s in self.branches)]
+        if parent is not None and any(parent is s for s in self.branches) and _final_answer(parent):
+            points.append(parent)
+        else:
+            self.branches = [s for s in self.branches if s is not parent]
+        while len(points) > REWIND_POINTS:
+            oldest = points.pop(0)
+            self.branches = [s for s in self.branches if s is not oldest]
         snapshot = Snapshot(scope, copy.deepcopy(client), messages, blocks, expected)
         self.branches.append(snapshot)
         if pruned:
             self.pruned.add(snapshot)
-        self.branches = self.branches[-8:]
+        while len(self.branches) > LIVE_BRANCHES:
+            # Other branches (a fork, a subagent on the same key, the chat beside a compaction) outrank a rewind point.
+            victim = next((s for s in self.branches[:-1] if any(s is p for p in points)), self.branches[0])
+            self.branches = [s for s in self.branches if s is not victim]
+            points = [p for p in points if p is not victim]
+        self.points = points
         self.revision += 1
 
     def forget_pruned(self):
@@ -484,7 +552,7 @@ class History:
         if len(client) <= offset + 1:
             return "history:%d_of_%d_messages" % (len(client), offset + 2)
         for index, (ours, theirs) in enumerate(zip(client, snapshot.client)):
-            if ours != theirs:
+            if not same_json(ours, theirs):
                 return "message:%d:%s" % (index, ours.get("role"))
         if not same_echo(client[offset], snapshot.echo, defaults):
             return "echo:" + _echo_difference(client[offset], snapshot.echo)
@@ -492,6 +560,123 @@ class History:
 
 
 _MISSING = object()
+
+
+def _final_answer(snapshot):
+    """True for a kept reply that called no tool: the end of a turn, where a client's undo can go back to."""
+    return not any(isinstance(block, dict) and block.get("type") == "tool_call" for block in snapshot.assistant or ())
+
+
+def transient(message):
+    """True for a user message of nothing but <system-reminder> text: what a client adds to one request without keeping it."""
+    content = message.get("content") if isinstance(message, dict) and message.get("role") == "user" else None
+    if not isinstance(content, list) or not content:
+        return False
+    for block in content:
+        text = block.get("text") if isinstance(block, dict) and block.get("type") == "text" else None
+        if not isinstance(text, str) or not (text.strip().startswith(_REMINDER_OPEN)
+                                             and text.strip().endswith(_REMINDER_CLOSE)):
+            return False
+    return True
+
+
+def _echo_index(kept, client):
+    """Where the client's echo of a kept reply stands in its next request, or None when the request does not extend it.
+
+    The request extends the kept one when it holds all of its messages, with one exception: a reminder the client added
+    to the kept request only, in the user messages that close it. OpenCode's goal plugin adds "<system-reminder>A goal
+    is active for this session...</system-reminder>" to every request without keeping it (at the end, or just before a
+    trailing user message), so in the next request the reminder is gone and the reply stands where it was. Every step
+    of such a conversation went cold: 89 requests in a row on 2026-11-06 (9b839275847f, ffb84e3c975b, 0aff4f28a7eb),
+    cache reads stuck at the 11.5k tokens of the system prompt, up to 122k tokens written and 4 to 18 credits a step,
+    the first token after 60 to 180 s. The reminder stays in what upstream gets, where the model saw it when it made the
+    signed reply, so that reply is continued in its own context and the cached prefix is read as it was written."""
+    if same_json(client[:len(kept)], kept):
+        return len(kept)
+    start = len(kept)
+    while start and isinstance(kept[start - 1], dict) and kept[start - 1].get("role") == "user":
+        start -= 1
+    if not same_json(client[:start], kept[:start]):
+        return None
+    at = start
+    for message in kept[start:]:
+        if at < len(client) and same_json(client[at], message):
+            at += 1
+        elif not transient(message):
+            return None
+    return at
+
+
+def dropped(snapshot, client, messages):
+    """How many reminders of the kept request the client left out of this one (resume() keeps them upstream)."""
+    return len(snapshot.client) - (len(client) - (len(messages) - len(snapshot.messages) - 1) - 1)
+
+
+def _complete_turns(messages, seen):
+    """True when what follows a kept reply's tool results is whole turns in the client's own words.
+
+    A reply the relay could not keep (a stream cut by a network error, a reply the user stopped) stays in the client's
+    history as an assistant message of its own, usually with a tool call answered by an error, before the client's next
+    message. Before, any assistant message there sent the next request cold, and the whole cached conversation was
+    written again: 281k and 617k tokens (14 and 31 credits) after a few seconds without internet on 2026-11-06. Such
+    turns now follow the kept reply as they are, unsigned, the way a cold replay sends every turn: text and tool calls,
+    each call answered before the next turn, no call id used twice, and no call left open at the end."""
+    pending = set()
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            call_id = message["content"]["toolCallId"]
+            if call_id not in pending:
+                return False
+            pending.discard(call_id)
+            continue
+        if pending:
+            return False
+        if role == "assistant":
+            for block in message["content"]:
+                if block["type"] not in ("text", "tool_call"):
+                    return False
+                if block["type"] == "tool_call":
+                    if block["toolCallId"] in seen:
+                        return False
+                    seen.add(block["toolCallId"])
+                    pending.add(block["toolCallId"])
+        elif role != "user":
+            return False
+    return not pending and (not messages or messages[-1].get("role") != "assistant")
+
+
+def same_json(a, b):
+    """True when two parsed JSON values are the same values, as a JSON client holds them.
+
+    Python's == also says True == 1 and False == 0, so a history that held 1 where the model wrote true was taken for the
+    conversation the signed reply belongs to (bug summary of 2026-11-06, section 3, item 14). And Python keeps an integer
+    exact where a JavaScript client (Claude Code, the AI SDK) holds a double: the id 9007199254740993 the model wrote
+    comes back from it as 9007199254740992, which was taken for another reply, and the whole conversation was sent
+    again, uncached (ultracode audit of the relay, G3.1). Numbers are compared as doubles."""
+    try:
+        return _same_json(a, b)
+    except RecursionError:  # nested past what is worth comparing: not the same, and the turn goes the unsigned way
+        return False
+
+
+def _double(number):
+    try:
+        return float(number)
+    except OverflowError:  # an integer past the range of a double is infinity to JavaScript
+        return float("inf") if number > 0 else float("-inf")
+
+
+def _same_json(a, b):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return _double(a) == _double(b)
+    if isinstance(a, dict) and isinstance(b, dict):
+        return len(a) == len(b) and all(key in b and _same_json(value, b[key]) for key, value in a.items())
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(map(_same_json, a, b))
+    return a == b
 
 
 def tool_defaults(tools):
@@ -516,7 +701,7 @@ def same_echo(theirs, ours, defaults=None):
     false of Edit), so an argument that holds its schema default counts as absent on both sides. Before, such an echo
     failed the check and the next turn went cold, rewriting the whole cached conversation (Claude Desktop test run of
     2026-11-06: 233k tokens, 30.7 credits for one Edit)."""
-    if theirs == ours:
+    if same_json(theirs, ours):
         return True
     if not defaults or not isinstance(theirs, dict) or not isinstance(ours, dict):
         return False
@@ -527,11 +712,11 @@ def same_echo(theirs, ours, defaults=None):
             if isinstance(block, dict) and block.get("type") == "tool_call" and isinstance(block.get("toolInput"), dict):
                 known = defaults.get(block.get("toolName")) or {}
                 block = dict(block, toolInput={key: value for key, value in block["toolInput"].items()
-                                               if known.get(key, _MISSING) != value})
+                                               if not same_json(known.get(key, _MISSING), value)})
             blocks.append(block)
         return dict(message, content=blocks)
 
-    return without_defaults(theirs) == without_defaults(ours)
+    return same_json(without_defaults(theirs), without_defaults(ours))
 
 
 _SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")
@@ -557,7 +742,7 @@ def _echo_difference(ours, theirs):
         return "role"
     calls = [[b for b in m.get("content") or [] if b.get("type") == "tool_call"] for m in (ours, theirs)]
     for field, label in (("toolCallId", "call_ids"), ("toolName", "names"), ("toolInput", "arguments")):
-        if [b.get(field) for b in calls[0]] != [b.get(field) for b in calls[1]]:
+        if not same_json([b.get(field) for b in calls[0]], [b.get(field) for b in calls[1]]):
             return label
     return "text"
 

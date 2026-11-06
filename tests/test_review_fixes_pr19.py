@@ -22,7 +22,7 @@ import validate
 from scripts import replay_upstream
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
-from test_native_context_reuse import FIRST, request, run, setup
+from test_native_context_reuse import FIRST, native_choice_route, request, run, setup
 
 
 class Response(io.BytesIO):
@@ -324,7 +324,7 @@ def test_empty_retries_default_and_validation():
 def runner_env(tmp_path, monkeypatch):
     backend, pool, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[],
                                   base="https://example.invalid", cache_keepwarm_seconds=0,
-                                  upstream_error_dir=str(tmp_path))
+                                  upstream_error_dir=str(tmp_path), openai_provider_resource_name="__managed__")
     backend.headers = lambda: {}
     runner.credits = SimpleNamespace(record_turn=lambda key, cost: None)
     state = SimpleNamespace(runner=runner, script=[END], calls=[])
@@ -339,8 +339,7 @@ def runner_env(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("choice", ["required", {"type": "function", "function": {"name": "read_file"}}])
 def test_ignored_tool_choice_after_empty_answer_has_empty_turn_diagnostics(runner_env, tmp_path, choice):
-    parsed = request(FIRST)
-    parsed.tool_choice = choice
+    parsed = native_choice_route(request(FIRST), choice)
     error = asyncio.run(run(runner_env.runner, parsed))[-1]["error"]
     assert error.code == "upstream_empty_turn" and error.status == 502
     assert "required client tool choice" in error.message
@@ -350,8 +349,7 @@ def test_ignored_tool_choice_after_empty_answer_has_empty_turn_diagnostics(runne
 
 def test_ignored_tool_choice_after_plain_text_has_a_named_code_and_diagnostics(runner_env, tmp_path):
     runner_env.script = [[text("I will not call a tool."), *END]]
-    parsed = request(FIRST)
-    parsed.tool_choice = "required"
+    parsed = native_choice_route(request(FIRST), "required")
     error = asyncio.run(run(runner_env.runner, parsed))[-1]["error"]
     assert error.code == "upstream_tool_choice_ignored" and error.status == 502
     assert error.upstream_attempts == 1 and error.diagnostic_id
