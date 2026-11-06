@@ -82,15 +82,24 @@ def verify(headers, query_key, expected: str) -> None:
 def upstream_headers(cfg) -> dict:
     """Retool session headers. Cookie/xsrf stay the source of upstream auth."""
     cfg = dict(cfg)  # read cookie and xsrf from the same credential snapshot
+    ua = cfg.get("ua") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     return {
-        "accept": "application/json",
+        "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
         "origin": cfg["base"],
         "referer": cfg["base"] + "/",
-        "user-agent": cfg["ua"],
+        "user-agent": ua,
         "cookie": cfg["cookie"],
         "x-xsrf-token": cfg["xsrf"],
         "x-retool-client-version": CLIENT_VERSION,
+        "sec-ch-ua": cfg.get("sec_ch_ua") or '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "accept-language": "en-US,en;q=0.9",
+        "priority": "u=1, i",
     }
 
 
