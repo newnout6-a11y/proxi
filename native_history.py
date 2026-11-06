@@ -513,11 +513,14 @@ def _echo_difference(ours, theirs):
     return "text"
 
 
-def cache_messages(messages, enabled, tools):
-    """Move only cache hints; signed thinking and the model prefix stay unchanged."""
+def cache_messages(messages, enabled, tools, mark_tail=True):
+    """Move only cache hints; signed thinking and the model prefix stay unchanged.
+
+    mark_tail=False leaves the last message without the newest hint: a compaction's own instruction is read by nobody
+    (the client replaces its history by the summary), so writing it to the cache only costs the premium of a write."""
     messages = copy.deepcopy(messages)
-    eligible, previous = [], []
-    for message in messages:
+    eligible, previous, owner = [], [], []
+    for position, message in enumerate(messages):
         value = message.get("content")
         if not isinstance(value, list):
             continue
@@ -532,14 +535,23 @@ def cache_messages(messages, enabled, tools):
                 block.pop('cache', None)
                 continue
             eligible.append(block)
+            owner.append(position)
             if block.pop("cache", False):
                 previous.append(len(eligible) - 1)
     if enabled and eligible:
         budget = 3 if tools else 4
-        chosen = {len(eligible) - 1}
-        if previous:
+
+        def allowed(index):
+            return mark_tail or owner[index] != len(messages) - 1
+
+        newest = len(eligible) - 1
+        while newest >= 0 and not allowed(newest):
+            newest -= 1
+        chosen = {newest} if newest >= 0 else set()
+        if previous and allowed(previous[-1]):
             chosen.add(previous[-1])
-        chosen.add(0)
+        if allowed(0):
+            chosen.add(0)
         for index in sorted(chosen)[-budget:]:
             eligible[index]["cache"] = True
     return messages

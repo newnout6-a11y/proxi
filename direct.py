@@ -694,12 +694,16 @@ def _has_cacheable_text(chunk):
     return any(not isinstance(block, dict) or block.get("type") == "text" for block in blocks)
 
 
-def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
+def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None,
+               mark_tail=True):
     """Assemble the request body.
 
     The stable head becomes a cached system block and the history is sent as one
     message per chunk, preserving prior turn endpoints as cache breakpoints so
     intermediate multi-tool turns do not discard prefix caches.
+
+    mark_tail=False puts no hint on the last chunk: the request of a client's compaction ends in an instruction that
+    nobody reads again, and a hint there only makes the provider write it at the price of a write.
     """
     messages = []
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
@@ -749,6 +753,8 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             # An image-only tail cannot carry cache: selecting its index silently
             # lost the recent history breakpoint and re-billed the whole prefix.
             cacheable_indices = [i for i, part in enumerate(history) if _has_cacheable_text(part)]
+            if not mark_tail and cacheable_indices and cacheable_indices[-1] == len(history) - 1:
+                cacheable_indices.pop()
             cacheable = set(cacheable_indices)
             chosen = {cacheable_indices[-1]} if cacheable_indices else set()
             previous = [i for i in session_ends if i in cacheable]
@@ -1407,12 +1413,16 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     """Yield normalised relay events from the direct NDJSON stream."""
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
+    # The summary of a client's compaction is a side request: the client replaces its history by that summary and
+    # never continues this one (see where the branches are recorded below, and what keepwarm does after it).
+    side_request = client_context.current().get("client_task") == client_context.COMPACTION
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
     parent, messages = (conversation_state.resume(session, history, scope, client)
                         if history is not None and client is not None else (None, None))
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
-        body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools)
+        body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools,
+                                                         mark_tail=not side_request)
         body["rit"] = make_rit(body["messages"], tools)
         journal.emit("native_history.resume", "Сохранённые assistant/thinking blocks возвращены upstream", "info",
                      blocks=len(parent.assistant), messages=len(body["messages"]),
@@ -1430,7 +1440,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                          "warn", reason="prefix_or_settings_mismatch",
                          restored=any(getattr(branch, "restored", False) for branch in history.branches),
                          why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
-        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
+        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session,
+                          mark_tail=not side_request)
         cold = (native_history.unsigned_tool_transcript(client)
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
         if cold is not None:
@@ -1438,7 +1449,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             # account. Client-visible calls/results are still valid protocol.
             # Rebuild them without trusting any client-supplied thinking blocks.
             initial = body['messages'][:1] if head else []
-            body['messages'] = native_history.cache_messages(initial + cold, cfg.get('direct_cache', True), tools)
+            body['messages'] = native_history.cache_messages(initial + cold, cfg.get('direct_cache', True), tools,
+                                                             mark_tail=not side_request)
             body['rit'] = make_rit(body['messages'], tools)
             journal.emit('native_history.cold', 'История инструментов восстановлена без старых thinking-подписей',
                          'info', messages=len(cold), signatures=0)
@@ -1455,9 +1467,6 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     session._turn_seq = getattr(session, "_turn_seq", 0) + 1
     turn_seq = session._turn_seq
     session._last_request_at = time.time()
-    # The summary of a client's compaction is a side request: the client replaces its history by that summary and
-    # never continues this one (see where the branches are recorded below, and what keepwarm does after it).
-    side_request = identity.get("client_task") == client_context.COMPACTION
     rejected = False
     # A completed answer that asked for no tool is final: a subagent that gave one is done.
     asked_tool, ended = False, None
