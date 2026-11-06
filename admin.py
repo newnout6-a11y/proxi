@@ -38,7 +38,8 @@ BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
 # _client_instructions), so the next request already sends the new head. So is compaction_keep_effort, which
 # TurnRunner._run_once reads when a client's compaction begins.
 LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
-                 "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort"}
+                 "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort",
+                 "journal_max_file_bytes", "journal_keep_files"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 POOL_FIELDS = {"enabled", "priority", "label"}
@@ -206,6 +207,12 @@ def _schema():
          "Максимальный размер тела HTTP-запроса от клиента", "байт", 1, 1_073_741_824, None),
         ("max_frame_bytes", "integer", "Размер WebSocket frame", "limits",
          "Максимальный размер одного кадра WebSocket от Retool", "байт", 1, 1_073_741_824, None),
+        ("journal_max_file_bytes", "integer", "Размер файла журнала", "limits",
+         "На каком размере журнал начинает новый файл; на диске лежит не больше (число прежних файлов + 1) таких файлов",
+         "байт", 1_048_576, 1_073_741_824, None),
+        ("journal_keep_files", "integer", "Прежние файлы журнала", "limits",
+         "Сколько прежних файлов журнала хранить на диске; самый старый удаляется при следующей смене файла; "
+         "0 — не хранить", None, 0, 50, None),
         ("enable_chat", "boolean", "Chat Completions API", "api",
          "Принимать запросы OpenAI Chat Completions на /v1/chat/completions", None, None, None, None),
         ("enable_responses", "boolean", "Responses API", "api",
