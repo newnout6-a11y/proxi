@@ -26,6 +26,11 @@ def test_a_model_without_max_offers_no_ultra():
         assert "ultra" not in efforts and version is None, slug
 
 
+def test_the_catalog_leaves_codexs_node_repl_on_like_openais_own():
+    # With node_repl_disabled Codex answered every mcp__node_repl__js call "node_repl is unavailable for this model".
+    assert {item["node_repl_disabled"] for item in models.codex_catalog()["models"]} == {False}
+
+
 def test_ultra_on_the_wire_means_max():
     for body in (_body("responses", reasoning={"effort": "ultra"}), _body("chat", reasoning_effort="ultra"),
                  _body("responses", reasoning={"effort": "ULTRA"})):

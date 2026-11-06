@@ -236,6 +236,8 @@ CURRENT_TITLE = client_context.SDK_TITLE_PREFIX + " The title is a name for what
 LEGACY_TITLE = ("Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of "
                 "this coding session.\n\nReturn JSON with a single \"title\" field.")
 DESKTOP_TITLE = "You write short session titles. Reply with only the tagged fields the prompt asks for."
+HARNESS_TITLE = ("Create a concise title for an AI coding-assistant session from the supplied human messages.\nReturn only "
+                 "the title on one line, **in plain text of natural language**, with no quotes, prefix, explanation.")
 
 
 def kind_of(system, client="claude-code", **extra):
@@ -244,7 +246,8 @@ def kind_of(system, client="claude-code", **extra):
     return client_context.request_kind(parsed, {"client": client} if client else {})
 
 
-@pytest.mark.parametrize("wording", [CURRENT_TITLE, LEGACY_TITLE, DESKTOP_TITLE], ids=["current", "legacy", "desktop"])
+@pytest.mark.parametrize("wording", [CURRENT_TITLE, LEGACY_TITLE, DESKTOP_TITLE, HARNESS_TITLE],
+                         ids=["current", "legacy", "desktop", "harness"])
 @pytest.mark.parametrize("preamble", [
     "", "\n  ", ATTRIBUTION + "\n", ATTRIBUTION + "\n" + CLI_IDENTITY + "\n", CLI_IDENTITY + "\n",
     ATTRIBUTION + "\n" + SDK_IDENTITY + "\n\n", ATTRIBUTION + "\r\n" + CLI_IDENTITY + "\r\n",

@@ -84,6 +84,20 @@ def test_claude_codes_summary_request_is_recognised_by_the_start_of_its_instruct
     assert task(chat([*WORK, *tail_messages("Please create a detailed summary of the conversation so far.")])) == ""
 
 
+# Codex's template (codex-rs/prompts/templates/compact/prompt.md), sent after the history of a request without tools. It
+# was not recognised, so keepwarm kept the dead tool-less body warm: 1.2-1.3 credits a ping every 4 minutes (a2 report).
+CODEX_COMPACTION = ("You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that "
+                    "will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, "
+                    "constraints, or user preferences\n- What remains to be done (clear next steps)")
+
+
+def test_codexs_compaction_request_is_recognised_with_or_without_tools():
+    for tools in (False, True):
+        parsed = chat([*WORK, {"role": "assistant", "content": "Done."}, *tail_messages(CODEX_COMPACTION)], tools=tools)
+        assert client_context.client_task(parsed, {"client": "codex"}) == "compaction"
+    assert task(chat([*WORK, *tail_messages("Why is it called a CONTEXT CHECKPOINT COMPACTION?")])) == ""
+
+
 @pytest.mark.parametrize("instruction", [FIRST, UPDATE])
 def test_opencode_2_ends_the_chats_own_request_with_the_instruction_and_it_is_recognised_by_its_start(instruction):
     parsed = chat([*WORK, {"role": "assistant", "content": "ok"}, *tail_messages(instruction + TAIL)])

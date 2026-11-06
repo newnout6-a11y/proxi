@@ -626,7 +626,9 @@ def codex_catalog(entries=None, snapshot=None):
             'input_modalities': ['text', 'image'] if entry.get('vision') else ['text'],
             'supports_search_tool': False, 'supports_experimental_context': False,
             'use_responses_lite': False, 'supports_reasoning_effort_updates': False,
-            'node_repl_disabled': True, 'tool_mode': 'direct',
+            # Codex refuses its node_repl MCP server (mcp__node_repl__js: "node_repl is unavailable for this model") for
+            # a model whose entry disables it; OpenAI's own catalog leaves it on for every model, and so does this one.
+            'node_repl_disabled': False, 'tool_mode': 'direct',
         })
         if delegation:
             result[-1]['multi_agent_version'] = 'v2'
