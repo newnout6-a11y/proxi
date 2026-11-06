@@ -208,12 +208,25 @@ export function costOf(trace, status = trace.status) {
 /** A turn silent for longer than this is not running any more: the relay's own turn timeout is 15 minutes by default. */
 export const STALE_AFTER = 20 * 60;
 
+/** What a raised turn timeout gets on top of it, for the turn's end to arrive and be journaled. */
+export const STALE_MARGIN = 5 * 60;
+
 /**
- * A turn still 'running' after that much silence is 'interrupted' (a relay restart is already recognised while the
- * traces are built). It ends at its last event, not at the clock.
+ * How long a running turn may stay silent before it counts as interrupted: the relay ends a turn itself after its
+ * `turn_timeout` (an operator may raise it to a day), so a turn within it is not lost. Never shorter than STALE_AFTER,
+ * which is also what an unknown timeout (an older relay) gets.
  */
-export function statusAt(trace, now = Date.now() / 1000) {
-  return trace.status === 'running' && now - trace.last > STALE_AFTER ? 'interrupted' : trace.status;
+export function staleLimit(turnTimeout) {
+  return typeof turnTimeout === 'number' && Number.isFinite(turnTimeout) && turnTimeout > 0
+    ? Math.max(STALE_AFTER, turnTimeout + STALE_MARGIN) : STALE_AFTER;
+}
+
+/**
+ * A turn still 'running' after that much silence (`staleAfter`, in seconds: see staleLimit) is 'interrupted' (a relay
+ * restart is already recognised while the traces are built). It ends at its last event, not at the clock.
+ */
+export function statusAt(trace, now = Date.now() / 1000, staleAfter = STALE_AFTER) {
+  return trace.status === 'running' && now - trace.last > staleAfter ? 'interrupted' : trace.status;
 }
 
 export const PHASES = [
@@ -228,8 +241,8 @@ export const PHASES = [
  * Phase lengths in ms: waiting, thinking, tool arguments, output. What is left over is `other`, and `exec`
  * (local commands) is the part of it that is known to be a command.
  */
-export function phasesOf(trace, now = Date.now() / 1000) {
-  const status = statusAt(trace, now);
+export function phasesOf(trace, now = Date.now() / 1000, staleAfter = STALE_AFTER) {
+  const status = statusAt(trace, now, staleAfter);
   const open = status === 'running';
   const end = open ? Math.max(now, trace.last) : trace.ended ?? trace.last;
   const duration = Number.isFinite(trace.duration) ? trace.duration : elapsed(trace.started, end);
@@ -256,8 +269,8 @@ export function phasesOf(trace, now = Date.now() / 1000) {
  * squeeze every other tape as it ticks. With nothing finished to measure by, the running turns set the scale
  * themselves, so that a short one is still shorter than a long one instead of every tape being full.
  */
-export function scaleOf(traces, now = Date.now() / 1000) {
-  const all = traces.map((trace) => phasesOf(trace, now));
+export function scaleOf(traces, now = Date.now() / 1000, staleAfter = STALE_AFTER) {
+  const all = traces.map((trace) => phasesOf(trace, now, staleAfter));
   const finished = all.filter((phases) => !phases.open);
   return Math.max(1, ...(finished.length ? finished : all).map((phases) => phases.total));
 }

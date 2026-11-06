@@ -80,26 +80,45 @@ writes, it keeps the file's BOM, line endings, indentation and final-newline
 state. Rewriting removes comments, so a file that has them is refused until you
 delete them or pass `--allow-reformat`; the backup keeps the original. Nothing is
 written and no backup is made when the catalog is already current: the summary
-shows `written: false`. The `--output` preview masks credentials as `***`
-(`apiKey`, header and environment values, other token/secret/password fields);
-`--include-secrets` writes it verbatim.
+shows `written: false`. The `--output` preview masks credentials as `***`: the
+values of `apiKey`, header and environment keys and other token/secret/password
+fields, a string under `key`, `auth`, `pass` or `pwd`, the user info and secret
+parameters (`token`, `key`, `signature` and the like) of any URL, the argument after
+a secret flag in a command (`--api-key X`, `--token=X`), every `NAME=value` item of
+an `env` list and secret `NAME=value` text. `--include-secrets` writes it verbatim.
+The rules go by name and shape, so they can miss a credential in an unexpected place:
+read a preview before you share it.
 
 A reference to a removed relay model is replaced instead of left dangling, in
 `model`, `small_model`, `agent.*.model`, `command.*.model` and the deprecated
-`mode.*.model`. `small_model` and the hidden background agents (`title`, `summary`,
-`compaction`) get the first published model of the small tier (Haiku, Flash, nano,
-mini, GLM Flash), or lose the override when none is published so OpenCode chooses
-its own. Everything else gets the default model (Opus 5.5 when published). A valid
-reference keeps a `#variant` suffix only while that model still publishes it.
-Haiku's window is 200K tokens, smaller than the 1M-token models: if you compact very
-long sessions, set `agent.compaction.model` to a larger-window model yourself; the
-script touches only references to models that no longer exist.
+`mode.*.model`. `small_model` and the hidden `title` and `summary` agents get the
+first published model of the small tier (Haiku, Flash, nano, mini, GLM Flash), or
+lose the override when none is published so OpenCode chooses its own. Everything
+else gets the default model (Opus 5.5 when published). A valid reference keeps a
+`#variant` suffix only while that model still publishes it.
+
+`agent.compaction.model` is treated differently, because compaction summarizes the
+whole session and a model whose window is smaller than the session stalls without an
+error (OpenCode issue #46164). A removed compaction model is replaced by the first
+model of the small tier whose window is at least the main `model`'s. For the default
+main model, Opus 5.5 with 1,000,000 tokens, Haiku (200K), nano, mini and GLM Flash
+all fall short and only Gemini 3.5 Flash qualifies, which is published only when a
+Google resource is configured. So the usual outcome is that the override is removed
+and OpenCode compacts with the session's model; the same happens when the main model
+is not a relay model and its window is unknown. Either way the summary's `warnings`
+name the old reference and what was done. A compaction model you chose that is still
+published is kept as it is, even if its window is smaller: check that yourself.
 
 The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
-retool-relay/zai-org/GLM-5.3 --variant high`; OpenCode 2.2.5 uses `--model
-retool-relay/zai-org/GLM-5.3#high`. Version 2 rejects `--variant` before sending a
-model request. Both exact clients passed a real GLM high request through an
-isolated current-source relay; their timings and evidence are in the audit.
+retool-relay/claude-opus-5-5 --variant high`; OpenCode 2.2.5 uses `--model
+retool-relay/claude-opus-5-5#high`. Version 2 rejects `--variant` before sending a
+model request. Only a model that publishes levels has variants. GLM-5.3, GLM-5.3
+Flash and Haiku 4.5 publish none, because Retool accepts an effort level for them
+and ignores it: the sync gives them no variants and drops a `#high` suffix from a
+reference to them (the relay itself still accepts such a request). The audit
+records real GLM `high` requests through both exact clients; they were made before
+that decision, when GLM still published levels, and show the clients' syntax, not a
+selector GLM has today.
 
 `scripts/probe_client_settings.py` runs the installed clients against a local fake
 server with a deliberately invalid key. It finds the newest OpenCode Desktop CLI
@@ -117,13 +136,23 @@ plugin patch lists at `~/.dsh/profiles/web/cordis.patch.yml` and
 `~/.dsh/profiles/desktop/cordis.patch.yml`. The `llm-pi-ai` node stores providers
 under `config.providers`. The existing Proxi route uses OpenAI Chat Completions.
 
-Both profiles have been reconciled to the same 27 verified IDs. The main
-`retool` group holds 26 reasoning models, preserving its medium default and
-every supported selector; `retool-text` holds GPT-4.1 without a reasoning
-selector. Both use the same existing connection and credential reference. This
-split avoids an installed SDK limitation: a provider-wide medium default is
-rejected for a non-reasoning model before HTTP, while simply deleting that
-default can silently disable thinking on a model with an off selector.
+Both profiles have been reconciled to the same 27 verified IDs. After a sync the
+main `retool` group holds 23 models and `retool-text` holds 4. `retool` takes the
+models that publish selectable reasoning levels and keeps its medium default and
+every supported selector. `retool-text` takes the four that publish none: GPT-4.1
+(not a reasoning model), Haiku 4.5, GLM-5.3 and GLM-5.3 Flash (Retool accepts an
+effort level for the last three and ignores it). Both use the same existing
+connection and credential reference. This split avoids an installed SDK
+limitation: a provider-wide medium default is rejected for a model without
+selectors before HTTP, while simply deleting that default can silently disable
+thinking on a model with an off selector.
+
+The name `retool-text` and its display-name suffix "(без thinking)" mean "no
+reasoning-level selector", not "does not think". GLM-5.3 and GLM-5.3 Flash reason
+on every request, whatever level is sent, and the group keeps the provider's
+`thinkingFormat: deepseek` setting, so Harness shows their thinking like that of
+any other model. The group is not renamed: the sync recognizes the managed group
+by that name and display name.
 
 To preview or update an existing profile, use `scripts/sync_harness_catalog.py
 --settings PATH`. Preview writes only with `--output`; replacing the profile
@@ -134,15 +163,21 @@ passed default, off, high and rejection checks with the exact generated files;
 the SDK bundles and Desktop ASAR were not modified.
 
 The `--output` preview masks credential values (`apiKey`, header and environment
-values, tokens, passwords) as `'***'` and replaces only those values; `apiKeyEnv`
-references stay visible. `--include-secrets` writes the exact bytes. A profile that
-is already current is not rewritten and gets no backup (`written: false`). A last
-provider block without a final newline is spliced correctly and keeps that ending.
-A profile that is not UTF-8 or not valid YAML is reported with its line and column,
-never its content. Catalog discovery uses the whole relay config like the relay.
-One limit remains: a comment written directly after the Proxi block, before the next
-provider, can be dropped or repeated (ruamel attaches it to the block's last key), so
-compare the preview with the profile before `--write`.
+values, tokens, passwords) as `'***'`, and also the user info and secret parameters
+of URLs, the argument after a secret flag, every `NAME=value` item of an `env` list and
+secret `NAME=value` text; `apiKeyEnv` references stay visible. Every comment keeps its
+place but reads `# ***`, because a comment can quote an old key. Other bytes are kept,
+except that a plain or quoted value with a masked URL or argument is rewritten in
+double quotes. `--include-secrets` writes the exact bytes. The rules go by name and
+shape, so they can miss a credential in an unexpected place: read a preview before you
+share it. A profile that is already current is not rewritten and gets no backup
+(`written: false`). A last provider block without a final newline is spliced correctly
+and keeps that ending. A profile that is not UTF-8 or not valid YAML is reported with
+its line and column, never its content. Catalog discovery uses the whole relay config
+like the relay. One limit remains: a comment written directly after the Proxi block,
+before the next provider, can be dropped or repeated (ruamel attaches it to the block's
+last key), so compare the preview with the profile before `--write`: the preview shows
+each comment as `# ***` in its place, and `--include-secrets` shows the text.
 
 ### Historical Harness setup — 0.1.5-rc.2
 
@@ -356,10 +391,17 @@ Markdown fence is removed, the JSON is parsed and validated against the common
 subset of the schema (`type`, `properties`, `required`, `additionalProperties`,
 `items`, `enum`, `anyOf`, nullable, local `$ref`; unknown keywords never reject).
 Nothing of that reply reaches Codex before the check passes. An invalid reply ends
-the stream with an SSE `error` event (non-stream: `502 upstream_invalid_output`
-with `x-should-retry: false`) and its credits stay accounted. Codex then decides how
-often to ask again within its own `stream_max_retries`; every retry is a paid
-request. `x-proxi-output-format: validated-json-schema` marks the emulation, and a
+the stream with an SSE `error` event and then `response.failed` with code
+`invalid_prompt` (non-stream: `502 upstream_invalid_output` with
+`x-should-retry: false`), and its credits stay accounted. Codex ignores the `error`
+event but handles `response.failed`: it stops at once and prints the message (the
+schema path that failed). Without `response.failed` it saw the stream end before
+`response.completed` and asked again up to `stream_max_retries` (5) times, each a paid
+request, never showing the reason; a live run of codex-cli 0.164.0 sent 6 requests
+before and sends 1 now. Temporary failures (`upstream_error`, a timeout, a rate limit)
+get a code Codex retries, and `insufficient_credits` becomes `insufficient_quota`,
+for which Codex prints its own fixed quota text. The README lists the mapping.
+`x-proxi-output-format: validated-json-schema` marks the emulation, and a
 format combined with a required tool call is rejected with 422. This is
 post-validation, not constrained decoding: a live check on 2026-11-05 (`gpt-6-sol`,
 `gpt-5.5`, a `project_name`/`programming_languages` schema) returned valid bare JSON,
@@ -370,8 +412,10 @@ relay does not forward them; it names both, without values, in
 `x-proxi-ignored-parameters` and the `request.compatibility` journal event.
 
 Codex 0.164.0 passed real source reading, patching and testing (two tests), and a
-separate real subagent spawn/wait/result round trip. See `pr-1-review.md` for
-commands, versions and limitations.
+separate real subagent spawn/wait/result round trip. Commands, versions and
+limitations were in the review of
+[PR #1](https://github.com/newnout6-a11y/proxi/pull/1), `docs/pr-1-review.md`; the file
+was removed from the repository, its last version is `git show 60cc80f^:docs/pr-1-review.md`.
 
 ## Claude Code
 
@@ -419,7 +463,10 @@ a concise, sentence-case title…" (older). A system prompt that only quotes the
 further down stays an ordinary request and gets the configured relay policy.
 `output_config.task_budget` is accepted, not enforced, and named in
 `x-proxi-ignored-parameters`. A rejected request now carries the Messages error type
-`invalid_request_error` instead of `unprocessable_entity`.
+`invalid_request_error` instead of `unprocessable_entity`. Every relay error carries one of
+the documented Anthropic types in Messages (JSON and SSE): `upstream_error` is `api_error`,
+`upstream_timeout` is `timeout_error`, `insufficient_credits` is `billing_error`; the relay's own
+code stays in `error.relay_code` wherever the type replaced it; the README lists the whole table.
 
 #### Request classes
 
@@ -461,7 +508,11 @@ an error, never a silent write to a source Desktop ignores. `--write
 --backup-dir PATH` replaces a configLibrary file atomically (the backup must be
 on the same volume) or updates the existing `HKCU` value in place, after saving
 the old content. A configLibrary backup holds the gateway settings: keep it
-private. Quit Desktop first: it reads its configuration at launch. Every other
+private. Nothing is written and no backup is made when the generated list equals
+the existing one, compared as parsed JSON so another layout does not count: the
+summary then shows `written: false, changed: false` (a preview shows `changed` as
+well, and `written` is `false` until `--write` has actually replaced something).
+Quit Desktop first: it reads its configuration at launch. Every other
 key, the endpoint, the gateway key and the authentication scheme stay untouched.
 The script never writes `HKLM` and never creates a policy: a policy that sets any
 other key would switch Desktop away from its working local configuration, so
@@ -476,8 +527,20 @@ default model. The script keeps existing rows in order with every field it does
 not derive (`labelOverride`, `supports1m`, `behavesAs` and so on), appends new
 models at the end and moves the first row only for an explicit `--default-model`;
 a current default that is no longer available is an error, not a silent
-replacement. It owns `isFamilyDefault`, `anthropicFamilyTier` and `maxEffort`,
-and gives new rows the relay's label.
+replacement.
+
+The script owns exactly three row fields: `isFamilyDefault`,
+`anthropicFamilyTier` and `maxEffort`. It computes them again on every run and
+overwrites what the file holds, because it cannot tell its own earlier value from
+one you typed. A hand-edited `maxEffort` or `isFamilyDefault` does not survive; a
+row whose model has no family tier or no effort selector loses that field; and
+turning `allow_effort_downgrade` on raises `maxEffort` of the five-level rows from
+`high` to `max` on the next run (turning it off lowers it again). `name` identifies
+the row, `labelOverride` is set only for rows the
+script adds (the relay's label), and every other field is kept as it is. The
+summary lists each change to an existing row in `changed_fields`, for a preview
+and for `--write` alike: `model`, `field`, `was` and `now`, where `null` means the
+field was absent. Read it before writing.
 
 Which models: the relay exposes 27 routes and the script selects the verified
 Claude ones (`provider` anthropic with a `claude-` prefix), currently 11. That is
@@ -527,7 +590,7 @@ real system prefix.
 
 Haiku 4.5 accepts verified `thinking: {type: "disabled"}`. The SDK's beta
 `thinking.display: "updates"` uses the route's available summaries, with
-`x-proxi-thinking-display: summarized` and a named compatibility warning; the
+`x-proxi-thinking-display: summarized` and a debug-level compatibility event naming the field; the
 beta's native update cadence is not implemented. Its exact session-title schema
 has a bounded, buffered post-validation path. A sole JSON Markdown fence may be
 removed; the object must still contain exactly one string `title`, no duplicate

@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { API_KEY, DEFAULT_ROLES, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
-import { NOW, metricsFor } from './fixtures.js';
+import { NOW, PARTIAL_BALANCE, RESET_DATE, metricsFor } from './fixtures.js';
 
 // Replaces the journal page the admin loads at start; the live stream stays empty.
 const serveEvents = (page, data) => page.route(/\/admin\/api\/events\?/, (route) => route.fulfill({
@@ -338,6 +338,40 @@ test('turns left running by a restart or by silence are interrupted and never st
   await expect(done.locator('.tape-fill')).toHaveAttribute('style', /width: 100%/);
 });
 
+test('a turn silent for longer than the default limit keeps running while the relay allows turns that long', async ({ page }) => {
+  // The relay runs with a two hour turn timeout: a turn may be silent that long, and five minutes more for its end
+  await mockAdmin(page, { overviewPatch: { resources: { turn_timeout: 7200 } } });
+  await serveEvents(page, [
+    eventAt('t-long', -1800, 'turn.begin', { model: 'model-long', effort: 'high' }),
+    eventAt('t-long', -1799, 'upstream.thinking_start'),
+    eventAt('t-gone', -8000, 'turn.begin', { model: 'model-gone', effort: 'high' }),
+    eventAt('t-gone', -7999, 'upstream.thinking_start'),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  // Half an hour of silence is past the 20 minutes of the default limit, but within this relay's turn timeout
+  const long = page.locator('.trace', { hasText: 'model-long' });
+  await expect(long.locator('.tag')).toHaveText('идёт');
+  await expect(long.locator('.live-phase')).toHaveCount(1);
+  await expect(long.locator('.tape')).not.toHaveClass(/is-interrupted/);
+  // More than two hours and five minutes is not: that turn ended without a word
+  const gone = page.locator('.trace', { hasText: 'model-gone' });
+  await expect(gone.locator('.tag')).toHaveText('прерван');
+  await expect(gone.locator('.live-phase')).toHaveCount(0);
+  await expect(gone).toContainText('всего 1,00 с');
+});
+
+test('without a turn timeout from the relay a silent turn is interrupted after the default 20 minutes', async ({ page }) => {
+  await mockAdmin(page, { overviewPatch: { resources: undefined } });
+  await serveEvents(page, [
+    eventAt('t-quiet', -1800, 'turn.begin', { model: 'model-quiet', effort: 'high' }),
+    eventAt('t-quiet', -1799, 'upstream.thinking_start'),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  await expect(page.locator('.trace', { hasText: 'model-quiet' }).locator('.tag')).toHaveText('прерван');
+});
+
 test('turn rows price a turn by the relay rules: nothing for a refused attempt, unknown for usage without a price, a lower bound while it runs', async ({ page }) => {
   await mockAdmin(page);
   await serveEvents(page, [
@@ -607,6 +641,61 @@ test('an effort level the model lacks is an error only while approximation is of
   await expect(banner).toContainText('xhigh');
 });
 
+// The relay takes any known level for these routes and changes nothing (reasoning_effort_control "accepted-ignored").
+for (const id of ['zai-org/GLM-5.3', 'claude-haiku-4-5']) {
+  test(`a saved effort level on ${id}, whose route ignores it, raises no warning`, async ({ page }) => {
+    const state = await mockAdmin(page, { rich: true });
+    for (const values of [state.settings, state.effective]) Object.assign(values, { model: id, reasoning_effort: 'high' });
+    await login(page);
+    await nav(page, 'Настройки');
+    await expect(page.locator('#setting-model')).toHaveValue(id);
+    await expect(page.locator('#setting-reasoning_effort')).toHaveValue('high');
+    await expect(page.getByRole('status').filter({ hasText: 'не поддерживается моделью' })).toHaveCount(0);
+  });
+}
+
+test('a model that ignores effort offers every level, marks each as ignored, and still warns for one that refuses a level', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const effort = page.locator('#setting-reasoning_effort');
+  const banner = page.getByRole('status').filter({ hasText: 'не поддерживается моделью' });
+  await effort.selectOption('max');
+  await page.locator('#setting-model').selectOption('zai-org/GLM-5.3'); // lists no level, takes any
+  await expect(banner).toHaveCount(0);
+  const marked = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((level) => `${level} · модель игнорирует`);
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', ...marked]);
+  await expect(effort).toHaveValue('max');
+  await effort.selectOption('xhigh');
+  await expect(banner).toHaveCount(0);
+  // Approximation has nothing to do here: the list and the silence are the same with it on
+  const approximate = page.getByRole('switch', { name: 'Подбирать ближайший effort' });
+  await approximate.click();
+  await expect(banner).toHaveCount(0);
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', ...marked]);
+  await approximate.click();
+
+  // A route that lists levels is judged by them; one that lists none and does not take a level refuses it
+  await effort.selectOption('high');
+  await page.locator('#setting-model').selectOption('gpt-4.1');
+  await expect(banner).toContainText('GPT 4.1');
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', 'high']);
+  await page.locator('#setting-model').selectOption('gpt-5.5');
+  await expect(banner).toHaveCount(0);
+  await expect(effort.locator('option')).toHaveText(['по умолчанию модели', 'low', 'medium', 'high']);
+});
+
+test('the catalog says that a route takes an effort level and ignores it, instead of leaving the choice to the provider', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await login(page);
+  await nav(page, 'Настройки');
+  const effort = (id) => page.locator('.model-card').filter({ has: page.getByText(id, { exact: true }) }).locator('.model-effort');
+  await expect(effort('zai-org/GLM-5.3')).toContainText('Effort: принимает уровень, игнорирует');
+  await expect(effort('zai-org/GLM-5.3')).not.toContainText('выбирает провайдер');
+  await expect(effort('claude-opus-5-5')).toContainText('Effort: low · medium · high · max');
+  await expect(effort('gpt-4.1')).toContainText('Effort: без мышления');
+});
+
 test('leaving the settings with unsaved edits asks first and keeps them when declined', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
@@ -695,6 +784,55 @@ test('incomplete usage is not shown as free inference or a reliable forecast', a
   await expect(page.locator('.stat').first()).toContainText('—');
   await expect(page.getByText('есть неучтённый расход')).toBeVisible();
 });
+
+test('a balance known for only some of the accounts says how many are missing, and so does its forecast', async ({ page }) => {
+  await mockAdmin(page, { overviewPatch: { balance: PARTIAL_BALANCE } });
+  await login(page);
+  await expect(page.locator('.figure-xl')).toContainText('1 479,89');
+  await expect(page.locator('.figure-xl .tag')).toHaveText('частично: 1 из 2 неизвестны');
+  await expect(page.locator('.figure-xl .tag')).toHaveAttribute('title', /только по аккаунтам с известным балансом/);
+  await expect(page.locator('.forecast')).toContainText('по известным балансам хватит примерно на');
+});
+
+test('a balance with a known total but a missing monthly limit says so, and its forecast needs no qualifier', async ({ page }) => {
+  await mockAdmin(page, { overviewPatch: { balance: { ...PARTIAL_BALANCE, unknown_accounts: 0 } } });
+  await login(page);
+  await expect(page.locator('.figure-xl .tag')).toHaveText('частично: лимит месяца известен не у всех');
+  await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+  await expect(page.locator('.forecast')).not.toContainText('по известным балансам');
+});
+
+for (const [name, patch] of [
+  ['every balance is known', {}],
+  ['the relay does not report the pool\'s coverage', { balance: { available: 1495.09, monthly_allocation: 6000, used_month: 4504.91, reset_date: RESET_DATE } }],
+]) {
+  test(`a balance that covers the whole pool carries no partial mark: ${name}`, async ({ page }) => {
+    await mockAdmin(page, { overviewPatch: patch });
+    await login(page);
+    await expect(page.locator('.figure-xl')).toContainText('495,09');
+    await expect(page.locator('.figure-xl .tag')).toHaveCount(0);
+    await expect(page.locator('.forecast')).toContainText('хватит примерно на');
+    await expect(page.locator('.forecast')).not.toContainText('по известным балансам');
+  });
+}
+
+for (const width of [280, 320]) {
+  test(`the partial mark stays inside the balance panel at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 850 });
+    await mockAdmin(page, { overviewPatch: { balance: { ...PARTIAL_BALANCE, accounts_total: 12, unknown_accounts: 10 } } });
+    await login(page);
+    const mark = page.locator('.figure-xl .tag');
+    await expect(mark).toHaveText('частично: 10 из 12 неизвестны');
+    const inside = await page.evaluate(() => {
+      const tag = document.querySelector('.figure-xl .tag').getBoundingClientRect();
+      const panel = document.querySelector('.instrument').getBoundingClientRect();
+      return { left: tag.left - panel.left, right: panel.right - tag.right, wide: document.documentElement.scrollWidth - innerWidth };
+    });
+    expect(inside.left).toBeGreaterThanOrEqual(0);
+    expect(inside.right).toBeGreaterThanOrEqual(0);
+    expect(inside.wide).toBeLessThanOrEqual(1);
+  });
+}
 
 test('periods without a complete price are marked on the spend chart and summed as a lower bound', async ({ page }) => {
   // Period 21 holds a known part of its price, period 31 none at all; the relay counts the unpriced requests in both

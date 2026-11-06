@@ -21,7 +21,7 @@ import auth
 import config
 import journal
 import models
-from accounts import enabled as account_enabled, priority as account_priority
+from accounts import UNNAMED, account_tag, cfg_tag, enabled as account_enabled, priority as account_priority
 from redact import redact
 import sse
 import validate
@@ -85,7 +85,8 @@ def _schema():
          "с", 0, 86400, None),
         ("account_rate_limit_cooldown", "integer", "Пауза после часового лимита", "routing",
          "На сколько секунд аккаунт уходит из пула, когда Retool сообщает о часовом лимите managed-ключей; "
-         "лимит сразу после возврата удваивает паузу, но не больше часа", "с", 1, 3600, None),
+         "лимит сразу после возврата удлиняет паузу на 5 минут за раз, но не дольше 20 минут "
+         "(или самой паузы, если она длиннее)", "с", 1, 3600, None),
         ("session_refresh_interval", "integer", "Продление сессии", "routing",
          "Как часто продлевать сессию Retool каждого включённого аккаунта; 0 — не продлевать по таймеру",
          "с", 0, 86400, None),
@@ -322,7 +323,7 @@ class Admin:
             return "no_accounts", "No account is enabled"
         reasons = [models.route_block_reason(entry, item) for item in configs]
         if all(reasons):
-            return "blocked", reasons[0]
+            return "blocked", "; ".join(dict.fromkeys(reasons))  # as models.catalog_visibility words it
         key = models.PROVIDER_RESOURCE_KEY.get(entry["provider"])
         if key is None:
             return "no_resource", f"Provider '{entry['provider']}' is not routed"
@@ -351,7 +352,7 @@ class Admin:
             info, backend = entry["info"], entry["backend"]
             error = info.get("error") or info.get("stale_error")
             accounts.append({
-                "account": account_report.account_tag(backend), "state": entry["state"],
+                "account": account_tag(backend, UNNAMED), "state": entry["state"],
                 "routable": entry["routable"], "reserve": entry["reserve"],
                 "available": entry["available"],
                 "monthly_allocation": account_report.known(info.get("monthly_allocation")),
@@ -439,7 +440,7 @@ class Admin:
 
     @staticmethod
     def _record_tag(record):
-        return journal.tag(record.get("account_id") or record.get("page_uuid")) or "account"
+        return cfg_tag(record, UNNAMED)
 
     def _live_backends(self):
         return getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]
@@ -644,7 +645,9 @@ class Admin:
                 first = {key: copy.deepcopy(saved[key]) for key in ACCOUNT_RECORD_KEYS if key in saved}
                 if not first.get("account_id") and self.cfg.get("account_id"):
                     first["account_id"] = self.cfg["account_id"]
-                for key in ("cookie", "xsrf"):
+                # The access descriptor moves with the account: with accounts[] a root copy is ignored,
+                # and config.load would warn about it at every start.
+                for key in ("cookie", "xsrf", "provider_access"):
                     saved.pop(key, None)
                 saved["accounts"] = [first]
             saved["accounts"].append(record)
@@ -709,10 +712,9 @@ class Admin:
             if first.get(key):
                 saved[key] = first[key]
         # An access descriptor is bound to one account's resource and never inherited, so unlike a
-        # resource it is not handed to same-tenant accounts; the root must not keep the removed one's.
+        # resource it is neither handed to same-tenant accounts nor mirrored into the root: with
+        # accounts[] a root copy is ignored, and config.load would warn about it at every start.
         saved.pop("provider_access", None)
-        if first.get("provider_access"):
-            saved["provider_access"] = copy.deepcopy(first["provider_access"])
 
     def _pool_route(self, handler, path, match):
         allowed = ("GET", "POST") if match is None else ("POST",) if match.group(2) else ("PATCH", "DELETE")
@@ -793,7 +795,13 @@ class Admin:
         role, cap = candidate.get("relay_system_prompt"), candidate.get("max_prompt_bytes")
         if not isinstance(role, str) or not {"relay_system_prompt", "max_prompt_bytes"} & set(changes):
             return
-        size, limit = len(role.encode("utf-8")), _role_limit(cap)
+        try:
+            size = len(role.encode("utf-8"))
+        except UnicodeEncodeError:
+            # JSON can carry half of a surrogate pair ("\ud800"); it is not text UTF-8 can store.
+            raise apierr.bad_request("relay_system_prompt contains an unpaired surrogate (half of a Unicode pair), "
+                                     "which cannot be saved as UTF-8 text", param="relay_system_prompt")
+        limit = _role_limit(cap)
         if size > limit:
             param = "relay_system_prompt" if "relay_system_prompt" in changes else "max_prompt_bytes"
             capped = f" with max_prompt_bytes={cap}" if limit < ROLE_MAX_BYTES else ""

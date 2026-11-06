@@ -114,7 +114,7 @@ def test_streaming_title_is_buffered_then_emitted_and_cost_retained():
 
 @pytest.mark.parametrize('text,reason', [('not JSON', 'stop'), ('{"title":1}', 'stop'),
     ('{"title":"a","extra":1}', 'stop'), ('{"title":"a","title":"b"}', 'stop'),
-    ('{"title":"a"}', 'timeout'), ('{"title":"a"}', 'cancelled'), ('{"title":', 'stop'),
+    ('{"title":"a"}', 'max_exec'), ('{"title":', 'stop'),
     ('Here is JSON: {"title":"a"}', 'stop'), ('["title"]', 'stop'), ('{}', 'stop'),
     ('```json\n{"title":"a"}\n```\nExplanation', 'stop')])
 def test_invalid_or_truncated_title_never_leaks_partial_content(text, reason):
@@ -124,6 +124,23 @@ def test_invalid_or_truncated_title_never_leaks_partial_content(text, reason):
         result.end(reason)
     assert error.value.status == 502
     assert [name for name, _ in writer.events] == ['message_start', 'ping']
+
+
+def test_a_timed_out_title_is_a_gateway_timeout_and_still_leaks_nothing():
+    result, writer = adapter()
+    result.feed({'type': 'text', 'delta': '{"title":"a"}'})
+    with pytest.raises(apierr.ApiError) as error:
+        result.end('timeout')
+    assert (error.value.status, error.value.code) == (504, 'upstream_timeout')
+    assert [name for name, _ in writer.events] == ['message_start', 'ping']
+
+
+def test_a_cancelled_title_request_is_no_error_and_releases_nothing():
+    result, writer = adapter()
+    result.feed({'type': 'text', 'delta': '{"title":"a"}'})
+    payload = result.end('cancelled')
+    assert payload['content'] == [{'type': 'text', 'text': ''}]
+    assert 'content_block_delta' not in dict(writer.events) and 'error' not in dict(writer.events)
 
 
 @pytest.mark.parametrize('kind', ['tool_call', 'hitl', 'exec_start', 'exec_result'])
