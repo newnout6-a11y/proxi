@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import apierr
@@ -214,6 +215,78 @@ def make_rit(messages, tools=None):
 _KNOWN_TYPES = ("string", "number", "integer", "boolean", "null", "array", "object")
 
 
+def _pointer(root, ref):
+    """What a local reference (#/$defs/Name) points at inside `root`; None for one that points elsewhere or nowhere."""
+    if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
+        return None
+    node = root
+    for part in ref.split("/")[1:]:
+        part = urllib.parse.unquote(part).replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node
+
+
+_LIMIT_KEYS = ("pattern", "format", "minLength", "maxLength", "minimum", "maximum", "exclusiveMinimum",
+               "exclusiveMaximum", "multipleOf", "minItems", "maxItems")
+
+
+def _merged(base, extra):
+    """Two schemas that both hold, as one: properties and required add up, an enum narrows, anything else `extra` decides.
+
+    A limit both of them set (two patterns, as Claude Code writes them in allOf) is kept beside the first, in an allOf
+    that only _limits reads, so that the model is told both."""
+    result = dict(base)
+    for key, value in extra.items():
+        if key == "properties" and isinstance(value, dict) and isinstance(result.get("properties"), dict):
+            result["properties"] = {**result["properties"],
+                                    **{name: {"allOf": [result["properties"][name], sub]} if name in result["properties"]
+                                       else sub for name, sub in value.items()}}
+        elif key == "required" and isinstance(value, list) and isinstance(result.get("required"), list):
+            result["required"] = list(dict.fromkeys([*result["required"], *value]))
+        elif key == "enum" and isinstance(value, list) and isinstance(result.get("enum"), list):
+            result["enum"] = [item for item in result["enum"] if item in value]
+        elif key == "allOf" and isinstance(value, list):
+            result["allOf"] = [*(result["allOf"] if isinstance(result.get("allOf"), list) else []), *value]
+        elif key in _LIMIT_KEYS and key in result and result[key] != value:
+            result["allOf"] = [*(result["allOf"] if isinstance(result.get("allOf"), list) else []), {key: value}]
+        else:
+            result[key] = value
+    return result
+
+
+def _deref(schema, root, trail=()):
+    """(the schema with its $ref followed and its allOf merged in, the references expanded to make it).
+
+    Pydantic, zod and the MCP SDKs describe a nested object once, under $defs, and point at it, and give such a field a
+    description with allOf. The Retool shape of those fields was a plain string, and the model wrote "Name: Ada, Age: 36"
+    where the client wanted an object (protocol test run of 2026-11-06; ultracode audit, C6). What a field says itself
+    (its description, its default) wins over what the referenced schema says. A reference that points outside the
+    schema is dropped, and one that points into itself is a plain object from the second step on, so a schema
+    that contains itself ends."""
+    if not isinstance(schema, dict):
+        return schema, trail
+    result, used = {}, trail
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref in trail:
+            result = {"type": "object"}
+        else:
+            found = _pointer(root, ref)
+            if isinstance(found, dict):
+                result, used = _deref(found, root, trail + (ref,))
+    for part in schema["allOf"] if isinstance(schema.get("allOf"), list) else ():
+        part, more = _deref(part, root, trail)
+        if isinstance(part, dict):
+            result = _merged(result, part)
+            used = used + tuple(item for item in more if item not in used)
+    return _merged(result, {key: value for key, value in schema.items() if key not in ("$ref", "allOf")}), used
+
+
 def _allowed_values(schema):
     """The values a schema restricts a field to (enum, const, or an anyOf/oneOf of those); None when it does not."""
     if "const" in schema:
@@ -235,7 +308,7 @@ def _allowed_values(schema):
     return None
 
 
-def _param_schema(schema, required):
+def _param_schema(schema, required, root=None, trail=()):
     """Convert one JSON-Schema property to Retool's typed param shape.
 
     Retool accepts only literal/string/number/boolean/null/array/object/enum/anyOf (its enum holds strings), so an
@@ -245,14 +318,27 @@ def _param_schema(schema, required):
 
     "X or null" (anyOf/oneOf with a null branch, or a type list with "null") is how Pydantic and many MCP servers write
     an optional field: the field keeps the type of X. Before, it became a plain string, and the model sent "" for the
-    booleans and lists of tavily_search. Another union of types becomes Retool's anyOf.
+    booleans and lists of tavily_search. Another union of types becomes Retool's anyOf, a type list of several types
+    included: "number or string" used to keep the number alone, and the string "007" went to the client as 7.
+
+    `root` is the schema of the whole tool, where a $ref points (see _deref); `trail` the references being expanded.
     """
     if not isinstance(schema, dict):
         return {"type": "string", "required": bool(required)}
+    if root is None:
+        root = schema
+    schema, trail = _deref(schema, root, trail)
     kind = schema.get("type")
     if isinstance(kind, list):
         kinds = [item for item in kind if item in _KNOWN_TYPES]
-        kind = next((item for item in kinds if item != "null"), kinds[0] if kinds else None)
+        spread = list(dict.fromkeys("number" if item == "integer" else item for item in kinds if item != "null"))
+        if len(spread) > 1 and _allowed_values(schema) is None and not schema.get("anyOf") and not schema.get("oneOf"):
+            rest = {key: value for key, value in schema.items() if key not in ("type", "description")}
+            schema = {"anyOf": [{**rest, "type": item} for item in spread],
+                      **({"description": schema["description"]} if schema.get("description") else {})}
+            kind = None
+        else:
+            kind = next((item for item in kinds if item != "null"), kinds[0] if kinds else None)
     allowed = _allowed_values(schema)
     allowed = [value for value in allowed if value is not None] if allowed is not None else None
     options = schema.get("anyOf") if isinstance(schema.get("anyOf"), list) else schema.get("oneOf")
@@ -262,9 +348,9 @@ def _param_schema(schema, required):
             merged = dict(branches[0])
             if schema.get("description"):
                 merged["description"] = schema["description"]
-            return _param_schema(merged, required)
+            return _param_schema(merged, required, root, trail)
         if branches:
-            node = {"type": "anyOf", "anyOf": [_param_schema(branch, False) for branch in branches]}
+            node = {"type": "anyOf", "anyOf": [_param_schema(branch, False, root, trail) for branch in branches]}
             if schema.get("description"):
                 node["description"] = str(schema["description"])
             node["required"] = bool(required)
@@ -284,11 +370,12 @@ def _param_schema(schema, required):
             node = {"type": "string" if kind == "string" else
                     ("number" if kind in ("number", "integer") else kind)}
         elif kind == "array":
-            node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False)}
+            node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False, root, trail)}
         elif kind == "object" or schema.get("properties") or schema.get("additionalProperties"):
             properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
             node = {"type": "object", "properties": {
-                name: _param_schema(sub, name in _required_names(schema)) for name, sub in properties.items()}}
+                name: _param_schema(sub, name in _required_names(schema), root, trail)
+                for name, sub in properties.items()}}
     description = " ".join(part for part in (str(schema["description"]) if schema.get("description") else "", note,
                                              _limits(schema)) if part)
     if description:
@@ -353,11 +440,12 @@ def tools_to_retool(tools):
         if not isinstance(function, dict) or not function.get("name"):
             continue
         params = {}
-        schema = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
+        root = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
+        schema, trail = _deref(root, root)
         required = set(_required_names(schema))
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
         for name in sorted(properties.keys()):
-            params[name] = _param_schema(properties[name], name in required)
+            params[name] = _param_schema(properties[name], name in required, root, trail)
         converted.append({"name": function["name"],
                           "description": function.get("description") or "",
                           "params": params, "strict": function.get("strict", False)})
