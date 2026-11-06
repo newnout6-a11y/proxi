@@ -73,6 +73,9 @@ const richSchema = {
     description: 'Уровень мышления, если клиент его не передал; auto оставляет выбор модели' },
   allow_effort_downgrade: { type: 'boolean', label: 'Подбирать ближайший effort', group: 'model', restart_required: true,
     description: 'Если модель не поддерживает запрошенный уровень мышления, взять ближайший вместо ошибки' },
+  claude_xhigh_effort: { type: 'string', label: 'Уровень вместо xhigh у Claude', group: 'model', enum: ['high', 'max'], restart_required: true,
+    description: 'У моделей Claude в Retool нет уровня xhigh, а Claude Desktop и другие клиенты шлют его всем моделям. '
+      + 'Запрос с xhigh получает выбранный здесь уровень вместо ошибки, независимо от подбора ближайшего effort' },
   max_prompt_bytes: { type: 'integer', label: 'Размер промпта', group: 'limits', unit: 'байт', min: 0, max: 1073741824,
     restart_required: true, description: 'Отклонять запросы с промптом больше этого размера; 0 — без ограничения' },
   session_mode: { type: 'string', label: 'Режим сессий', group: 'routing', enum: ['per_conversation', 'per_request', 'shared'], restart_required: true,
@@ -235,6 +238,10 @@ function poolSummary(pool) {
     routable: live.filter((a) => a.routable && a.enabled !== false).length, reserve: live.filter((a) => a.reserve).length, states };
 }
 
+// Mirrors models.replaces_xhigh: a Claude route whose levels the client can pick has no xhigh, and the relay serves it at another level.
+const withXhighFlag = (entry) => ({ ...entry, xhigh_replaced: entry.provider === 'anthropic'
+  && entry.reasoning_effort_control === 'selectable' && !entry.reasoning_effort_levels.includes('xhigh') });
+
 export function settingsResponse(settings, effective, schema) {
   const pending = Object.keys(settings).filter((key) => settings[key] !== effective[key]);
   return { settings, effective, schema, default_system_prompt: DEFAULT_ROLES[0].text, default_system_prompts: DEFAULT_ROLES,
@@ -246,10 +253,10 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
   const initial = { model: 'claude-opus-5-5', show_thinking: true, max_workers: 4, rate_limit_rps: 0,
     relay_system_prompt_mode: 'standalone', relay_system_prompt: null,
     ...(rich ? { reasoning_effort: 'high', session_mode: 'per_conversation', enable_anthropic: true, enable_chat: true,
-      allow_effort_downgrade: false, max_prompt_bytes: 0,
+      allow_effort_downgrade: false, claude_xhigh_effort: 'high', max_prompt_bytes: 0,
       min_account_balance: 20, cache_keepwarm_seconds: 240, upstream_empty_retries: 1, turn_timeout: 900 } : {}) };
   const events = empty ? [] : rich ? richJournal() : journal;
-  const models = rich ? [...catalog, ...extraCatalog] : catalog;
+  const models = (rich ? [...catalog, ...extraCatalog] : catalog).map(withXhighFlag);
   const state = { settings: { ...initial }, effective: { ...initial }, requests: [], patches: [], sessions: [],
     stream: [], streamRequests: 0, cleared: false, accountRequests: [],
     pool: accounts.map((a, i) => ({ ...poolAccount(a.account, i ? 'запасной' : 'основной', i), ...a })) };

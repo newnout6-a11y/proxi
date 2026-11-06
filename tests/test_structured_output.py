@@ -38,6 +38,13 @@ def format_field(dialect, schema):
     return {'output_config': {'format': {'type': 'json_schema', 'schema': schema}}}
 
 
+def inner(adapter):
+    """The adapter of the dialect under the wrappers of a request: the structured check, stop sequences, the output cap."""
+    while isinstance(adapter, (adapters.StructuredOutputAdapter, adapters.StopSequenceAdapter, adapters.OutputCapAdapter)):
+        adapter = adapter.adapter
+    return adapter
+
+
 def body(dialect, schema=MEMORY, **changes):
     data = _body(dialect, **format_field(dialect, schema))
     data.update(changes)
@@ -285,7 +292,7 @@ def test_valid_reply_reaches_the_client_only_after_validation_and_cost_is_kept(d
     if stream:
         assert emitted_text(dialect, writer.events) == VALID
         assert writer.events[-1] == ('done', {})
-    assert adapter.adapter.credits == .75
+    assert inner(adapter).credits == .75
     assert payload['usage']['output_tokens' if dialect != 'chat' else 'completion_tokens'] == 9
 
 
@@ -330,7 +337,7 @@ def test_invalid_reply_is_an_error_before_any_content_and_still_costs(dialect, t
     if stream:
         assert emitted_text(dialect, writer.events) == ''
         assert not any(name in ('response.completed', 'message_stop', 'done') for name, _ in writer.events)
-    assert adapter.adapter.credits == .5 and adapter.adapter.output_tokens == 9
+    assert inner(adapter).credits == .5 and inner(adapter).output_tokens == 9
 
 
 @pytest.mark.parametrize('stream', [False, True])
@@ -350,7 +357,7 @@ def test_a_timed_out_turn_is_an_upstream_timeout_with_no_content_and_the_cost_ke
         assert emitted_text(dialect, writer.events) == ''
         assert not any(name in ('response.completed', 'response.incomplete', 'message_stop', 'done')
                        for name, _ in writer.events)
-    assert adapter.adapter.credits == .5 and adapter.adapter.output_tokens == 9
+    assert inner(adapter).credits == .5 and inner(adapter).output_tokens == 9
 
 
 @pytest.mark.parametrize('text', ['{"selected_memories":[', '{"selected_memories":"PRIVATE"}', VALID, ''])
@@ -368,7 +375,7 @@ def test_a_cancelled_turn_is_not_validated_and_ends_like_any_other_request(diale
     if stream:
         assert emitted_text(dialect, writer.events) == '' and 'error' not in dict(writer.events)
         assert writer.events[-1] == ('done', {})
-    assert adapter.adapter.credits == .5 and adapter.adapter.output_tokens == 9
+    assert inner(adapter).credits == .5 and inner(adapter).output_tokens == 9
 
 
 @pytest.mark.parametrize('dialect', DIALECTS)
@@ -391,7 +398,9 @@ def test_error_envelope_is_dialect_shaped_and_names_the_failure(dialect):
 @pytest.mark.parametrize('dialect', DIALECTS)
 def test_buffer_is_bounded(dialect):
     writer = Writer()
-    adapter = adapters.for_dialect(dialect, parse(dialect), writer)
+    # a cap that cannot bind: below it the output cap would cut this delta before the buffer's own limit is reached
+    adapter = adapters.for_dialect(dialect, parse(dialect, **({'max_tokens': 32000} if dialect == 'anthropic' else {})),
+                                   writer)
     adapter.begin()
     with pytest.raises(apierr.ApiError):
         adapter.feed({'type': 'text', 'delta': 'x' * (structured.MAX_CHARS + 1)})
@@ -433,7 +442,7 @@ def test_tool_turn_is_released_unchanged_and_only_the_final_reply_is_validated(d
     first.feed({'type': 'credits', 'value': .25})
     payload = first.end('tool_calls')
     assert 'THINK-MARK' in json.dumps(writer.events)
-    assert 'call_1' in json.dumps(payload) and first.adapter.credits == .25
+    assert 'call_1' in json.dumps(payload) and inner(first).credits == .25
     # The next request carries the tool result and gets the validated answer.
     final = adapters.for_dialect(dialect, parsed, Writer())
     final.feed({'type': 'text', 'delta': 'Done: not json'})

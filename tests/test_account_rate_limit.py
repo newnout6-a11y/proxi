@@ -124,8 +124,10 @@ def _stream(tmp_path, monkeypatch, opener):
     return asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("payload,quota", [(HOURLY_BODY, True), (SHORT_BODY, False)])
-def test_the_transport_raises_the_flagged_error_after_one_attempt(tmp_path, monkeypatch, payload, quota):
+@pytest.mark.parametrize("payload,quota,attempts", [(HOURLY_BODY, True, 1), (SHORT_BODY, False, 4)])
+def test_the_transport_raises_the_flagged_error_once_the_attempts_it_owes_are_spent(
+        tmp_path, monkeypatch, payload, quota, attempts):
+    # the hourly quota is the account's and ends the attempt at once; an ordinary 429 is asked again three times
     posts = []
 
     def opener(request, **_kwargs):
@@ -136,7 +138,7 @@ def test_the_transport_raises_the_flagged_error_after_one_attempt(tmp_path, monk
     with pytest.raises(apierr.ApiError) as caught:
         _stream(tmp_path, monkeypatch, opener)
     error = caught.value
-    assert len(posts) == 1 and error.upstream_attempts == 1 and error.upstream_status == 429
+    assert len(posts) == attempts and error.upstream_attempts == attempts and error.upstream_status == 429
     assert apierr.is_account_quota(error) is quota
     assert error.retry_after == (90.0 if quota else None)
 
@@ -679,12 +681,12 @@ def test_a_limit_mixed_with_other_unusable_accounts_still_answers_429(retool):
     assert "1 из 2" in error.message and 100 <= error.retry_after <= 120
 
 
-def test_an_ordinary_429_is_returned_as_before_without_parking_the_account(retool):
+def test_an_ordinary_429_is_returned_without_parking_the_account_after_its_retries_on_the_same_one(retool):
     retool.script["acc-a"] = short_429
     before = journal.JOURNAL.last_seq
     events = asyncio.run(run(retool.runner, turn()))
     error = events[-1]["error"]
-    assert retool.posts == ["acc-a"]
+    assert retool.posts == ["acc-a"] * 4  # asked again on the same account, never on the other
     assert (error.status, error.code, error.message) == (429, "rate_limit_error", "Slow down, try again")
     assert retool.a.unavailable is None
     assert not _events("account.rate_limited", before) and not _events("account.failover", before)
@@ -906,11 +908,11 @@ def test_an_account_parked_after_the_check_still_ends_in_an_error_event(served, 
     assert served.posts == []
 
 
-def test_an_ordinary_429_reaches_the_client_and_parks_nothing(served):
+def test_an_ordinary_429_reaches_the_client_after_its_retries_and_parks_nothing(served):
     served.script["acc-a"] = short_429
     status, body, headers = served.call("/v1/chat/completions", CHAT)
     assert status == 429 and body["error"]["message"] == "Slow down, try again"
-    assert served.posts == ["acc-a"]
+    assert served.posts == ["acc-a"] * 4
     assert all(backend.unavailable is None for backend in served.backends)
     status, health, _ = served.call("/health", key=None)
     assert "rate_limited_until" not in health["accounts"] and health["accounts"]["states"] == {"active": 2}

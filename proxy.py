@@ -26,6 +26,7 @@ from redact import redact
 import config as config_module
 import conversation_infer
 import conversation_state
+import forced_choice
 import generation
 import models as model_catalog
 import sse
@@ -274,7 +275,7 @@ def make_handler(runtime: Runtime):
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
             self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after, "
                              "x-proxi-ignored-parameters, x-proxi-system-messages, "
-                             "x-proxi-thinking-display, x-proxi-output-format")
+                             "x-proxi-thinking-display, x-proxi-output-format, x-proxi-tool-choice")
 
         def _json(self, status, payload, extra=None):
             self._status = status
@@ -734,7 +735,8 @@ def make_handler(runtime: Runtime):
             self._carry_tools(parsed)
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
-            effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
+            effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"),
+                                                       cfg.get("claude_xhigh_effort", "high"))
             self._effort_str = effective_effort or (
                 "provider" if parsed.entry.get("reasoning") and
                 parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
@@ -744,6 +746,8 @@ def make_handler(runtime: Runtime):
                 compatibility_headers['x-proxi-model-substituted'] = '%s=%s' % (parsed.requested_model, substituted)
             if parsed.structured_output:
                 compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
+            if forced_choice.requirement(parsed.model, parsed.tools, parsed.tool_choice) is not None:
+                compatibility_headers['x-proxi-tool-choice'] = 'emulated'
             if 'thinking.display' in parsed.declared_ignored:
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:
@@ -978,7 +982,8 @@ def make_handler(runtime: Runtime):
                 try:
                     _, resolved = models.resolve_tolerant(
                         parsed.model, effort, strict=cfg["strict_models"], default_model=cfg.get("model"),
-                        allow_downgrade=cfg.get("allow_effort_downgrade", False))
+                        allow_downgrade=cfg.get("allow_effort_downgrade", False),
+                        xhigh_as=cfg.get("claude_xhigh_effort", "high"))
                 except apierr.ApiError as error:
                     raise apierr.bad_request("profile '%s' sets generation.effort to '%s': %s" % (
                         plan.profile, effort, error.message), param=where + "effort")
