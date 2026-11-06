@@ -303,7 +303,9 @@ def prompt_relay(tmp_path, monkeypatch):
                     "relay_api_key": KEY, "workspace_root": str(tmp_path), "command_log": str(tmp_path / "c.log"),
                     "host": "127.0.0.1", "port": 0, "cookie_values": [], "client_metadata_home": str(tmp_path),
                     "cache_keepwarm_seconds": 0, "upstream_error_dir": str(tmp_path), "accounts": [account()],
-                    "prompts_file": str(tmp_path / "prompts.json"), "allow_effort_downgrade": False})
+                    "prompts_file": str(tmp_path / "prompts.json"), "allow_effort_downgrade": False,
+                    # the Agent SDK runner's first request carries tool search; these tests are about prompt profiles
+                    "claude_tool_search": "native"})
         cfg.update(overrides)
         runtime = proxy.Runtime(cfg)
         for backend in runtime.accounts.backends:

@@ -33,6 +33,7 @@ import models
 import prompt_body
 import prompt_policy
 import prompt_stabilizer
+import tool_search_policy
 import tool_union
 import validate
 from accounts import UNNAMED, AccountDispatcher, account_tag
@@ -129,6 +130,8 @@ class Runtime:
         self.conversations = conversation_infer.ConversationIndex()
         # The tools a client declared before, for a client that declares them late (tool_union).
         self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL))
+        # Conversations Claude Code's tool search was refused for (tool_search_policy).
+        self.tool_search_guard = tool_search_policy.LoopGuard()
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
         self.journal = journal.JOURNAL
@@ -454,7 +457,7 @@ def make_handler(runtime: Runtime):
             except apierr.ApiError as err:
                 self._error_code = err.code
                 self._log_error(err)
-                if err.status >= 400:
+                if err.status >= 400 and not getattr(err, "expected", False):
                     console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
                 if getattr(self, "_streaming", False):
                     self._stream_failure(dialect, err)
@@ -498,7 +501,8 @@ def make_handler(runtime: Runtime):
             self._writer.done()
 
         def _log_error(self, err):
-            journal.emit("http.error", err.message, "error" if err.status >= 500 else "warn",
+            journal.emit("http.error", err.message, "debug" if getattr(err, "expected", False)
+                         else "error" if err.status >= 500 else "warn",
                          status=err.status, code=err.code, param=err.param, model=self._model,
                          effort=self._effort_str or None,
                          stage=getattr(err, "stage", "upstream" if hasattr(err, "upstream_status") else "relay"),
@@ -686,6 +690,7 @@ def make_handler(runtime: Runtime):
                 self._client_trace.event("client_request", method=self.command, path=self.path, dialect=dialect)
             data = validate.load_json(raw)
             self._bind_client(data)
+            self._refuse_tool_search(data, dialect)
             fetches = validate.ImageFetches()
             with fetches:
                 if dialect == "anthropic":
@@ -805,6 +810,36 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _refuse_tool_search(self, data, dialect):
+            """Turn down Claude Code's tool search so that it loads every tool up front (see tool_search_policy).
+
+            Every tool a ToolSearch loads changes the tool list, which the relay puts first in the cached prompt, so each
+            load rewrote the whole conversation (33.8 credits at 336k tokens). A 400 makes Claude Code 2.1.305 and later send
+            the request again with all tools loaded and no deferral; that costs two rejected requests per conversation and
+            nothing upstream. Only a recognised Claude Code of a version that does this is refused, and a conversation that
+            goes on sending tool search after it has been refused LOOP_LIMIT times is served as it asks."""
+            if dialect != "anthropic" or cfg.get("claude_tool_search", "eager") != "eager":
+                return
+            identity = client_context.current()
+            if identity.get("client") not in ("claude-code", "claude-desktop"):
+                return
+            version = tool_search_policy.client_version(self.headers.get("user-agent"))
+            where = tool_search_policy.deferral(data) if version and version >= tool_search_policy.MIN_VERSION else None
+            if where is None:
+                return
+            conversation = (identity.get("client_session_id") or "", identity.get("agent") or "")
+            if not runtime.tool_search_guard.allow(conversation):
+                journal.emit("tool_search.refusal_loop",
+                             "Claude Code продолжает слать tool search после отказов: запрос обслужен как есть", "warn",
+                             request_id=self.request_id, version=".".join(map(str, version)))
+                return
+            journal.emit("tool_search.refused",
+                         "Tool search Claude Code отклонён: клиент пришлёт тот же запрос со всеми инструментами сразу", "info",
+                         request_id=self.request_id, version=".".join(map(str, version)), where=where)
+            error = apierr.bad_request(tool_search_policy.message(where))
+            error.expected = True
+            raise error
 
         def _carry_tools(self, parsed):
             """Give a client of the listed families the union of the tools it has declared before and this request's.

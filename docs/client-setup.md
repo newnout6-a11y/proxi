@@ -626,6 +626,49 @@ blocks are collapsed by default: `Ctrl+O` expands them;
 `showThinkingSummaries: true` enables summaries. This cannot reveal text that
 Retool has redacted or omitted.
 
+### Tool search of Claude Code 2.1.304 and later
+
+Since 2.1.304 Claude Code defers its MCP tools (and some of its own) behind `ToolSearch` when `ANTHROPIC_BASE_URL` is a
+gateway. The first request lists 14 tools (the user's own count was 15 to 26): the built-in ones, `ToolSearch` and a
+`DeferredToolPlaceholder` with `defer_loading: true`; every tool the model loads is added to `tools` afterwards (and a
+`tool_reference` to the result). The relay puts `tools` first in the prompt it sends upstream, so each load rewrote the whole
+cached conversation: four loads were 41% of all tokens written in the Claude Code dialog of 2026-11-06 (14.6, 29, 31 and
+33.8 credits, the last one at 336k tokens). Anthropic's own API does not pay this (a deferred tool is not part of the cached
+prefix there); a translating layer cannot copy it, and nothing in `/v1/models`, in a response header or in `anthropic-beta`
+tells the client not to defer (checked in the docs, code.claude.com gateway protocol and MCP pages): the decision is the
+client's, made from `ENABLE_TOOL_SEARCH`, the model name and the host.
+
+What the client does document is the other direction: from 2.1.305 on a 400 or 422 to a request that carries tool search
+makes it send the request again without `defer_loading` and `tool_reference`, with every tool loaded up front, and keep it that
+way for the conversation. The relay answers such a request with a 400 (`claude_tool_search: "eager"`, the default), and
+nothing is spent upstream. Checked against the installed 2.1.310 on a fake gateway and then on this relay's code with a
+scripted model:
+
+- A new conversation: the first request is refused, the client repeats it once, is refused again, and then sends the same
+  request with all 26 tools and no deferral. Two refused requests per conversation; the refusal is not stored between
+  processes (`.claude.json` holds nothing about it).
+- A resumed conversation whose history holds `tool_reference` blocks gets them stripped by the client, and goes on with every
+  tool loaded.
+- Status 422, a message that does not name tool search, and `x-should-retry: false` all take the same way.
+
+Only a recognised Claude Code or Claude Desktop whose user agent names a version of 2.1.305 or later is refused (2.1.304
+failed every request it was refused; a client with no version is served as it asks), and a conversation that is refused
+more than six times in ten minutes is served as it asks and journaled as `tool_search.refusal_loop`. `tool_search.refused`
+(info) names each refusal. `claude_tool_search: "native"` serves the deferral as before.
+
+The price of loading everything up front is the size of the prefix: the tools the user has (51 with three MCP servers) are
+about 23k more tokens in every request, read from the cache at 0.09 credits more per request, and the first request that
+writes them is one-off for a new tool set (4.8 credits instead of 2.5, shared by every later session). One late load costs
+as much as about 375 requests of that reading, and loads happen in most sessions, so the long dialog of 2026-11-06 would have
+spent about 40 of its 343 credits less. A session that never loads a tool and lasts a few requests is a little dearer.
+It also removes the known failure of 2.1.304 and later in which a subagent or a `claude -p` process is left with `ToolSearch`
+as its only tool (anthropics/claude-code#104309). The other way to the same list is on the client: `ENABLE_TOOL_SEARCH=false`
+in `~/.claude/settings.json` `env`, which makes the client send no deferral at all (no refused requests); the relay
+needs neither.
+
+A conversation that was running with tool search when the relay started refusing it pays one cache rewrite: the history loses
+its tool references and the tool list changes once.
+
 ### Structured outputs, titles and side requests
 
 Claude Code sends `output_config.format` (`json_schema`) for session titles, memory

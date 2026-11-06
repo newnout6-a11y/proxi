@@ -53,7 +53,8 @@ def client_key(family, headers, parsed):
     if not getattr(parsed, "tools", None):
         return None
     lowered = {str(name).lower(): value for name, value in (headers or {}).items()}
-    sub = bool(lowered.get("x-openai-subagent") or lowered.get("x-codex-parent-thread-id"))
+    sub = bool(lowered.get("x-openai-subagent") or lowered.get("x-codex-parent-thread-id")
+               or lowered.get("x-claude-code-agent-id"))
     plan = getattr(parsed, "prompt_plan", None)
     return (family, str(lowered.get("originator") or "").strip().lower(), getattr(parsed, "model", "") or "",
             "sub" if sub else "root", project_of(parsed), getattr(plan, "profile", None) or "",
