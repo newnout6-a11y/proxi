@@ -348,7 +348,8 @@ class History:
         for snapshot in reversed(self.branches):
             offset = len(snapshot.client)
             if (scope != snapshot.scope or len(client) <= offset + 1
-                    or client[:offset] != snapshot.client or not same_echo(client[offset], snapshot.echo, defaults)):
+                    or not same_json(client[:offset], snapshot.client)
+                    or not same_echo(client[offset], snapshot.echo, defaults)):
                 continue
             tail = client[offset + 1:]
             calls = [b["toolCallId"] for b in snapshot.assistant if b["type"] == "tool_call"]
@@ -378,7 +379,7 @@ class History:
         if len(client) <= offset + 1:
             return "history:%d_of_%d_messages" % (len(client), offset + 2)
         for index, (ours, theirs) in enumerate(zip(client, snapshot.client)):
-            if ours != theirs:
+            if not same_json(ours, theirs):
                 return "message:%d:%s" % (index, ours.get("role"))
         if not same_echo(client[offset], snapshot.echo, defaults):
             return "echo:" + _echo_difference(client[offset], snapshot.echo)
@@ -422,6 +423,27 @@ def _complete_turns(messages, seen):
     return not pending and (not messages or messages[-1].get("role") != "assistant")
 
 
+def same_json(a, b):
+    """True when two parsed JSON values are the same values.
+
+    Python's == also says True == 1 and False == 0, so a history that held 1 where the model wrote true was taken for the
+    conversation the signed reply belongs to (bug summary of 2026-11-06, section 3, item 14)."""
+    try:
+        return _same_json(a, b)
+    except RecursionError:  # nested past what is worth comparing: not the same, and the turn goes the unsigned way
+        return False
+
+
+def _same_json(a, b):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return len(a) == len(b) and all(key in b and _same_json(value, b[key]) for key, value in a.items())
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(map(_same_json, a, b))
+    return a == b
+
+
 def tool_defaults(tools):
     """{tool name: {argument: default}} from the client's own tool schemas, for the arguments that declare a default."""
     found = {}
@@ -444,7 +466,7 @@ def same_echo(theirs, ours, defaults=None):
     false of Edit), so an argument that holds its schema default counts as absent on both sides. Before, such an echo
     failed the check and the next turn went cold, rewriting the whole cached conversation (Claude Desktop test run of
     2026-11-06: 233k tokens, 30.7 credits for one Edit)."""
-    if theirs == ours:
+    if same_json(theirs, ours):
         return True
     if not defaults or not isinstance(theirs, dict) or not isinstance(ours, dict):
         return False
@@ -455,11 +477,11 @@ def same_echo(theirs, ours, defaults=None):
             if isinstance(block, dict) and block.get("type") == "tool_call" and isinstance(block.get("toolInput"), dict):
                 known = defaults.get(block.get("toolName")) or {}
                 block = dict(block, toolInput={key: value for key, value in block["toolInput"].items()
-                                               if known.get(key, _MISSING) != value})
+                                               if not same_json(known.get(key, _MISSING), value)})
             blocks.append(block)
         return dict(message, content=blocks)
 
-    return without_defaults(theirs) == without_defaults(ours)
+    return same_json(without_defaults(theirs), without_defaults(ours))
 
 
 _SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")
@@ -485,7 +507,7 @@ def _echo_difference(ours, theirs):
         return "role"
     calls = [[b for b in m.get("content") or [] if b.get("type") == "tool_call"] for m in (ours, theirs)]
     for field, label in (("toolCallId", "call_ids"), ("toolName", "names"), ("toolInput", "arguments")):
-        if [b.get(field) for b in calls[0]] != [b.get(field) for b in calls[1]]:
+        if not same_json([b.get(field) for b in calls[0]], [b.get(field) for b in calls[1]]):
             return label
     return "text"
 
