@@ -381,6 +381,7 @@ def test_the_limits_table_names_every_limit_constant_with_its_value():
         "MAX_EDITS": str(pp.MAX_EDITS),
         "MAX_PATTERN_CHARS": str(pp.MAX_PATTERN_CHARS),
         "MAX_PATTERN_WEIGHT": grouped(pp.MAX_PATTERN_WEIGHT),
+        "REGEX_WORK": grouped(pp.REGEX_WORK),
         "REGEX_TIMEOUT": seconds(pp.REGEX_TIMEOUT),
         "REGEX_BUDGET": seconds(pp.REGEX_BUDGET),
         "MAX_MATCHES": grouped(pp.MAX_MATCHES),
