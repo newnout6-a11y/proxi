@@ -1216,7 +1216,8 @@ class TurnRunner:
                                             arguments=_preview(event.get("arguments")), streamed=True,
                                             args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
                                     out.put({key: value for key, value in event.items() if key != "partial"}
-                                            | {"tool_type": definition.get("x-client-type", "function")})
+                                            | {"tool_type": definition.get("x-client-type", "function"),
+                                               "done": not event.get("partial")})
                                 elif event["type"] == "tool_call":
                                     # A call of a tool the client did not declare (under a forced choice, of another
                                     # tool) has nothing to run it on the client and is not passed on; the journal names
