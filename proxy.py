@@ -26,6 +26,7 @@ from redact import redact
 import config as config_module
 import conversation_infer
 import conversation_state
+import forced_choice
 import generation
 import models as model_catalog
 import sse
@@ -274,7 +275,7 @@ def make_handler(runtime: Runtime):
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
             self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after, "
                              "x-proxi-ignored-parameters, x-proxi-system-messages, "
-                             "x-proxi-thinking-display, x-proxi-output-format")
+                             "x-proxi-thinking-display, x-proxi-output-format, x-proxi-tool-choice")
 
         def _json(self, status, payload, extra=None):
             self._status = status
@@ -744,6 +745,8 @@ def make_handler(runtime: Runtime):
                 compatibility_headers['x-proxi-model-substituted'] = '%s=%s' % (parsed.requested_model, substituted)
             if parsed.structured_output:
                 compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
+            if forced_choice.requirement(parsed.model, parsed.tools, parsed.tool_choice) is not None:
+                compatibility_headers['x-proxi-tool-choice'] = 'emulated'
             if 'thinking.display' in parsed.declared_ignored:
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
             if parsed.declared_ignored:

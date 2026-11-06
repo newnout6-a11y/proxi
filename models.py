@@ -291,6 +291,26 @@ for _name, _limit in _ROUTE_INPUT_TOKENS.items():
     _BY_ID[_name]['route_input_tokens'] = _limit
 
 
+def _is_claude_route(model):
+    """A catalog id of the Anthropic provider; a name the catalog lacks (strict_models off) counts when it says claude."""
+    entry = _BY_ID.get(model)
+    return entry['provider'] == 'anthropic' if entry else str(model or '').startswith('claude')
+
+
+def refuses_forced_tool_choice(model):
+    """True when Retool answers 400 to tool_choice any/required/named for the route: every Claude model, with and
+    without thinking, at every effort (live probes of 2026-11-06). GPT and GLM take both natively. The relay asks for
+    the call in words instead (forced_choice)."""
+    return _is_claude_route(model)
+
+
+def ignores_output_cap(model):
+    """True when the route takes maxCompletionTokens and does not keep it: a cap of 300 returned 5,466 tokens and
+    end_turn from Claude (live probes of 2026-11-06). GPT and GLM keep it. The relay cuts the reply itself
+    (adapters.OutputCapAdapter)."""
+    return _is_claude_route(model)
+
+
 def _today():
     return datetime.datetime.now(datetime.timezone.utc).date()
 

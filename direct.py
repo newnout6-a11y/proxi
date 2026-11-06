@@ -25,6 +25,7 @@ import urllib.request
 import apierr
 import conversation_state
 import credits
+import forced_choice
 import journal
 import client_context
 import console_log
@@ -1385,6 +1386,11 @@ def scope_effort(scope):
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
     """Yield normalised relay events from the direct NDJSON stream."""
+    # A route that refuses a forced choice is sent `auto` (forced_choice): the choice is neither sent nor part of the scope
+    # of the branch, which the next request continues whatever it forces.
+    required = forced_choice.requirement(model_provider.get("model"), tools, tool_choice)
+    if required is not None:
+        tool_choice = "auto"
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
@@ -1528,9 +1534,15 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         # Start the scheduler with the turn, not after it: a session's first long
         # turn needs its anchored during-turn ping too.
         _ensure_keepwarm(session, cfg)
+
+    def open_stream(sent):
+        # Only a route that refuses a forced choice has a requirement: its reply is held until it holds the call.
+        return (_forced_stream(cfg, session, sent, param_types, required) if required is not None
+                else _stream_body(cfg, session, sent, param_types))
+
     try:
         try:
-            async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+            async with contextlib.aclosing(open_stream(body)) as stream:
                 async for event in stream:
                     note(event)
                     yield event
@@ -1551,7 +1563,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             body = {key: value for key, value in body.items() if key != "metadata"}
             if body.get("openAICacheKey"):
                 session._turn_body = body
-            async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+            async with contextlib.aclosing(open_stream(body)) as stream:
                 async for event in stream:
                     note(event)
                     yield event
@@ -1679,6 +1691,51 @@ def _dump_empty_once(payload, flags, cfg, session, model=None):
                  diagnostic_id=stamp)
     budget.empty_dump_id = stamp
     return stamp
+
+
+def _asked_for_call(body, text):
+    """The body with `text` as one more user turn after its last message.
+
+    Nothing of the body moves: the turn carries no cache mark and is not in the history that gets stored, so a request that
+    continues this one finds the prefix the cache holds. Only the integrity hint is made again, as it covers the messages."""
+    messages = [*body["messages"], {"role": "user", "content": [{"type": "text", "text": text}]}]
+    return {**body, "messages": messages, "rit": make_rit(messages, body.get("tools"))}
+
+
+async def _forced_stream(cfg, session, body, param_types, required):
+    """_stream_body for a route that refuses a forced tool choice: the call is asked for in words, and the reply checked.
+
+    The reply is released once it holds the call (forced_choice.Gate). An attempt that ends without it is asked again once,
+    more firmly: nothing of it reaches the client (its thinking, its text and the calls of other tools are dropped) and its
+    cost still counts. A second miss is the error a route that ignored a native choice earns in the orchestrator. Only the
+    accepted attempt leaves its reply on the session for the history to keep."""
+    attempt = 0
+    while True:
+        attempt += 1
+        gate = forced_choice.Gate(required)
+        end = None
+        sent = _asked_for_call(body, forced_choice.instruction(required, firm=attempt > 1))
+        async with contextlib.aclosing(_stream_body(cfg, session, sent, param_types)) as stream:
+            async for event in stream:
+                if event.get("type") == "end":
+                    end = event  # judged below: an attempt that missed the call must not end the turn
+                    continue
+                for ready in gate.feed(event):
+                    yield ready
+        if end is None:
+            return  # the stream ended with its error event, which the gate let through
+        if gate.complied or end.get("reason") == "cancelled":
+            yield end
+            return
+        budget = getattr(session, "_attempt_budget", None) or AttemptBudget()
+        final = attempt > 1 or not budget.remaining
+        journal.emit("turn.forced_choice_missed",
+                     "Модель не вызвала требуемый инструмент%s" % ("" if final else ": повтор с усиленной просьбой"),
+                     "warn", model=body.get("model"), tool=required.named, called=gate.called, wrote_text=gate.text,
+                     attempt=attempt)
+        if final:
+            raise budget.error("upstream_tool_choice_ignored" if gate.text or gate.called else "upstream_empty_turn",
+                               "upstream did not honor the required client tool choice")
 
 
 async def _stream_body(cfg, session, body, param_types=None, *, payload=None):

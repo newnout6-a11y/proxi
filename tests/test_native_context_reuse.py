@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import models
 import validate
 from orchestrator import TurnRunner
 from session import SessionPool, StartResult
@@ -44,6 +45,15 @@ def request(messages, *, key="header:client-a", system="CLIENT_SYSTEM", tools=No
 def continued(messages, label="NEXT_RESULT"):
     return copy.deepcopy(messages) + [{"role": "assistant", "content": "ready"},
                                       {"role": "user", "content": label}]
+
+
+def native_choice_route(parsed, choice):
+    """A request whose route takes a forced tool choice itself (GPT, GLM): what the orchestrator checks is a route that
+    ignores such a choice. Claude refuses it and gets the call asked for in words, with a second attempt
+    (test_forced_choice). The account needs a resource for the route: openai_provider_resource_name."""
+    parsed.entry, parsed.model = models.resolve("gpt-6.1-sol")[0], "gpt-6.1-sol"
+    parsed.tool_choice = choice
+    return parsed
 
 
 class Socket:
