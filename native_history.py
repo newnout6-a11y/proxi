@@ -354,7 +354,7 @@ class History:
             calls = [b["toolCallId"] for b in snapshot.assistant if b["type"] == "tool_call"]
             results = [m["content"]["toolCallId"] for m in tail[:len(calls)] if m["role"] == "tool"]
             if (len(results) != len(calls) or len(set(results)) != len(results) or set(results) != set(calls)
-                    or any(m["role"] != "user" for m in tail[len(calls):])):
+                    or not _complete_turns(tail[len(calls):], set(calls))):
                 continue
             return snapshot, snapshot.messages + [{"role": "assistant", "content": snapshot.assistant}] + tail
         return None, None
@@ -386,6 +386,40 @@ class History:
 
 
 _MISSING = object()
+
+
+def _complete_turns(messages, seen):
+    """True when what follows a kept reply's tool results is whole turns in the client's own words.
+
+    A reply the relay could not keep (a stream cut by a network error, a reply the user stopped) stays in the client's
+    history as an assistant message of its own, usually with a tool call answered by an error, before the client's next
+    message. Before, any assistant message there sent the next request cold, and the whole cached conversation was
+    written again: 281k and 617k tokens (14 and 31 credits) after a few seconds without internet on 2026-11-06. Such
+    turns now follow the kept reply as they are, unsigned, the way a cold replay sends every turn: text and tool calls,
+    each call answered before the next turn, no call id used twice, and no call left open at the end."""
+    pending = set()
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            call_id = message["content"]["toolCallId"]
+            if call_id not in pending:
+                return False
+            pending.discard(call_id)
+            continue
+        if pending:
+            return False
+        if role == "assistant":
+            for block in message["content"]:
+                if block["type"] not in ("text", "tool_call"):
+                    return False
+                if block["type"] == "tool_call":
+                    if block["toolCallId"] in seen:
+                        return False
+                    seen.add(block["toolCallId"])
+                    pending.add(block["toolCallId"])
+        elif role != "user":
+            return False
+    return not pending and (not messages or messages[-1].get("role") != "assistant")
 
 
 def tool_defaults(tools):
