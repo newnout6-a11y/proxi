@@ -7,6 +7,7 @@ import json
 import native_history
 import generation
 import math
+import re
 import socket
 import urllib.parse
 import urllib.request
@@ -555,6 +556,12 @@ def _tools(data):
                 result.append(nested)
             continue
         if kind not in ("function", "custom"):
+            if isinstance(kind, str) and re.fullmatch(r"[a-z][a-z_]*_\d{8}", kind):
+                # web_search_20250305 and the like: the provider runs these itself, and the Retool route has none of
+                # them. Claude Code's WebSearch sends one; naming it lets the model turn to a client tool at once.
+                raise unprocessable(f"{where} is a server tool of the provider ('{kind}'), which the Retool route "
+                                    "cannot run: it runs client tools (functions) only. Use a client tool instead, "
+                                    "such as a search MCP server or WebFetch", param=where + ".type")
             raise unprocessable(f"{where}.type must be 'function' or 'custom'", param=where + ".type")
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
         name = fn.get("name")
