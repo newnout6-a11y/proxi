@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 import json
 import urllib.parse
+import weakref
 
 INSTRUCTION_ROLES = ("system", "developer")
 INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
@@ -382,6 +383,25 @@ def echo(blocks, param_types, coerce):
     return canonical_assistant(visible)
 
 
+def deliverable(reply, names, param_types, coerce):
+    """The reply `(blocks, echo)` as the client has it when only the calls of the tools `names` reached it, or None.
+
+    The relay passes on a call only when the client can run it: one of a tool that was not declared, or, under a named
+    choice, of another tool than the named one, is dropped (orchestrator, `tool.call_dropped`). The model made that call
+    all the same, so the reply kept as a branch had a call the client never echoes, and its next request could not
+    continue the branch: history reset and the prefix written again (a5, C4). The branch is the reply without the
+    dropped calls: its thinking blocks, which carry the signatures, stay as they are, and the message the client
+    echoes is the message the branch holds. None when nothing is left that the client received (no text and no call),
+    so that nothing is recorded."""
+    blocks, _ = reply
+    kept = [block for block in blocks if block["type"] != "tool_call" or block["toolName"] in names]
+    if len(kept) == len(blocks):
+        return reply
+    if not any(block["type"] in ("text", "tool_call") for block in kept):
+        return None
+    return kept, echo(kept, param_types, coerce)
+
+
 @dataclass(frozen=True, eq=False)
 class Snapshot:
     scope: str
@@ -396,10 +416,12 @@ class Snapshot:
 class History:
     """Bounded live branches; sequential tool turns replace their parent snapshot.
 
-    `revision` counts the recorded snapshots: the stored copy of a conversation is rewritten when it moves."""
+    `revision` counts the recorded snapshots: the stored copy of a conversation is rewritten when it moves. `pruned`
+    holds the branches that were recorded without a call the model made (deliverable): a shape upstream may refuse."""
     def __init__(self):
         self.branches = []
         self.revision = 0
+        self.pruned = weakref.WeakSet()
 
     def resume(self, scope, client, defaults=None):
         for snapshot in reversed(self.branches):
@@ -434,10 +456,19 @@ class History:
                 return snapshot, snapshot.messages + client[offset:]
         return None, None
 
-    def record(self, scope, client, messages, blocks, expected, parent=None):
+    def record(self, scope, client, messages, blocks, expected, parent=None, pruned=False):
         self.branches = [s for s in self.branches if s is not parent]
-        self.branches.append(Snapshot(scope, copy.deepcopy(client), messages, blocks, expected))
+        snapshot = Snapshot(scope, copy.deepcopy(client), messages, blocks, expected)
+        self.branches.append(snapshot)
+        if pruned:
+            self.pruned.add(snapshot)
         self.branches = self.branches[-8:]
+        self.revision += 1
+
+    def forget_pruned(self):
+        """Drop the branches that were recorded without a call; the next request starts that history again."""
+        self.branches = [s for s in self.branches if s not in self.pruned]
+        self.pruned.clear()
         self.revision += 1
 
     def mismatch(self, scope, client, defaults=None):

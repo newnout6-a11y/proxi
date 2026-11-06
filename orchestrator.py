@@ -1165,6 +1165,7 @@ class TurnRunner:
                     visible_text = ""
                     holder["upstream_started_at"] = time.time()
                     streamed_tool_call = False
+                    dropped_calls = []
                     upstream_completed = False
                     stream_prompt = prompt
                     # Token estimates must describe what the model actually received.
@@ -1211,6 +1212,9 @@ class TurnRunner:
                             chunks)
                         direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
                                                                  if native_tools else None)
+                        # Which calls the client can receive: a call of another tool is dropped below, and is no part
+                        # of what the turn delivered or of the branch kept for it (direct.iter_events).
+                        direct_target._native_callable_tools = list(tool_names) if native_tools else None
                         direct_target._native_tool_defaults = (native_history.tool_defaults(parsed.tools)
                                                                if native_tools else None)
                         # Relay-only retry instructions live in chunks; a cold
@@ -1325,6 +1329,7 @@ class TurnRunner:
                                     # tool) has nothing to run it on the client and is not passed on; the journal names
                                     # it instead of losing it without a trace (ultracode audit of the relay, C4).
                                     if not event.get("partial"):
+                                        dropped_calls.append(event.get("name"))
                                         log("tool.call_dropped",
                                             "Вызов инструмента %s не передан клиенту: клиент его не объявлял" % (
                                                 event.get("name"),),
@@ -1450,10 +1455,13 @@ class TurnRunner:
                                   "For this requested task, issue the appropriate client tool call now.")
                         continue
                     if tool_names and (choice == "required" or isinstance(choice, dict)):
-                        # Same error shape as an empty turn: diagnostic_id and attempt count.
+                        # Same error shape as an empty turn: diagnostic_id and attempt count. A reply whose only calls
+                        # were dropped is no empty turn: the model answered, with a call the client cannot receive.
                         raise holder["_attempt_budget"].error(
-                            "upstream_tool_choice_ignored" if final_text.strip() else "upstream_empty_turn",
-                            "upstream did not honor the required client tool choice")
+                            "upstream_tool_choice_ignored" if final_text.strip() or dropped_calls else "upstream_empty_turn",
+                            "upstream did not honor the required client tool choice" + (
+                                " (it called only %s, which this request does not offer)" % ", ".join(
+                                    sorted({str(name)[:60] for name in dropped_calls})[:5]) if dropped_calls else ""))
 
                     # Once the summary turn is requested, nothing is executed any more.
                     can_exec = self._can_exec(exec_steps) and not final_summary and not client_owns_instructions

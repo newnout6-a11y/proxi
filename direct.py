@@ -53,6 +53,17 @@ _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
 # Whether upstream refused a body that carried a cache hint on the result of a tool; once it did, no body carries one for
 # the rest of the run (see _hints_tool_results and the retry in iter_events).
 _TOOL_RESULT_HINTS = {"refused": False}
+# Whether upstream refused a body whose branch had lost a call (native_history.deliverable) and answered the same request
+# without that branch; once it did, no reply is cut down that way for the rest of the run.
+_PRUNING = {"refused": False}
+
+
+def _anthropic_route(model):
+    """Whether Anthropic's API serves this model: the route with cache breakpoints and signed thinking blocks."""
+    try:
+        return model_catalog.resolve(model, strict=True)[0].get("provider") == "anthropic"
+    except apierr.ApiError:
+        return False
 
 
 def _hints_tool_results(model):
@@ -60,12 +71,7 @@ def _hints_tool_results(model):
 
     Only the Anthropic route has breakpoints (the others cache by themselves), and only until upstream has refused a body
     that carried one: the shape of that hint was never seen accepted, which is why it can switch itself off."""
-    if _TOOL_RESULT_HINTS["refused"]:
-        return False
-    try:
-        return model_catalog.resolve(model, strict=True)[0].get("provider") == "anthropic"
-    except apierr.ApiError:
-        return False
+    return not _TOOL_RESULT_HINTS["refused"] and _anthropic_route(model)
 
 
 def _has_tool_result_hint(messages):
@@ -1437,7 +1443,10 @@ def scope_effort(scope):
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
-    """Yield normalised relay events from the direct NDJSON stream."""
+    """Yield normalised relay events from the direct NDJSON stream.
+
+    `session._native_callable_tools` names the tools whose calls reach the client (None: every call does); a call of
+    another tool is dropped by the caller and is not part of what the turn delivered, nor of the branch recorded for it."""
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
     # The summary of a client's compaction is a side request: the client replaces its history by that summary and
@@ -1460,6 +1469,9 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         # A compaction that forks from the last request (History.resume_fork) continues the prefix that request cached.
         parent, messages = history.resume_fork(scope, client)
         forked = messages is not None
+    # A branch that lost a call is a shape upstream was never seen to accept: a refusal that blames the blocks of the
+    # history sends the same request again from the client's own messages (below).
+    pruned_parent = bool(parent is not None and not forked and parent in getattr(history, "pruned", ()))
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
         body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools,
@@ -1518,6 +1530,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     rejected = False
     # A completed answer that asked for no tool is final: a subagent that gave one is done.
     asked_tool, ended = False, None
+    callable_names = getattr(session, "_native_callable_tools", None)
+    callable_names = None if callable_names is None else frozenset(callable_names)
     # What the turn delivered decides what it may become: only a usable answer is a keepwarm body.
     wrote_text = thinking_seen = errored = began = False
     failure = None
@@ -1589,7 +1603,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         began = began or event.get("type") != "usage_start"
         kind = event.get("type")
         if kind == "tool_call" and not event.get("partial") and not event.get("invalid"):
-            asked_tool = True
+            asked_tool = asked_tool or callable_names is None or event.get("name") in callable_names
         elif kind == "end":
             ended = event.get("reason")
         elif kind == "text":
@@ -1623,6 +1637,26 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             said = (error.message or "").lower()
             plausible = "cache" in said or said.strip() in ("", "{}") or "invalid request format" in said
             about_branch = conversation_state.blocks_refused(error) and "cache" not in said
+            if pruned_parent and not began and not assist and about_branch and error.status in (400, 422):
+                # Upstream refused the history of a branch that had lost a call: forget those branches and ask again from
+                # what the client sent (no signatures, like any first request after a reset). If that is answered the
+                # shape was the cause, and replies are no longer cut down that way for the rest of the run.
+                history.forget_pruned()
+                upstream_status = getattr(error, "upstream_status", None) or error.status
+                answered = False
+                async with contextlib.aclosing(iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice,
+                                                           max_tokens, chunks)) as again:
+                    async for event in again:
+                        if not answered and event.get("type") != "usage_start":
+                            answered = True
+                            _PRUNING["refused"] = True
+                            journal.emit("native_history.prune_refused",
+                                         "Upstream отклонил историю без вызова, которого клиент не получил (HTTP %s): "
+                                         "запрос повторён с нуля, дальше ответы так не режутся" % upstream_status, "warn",
+                                         status=upstream_status, upstream_message=(error.message or "").replace("\n", " ")[:160],
+                                         model=model_provider.get("model"))
+                        yield event
+                return
             if rebuild is not None and not began and not assist and plausible and not about_branch \
                     and error.status in (400, 422):
                 # Upstream refused a body that carries a cache hint on the result of a tool, a shape that was never seen
@@ -1667,12 +1701,26 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                         note(event)
                         yield event
         reply = getattr(session, "_direct_reply", None)
+        pruned = False
+        if (reply is not None and callable_names is not None and not _PRUNING["refused"]
+                and _anthropic_route(model_provider.get("model"))):
+            # Only on the Anthropic route, where a signature belongs to its thinking block alone: OpenAI wants a reasoning
+            # item followed by the item it was made with, so a call cannot be left out there.
+            kept = native_history.deliverable(reply, callable_names, param_types, coerce_arguments)
+            if kept is not reply:
+                journal.emit("native_history.pruned",
+                             "В ветку не записаны вызовы, которых клиент не получил: %s" % ", ".join(sorted(
+                                 {block["toolName"] for block in reply[0]
+                                  if block["type"] == "tool_call" and block["toolName"] not in callable_names})),
+                             "info", kept=kept is not None)
+                pruned = kept is not None
+            reply = kept
         # Recording a compaction's summary would put a branch nobody extends in place of the parent it resumed
         # (a nudged or repeated compaction, a background one beside the chat, or the chat itself after an abandoned
         # compaction would then start from nothing), so the dialog's branches stay as the chat left them.
         if client is not None and history is not None and reply is not None and not session._cancelled and not side_request:
             blocks, expected = reply
-            history.record(scope, client, body["messages"], blocks, expected, parent)
+            history.record(scope, client, body["messages"], blocks, expected, parent, pruned=pruned)
     except apierr.ApiError as error:
         if error.status in (400, 422) and parent is not None:
             # A branch read back from disk is not replayed again once upstream has refused its blocks: the next
