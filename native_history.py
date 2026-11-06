@@ -97,9 +97,12 @@ def client_messages(messages, image_converter, *, lead=None):
         blocks = []
         for block in value:
             if isinstance(block, str):
-                blocks.append({"type": "text", "text": block})
+                if block:
+                    blocks.append({"type": "text", "text": block})
             elif block.get("type") in ("text", "input_text", "output_text", "summary_text"):
-                blocks.append({"type": "text", "text": block["text"]})
+                # Upstream refuses an empty text block; the text bridge leaves it out as well.
+                if block["text"]:
+                    blocks.append({"type": "text", "text": block["text"]})
             elif block.get("type") in ("image", "image_url", "input_image") or "imageData" in block:
                 blocks.append(image_converter(block, "native history"))
             elif block.get("type") == "tool_reference" and isinstance(block.get("tool_name"), str) and block["tool_name"]:
@@ -170,14 +173,15 @@ def client_messages(messages, image_converter, *, lead=None):
                 pending = []
                 for block in ([{"type": "text", "text": value}] if isinstance(value, str) else value or []):
                     if isinstance(block, dict) and block.get("type") == "tool_result":
-                        if pending:
+                        if pending and content(pending):
                             result.append({"role": "user", "content": content(pending)})
-                            pending = []
+                        pending = []
                         result.append(tool_result(block.get("tool_use_id") or block.get("tool_call_id"),
                                                   block.get("content"), block.get("is_error", False)))
                     else:
                         pending.append(block)
-                if pending:
+                # A user turn of nothing but empty text has nothing to say upstream, which refuses an empty message.
+                if pending and content(pending):
                     result.append({"role": "user", "content": content(pending)})
             else:
                 raise ValueError("unsupported role")
