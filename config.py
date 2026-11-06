@@ -14,6 +14,7 @@ import time
 
 from apierr import service_unavailable
 import models
+import web_search
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
@@ -79,6 +80,14 @@ DEFAULTS = {
     # Retool's Claude routes have no xhigh. A request for it is served at this level instead of failing: high (what the
     # nearest-level rule picks too) or max. Read from the config like allow_effort_downgrade, so a change needs a restart.
     "claude_xhigh_effort": "high",
+    # WebSearch of Claude Code (a server tool of the provider that Retool cannot run): "" refuses it with a 422, "exa" lets the
+    # relay run the model's searches on Exa (POST /search). The key is read from the environment variable named here and is never
+    # kept in config.json; a missing variable leaves the refusal in place and the start prints a warning.
+    "web_search_provider": "",
+    "web_search_key_env": "EXA_API_KEY",
+    "web_search_endpoint": "https://api.exa.ai",
+    "web_search_results": 5,      # pages the provider returns per search (the model reads them all)
+    "web_search_timeout": 20,     # seconds one search may take
     # A client's compaction (the request that summarizes its history so that the client can replace it) runs on the effort
     # of the signed branch it resends: another effort restarts that history and the provider's cached messages, and the
     # whole conversation is written again. False lets the effort the client sends decide, as for any other request.
@@ -431,6 +440,25 @@ def _provider_access_warnings(cfg, record, name):
     return warnings
 
 
+def _check_web_search(cfg):
+    """The WebSearch settings of a config: a provider the relay knows, the name of the variable that holds its key, and bounds."""
+    if cfg["web_search_provider"] not in ("",) + web_search.PROVIDERS:
+        raise service_unavailable("web_search_provider must be one of: \"\", " + ", ".join(web_search.PROVIDERS))
+    if not isinstance(cfg["web_search_key_env"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}",
+                                                                        cfg["web_search_key_env"]):
+        raise service_unavailable("web_search_key_env must be the name of an environment variable (the key itself "
+                                  "does not belong in config.json)")
+    endpoint = cfg["web_search_endpoint"]
+    if not isinstance(endpoint, str) or not re.fullmatch(r"https?://[^\s/?#]+(/[^\s?#]*)?", endpoint):
+        raise service_unavailable("web_search_endpoint must be an http(s) address")
+    results, timeout = _whole_number(cfg["web_search_results"]), cfg["web_search_timeout"]
+    if results is None or not 1 <= results <= 20:
+        raise service_unavailable("web_search_results must be a whole number from 1 to 20")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 120:
+        raise service_unavailable("web_search_timeout must be a number of seconds from 1 to 120")
+    cfg["web_search_results"] = results
+
+
 def _whole_number(value):
     """The integer a setting says: a whole number or its text; None for true/false, a fraction or anything else."""
     if type(value) is int:
@@ -533,6 +561,7 @@ def _load(path):
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     if cfg["claude_xhigh_effort"] not in models.XHIGH_REPLACEMENTS:
         raise service_unavailable("claude_xhigh_effort must be one of: " + ", ".join(models.XHIGH_REPLACEMENTS))
+    _check_web_search(cfg)
     if type(cfg["compaction_keep_effort"]) is not bool:
         raise service_unavailable("compaction_keep_effort must be a boolean")
     if type(cfg["infer_conversations"]) is not bool:
@@ -659,6 +688,12 @@ def _load(path):
                 if val and not HOSTNAME.fullmatch(val) and val not in cookie_vals:
                     cookie_vals.append(val)
     cfg["cookie_values"] = cookie_vals
+    search_key = web_search.key_of(cfg)
+    if search_key and search_key not in cookie_vals:
+        cookie_vals.append(search_key)  # masked wherever the relay redacts secrets, should it ever show up in a message
+    if cfg["web_search_provider"] and not search_key:
+        warnings.append("web_search_provider is %s, but the environment variable %s holds no key: WebSearch stays refused"
+                        % (cfg["web_search_provider"], cfg["web_search_key_env"]))
     cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
     cfg["config_warnings"] = warnings
     for text in warnings:

@@ -92,6 +92,9 @@ class _Base:
         elif kind == "tool_call":
             self._attempt_observed = True
             self._feed_tool_call(event)
+        elif kind == "server_tool_result":
+            self._attempt_observed = True
+            self._server_result(event)
         elif kind == "credits":
             self._attempt_observed = True
             value = event.get('value')
@@ -192,6 +195,9 @@ class _Base:
             current = {"id": call_id, "name": name, "arguments": ""}
             if event.get("tool_type") == "custom" or name in self._custom_tools:
                 current["tool_type"] = "custom"
+            if event.get("server"):
+                # A tool the provider runs for the client (web_search): its own block type, never a call to answer.
+                current["server"] = str(event["server"])
             self.tool_calls.append(current)
         if arguments.startswith(current["arguments"]):
             delta = arguments[len(current["arguments"]):]
@@ -203,6 +209,9 @@ class _Base:
         self._tool_call(self.tool_calls.index(current), current, delta, new=is_new)
 
     def _tool_call(self, index, call, delta, new=False):
+        pass
+
+    def _server_result(self, event):
         pass
 
     def payload(self, reason, prompt_text=None):
@@ -594,6 +603,8 @@ class AnthropicAdapter(_Base):
         self._open_indices = set()
         self._tool_indices = {}
         self._deferred = []
+        # Searches the relay ran for the client (web_search_tool_result blocks that hold results): usage.server_tool_use.
+        self.web_searches = 0
 
     def _emit(self, name, payload):
         if self.writer:
@@ -700,11 +711,12 @@ class AnthropicAdapter(_Base):
                 self._close_blocks()
             self.open_kind = "tool"
             self.index = len(self._blocks)
-            self._blocks.append({"type": "tool_use", "id": call["id"], "name": call["name"], "input": {}})
+            kind = "server_tool_use" if call.get("server") else "tool_use"
+            self._blocks.append({"type": kind, "id": call["id"], "name": call["name"], "input": {}})
             self._tool_indices[call["id"]] = self.index
             self._open_indices.add(self.index)
             self._emit("content_block_start", {"type": "content_block_start", "index": self.index,
-                                               "content_block": {"type": "tool_use", "id": call["id"],
+                                               "content_block": {"type": kind, "id": call["id"],
                                                                  "name": call["name"], "input": {}}})
         block_index = self._tool_indices[call["id"]]
         try:
@@ -722,21 +734,36 @@ class AnthropicAdapter(_Base):
             if not self._open_tools():
                 self._release()
 
+    def _server_result(self, event):
+        """The result of a server tool the relay ran: one block, delivered whole (Anthropic streams it in its start event)."""
+        self._close_blocks()
+        content = event.get("content")
+        block = {"type": "web_search_tool_result", "tool_use_id": str(event.get("tool_use_id")), "content": content}
+        self.index = len(self._blocks)
+        self._blocks.append(block)
+        self._emit("content_block_start", {"type": "content_block_start", "index": self.index, "content_block": block})
+        self._emit("content_block_stop", {"type": "content_block_stop", "index": self.index})
+        if isinstance(content, list):
+            self.web_searches += 1  # a search that failed is not billed, nor counted
+
     def _stop_reason(self, reason):
         if reason in CUT_SHORT:
             return "max_tokens"
         if self.stop_sequence is not None:
             return "stop_sequence"
-        if reason == "tool_calls" or self.tool_calls:
+        if reason == "tool_calls" or any(not call.get("server") for call in self.tool_calls):
             return "tool_use"
         return "end_turn"
+
+    def _usage_extras(self):
+        return {"server_tool_use": {"web_search_requests": self.web_searches}} if self.web_searches else {}
 
     def end(self, reason, prompt_text=None):
         raw_prompt, completion = self.usage(prompt_text)
         non_cached = self.input_tokens if self.input_tokens is not None else max(0, raw_prompt - (self.cache_read or 0) - (self.cache_write or 0))
         usage = {"input_tokens": non_cached, "output_tokens": completion,
                  "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_write,
-                 **self._price_usage()}
+                 **self._usage_extras(), **self._price_usage()}
         self._settle_tools()
         if not self._blocks:
             self._open("text")
@@ -759,7 +786,7 @@ class AnthropicAdapter(_Base):
                 "usage": {"input_tokens": non_cached, "output_tokens": completion,
                           "cache_read_input_tokens": self.cache_read,
                           "cache_creation_input_tokens": self.cache_write,
-                          **self._price_usage(), "estimated": True}}
+                          **self._usage_extras(), **self._price_usage(), "estimated": True}}
 
 
 _THINKING_EVENTS = ('thinking', 'thinking_start', 'thinking_status', 'thinking_signature')
@@ -806,6 +833,8 @@ class StructuredOutputAdapter:
             self.parts.append(event['delta'])
         elif kind == 'tool_call' and self.tools:
             self._release()
+            self.adapter.feed(event)
+        elif kind == 'server_tool_result' and self.tools:
             self.adapter.feed(event)
         elif kind in ('tool_call', 'tool_call_delta', 'tool_start', 'hitl', 'exec_start', 'exec_result'):
             raise apierr.invalid_structured_output('structured output unexpectedly requested an action')
@@ -953,6 +982,7 @@ class OutputCapAdapter:
         self.calls = {}  # the calls upstream has not ended yet, by id: their latest event
         self.capped = False
         self.dropped = 0
+        self.delivered = set()  # the ids of the server tool calls that reached the client: only their results follow
 
     def __getattr__(self, name):
         if name == 'adapter':
@@ -1007,12 +1037,17 @@ class OutputCapAdapter:
             self.dropped += 1
             return
         self.ascii, self.other = ascii_chars, other
+        if event.get('server'):
+            self.delivered.add(str(event.get('id')))
         self.adapter.feed(event)
 
     def feed(self, event):
         kind = event.get('type')
         if kind in self._ACCOUNTING:
             self.adapter.feed(event)
+        elif kind == 'server_tool_result':
+            if str(event.get('tool_use_id')) in self.delivered:
+                self.adapter.feed(event)
         elif self.capped:
             return
         elif kind == 'text':

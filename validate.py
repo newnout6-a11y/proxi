@@ -15,6 +15,7 @@ import urllib.request
 from apierr import bad_request, unprocessable, ApiError
 import models as model_catalog
 import tool_names
+import web_search
 
 MAX_TOKENS_CAP = 1_000_000  # absolute ceiling when a model has no catalog value
 
@@ -117,6 +118,9 @@ class Parsed:
         self.show_thinking = True
         self.tools = []
         self.tool_choice = "auto"
+        # The server tool web_search of an Anthropic request, when the relay runs its searches itself (web_search.spec_of):
+        # {"name", "max_uses", "allowed_domains", "blocked_domains", "country"}. parsed.tools then holds it as a function.
+        self.web_search = None
         self.conversation_key = None
         # The client's model name without @profile and #effort, before alias resolution, and the @profile
         # of a virtual model <model>@<profile>; the prompt layer reads both (prompt_policy.PlanInput).
@@ -320,11 +324,16 @@ def _parse_content(content, index, role, ignored=None):
             failed = " is_error=true" if block.get("is_error") else ""
             chunks.append(f"[tool_result id={call_id}{failed}: {sub_text}]")
             images.extend(sub_images)
-        elif btype in ("tool_use", "tool_call"):
+        elif btype in ("tool_use", "tool_call", "server_tool_use"):
             name = block.get("name") or "tool"
             args = block.get("input", block.get("arguments", {}))
             call_id = block.get("id") or block.get("tool_call_id") or "call"
             chunks.append(f"[tool_call {name} id={call_id}: {json.dumps(args, ensure_ascii=False)}]")
+        elif btype == "web_search_tool_result":
+            # The results of a search the relay ran, echoed inside the assistant message: the model reads them as the
+            # result of the call before them, as it did when they arrived, not as 200 characters of JSON.
+            chunks.append(f"[tool_result id={block.get('tool_use_id') or 'call'}: "
+                          f"{web_search.render_block_content(block.get('content'))}]")
         elif btype in ("thinking", "redacted_thinking"):
             continue
         elif btype in native_history.INLINE_TOOL_BLOCKS:
@@ -512,7 +521,7 @@ def _messages(data, *, min_items=1):
     return messages
 
 
-def _finish(data, parsed, dialect):
+def _finish(data, parsed, dialect, search=False):
     parsed.requested_effort = _effort(data)
     if parsed.requested_effort is None:
         parsed.requested_effort = model_catalog.parse_model_name(data.get("model")).effort
@@ -535,7 +544,7 @@ def _finish(data, parsed, dialect):
         parsed.wants_usage = bool(inc)
     else:
         parsed.wants_usage = True
-    parsed.tools = _tools(data)
+    parsed.tools = _tools(data, parsed if search else None)
     parsed.tool_choice = _tool_choice(data.get("tool_choice"))
     names = [tool["function"]["name"] for tool in parsed.tools]
     if parsed.tool_choice == "required" and not names:
@@ -545,8 +554,12 @@ def _finish(data, parsed, dialect):
     return parsed
 
 
-def _tools(data):
-    """Validate and retain OpenAI/Anthropic-compatible function definitions."""
+def _tools(data, search=None):
+    """Validate and retain OpenAI/Anthropic-compatible function definitions.
+
+    `search` is the Parsed of an Anthropic request that the relay may run web searches for (a provider is configured): its
+    web_search server tool is declared as a function the model can call, and parsed.web_search keeps what the relay needs
+    to run the calls. Without it a server tool of the provider is refused."""
     tools = data.get("tools")
     if tools is None:
         return []
@@ -576,13 +589,24 @@ def _tools(data):
                     raise unprocessable(f"duplicate tool name '{fn['name']}'", param=where + ".name")
                 result.append(nested)
             continue
+        if search is not None and isinstance(kind, str) and web_search.SERVER_TOOL.fullmatch(kind):
+            name = tool.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise unprocessable(f"{where}.name must be a non-empty string", param=where + ".name")
+            if any(item["function"]["name"] == name for item in result):
+                raise unprocessable(f"duplicate tool name '{name}'", param=where + ".name")
+            search.web_search = dict(web_search.spec_of(tool, where), name=name)
+            result.append(web_search.tool_definition(name, search.web_search))
+            continue
         if kind not in ("function", "custom"):
             if isinstance(kind, str) and re.fullmatch(r"[a-z][a-z_]*_\d{8}", kind):
                 # web_search_20250305 and the like: the provider runs these itself, and the Retool route has none of
                 # them. Claude Code's WebSearch sends one; naming it lets the model turn to a client tool at once.
+                how = ("; the relay runs web_search itself once web_search_provider and the key it names are configured "
+                       "(README)" if web_search.SERVER_TOOL.fullmatch(kind) else "")
                 raise unprocessable(f"{where} is a server tool of the provider ('{kind}'), which the Retool route "
                                     "cannot run: it runs client tools (functions) only. Use a client tool instead, "
-                                    "such as a search MCP server or WebFetch", param=where + ".type")
+                                    "such as a search MCP server or WebFetch" + how, param=where + ".type")
             raise unprocessable(f"{where}.type must be 'function' or 'custom'", param=where + ".type")
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
         if kind == "custom" and isinstance(tool.get("custom"), dict):
@@ -834,7 +858,7 @@ def parse_anthropic(data, cfg):
     if stop is not None and not isinstance(stop, list):
         raise unprocessable("'stop_sequences' must be an array", param="stop_sequences")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed, 'anthropic')
+    return _finish(data, parsed, 'anthropic', search=web_search.provider(cfg) is not None)
 
 
 def _effort(data):

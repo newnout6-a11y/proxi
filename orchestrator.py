@@ -28,6 +28,7 @@ from context import build_system_instructions, relay_policy
 from redact import redact
 from session import SessionLease
 from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
+import web_search
 
 
 _CONV_HEADER = "\n\n[CLIENT CONVERSATION — chronological]\n"
@@ -75,6 +76,15 @@ def _preview(value, limit=600):
         return None
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _loads_object(raw):
+    """The JSON object in tool arguments, {} for anything else."""
+    try:
+        value = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _trim(text: str, budget: int) -> str:
@@ -379,6 +389,11 @@ def acquire_plan(cfg, parsed):
     purpose = _purpose(parsed)
     key = getattr(parsed, "conversation_key", None)
     parent_key = getattr(parsed, "parent_conversation_key", None)
+    if getattr(parsed, "web_search", None) and len(getattr(parsed, "tools", None) or ()) == 1:
+        # Claude Code runs WebSearch as a request of its own, carrying the id of the chat it serves: that is a job on its own
+        # (a standalone head, one tool), and on the chat's session it would replace the head and the tools the chat's
+        # signed history and cache are keyed by.
+        return AcquirePlan("isolated", {"isolated": True})
     can_exec = (_can_exec(cfg, 0) and not native_tools
                 and not _client_owns_instructions(parsed, purpose, native_tools))
     persistent_text = (direct_mode and not native_tools and mode != "per_request"
@@ -781,6 +796,49 @@ class TurnRunner:
                 return None
         return None
 
+    async def _run_searches(self, searcher, spec, calls, used, cancelled, log):
+        """Run the search calls of one step: [(call id, content, text)], content as the client gets it, text as the model reads it.
+
+        A call counts against max_uses whether it succeeds or not (Anthropic's rule), and the ones past it get the
+        max_uses_exceeded error as their result, so the model goes on with what it has. A provider that fails, or answers
+        with a refusal, is an error result too: it never fails the turn."""
+        loop = asyncio.get_running_loop()
+        outcomes = []
+        for index, call in enumerate(calls):
+            started, error, detail, results, query = time.time(), None, "", [], None
+            try:
+                arguments = json.loads(call["arguments"] or "{}")
+                query = arguments.get("query") if isinstance(arguments, dict) else None
+            except ValueError:
+                pass
+            if not isinstance(query, str) or not query.strip():
+                error = "invalid_tool_input"
+            elif len(query) > web_search.QUERY_LIMIT:
+                error = "query_too_long"
+            elif used + index >= spec["max_uses"]:
+                error = "max_uses_exceeded"
+            else:
+                try:
+                    # Off the event loop: the provider is an HTTP call that may take seconds.
+                    found = await loop.run_in_executor(None, searcher.search, query.strip(), spec)
+                    results = web_search.within_domains(found, spec)
+                except web_search.SearchError as failure:
+                    error, detail = failure.code, failure.detail
+                except Exception as failure:  # noqa: BLE001 - a provider must never fail the turn
+                    error, detail = "unavailable", type(failure).__name__
+                if cancelled.is_set():
+                    raise asyncio.CancelledError()
+            content = ({"type": "web_search_tool_result_error", "error_code": error} if error
+                       else web_search.result_blocks(results))
+            outcomes.append((call["id"], content, web_search.render_block_content(content)))
+            log("web_search.run", "Поиск%s: %s" % (" не удался (%s)" % error if error else "",
+                                                   _preview(query, 120) if query else "—"),
+                "warn" if error in ("unavailable", "too_many_requests") else "info", call_id=call["id"],
+                query=_preview(query, 300) if query else None, results=len(results), error=error, detail=detail or None,
+                ms=round((time.time() - started) * 1000), provider=self.cfg.get("web_search_provider") or None,
+                allowed_domains=len(spec["allowed_domains"]), blocked_domains=len(spec["blocked_domains"]))
+        return outcomes
+
     async def run(self, parsed, out: queue.Queue, holder: dict):
         """Run a turn; retry on another account after a confirmed low balance or an hourly limit.
 
@@ -875,6 +933,10 @@ class TurnRunner:
         empty_retries = 0
         final_summary = False
         tool_retries = 0
+        # The web_search server tool of an Anthropic request: the model calls it as a function, the relay answers.
+        search_spec = getattr(parsed, "web_search", None)
+        searcher = web_search.provider(self.cfg) if search_spec else None
+        search_uses = search_steps = 0
         turn_started = time.time()
         outcome = {"reason": None, "error": None, "first": False}
         trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None),
@@ -1106,6 +1168,7 @@ class TurnRunner:
                     holder["upstream_started_at"] = time.time()
                     streamed_tool_call = False
                     upstream_completed = False
+                    search_calls = {}  # this step's calls of the search tool that upstream has ended, by id, in order
                     stream_prompt = prompt
                     # Token estimates must describe what the model actually received.
                     parsed._full_prompt_text = (instructions + "\n" + prompt) if instructions else prompt
@@ -1232,6 +1295,15 @@ class TurnRunner:
                                         holder['_attempt_usage'] = {}
                                         holder['_attempt_credited'] = False
                                     out.put(event)
+                                elif (event["type"] == "tool_call" and searcher is not None and direct_mode
+                                      and event.get("name") == search_spec["name"]):
+                                    # The relay's own tool: the client sees a server_tool_use block, not a call to run.
+                                    out.put({key: value for key, value in event.items() if key != "partial"}
+                                            | {"tool_type": "function", "server": "web_search",
+                                               "done": not event.get("partial")})
+                                    if not event.get("partial"):
+                                        search_calls[event.get("id") or event["name"]] = {
+                                            "id": event.get("id") or event["name"], "arguments": event.get("arguments")}
                                 elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                     if not event.get("partial"):
                                         streamed_tool_call = True
@@ -1318,6 +1390,41 @@ class TurnRunner:
                     if holder.get("reason") == "timeout":
                         out.put({"type": "end", "reason": "timeout"})
                         return
+
+                    if search_calls:
+                        outcomes = await self._run_searches(searcher, search_spec, list(search_calls.values()),
+                                                            search_uses, cancelled, log)
+                        search_uses += len(outcomes)
+                        for call_id, content, _ in outcomes:
+                            out.put({"type": "server_tool_result", "tool_use_id": call_id, "content": content})
+                        if not streamed_tool_call and search_steps < search_spec["max_uses"] + 2:
+                            # Only searches this step: the relay is the client of its own tool. The reply goes on from
+                            # the step just ended exactly as a tool loop of a client would continue it: its echo and the
+                            # results join the client's messages, so the signed thinking and the cached prefix are kept
+                            # (and a later request that echoes this reply finds the same history).
+                            search_steps += 1
+                            reply = getattr(direct_target, "_direct_reply", None)
+                            echo = reply[1] if reply else native_history.canonical_assistant(
+                                ([{"type": "text", "text": final_text}] if final_text else [])
+                                + [{"type": "tool_call", "toolCallId": call["id"], "toolName": search_spec["name"],
+                                    "toolInput": _loads_object(call["arguments"])} for call in search_calls.values()])
+                            if getattr(parsed, "native_messages", None) is not None:
+                                parsed.native_messages = [*parsed.native_messages, echo, *(
+                                    {"role": "tool", "content": {"toolCallId": call_id, "toolResult": text}}
+                                    for call_id, _, text in outcomes)]
+                            for position, call in enumerate(search_calls.values()):
+                                client_chunks.append("Assistant: %s\n[tool_call %s id=%s: %s]" % (
+                                    final_text if position == 0 else "", search_spec["name"], call["id"],
+                                    call["arguments"] or "{}"))
+                            client_chunks.extend("[tool result %s id=%s]: %s" % (search_spec["name"], call_id, text)
+                                                 for call_id, _, text in outcomes)
+                            # A forced choice applied to the step that asked for the search, not to the answer after it.
+                            parsed.tool_choice = choice = "auto"
+                            holder["_attempt_budget"].new_step()
+                            continue
+                        if not streamed_tool_call:
+                            log("web_search.loop_stopped", "Цикл поиска остановлен: модель продолжает вызывать поиск "
+                                "после лимита max_uses=%d" % search_spec["max_uses"], "warn", uses=search_uses)
 
                     native_calls = (executor.extract_tool_calls(final_text, tool_names) if tool_names else []) if not direct_mode else []
                     if not direct_mode and not native_calls and tool_names:
@@ -1538,5 +1645,6 @@ class TurnRunner:
             log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
                 "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout") else "success",
                 reason=reason, duration_ms=duration, exec_steps=exec_steps,
-                retries=empty_retries + tool_retries)
+                retries=empty_retries + tool_retries,
+                **({"web_searches": search_uses} if search_uses else {}))
             out.put(None)
