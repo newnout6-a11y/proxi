@@ -72,7 +72,8 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
   которая его принимает (GPT, GLM): Retool отвечает 400 на `required` и имя для каждой модели Claude, поэтому её запросу
   relay отправляет `auto`, а нужный вызов просит словами в последнем сообщении (README, «Ограничения маршрута Retool,
   которые relay обходит»);
-  `maxCompletionTokens` — только если клиент задал лимит, не меньше 16.
+  `maxCompletionTokens` — только если клиент задал лимит, не меньше 16 (маршрут Claude его не соблюдает, и небольшой
+  лимит относительно клиента relay держит сам, `adapters.OutputCapAdapter`).
 - `openAICacheKey` — `sha256(model, 0x00, tools JSON, 0x00, head)[:24]`; `rit` — не криптографический
   hint целостности от длины `messages` и `tools`.
 - Для каждой части `rit` длина — `JSON.stringify(value).length` в единицах UTF-16;

@@ -102,6 +102,8 @@ class Parsed:
         self.requested_effort = None
         self.stream = False
         self.max_tokens = None
+        # The cap the relay enforces itself on a route that ignores it (generation.output_cap); None: the route's own.
+        self.output_cap = None
         self.temperature = None
         self.verbosity = None
         self.structured_title = False
@@ -519,6 +521,7 @@ def _finish(data, parsed, dialect):
     parsed.verbosity, parsed.declared_ignored, parsed.routine_ignored = generation.controls(
         data, parsed.entry, dialect)
     parsed.stop_sequences = generation.stop_sequences(data, dialect)
+    parsed.output_cap = generation.output_cap(parsed.entry, parsed.max_tokens)
     parsed.declared_ignored += [name for name in parsed.inline_tool_changes if name not in parsed.declared_ignored]
     stream_options = data.get("stream_options")
     if stream_options is None:

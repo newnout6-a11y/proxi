@@ -6,6 +6,7 @@ import time
 import uuid
 
 import apierr
+import journal
 import structured
 from credits import token_counter as _token_counter
 from native_history import loads_finite
@@ -15,7 +16,10 @@ def approx_tokens(text: str) -> int:
     return max(0, len(text or "") // 4)
 
 
-FINISH_MAP = {"stop": "stop", "tool_calls": "tool_calls", "hitl": "stop", "timeout": "length", "cancelled": "stop", "max_exec": "length"}
+FINISH_MAP = {"stop": "stop", "tool_calls": "tool_calls", "hitl": "stop", "timeout": "length", "cancelled": "stop", "max_exec": "length",
+              "length": "length"}
+# Reasons that say the reply was cut short, not ended: `length` is the output cap of the request (OutputCapAdapter).
+CUT_SHORT = ("timeout", "length")
 
 
 class _Base:
@@ -522,7 +526,7 @@ class ResponsesAdapter(_Base):
         self._cut_off = reason in ("cancelled", "timeout")
         if not self._items:
             self._ensure_item("message", self.item_id)
-        status = "incomplete" if reason == "timeout" else "completed"
+        status = "incomplete" if reason in CUT_SHORT else "completed"
         for index, (kind, item_id, call) in enumerate(self._items):
             fields = {"item_id": item_id, "output_index": index}
             if kind == "message":
@@ -545,7 +549,7 @@ class ResponsesAdapter(_Base):
                 "output_index": index, "item": self._item(index, status=status),
             })
         final = self.payload(reason, prompt_text)
-        self._emit("response.incomplete" if reason == "timeout" else "response.completed", {"response": final})
+        self._emit("response.incomplete" if reason in CUT_SHORT else "response.completed", {"response": final})
         if self.writer:
             self.writer.done()
         return final
@@ -556,10 +560,12 @@ class ResponsesAdapter(_Base):
         reasoning_details = self._reasoning_details()
         if not self._items:
             self._ensure_item("message", self.item_id)
-        status = "incomplete" if reason == "timeout" else "completed"
+        status = "incomplete" if reason in CUT_SHORT else "completed"
         return {"id": self.id, "object": "response", "created_at": self.created,
                 "model": self.parsed.model,
                 "status": status,
+                # What OpenAI says of a reply that reached its cap; the turn timeout has no such reason to give.
+                **({"incomplete_details": {"reason": "max_output_tokens"}} if reason == "length" else {}),
                 "output": [self._item(index, status=status) for index in range(len(self._items))],
                 "output_text": self.text,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
@@ -717,7 +723,7 @@ class AnthropicAdapter(_Base):
                 self._release()
 
     def _stop_reason(self, reason):
-        if reason == "timeout":
+        if reason in CUT_SHORT:
             return "max_tokens"
         if self.stop_sequence is not None:
             return "stop_sequence"
@@ -921,6 +927,117 @@ class StopSequenceAdapter:
         return self.adapter.payload(self._reason(reason), prompt_text)
 
 
+def output_tokens(ascii_chars, other_chars):
+    """What that much output counts against a cap: Claude's tokenizer takes about 3.5 characters of ASCII per token and
+    about 2 of any other (Cyrillic, CJK, symbols). An estimate, like every count the relay makes when upstream is silent."""
+    return math.ceil(ascii_chars / 3.5 + other_chars / 2)
+
+
+class OutputCapAdapter:
+    """End the reply at the client's output cap, as the provider would: Retool's Claude route takes the cap and ignores it.
+
+    The cap counts what the client gets: text, and a tool call by its name and arguments. Thinking is left out: the route
+    hides most of it, and a cap that paid for it would turn a small cap into an empty reply. Text is cut where the cap is
+    reached. A tool call is delivered whole or not at all: its events wait until upstream ends the call, and one that does
+    not fit is dropped with everything after it, so the client never meets half of a call. The reply then ends as the
+    provider ends one that reached its cap: stop_reason max_tokens, finish_reason length, status incomplete. The upstream
+    generation runs on, as with a stop sequence: what the model writes past the cap is paid for and dropped, and its usage
+    and cost still arrive.
+    """
+    _ACCOUNTING = ('usage_start', 'usage', 'credits')
+
+    def __init__(self, adapter, cap):
+        self.adapter = adapter
+        self.cap = cap
+        self.ascii = self.other = 0  # the characters delivered so far, by how many tokens they cost
+        self.calls = {}  # the calls upstream has not ended yet, by id: their latest event
+        self.capped = False
+        self.dropped = 0
+
+    def __getattr__(self, name):
+        if name == 'adapter':
+            raise AttributeError(name)
+        return getattr(self.adapter, name)
+
+    def begin(self):
+        self.adapter.begin()
+
+    def fail(self, error, extra=None):
+        self.adapter.fail(error, extra)
+
+    @staticmethod
+    def _count(text):
+        ascii_chars = sum(1 for char in text if char < '\x80')
+        return ascii_chars, len(text) - ascii_chars
+
+    def _fit(self, text):
+        """How many leading characters of `text` still fit; they are counted as delivered."""
+        ascii_chars, other = self.ascii, self.other
+        for index, char in enumerate(text):
+            more = (ascii_chars + 1, other) if char < '\x80' else (ascii_chars, other + 1)
+            if output_tokens(*more) > self.cap:
+                self.ascii, self.other = ascii_chars, other
+                return index
+            ascii_chars, other = more
+        self.ascii, self.other = ascii_chars, other
+        return len(text)
+
+    def _text(self, event):
+        delta = event.get('delta') or ''
+        keep = self._fit(delta)
+        if keep:
+            self.adapter.feed(event if keep == len(delta) else {**event, 'delta': delta[:keep]})
+        if keep < len(delta):
+            self.capped = True
+
+    def _call(self, event):
+        key = str(event.get('id') or event.get('name') or 'call')
+        self.calls[key] = event
+        if not event.get('done', True):
+            return  # upstream is still writing its arguments: the client gets the call once it is whole, or not at all
+        event = self.calls.pop(key)
+        arguments = event.get('arguments', '')
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False, separators=(',', ':'))
+        name_ascii, name_other = self._count(str(event.get('name') or ''))
+        args_ascii, args_other = self._count(arguments)
+        ascii_chars, other = self.ascii + name_ascii + args_ascii, self.other + name_other + args_other
+        if output_tokens(ascii_chars, other) > self.cap:
+            self.capped = True
+            self.dropped += 1
+            return
+        self.ascii, self.other = ascii_chars, other
+        self.adapter.feed(event)
+
+    def feed(self, event):
+        kind = event.get('type')
+        if kind in self._ACCOUNTING:
+            self.adapter.feed(event)
+        elif self.capped:
+            return
+        elif kind == 'text':
+            self._text(event)
+        elif kind == 'tool_call':
+            self._call(event)
+        else:
+            self.adapter.feed(event)
+
+    def _reason(self, reason):
+        return 'length' if self.capped and reason in ('stop', 'tool_calls') else reason
+
+    def end(self, reason, prompt_text=None):
+        if self.capped:
+            journal.emit('reply.cut_at_cap', 'Ответ обрезан по max_tokens=%d: клиент получил около %d токенов%s' % (
+                self.cap, output_tokens(self.ascii, self.other),
+                ', вызовов инструментов отброшено: %d' % self.dropped if self.dropped else ''),
+                'info', cap=self.cap, delivered_tokens=output_tokens(self.ascii, self.other),
+                dropped_calls=self.dropped)
+        return self.adapter.end(self._reason(reason), prompt_text)
+
+    def payload(self, reason, prompt_text=None):
+        return self.adapter.payload(self._reason(reason), prompt_text)
+
+
 def for_dialect(dialect, parsed, writer=None):
     if dialect == "anthropic":
         adapter = AnthropicAdapter(parsed, writer)
@@ -936,6 +1053,10 @@ def for_dialect(dialect, parsed, writer=None):
     if stops:
         # Outside the structured check: the reply is cut at its stop sequence first, and what is left is validated.
         adapter = StopSequenceAdapter(adapter, stops)
+    cap = getattr(parsed, 'output_cap', None)
+    if cap:
+        # Outermost: the cap counts what the model wrote, and a stop sequence that came first still ends the reply.
+        adapter = OutputCapAdapter(adapter, cap)
     return adapter
 
 def error_payload(dialect, err):
