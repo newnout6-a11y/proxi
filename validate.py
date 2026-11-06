@@ -14,6 +14,7 @@ import urllib.request
 
 from apierr import bad_request, unprocessable, ApiError
 import models as model_catalog
+import tool_names
 
 MAX_TOKENS_CAP = 1_000_000  # absolute ceiling when a model has no catalog value
 
@@ -473,7 +474,7 @@ def _responses_item(item):
                      if kind == "custom_tool_call" else item.get("arguments") or "")
         name = item.get("name") or "tool"
         if item.get("namespace"):
-            name = str(item["namespace"]) + "." + name
+            name = tool_names.namespaced(str(item["namespace"]), name)
         return {"role": "assistant", "content": "",
                 "tool_calls": [{"id": item.get("call_id") or item.get("id") or "call",
                                 "function": {"name": name,
@@ -550,7 +551,7 @@ def _tools(data):
                 client_name = fn["name"]
                 fn["x-namespace"] = namespace
                 fn["x-client-name"] = client_name
-                fn["name"] = namespace + "." + client_name
+                fn["name"] = tool_names.namespaced(namespace, client_name)
                 if any(item["function"]["name"] == fn["name"] for item in result):
                     raise unprocessable(f"duplicate tool name '{fn['name']}'", param=where + ".name")
                 result.append(nested)
@@ -614,12 +615,12 @@ def _tool_choice(value):
         if choice_type in ("tool", "custom") and isinstance(value.get("name"), str):
             name = value["name"]
             if value.get("namespace"):
-                name = str(value["namespace"]) + "." + name
+                name = tool_names.namespaced(str(value["namespace"]), name)
             return {"type": "function", "function": {"name": name}}
         if choice_type == "function" and fn is None and isinstance(value.get("name"), str):
             name = value["name"]
             if value.get("namespace"):
-                name = str(value["namespace"]) + "." + name
+                name = tool_names.namespaced(str(value["namespace"]), name)
             return {"type": "function", "function": {"name": name}}
         if value.get("type") != "function" or not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
             raise unprocessable("'tool_choice' function form is invalid", param="tool_choice")

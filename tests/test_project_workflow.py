@@ -266,12 +266,18 @@ def test_latest_client_tool_result_follows_tool_schema_in_upstream_prompt(tmp_pa
 def test_tool_envelope_preserves_namespace_and_rejects_ambiguous_short_names():
     def envelope(body):
         return "<tool_call>" + json.dumps(body) + "</tool_call>"
+    allowed = ["multi_agent_v1__spawn_agent"]
     call = executor.extract_tool_call(envelope({"namespace": "multi_agent_v1", "name": "spawn_agent",
-                                               "arguments": {"message": "inspect"}}), ["multi_agent_v1.spawn_agent"])
-    assert call["name"] == "multi_agent_v1.spawn_agent"
+                                               "arguments": {"message": "inspect"}}), allowed)
+    assert call["name"] == "multi_agent_v1__spawn_agent"
     short = envelope({"name": "spawn_agent", "arguments": {}})
-    assert executor.extract_tool_call(short, ["multi_agent_v1.spawn_agent"])["name"] == "multi_agent_v1.spawn_agent"
-    assert executor.extract_tool_call(short, ["a.spawn_agent", "b.spawn_agent"]) is None
+    assert executor.extract_tool_call(short, allowed)["name"] == "multi_agent_v1__spawn_agent"
+    assert executor.extract_tool_call(short, ["a__spawn_agent", "b__spawn_agent"]) is None
+    # the dotted form, with or without the namespace field, names the same tool
+    dotted = envelope({"name": "multi_agent_v1.spawn_agent", "arguments": {}})
+    assert executor.extract_tool_call(dotted, allowed)["name"] == "multi_agent_v1__spawn_agent"
+    both = envelope({"namespace": "multi_agent_v1", "name": "multi_agent_v1.spawn_agent", "arguments": {}})
+    assert executor.extract_tool_call(both, allowed)["name"] == "multi_agent_v1__spawn_agent"
 
 
 def test_parallel_native_tool_envelopes_are_all_returned(tmp_path):

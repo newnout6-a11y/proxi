@@ -1001,7 +1001,7 @@ relay переводится, и клиент не встречает тип, к
 
 | код relay | тип Messages |
 | --- | --- |
-| `invalid_request_error`, `unprocessable_entity`, `unsupported_media_type`, `method_not_allowed` | `invalid_request_error` |
+| `invalid_request_error`, `unprocessable_entity`, `unsupported_media_type`, `method_not_allowed`, `context_length_exceeded` | `invalid_request_error` |
 | `unauthorized` | `authentication_error` |
 | `insufficient_credits` | `billing_error` |
 | `forbidden` | `permission_error` |
@@ -1036,6 +1036,7 @@ upstream, таймаут хода, отказ по кредитам или ли�
 | --- | --- | --- |
 | `upstream_invalid_output`, `upstream_empty_turn`, `upstream_attempt_limit`, `upstream_tool_choice_ignored`, `invalid_request_error`, `unprocessable_entity`, `prompt_too_large` и прочие 4xx | `invalid_prompt` | не повторяет, печатает сообщение |
 | `insufficient_credits` | `insufficient_quota` | не повторяет, печатает свой текст «Quota exceeded…» |
+| `context_length_exceeded` (провайдер ответил, что вход больше окна контекста модели: «exceeds the context window», «prompt is too long») | `context_length_exceeded` | не повторяет, говорит, что в окне контекста не осталось места; раньше это была 502, и Codex отправлял те же данные ещё пять раз |
 | `rate_limit_error` | `rate_limit_exceeded` | повторяет; ждёт столько, сколько названо в сообщении |
 | `upstream_error`, `upstream_auth_error`, `upstream_timeout`, `service_unavailable`, `internal_error` | `server_error` | повторяет с собственной паузой 0,2 с × 2ⁿ (до 5 раз) |
 

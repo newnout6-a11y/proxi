@@ -242,11 +242,12 @@ def test_codex_namespace_tools_keep_the_client_namespace_and_call_identity():
             {"type": "function_call_output", "call_id": "call_agent", "output": "agent-id"},
         ]), CFG)
     definition = parsed.tools[0]["function"]
-    assert definition["name"] == "multi_agent_v1.spawn_agent"
+    # one name upstream accepts (OpenAI: ^[a-zA-Z0-9_-]{1,64}$), the namespace and the client's name kept beside it
+    assert definition["name"] == "multi_agent_v1__spawn_agent"
     assert definition["x-client-name"] == "spawn_agent"
     assert definition["x-namespace"] == "multi_agent_v1"
     assert parsed.tool_choice["function"]["name"] == definition["name"]
-    assert "tool_call multi_agent_v1.spawn_agent id=call_agent" in parsed.prompt
+    assert "tool_call multi_agent_v1__spawn_agent id=call_agent" in parsed.prompt
 
 
 def test_image_input_is_rejected_rather_than_replaced_with_a_text_placeholder():
