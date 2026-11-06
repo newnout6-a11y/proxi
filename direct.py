@@ -58,12 +58,29 @@ _TOOL_RESULT_HINTS = {"refused": False}
 _PRUNING = {"refused": False}
 
 
+def _provider_of(model):
+    """The provider the catalog gives this model, or None for a model it does not know."""
+    try:
+        return model_catalog.resolve(model, strict=True)[0].get("provider")
+    except apierr.ApiError:
+        return None
+
+
 def _anthropic_route(model):
     """Whether Anthropic's API serves this model: the route with cache breakpoints and signed thinking blocks."""
-    try:
-        return model_catalog.resolve(model, strict=True)[0].get("provider") == "anthropic"
-    except apierr.ApiError:
-        return False
+    return _provider_of(model) == "anthropic"
+
+
+def _live_thinking(model):
+    """Whether this model's reasoning text may reach the client while its attempt can still be retried.
+
+    Claude's thinking carries a signature that belongs to one history and must never be shown twice, so all of it waits
+    until the attempt has proved usable. The reasoning of the other routes is display text: shown at once, a retried
+    attempt costs the client a second pass of it and nothing else, while held back it leaves the client waiting for the
+    first word of the answer (a3, GLM: 9.1 s of silence and then the whole reasoning in one burst, upstream having sent
+    it continuously from 1.5 s to 10.6 s). A model the catalog does not know keeps the old behaviour."""
+    provider = _provider_of(model)
+    return provider is not None and provider != "anthropic"
 
 
 def _hints_tool_results(model):
@@ -1997,6 +2014,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     # Client service checks (Auto mode, titles) fail deterministically when empty:
     # re-sending the same body only pays for the same empty answer again.
     service_request = client_context.current().get("request_purpose") in client_context.SERVICE_KINDS
+    live_thinking = _live_thinking(body.get("model"))
     try:
         max_empty_retries = _int_setting(cfg, "upstream_empty_retries", 1)
         empty_retries = 0
@@ -2037,6 +2055,9 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         held.clear()
                         yield event
                     elif kind in _LIVE_EVENTS or not may_retry:
+                        yield event
+                    elif live_thinking and kind in ("thinking", "thinking_start"):
+                        # Reasoning text without a signature: the client may read it while the model is still at it.
                         yield event
                     else:
                         held.append(event)
