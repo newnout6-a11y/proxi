@@ -35,6 +35,35 @@ def reminder(text):
     return _REMINDER_OPEN + "\n" + text + "\n" + _REMINDER_CLOSE
 
 
+def readable_block(block):
+    """Text for an Anthropic document or search result, which the Retool route has no block for; None for others.
+
+    Claude Code's Read answers a PDF with a document block, and search tools answer with search_result blocks. The
+    model got the first 200 characters of their JSON instead, and the conversation lost its native history for good
+    because the block could not be read natively."""
+    kind = block.get("type") if isinstance(block, dict) else None
+    if kind == "search_result":
+        texts = [part.get("text") for part in block.get("content") or []
+                 if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
+        head = "[search result: %s, %s]" % (block.get("title") or "untitled", block.get("source") or "no source")
+        return "\n".join([head] + texts)
+    if kind != "document":
+        return None
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    title = " %s" % block["title"] if isinstance(block.get("title"), str) and block["title"] else ""
+    if source.get("type") == "text" and isinstance(source.get("data"), str):
+        return "[document%s]\n%s" % (title, source["data"])
+    if source.get("type") == "content":
+        texts = [part.get("text") for part in source.get("content") or []
+                 if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
+        return "\n".join(["[document%s]" % title] + texts)
+    if source.get("type") == "url":
+        return "[document%s at %s: this route does not pass the file to the model]" % (title, source.get("url"))
+    kilobytes = len(source.get("data") or "") * 3 // 4 // 1024 if source.get("type") == "base64" else 0
+    return "[document%s, %s%s: this route does not pass the file to the model]" % (
+        title, source.get("media_type") or source.get("type") or "file", ", %d KB" % kilobytes if kilobytes else "")
+
+
 def client_messages(messages, image_converter, *, lead=None):
     """Canonical client echo for matching, never a source of thinking signatures.
 
@@ -77,6 +106,8 @@ def client_messages(messages, image_converter, *, lead=None):
                 # Claude Code's ToolSearch answers with references to the tools it loaded. Upstream has no such block,
                 # and the loaded tools are in the request's tool list already, so the result names them.
                 blocks.append({"type": "text", "text": "Tool loaded: " + block["tool_name"]})
+            elif readable_block(block) is not None:
+                blocks.append({"type": "text", "text": readable_block(block)})
             else:
                 raise ValueError("unsupported content")
         return blocks

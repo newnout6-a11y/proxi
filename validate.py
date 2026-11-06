@@ -329,6 +329,8 @@ def _parse_content(content, index, role, ignored=None):
             if ignored is not None:
                 by_value = isinstance(block.get("tool"), dict) and block["tool"].get("type") == "tool_definition"
                 ignored.append(btype + (".tool_definition" if by_value else ""))
+        elif native_history.readable_block(block) is not None:
+            chunks.append(native_history.readable_block(block))
         else:
             chunks.append(f"[{btype or 'block'}: {json.dumps(block, ensure_ascii=False)[:200]}]")
     return "\n".join(c for c in chunks if c), images
