@@ -503,6 +503,7 @@ def _finish(data, parsed, dialect):
     parsed.structured_title = bool(parsed.structured_output and parsed.structured_output['title'])
     parsed.verbosity, parsed.declared_ignored, parsed.routine_ignored = generation.controls(
         data, parsed.entry, dialect)
+    parsed.stop_sequences = generation.stop_sequences(data, dialect)
     parsed.declared_ignored += [name for name in parsed.inline_tool_changes if name not in parsed.declared_ignored]
     stream_options = data.get("stream_options")
     if stream_options is None:
