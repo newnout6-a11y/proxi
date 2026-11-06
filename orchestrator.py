@@ -1217,6 +1217,16 @@ class TurnRunner:
                                             args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
                                     out.put({key: value for key, value in event.items() if key != "partial"}
                                             | {"tool_type": definition.get("x-client-type", "function")})
+                                elif event["type"] == "tool_call":
+                                    # A call of a tool the client did not declare (under a forced choice, of another
+                                    # tool) has nothing to run it on the client and is not passed on; the journal names
+                                    # it instead of losing it without a trace (ultracode audit of the relay, C4).
+                                    if not event.get("partial"):
+                                        log("tool.call_dropped",
+                                            "Вызов инструмента %s не передан клиенту: клиент его не объявлял" % (
+                                                event.get("name"),),
+                                            "warn", name=event.get("name"), call_id=event.get("id"),
+                                            declared=len(tool_names))
                                 elif event['type'] == 'usage':
                                     usage, delta = self._usage_update(holder, event)
                                     breakdown = credits.cost_breakdown(usage, parsed.model)
