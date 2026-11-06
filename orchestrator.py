@@ -485,11 +485,16 @@ class TurnRunner:
 
         refused = lowered = False
         defaults = native_history.tool_defaults(parsed.tools)
+
+        def continues(scope):
+            # The request continues the branch as a turn of it, or forks from it (History.resume_fork: Desktop's compaction).
+            return (history.resume(scope, client, defaults)[0] is not None
+                    or history.resume_fork(scope, client)[0] is not None)
+
         for effort in dict.fromkeys(direct.scope_effort(branch.scope) for branch in reversed(list(history.branches))):
             if effort is None:
                 continue
-            found, _ = history.resume(scope_of(effort), client, defaults)
-            if found is None:
+            if not continues(scope_of(effort)):
                 continue
             if effort == wanted:
                 return None, None  # the request resumes as it is
@@ -517,7 +522,7 @@ class TurnRunner:
             differs = []
         if differs:
             return None, {"reason": "scope", "differs": differs}
-        if history.resume(newest.scope, client, defaults)[0] is None:
+        if not continues(newest.scope):
             return None, {"reason": "history"}
         return None, ({"reason": "lower"} if lowered else {"reason": "effort"} if refused else None)
 

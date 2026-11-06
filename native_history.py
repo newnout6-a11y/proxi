@@ -416,6 +416,24 @@ class History:
             return snapshot, snapshot.messages + [{"role": "assistant", "content": snapshot.assistant}] + tail
         return None, None
 
+    def resume_fork(self, scope, client):
+        """(snapshot, upstream messages) for a request that forks from a recorded one, else (None, None).
+
+        Claude Desktop's compaction sends the messages of its last request WITHOUT the reply to that request (the client
+        files a reply into the next turn it builds) and its instruction after them. resume() wants the echo of that
+        reply and never accepted this shape: the history started again, the whole prefix was written once more although
+        the provider still had it (a4, 2026-11-06: 485k tokens, 51.9 credits for one /compact; emulated at 130k tokens
+        6.61 credits and 9.2 s to the first token against 2.57 and 2.5 s). Here the client's history must be exactly the
+        history the snapshot started from, followed by user messages and nothing else; the upstream messages are the
+        snapshot's own input, the prefix its request cached, plus those. No reply of the snapshot is replayed, so no
+        signature is attached to anything it does not belong to. The caller records nothing for the fork."""
+        for snapshot in reversed(self.branches):
+            offset = len(snapshot.client)
+            if (scope == snapshot.scope and len(client) > offset and client[:offset] == snapshot.client
+                    and all(message.get("role") == "user" for message in client[offset:])):
+                return snapshot, snapshot.messages + client[offset:]
+        return None, None
+
     def record(self, scope, client, messages, blocks, expected, parent=None):
         self.branches = [s for s in self.branches if s is not parent]
         self.branches.append(Snapshot(scope, copy.deepcopy(client), messages, blocks, expected))

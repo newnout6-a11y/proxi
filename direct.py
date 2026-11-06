@@ -1419,18 +1419,26 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
     parent, messages = (conversation_state.resume(session, history, scope, client)
                         if history is not None and client is not None else (None, None))
+    forked = False
+    if messages is None and side_request and history is not None and client is not None:
+        # A compaction that forks from the last request (History.resume_fork) continues the prefix that request cached.
+        parent, messages = history.resume_fork(scope, client)
+        forked = messages is not None
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
         body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools,
                                                          mark_tail=not side_request)
         body["rit"] = make_rit(body["messages"], tools)
+        # A fork replays none of the last reply: no block of the parent is in this body.
+        replayed = [] if forked else parent.assistant
         journal.emit("native_history.resume", "Сохранённые assistant/thinking blocks возвращены upstream", "info",
-                     blocks=len(parent.assistant), messages=len(body["messages"]),
-                     signatures=sum(b["type"] == "thinking" for b in parent.assistant))
+                     blocks=len(replayed), messages=len(body["messages"]),
+                     signatures=sum(b["type"] == "thinking" for b in replayed), fork=forked)
         req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
-        console_log.write("[%s] [history] native continuation restored thinking=%d tool_calls=%d" % (
-            req_id, sum(b["type"] in ("thinking", "redacted_thinking") for b in parent.assistant),
-            sum(b["type"] == "tool_call" for b in parent.assistant)))
+        console_log.write("[%s] [history] native continuation %s thinking=%d tool_calls=%d" % (
+            req_id, "forked from the last request" if forked else "restored",
+            sum(b["type"] in ("thinking", "redacted_thinking") for b in replayed),
+            sum(b["type"] == "tool_call" for b in replayed)))
     else:
         if history is not None and history.branches and client is not None:
             # Never attach an old signature to a rebuilt/edited prefix.
