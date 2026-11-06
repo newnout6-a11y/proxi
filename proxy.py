@@ -24,6 +24,7 @@ import client_context
 import console_log
 from redact import redact
 import config as config_module
+import conversation_infer
 import conversation_state
 import generation
 import models as model_catalog
@@ -122,6 +123,8 @@ class Runtime:
         self.runner.accounts = self.accounts
         self.prompts = prompt_policy.PromptStore(cfg)
         self.runner.prompts = self.prompts
+        # Requests that carry no conversation identity find theirs by their history (conversation_infer).
+        self.conversations = conversation_infer.ConversationIndex()
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
         self.journal = journal.JOURNAL
@@ -685,6 +688,7 @@ def make_handler(runtime: Runtime):
                     parsed = validate.parse_chat(data, cfg)
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
                 data, self.headers, client_context.current())
+            self._infer_conversation(parsed)
             parsed.request_id = self.request_id
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
@@ -791,6 +795,24 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _infer_conversation(self, parsed):
+            """A request with tools and no identity of its own takes the key of the conversation its history extends.
+
+            Such a client (DeepSeek Harness sends no session header) used to get a throwaway session per request, and its
+            native history never continued. See conversation_infer for what makes a match exact."""
+            index = getattr(runtime, "conversations", None)
+            digests = getattr(parsed, "message_fingerprints", None)
+            if parsed.conversation_key is not None or index is None or not cfg.get("infer_conversations", True):
+                return
+            if not parsed.tools or not digests:
+                return
+            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests)
+            if how == "new":
+                journal.emit("conversation.inferred",
+                             "Запрос без идентификатора диалога: начат диалог по его истории (%d сообщений)" % len(digests),
+                             "debug", request_id=self.request_id, messages=len(digests),
+                             conversation=journal.tag(parsed.conversation_key))
 
         def _apply_prompts(self, data, parsed, dialect, size, fetches=None):
             """The prompt hooks of a completion (plan section 3): the plan, a second parse of an edited body, the generation.

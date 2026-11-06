@@ -283,6 +283,30 @@ before the next provider, can be dropped or repeated (ruamel attaches it to the 
 last key), so compare the preview with the profile before `--write`: the preview shows
 each comment as `# ***` in its place, and `--include-secrets` shows the text.
 
+### Harness without a session ID
+
+The Harness 0.2.2 adapters send no session identity (`sendSessionAffinityHeaders` is withheld and the config refuses to
+set it), so a Harness request names no conversation. A client like that did get a throwaway session per request: in the
+test run of 2026-11-06 `native_history.cold` was journaled on 488 of 490 requests, signed thinking never came back and
+nothing was kept warm. The relay now finds the conversation from the request itself (`conversation_infer.py`): a request
+that carries tools and no identity takes the key of the conversation whose request its history extends, that is, when
+its model, system prompt and message list begin with exactly the messages of a request the relay has seen. The check is
+a hash over the model, the system text and a digest of every message, so two requests share a key only when one holds the
+whole history of the other. The conversations that can share a key are one conversation and its forks, and native
+history keeps each continuation on a branch of its own and resumes a branch only for exactly its messages. A history the
+client edits (a pruned tool result, a regenerated answer) starts a key of its own, as every request did before.
+The first request of each conversation is journaled as `conversation.inferred` (debug). `infer_conversations: false` in
+`config.json` restores one session per request. A client that does send an identity (a header, a session id in the
+metadata, a plugin that sets `x-proxi-session-id`) keeps it: nothing is inferred for it.
+
+An inferred conversation is a pool conversation like any other: it is kept 15 minutes after its last request, warmed
+by the cache keepwarm while it lasts, and stored for a restart. The index is in memory (24 hours, 20000 histories),
+so after a relay restart a Harness chat continues under a new key once and then as before.
+
+Harness 0.2.2-alpha.3 and later also offer the explicit way, the `llm-pi-ai/request-headers` plugin hook; a plugin that
+sets `x-proxi-session-id` to the hook's `request.sessionId` (and `x-proxi-client: harness`) gives an exact identity that
+survives an edited history and a relay restart. It is optional now.
+
 ### Historical Harness setup — 0.1.5-rc.2
 
 The earlier installed `DeepSeek Harness.lnk` setup launched the

@@ -80,6 +80,9 @@ DEFAULTS = {
     # of the signed branch it resends: another effort restarts that history and the provider's cached messages, and the
     # whole conversation is written again. False lets the effort the client sends decide, as for any other request.
     "compaction_keep_effort": True,
+    # A request with tools and no conversation identity (DeepSeek Harness sends no session header) takes the conversation
+    # whose request its history extends, so its signed history continues; False gives each such request a session of its own.
+    "infer_conversations": True,
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
     "transport": "direct",
     "direct_cache": True,
@@ -510,6 +513,8 @@ def _load(path):
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     if type(cfg["compaction_keep_effort"]) is not bool:
         raise service_unavailable("compaction_keep_effort must be a boolean")
+    if type(cfg["infer_conversations"]) is not bool:
+        raise service_unavailable("infer_conversations must be a boolean")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
                 "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
                 "trace_max_folders"):
