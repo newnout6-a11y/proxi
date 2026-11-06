@@ -820,7 +820,11 @@ class StopSequenceAdapter:
             self._flush(final=True)
             return reason
         # The reply ended at the sequence: whatever ended the upstream turn after it is not the client's affair.
-        return 'cancelled' if reason == 'cancelled' else 'stop'
+        if reason == 'cancelled':
+            return reason
+        # A call made before the sequence is still to be run: Chat says so with its finish_reason (a client that
+        # decides by it took the turn for final), Messages keeps stop_sequence and the tool_use block in the content.
+        return 'tool_calls' if self._base().tool_calls else 'stop'
 
     def end(self, reason, prompt_text=None):
         return self.adapter.end(self._reason(reason), prompt_text)
