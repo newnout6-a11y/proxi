@@ -107,5 +107,12 @@ class AttemptBudget:
         error.stage = "upstream"
         return error
 
-    def error(self, code="upstream_empty_turn", message="upstream returned an empty turn"):
+    # The answer to a turn whose every attempt came back without text or a tool call. An empty or thinking-only end is how
+    # the provider's classifier refuses a request (HTTP 200, no stop reason through Retool); probes of 2026-11-06 traced
+    # such refusals to instructions in the client's system prompt (docs/thinking-only-replies-2026-11-05.md).
+    EMPTY_TURN = ("upstream returned an empty turn: no text and no tool call. This can be a refusal by the provider's "
+                  "classifier, for example of instructions that claim priority over the platform's rules or ask the model "
+                  "to reveal its reasoning; check the system prompt and the project instructions the client sends")
+
+    def error(self, code="upstream_empty_turn", message=EMPTY_TURN):
         return self.attach(apierr.ApiError(502, code, message))

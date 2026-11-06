@@ -7,6 +7,7 @@ import EditList from './EditList.jsx';
 import { isObject, patchProfile, profileNameError } from './draft.js';
 import { useFocusLater } from './hooks.js';
 import { MID_SYSTEM_MODES } from './ops.js';
+import { publishedModels } from './publish.js';
 import { insertAt, problemText, templateProblems, variableNames } from './template.js';
 
 const EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
@@ -95,7 +96,7 @@ function Generation({ profile, name, onChange }) {
   );
 }
 
-function Publish({ profile, name, onChange }) {
+function Publish({ profile, name, onChange, catalog }) {
   // Emptying the list of masks keeps the list open: the user is retyping it, not switching publishing off
   const [listing, setListing] = useState(false);
   const mode = Array.isArray(profile.publish_as_model) || (listing && !profile.publish_as_model) ? 'list' : profile.publish_as_model === true ? 'all' : 'off';
@@ -104,6 +105,9 @@ function Publish({ profile, name, onChange }) {
     setListing(id === 'list');
     onChange({ publish_as_model: id === 'off' ? false : id === 'all' ? true : globs.length ? globs : ['claude-*'] });
   };
+  const published = mode === 'off' ? [] : publishedModels(mode === 'all' ? true : globs, catalog);
+  const example = (published && published[0]) || 'claude-opus-5-5';
+  const shown = published ? published.slice(0, 6) : [];
   return (
     <div className="p-publish">
       <fieldset className="p-radio-group">
@@ -117,16 +121,32 @@ function Publish({ profile, name, onChange }) {
       </fieldset>
       {mode === 'list' && (
         <Tokens label="Маски моделей" values={globs} onChange={(values) => onChange({ publish_as_model: values.length ? values : false })}
-          placeholder="claude-opus-*" path={`profiles.${name}.publish_as_model`} hint="Модель появится в каталоге как <модель>@имя-профиля. Маски: * и ?" />
+          placeholder="claude-opus-*" path={`profiles.${name}.publish_as_model`}
+          hint="Маска сравнивается с полным id модели из каталога, без учёта регистра: * — любые символы, ? — один символ" />
       )}
       {mode === 'list' && !globs.length && <p className="p-hint">Без масок профиль не публикуется</p>}
-      {mode === 'all' || globs.length > 0 ? <p className="p-hint">Клиент выбирает профиль, просто называя такую модель: <code>{`claude-opus-5-5@${name}`}</code></p> : null}
+      {mode === 'list' && globs.length > 0 && published && published.length === 0 && (
+        <Notice tone="warn" icon={TriangleAlert} className="p-publish-none">
+          <p>
+            Маски не подходят ни к одной модели каталога с маршрутом, поэтому профиль не появится в каталоге. Маска сравнивается с полным id:
+            например, у GLM он <code>zai-org/GLM-5.3</code>, поэтому подойдёт <code>*glm*</code> или <code>zai-org/GLM-*</code>
+          </p>
+        </Notice>
+      )}
+      {mode !== 'off' && published && published.length > 0 && (
+        <p className="p-hint p-publish-list">
+          В каталоге появятся ({fmtInt(published.length)}): {shown.map((id, index) => (
+            <span key={id}>{index ? ', ' : ''}<code>{`${id}@${name}`}</code></span>
+          ))}{published.length > shown.length ? ` и ещё ${fmtInt(published.length - shown.length)}` : ''}
+        </p>
+      )}
+      {mode === 'all' || globs.length > 0 ? <p className="p-hint">Клиент выбирает профиль, просто называя такую модель: <code>{`${example}@${name}`}</code></p> : null}
     </div>
   );
 }
 
 /** The form of one profile: template, edits of the client's system, history, tools, generation and publishing. */
-export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, usage, onRename, onDuplicate, onDelete, onAddRule }) {
+export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, usage, onRename, onDuplicate, onDelete, onAddRule, catalog = null }) {
   const profile = doc.profiles[name];
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(name);
@@ -215,7 +235,7 @@ export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, u
         <Generation profile={profile} name={name} onChange={patch} />
       </Disclosure>
       <Disclosure title="Публикация как модель" meta={profile.publish_as_model ? 'да' : 'нет'} defaultOpen={!!profile.publish_as_model}>
-        <Publish profile={profile} name={name} onChange={patch} />
+        <Publish profile={profile} name={name} onChange={patch} catalog={catalog} />
       </Disclosure>
     </div>
   );

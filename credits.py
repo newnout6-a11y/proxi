@@ -12,10 +12,25 @@ HISTORY_MAX = 200
 # Retool passes Anthropic pricing through: cache read 0.05x, cache write ~1.25x and
 # output ~5x of the base input rate. The tariff is flat — no long-context premium
 # up to at least 460k tokens (fit predicted 46.52 vs 46.53 actual on the record turn).
+# They stay the rates of a model MODEL_RATES does not name.
 RATE_INPUT = 0.000075
 RATE_CACHE_READ = 0.000004
 RATE_CACHE_WRITE = 0.000100
 RATE_OUTPUT = 0.000401
+# Per-model rates, an exact least-squares fit (largest error 0.0000 credits) of the reported credits of every attempt in
+# the live journal of 2026-11-06: 753 attempts of Sonnet 5.5 and 120 of Opus 5.5. Sonnet costs half of Opus for input,
+# output and a cache write; a cache read is 4e-6 for both.
+MODEL_RATES = {
+    "claude-sonnet-5-5": {"input": 0.00004, "cache_read": 0.000004, "cache_write": 0.00005, "output": 0.0002},
+    "claude-opus-5-5": {"input": 0.00008, "cache_read": 0.000004, "cache_write": 0.0001, "output": 0.0004},
+}
+_DEFAULT_RATES = {"input": RATE_INPUT, "cache_read": RATE_CACHE_READ, "cache_write": RATE_CACHE_WRITE,
+                  "output": RATE_OUTPUT}
+
+
+def rates(model=None):
+    """The credit rates per token of `model` ({"input", "cache_read", "cache_write", "output"}); the default fit for any other."""
+    return MODEL_RATES.get(model, _DEFAULT_RATES)
 
 
 def token_counter(value):
@@ -27,18 +42,19 @@ def token_counter(value):
     return None
 
 
-def cost_breakdown(usage):
-    """Per-category credit cost and cache hit ratio for one turn's usage."""
+def cost_breakdown(usage, model=None):
+    """Per-category credit cost and cache hit ratio for one turn's usage, at the rates of `model` (see rates)."""
     inp = int(usage.get("input_tokens") or 0)
     out = int(usage.get("output_tokens") or 0)
     read = int(usage.get("cache_read") or 0)
     write = int(usage.get("cache_write") or 0)
     prompt = inp + read + write
+    rate = rates(model)
     return {
-        "cost_input": round(inp * RATE_INPUT, 5),
-        "cost_cache_read": round(read * RATE_CACHE_READ, 5),
-        "cost_cache_write": round(write * RATE_CACHE_WRITE, 5),
-        "cost_output": round(out * RATE_OUTPUT, 5),
+        "cost_input": round(inp * rate["input"], 5),
+        "cost_cache_read": round(read * rate["cache_read"], 5),
+        "cost_cache_write": round(write * rate["cache_write"], 5),
+        "cost_output": round(out * rate["output"], 5),
         "prompt_tokens": prompt,
         "cache_hit_ratio": round(read / prompt, 4) if prompt else None,
     }

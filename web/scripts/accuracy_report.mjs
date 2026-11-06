@@ -15,7 +15,7 @@ const output = process.env.ADMIN_QA_DIR || path.join(os.tmpdir(), 'proxi-design-
 const rows = [];
 const WIDTHS = [280, 320, 414, 1440];
 // The prompts screen is judged tab by tab, plain and with everything on it opened: folded editors, an open rule, the diff, the confirmation.
-const PROMPT_TABS = { profiles: 'Профили', rules: 'Правила', texts: 'Тексты', preview: 'Предпросмотр', seen: 'Что увидела', pins: 'Пины' };
+const PROMPT_TABS = { profiles: 'Профили', rules: 'Правила', texts: 'Тексты', preview: 'Предпросмотр', seen: 'Что увидела', pins: 'Закрепления' };
 // The preview is judged on a request that leaves every kind of line under it: edits of the client's system that matched and one that
 // did not, twelve reminders folded into one line, mid-dialog system messages, tools edited, hidden and skipped, and an edit with no tool
 const RICH_DOCUMENT = initialDocument();
