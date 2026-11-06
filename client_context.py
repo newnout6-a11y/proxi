@@ -92,8 +92,12 @@ LEGACY_COMPACTION_INSTRUCTIONS = (
 # a reminder.
 _TRAILING_USER_MESSAGES = 3
 # Request headers a recorded request keeps for a preview: client identity and affinity, never a credential.
-_RECORDED_HEADERS = frozenset({"user-agent", "originator", "x-session-affinity", "x-session-id"})
-_RECORDED_PREFIXES = ("x-proxi-", "x-claude-code-", "x-opencode-")
+# prompt_client reads x-codex-* (and the originator); conversation_affinity reads the session ids Codex 0.164 sends.
+_RECORDED_HEADERS = frozenset({"user-agent", "originator", "x-session-affinity", "x-session-id",
+                               "session-id", "thread-id", "conversation-id", "x-conversation-id"})
+_RECORDED_PREFIXES = ("x-proxi-", "x-claude-code-", "x-opencode-", "x-codex-")
+# The ring is in memory and holds a few requests: a header a client pads (x-codex-turn-metadata is a JSON blob) is cut.
+_RECORDED_VALUE_LIMIT = 4096
 SDK_TITLE_PREFIX = "You are naming a coding session so the user can pick it out of a long list of sessions."
 # Claude Code before 2.1.234 asked for the same title in these words.
 LEGACY_TITLE_PREFIX = "Generate a concise, sentence-case title"
@@ -238,7 +242,7 @@ def recorded_headers(headers):
     for name, value in (headers or {}).items():
         lowered = str(name).lower()
         if lowered in _RECORDED_HEADERS or lowered.startswith(_RECORDED_PREFIXES):
-            kept[lowered] = str(value)
+            kept[lowered] = str(value)[:_RECORDED_VALUE_LIMIT]
     return kept
 
 

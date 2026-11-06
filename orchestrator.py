@@ -1,6 +1,7 @@
 """Turn orchestration: context injection, execution loop, event fan-out."""
 import asyncio
 import collections
+import contextlib
 import hashlib
 
 import direct
@@ -53,7 +54,7 @@ EXEC_REMINDER = (
 _SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")
 # Why a compaction restarts the history of its dialog, for the journal (cache.compaction_restart).
 _RESTART_REASONS = {
-    "no_branch": "у диалога нет подписанной ветки (первый запрос, перезапуск relay или вытеснение диалога)",
+    "no_branch": "у диалога нет подписанной ветки (первый запрос или нет сохранённого состояния)",
     "history": "сообщения запроса не продолжают ветку диалога (история изменена или заменена)",
     "effort": "effort ветки недопустим для этой модели",
     "scope": "у запроса другие %s, чем у ветки",
@@ -199,13 +200,41 @@ def _client_system(parsed):
     return parsed.system if (parsed.system or "").strip() else ""
 
 
+# What of the request as the client sent it decides who owns it, whether anything may be executed for it and which
+# pool session it takes (plan I9). A profile may rewrite the body so that its second parse no longer shows these (it hides
+# every tool): proxy hands the first parse's answers on as `prompt_origin`.
+ClientOrigin = collections.namedtuple("ClientOrigin", "tools system structured")
+
+
+def client_origin(parsed):
+    """The ClientOrigin of `parsed`, the parse of the body the client sent."""
+    return ClientOrigin(tools=bool(getattr(parsed, "tools", None)), system=bool(_client_system(parsed)),
+                        structured=bool(getattr(parsed, "structured_output", None)))
+
+
+def _origin(parsed):
+    origin = getattr(parsed, "prompt_origin", None)
+    return origin if isinstance(origin, ClientOrigin) else None
+
+
+def client_tools(parsed):
+    """Whether the client sent tools of its own, as it sent them: a profile may hide all of them from the model."""
+    origin = _origin(parsed)
+    return origin.tools if origin is not None else bool(getattr(parsed, "tools", None))
+
+
 def _client_owns_instructions(parsed, purpose, native_tools):
     """True when the client brings the instructions of this job, so the relay adds no project context or shell protocol.
 
     A JSON-only reply has no room for the relay's workspace or shell protocol;
-    a client that supplies tools keeps the relay's native-tools role as before."""
-    return (purpose in client_context.CLIENT_TEXT_KINDS or bool(_client_system(parsed))
-            or (bool(getattr(parsed, "structured_output", None)) and not native_tools))
+    a client that supplies tools keeps the relay's native-tools role as before.
+    A request a profile rewrote is judged by what the client sent (plan I9), not by the body it was turned into."""
+    origin = _origin(parsed)
+    if origin is not None:
+        native_tools, system, structured_output = origin.tools, origin.system, origin.structured
+    else:
+        system, structured_output = bool(_client_system(parsed)), bool(getattr(parsed, "structured_output", None))
+    return purpose in client_context.CLIENT_TEXT_KINDS or system or (structured_output and not native_tools)
 
 
 def _relay_task_args(cfg):
@@ -221,17 +250,22 @@ class RelaySources:
     """The relay's own texts a prompt template may name (prompt_policy.HeadSources), each built once, and only when asked.
 
     The blocks of a relay task come from the same build_system_instructions call as the legacy head, so
-    `{{relay_task}}{{exec_reminder}}` repeats that head byte for byte. They stay empty for a request the client owns
-    and for one that brings client tools (plan I9): no project context and no shell protocol reach a client's job.
-    The role texts are the file's relay_texts, else config.json's relay_system_prompt (a live setting: the one role
-    slot the legacy head had, read when first needed and kept for this turn), else the built-in text.
-    Only cfg is read, so the preview can build the same object for a pasted request.
+    `{{relay_task}}{{exec_reminder}}` repeats that head byte for byte (with the built-in role). They stay empty for a
+    request the client owns and for one that brings client tools (plan I9): no project context and no shell protocol
+    reach a client's job.
+    The role texts are the file's relay_texts, else the built-in text. config.json's relay_system_prompt belongs to the
+    legacy head alone (no file, $legacy, no rule matched): a request a profile serves never reads it, so the preview
+    shows the head the relay sends, and saving a role in the settings leaves the heads of conversations that a profile
+    holds as they are (plan I3). Only cfg is read, so the preview can build the same object for a pasted request.
     """
 
-    def __init__(self, cfg, snapshot, *, client_owned, native_tools, output_spec=None, tool_choice="auto"):
+    def __init__(self, cfg, snapshot, *, client_owned, native_tools, output_spec=None, tool_choice="auto",
+                 client_tools=None):
         self.cfg, self.snapshot = cfg, snapshot
         self.client_owned = client_owned
         self.native_tools, self.output_spec, self.tool_choice = bool(native_tools), output_spec, tool_choice
+        # native_tools says what the model is offered; client_tools whether the client sent any (a profile can hide them all)
+        self.client_tools = self.native_tools if client_tools is None else bool(client_tools)
         self._built = {}
 
     def _once(self, name, build):
@@ -242,26 +276,17 @@ class RelaySources:
     def _text(self, name):
         return self.snapshot.relay_text(name) if self.snapshot is not None else None
 
-    def _configured_role(self):
-        # One read per turn: a PATCH in the middle of it must not give {{role}} and {{relay_task}} two texts.
-        return self._once("configured_role", lambda: self.cfg.get("relay_system_prompt"))
-
     @property
     def _is_relay_task(self):
-        return not self.client_owned and not self.native_tools
+        return not self.client_owned and not self.client_tools
 
     def relay_role(self):
         # None is the built-in role, a blank text means no role of the relay's own: as relay_policy reads settings.
-        def build():
-            text = self._text("role")
-            return relay_policy(self._configured_role() if text is None else text)
-        return self._once("role", build)
+        return self._once("role", lambda: relay_policy(self._text("role")))
 
     def native_role(self):
         def build():
             text = self._text("native_role")
-            if text is None:
-                text = self._configured_role()  # legacy: one role slot served a client with tools too
             return DEFAULT_NATIVE_TOOLS_ROLE if text is None else (text if text.strip() else "")
         return self._once("native_role", build)
 
@@ -313,6 +338,13 @@ def split_changes(changes):
     return history, tools
 
 
+# What prompt.plan and the ring say when a profile leaves a client that sent tools (and no system prompt) with no head
+# at all: without the profile it would have had the relay's native-tools role.
+EMPTY_HEAD_WARNING = ("the head is empty: the client sent tools but no system prompt, and the profile's template adds "
+                      "nothing; the model works from the tools alone (add {{native_role}} to give it the relay's role "
+                      "for a client with tools)")
+
+
 # What a recorded request keeps of the changes a rewrite made: the ring is in memory, so a body with thousands of
 # edited messages is cut here, and the summary (one entry per kind of edit) still names every kind.
 RING_CHANGES = 200
@@ -337,8 +369,10 @@ def acquire_plan(cfg, parsed):
 
     TurnRunner acquires with exactly this plan, and the HTTP layer puts the same keywords to the pool
     (model_refusal, unavailable_error) before a response starts: the check and the acquire read the same accounts.
+    The plan follows the request as the client sent it (plan I9): a profile that hides every tool leaves the
+    conversation in the session its tools made, and the plan is the same before and after the body is rewritten.
     """
-    native_tools = getattr(parsed, "tools", None) or []
+    native_tools = client_tools(parsed)
     direct_mode = cfg.get("transport") == "direct"
     mode = cfg.get("session_mode")
     purpose = _purpose(parsed)
@@ -592,7 +626,7 @@ class TurnRunner:
         if plan is None or plan.legacy:
             return None
         sources = RelaySources(self.cfg, plan.snapshot, client_owned=client_owned, native_tools=native_tools,
-                               output_spec=output_spec, tool_choice=choice)
+                               output_spec=output_spec, tool_choice=choice, client_tools=client_tools(parsed))
         try:
             # Off the event loop, as the legacy head is: a relay task reads its project from disk.
             composed = await asyncio.get_running_loop().run_in_executor(
@@ -619,6 +653,9 @@ class TurnRunner:
         changes = list(getattr(parsed, "prompt_changes", None) or ())
         history, tools = split_changes(changes)
         notes = list(warnings or ()) + list(getattr(parsed, "prompt_warnings", ()))
+        if not head.strip() and client_tools(parsed) and EMPTY_HEAD_WARNING not in notes:
+            # No text of the profile or the client is quoted: the warning is as good for the journal as for the ring.
+            notes.append(EMPTY_HEAD_WARNING)
         inp = getattr(parsed, "prompt_input", None)
         try:
             summary = journal_changes(changes)
@@ -826,7 +863,10 @@ class TurnRunner:
             if isinstance(choice, dict):
                 tool_names = [choice["function"]["name"]]
             direct_mode = self.cfg.get("transport") == "direct"
-            is_native = bool(native_tools)
+            # native_tools is what the model is offered; what the client sent decides who owns the job, what the legacy
+            # head says and whether anything runs on this machine (plan I9): a profile can hide every tool.
+            client_has_tools = client_tools(parsed)
+            is_native = client_has_tools
             purpose = _purpose(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
             output_spec = getattr(parsed, "structured_output", None)
@@ -862,7 +902,7 @@ class TurnRunner:
             reminder = ""
             if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif (composed is None and not native_tools and not client_owns_instructions
+            elif (composed is None and not client_has_tools and not client_owns_instructions
                   and self.cfg["exec_policy"] != "off"):
                 reminder = EXEC_REMINDER
             if direct_mode:
@@ -887,19 +927,30 @@ class TurnRunner:
             # from the global cfg here would 503 account-only configurations.
             model_provider = {"model": parsed.model}
             effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"))
-            requested_effort = getattr(parsed, "requested_effort", None) or parsed.effort
+            # The effort of the request is the client's, then the profile's when the profile sets one (proxy applied it
+            # to parsed.effort); requested_effort is always what the client sent, effort_source says who decided.
+            profile_effort = getattr(parsed, "prompt_effort", None)
+            asked = getattr(parsed, "requested_effort", None)
+            requested_effort = asked if profile_effort else (asked or parsed.effort)
             effort_source = "client"
             if requested_effort is None:
                 requested_effort = self.cfg.get("reasoning_effort") if parsed.entry.get("reasoning") else None
                 effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
+            if profile_effort:
+                effort_source = "profile"
             task = getattr(parsed, "client_task", "")
             # A client's compaction runs on the effort of its dialog when that is what makes the dialog's signed
             # history resume (README, "Сжатие истории"); the journal still says what the client asked for.
+            # That comes last: the profile sets the effort of the request, the compaction may keep the dialog's over it.
             kept, why = None, None
             holder.pop("kept_effort", None)  # a retry on another account decides again
             if (task == client_context.COMPACTION and native_tools and direct_mode
                     and self.cfg.get("compaction_keep_effort", True)):
                 try:
+                    if hasattr(self.pool, "load_stored"):
+                        # A dialog stored before a restart is only on disk: read it for the question below.
+                        await self.pool.load_stored(getattr(parsed, "conversation_key", None), model_entry=parsed.entry,
+                                                    exclude=exclude, **acquire_plan(self.cfg, parsed).kwargs)
                     kept, why = self._dialog_effort(parsed, instructions, choice, exclude)
                 except Exception as exc:  # a lookup that only helps: without it the request runs on the client's effort
                     log("cache.effort_check_failed", "Не удалось сверить effort сжатия с диалогом, запрос идёт как есть: "
@@ -910,14 +961,21 @@ class TurnRunner:
                 model_provider["reasoningEffort"] = effort
             if getattr(parsed, 'verbosity', None) is not None:
                 model_provider['verbosity'] = parsed.verbosity
+            effort_note = ""
+            if kept:
+                effort_note = " (effort диалога, клиент просил %s)" % (requested_effort or "по умолчанию",)
+            elif effort_source == "profile":
+                effort_note = " (effort профиля «%s», клиент просил %s)" % (
+                    getattr(getattr(parsed, "prompt_plan", None), "profile", None), requested_effort or "по умолчанию")
             log("turn.begin", "Ход %s · effort %s · %s%s%s" % (
                     parsed.model, effort or "—", "direct" if direct_mode else "agent",
-                    " · сжатие истории" if task == client_context.COMPACTION else "",
-                    " (effort диалога, клиент просил %s)" % (requested_effort or "по умолчанию",) if kept else ""),
+                    " · сжатие истории" if task == client_context.COMPACTION else "", effort_note),
                 model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
                 requested_effort=requested_effort, effective_effort=effort,
                 effort_source=effort_source,
                 effort_resolution=("cache_continuity" if kept else
+                                   "provider_managed" if effort_source == "profile" and effort is None else
+                                   "profile" if effort_source == "profile" else
                                    "model_default" if requested_effort in (None, "auto") else
                                    "provider_managed" if effort is None else
                                    "exact" if requested_effort == effort else "compatibility"),
@@ -1081,126 +1139,129 @@ class TurnRunner:
                     log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
                     usage_started = False
                     try:
-                        async for event in stream:
-                            if not first_token and event["type"] in ("text", "thinking", "tool_call"):
-                                first_token = True
-                                ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
-                                log("upstream.first_token", "Первый токен через %d мс" % ttft,
-                                    "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
-                            if event["type"] in ("thinking_status", "thinking_start", "thinking", "thinking_signature",
-                                                 "tool_call"):
-                                text_open = False
-                            if event["type"] == "text":
-                                if not text_open and event["delta"]:
-                                    # Every text segment (text, thinking, text) opens its own answer span.
-                                    text_open = True
-                                    ms = round((time.time() - holder["upstream_started_at"]) * 1000)
-                                    log("upstream.text_start", "Модель начала писать текст через %d мс" % ms,
-                                        "debug", ms=ms)
-                                final_text += event["delta"]
-                                upstream_text += event["delta"]
-                                # Tool envelopes are parsed only after the complete
-                                # upstream turn, so do not leak their markup to a
-                                # native client. Ordinary text remains streamed.
-                                if direct_mode or not native_tools:
+                        # Leaving the loop (an error event raises below) closes the generators of the stream at once:
+                        # left to the garbage collector, a cut turn keeps its session "busy" until some later collection.
+                        async with contextlib.aclosing(stream):
+                            async for event in stream:
+                                if not first_token and event["type"] in ("text", "thinking", "tool_call"):
+                                    first_token = True
+                                    ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                    log("upstream.first_token", "Первый токен через %d мс" % ttft,
+                                        "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
+                                if event["type"] in ("thinking_status", "thinking_start", "thinking", "thinking_signature",
+                                                     "tool_call"):
+                                    text_open = False
+                                if event["type"] == "text":
+                                    if not text_open and event["delta"]:
+                                        # Every text segment (text, thinking, text) opens its own answer span.
+                                        text_open = True
+                                        ms = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                        log("upstream.text_start", "Модель начала писать текст через %d мс" % ms,
+                                            "debug", ms=ms)
+                                    final_text += event["delta"]
+                                    upstream_text += event["delta"]
+                                    # Tool envelopes are parsed only after the complete
+                                    # upstream turn, so do not leak their markup to a
+                                    # native client. Ordinary text remains streamed.
+                                    if direct_mode or not native_tools:
+                                        out.put(event)
+                                        visible_text += event["delta"]
+                                    else:
+                                        visible = native_text.feed(event["delta"])
+                                        if visible:
+                                            visible_text += visible
+                                            out.put({"type": "text", "delta": visible})
+                                elif event["type"] == "final_text":
+                                    if event.get("text"):
+                                        final_text = event["text"]
+                                elif event["type"] in ("thinking_status", "thinking_start"):
+                                    if think_started is None:
+                                        think_started = time.time()
+                                        ms = round((think_started - holder["upstream_started_at"]) * 1000)
+                                        log("upstream.thinking_start", "Upstream сообщил начало thinking через %d мс" % ms,
+                                            "info", ms=ms)
                                     out.put(event)
-                                    visible_text += event["delta"]
-                                else:
-                                    visible = native_text.feed(event["delta"])
-                                    if visible:
-                                        visible_text += visible
-                                        out.put({"type": "text", "delta": visible})
-                            elif event["type"] == "final_text":
-                                if event.get("text"):
-                                    final_text = event["text"]
-                            elif event["type"] in ("thinking_status", "thinking_start"):
-                                if think_started is None:
-                                    think_started = time.time()
-                                    ms = round((think_started - holder["upstream_started_at"]) * 1000)
-                                    log("upstream.thinking_start", "Upstream сообщил начало thinking через %d мс" % ms,
-                                        "info", ms=ms)
-                                out.put(event)
-                            elif event["type"] in ("thinking", "thinking_signature"):
-                                if event["type"] == "thinking_signature" and think_started is not None:
-                                    span = round((time.time() - think_started) * 1000)
-                                    log("upstream.thinking_end", "Мышление заняло %d мс" % span, "info",
-                                        thinking_ms=span)
-                                    think_started = None
-                                out.put(event)
-                            elif event["type"] in ("thinking_heartbeat", "usage_start"):
-                                if event["type"] == "usage_start":
-                                    if usage_started:
-                                        journal_attempt += 1
-                                        holder['_journal_attempt'] = journal_attempt
-                                        log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
-                                    usage_started = True
-                                    think_started = None
-                                    holder['_attempt_usage'] = {}
-                                    holder['_attempt_credited'] = False
-                                out.put(event)
-                            elif event["type"] == "tool_call" and event.get("name") in tool_names:
-                                if not event.get("partial"):
-                                    streamed_tool_call = True
-                                definition = tool_definitions[event["name"]]
-                                call_key = event.get("id") or event["name"]
-                                if call_key not in tool_started:
-                                    tool_started[call_key] = time.time()
-                                    ms = round((tool_started[call_key] - holder["upstream_started_at"]) * 1000)
-                                    log("upstream.tool_start", "Модель начала вызов %s через %d мс" % (event["name"], ms),
-                                        "debug", name=event["name"], call_id=event.get("id"), ms=ms)
-                                if not event.get("partial"):
-                                    args_ms = round((time.time() - tool_started[call_key]) * 1000)
-                                    log("tool.call", "Инструмент клиента: %s (аргументы %d мс)" % (event["name"], args_ms),
-                                        "info", name=event["name"], call_id=event.get("id"),
-                                        arguments=_preview(event.get("arguments")), streamed=True,
-                                        args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
-                                out.put({key: value for key, value in event.items() if key != "partial"}
-                                        | {"tool_type": definition.get("x-client-type", "function")})
-                            elif event['type'] == 'usage':
-                                usage, delta = self._usage_update(holder, event)
-                                breakdown = credits.cost_breakdown(usage)
-                                known = holder.get('_attempt_credited') or event.get('credits_reported')
-                                log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
-                                                      'Токены получены; стоимость upstream не сообщена'),
-                                    'info' if known else 'warn', credits=None, attempt=journal_attempt,
-                                    credits_reported=bool(known), **delta,
-                                    **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
-                                if session is not None:
-                                    acquired._last_prefix_tokens = breakdown['prompt_tokens']
-                                out.put(event)
-                            elif event["type"] == "credits":
-                                # Each upstream attempt (retry, exec follow-up) is billed
-                                # separately: a per-turn dedup key dropped all but the first.
-                                credit_events = holder.get("_credit_events", 0) + 1
-                                holder["_credit_events"] = credit_events
-                                account_credits.record_turn(
-                                    turn_id if credit_events == 1 else "%s#%d" % (turn_id, credit_events),
-                                    event["value"])
-                                holder['_attempt_credited'] = True
-                                usage, delta = self._usage_update(holder, event)
-                                breakdown = credits.cost_breakdown(usage)
-                                hit = breakdown["cache_hit_ratio"]
-                                log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
-                                    event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
-                                    "%d%%" % round(hit * 100) if hit is not None else "—"),
-                                    "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
-                                    **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
-                                if session is not None:
-                                    # Write through the lease: SessionLease only proxies
-                                    # reads, so keepwarm (which holds the real session)
-                                    # saw prefix_tokens=0 forever.
-                                    acquired._last_prefix_tokens = breakdown["prompt_tokens"]
-                                out.put(event)
-                            elif event["type"] == "hitl":
-                                out.put(event)
-                                final_text += "\n" + event["question"]
-                            elif event["type"] == "end":
-                                holder["reason"] = event["reason"]
-                                upstream_completed = event["reason"] in ("stop", "tool_calls")
-                            elif event["type"] == "error":
-                                # A truncated upstream stream must reach the client as
-                                # an error, not fall through to a clean "stop".
-                                raise event["error"]
+                                elif event["type"] in ("thinking", "thinking_signature"):
+                                    if event["type"] == "thinking_signature" and think_started is not None:
+                                        span = round((time.time() - think_started) * 1000)
+                                        log("upstream.thinking_end", "Мышление заняло %d мс" % span, "info",
+                                            thinking_ms=span)
+                                        think_started = None
+                                    out.put(event)
+                                elif event["type"] in ("thinking_heartbeat", "usage_start"):
+                                    if event["type"] == "usage_start":
+                                        if usage_started:
+                                            journal_attempt += 1
+                                            holder['_journal_attempt'] = journal_attempt
+                                            log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
+                                        usage_started = True
+                                        think_started = None
+                                        holder['_attempt_usage'] = {}
+                                        holder['_attempt_credited'] = False
+                                    out.put(event)
+                                elif event["type"] == "tool_call" and event.get("name") in tool_names:
+                                    if not event.get("partial"):
+                                        streamed_tool_call = True
+                                    definition = tool_definitions[event["name"]]
+                                    call_key = event.get("id") or event["name"]
+                                    if call_key not in tool_started:
+                                        tool_started[call_key] = time.time()
+                                        ms = round((tool_started[call_key] - holder["upstream_started_at"]) * 1000)
+                                        log("upstream.tool_start", "Модель начала вызов %s через %d мс" % (event["name"], ms),
+                                            "debug", name=event["name"], call_id=event.get("id"), ms=ms)
+                                    if not event.get("partial"):
+                                        args_ms = round((time.time() - tool_started[call_key]) * 1000)
+                                        log("tool.call", "Инструмент клиента: %s (аргументы %d мс)" % (event["name"], args_ms),
+                                            "info", name=event["name"], call_id=event.get("id"),
+                                            arguments=_preview(event.get("arguments")), streamed=True,
+                                            args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
+                                    out.put({key: value for key, value in event.items() if key != "partial"}
+                                            | {"tool_type": definition.get("x-client-type", "function")})
+                                elif event['type'] == 'usage':
+                                    usage, delta = self._usage_update(holder, event)
+                                    breakdown = credits.cost_breakdown(usage)
+                                    known = holder.get('_attempt_credited') or event.get('credits_reported')
+                                    log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
+                                                          'Токены получены; стоимость upstream не сообщена'),
+                                        'info' if known else 'warn', credits=None, attempt=journal_attempt,
+                                        credits_reported=bool(known), **delta,
+                                        **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
+                                    if session is not None:
+                                        acquired._last_prefix_tokens = breakdown['prompt_tokens']
+                                    out.put(event)
+                                elif event["type"] == "credits":
+                                    # Each upstream attempt (retry, exec follow-up) is billed
+                                    # separately: a per-turn dedup key dropped all but the first.
+                                    credit_events = holder.get("_credit_events", 0) + 1
+                                    holder["_credit_events"] = credit_events
+                                    account_credits.record_turn(
+                                        turn_id if credit_events == 1 else "%s#%d" % (turn_id, credit_events),
+                                        event["value"])
+                                    holder['_attempt_credited'] = True
+                                    usage, delta = self._usage_update(holder, event)
+                                    breakdown = credits.cost_breakdown(usage)
+                                    hit = breakdown["cache_hit_ratio"]
+                                    log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
+                                        event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
+                                        "%d%%" % round(hit * 100) if hit is not None else "—"),
+                                        "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
+                                        **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
+                                    if session is not None:
+                                        # Write through the lease: SessionLease only proxies
+                                        # reads, so keepwarm (which holds the real session)
+                                        # saw prefix_tokens=0 forever.
+                                        acquired._last_prefix_tokens = breakdown["prompt_tokens"]
+                                    out.put(event)
+                                elif event["type"] == "hitl":
+                                    out.put(event)
+                                    final_text += "\n" + event["question"]
+                                elif event["type"] == "end":
+                                    holder["reason"] = event["reason"]
+                                    upstream_completed = event["reason"] in ("stop", "tool_calls")
+                                elif event["type"] == "error":
+                                    # A truncated upstream stream must reach the client as
+                                    # an error, not fall through to a clean "stop".
+                                    raise event["error"]
                     except apierr.ApiError:
                         raise
                     holder.setdefault("reason", "stop")
@@ -1281,7 +1342,7 @@ class TurnRunner:
 
                     # Once the summary turn is requested, nothing is executed any more.
                     can_exec = self._can_exec(exec_steps) and not final_summary and not client_owns_instructions
-                    command = executor.extract_command(final_text) if can_exec and not native_tools else None
+                    command = executor.extract_command(final_text) if can_exec and not client_has_tools else None
 
                     if not final_summary and exec_steps and not self._can_exec(exec_steps):
                         # Explicit step cap reached (max_exec_turns > 0 only).

@@ -46,3 +46,24 @@ def test_readme_rows_of_the_dump_limit_say_what_config_load_enforces(tmp_path, m
     assert rows
     for row in rows:
         assert "или меньше" not in row and "отрицательное значение relay не принимает" in row, row
+
+
+def test_the_example_config_notes_say_what_the_code_does_now():
+    # config.example.json is copied by people: its notes are the first documentation of a setting they read.
+    import direct
+    example = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+    assert "%d с" % int(direct.PING_LATEST) in example["cache_keepwarm_note"]
+    assert "%d" % int(direct.PING_LATEST) in example["cache_keepwarm_turn_note"]
+    assert "280" in example["cache_keepwarm_turn_note"] and int(direct.PING_DEADLINE) == 280
+    assert "prompt-pins" in example["conversation_state_note"]
+    # the legacy role reads nothing of a profile and a profile reads nothing of the role
+    assert "только на прежнем пути" in example["relay_system_prompt_note"]
+    assert "relay_texts" in example["relay_system_prompt_note"]
+    assert "prompts/" in example["prompts_file_note"] and "regex" in example["prompts_file_note"]
+
+
+def test_the_leftovers_of_saving_the_prompts_file_stay_out_of_git():
+    # a save leaves the previous version beside the file (prompts.json.bak) and, if it was interrupted, a temporary one
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "/prompts.json" in ignored and "/prompts/" in ignored
+    assert "/prompts.json.bak" in ignored and "/.prompts-*.tmp" in ignored

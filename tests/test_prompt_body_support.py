@@ -6,7 +6,8 @@ anthropic bodies.
 """
 import copy
 import json
-import re
+
+import regex
 
 import native_history
 import validate
@@ -17,7 +18,7 @@ CFG = {"strict_models": True, "model": MODEL}
 REMINDER = "<system-reminder>\nPlan mode is active. Do not edit files.\n</system-reminder>"
 TOOL_REMINDER = "<system-reminder>\nInstructions from: AGENTS.md\nUse tabs.\n</system-reminder>"
 IMAGE = "data:image/png;base64,AAAA"
-_FLAGS = {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL}
+_FLAGS = {"i": regex.IGNORECASE, "m": regex.MULTILINE, "s": regex.DOTALL}
 
 
 class FakeSnapshot:
@@ -28,8 +29,9 @@ class FakeSnapshot:
         self.regex_calls = []
 
     def regex(self, pattern, flags=""):
+        # A real Snapshot hands out patterns of the regex module (prompt_policy.compile_pattern), and so does this.
         self.regex_calls.append((pattern, flags))
-        return re.compile(pattern, sum(_FLAGS[flag] for flag in flags))
+        return regex.compile(pattern, sum((_FLAGS[flag] for flag in flags), regex.VERSION0))
 
     def relay_text(self, name):
         return self.reminder if name == "reminder" else None

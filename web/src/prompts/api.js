@@ -65,14 +65,44 @@ export function normalizeSpecialUses(raw) {
   return found.length ? found : SPECIAL_USES;
 }
 
-/** The profile name rule as the relay writes it (a Python regex source): a whole-string test, or null when it does not read here. */
-export function compileProfileName(source) {
+/**
+ * A name rule as the relay writes it (a Python regex source) read as a whole-string test; null when it does not read here.
+ * Python's `\w` and `\d` take letters and digits of every script, JavaScript's only ASCII, so they are spelled out; any other
+ * escape of a letter or digit (`\A`, `\Z`, `\b` …) means something else in JavaScript and is not guessed at.
+ */
+export function compileName(source) {
   if (typeof source !== 'string' || !source) return null;
+  let body = '';
+  let inClass = false;
+  for (let at = 0; at < source.length; at += 1) {
+    const char = source[at];
+    if (char === '\\') {
+      const next = source[at + 1];
+      at += 1;
+      if (next === 'w') body += inClass ? '\\p{L}\\p{N}_' : '[\\p{L}\\p{N}_]';
+      else if (next === 'd') body += '\\p{Nd}';
+      else if (next === undefined || /[A-Za-z0-9]/.test(next)) return null;
+      else body += `\\${next}`;
+      continue;
+    }
+    if (char === '[' && !inClass) inClass = true;
+    else if (char === ']' && inClass) inClass = false;
+    body += char;
+  }
   try {
-    return new RegExp(`^(?:${source})$`);
+    return new RegExp(`^(?:${body})$`, body.includes('\\p{') ? 'u' : '');
   } catch {
     return null;
   }
+}
+
+/** The profile name rule as the relay writes it, or null when it does not read here. */
+export const compileProfileName = compileName;
+
+/** The rule for the name of a text as the relay publishes it: {pattern, source}, or null when there is none or it does not read here. */
+export function compileTextName(source) {
+  const pattern = compileName(source);
+  return pattern ? { pattern, source } : null;
 }
 
 /** Limits the relay enforces; what it does not say stays at the documented value (plan section 2). */
@@ -100,6 +130,7 @@ export function normalizeBuiltin(raw) {
     relayTaskVariables: taskVariables.length ? taskVariables : RELAY_TASK_VARIABLES,
     specialUses: normalizeSpecialUses(data.special_uses),
     profileName: compileProfileName(data.profile_name),
+    textName: compileTextName(data.text_name),
     limits: normalizeLimits(data.limits),
     structuredExample: typeof example === 'string' ? example : isObject(example) || Array.isArray(example) ? JSON.stringify(example, null, 2) : '',
   };
@@ -137,6 +168,22 @@ export function normalizePrompts(raw) {
 export function normalizeSaved(raw) {
   const data = isObject(raw) ? raw : {};
   return { rev: isNum(data.rev) ? data.rev : null, warnings: list(data.warnings).map(warningText) };
+}
+
+/**
+ * The warnings to show about the document in force. The relay lists them with the document; the answer of a save lists
+ * them too, and names the ones of the engine (a hidden tool, protection off) that a relay may leave out of the list it
+ * sends with the document. So while the document in force is the one that save made, both are shown, and a warning that
+ * both name is shown once. Until the reading has caught up with the save, the list that came with the previous document
+ * is not about it and only the save's own answer is shown; once somebody else has saved since, only the relay's list is.
+ */
+export function warningsToShow(server, lastSave) {
+  if (!server) return [];
+  const own = server.warnings;
+  if (!lastSave || lastSave.rev === null) return own;
+  const read = server.rev ?? -1;
+  if (lastSave.rev > read) return [...new Set(lastSave.warnings)];
+  return lastSave.rev === read ? [...new Set([...own, ...lastSave.warnings])] : own;
 }
 
 /**
@@ -188,6 +235,8 @@ export function normalizeRecent(raw) {
     profile: typeof item.profile === 'string' ? item.profile : null,
     rev: isNum(item.rev) ? item.rev : null,
     pinned: item.pinned === true,
+    // a service request (a title, a compaction) answered by the protective rules: not what the rules of the document are written for
+    protected: item.protected === true,
     head: text(item.head),
     parts: normalizeParts(item.parts),
     history_changes: list(item.history_changes),

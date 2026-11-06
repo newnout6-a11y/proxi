@@ -274,6 +274,32 @@ test('journal clear asks for confirmation and empties the buffer into the illust
   expect(state.requests.some(({ path, headers }) => path === '/admin/api/events/clear' && headers['x-admin-request'] === '1')).toBe(true);
 });
 
+test('the events of the prompts layer have a category chip and a name of their own, and the chip filters them', async ({ page }) => {
+  await mockAdmin(page);
+  await serveEvents(page, [
+    eventAt(null, -50, 'prompt.reload', { rev: 3, source: 'file' }, { message: 'Промпты перечитаны: ревизия 3' }),
+    eventAt('t-prompt', -40, 'prompt.plan', { rev: 3, profile: 'mine-first', rule: 'opencode' }, { level: 'debug', message: 'План промптов: mine-first' }),
+    eventAt(null, -30, 'prompt.edit_skipped', { op: 'drop_tag', reason: 'unsupported system content' }, { level: 'warn', message: 'Правка пропущена: drop_tag' }),
+    eventAt(null, -20, 'admin.prompts', { rev: 4, changed_paths: ['profiles.mine-first'] }, { message: 'Промпты сохранены: ревизия 4' }),
+    eventAt(null, -10, 'http.request', { status: 200, route: 'anthropic' }, { message: 'POST /v1/messages → 200' }),
+  ]);
+  await login(page);
+  await openEvents(page);
+  const categories = page.getByRole('group', { name: 'Категории' });
+  const chip = categories.getByRole('button', { name: /^Промпты/ });
+  await expect(chip).toBeVisible();
+  await expect(chip.locator('.chip-count')).toHaveText('3');
+  await expect(page.locator('.log-row')).toHaveCount(5);
+  // the event shows the name of the category, not the raw word of its kind (newest first)
+  await expect(page.locator('.log-row .cat')).toHaveText(['HTTP', 'Админ', 'Промпты', 'Промпты', 'Промпты']);
+
+  await chip.click();
+  await expect(chip).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('.log-row')).toHaveCount(3);
+  await expect(page.locator('.log-row .cat')).toHaveText(['Промпты', 'Промпты', 'Промпты']);
+  await expect(page.locator('.log-row', { hasText: 'POST /v1/messages' })).toHaveCount(0);
+});
+
 test('activity opens on turns, aggregated into a turn tape and steps', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
