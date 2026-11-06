@@ -38,7 +38,9 @@ BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
 # _client_instructions), so the next request already sends the new head. So is compaction_keep_effort, which
 # TurnRunner._run_once reads when a client's compaction begins.
 LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
-                 "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort"}
+                 "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort",
+                 "max_conversations", "conversation_wait", "account_rate_limit_wait",
+                 "journal_max_file_bytes", "journal_keep_files"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 POOL_FIELDS = {"enabled", "priority", "label"}
@@ -113,14 +115,23 @@ def _schema():
          "На сколько секунд аккаунт уходит из пула, когда Retool сообщает о часовом лимите managed-ключей; "
          "лимит сразу после возврата удлиняет паузу на 5 минут за раз, но не дольше 20 минут "
          "(или самой паузы, если она длиннее)", "с", 1, 3600, None),
+        ("account_rate_limit_wait", "integer", "Ожидание при часовом лимите", "routing",
+         "Сколько секунд запрос диалога с тёплым кэшем ждёт аккаунт, ответивший о часовом лимите, и пробует его ещё раз, "
+         "прежде чем диалог переедет на другой аккаунт (там весь префикс записывается заново). Если Retool прислал "
+         "Retry-After, ждём столько, когда это не больше предела; 0 — переезжать сразу. Применяется сразу",
+         "с", 0, 120, None),
         ("session_refresh_interval", "integer", "Продление сессии", "routing",
          "Как часто продлевать сессию Retool каждого включённого аккаунта; 0 — не продлевать по таймеру",
          "с", 0, 86400, None),
         ("account_refresh_parallel", "integer", "Проверок одновременно", "routing",
          "Сколько аккаунтов можно проверять или продлевать одновременно", None, 1, 32, None),
         ("max_conversations", "integer", "Открытые диалоги", "routing",
-         "Сколько диалогов relay держит открытыми; при переполнении закрывается самый давний неактивный",
+         "Сколько диалогов relay держит открытыми; при переполнении закрывается неактивный диалог, который дешевле "
+         "всего собрать заново (маленький и малоиспользованный), а не просто самый давний. Применяется сразу",
          None, 1, 4096, None),
+        ("conversation_wait", "integer", "Ожидание места для диалога", "routing",
+         "Сколько секунд новый диалог ждёт место, если все открытые диалоги заняты и вытеснить некого, прежде чем "
+         "получить 503; 0 — отвечать 503 сразу. Применяется сразу", "с", 0, 300, None),
         ("conversation_idle_timeout", "integer", "Хранение неактивного диалога", "routing",
          "Через сколько секунд простоя диалог закрывается и следующий запрос начнёт новый тред Retool",
          "с", 1, 86400, None),
@@ -138,7 +149,8 @@ def _schema():
          None, None, None, list(models.XHIGH_REPLACEMENTS)),
         ("compaction_keep_effort", "boolean", "Сжатие на effort диалога", "model",
          "Когда клиент сжимает историю, relay берёт effort диалога, если так продолжается его подписанная история: "
-         "смена effort сбрасывает её и кэш сообщений, и весь диалог записывается заново. Применяется сразу",
+         "смена effort сбрасывает её и кэш сообщений, и весь диалог записывается заново. Effort диалога берётся, "
+         "только если он не ниже effort запроса: relay никогда не понижает effort ради кэша. Применяется сразу",
          None, None, None, None),
         ("show_thinking", "boolean", "Передавать мышление модели", "model",
          "Отдавать клиенту блоки мышления модели, когда Retool их присылает",
@@ -210,6 +222,12 @@ def _schema():
          "Максимальный размер тела HTTP-запроса от клиента", "байт", 1, 1_073_741_824, None),
         ("max_frame_bytes", "integer", "Размер WebSocket frame", "limits",
          "Максимальный размер одного кадра WebSocket от Retool", "байт", 1, 1_073_741_824, None),
+        ("journal_max_file_bytes", "integer", "Размер файла журнала", "limits",
+         "На каком размере журнал начинает новый файл; на диске лежит не больше (число прежних файлов + 1) таких файлов",
+         "байт", 1_048_576, 1_073_741_824, None),
+        ("journal_keep_files", "integer", "Прежние файлы журнала", "limits",
+         "Сколько прежних файлов журнала хранить на диске; самый старый удаляется при следующей смене файла; "
+         "0 — не хранить", None, 0, 50, None),
         ("enable_chat", "boolean", "Chat Completions API", "api",
          "Принимать запросы OpenAI Chat Completions на /v1/chat/completions", None, None, None, None),
         ("enable_responses", "boolean", "Responses API", "api",

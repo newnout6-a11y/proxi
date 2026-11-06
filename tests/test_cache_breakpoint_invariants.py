@@ -231,8 +231,15 @@ def test_native_chain_keeps_its_breakpoints_when_screenshots_end_the_history(tmp
         assert {kind for _, kind in marked} <= {"text", "tool_call"}
         assert len(marked) <= 3
         calls = [i for i, m in enumerate(body["messages"]) if m["role"] == "assistant"]
+        # a tool result carries the newest hint where it arrives (item 16); the hint of a result is not in `marked`,
+        # which lists blocks of messages whose content is a list
+        hinted_results = [i for i, m in enumerate(body["messages"]) if isinstance(m["content"], dict)
+                          and isinstance(m["content"].get("toolResult"), list)
+                          and any(isinstance(b, dict) and b.get("cache") for b in m["content"]["toolResult"])]
+        assert len(marked) + len(hinted_results) <= 3
         if calls:
-            assert (calls[-1], "tool_call") in marked
+            assert (calls[-1], "tool_call") in marked or any(index > calls[-1] for index in hinted_results)
+        endpoints = {index for index, _ in marked} | set(hinted_results)
         if previous_endpoint is not None:
-            assert previous_endpoint in {index for index, _ in marked}
-        previous_endpoint = max(index for index, _ in marked)
+            assert previous_endpoint in endpoints
+        previous_endpoint = max(endpoints)

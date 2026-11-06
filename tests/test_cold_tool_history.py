@@ -69,7 +69,8 @@ def test_first_tool_followup_on_a_new_session_rebuilds_roles_without_client_thin
     assistant = next(m for m in wire if m['role'] == 'assistant')
     result = next(m for m in wire if m['role'] == 'tool')
     assert assistant['content'][0]['type'] == 'tool_call'
-    assert result['content']['toolResult'] == 'RESULT-MARKER'
+    # a result carries the newest hint where it arrives (item 16): one text block, hinted
+    assert result['content']['toolResult'] == [{'type': 'text', 'text': 'RESULT-MARKER', 'cache': True}]
     assert result['content']['toolCallId'] == assistant['content'][0]['toolCallId']
     assert not any(b.get('type') in ('thinking', 'redacted_thinking') for m in wire
                    for b in m.get('content', []) if isinstance(b, dict))

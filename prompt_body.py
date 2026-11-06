@@ -106,8 +106,9 @@ def rewrite(data: dict, dialect: str, profile: dict, snapshot) -> tuple[dict, li
       blank entry with exactly those fields, so effort and structured output do not change; kept
       names them.
     * skipped: True with a short reason when the edit was refused on this request: why a deletion would break the
-      conversation, or "timeout" (a pattern did not finish in policy.REGEX_TIMEOUT, or the regex time of the call,
-      policy.REGEX_BUDGET, was spent) or "too_large" (the edit would add more than policy.MAX_EDIT_GROWTH characters to
+      conversation, or "timeout" (a pattern did not finish in policy.REGEX_TIMEOUT, or what all the regular expressions of
+      the call may use, policy.REGEX_WORK characters to scan and policy.REGEX_BUDGET seconds, was spent) or "too_large" (the
+      edit would add more than policy.MAX_EDIT_GROWTH characters to
       one text, or the edits of the section more than policy.MAX_BODY_GROWTH in all: history and tools count apart, in the
       order of the messages and tools, so a conversation that grows keeps the decisions it had). The text is then left as
       it was. No change entry at all means the edit did not match anything (the preview shows it as unmatched).
@@ -207,7 +208,8 @@ class _Context:
     def __init__(self, snapshot, dialect, changes):
         self.snapshot, self.dialect, self.changes = snapshot, dialect, changes
         self._template = _KEEP
-        # The time all the regular expressions of this rewrite may take together (see policy.Deadline).
+        # What all the regular expressions of this rewrite may use together: characters to scan, and time as a last stop (see
+        # policy.Deadline).
         self.deadline = policy.Deadline()
         # How many characters the edits of the history, and apart from them those of the tools, may still add in all.
         self.room = {"history": policy.MAX_BODY_GROWTH, "tools": policy.MAX_BODY_GROWTH}

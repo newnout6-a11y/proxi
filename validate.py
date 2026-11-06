@@ -1,6 +1,7 @@
 """Strict request parsing for every supported dialect."""
 import base64
 import contextvars
+import functools
 import hashlib
 import ipaddress
 import json
@@ -68,16 +69,17 @@ _IMAGE_FETCHES = contextvars.ContextVar("proxi_image_fetches", default=None)
 
 
 class ImageFetches:
-    """The remote images one request has downloaded, by URL, for the second parse of a body a prompt profile rewrote.
+    """The remote images one request has downloaded, by URL: every parse made inside the block takes them from here.
 
-    Used as a context manager it records, in the parses made inside it, what each download gave. Once `reuse` is set,
-    a parse made inside it takes those images from here instead of downloading them again: the rewrite leaves images
-    alone, so the second parse wants exactly the pictures the first one fetched (and must not fail on a link that has
-    stopped answering since). Outside any such block, and while `reuse` is off, every parse downloads as it always did."""
+    One parse reads a picture three times (it renders the text, fingerprints the messages and builds the native ones),
+    and a body a prompt profile rewrote is parsed once more. Each read used to download the picture again: three
+    downloads of the same link per request, so that one slow answer failed the request with a 422 and a picture that
+    changed between two of them made the native history differ from itself. The first download is kept, and the
+    other reads, of this parse and of the second one, get the same bytes (and a link that has stopped answering since
+    costs nothing). A parse outside any block opens one of its own (_in_fetch_scope)."""
 
     def __init__(self):
         self.found = {}
-        self.reuse = False
         self._tokens = []
 
     def __enter__(self):
@@ -87,6 +89,17 @@ class ImageFetches:
     def __exit__(self, *exc):
         _IMAGE_FETCHES.reset(self._tokens.pop())
         return False
+
+
+def _in_fetch_scope(parse):
+    """Run a parse inside the fetch scope of its request, or inside one of its own when it is called without."""
+    @functools.wraps(parse)
+    def scoped(data, cfg):
+        if _IMAGE_FETCHES.get() is not None:
+            return parse(data, cfg)
+        with ImageFetches():
+            return parse(data, cfg)
+    return scoped
 
 
 class Parsed:
@@ -253,7 +266,7 @@ def _extract_image_data(block, where):
                     data_b64 = rest.strip()
             elif url.startswith("http://") or url.startswith("https://"):
                 fetches = _IMAGE_FETCHES.get()
-                kept = fetches.found.get(url) if fetches is not None and fetches.reuse else None
+                kept = fetches.found.get(url) if fetches is not None else None
                 if kept is not None:
                     mime_type, data_b64 = kept
                 else:
@@ -359,7 +372,54 @@ def _instruction_text(*parts):
     return "\n\n".join(part for part in parts if part and part.strip())
 
 
-def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, converted=None, ignored=None):
+def _marked_text_blocks(content, role):
+    """The blocks of a user message whose client marked a block that is not the last one, else None.
+
+    Claude Code's permission classifier (auto-mode-check) sends the whole transcript as one user message of text blocks
+    and marks, with cache_control, the part that stays the same from one request to the next; what follows the mark (the
+    pending action, the instruction) is new every time. Joined into one text, that message got one breakpoint at its
+    very end, which no later request can read: every check wrote the growing transcript again (a5, 2026-11-06: 35 checks
+    read 64.7k tokens of system prompt and nothing of the transcript, and wrote 28k tokens each).
+
+    The blocks keep the text the join made of them (the role before the first one, the trailing whitespace of the whole
+    message stripped, empty blocks left out, a block of only whitespace joined to the block before it, as no such block
+    can go upstream; the newline of the join is the private "sep" that build_body adds back), so that the text sent
+    upstream, parsed.prompt and the fingerprints do not change. The last marked block, and only it, carries `cache`:
+    upstream has taken a flag on a block that is not the last of its message, but never two in one. A mark on the last
+    block is where build_body flags a message anyway: such a message stays one text.
+    """
+    if not isinstance(content, list) or len(content) < 2:
+        return None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str):
+            return None
+    kept = []
+    for block in content:
+        text, mark = block["text"], bool(block.get("cache_control"))
+        if not text:
+            if mark and kept:
+                kept[-1][1] = True  # an empty block cannot carry the mark upstream: the block before it ends in the same place
+        elif kept and not text.strip():
+            kept[-1][0] += "\n" + text
+            kept[-1][1] = kept[-1][1] or mark
+        else:
+            kept.append([text, mark])
+    if len(kept) < 2:
+        return None
+    kept[-1][0] = kept[-1][0].rstrip()
+    marked = [index for index, (_, mark) in enumerate(kept) if mark]
+    if not marked or marked[-1] == len(kept) - 1:
+        return None
+    blocks = [{"type": "text", "text": text} for text, _ in kept]
+    blocks[0]["text"] = f"{role.capitalize()}: {blocks[0]['text']}"
+    blocks[marked[-1]]["cache"] = True
+    for block in blocks[:-1]:
+        block["sep"] = "\n"
+    return blocks
+
+
+def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, converted=None, ignored=None,
+                   keep_marked_blocks=False):
     """Return (system_text, [chunk per conversation message]).
 
     Chunks keep one message per element so the direct transport can place cache
@@ -367,6 +427,9 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
     leading system/developer messages form the head; a later non-empty one keeps
     its place as a user-turn reminder (its index is appended to `converted`),
     and a blank one, such as an effort-only entry, produces nothing.
+
+    keep_marked_blocks: a user message of text blocks that the client marked with cache_control stays a list of blocks
+    where the mark was (_marked_text_blocks), instead of one text with the mark lost.
     """
     if lead is None:
         lead = native_history.leading_instructions(messages, role_key) if allow_system else 0
@@ -438,7 +501,10 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
                 convo.append(images)
             continue
         user_text = f"{role.capitalize()}: {text}".strip()
-        if images:
+        marked = _marked_text_blocks(message.get("content"), role) if keep_marked_blocks and not images else None
+        if marked is not None:
+            convo.append(marked)
+        elif images:
             blocks = []
             if text:
                 blocks.append({"type": "text", "text": user_text})
@@ -501,8 +567,6 @@ def _responses_item(item):
                                              "arguments": arguments}}]}
     if kind == "item_reference":
         raise unprocessable("item_reference is not supported; send the full conversation items", param="input")
-    if kind == "reasoning" and "role" not in item:
-        return {"role": "assistant", "content": item.get("summary") or ""}
     if kind == "agent_message" and "role" not in item:
         # Codex's multi-agent v2: a message between the agents of one task (author -> recipient), such as a task or
         # a sub-agent's final answer. Upstream has no such item; to the agent that holds it, it is a turn it received.
@@ -762,6 +826,7 @@ def _effort_of(data, cfg):
         allow_downgrade=cfg.get("allow_effort_downgrade", False), xhigh_as=cfg.get("claude_xhigh_effort", "high"))
 
 
+@_in_fetch_scope
 def parse_chat(data, cfg):
     parsed = Parsed()
     entry, effort = _effort_of(data, cfg)
@@ -785,6 +850,7 @@ def parse_chat(data, cfg):
     return _finish(data, parsed, 'chat')
 
 
+@_in_fetch_scope
 def parse_responses(data, cfg):
     parsed = Parsed()
     entry, effort = _effort_of(data, cfg)
@@ -796,8 +862,13 @@ def parse_responses(data, cfg):
     if isinstance(raw_input, str):
         messages = [{"role": "user", "content": raw_input}]
     elif isinstance(raw_input, list):
-        messages = [_responses_item(item) for item in raw_input]
-        for index, message in enumerate(messages):
+        # A reasoning item is what the model thought of an earlier turn (a summary, an encrypted copy of it), not a turn
+        # of the conversation: the native history leaves it out, and the text bridge did not, so every summary came back
+        # to the model as something the assistant had said (ultracode audit, C16).
+        kept = [(index, item) for index, item in enumerate(raw_input)
+                if not (isinstance(item, dict) and item.get("type") == "reasoning" and "role" not in item)]
+        messages = [_responses_item(item) for _, item in kept]
+        for (index, _), message in zip(kept, messages):
             if (isinstance(message, dict) and message.get("role") is None and not message.get("tool_calls")
                     and message.get("type") not in (None, "message")):
                 # Without this the item failed later as "messages[N].role must be a string", which names no type.
@@ -816,10 +887,7 @@ def parse_responses(data, cfg):
     parsed.system_messages_normalized = bool(converted)
     parsed.inline_tool_changes = list(dict.fromkeys(ignored))
     parsed.message_fingerprints = _message_fingerprints(messages, lead)
-    native_input = ([message for item, message in zip(raw_input, messages)
-                     if item.get("type") != "reasoning" or "role" in item]
-                    if isinstance(raw_input, list) else messages)
-    parsed.native_messages = native_history.client_messages(native_input, _extract_image_data, lead=lead)
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
@@ -827,6 +895,7 @@ def parse_responses(data, cfg):
     return _finish(data, parsed, 'responses')
 
 
+@_in_fetch_scope
 def parse_anthropic(data, cfg):
     parsed = Parsed()
     model = _opt_str(data, "model")
@@ -839,7 +908,9 @@ def parse_anthropic(data, cfg):
     # prefix, so only the leading instructions join the top-level system text.
     # Later ones keep their place as user-turn reminders.
     lead, converted, ignored = native_history.leading_instructions(messages), [], []
-    system, chunks = _render_chunks(messages, lead=lead, converted=converted, ignored=ignored)
+    # A request without tools (the permission classifier of Claude Code) keeps the cache marks of its text blocks.
+    system, chunks = _render_chunks(messages, lead=lead, converted=converted, ignored=ignored,
+                                    keep_marked_blocks=not data.get("tools"))
     text_chunks = [c if isinstance(c, str) else "\n".join(b.get("text", f"[{b.get('type')}]") for b in c if isinstance(b, dict)) for c in chunks]
     parsed.prompt, parsed.message_chunks = "\n\n".join(text_chunks), chunks
     declared_system = data.get("system")

@@ -39,6 +39,13 @@ DEFAULTS = {
     "max_workers": 32,
     "max_conversations": 128,
     "conversation_idle_timeout": 900,
+    # A new conversation that finds the pool full of conversations that cannot go now (busy, or the parent of a running
+    # subagent) waits up to this many seconds for a slot before it gets 503. 0 answers 503 at once.
+    "conversation_wait": 10,
+    # The journal (journal.jsonl) starts a new file at this size and keeps this many old ones (journal.jsonl.1 is the
+    # newest), so at most (journal_keep_files + 1) * journal_max_file_bytes stay on disk. 0 keeps no old file.
+    "journal_max_file_bytes": 50 * 1024 * 1024,
+    "journal_keep_files": 5,
     # Conversations survive a relay restart: after every turn that moved one, its signed history, cache marks and
     # account are written to a private directory (empty = <state-dir>/conversations) and read back, onto the
     # same account, when the conversation's next request creates its session.
@@ -143,6 +150,10 @@ DEFAULTS = {
     # Pause after Retool's hourly managed-key limit; a limit right after the return adds 5 minutes
     # to it, up to max(this, 20 minutes).
     "account_rate_limit_cooldown": 900,
+    # Seconds a request that has a warm conversation waits on an account that answered the hourly limit, and then asks
+    # that account once more, before the conversation moves to another account (which writes its whole prefix again).
+    # With a Retry-After from Retool it waits that long if that fits; 0 moves the conversation at once.
+    "account_rate_limit_wait": 0,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -155,6 +166,11 @@ PROMPTS_FILE_MAX_CHARS = 4096
 # The counts and sizes of the stored conversations: whole positive numbers.
 STATE_NUMBERS = ("conversation_state_max_conversations", "conversation_state_ttl",
                  "conversation_state_max_file_bytes", "conversation_state_max_total_bytes")
+# The size and the number of the journal's files: whole numbers, checked before int() would turn true into 1.
+JOURNAL_NUMBERS = ("journal_max_file_bytes", "journal_keep_files")
+# How long a new conversation waits for a slot of a full pool, and how long a request waits on an account that is at its
+# hourly limit: whole numbers of seconds, checked the same way.
+POOL_NUMBERS = ("conversation_wait", "account_rate_limit_wait")
 
 # Cookie values that are just host names are not secrets.
 HOSTNAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
@@ -528,7 +544,7 @@ def _load(path):
             cfg[key] = value
 
     # Before the loop below, which would turn true into 1, 1.9 into 1 and crash on infinity.
-    for num_key in STATE_NUMBERS:
+    for num_key in STATE_NUMBERS + JOURNAL_NUMBERS + POOL_NUMBERS:
         if _whole_number(cfg[num_key]) is None:
             raise service_unavailable(f"config value '{num_key}' must be an integer (a whole number: "
                                       "not true/false, not a fraction)")
@@ -536,15 +552,17 @@ def _load(path):
     for num_key in ("port", "agent_mode", "max_body_bytes", "max_frame_bytes", "max_workers",
                     "turn_timeout", "recv_timeout", "upstream_timeout",
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
+                    "conversation_wait",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
                     "cache_keepwarm_subagent_idle",
                     "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
-                    "account_rate_limit_cooldown",
+                    "account_rate_limit_cooldown", "account_rate_limit_wait",
                     "upstream_empty_retries", "upstream_rate_limit_retries", "upstream_error_max_dumps",
                     "upstream_attempt_summaries_max",
                     "trace_max_folders", "conversation_state_max_conversations", "conversation_state_ttl",
-                    "conversation_state_max_file_bytes", "conversation_state_max_total_bytes"):
+                    "conversation_state_max_file_bytes", "conversation_state_max_total_bytes",
+                    "journal_max_file_bytes", "journal_keep_files"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -562,6 +580,8 @@ def _load(path):
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
     if not 1 <= cfg["account_rate_limit_cooldown"] <= 3600:
         raise service_unavailable("account_rate_limit_cooldown must be between 1 and 3600 seconds")
+    if not 0 <= cfg["account_rate_limit_wait"] <= 120:
+        raise service_unavailable("account_rate_limit_wait must be between 0 and 120 seconds (0 moves the conversation at once)")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     if cfg["claude_xhigh_effort"] not in models.XHIGH_REPLACEMENTS:
@@ -597,6 +617,12 @@ def _load(path):
             raise service_unavailable(f"{key} must be positive")
     if cfg["max_conversations"] < 1 or cfg["conversation_idle_timeout"] < 1:
         raise service_unavailable("max_conversations and conversation_idle_timeout must be positive")
+    if not 0 <= cfg["conversation_wait"] <= 300:
+        raise service_unavailable("conversation_wait must be between 0 and 300 seconds (0 answers 503 at once)")
+    if not 1024 * 1024 <= cfg["journal_max_file_bytes"] <= 1024 ** 3:
+        raise service_unavailable("journal_max_file_bytes must be between 1 MiB and 1 GiB (1048576 to 1073741824)")
+    if not 0 <= cfg["journal_keep_files"] <= 50:
+        raise service_unavailable("journal_keep_files must be between 0 and 50 (0 keeps no old file)")
     if type(cfg["conversation_state"]) is not bool:
         raise service_unavailable("conversation_state must be a boolean")
     if not isinstance(cfg["conversation_state_dir"], str):

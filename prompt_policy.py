@@ -25,8 +25,9 @@ prompt: a tag mentioned inside a sentence is not a block. Every pattern of every
 revision, and every "with" of replace_regex is checked against its pattern.
 
 Limits (review R1): text files are read only from prompts/ next to the prompts file (.md and .txt). A pattern has the syntax of
-`re` but is a pattern of the `regex` module, which runs it with the GIL released and under a time limit (REGEX_TIMEOUT per
-operation, REGEX_BUDGET per call): an edit that runs out of time is not applied (a warning of the head, `skipped: "timeout"` in
+`re` but is a pattern of the `regex` module, which runs it with the GIL released and under limits (REGEX_WORK characters scanned
+per call; as an emergency stop REGEX_TIMEOUT per operation and REGEX_BUDGET seconds per call): an edit that goes over them is
+not applied (a warning of the head, `skipped: "timeout"` in
 the report of the body). The head is at most MAX_HEAD_BYTES (a document that cannot stay under it is refused, a head that
 goes over it is a 413); an edit may add at most MAX_EDIT_GROWTH characters to its text and the history edits (and, apart, the
 tool edits) of one request at most MAX_BODY_GROWTH in all (`skipped: "too_large"`).
@@ -129,8 +130,14 @@ MAX_PATTERN_WEIGHT = 50_000
 # Regular expressions run in the `regex` module with a time limit (plan I11, review R1-01): Python's own `re` holds the GIL
 # while it matches, so one catastrophic pattern on untrusted text (a tool result, an AGENTS.md) would freeze every thread of
 # the relay. `regex` lets the other threads run while it matches (concurrent=True) and stops at the limit.
-REGEX_TIMEOUT = 0.25     # seconds one search or replacement may take
-REGEX_BUDGET = 1.0       # seconds all the regular expressions of one call (compose_head, rewrite) may take together
+# What bounds the ordinary work of a call is not time but work: every operation is charged the length of the text it runs on, and
+# a call may scan REGEX_WORK characters in all. The same body then costs the same on every machine and under any load: the
+# wall-clock budget of 1 s alone skipped edits whenever the relay was busy, so the same request had another head or other tool
+# descriptions from one turn to the next, and with them another scope of the signed history (a5, G4.1). The time limits are
+# the emergency stop for a pattern that backtracks without end, and are loose enough for a loaded machine not to reach them.
+REGEX_WORK = 250_000_000  # characters all the regular expressions of one call (compose_head, rewrite) may scan together
+REGEX_TIMEOUT = 1.0       # seconds one search or replacement may take
+REGEX_BUDGET = 8.0        # seconds all the regular expressions of one call may take together
 # How large the texts that edits make may be (review R1-03). The head, in UTF-8 bytes, is what every request sends to Retool;
 # an edit may make the text it edits at most MAX_EDIT_GROWTH characters longer, and the edits of the history (and, apart from
 # them, those of the tools) of one request together at most MAX_BODY_GROWTH characters: replacing " " with a long text, or a
@@ -960,7 +967,8 @@ class EditRefused(Exception):
 
 
 class RegexTimeout(EditRefused):
-    """A pattern did not finish in its share of the time (REGEX_TIMEOUT for one operation, REGEX_BUDGET for a call)."""
+    """A pattern did not finish in its share: REGEX_TIMEOUT for one operation, REGEX_BUDGET seconds or REGEX_WORK characters for
+    a call."""
     reason = "timeout"
 
 
@@ -981,21 +989,29 @@ REGEX_ERRORS = (re.error,) + ((_regex.error,) if _regex is not None else ())
 
 
 class Deadline:
-    """The regular-expression time of one call (compose_head, prompt_body.rewrite): REGEX_BUDGET seconds in all.
+    """What the regular expressions of one call (compose_head, prompt_body.rewrite) may use: REGEX_WORK characters of text to
+    scan in all, and as an emergency stop REGEX_BUDGET seconds.
 
-    One operation may take REGEX_TIMEOUT at most (less when the budget is nearly gone). Without a budget, 200 edits that each
-    time out would cost 200 timeouts; with it, the first few do and the rest are refused at once.
+    An operation is charged the length of its text before it runs, so what is refused depends on the request and on nothing
+    else: the same request gets the same edits on a quiet machine and a busy one. One operation may take REGEX_TIMEOUT at most
+    (less when the time is nearly gone). Without a budget, 200 edits that each time out would cost 200 timeouts; with it, the
+    first few do and the rest are refused at once.
     """
-    __slots__ = ("per_operation", "left")
+    __slots__ = ("per_operation", "left", "work")
 
-    def __init__(self, budget=None, per_operation=None):
+    def __init__(self, budget=None, per_operation=None, work=None):
         self.left = REGEX_BUDGET if budget is None else budget
         self.per_operation = REGEX_TIMEOUT if per_operation is None else per_operation
+        self.work = REGEX_WORK if work is None else work
 
-    def run(self, call):
-        """call(timeout) with the time that is left; RegexTimeout when none is, or when the call used all of it."""
+    def run(self, call, size=0):
+        """call(timeout) with the time that is left, after charging `size` characters of work; RegexTimeout when no work or
+        time is left, or when the call used all of it."""
+        if size > self.work:
+            raise RegexTimeout("the work for regular expressions is spent")
         if self.left < _MIN_SLICE:
             raise RegexTimeout("the time for regular expressions is spent")
+        self.work -= size
         started = time.perf_counter()
         try:
             return call(min(self.per_operation, self.left))
@@ -1014,7 +1030,7 @@ def _limits(compiled, timeout):
 
 def regex_search(compiled, text, deadline=None):
     """The first match of the compiled pattern in text, or None; RegexTimeout when the time is up."""
-    return (deadline or Deadline()).run(lambda timeout: compiled.search(text, **_limits(compiled, timeout)))
+    return (deadline or Deadline()).run(lambda timeout: compiled.search(text, **_limits(compiled, timeout)), len(text))
 
 
 def regex_spans(compiled, text, deadline=None):
@@ -1031,12 +1047,12 @@ def regex_spans(compiled, text, deadline=None):
                 if len(found) > MAX_MATCHES:
                     raise EditTooLarge("the pattern matches in more than %d places" % MAX_MATCHES)
         return found
-    return (deadline or Deadline()).run(spans)
+    return (deadline or Deadline()).run(spans, len(text))
 
 
 def regex_remove(compiled, text, deadline=None):
     """(text without the matches, how many there were); RegexTimeout when the time is up."""
-    return (deadline or Deadline()).run(lambda timeout: compiled.subn("", text, **_limits(compiled, timeout)))
+    return (deadline or Deadline()).run(lambda timeout: compiled.subn("", text, **_limits(compiled, timeout)), len(text))
 
 
 def regex_replace(compiled, template, text, deadline=None, room=None):
@@ -1059,7 +1075,8 @@ def regex_replace(compiled, template, text, deadline=None, room=None):
             raise EditTooLarge("the replacement would make the text more than %d characters longer" % room)
         return value
 
-    new, count = (deadline or Deadline()).run(lambda timeout: compiled.subn(swap, text, **_limits(compiled, timeout)))
+    new, count = (deadline or Deadline()).run(lambda timeout: compiled.subn(swap, text, **_limits(compiled, timeout)),
+                                              len(text))
     return new, count, removed, added
 
 
