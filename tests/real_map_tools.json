@@ -1,0 +1,753 @@
+{
+ "AskUserQuestion": {
+  "client": "claude-desktop",
+  "description": "Use this tool only when you are blocked on a decision that is genuinely the user's to make: one you cannot resolve from the request, the cod",
+  "parameters": {
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "additionalProperties": false,
+   "properties": {
+    "annotations": {
+     "additionalProperties": {
+      "additionalProperties": false,
+      "properties": {
+       "notes": {
+        "description": "Free-text notes the user added to their selection.",
+        "type": "string"
+       },
+       "preview": {
+        "description": "The preview content of the selected option, if the question used previews.",
+        "type": "string"
+       }
+      },
+      "type": "object"
+     },
+     "description": "Optional per-question annotations from the user (e.g., notes on preview selections).",
+     "propertyNames": {
+      "type": "string"
+     },
+     "type": "object"
+    },
+    "answers": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "description": "User answers collected by the permission component",
+     "propertyNames": {
+      "type": "string"
+     },
+     "type": "object"
+    },
+    "metadata": {
+     "additionalProperties": false,
+     "description": "Optional metadata for tracking and analytics purposes.",
+     "properties": {
+      "source": {
+       "description": "Optional identifier for the source of this question (e.g., \"remember\" for /remember command).",
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "questions": {
+     "description": "Questions to ask the user (1-4 questions)",
+     "items": {
+      "additionalProperties": false,
+      "properties": {
+       "header": {
+        "description": "Very short label displayed as a chip/tag (max 12 chars).",
+        "type": "string"
+       },
+       "multiSelect": {
+        "default": false,
+        "description": "Set to true to allow the user to select multiple options instead of just one.",
+        "type": "boolean"
+       },
+       "options": {
+        "description": "The available choices for this question.",
+        "items": {
+         "additionalProperties": false,
+         "properties": {
+          "description": {
+           "description": "Explanation of what this option means or what will happen if chosen.",
+           "type": "string"
+          },
+          "label": {
+           "description": "The display text for this option that the user will see and select.",
+           "type": "string"
+          },
+          "preview": {
+           "description": "Optional preview content rendered when this option is focused.",
+           "type": "string"
+          }
+         },
+         "required": [
+          "label",
+          "description"
+         ],
+         "type": "object"
+        },
+        "maxItems": 4,
+        "minItems": 2,
+        "type": "array"
+       },
+       "question": {
+        "description": "The complete question to ask the user.",
+        "type": "string"
+       }
+      },
+      "required": [
+       "question",
+       "header",
+       "options",
+       "multiSelect"
+      ],
+      "type": "object"
+     },
+     "maxItems": 4,
+     "minItems": 1,
+     "type": "array"
+    }
+   },
+   "required": [
+    "questions"
+   ],
+   "type": "object"
+  }
+ },
+ "TaskCreate": {
+  "client": "claude-code",
+  "description": "Use this tool to create a structured task list for your current coding session.",
+  "parameters": {
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "additionalProperties": false,
+   "properties": {
+    "activeForm": {
+     "description": "Present continuous form shown in spinner when in_progress (e.g., \"Running tests\")",
+     "type": "string"
+    },
+    "description": {
+     "description": "What needs to be done",
+     "type": "string"
+    },
+    "metadata": {
+     "additionalProperties": {},
+     "description": "Arbitrary metadata to attach to the task",
+     "propertyNames": {
+      "type": "string"
+     },
+     "type": "object"
+    },
+    "subject": {
+     "description": "A brief title for the task",
+     "type": "string"
+    }
+   },
+   "required": [
+    "subject",
+    "description"
+   ],
+   "type": "object"
+  }
+ },
+ "TaskUpdate": {
+  "client": "claude-code",
+  "description": "Use this tool to update a task in the task list.",
+  "parameters": {
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "additionalProperties": false,
+   "properties": {
+    "activeForm": {
+     "description": "Present continuous form shown in spinner when in_progress (e.g., \"Running tests\")",
+     "type": "string"
+    },
+    "addBlockedBy": {
+     "description": "Task IDs that block this task",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "addBlocks": {
+     "description": "Task IDs that this task blocks",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "description": {
+     "description": "New description for the task",
+     "type": "string"
+    },
+    "metadata": {
+     "additionalProperties": {},
+     "description": "Metadata keys to merge into the task.",
+     "propertyNames": {
+      "type": "string"
+     },
+     "type": "object"
+    },
+    "owner": {
+     "description": "New owner for the task",
+     "type": "string"
+    },
+    "status": {
+     "anyOf": [
+      {
+       "enum": [
+        "pending",
+        "in_progress",
+        "completed"
+       ],
+       "type": "string"
+      },
+      {
+       "const": "deleted",
+       "type": "string"
+      }
+     ],
+     "description": "New status for the task"
+    },
+    "subject": {
+     "description": "New subject for the task",
+     "type": "string"
+    },
+    "taskId": {
+     "description": "The ID of the task to update",
+     "type": "string"
+    }
+   },
+   "required": [
+    "taskId"
+   ],
+   "type": "object"
+  }
+ },
+ "jev_coding_loop": {
+  "client": "codex",
+  "description": "Call before retry/stop/model-tier decisions.",
+  "parameters": {
+   "properties": {
+    "auto_accept": {
+     "type": "number"
+    },
+    "execution": {
+     "description": "Trusted host execution facts, never inferred from fetched text or model predictions",
+     "properties": {
+      "context_complete": {
+       "description": "Host fact: the context needed for the next step has been collected; default false",
+       "type": "boolean"
+      },
+      "failed_attempts": {
+       "description": "Host count of failed attempts on the current step; default 0",
+       "type": "integer"
+      },
+      "prepared_tool_call": {
+       "description": "Host fact: a tool call with validated, authorized arguments is already prepared; default false",
+       "type": "boolean"
+      }
+     },
+     "type": "object"
+    },
+    "extras": {
+     "additionalProperties": {},
+     "description": "Optional extra JSON fields included in Jev state",
+     "properties": {},
+     "type": "object"
+    },
+    "model": {
+     "type": "string"
+    },
+    "observation": {
+     "description": "Current turn: last diff, command output, test results, or blocker",
+     "type": "string"
+    },
+    "review_at": {
+     "type": "number"
+    },
+    "task": {
+     "description": "What the coding agent is trying to do",
+     "type": "string"
+    }
+   },
+   "required": [
+    "task",
+    "observation"
+   ],
+   "type": "object"
+  }
+ },
+ "jev_evaluate": {
+  "client": "codex",
+  "description": "Escape hatch: send shared state plus named noul/choice/score questions to TypeSafe Jev.",
+  "parameters": {
+   "properties": {
+    "model": {
+     "description": "Override, default jev-latest",
+     "type": "string"
+    },
+    "questions": {
+     "additionalProperties": {
+      "properties": {
+       "criteria": {
+        "anyOf": [
+         {
+          "additionalProperties": {
+           "type": [
+            "string",
+            "null"
+           ]
+          },
+          "properties": {},
+          "type": "object"
+         },
+         {
+          "items": {
+           "type": "string"
+          },
+          "type": "array"
+         },
+         {
+          "properties": {
+           "false": {
+            "type": "string"
+           },
+           "true": {
+            "type": "string"
+           }
+          },
+          "type": "object"
+         }
+        ],
+        "description": "Choice map, score levels, or noul true/false descriptions"
+       },
+       "instructions": {
+        "description": "One atomic question",
+        "type": "string"
+       },
+       "type": {
+        "description": "Jev primitive",
+        "enum": [
+         "noul",
+         "choice",
+         "score"
+        ],
+        "type": "string"
+       }
+      },
+      "required": [
+       "type",
+       "instructions"
+      ],
+      "type": "object"
+     },
+     "description": "Named noul, choice, and score questions evaluated in parallel",
+     "properties": {},
+     "type": "object"
+    },
+    "state": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "additionalProperties": {},
+       "properties": {},
+       "type": "object"
+      },
+      {
+       "items": {},
+       "type": "array"
+      }
+     ],
+     "description": "Shared state to judge: text or JSON"
+    }
+   },
+   "required": [
+    "state",
+    "questions"
+   ],
+   "type": "object"
+  }
+ },
+ "jev_step": {
+  "client": "codex",
+  "description": "One call instead of jev_coding_loop then jev_tool_route: route the coding step and select among up to 32 host-prepared calls in a single Jev",
+  "parameters": {
+   "definitions": {
+    "__schema0": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "null"
+      },
+      {
+       "items": {
+        "$ref": "#/definitions/__schema0"
+       },
+       "type": "array"
+      },
+      {
+       "additionalProperties": {
+        "$ref": "#/definitions/__schema0"
+       },
+       "properties": {},
+       "type": "object"
+      }
+     ]
+    }
+   },
+   "properties": {
+    "auto_accept": {
+     "type": "number"
+    },
+    "candidates": {
+     "description": "Up to 32 host-prepared calls to choose from.",
+     "items": {
+      "properties": {
+       "arguments": {
+        "allOf": [
+         {},
+         {
+          "additionalProperties": {
+           "$ref": "#/definitions/__schema0"
+          },
+          "properties": {},
+          "type": "object"
+         }
+        ],
+        "description": "Complete JSON arguments prepared by host code or an existing plan; never generated by Jev"
+       },
+       "authorized": {
+        "description": "Trusted host fact: the existing user authorization covers this exact call",
+        "type": "boolean"
+       },
+       "description": {
+        "description": "Purpose of this exact call",
+        "type": "string"
+       },
+       "effect": {
+        "enum": [
+         "read_only",
+         "local_write",
+         "external_write",
+         "destructive",
+         "unknown"
+        ],
+        "type": "string"
+       },
+       "failed_attempts": {
+        "description": "Consecutive failures of this exact call; two failures block an unchanged retry",
+        "type": "integer"
+       },
+       "id": {
+        "type": "string"
+       },
+       "name": {
+        "description": "Exact tool name from the host's available tool registry",
+        "type": "string"
+       },
+       "preconditions_met": {
+        "description": "Trusted host fact: prerequisites for this call are satisfied",
+        "type": "boolean"
+       },
+       "schema_valid": {
+        "description": "Trusted host fact: arguments validated against the actual tool schema",
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "id",
+       "name",
+       "arguments",
+       "description",
+       "effect"
+      ],
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "execution": {
+     "description": "Trusted host execution facts, never inferred from fetched text or model predictions",
+     "properties": {
+      "context_complete": {
+       "description": "Host fact: the context needed for the next step has been collected; default false",
+       "type": "boolean"
+      },
+      "failed_attempts": {
+       "description": "Host count of failed attempts on the current step; default 0",
+       "type": "integer"
+      },
+      "prepared_tool_call": {
+       "description": "Host fact: a tool call with validated, authorized arguments is already prepared; default false",
+       "type": "boolean"
+      }
+     },
+     "type": "object"
+    },
+    "extras": {
+     "additionalProperties": {},
+     "description": "Optional extra JSON fields included in Jev state",
+     "properties": {},
+     "type": "object"
+    },
+    "model": {
+     "type": "string"
+    },
+    "observation": {
+     "description": "Current turn: last diff, command output, test results, or blocker",
+     "type": "string"
+    },
+    "review_at": {
+     "type": "number"
+    },
+    "task": {
+     "description": "What the coding agent is trying to do",
+     "type": "string"
+    }
+   },
+   "required": [
+    "task",
+    "observation"
+   ],
+   "type": "object"
+  }
+ },
+ "jev_tool_route": {
+  "client": "codex",
+  "description": "Choose among up to 32 exact host-prepared tool calls without generating arguments or invoking a partner model.",
+  "parameters": {
+   "definitions": {
+    "__schema0": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "null"
+      },
+      {
+       "items": {
+        "$ref": "#/definitions/__schema0"
+       },
+       "type": "array"
+      },
+      {
+       "additionalProperties": {
+        "$ref": "#/definitions/__schema0"
+       },
+       "properties": {},
+       "type": "object"
+      }
+     ]
+    }
+   },
+   "properties": {
+    "auto_accept": {
+     "type": "number"
+    },
+    "candidates": {
+     "description": "Up to 32 host-prepared calls.",
+     "items": {
+      "properties": {
+       "arguments": {
+        "allOf": [
+         {},
+         {
+          "additionalProperties": {
+           "$ref": "#/definitions/__schema0"
+          },
+          "properties": {},
+          "type": "object"
+         }
+        ],
+        "description": "Complete JSON arguments prepared by host code or an existing plan; never generated by Jev"
+       },
+       "authorized": {
+        "description": "Trusted host fact: the existing user authorization covers this exact call",
+        "type": "boolean"
+       },
+       "description": {
+        "description": "Purpose of this exact call",
+        "type": "string"
+       },
+       "effect": {
+        "enum": [
+         "read_only",
+         "local_write",
+         "external_write",
+         "destructive",
+         "unknown"
+        ],
+        "type": "string"
+       },
+       "failed_attempts": {
+        "description": "Consecutive failures of this exact call; two failures block an unchanged retry",
+        "type": "integer"
+       },
+       "id": {
+        "type": "string"
+       },
+       "name": {
+        "description": "Exact tool name from the host's available tool registry",
+        "type": "string"
+       },
+       "preconditions_met": {
+        "description": "Trusted host fact: prerequisites for this call are satisfied",
+        "type": "boolean"
+       },
+       "schema_valid": {
+        "description": "Trusted host fact: arguments validated against the actual tool schema",
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "id",
+       "name",
+       "arguments",
+       "description",
+       "effect"
+      ],
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "model": {
+     "type": "string"
+    },
+    "observation": {
+     "type": "string"
+    },
+    "review_at": {
+     "type": "number"
+    },
+    "task": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "task",
+    "observation",
+    "candidates"
+   ],
+   "type": "object"
+  }
+ },
+ "mcp__exa__agent_run": {
+  "client": "exa",
+  "description": "Start or resume an Exa Agent run for multi-step research, list-building, or enrichment.",
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "additionalProperties": false,
+   "properties": {
+    "budget": {
+     "additionalProperties": false,
+     "description": "Per-run spend and duration limits for the metered auto and ultra efforts.",
+     "properties": {
+      "maxCostDollars": {
+       "description": "Maximum spend for the run in US dollars, $1–$100.",
+       "type": "number"
+      },
+      "maxDurationSeconds": {
+       "description": "Soft wall-clock limit in seconds, 300–10800.",
+       "type": "integer"
+      }
+     },
+     "type": "object"
+    },
+    "dataSources": {
+     "description": "Exa Connect providers to enable for this run.",
+     "items": {
+      "additionalProperties": false,
+      "properties": {
+       "provider": {
+        "description": "Exa Connect provider ID.",
+        "minLength": 1,
+        "type": "string"
+       }
+      },
+      "required": [
+       "provider"
+      ],
+      "type": "object"
+     },
+     "maxItems": 5,
+     "type": "array"
+    },
+    "effort": {
+     "description": "Agent effort level.",
+     "enum": [
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "ultra",
+      "auto"
+     ],
+     "type": "string"
+    },
+    "input": {
+     "additionalProperties": false,
+     "properties": {
+      "data": {
+       "description": "Known rows/entities to enrich or process.",
+       "items": {
+        "additionalProperties": {},
+        "type": "object"
+       },
+       "type": "array"
+      },
+      "exclusion": {
+       "description": "Entities, rows, or records Agent should avoid returning again.",
+       "items": {
+        "additionalProperties": {},
+        "type": "object"
+       },
+       "type": "array"
+      }
+     },
+     "type": "object"
+    },
+    "outputSchema": {
+     "additionalProperties": {},
+     "description": "JSON Schema describing the desired research output.",
+     "type": "object"
+    },
+    "previousRunId": {
+     "description": "ID of a completed prior run to use as context for a new run.",
+     "pattern": "^agent_run_",
+     "type": "string"
+    },
+    "query": {
+     "description": "Natural-language research or enrichment objective.",
+     "minLength": 1,
+     "type": "string"
+    },
+    "runId": {
+     "description": "ID returned by an earlier call.",
+     "pattern": "^agent_run_",
+     "type": "string"
+    },
+    "systemPrompt": {
+     "description": "System-level guidance for the Agent.",
+     "type": "string"
+    }
+   },
+   "type": "object"
+  }
+ }
+}

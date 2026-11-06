@@ -337,6 +337,95 @@ def _deref(schema, root, trail=()):
     return _merged(result, {key: value for key, value in schema.items() if key not in ("$ref", "allOf")}), used
 
 
+def _is_map(schema):
+    """Whether a schema (its $ref and allOf already followed) is a dictionary with keys of its own: additionalProperties as a
+    schema or true, patternProperties, or an object that names no properties at all. An object that must stay empty
+    (additionalProperties false) and one with properties of its own are not."""
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and properties:
+        return False
+    kind = schema.get("type")
+    kinds = kind if isinstance(kind, list) else [kind]
+    if not all(item in ("object", "null", None) for item in kinds):
+        return False
+    extra = schema.get("additionalProperties")
+    if schema.get("patternProperties") or isinstance(extra, dict) or extra is True:
+        return True
+    return "object" in kinds and extra is not False
+
+
+# What the model reads at the end of the description of a dictionary field that is declared as a string (see _param_schema),
+# and what marks such a field for the code that turns the string back into the dictionary (_marked).
+MAP_NOTE = "This is a map with any keys: pass it as one string that holds a JSON object, for example {\"name\": \"value\"} (or {} when empty)."
+
+
+def _marked(spec):
+    """Whether a Retool param node is a dictionary written as a string (MAP_NOTE ends its description)."""
+    return isinstance(spec, dict) and spec.get("type") == "string" and MAP_NOTE in str(spec.get("description") or "")
+
+
+def _has_marked(spec):
+    """Whether a Retool param node is, or holds somewhere inside it, a dictionary written as a string."""
+    if not isinstance(spec, dict):
+        return False
+    if _marked(spec):
+        return True
+    if isinstance(spec.get("properties"), dict) and any(_has_marked(sub) for sub in spec["properties"].values()):
+        return True
+    if _has_marked(spec.get("items")):
+        return True
+    return isinstance(spec.get("anyOf"), list) and any(_has_marked(sub) for sub in spec["anyOf"])
+
+
+def _refuse_constant(name):
+    raise ValueError("%s is not JSON" % name)
+
+
+def _decode_map(text):
+    """The dict a model wrote as a JSON string, an empty dict for an empty string, _JSON_NULL for the text "null"; None when
+    the text is no JSON object (the string then stays as it is, and the client's own check says what is wrong with it)."""
+    text = text.strip()
+    if not text:
+        return {}
+    if text == "null":
+        return _JSON_NULL
+    try:
+        value = json.loads(text, parse_constant=_refuse_constant)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _decode_in(value, spec):
+    """(value with every dictionary written as a string under `spec` turned into the dict, whether anything changed)."""
+    if not isinstance(spec, dict):
+        return value, False
+    if _marked(spec):
+        decoded = _decode_map(value) if isinstance(value, str) else None
+        return (value, False) if decoded is None else (None if decoded is _JSON_NULL else decoded, True)
+    kind = spec.get("type")
+    if kind == "object" and isinstance(value, dict) and isinstance(spec.get("properties"), dict):
+        found, result = False, dict(value)
+        for name, sub in spec["properties"].items():
+            if name in result:
+                result[name], changed = _decode_in(result[name], sub)
+                found = found or changed
+        return (result, True) if found else (value, False)
+    if kind == "array" and isinstance(value, list):
+        found, result = False, []
+        for item in value:
+            item, changed = _decode_in(item, spec.get("items"))
+            result.append(item)
+            found = found or changed
+        return (result, True) if found else (value, False)
+    if kind == "anyOf" and isinstance(spec.get("anyOf"), list):
+        for branch in spec["anyOf"]:
+            result, changed = _decode_in(value, branch)
+            if changed:
+                return result, True
+    return value, False
+
+
 def _allowed_values(schema):
     """The values a schema restricts a field to (enum, const, or an anyOf/oneOf of those); None when it does not."""
     if "const" in schema:
@@ -358,7 +447,7 @@ def _allowed_values(schema):
     return None
 
 
-def _param_schema(schema, required, root=None, trail=()):
+def _param_schema(schema, required, root=None, trail=(), maps=False):
     """Convert one JSON-Schema property to Retool's typed param shape.
 
     Retool accepts only literal/string/number/boolean/null/array/object/enum/anyOf (its enum holds strings), so an
@@ -372,6 +461,15 @@ def _param_schema(schema, required, root=None, trail=()):
     included: "number or string" used to keep the number alone, and the string "007" went to the client as 7.
 
     `root` is the schema of the whole tool, where a $ref points (see _deref); `trail` the references being expanded.
+
+    `maps` (a strict tool) turns a dictionary with keys of its own (_is_map) into a string that holds a JSON object, and
+    says so in the description (MAP_NOTE): Retool's shape has no map, and a strict tool makes the provider write the
+    empty object for the one it has, so the model could never fill it (gpt-6.1-sol, real schemas of Claude Code, Exa and
+    Codex: `{}`, `null` or a run of blanks in 30 of 30 requests). A string cannot be emptied that way. The code that
+    reads the call gives the client the dict back (coerce_arguments, ArgStream). A tool that is not strict keeps the
+    empty object: asked for keys, the models wrote them into it in 147 of 171 requests on the real schemas (all three
+    dialects, streamed or not); the 24 that did not were a tool the model declined (gpt-6.1-sol, AskUserQuestion) and
+    fields that an older converter wrote as strings (allOf, C6), none an empty map.
     """
     if not isinstance(schema, dict):
         return {"type": "string", "required": bool(required)}
@@ -398,14 +496,18 @@ def _param_schema(schema, required, root=None, trail=()):
             merged = dict(branches[0])
             if schema.get("description"):
                 merged["description"] = schema["description"]
-            return _param_schema(merged, required, root, trail)
+            return _param_schema(merged, required, root, trail, maps)
         if branches:
-            node = {"type": "anyOf", "anyOf": [_param_schema(branch, False, root, trail) for branch in branches]}
+            # A dictionary that is one kind among several stays the object it was: beside a plain string it would be a
+            # second string, and the code that reads the call could not tell which of the two the model meant.
+            node = {"type": "anyOf", "anyOf": [
+                _param_schema(branch, False, root, trail, maps and not _is_map(_deref(branch, root, trail)[0]))
+                for branch in branches]}
             if schema.get("description"):
                 node["description"] = str(schema["description"])
             node["required"] = bool(required)
             return node
-    note = None
+    note, as_text = None, False
     node = {"type": "string"}
     if allowed and all(isinstance(value, str) for value in allowed):
         node = {"type": "enum", "enum": list(dict.fromkeys(allowed))}
@@ -420,14 +522,16 @@ def _param_schema(schema, required, root=None, trail=()):
             node = {"type": "string" if kind == "string" else
                     ("number" if kind in ("number", "integer") else kind)}
         elif kind == "array":
-            node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False, root, trail)}
+            node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False, root, trail, maps)}
+        elif maps and _is_map(schema):
+            as_text = True
         elif kind == "object" or schema.get("properties") or schema.get("additionalProperties"):
             properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
             node = {"type": "object", "properties": {
-                name: _param_schema(sub, name in _required_names(schema), root, trail)
+                name: _param_schema(sub, name in _required_names(schema), root, trail, maps)
                 for name, sub in properties.items()}}
     description = " ".join(part for part in (str(schema["description"]) if schema.get("description") else "", note,
-                                             _limits(schema)) if part)
+                                             _limits(schema), MAP_NOTE if as_text else "") if part)
     if description:
         node["description"] = description
     node["required"] = bool(required)
@@ -494,8 +598,9 @@ def tools_to_retool(tools):
         schema, trail = _deref(root, root)
         required = set(_required_names(schema))
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        maps = bool(function.get("strict"))  # see _param_schema
         for name in sorted(properties.keys()):
-            params[name] = _param_schema(properties[name], name in required, root, trail)
+            params[name] = _param_schema(properties[name], name in required, root, trail, maps)
         converted.append({"name": function["name"],
                           "description": function.get("description") or "",
                           "params": params, "strict": function.get("strict", False)})
@@ -522,6 +627,10 @@ def coerce_arguments(raw, params):
         if coerced is not None:
             data[key] = None if coerced is _JSON_NULL else coerced
             changed = True
+        elif _has_marked(spec):
+            # A dictionary the model wrote as a string inside this array or object.
+            data[key], inside = _decode_in(value, spec)
+            changed = changed or inside
     return json.dumps(data, ensure_ascii=False) if changed else text
 
 
@@ -531,6 +640,8 @@ _JSON_NULL = object()
 
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
+    if _marked(spec):
+        return _decode_map(value)
     kind = spec.get("type") if isinstance(spec, dict) else None
     if value == "null" and kind in ("number", "boolean", "array", "object"):
         # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
@@ -551,15 +662,19 @@ def _coerce_value(value, spec):
 class ArgStream:
     """Stream tool-call JSON as it arrives while keeping coerce_arguments' repairs.
 
-    Only a top-level string value of a number/boolean parameter is held until it
-    closes, then emitted coerced. Everything else (long string bodies, nested
+    Only a top-level string value of a number/boolean parameter (or of a dictionary written as a string) is held
+    until it closes, then emitted coerced. Everything else (long string bodies, nested
     values) passes through at once, so the emitted text is always a prefix of
     the final arguments and clients can render the call while it is generated.
     Anything unexpected switches to verbatim pass-through.
+
+    A tool with a dictionary written as a string inside an array or object cannot be decoded in passing: all of its
+    arguments are held until the call ends and are then given as coerce_arguments makes them.
     """
 
     def __init__(self, params):
         self.params = params or {}
+        self.buffer = [] if any(_has_marked(spec) and not _marked(spec) for spec in self.params.values()) else None
         self.state = "pre"
         self.depth = 0
         self.in_string = False
@@ -573,9 +688,12 @@ class ArgStream:
         except ValueError:
             return False
         spec = self.params.get(name)
-        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean", "array", "object")
+        return isinstance(spec, dict) and (spec.get("type") in ("number", "boolean", "array", "object") or _marked(spec))
 
     def feed(self, chunk):
+        if self.buffer is not None:
+            self.buffer.append(chunk or "")
+            return ""
         out = []
         for char in chunk or "":
             state = self.state
@@ -601,7 +719,8 @@ class ArgStream:
                     except ValueError:
                         value = None
                     coerced = _coerce_value(value, self.params.get(self.key_name)) if isinstance(value, str) else None
-                    out.append(raw if coerced is None else "null" if coerced is _JSON_NULL else json.dumps(coerced))
+                    out.append(raw if coerced is None else "null" if coerced is _JSON_NULL
+                               else json.dumps(coerced, ensure_ascii=False))
                     self.state = "after"
             elif state == "keystr":
                 out.append(char)
@@ -674,6 +793,9 @@ class ArgStream:
 
     def finish(self):
         """Flush a value left open by a truncated stream verbatim."""
+        if self.buffer is not None:
+            text, self.buffer = "".join(self.buffer), None
+            return coerce_arguments(text, self.params) if text else ""
         if self.held is not None:
             raw, self.held = "".join(self.held), None
             return raw
