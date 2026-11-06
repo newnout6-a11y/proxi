@@ -453,7 +453,7 @@ class TurnRunner:
         except apierr.ApiError:
             return None, None  # acquire says why
         wanted = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"))
-        tools = direct.tools_for_session(parsed.tools, session)
+        tools = direct.tools_to_retool(parsed.tools)
 
         def scope_of(effort):
             provider = {"model": parsed.model}
@@ -1099,8 +1099,7 @@ class TurnRunner:
                         self._check_prompt(self._direct_text(instructions, chunks or [stream_prompt]))
 
                         if native_tools:
-                            # A conversation keeps the declaration its signed history was made with (tools_for_session)
-                            tools_converted = direct.tools_for_session(parsed.tools, direct_target)
+                            tools_converted = direct.tools_to_retool(parsed.tools)
                             if hasattr(direct_target, "register_tools"):
                                 direct_target.register_tools(tools_converted)
                             final_tools = tools_converted
