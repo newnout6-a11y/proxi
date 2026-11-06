@@ -185,6 +185,47 @@ def test_a_call_without_the_done_marker_counts_as_whole():
     assert final["content"][0]["type"] == "tool_use" and final["stop_reason"] == "tool_use"
 
 
+def streamed_arguments(writer):
+    parts = []
+    for name, payload in writer.events:
+        if name == "content_block_delta" and payload["delta"]["type"] == "input_json_delta":
+            parts.append(payload["delta"]["partial_json"])
+        elif name == "data" and isinstance(payload, dict):
+            for choice in payload.get("choices") or []:
+                parts += [(item.get("function") or {}).get("arguments") or ""
+                          for item in (choice.get("delta") or {}).get("tool_calls") or []]
+        elif name == "response.function_call_arguments.delta":
+            parts.append(payload["delta"])
+    return "".join(parts)
+
+
+@pytest.mark.parametrize("dialect", ["anthropic", "chat", "responses"])
+def test_a_call_the_stream_ended_inside_goes_on_as_it_stands_not_swallowed_by_the_cap(dialect):
+    # Upstream cut the call (its stream ended inside the arguments): that is no cap's doing, and the adapter below tells
+    # the client the reply is cut. Held back until a call ends, the call would have vanished without a word.
+    writer, final = run(dialect, [call(arguments='{"pa', done=False)], stream=True, reason="length")
+    assert streamed_arguments(writer) == '{"pa'
+    if dialect == "anthropic":
+        assert final["stop_reason"] == "max_tokens"
+    elif dialect == "chat":
+        assert final["choices"][0]["finish_reason"] == "length"
+    else:
+        assert final["status"] == "incomplete"
+
+
+def test_a_call_the_stream_ended_inside_is_held_to_the_cap_like_any_other():
+    writer, final = run("anthropic", [text("ok"), call("big", arguments='{"content":"' + "z" * 200, done=False)],
+                        stream=True, reason="length")
+    wire = json.dumps(writer.events)
+    assert "tool_use" not in wire and "zzz" not in wire
+    assert final["stop_reason"] == "max_tokens" and final["content"] == [{"type": "text", "text": "ok"}]
+
+
+def test_a_cancelled_reply_lets_an_open_call_go():
+    writer, final = run("anthropic", [call(arguments='{"pa', done=False)], stream=True, reason="cancelled")
+    assert "tool_use" not in json.dumps(writer.events)
+
+
 # --- with the other adapters ---------------------------------------------------------------------------------------------
 
 def test_a_stop_sequence_that_comes_first_still_ends_the_reply():

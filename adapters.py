@@ -1025,7 +1025,9 @@ class OutputCapAdapter:
         self.calls[key] = event
         if not event.get('done', True):
             return  # upstream is still writing its arguments: the client gets the call once it is whole, or not at all
-        event = self.calls.pop(key)
+        self._admit(self.calls.pop(key))
+
+    def _admit(self, event):
         arguments = event.get('arguments', '')
         if not isinstance(arguments, str):
             arguments = json.dumps(arguments, ensure_ascii=False, separators=(',', ':'))
@@ -1040,6 +1042,16 @@ class OutputCapAdapter:
         if event.get('server'):
             self.delivered.add(str(event.get('id')))
         self.adapter.feed(event)
+
+    def _release_open_calls(self):
+        """A call the stream ended inside was cut by upstream, not by the cap: it goes on as it stands and the adapter below
+        tells it as cut, like any other. It is still held to the cap, and a server tool call is never half-delivered."""
+        for event in list(self.calls.values()):
+            if self.capped or event.get('server'):
+                self.dropped += 1
+            else:
+                self._admit(event)
+        self.calls.clear()
 
     def feed(self, event):
         kind = event.get('type')
@@ -1061,6 +1073,8 @@ class OutputCapAdapter:
         return 'length' if self.capped and reason in ('stop', 'tool_calls') else reason
 
     def end(self, reason, prompt_text=None):
+        if reason != 'cancelled':
+            self._release_open_calls()
         if self.capped:
             journal.emit('reply.cut_at_cap', 'Ответ обрезан по max_tokens=%d: клиент получил около %d токенов%s' % (
                 self.cap, output_tokens(self.ascii, self.other),
