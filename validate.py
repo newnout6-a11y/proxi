@@ -396,6 +396,10 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
                     fn = call.get("function") or {}
                     name = fn.get("name") or call.get("name") or "tool"
                     args = fn.get("arguments") or call.get("arguments") or ""
+                    if isinstance(call.get("custom"), dict):
+                        # A call to a custom tool of Chat: its one string is the input the model was offered the tool as.
+                        name = call["custom"].get("name") or "tool"
+                        args = json.dumps({"input": call["custom"].get("input", "")}, ensure_ascii=False)
                     call_id = call.get("id") or call.get("tool_call_id") or "call"
                     asst_text = f"Assistant: {text}\n[tool_call {name} id={call_id}: {str(args)}]".strip()
                     if images:
@@ -573,6 +577,8 @@ def _tools(data):
                                     "such as a search MCP server or WebFetch", param=where + ".type")
             raise unprocessable(f"{where}.type must be 'function' or 'custom'", param=where + ".type")
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if kind == "custom" and isinstance(tool.get("custom"), dict):
+            fn = tool["custom"]  # Chat nests a custom tool under "custom", as it nests a function under "function"
         name = fn.get("name")
         if not isinstance(name, str) or not name.strip():
             raise unprocessable(f"{where}.function.name must be a non-empty string",
@@ -600,10 +606,10 @@ def _tools(data):
         })
         if kind == "custom":
             result[-1]["function"]["x-client-type"] = "custom"
-            if tool.get("format") is not None:
-                if not isinstance(tool["format"], dict):
+            if fn.get("format") is not None:
+                if not isinstance(fn["format"], dict):
                     raise unprocessable("custom tool format must be an object", param=where + ".format")
-                result[-1]["function"]["x-format"] = tool["format"]
+                result[-1]["function"]["x-format"] = fn["format"]
         if fn.get("strict") is not None:
             result[-1]["function"]["strict"] = _opt_bool(fn, "strict")
     return result
@@ -625,6 +631,8 @@ def _tool_choice(value):
             return "none"
         if choice_type == "any":
             return "required"
+        if choice_type == "custom" and isinstance(value.get("custom"), dict) and isinstance(value["custom"].get("name"), str):
+            return {"type": "function", "function": {"name": value["custom"]["name"]}}  # Chat's own shape
         if choice_type in ("tool", "custom") and isinstance(value.get("name"), str):
             name = value["name"]
             if value.get("namespace"):

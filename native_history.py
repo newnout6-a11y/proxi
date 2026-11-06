@@ -156,6 +156,11 @@ def client_messages(messages, image_converter, *, lead=None):
                     else:
                         raise ValueError("unsupported assistant block")
                 for item in message.get("tool_calls") or []:
+                    if isinstance(item.get("custom"), dict):
+                        # A call to a custom tool of Chat: its one string is the input the model was offered the tool as.
+                        calls.append(call(item.get("id"), item["custom"].get("name"),
+                                          {"input": item["custom"].get("input", "")}))
+                        continue
                     fn = item.get("function") or item
                     calls.append(call(item.get("id") or item.get("tool_call_id"), fn.get("name"),
                                       fn.get("arguments", "{}")))

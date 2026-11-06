@@ -251,6 +251,12 @@ class ChatAdapter(_Base):
     def _tool_call(self, index, call, delta, new=False):
         if not self.writer:
             return
+        if call.get("tool_type") == "custom":
+            # The input is written inside the JSON envelope the model was offered the tool as, and is unwrapped only
+            # when that is whole (the Responses custom tool waits for it too): the call goes out whole, as soon as it is.
+            if call.get("done"):
+                self._send_custom(index, call)
+            return
         item = {"index": index}
         if new:
             item.update({"id": call["id"], "type": "function"})
@@ -259,9 +265,53 @@ class ChatAdapter(_Base):
             item["function"]["name"] = call["name"]
         self.writer.data(self._chunk({"tool_calls": [item]}))
 
+    @staticmethod
+    def _custom_text(call):
+        """The input of a call to a custom tool of Chat: the string inside the envelope {"input": ...} the model was
+        offered the tool as; None while that envelope is not whole."""
+        arguments = call["arguments"]
+        try:
+            value = json.loads(arguments)
+        except (ValueError, TypeError):
+            return None if re.match(r'^\s*\{\s*"input"\s*:', arguments) else arguments
+        return value["input"] if isinstance(value, dict) and isinstance(value.get("input"), str) else arguments
+
+    def _send_custom(self, index, call):
+        if call.get("sent"):
+            return call["arguments"]
+        value = self._custom_text(call)
+        if value is not None:
+            call["sent"] = True
+            self.writer.data(self._chunk({"tool_calls": [{"index": index, "id": call["id"], "type": "custom",
+                                                           "custom": {"name": call["name"], "input": value}}]}))
+        return value
+
+    def _wire_calls(self, reason):
+        """The calls of the reply as Chat writes them: a function call, or a custom one with its one input string.
+
+        A custom call whose input is cut off is dropped when the client left or the turn timed out, and an upstream
+        fault when upstream said the turn was complete: half a patch is never passed on."""
+        calls = []
+        for call in self.tool_calls:
+            if call.get("tool_type") != "custom":
+                calls.append({"id": call["id"], "type": "function",
+                              "function": {"name": call["name"], "arguments": call["arguments"]}})
+                continue
+            value = self._custom_text(call)
+            if value is None:
+                if reason not in ("cancelled", "timeout"):
+                    raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                continue
+            calls.append({"id": call["id"], "type": "custom", "custom": {"name": call["name"], "input": value}})
+        return calls
+
     def end(self, reason, prompt_text=None):
         finish = FINISH_MAP.get(reason, "stop")
         if self.writer:
+            for index, call in enumerate(self.tool_calls):
+                if call.get("tool_type") == "custom" and not call.get("sent"):
+                    if self._send_custom(index, call) is None and reason not in ("cancelled", "timeout"):
+                        raise apierr.upstream_error("Retool returned incomplete custom tool input")
             self.writer.data(self._chunk({}, finish))
             prompt, completion = self.usage(prompt_text)
             usage_dict = {
@@ -298,17 +348,14 @@ class ChatAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
+        calls = self._wire_calls(reason)
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
                 "choices": [{"index": 0, "message": {"role": "assistant",
-                                                     "content": self.text or (None if self.tool_calls else ""),
+                                                     "content": self.text or (None if calls else ""),
                                                      **({"reasoning_content": self.thinking} if (self.thinking and self.parsed.show_thinking) else {}),
-                                                     **({"tool_calls": [{"id": call["id"], "type": "function",
-                                                                          "function": {"name": call["name"],
-                                                                                       "arguments": call["arguments"]}}
-                                                                        for call in self.tool_calls]}
-                                                        if self.tool_calls else {})},
-                             "finish_reason": FINISH_MAP.get(reason, "tool_calls" if self.tool_calls else "stop")}],
+                                                     **({"tool_calls": calls} if calls else {})},
+                             "finish_reason": FINISH_MAP.get(reason, "tool_calls" if calls else "stop")}],
                 "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
                           "total_tokens": prompt + completion,
                           "cached_tokens": self.cache_read or 0,
