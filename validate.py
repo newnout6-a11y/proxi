@@ -496,8 +496,6 @@ def _responses_item(item):
                                              "arguments": arguments}}]}
     if kind == "item_reference":
         raise unprocessable("item_reference is not supported; send the full conversation items", param="input")
-    if kind == "reasoning" and "role" not in item:
-        return {"role": "assistant", "content": item.get("summary") or ""}
     if kind == "agent_message" and "role" not in item:
         # Codex's multi-agent v2: a message between the agents of one task (author -> recipient), such as a task or
         # a sub-agent's final answer. Upstream has no such item; to the agent that holds it, it is a turn it received.
@@ -761,8 +759,13 @@ def parse_responses(data, cfg):
     if isinstance(raw_input, str):
         messages = [{"role": "user", "content": raw_input}]
     elif isinstance(raw_input, list):
-        messages = [_responses_item(item) for item in raw_input]
-        for index, message in enumerate(messages):
+        # A reasoning item is what the model thought of an earlier turn (a summary, an encrypted copy of it), not a turn
+        # of the conversation: the native history leaves it out, and the text bridge did not, so every summary came back
+        # to the model as something the assistant had said (ultracode audit, C16).
+        kept = [(index, item) for index, item in enumerate(raw_input)
+                if not (isinstance(item, dict) and item.get("type") == "reasoning" and "role" not in item)]
+        messages = [_responses_item(item) for _, item in kept]
+        for (index, _), message in zip(kept, messages):
             if (isinstance(message, dict) and message.get("role") is None and not message.get("tool_calls")
                     and message.get("type") not in (None, "message")):
                 # Without this the item failed later as "messages[N].role must be a string", which names no type.
@@ -781,10 +784,7 @@ def parse_responses(data, cfg):
     parsed.system_messages_normalized = bool(converted)
     parsed.inline_tool_changes = list(dict.fromkeys(ignored))
     parsed.message_fingerprints = _message_fingerprints(messages, lead)
-    native_input = ([message for item, message in zip(raw_input, messages)
-                     if item.get("type") != "reasoning" or "role" in item]
-                    if isinstance(raw_input, list) else messages)
-    parsed.native_messages = native_history.client_messages(native_input, _extract_image_data, lead=lead)
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
