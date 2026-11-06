@@ -121,7 +121,8 @@ def test_classifier_output_cannot_run_a_local_relay_command(tmp_path, monkeypatc
 def test_anonymous_relay_task_keeps_its_configured_project_and_execution_support(tmp_path, monkeypatch):
     _, _, runner = setup(tmp_path, transport="direct", project_context=True,
                          exec_policy="allowlist", cookie_values=[], command_timeout=3,
-                         command_output_limit=4000, exec_allowlist=[], context_max_bytes=6000)
+                         command_output_limit=4000, exec_allowlist=[], context_max_bytes=6000,
+                         relay_system_prompt='USER_CONFIGURED_RELAY_SYSTEM')
     (tmp_path / "README.md").write_text("SYNTHETIC_PROJECT_CONTEXT", encoding="utf-8")
     calls, commands = [], []
 
@@ -132,11 +133,12 @@ def test_anonymous_relay_task_keeps_its_configured_project_and_execution_support
 
     monkeypatch.setattr(RelaySession, "stream", stream)
     monkeypatch.setattr(executor, "run_command", lambda command, *_a, **_kw: (commands.append(command) or 0, "SYNTHETIC_OUTPUT"))
-    parsed = request([{"role": "user", "content": "Run my relay task"}], tools=[], system="USER_SYSTEM")
+    parsed = request([{"role": "user", "content": "Run my relay task"}], tools=[], system="")
     events = asyncio.run(run(runner, parsed))
     assert events[-1] == {"type": "end", "reason": "stop"}
     assert commands == ["echo relay-task"]
     assert "SYNTHETIC_PROJECT_CONTEXT" in calls[0]["head"] and "LOCAL EXEC REMINDER" in calls[0]["head"]
+    assert 'USER_CONFIGURED_RELAY_SYSTEM' in calls[0]['head']
     assert "SYNTHETIC_OUTPUT" in str(calls[1]["chunks"])
 
 

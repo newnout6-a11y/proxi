@@ -78,7 +78,7 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
   return (
     <div className="shell">
       <aside className="rail">
-        <div className="brand"><Mark /><strong>relay</strong></div>
+        <div className="brand"><Mark /><strong>Proxi</strong><span className="brand-caption">Retool relay</span></div>
         <nav aria-label="Разделы">
           {GROUPS.map((group) => (
             <div className="nav-group" key={group}>
@@ -104,6 +104,7 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
           {/* The dot alone carries the state; the words stay for the tooltip and screen readers */}
           <div className="stream-state" role="status" title={streamLabel} aria-label={streamLabel}>
             <Dot tone={journal.status === 'live' ? 'pos' : 'warn'} live={journal.status === 'live'} />
+            <span>{journal.status === 'live' ? 'Журнал подключён' : journal.status === 'reconnecting' ? 'Переподключение' : 'Подключаем журнал'}</span>
           </div>
           <div className="rail-actions">
             <button type="button" className="icon-button" aria-label="Сменить тему" onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}>

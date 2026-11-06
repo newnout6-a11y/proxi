@@ -41,10 +41,10 @@ export default function Login({ onLogin }) {
   return (
     <div className="login-screen">
       <form className="login-form" onSubmit={submit} noValidate>
-        <div className="brand"><Mark /><strong>relay</strong></div>
+        <div className="brand"><Mark /><strong>Proxi</strong></div>
         <div className="login-copy">
-          <h1>Пульт relay</h1>
-          <p>Кредиты, кэш промпта и каждый ход модели, которые проходят через локальный relay от Claude Code и OpenCode к Retool</p>
+          <h1>Весь relay перед глазами</h1>
+          <p>Баланс аккаунтов, расход кредитов и каждый ход модели — от запроса IDE до ответа Retool</p>
         </div>
         <label className="field" htmlFor="relay-key">
           <span>Relay key</span>

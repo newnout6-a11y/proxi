@@ -48,12 +48,23 @@ function useHover(n, plotW) {
     const i = Math.round(((event.clientX - box.left - PAD.l) / plotW) * (n - 1));
     setHover(i < 0 || i >= n ? null : i);
   };
-  return [hover, onMove, () => setHover(null)];
+  const keyboard = {
+    tabIndex: n ? 0 : -1,
+    onFocus: () => setHover((current) => current ?? 0),
+    onBlur: () => setHover(null),
+    onKeyDown: (event) => {
+      if (!n || !['ArrowLeft', 'ArrowRight', 'Home', 'End', 'Escape'].includes(event.key)) return;
+      event.preventDefault();
+      setHover((current) => event.key === 'Escape' ? null : event.key === 'Home' ? 0 : event.key === 'End' ? n - 1
+        : Math.min(n - 1, Math.max(0, (current ?? 0) + (event.key === 'ArrowRight' ? 1 : -1))));
+    },
+  };
+  return [hover, onMove, () => setHover(null), keyboard];
 }
 
 function Tip({ W, x, children }) {
   const flip = x > W - 220;
-  return <dl className="chart-tip" style={flip ? { right: W - x + 12 } : { left: x + 12 }}>{children}</dl>;
+  return <dl className="chart-tip" role="status" aria-live="polite" style={flip ? { right: W - x + 12 } : { left: x + 12 }}>{children}</dl>;
 }
 
 /**
@@ -97,7 +108,7 @@ export function SpendChart({ buckets, windowSec }) {
   const H = Math.max(size.h, 200);
   const plotW = Math.max(10, W - PAD.l - PAD.r);
   const plotH = H - PAD.t - PAD.b;
-  const [hover, onMove, onLeave] = useHover(n, plotW);
+  const [hover, onMove, onLeave, keyboard] = useHover(n, plotW);
 
   const model = useMemo(() => {
     const values = buckets.map((b) => Number(b.credits) || 0);
@@ -108,6 +119,7 @@ export function SpendChart({ buckets, windowSec }) {
   }, [buckets]);
 
   const empty = !n || !model.total;
+  const incomplete = buckets.some((b) => b.credits_complete === false);
   const baseY = PAD.t + plotH + 0.5;
   const yAt = (v) => baseY - (v / model.max) * plotH;
   const xAt = (i) => PAD.l + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2);
@@ -119,12 +131,12 @@ export function SpendChart({ buckets, windowSec }) {
   const bucket = active !== null ? buckets[active] : null;
   const span = bucketLabel(windowSec, n);
   const peakRight = !empty && xAt(model.peakIndex) > W - 120;
-  const summary = empty ? 'Расхода за окно не было'
+  const summary = empty ? incomplete ? 'Стоимость не сообщена' : 'Расхода за окно не было'
     : `Расход кредитов за каждые ${span}: всего ${fmtFixed(model.total, 2)}, максимум ${fmtFixed(model.peak, 2)}`;
 
   return (
     <div className="chart-frame" ref={ref}>
-      <svg className="chart" width={W} height={H} role="img" aria-label={summary} onPointerMove={onMove} onPointerLeave={onLeave}>
+      <svg className="chart" width={W} height={H} role="img" aria-label={summary} aria-description="Стрелки влево и вправо выбирают период, Home и End — крайние периоды" {...keyboard} onPointerMove={onMove} onPointerLeave={onLeave}>
         {ticks.map((v) => (
           <g key={v}>
             <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(v)) + 0.5} y2={Math.round(yAt(v)) + 0.5} />
@@ -159,11 +171,11 @@ export function SpendChart({ buckets, windowSec }) {
           </g>
         )}
       </svg>
-      {empty && <p className="chart-empty">Расхода за окно не было</p>}
+      {empty && <p className="chart-empty">{incomplete ? 'Стоимость не сообщена' : 'Расхода за окно не было'}</p>}
       {bucket && (
         <Tip W={W} x={xAt(active)}>
           <dt className="mono">{fmtShortTime(bucket.t)}–{fmtShortTime(bucket.t + windowSec / n)}</dt>
-          <dd><span>кредиты</span><b className="num">{fmtFixed(bucket.credits, 2)}</b></dd>
+          <dd><span>кредиты</span><b className="num">{bucket.credits_complete === false ? bucket.credits > 0 ? `≥ ${fmtFixed(bucket.credits, 2)}` : '—' : fmtFixed(bucket.credits, 2)}</b></dd>
           <dd><span>запросы</span><b className="num">{fmtInt(bucket.requests)}</b></dd>
           <dd><span>ходы</span><b className="num">{fmtInt(bucket.turns)}</b></dd>
           <dd><span>первый токен</span><b className="num">{fmtMs(bucket.ttft)}</b></dd>
@@ -173,7 +185,7 @@ export function SpendChart({ buckets, windowSec }) {
   );
 }
 
-/** A write is a spike when it is several times the window's usual write: the cache went cold and was rebuilt. */
+/** A write is a spike when it is several times the window's usual write; cause is not inferred. */
 export function writeSpikes(buckets) {
   const writes = buckets.map((b) => b.cache_write || 0);
   const busy = writes.filter((w) => w > 0).sort((a, b) => a - b);
@@ -196,7 +208,7 @@ export function CacheChart({ buckets, windowSec }) {
   const plotW = Math.max(10, W - PAD.l - PAD.r);
   const gap = 20;
   const laneH = (H - PAD.t - PAD.b - gap) / 2;
-  const [hover, onMove, onLeave] = useHover(n, plotW);
+  const [hover, onMove, onLeave, keyboard] = useHover(n, plotW);
 
   const model = useMemo(() => {
     const reads = buckets.map((b) => b.cache_read || 0);
@@ -225,7 +237,7 @@ export function CacheChart({ buckets, windowSec }) {
 
   return (
     <div className="chart-frame chart-frame-cache" ref={ref}>
-      <svg className="chart" width={W} height={H} role="img" aria-label={summary} onPointerMove={onMove} onPointerLeave={onLeave}>
+      <svg className="chart" width={W} height={H} role="img" aria-label={summary} aria-description="Стрелки влево и вправо выбирают период, Home и End — крайние периоды" {...keyboard} onPointerMove={onMove} onPointerLeave={onLeave}>
         <text className="c-label" x={PAD.l - 8} y={PAD.t + 8} textAnchor="end">{fmtTokens(model.readMax)}</text>
         <text className="c-label" x={PAD.l - 8} y={writeTop + 8} textAnchor="end">{fmtTokens(model.writeMax)}</text>
         <text className="c-lane" x={PAD.l + 4} y={PAD.t + 10}>чтение</text>
@@ -283,7 +295,7 @@ export function CacheChart({ buckets, windowSec }) {
           <dd><span>прочитано</span><b className="num">{fmtTokens(bucket.cache_read)}</b></dd>
           <dd><span>записано</span><b className="num">{fmtTokens(bucket.cache_write)}</b></dd>
           <dd><span>без кэша</span><b className="num">{fmtTokens(bucket.input)}</b></dd>
-          {model.spikes.has(active) && <dd className="tip-note">кэш записан заново</dd>}
+          {model.spikes.has(active) && <dd className="tip-note">запись выше обычной за окно</dd>}
         </Tip>
       )}
     </div>
@@ -308,9 +320,9 @@ export function RankedList({ items, format = fmtInt, empty = 'Пока пуст�
 }
 
 /** The turn tape: a thin strip of phases (waiting, thinking, tools, output) on a shared scale. */
-export function TurnTape({ trace, max, className = '' }) {
-  const p = phasesOf(trace);
-  const values = [p.wait, p.think, p.tools, p.out];
+export function TurnTape({ trace, max, now, className = '' }) {
+  const p = phasesOf(trace, now);
+  const values = [p.wait, p.think, p.tools, p.out, p.other];
   const fill = max ? Math.max(1.5, (p.total / max) * 100) : 100;
   const label = PHASES.map((phase, i) => `${phase.label} ${fmtMs(values[i])}`).join(', ');
   return (

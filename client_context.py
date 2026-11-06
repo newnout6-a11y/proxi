@@ -25,6 +25,12 @@ _TITLE_TTL = 15
 _MISS_TTL = 30
 SERVICE_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe"})
 CLIENT_TEXT_KINDS = SERVICE_KINDS | {"client-text"}
+SDK_TITLE_PREFIX = "You are naming a coding session so the user can pick it out of a long list of sessions."
+
+
+def is_sdk_title_system(system):
+    # Billing and SDK identity blocks can precede the actual service policy.
+    return any(line.startswith(SDK_TITLE_PREFIX) for line in system.splitlines())
 
 
 def request_kind(parsed, identity=None):
@@ -34,7 +40,8 @@ def request_kind(parsed, identity=None):
     system = (getattr(parsed, "system", "") or "").lstrip()
     if re.search(r"(?:^|\n)You are a security monitor for autonomous AI coding agents(?:\.|\n|$)", system):
         return "auto-mode-check"
-    if system.startswith("You write short session titles. Reply with only the tagged fields the prompt asks for."):
+    if (system.startswith("You write short session titles. Reply with only the tagged fields the prompt asks for.")
+            or is_sdk_title_system(system)):
         return "session-title"
     info = current() if identity is None else identity
     if (info.get("client") == "claude-desktop" and not system

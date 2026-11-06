@@ -1,10 +1,12 @@
 """Dialect adapters: OpenAI Chat, OpenAI Responses, Anthropic Messages."""
 import json
+import math
 import re
 import time
 import uuid
 
 import apierr
+from credits import token_counter as _token_counter
 
 
 def approx_tokens(text: str) -> int:
@@ -26,6 +28,10 @@ class _Base:
         self.cache_read = 0
         self.cache_write = 0
         self.reasoning_tokens = 0
+        self._reasoning_reported = False
+        self._attempt_observed = False
+        self._attempt_credited = False
+        self._prior_cost_unknown = False
         self.input_tokens = None
         self.output_tokens = None
         self.exec_lines = 0
@@ -43,11 +49,19 @@ class _Base:
         if kind == "usage_start":
             # One client response may include several paid upstream attempts.
             # Context size describes the latest one; credits cover all of them.
+            if self._attempt_observed and not self._attempt_credited:
+                self._prior_cost_unknown = True
+            self._attempt_observed = self._attempt_credited = False
             self.cache_read = self.cache_write = self.reasoning_tokens = 0
+            self._reasoning_reported = False
             self.input_tokens = self.output_tokens = None
             self._usage_offsets = (len(self.text), len(self.thinking), len(self.tool_calls))
             self._usage_boundary()
+        elif kind == 'usage':
+            self._attempt_observed = True
+            self._set_usage(event.get('usage') or {})
         elif kind == "thinking":
+            self._attempt_observed = True
             self.thinking += event["delta"]
             if not self.parsed.show_thinking:
                 return
@@ -64,25 +78,20 @@ class _Base:
             if self.parsed.show_thinking:
                 self._signature(event.get("signature", ""))
         elif kind == "text":
+            self._attempt_observed = True
             self.text += event["delta"]
             self._text(event["delta"])
         elif kind == "tool_call":
+            self._attempt_observed = True
             self._feed_tool_call(event)
         elif kind == "credits":
-            self.credits += event.get("value", 0.0)
+            self._attempt_observed = True
+            value = event.get('value')
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                self.credits += value
+                self._attempt_credited = True
             usage = event.get("usage") or {}
-            if usage:
-                # Token counters are a snapshot, never a sum of retry costs.
-                self.cache_read = int(usage.get("cache_read") or 0)
-                self.cache_write = int(usage.get("cache_write") or 0)
-                self.input_tokens = int(usage["input_tokens"]) if usage.get("input_tokens") is not None else None
-                self.output_tokens = int(usage["output_tokens"]) if usage.get("output_tokens") is not None else None
-            output_tokens = self.output_tokens
-            thinking = self.thinking[self._usage_offsets[1]:]
-            if thinking:
-                self.reasoning_tokens = approx_tokens(thinking)
-            elif output_tokens is not None:
-                self.reasoning_tokens = max(0, int(output_tokens) - self._completion_estimate())
+            self._set_usage(usage)
         elif kind == "hitl":
             block = ("\n\n" if self.text else "") + event["question"]
             self.text += block
@@ -96,13 +105,39 @@ class _Base:
             self.text += block
             self._text(block)
 
+    def _set_usage(self, usage):
+        if not usage:
+            return
+        # Counts are snapshots. A visible summary is not an exact hidden-token count.
+        for key in ('cache_read', 'cache_write', 'input_tokens', 'output_tokens'):
+            if key in usage:
+                counter = _token_counter(usage[key])
+                if counter is not None:
+                    setattr(self, key, counter)
+        if 'reasoning_tokens' in usage:
+            reasoning = _token_counter(usage['reasoning_tokens'])
+            self._reasoning_reported = reasoning is not None
+            self.reasoning_tokens = reasoning if self._reasoning_reported else 0
+        if self.output_tokens is not None and self.reasoning_tokens > self.output_tokens:
+            self._reasoning_reported = False
+            self.reasoning_tokens = 0
+
+    def _reasoning_details(self):
+        return {'reasoning_tokens': self.reasoning_tokens} if self._reasoning_reported else {}
+
+    def _price_usage(self):
+        complete = self._attempt_credited and not self._prior_cost_unknown
+        return {'credits_used': round(self.credits, 5) if complete else None,
+                'reported_credits_used': round(self.credits, 5), 'credits_complete': complete}
+
     def _completion_estimate(self):
         text_at, _, calls_at = self._usage_offsets
         tool_text = "".join(c.get("name", "") + c.get("arguments", "") for c in self.tool_calls[calls_at:])
         return approx_tokens(self.text[text_at:]) + approx_tokens(tool_text)
 
     def _reasoning_usage(self):
-        reasoning = self.reasoning_tokens or approx_tokens(self.thinking[self._usage_offsets[1]:])
+        reasoning = (self.reasoning_tokens if self._reasoning_reported else
+                     approx_tokens(self.thinking[self._usage_offsets[1]:]))
         return min(reasoning, self.output_tokens) if self.output_tokens is not None else reasoning
 
     def usage(self, prompt_text=None):
@@ -243,13 +278,9 @@ class ChatAdapter(_Base):
                     "cache_write_tokens": self.cache_write or 0,
                     "cache_creation_input_tokens": self.cache_write or 0,
                 },
-                "completion_tokens_details": {
-                    "reasoning_tokens": reasoning,
-                },
-                "output_tokens_details": {
-                    "reasoning_tokens": reasoning,
-                },
-                "credits_used": round(self.credits, 5),
+                "completion_tokens_details": self._reasoning_details(),
+                "output_tokens_details": self._reasoning_details(),
+                **self._price_usage(),
                 "estimated": True,
             }
             if self.parsed.wants_usage:
@@ -291,9 +322,9 @@ class ChatAdapter(_Base):
                               "cache_write_tokens": self.cache_write or 0,
                               "cache_creation_input_tokens": self.cache_write or 0,
                           },
-                          "completion_tokens_details": {"reasoning_tokens": reasoning},
-                          "output_tokens_details": {"reasoning_tokens": reasoning},
-                          "credits_used": round(self.credits, 5), "estimated": True}}
+                          "completion_tokens_details": self._reasoning_details(),
+                          "output_tokens_details": self._reasoning_details(),
+                          **self._price_usage(), "estimated": True}}
 
 
 class ResponsesAdapter(_Base):
@@ -444,7 +475,7 @@ class ResponsesAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
-        reasoning = self._reasoning_usage()
+        reasoning_details = self._reasoning_details()
         if not self._items:
             self._ensure_item("message", self.item_id)
         status = "incomplete" if reason == "timeout" else "completed"
@@ -456,10 +487,13 @@ class ResponsesAdapter(_Base):
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "total_tokens": prompt + completion,
                           "input_token_details": {"cached_tokens": self.cache_read},
-                          "output_token_details": {"reasoning_tokens": reasoning},
                           "input_tokens_details": {"cached_tokens": self.cache_read},
-                          "output_tokens_details": {"reasoning_tokens": reasoning},
-                          "credits_used": round(self.credits, 5), "estimated": True}}
+                          # The details object is optional, but reasoning_tokens
+                          # is required when it exists in strict Responses clients.
+                          # Omit unknown details instead of {} or an invented zero.
+                          **({"output_token_details": reasoning_details,
+                              "output_tokens_details": reasoning_details} if reasoning_details else {}),
+                          **self._price_usage(), "estimated": True}}
 
 
 class AnthropicAdapter(_Base):
@@ -567,7 +601,8 @@ class AnthropicAdapter(_Base):
         raw_prompt, completion = self.usage(prompt_text)
         non_cached = self.input_tokens if self.input_tokens is not None else max(0, raw_prompt - (self.cache_read or 0) - (self.cache_write or 0))
         usage = {"input_tokens": non_cached, "output_tokens": completion,
-                 "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_write}
+                 "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_write,
+                 **self._price_usage()}
         if not self._blocks:
             self._open("text")
         self._close_blocks()
@@ -588,11 +623,67 @@ class AnthropicAdapter(_Base):
                 "usage": {"input_tokens": non_cached, "output_tokens": completion,
                           "cache_read_input_tokens": self.cache_read,
                           "cache_creation_input_tokens": self.cache_write,
-                          "credits_used": round(self.credits, 5), "estimated": True}}
+                          **self._price_usage(), "estimated": True}}
+
+
+class ValidatedTitleAdapter:
+    """Buffer the SDK title until its exact JSON contract has been checked.
+
+    Usage/cost events still reach the ordinary adapter; no invalid partial text
+    reaches the client. This is post-validation, not native structured output.
+    """
+    def __init__(self, parsed, writer=None):
+        self.adapter = AnthropicAdapter(parsed, writer)
+        self.parts = []
+        self.size = 0
+
+    def begin(self):
+        self.adapter.begin()
+
+    def feed(self, event):
+        kind = event.get('type')
+        if kind == 'text':
+            delta = event['delta']
+            self.size += len(delta)
+            if self.size > 256 * 1024:
+                raise apierr.upstream_error('session title exceeds the validation buffer')
+            self.parts.append(delta)
+        elif kind in ('tool_call', 'tool_call_delta', 'tool_start', 'hitl', 'exec_start', 'exec_result'):
+            raise apierr.upstream_error('session title unexpectedly requested an action')
+        elif kind in ('usage_start', 'usage', 'credits'):
+            self.adapter.feed(event)
+
+    def end(self, reason, prompt_text=None):
+        text = ''.join(self.parts)
+        # Assist Haiku returns this exact formatting envelope even when asked
+        # for bare JSON. Remove only a whole-response fence; never extract JSON
+        # from prose or manufacture/repair a title value.
+        fenced = re.fullmatch(r'\s*```(?:json)?[ \t]*\r?\n(.*?)\r?\n```\s*', text, re.DOTALL)
+        if fenced:
+            text = fenced.group(1)
+
+        def unique_object(pairs):
+            obj = dict(pairs)
+            if len(obj) != len(pairs):
+                raise ValueError('duplicate JSON keys')
+            return obj
+
+        try:
+            value = json.loads(text, object_pairs_hook=unique_object)
+            valid = (reason == 'stop' and isinstance(value, dict)
+                     and set(value) == {'title'} and isinstance(value['title'], str))
+        except (ValueError, RecursionError):
+            valid = False
+        if not valid:
+            raise apierr.upstream_error('upstream did not return a complete session title JSON object')
+        self.adapter.feed({'type': 'text', 'delta': text})
+        return self.adapter.end(reason, prompt_text)
 
 
 def for_dialect(dialect, parsed, writer=None):
     if dialect == "anthropic":
+        if getattr(parsed, 'structured_title', False):
+            return ValidatedTitleAdapter(parsed, writer)
         return AnthropicAdapter(parsed, writer)
     if dialect == "responses":
         return ResponsesAdapter(parsed, writer)

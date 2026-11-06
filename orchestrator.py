@@ -18,7 +18,7 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
-from context import build_system_instructions
+from context import DEFAULT_RELAY_SYSTEM_PROMPT, build_system_instructions
 from redact import redact
 from session import SessionLease
 from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
@@ -138,7 +138,7 @@ class _FailoverOut:
         if event.get("type") == "error":
             self.error = event["error"]
             return
-        if event.get("type") not in ("credits", "usage_start"):
+        if event.get("type") not in ("credits", "usage", "usage_start"):
             self.started = True
         self.out.put(event)
 
@@ -240,14 +240,38 @@ class TurnRunner:
             target._client_context = context
             target._client_context_pending = False
 
-    def _followup(self, instructions, reminder, command, code, output, header):
+    @staticmethod
+    def _direct_text(instructions, chunks):
+        """Text actually sent in the system head and each retained content block."""
+        parts = [instructions] if instructions else []
+        def append(value):
+            if isinstance(value, str):
+                if value:
+                    parts.append(value)
+            elif isinstance(value, list):
+                for block in value:
+                    append(block)
+            elif isinstance(value, dict) and value.get('type') == 'text':
+                append(value.get('text'))
+        for chunk in chunks:
+            append(chunk)
+        return '\n'.join(parts)
+
+    def _followup(self, instructions, reminder, command, code, output, header, *, direct_chunks=None):
+        def tail(body):
+            return executor.format_command_followup(command, code, body, header) + reminder
+
         def compose(body):
-            text = executor.format_command_followup(command, code, body, header) + reminder
+            text = tail(body)
             return instructions + "\n\n" + text if instructions else text
+
+        def full(body):
+            return (compose(body) if direct_chunks is None else
+                    self._direct_text(instructions, [*direct_chunks, tail(body)]))
 
         limit = int(self.cfg.get("max_prompt_bytes", 0) or 0)
         if limit > 0:
-            fixed = self._check_prompt(compose(""))
+            fixed = self._check_prompt(full(""))
             budget = limit - _b(fixed)
             if _b(output) > budget:
                 notice = "\n[command output truncated to configured prompt byte limit]"
@@ -255,10 +279,13 @@ class TurnRunner:
                     raise apierr.ApiError(413, "prompt_too_large",
                                          "configured max_prompt_bytes leaves no room for command output")
                 output = _trim(output, budget - _b(notice)) + notice
-        return self._check_prompt(compose(output))
+        self._check_prompt(full(output))
+        return compose(output)
 
     def _instructions(self, native_tools=False):
         if native_tools:
+            if self.cfg.get('relay_system_prompt') is not None:
+                return self.cfg['relay_system_prompt']
             return ("[ROLE]\nYou are a coding assistant using the client's tools. "
                     "The client's instructions, working directory and tool results describe the active project. "
                     "Use those tools to inspect, edit and test that project. "
@@ -270,8 +297,33 @@ class TurnRunner:
             enable_local_exec=self.cfg["exec_policy"] != "off",
             limit=self.cfg["context_max_bytes"],
             cookie_values=self.cfg.get("cookie_values", ()),
+            system_prompt=self.cfg.get('relay_system_prompt'),
             exec_policy=self.cfg["exec_policy"],
         )
+
+    def _client_instructions(self, instructions):
+        """Compose only policy text, never relay workspace or shell capabilities."""
+        mode = self.cfg.get('relay_system_prompt_mode', 'standalone')
+        if mode == 'standalone':
+            return instructions
+        policy = self.cfg.get('relay_system_prompt')
+        if policy is None:
+            policy = DEFAULT_RELAY_SYSTEM_PROMPT
+        if mode == 'replace':
+            return policy
+        return '\n\n'.join(part for part in (instructions, policy) if part)
+
+    @staticmethod
+    def _usage_update(holder, event):
+        """Keep the attempt snapshot; journal additive deltas exactly once."""
+        snapshot = holder.setdefault('_attempt_usage', {})
+        delta = {}
+        for key in ('input_tokens', 'output_tokens', 'cache_read', 'cache_write'):
+            value = credits.token_counter((event.get('usage') or {}).get(key))
+            if value is not None:
+                delta[key] = value - snapshot.get(key, 0)
+                snapshot[key] = value
+        return snapshot, delta
 
     @staticmethod
     def _tool_prompt(parsed):
@@ -422,20 +474,28 @@ class TurnRunner:
             is_native = bool(native_tools)
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
-            client_owns_instructions = client_text or (direct_mode and is_native and bool(parsed.system))
+            client_owns_instructions = client_text or bool(parsed.system)
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
                 instructions = parsed.system or ""
+                if purpose not in client_context.SERVICE_KINDS:
+                    instructions = self._client_instructions(instructions)
             else:
                 instructions = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
                 raise asyncio.CancelledError()
+            if getattr(parsed, 'structured_title', False):
+                # The route lacks constrained decoding. Supply the fixed service
+                # contract as instructions and validate the complete reply later.
+                instructions += ('\n\n[SESSION TITLE OUTPUT FORMAT]\n'
+                                 'Return only one JSON object with one string field named "title". '
+                                 'Do not wrap it in Markdown fences or add any other text.')
             reminder = ""
             if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
-            elif not native_tools and not client_text and self.cfg["exec_policy"] != "off":
+            elif not native_tools and not client_owns_instructions and self.cfg["exec_policy"] != "off":
                 reminder = (
                     "\n\n[LOCAL EXEC REMINDER]\n"
                     "To run anything on the user's machine you MUST output "
@@ -473,6 +533,8 @@ class TurnRunner:
                 effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
             if effort is not None:
                 model_provider["reasoningEffort"] = effort
+            if getattr(parsed, 'verbosity', None) is not None:
+                model_provider['verbosity'] = parsed.verbosity
             log("turn.begin", "Ход %s · effort %s · %s" % (parsed.model, effort or "—",
                                                           "direct" if direct_mode else "agent"),
                 model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
@@ -486,12 +548,15 @@ class TurnRunner:
                 prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
                 messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose)
 
+            client_chunks = list(getattr(parsed, 'message_chunks', None) or ([parsed.prompt] if parsed.prompt else []))
+            if direct_mode:
+                self._check_prompt(self._direct_text(instructions, client_chunks))
             base_prompt = self._check_prompt(prompt)
             session = None
             try:
                 key = getattr(parsed, "conversation_key", None)
                 parent_key = getattr(parsed, "parent_conversation_key", None)
-                can_exec = self._can_exec(0) and not native_tools and not client_text
+                can_exec = self._can_exec(0) and not native_tools and not client_owns_instructions
                 persistent_text = (direct_mode and not native_tools
                                    and self.cfg.get("session_mode") != "per_request"
                                    and purpose not in client_context.SERVICE_KINDS
@@ -576,17 +641,17 @@ class TurnRunner:
                             stream_prompt = (instructions + self._tool_prompt(parsed) + _CONV_HEADER + stream_prompt + _NATIVE_CONTINUE
                                              if native_tools else instructions + "\n\n" + stream_prompt)
                     if direct_mode:
-                        if instructions and stream_prompt.startswith(instructions):
-                            stream_prompt = stream_prompt[len(instructions):]
-                        chunks = list(getattr(parsed, "message_chunks", None) or ([parsed.prompt] if getattr(parsed, "prompt", None) else []))
+                        if last_followup and instructions and stream_prompt.startswith(instructions + '\n\n'):
+                            stream_prompt = stream_prompt[len(instructions) + 2:]
+                        chunks = list(client_chunks)
                         if exec_chunks:
-                            if stream_prompt and len(stream_prompt.strip()) < len(exec_chunks[-1]):
-                                exec_chunks[-1] = stream_prompt.strip()
+                            exec_chunks[-1] = stream_prompt
                             chunks.extend(exec_chunks)
                         elif last_followup:
                             chunks.append(stream_prompt.strip())
                         elif chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
+                        self._check_prompt(self._direct_text(instructions, chunks or [stream_prompt]))
 
                         if native_tools:
                             tools_converted = direct.tools_to_retool(parsed.tools)
@@ -610,6 +675,9 @@ class TurnRunner:
                             chunks)
                         direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
                                                                  if native_tools else None)
+                        # Relay-only retry instructions live in chunks; a cold
+                        # canonical replay must not discard those later attempts.
+                        direct_target._native_allow_cold_replay = not (empty_retries or tool_retries or exec_steps)
                         direct_target._native_conversation_key = key
                     stream = (session.stream(stream_prompt, model_provider, tool_names=tool_names)
                               if native_tools else session.stream(stream_prompt, model_provider))
@@ -620,6 +688,10 @@ class TurnRunner:
                     think_started = None
                     tool_started = {}
                     out.put({"type": "usage_start"})
+                    journal_attempt = holder.get('_journal_attempt', 0) + 1
+                    holder['_journal_attempt'] = journal_attempt
+                    log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
+                    usage_started = False
                     try:
                         async for event in stream:
                             if not first_token and event["type"] in ("text", "thinking", "tool_call"):
@@ -664,7 +736,14 @@ class TurnRunner:
                                 out.put(event)
                             elif event["type"] in ("thinking_heartbeat", "usage_start"):
                                 if event["type"] == "usage_start":
+                                    if usage_started:
+                                        journal_attempt += 1
+                                        holder['_journal_attempt'] = journal_attempt
+                                        log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
+                                    usage_started = True
                                     think_started = None
+                                    holder['_attempt_usage'] = {}
+                                    holder['_attempt_credited'] = False
                                 out.put(event)
                             elif event["type"] == "tool_call" and event.get("name") in tool_names:
                                 if not event.get("partial"):
@@ -684,6 +763,18 @@ class TurnRunner:
                                         args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
                                 out.put({key: value for key, value in event.items() if key != "partial"}
                                         | {"tool_type": definition.get("x-client-type", "function")})
+                            elif event['type'] == 'usage':
+                                usage, delta = self._usage_update(holder, event)
+                                breakdown = credits.cost_breakdown(usage)
+                                known = holder.get('_attempt_credited') or event.get('credits_reported')
+                                log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
+                                                      'Токены получены; стоимость upstream не сообщена'),
+                                    'info' if known else 'warn', credits=None, attempt=journal_attempt,
+                                    credits_reported=bool(known), **delta,
+                                    **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
+                                if session is not None:
+                                    acquired._last_prefix_tokens = breakdown['prompt_tokens']
+                                out.put(event)
                             elif event["type"] == "credits":
                                 # Each upstream attempt (retry, exec follow-up) is billed
                                 # separately: a per-turn dedup key dropped all but the first.
@@ -692,13 +783,15 @@ class TurnRunner:
                                 account_credits.record_turn(
                                     turn_id if credit_events == 1 else "%s#%d" % (turn_id, credit_events),
                                     event["value"])
-                                usage = event.get("usage") or {}
+                                holder['_attempt_credited'] = True
+                                usage, delta = self._usage_update(holder, event)
                                 breakdown = credits.cost_breakdown(usage)
                                 hit = breakdown["cache_hit_ratio"]
                                 log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
                                     event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
                                     "%d%%" % round(hit * 100) if hit is not None else "—"),
-                                    "info", credits=event["value"], **usage, **breakdown)
+                                    "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
+                                    **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
                                 if session is not None:
                                     # Write through the lease: SessionLease only proxies
                                     # reads, so keepwarm (which holds the real session)
@@ -794,7 +887,7 @@ class TurnRunner:
                             "upstream did not honor the required client tool choice")
 
                     # Once the summary turn is requested, nothing is executed any more.
-                    can_exec = self._can_exec(exec_steps) and not final_summary and not client_text
+                    can_exec = self._can_exec(exec_steps) and not final_summary and not client_owns_instructions
                     command = executor.extract_command(final_text) if can_exec and not native_tools else None
 
                     if not final_summary and exec_steps and not self._can_exec(exec_steps):
@@ -802,7 +895,8 @@ class TurnRunner:
                         final_summary = True
                         summary = ("\n\n[ИТОГ] Команды больше не выполняй. "
                                    "Дай итоговый ответ по уже собранной информации, на русском.")
-                        prompt = (self._followup(instructions, reminder + summary, *last_followup)
+                        prompt = (self._followup(instructions, reminder + summary, *last_followup,
+                                                direct_chunks=client_chunks + exec_chunks[:-1] if direct_mode else None)
                                   if last_followup else self._check_prompt(prompt + summary))
                         continue
 
@@ -813,7 +907,8 @@ class TurnRunner:
                             command=command[:300])
                         summary = ("\n\n[ИТОГ] Команда '" + command + "' повторяется. "
                                    "Команды больше не выполняй, дай итоговый ответ.")
-                        prompt = (self._followup(instructions, reminder + summary, *last_followup)
+                        prompt = (self._followup(instructions, reminder + summary, *last_followup,
+                                                direct_chunks=client_chunks + exec_chunks[:-1] if direct_mode else None)
                                   if last_followup else self._check_prompt(prompt + summary))
                         continue
 
@@ -910,7 +1005,8 @@ class TurnRunner:
                     last_followup = (safe_command, code, output, header)
                     followup_text = executor.format_command_followup(safe_command, code, output, header)
                     exec_chunks.append(followup_text)
-                    prompt = self._followup(instructions, reminder, *last_followup)
+                    prompt = self._followup(instructions, reminder, *last_followup,
+                                            direct_chunks=client_chunks + exec_chunks[:-1] if direct_mode else None)
             finally:
                 if session is not None:
                     await self.pool.release(session)

@@ -188,7 +188,9 @@ def make_handler(runtime: Runtime):
                              "x-proxi-parent-session-id, x-opencode-session-id, x-opencode-parent-session-id, "
                              "x-claude-code-session-id, x-claude-code-agent-id")
             self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
-            self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after")
+            self.send_header("access-control-expose-headers", "x-request-id, request-id, retry-after, "
+                             "x-proxi-ignored-parameters, x-proxi-system-messages, "
+                             "x-proxi-thinking-display, x-proxi-output-format")
 
         def _json(self, status, payload, extra=None):
             self._status = status
@@ -458,6 +460,7 @@ def make_handler(runtime: Runtime):
             self._json(200, {"input_tokens": adapters.approx_tokens(text)}, {"x-proxi-token-count": "estimated"})
 
         def _models(self):
+            entries = [model for model in model_catalog.catalog() if self._model_routable(model)]
             data = [{
                 "id": model["id"],
                 "object": "model",
@@ -465,6 +468,7 @@ def make_handler(runtime: Runtime):
                 "label": model["label"],
                 "context_window": model["context"],
                 "max_output_tokens": model.get("max_output"),
+                **model_catalog.desktop_metadata(model, entries),
                 **{key: model[key] for key in ("metadata_checked_at", "metadata_source", "metadata_status", "metadata_notes")
                    if key in model},
                 "capabilities": {"reasoning": model["reasoning"], "tools": model["tools"],
@@ -472,20 +476,11 @@ def make_handler(runtime: Runtime):
                                  "reasoning_effort_levels": model.get("reasoning_effort_levels", []),
                                  "default_reasoning_effort": model.get("default_reasoning_effort"),
                                  "reasoning_effort_control": model.get("reasoning_effort_control", "selectable")},
-            } for model in model_catalog.catalog()
-                if self._model_routable(model)]
+            } for model in entries]
             self._json(200, {"object": "list", "data": data})
 
         def _model_routable(self, model) -> bool:
-            """Hide models whose provider resource is not configured."""
-            if cfg.get("show_unrouted_models"):
-                return True
-            if not any(cfg.get(k) for k in model_catalog.PROVIDER_RESOURCE_KEY.values()):
-                return True  # nothing configured yet: list everything, calls fail with a clear 503
-            if model["id"] == cfg.get("model"):
-                return True  # the configured default stays visible
-            key = model_catalog.PROVIDER_RESOURCE_KEY.get(model["provider"])
-            return bool(key and cfg.get(key))
+            return model_catalog.catalog_routable(model, cfg, runtime.accounts.backends)
 
         def _balance_report(self):
             return account_report.balance_report(account_report.collect(runtime, force_refresh=True))
@@ -586,6 +581,23 @@ def make_handler(runtime: Runtime):
                 parsed.entry.get("reasoning_effort_control") == "provider-managed" else "none")
 
             parsed.request_purpose = client_context.request_kind(parsed)
+            compatibility_headers = {}
+            if parsed.structured_title:
+                compatibility_headers['x-proxi-output-format'] = 'validated-session-title'
+            if 'thinking.display' in parsed.declared_ignored:
+                compatibility_headers['x-proxi-thinking-display'] = 'summarized'
+            if parsed.declared_ignored:
+                compatibility_headers['x-proxi-ignored-parameters'] = ','.join(parsed.declared_ignored)
+                journal.emit('request.compatibility',
+                             'Параметры не поддерживаются маршрутом и не передаются: ' + ', '.join(parsed.declared_ignored),
+                             'warn', parameters=parsed.declared_ignored)
+            if parsed.system_messages_normalized:
+                compatibility_headers['x-proxi-system-messages'] = 'merged-into-head'
+                journal.emit('request.compatibility',
+                             'Системные напоминания объединены в один head: Retool не принимает несколько system. '
+                             'Изменение head сбрасывает прежний подписанный префикс.', 'warn',
+                             request_id=self.request_id, control='mid_conversation_system',
+                             handling='merged_into_head')
             if self._client_trace:
                 self._client_trace.event("validated_request", parsed=vars(parsed), effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
@@ -608,13 +620,14 @@ def make_handler(runtime: Runtime):
                 adapter = adapters.for_dialect(dialect, parsed)
                 reason = self._collect(fut, events, adapter, prompt_text, holder)
                 payload = adapter.end(reason, prompt_text)
-                self._json(200, payload)
+                self._json(200, payload, compatibility_headers)
                 return
 
             writer = sse.StreamWriter(self)
             self._writer = writer
             self._streaming = True
-            writer.start({"x-request-id": self.request_id, "request-id": self.request_id})
+            writer.start({"x-request-id": self.request_id, "request-id": self.request_id,
+                          **compatibility_headers})
             self._response_started = True
             self._model = parsed.model
             self._stream_status = 200
@@ -647,7 +660,11 @@ def make_handler(runtime: Runtime):
                 if kind == "end":
                     reason = event.get("reason", "stop")
                     continue
-                adapter.feed(event)
+                try:
+                    adapter.feed(event)
+                except apierr.ApiError:
+                    self._cancel_turn(fut, holder_session)
+                    raise
                 if sse.client_gone(self):
                     self._cancel_turn(fut, holder_session)
                     return "cancelled"
@@ -706,7 +723,11 @@ def make_handler(runtime: Runtime):
                     reason = event.get("reason", "stop")
                     holder["reason"] = reason
                     continue
-                adapter.feed(event)
+                try:
+                    adapter.feed(event)
+                except apierr.ApiError:
+                    self._cancel_turn(fut, holder)
+                    raise
                 last_write = time.time()
                 # Check for a disconnect on every event, not only when the stream idles.
                 if sse.client_gone(self) or getattr(writer, "broken", False):
@@ -784,6 +805,11 @@ def startup_config(argv=None):
     return cfg
 
 
+def startup_balance(runtime):
+    """Use the same account pool and unknown-balance semantics as /v1/balance."""
+    return account_report.balance_report(account_report.collect(runtime, force_refresh=True))
+
+
 def main(argv=None):
     cfg = startup_config(argv)
     runtime = Runtime(cfg)
@@ -799,7 +825,7 @@ def main(argv=None):
     refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
     for r in refreshers:
         r.start()  # no-op for accounts the dispatcher schedules
-    balance = runtime.credits.get_balance(force_refresh=True)
+    balance = startup_balance(runtime)
     print("=" * 64)
     print(" Retool AI relay")
     print(" listen:        http://" + cfg["host"] + ":" + str(cfg["port"]) + "/v1")

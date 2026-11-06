@@ -153,9 +153,9 @@ def test_reasoning_effort_clamping_and_preservation():
     entry_haiku, effort_haiku = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh", allow_downgrade=True)
     assert effort_haiku == "high"
 
-    # 4. Non-reasoning model safely clamps effort to None without 400 error
+    # 4. GLM Flash has live-verified thinking and retains supported effort.
     entry_glm, effort_glm = models.resolve_tolerant("zai-org/GLM-5.3-Flash", "high", allow_downgrade=True)
-    assert effort_glm is None
+    assert effort_glm == 'high'
 
 
 def test_full_context_preservation_no_truncation():
