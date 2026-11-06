@@ -153,7 +153,8 @@ def test_codex_catalog_advertises_direct_client_tools_and_actual_route_capabilit
     assert native["input_modalities"] == ["text", "image"]
     assert native["supports_reasoning_summary_parameter"] is True
     assert native["default_reasoning_summary"] == "detailed"
-    assert [value["effort"] for value in native["supported_reasoning_levels"]] == entry["reasoning_effort_levels"]
+    assert [value["effort"] for value in native["supported_reasoning_levels"]] == entry["reasoning_effort_levels"] + ["ultra"]
+    assert native["multi_agent_version"] == "v2"  # Ultra delegates only on a model that says v2
     assert native["default_reasoning_level"] in entry["reasoning_effort_levels"]
     assert native["model_messages"]["instructions_template"] == native["base_instructions"]
     assert native["use_responses_lite"] is False

@@ -851,6 +851,9 @@ def _effort(data):
                 raise unprocessable("budget_tokens requires enabled thinking", param="thinking.budget_tokens")
             selected.append(model_catalog.effort_from_budget(thinking["budget_tokens"]))
     selected = [value.lower() for value in selected]
+    # Codex's Ultra is maximum reasoning plus delegation it runs itself; it sends max for it, and a client that sends
+    # the name instead means the same effort (openai/codex df1199f: "the inference backend expects max").
+    selected = ["max" if value == "ultra" else value for value in selected]
     if len(set(selected)) > 1:
         raise unprocessable("conflicting reasoning effort controls", param="reasoning_effort")
     # Current Claude clients can place effort updates in system entries, including
@@ -873,6 +876,7 @@ def _effort(data):
                                     param=f'messages[{index}].output_config')
             if output.get('effort') is not None:
                 latest = _opt_str(output, 'effort').lower()
+                latest = 'max' if latest == 'ultra' else latest
     if latest is not None and isinstance(thinking, dict):
         kind = thinking.get('type')
         explicit = thinking.get('effort')
