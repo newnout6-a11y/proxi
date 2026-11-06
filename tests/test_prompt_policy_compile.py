@@ -737,7 +737,9 @@ def test_the_example_document_of_the_plan_is_valid(tmp_path):
     (tmp_path / "prompts" / "opus.md").write_text("Ты — Opus.\n", encoding="utf-8")
     snapshot = compile_doc(PLAN_EXAMPLE, tmp_path)
     assert snapshot.profile_names() == ["passthrough", "mine-first", "exact-opus"]
-    assert snapshot.warnings == []
+    # exact-opus replaces the client's system prompt on purpose; the engine says so, and nothing else
+    assert len(snapshot.warnings) == 1 and snapshot.warnings[0].startswith(
+        "profiles.exact-opus: the head does not use {{client_system}}")
     assert snapshot.profile("passthrough")["description"] == "the client's system prompt, unchanged"
     assert snapshot.profile("exact-opus")["head"] == "{{text:opus_role}}"
     assert snapshot.document["profiles"]["passthrough"] == {"head": "{{client_system}}"}
@@ -781,9 +783,11 @@ def test_compile_warnings_say_what_is_wrong_and_never_quote_a_text(tmp_path):
                         "client_system": {"edits": [{"op": "append", "text": secret}]}}},
         rules=[{"name": "loud", "use": "p", "override_protected": True}])
     warnings = compile_doc(doc, tmp_path).warnings
-    assert len(warnings) == 3 and all(isinstance(line, str) for line in warnings)
+    assert len(warnings) == 4 and all(isinstance(line, str) for line in warnings)
     assert secret not in " ".join(warnings)
     assert len(set(warnings)) == len(warnings)
+    assert any(line.startswith("profiles.p: the head does not use {{client_system}}") and "rule 'loud'" in line
+               for line in warnings)
 
 
 # -- nothing but a PromptConfigError may escape -------------------------------------------------------------------------

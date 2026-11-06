@@ -406,6 +406,8 @@ class TurnRunner:
         self.accounts = None
         # PromptStore; set by Runtime. None keeps every head on the legacy path.
         self.prompts = None
+        # (profile, client) pairs whose dropped system prompt the journal has already named (_warn_dropped_client_system).
+        self._dropped_noted = set()
 
     def _can_exec(self, steps: int) -> bool:
         return _can_exec(self.cfg, steps)
@@ -646,6 +648,28 @@ class TurnRunner:
             return None
         return head, parts, warnings
 
+    def _warn_dropped_client_system(self, log, parsed, plan, inp):
+        """Once per profile and client: the head leaves out the system prompt of a client that sent tools.
+
+        That prompt holds the client's rules for its tools, edits and permissions. The prompt.plan warning of every request
+        is a debug line nobody reads, and a user's profile cut Harness's own instructions out for a day (2026-11-06) with
+        nothing in the journal at a level anyone watches."""
+        import prompt_policy
+        chars = prompt_policy.dropped_client_system(plan, _client_system(parsed)) if client_tools(parsed) else 0
+        if not chars:
+            return
+        client = getattr(inp, "client", None) or prompt_policy.prompt_client(client_context.current(), {})
+        key = (plan.profile, client)
+        if key in self._dropped_noted or len(self._dropped_noted) >= 256:
+            return
+        self._dropped_noted.add(key)
+        log("prompt.client_system_dropped",
+            "Профиль «%s» не передаёт модели системный промпт клиента %s (%d симв.): его правила по инструментам, правкам и "
+            "разрешениям не доходят до модели; добавьте {{client_system}} в head профиля или сузьте правило" % (
+                plan.profile, client, chars), "warn", profile=plan.profile, rule=plan.rule, client=client, chars=chars)
+        console_log.write("[prompt] profile %s drops the system prompt of %s (%d characters): its rules for tools never "
+                          "reach the model; add {{client_system}} to the head" % (plan.profile, client, chars))
+
     def _note_plan(self, log, holder, parsed, composed):
         """The prompt.plan event of a turn and, once per request, the ring entry of what the model saw (plan 4.1, 4.2).
 
@@ -659,6 +683,7 @@ class TurnRunner:
             # No text of the profile or the client is quoted: the warning is as good for the journal as for the ring.
             notes.append(EMPTY_HEAD_WARNING)
         inp = getattr(parsed, "prompt_input", None)
+        self._warn_dropped_client_system(log, parsed, plan, inp)
         try:
             summary = journal_changes(changes)
             summary_history, summary_tools = split_changes(summary)
