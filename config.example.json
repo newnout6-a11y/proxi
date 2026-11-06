@@ -52,6 +52,8 @@
   "account_balance_interval": 300,
   "account_refresh_parallel": 3,
   "account_rate_limit_cooldown": 900,
+  "account_rate_limit_wait": 0,
+  "account_rate_limit_wait_note": "когда аккаунт отвечает часовым лимитом, диалог переезжает на другой аккаунт и записывает весь префикс заново (79 тыс. токенов за 38 с, а у больших диалогов 490 тыс.). Если задать секунды, запрос диалога с префиксом не меньше 8000 токенов один раз ждёт на этом аккаунте (Retry-After, если Retool его прислал и он не больше этого значения; иначе всё значение) и спрашивает его ещё раз; аккаунт на время ожидания не исключается. 0 — переезжать сразу, как раньше; до 120; меняется в админке без перезапуска",
   "model": "claude-opus-5-5",
   "provider_resource_name": "<YOUR-ANTHROPIC-PROVIDER-RESOURCE-UUID>",
   "openai_provider_resource_name": "<YOUR-OPENAI-PROVIDER-RESOURCE-UUID>",

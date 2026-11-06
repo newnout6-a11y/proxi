@@ -202,6 +202,22 @@ def _may_be_balance_related(error):
     return status >= 500 and code != "upstream_timeout"
 
 
+# A conversation moved to another account writes its prefix there again; below this many prompt tokens that costs next
+# to nothing, and waiting for the limited account (account_rate_limit_wait) is only a delay.
+LIMIT_WAIT_MIN_PREFIX = 8000
+
+
+async def _pause(cancelled, seconds):
+    """Wait `seconds` without holding a thread; True when the client went away first."""
+    end = time.monotonic() + seconds
+    while not cancelled.is_set():
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        await asyncio.sleep(min(0.25, left))
+    return True
+
+
 def _can_exec(cfg, steps: int) -> bool:
     """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
     if cfg["exec_policy"] == "off":
@@ -784,6 +800,24 @@ class TurnRunner:
                 return None
         return None
 
+    def _limit_pause(self, error, session):
+        """Seconds to wait on an account at its hourly limit before its conversation moves, or None to move it now.
+
+        Only a conversation with a prefix worth keeping waits (LIMIT_WAIT_MIN_PREFIX): the other account writes the
+        whole prefix again and cannot take the signed history along (field: 79k tokens in 38 s, and 490k tokens, after one
+        429 each). Retool sends no Retry-After for this limit, so a wait is the setting's whole length; when it does
+        send one, the wait is the hint if that fits in the setting, and a longer hint moves the conversation at once."""
+        try:
+            allowed = float(self.cfg.get("account_rate_limit_wait") or 0)
+        except (TypeError, ValueError):
+            return None
+        if allowed <= 0 or int(getattr(session, "_last_prefix_tokens", 0) or 0) < LIMIT_WAIT_MIN_PREFIX:
+            return None
+        hint = getattr(error, "retry_after", None)
+        if hint is None:
+            return allowed
+        return float(hint) if hint <= allowed else None
+
     async def run(self, parsed, out: queue.Queue, holder: dict):
         """Run a turn; retry on another account after a confirmed low balance or an hourly limit.
 
@@ -791,10 +825,12 @@ class TurnRunner:
         confirmed by the dispatcher's fresh balance fetch (the serving account dropped below
         min_account_balance); Retool's hourly managed-key limit parks the serving account at
         once, even when the turn is already streaming and cannot be retried. Other failures
-        (empty turns, 5xx) are returned as before.
+        (empty turns, 5xx) are returned as before. With account_rate_limit_wait set, a conversation
+        with a warm prefix first waits once on the limited account and asks it again (_limit_pause).
         """
         exclude = []
         rechecked = False
+        waited, awaiting = False, None
         cancelled = holder.setdefault("cancel_event", threading.Event())
         max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
         # Exec steps are bounded only by max_exec_turns; each step (plus the summary
@@ -816,12 +852,36 @@ class TurnRunner:
             lease = holder.get("session")
             backend = getattr(getattr(lease, "session", lease), "backend", None)
             accounts = getattr(self, "accounts", None)
+            if awaiting is not None:
+                if error is None or not apierr.is_account_quota(error):
+                    journal.emit("account.rate_limit_lifted",
+                                 "Часовой лимит Retool снят за %g с ожидания — диалог остался на своём аккаунте" % awaiting[1],
+                                 "info", account=account_tag(awaiting[0]), request_id=getattr(parsed, "request_id", None),
+                                 seconds=awaiting[1])
+                awaiting = None
             retryable = (error is not None and not relay.started and not cancelled.is_set()
                          and accounts is not None and holder["_attempt_budget"].remaining > 0)
             exhausted = False
             rate_limited = False
             try:
                 if error is not None and backend is not None and apierr.is_account_quota(error):
+                    pause = (self._limit_pause(error, getattr(lease, "session", lease))
+                             if retryable and backend not in exclude and not waited
+                             and holder["_attempt_budget"].remaining > 1 else None)
+                    if pause is not None:
+                        # The account is not parked and not excluded: the retry goes to it with the conversation's
+                        # history, and only a second 429 takes the usual way below.
+                        waited, awaiting = True, (backend, pause)
+                        journal.emit("account.rate_limit_wait",
+                                     "Часовой лимит Retool — запрос ждёт %g с тот же аккаунт, чтобы диалог не переезжал" % pause,
+                                     "info", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
+                                     seconds=pause, retry_after=getattr(error, "retry_after", None))
+                        console_log.write("[%s] [account] %s: часовой лимит Retool, ждём %g с и повторяем на нём" % (
+                            getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), pause))
+                        if not await _pause(cancelled, pause):
+                            holder["reason"] = "stop"
+                            continue
+                        retryable = False  # the client went away while the request waited: only the account is told
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):

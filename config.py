@@ -114,6 +114,10 @@ DEFAULTS = {
     # Pause after Retool's hourly managed-key limit; a limit right after the return adds 5 minutes
     # to it, up to max(this, 20 minutes).
     "account_rate_limit_cooldown": 900,
+    # Seconds a request that has a warm conversation waits on an account that answered the hourly limit, and then asks
+    # that account once more, before the conversation moves to another account (which writes its whole prefix again).
+    # With a Retry-After from Retool it waits that long if that fits; 0 moves the conversation at once.
+    "account_rate_limit_wait": 0,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -128,8 +132,9 @@ STATE_NUMBERS = ("conversation_state_max_conversations", "conversation_state_ttl
                  "conversation_state_max_file_bytes", "conversation_state_max_total_bytes")
 # The size and the number of the journal's files: whole numbers, checked before int() would turn true into 1.
 JOURNAL_NUMBERS = ("journal_max_file_bytes", "journal_keep_files")
-# How long a new conversation waits for a slot of a full pool: a whole number of seconds, checked the same way.
-POOL_NUMBERS = ("conversation_wait",)
+# How long a new conversation waits for a slot of a full pool, and how long a request waits on an account that is at its
+# hourly limit: whole numbers of seconds, checked the same way.
+POOL_NUMBERS = ("conversation_wait", "account_rate_limit_wait")
 
 # Cookie values that are just host names are not secrets.
 HOSTNAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
@@ -497,7 +502,7 @@ def _load(path):
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
                     "cache_keepwarm_subagent_idle",
                     "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
-                    "account_rate_limit_cooldown",
+                    "account_rate_limit_cooldown", "account_rate_limit_wait",
                     "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
                     "trace_max_folders", "conversation_state_max_conversations", "conversation_state_ttl",
                     "conversation_state_max_file_bytes", "conversation_state_max_total_bytes",
@@ -519,6 +524,8 @@ def _load(path):
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
     if not 1 <= cfg["account_rate_limit_cooldown"] <= 3600:
         raise service_unavailable("account_rate_limit_cooldown must be between 1 and 3600 seconds")
+    if not 0 <= cfg["account_rate_limit_wait"] <= 120:
+        raise service_unavailable("account_rate_limit_wait must be between 0 and 120 seconds (0 moves the conversation at once)")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     if type(cfg["compaction_keep_effort"]) is not bool:
