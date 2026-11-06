@@ -689,6 +689,16 @@ def make_handler(runtime: Runtime):
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
+            substituted = model_catalog.substitute_for(parsed.requested_model)
+            if substituted != parsed.model:
+                substituted = None
+            if substituted:
+                # The client named a model no account serves (Codex's memory jobs ask for gpt-6-luna): the nearest served
+                # one answers, and the journal and the response headers say which.
+                journal.emit("request.model_substituted",
+                             "Модель %s не обслуживается маршрутом Retool: запрос выполняет %s" % (
+                                 parsed.requested_model, substituted), "info",
+                             request_id=self.request_id, requested=parsed.requested_model, served=substituted)
             parsed.request_purpose = client_context.request_kind(parsed)
             # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
             # identity, so that every event of the request, the transport's included, says what it is.
@@ -711,6 +721,8 @@ def make_handler(runtime: Runtime):
                 parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
 
             compatibility_headers = {}
+            if substituted:
+                compatibility_headers['x-proxi-model-substituted'] = '%s=%s' % (parsed.requested_model, substituted)
             if parsed.structured_output:
                 compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
             if 'thinking.display' in parsed.declared_ignored:
