@@ -924,13 +924,36 @@ def _error_from_event(event):
     return apierr.upstream_error(text)
 
 
+KEEPWARM_NUDGE = "Reply with the single word OK and nothing else. Do not call any tool."
+
+
+def ping_body(body):
+    """The request a keep-alive sends: the last body, then one more user message that asks for a one-word answer.
+
+    A ping used to send the last body again, and Retool's Claude route ignores maxCompletionTokens, so the model wrote
+    the whole reply again: 1,041 pings of one load cost 467 credits where 194 were expected, up to 14.6k output tokens
+    for one (journal of 2026-11-06). An output token costs 50 to 100 times a token read from the cache. The earlier
+    messages keep their cache hints, so the ping still reads the same prefix; the new message carries none, because it
+    is not worth a cache entry and the request has only a few breakpoints to spare. `rit` is the hint of the new list.
+    Measured through the relay (Sonnet 5.5, 13.8k cached tokens): the same body again 715 output tokens and 0.198
+    credits, this body 4 output tokens and 0.057, both reading all 13,752 tokens; Opus 5.5 on high 1505 against 50
+    output tokens, on max about 150-370 (it thinks a little even about this); after a tool result, with tools declared,
+    the model answers OK and calls none. The model and the effort stay the turn's own: the relay does not lower an
+    effort or change a model to make a request cheaper, a ping included."""
+    messages = [*(body.get("messages") or []), {"role": "user", "content": [{"type": "text", "text": KEEPWARM_NUDGE}]}]
+    payload = dict(body)
+    payload["messages"] = messages
+    payload["rit"] = make_rit(messages, payload.get("tools"))
+    payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
+    return payload
+
+
 def _ping(session, body):
     """Cheap request that re-reads the cached prefix so its TTL does not lapse.
 
     Returns the credits Retool actually billed for the ping (from the usage
     metadata event), or None when the stream ended without reporting them."""
-    payload = dict(body)
-    payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
+    payload = ping_body(body)
     # Effort can be part of the provider cache scope. Preserve the exact request
     # settings rather than replacing max with low during a cache refresh.
     headers = session.backend.headers()
