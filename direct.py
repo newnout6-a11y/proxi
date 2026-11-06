@@ -163,12 +163,11 @@ def make_rit(messages, tools=None):
 _KNOWN_TYPES = ("string", "number", "boolean", "null", "array", "object")
 
 
-def _param_schema(schema, required):
-    """Convert one JSON-Schema property to Retool's typed param shape.
+def _param_schema_v1(schema, required):
+    """The conversion of the relay before 2026-11-06: a string enum came out as a plain string.
 
-    Retool accepts only literal/string/number/boolean/null/array/object/enum/anyOf,
-    so an unsupported or union type must degrade instead of emitting "any".
-    """
+    A conversation whose signed history was made with it keeps it (tools_for_session): another declaration of the same
+    tools is another prefix, so the history would start again and the cache would be written anew."""
     if not isinstance(schema, dict):
         return {"type": "string", "required": bool(required)}
     kind = schema.get("type")
@@ -179,16 +178,16 @@ def _param_schema(schema, required):
         node = {"type": "string" if kind == "string" else
                 ("number" if kind in ("number", "integer") else kind)}
     elif kind == "array":
-        node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False)}
+        node = {"type": "array", "items": _param_schema_v1(schema.get("items") or {}, False)}
     elif kind == "object":
         node = {"type": "object", "properties": {
-            name: _param_schema(sub, name in (schema.get("required") or []))
+            name: _param_schema_v1(sub, name in (schema.get("required") or []))
             for name, sub in (schema.get("properties") or {}).items()}}
     elif schema.get("enum"):
         node = {"type": "enum", "enum": [str(item) for item in schema["enum"]]}
     elif (schema.get("properties") or schema.get("additionalProperties")):
         node = {"type": "object", "properties": {
-            name: _param_schema(sub, name in (schema.get("required") or []))
+            name: _param_schema_v1(sub, name in (schema.get("required") or []))
             for name, sub in (schema.get("properties") or {}).items()}}
     if schema.get("description"):
         node["description"] = str(schema["description"])
@@ -196,8 +195,75 @@ def _param_schema(schema, required):
     return node
 
 
-def tools_to_retool(tools):
-    """Translate client function tools to the Retool tool declaration shape with canonical ordering."""
+def _allowed_values(schema):
+    """The values a schema restricts a field to (enum, const, or an anyOf/oneOf of those); None when it does not."""
+    if "const" in schema:
+        return [schema["const"]]
+    if isinstance(schema.get("enum"), list) and schema["enum"]:
+        return list(schema["enum"])
+    options = schema.get("anyOf") or schema.get("oneOf")
+    if isinstance(options, list) and options:
+        values = []
+        for option in options:
+            if isinstance(option, dict) and option.get("type") == "null" and len(option) <= 2:
+                values.append(None)
+                continue
+            found = _allowed_values(option) if isinstance(option, dict) else None
+            if found is None:
+                return None
+            values.extend(found)
+        return values
+    return None
+
+
+def _param_schema(schema, required):
+    """Convert one JSON-Schema property to Retool's typed param shape.
+
+    Retool accepts only literal/string/number/boolean/null/array/object/enum/anyOf (its enum holds strings), so an
+    unsupported or union type must degrade instead of emitting "any". The values a field is restricted to reach the
+    model: strings as an enum, others (numbers, booleans) in the description, which the model reads as well. A client's
+    MCP server checks them, and a guessed value fails the call (wrap_up of Claude Desktop: "Invalid option").
+    """
+    if not isinstance(schema, dict):
+        return {"type": "string", "required": bool(required)}
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((item for item in kind if item in _KNOWN_TYPES), None)
+    allowed = _allowed_values(schema)
+    allowed = [value for value in allowed if value is not None] if allowed is not None else None
+    note = None
+    node = {"type": "string"}
+    if allowed and all(isinstance(value, str) for value in allowed):
+        node = {"type": "enum", "enum": list(dict.fromkeys(allowed))}
+    else:
+        if allowed:
+            note = "Allowed values: %s." % ", ".join(json.dumps(value, ensure_ascii=False) for value in allowed)
+            if kind is None:
+                kinds = {"number" if isinstance(value, (int, float)) and not isinstance(value, bool) else
+                         "boolean" if isinstance(value, bool) else None for value in allowed}
+                kind = kinds.pop() if len(kinds) == 1 and None not in kinds else None
+        if kind in ("string", "number", "integer", "boolean", "null"):
+            node = {"type": "string" if kind == "string" else
+                    ("number" if kind in ("number", "integer") else kind)}
+        elif kind == "array":
+            node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False)}
+        elif kind == "object" or schema.get("properties") or schema.get("additionalProperties"):
+            node = {"type": "object", "properties": {
+                name: _param_schema(sub, name in (schema.get("required") or []))
+                for name, sub in (schema.get("properties") or {}).items()}}
+    description = " ".join(part for part in (str(schema["description"]) if schema.get("description") else "", note)
+                           if part)
+    if description:
+        node["description"] = description
+    node["required"] = bool(required)
+    return node
+
+
+def tools_to_retool(tools, legacy=False):
+    """Translate client function tools to the Retool tool declaration shape with canonical ordering.
+
+    `legacy` gives the declaration of the relay before 2026-11-06 (_param_schema_v1), for a conversation made with it."""
+    convert = _param_schema_v1 if legacy else _param_schema
     converted = []
     sorted_tools = sorted(
         tools or [],
@@ -213,11 +279,32 @@ def tools_to_retool(tools):
         required = set(schema.get("required") or [])
         properties = schema.get("properties") or {}
         for name in sorted(properties.keys()):
-            params[name] = _param_schema(properties[name], name in required)
+            params[name] = convert(properties[name], name in required)
         converted.append({"name": function["name"],
                           "description": function.get("description") or "",
                           "params": params, "strict": function.get("strict", True)})
     return converted
+
+
+def tools_for_session(tools, session):
+    """The Retool declaration of the client's tools for the conversation of `session`.
+
+    The current conversion, unless the newest signed branch of the conversation was made with the legacy one: the tools
+    are part of the signed prefix (native_scope) and of the cached one, so such a conversation keeps its declaration and
+    does not lose its history and cache to the change. New conversations get the current one."""
+    current = tools_to_retool(tools)
+    history = getattr(session, "_native_history", None)
+    branches = list(getattr(history, "branches", None) or ())
+    if not branches:
+        return current
+    try:
+        sent = json.loads(branches[-1].scope)[3]
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+        return current
+    if sent == current:
+        return current
+    legacy = tools_to_retool(tools, legacy=True)
+    return legacy if sent == legacy else current
 
 
 def coerce_arguments(raw, params):
