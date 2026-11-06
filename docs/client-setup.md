@@ -164,10 +164,13 @@ model and account and the same messages. Only the new tail is then written. The 
 both efforts: `turn.begin` has `requested_effort` (the client's), `effective_effort` (the dialog's),
 `effort_source: dialog` and `effort_resolution: cache_continuity`, and every event of the request
 has `client_task: "compaction"`. `compaction_keep_effort: false` turns the substitution off; the
-label stays. A compaction with nothing to continue (the first request of a dialog, a restart whose
+label stays. The dialog's effort is taken only when it is not lower than the one the compaction
+would run on: the relay never lowers an effort to save a cache, so a dialog on `low` is not
+carried over to a client that asks for `high` (that compaction runs on `high` and the history is
+written again; the reason is `lower`). A compaction with nothing to continue (the first request of a dialog, a restart whose
 stored state was not applied, another model, a history that was edited) runs on the effort the client
 sent, and the label shows why it was dear: `cache.compaction_restart` names the reason (`no_branch`,
-`history`, `effort`, or `scope` with `differs`: `conversation`, `provider` for a model or account,
+`history`, `effort`, `lower`, or `scope` with `differs`: `conversation`, `provider` for a model or account,
 `head`, `tools`, `tool_choice`). A restart alone does not lose the branch: with stored conversations on
 (the default) the relay reads the dialog's file before it asks, so a compaction that comes first after a
 restart still continues the signed history (README, "Состояние диалогов после перезапуска"). It starts

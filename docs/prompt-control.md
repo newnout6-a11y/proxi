@@ -367,7 +367,7 @@ You are a coding assistant working in the user's project. Follow the user's inst
 - **Недопустимый effort.** Если effort профиля недопустим для модели запроса, запрос получает `400` с `param: "profiles.<имя>.generation.effort"` до обращения к Retool (текст ошибки называет профиль и причину).
 - **Verbosity.** Если у модели нет такого уровня verbosity, значение профиля не применяется: запрос идёт, а предупреждение `generation.verbosity … not applied` попадает в `warnings` события `prompt.plan` и в «что увидела модель».
 - **Журнал.** В `turn.begin` `requested_effort` остаётся тем, что прислал клиент, а effort профиля помечен `effort_source: "profile"` (`effort_resolution: "profile"`; если у модели нет выбираемого effort — `provider_managed`). Текст события говорит: «effort профиля «имя», клиент просил …».
-- **Порядок.** Effort запроса — клиент, затем профиль. Сжатие истории клиентом идёт ещё и после них: оно запускается на effort диалога (`effort_source: "dialog"`, `effort_resolution: "cache_continuity"`), если так продолжается подписанная ветка, и тогда effort профиля уступает effort диалога ([README](../README.md#ограничения-важно), пункт про сжатие).
+- **Порядок.** Effort запроса — клиент, затем профиль. Сжатие истории клиентом идёт ещё и после них: оно запускается на effort диалога (`effort_source: "dialog"`, `effort_resolution: "cache_continuity"`), если так продолжается подписанная ветка, и тогда effort профиля уступает effort диалога, но только когда effort диалога не ниже: relay не понижает effort ради кэша ([README](../README.md#ограничения-важно), пункт про сжатие).
 
 ## Пределы движка
 

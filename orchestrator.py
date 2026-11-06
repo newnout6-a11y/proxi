@@ -59,10 +59,17 @@ _RESTART_REASONS = {
     "no_branch": "у диалога нет подписанной ветки (первый запрос или нет сохранённого состояния)",
     "history": "сообщения запроса не продолжают ветку диалога (история изменена или заменена)",
     "effort": "effort ветки недопустим для этой модели",
+    "lower": "effort ветки ниже того, на котором пошёл бы запрос: relay не понижает effort ради кэша",
     "scope": "у запроса другие %s, чем у ветки",
 }
 _SCOPE_NAMES = {"conversation": "диалог", "provider": "модель или аккаунт", "head": "system (head)", "tools": "tools",
                 "tool_choice": "tool_choice"}
+
+
+def _below(effort, than):
+    """Whether `effort` is a lower reasoning level than `than` (False when either is not a level)."""
+    levels = model_catalog.EFFORT_ORDER
+    return effort in levels and than in levels and levels.index(effort) < levels.index(than)
 
 
 def _b(text: str) -> int:
@@ -435,9 +442,10 @@ class TurnRunner:
     def _dialog_effort(self, parsed, head, choice, exclude):
         """(the effort of the dialog, why the history restarts anyway) for a compaction.
 
-        The first is the effort of the dialog when asking for it makes the signed history of the dialog resume, else None
+        The first is the effort of the dialog when asking for it makes the signed history of the dialog resume and it is
+        not lower than the effort the request would run on (the relay never lowers an effort to save a cache), else None
         to leave the client's own effort alone. The second is None, or, when the request does not continue the dialog's
-        signed history on any effort, what to tell the journal: {"reason": "no_branch" | "history" | "effort"} or
+        signed history on any effort, what to tell the journal: {"reason": "no_branch" | "history" | "effort" | "lower"} or
         {"reason": "scope", "differs": [...]} naming what differs from the newest branch (the parts of native_scope).
 
         A signed branch is made under one reasoning effort and continues only a request that asks for that one: with
@@ -475,7 +483,7 @@ class TurnRunner:
                 provider["providerResourceName"] = resource
             return direct.native_scope(key, provider, head or "", tools, choice)
 
-        refused = False
+        refused = lowered = False
         defaults = native_history.tool_defaults(parsed.tools)
         for effort in dict.fromkeys(direct.scope_effort(branch.scope) for branch in reversed(list(history.branches))):
             if effort is None:
@@ -485,6 +493,11 @@ class TurnRunner:
                 continue
             if effort == wanted:
                 return None, None  # the request resumes as it is
+            if _below(effort, wanted):
+                # The relay never lowers an effort to keep a cache: the dialog's is taken only when it is not below the
+                # one the request would run on. The history restarts and is written again, at the effort that was asked.
+                lowered = True
+                continue
             try:
                 _, resolved = model_catalog.resolve_tolerant(
                     parsed.model, effort, strict=self.cfg.get("strict_models", True), default_model=self.cfg.get("model"),
@@ -506,7 +519,7 @@ class TurnRunner:
             return None, {"reason": "scope", "differs": differs}
         if history.resume(newest.scope, client, defaults)[0] is None:
             return None, {"reason": "history"}
-        return None, ({"reason": "effort"} if refused else None)
+        return None, ({"reason": "lower"} if lowered else {"reason": "effort"} if refused else None)
 
     def _check_prompt(self, prompt):
         limit = int(self.cfg.get("max_prompt_bytes", 0) or 0)

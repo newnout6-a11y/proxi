@@ -63,7 +63,7 @@
   "prompts_file_note": "файл профилей и правил промпта (docs/prompt-control.md): пусто — prompts.json рядом с config.json, относительный путь считается от папки config.json. Нет файла — relay работает как раньше. Файл читается без перезапуска. Тексты {\"file\": ...} читаются только из папки prompts/ рядом с файлом (.md, .txt); регулярным выражениям нужен пакет regex (его ставит requirements.txt).",
   "allow_effort_downgrade": false,
   "compaction_keep_effort": true,
-  "compaction_keep_effort_note": "сжатие истории клиентом (OpenCode, Claude Code) идёт на effort диалога, а не на том, что прислал агент сжатия: смена effort сбрасывает подписанную историю и кэш сообщений, и весь диалог пишется заново. false оставляет effort клиента",
+  "compaction_keep_effort_note": "сжатие истории клиентом (OpenCode, Claude Code) идёт на effort диалога, а не на том, что прислал агент сжатия: смена effort сбрасывает подписанную историю и кэш сообщений, и весь диалог пишется заново. Effort диалога берётся, только если он не ниже effort запроса: relay никогда не понижает effort ради кэша. false оставляет effort клиента",
   "exec_policy": "allowlist",
   "exec_policy_note": "allowlist режет команду по \\n и \\u0026\\u0026 || | ; \\u0026 вне кавычек; тело powershell/cmd после -Command/-c проверяется рекурсивно",
   "exec_allowlist": [
