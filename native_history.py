@@ -380,12 +380,25 @@ class Snapshot:
     restored: bool = False
 
 
+LIVE_BRANCHES = 8
+# The turns a user can take back and still continue: the newest final answers whose conversation went on.
+REWIND_POINTS = 3
+
+
 class History:
     """Bounded live branches; sequential tool turns replace their parent snapshot.
+
+    A final answer (a reply without a tool call) is kept when the next turn continues it, for REWIND_POINTS turns: it is
+    where a client's undo goes back to (OpenCode's /undo and Revert, Claude Code's /rewind and double Esc, Codex's
+    double Esc, Claude Desktop's edit and retry). The request after an undo is the conversation up to the end of an
+    earlier turn plus a new message; with the final answer of that turn gone, it was sent cold, every message written
+    to the cache again (30 credits at 300k tokens) though the provider still held the prefix it had cached minutes
+    before. Points give way to other branches when the live bound is reached.
 
     `revision` counts the recorded snapshots: the stored copy of a conversation is rewritten when it moves."""
     def __init__(self):
         self.branches = []
+        self.points = []
         self.revision = 0
 
     def resume(self, scope, client, defaults=None):
@@ -403,9 +416,21 @@ class History:
         return None, None
 
     def record(self, scope, client, messages, blocks, expected, parent=None):
-        self.branches = [s for s in self.branches if s is not parent]
+        points = [p for p in getattr(self, "points", []) if p is not parent and any(p is s for s in self.branches)]
+        if parent is not None and any(parent is s for s in self.branches) and _final_answer(parent):
+            points.append(parent)
+        else:
+            self.branches = [s for s in self.branches if s is not parent]
+        while len(points) > REWIND_POINTS:
+            oldest = points.pop(0)
+            self.branches = [s for s in self.branches if s is not oldest]
         self.branches.append(Snapshot(scope, copy.deepcopy(client), messages, blocks, expected))
-        self.branches = self.branches[-8:]
+        while len(self.branches) > LIVE_BRANCHES:
+            # Other branches (a fork, a subagent on the same key, the chat beside a compaction) outrank a rewind point.
+            victim = next((s for s in self.branches[:-1] if any(s is p for p in points)), self.branches[0])
+            self.branches = [s for s in self.branches if s is not victim]
+            points = [p for p in points if p is not victim]
+        self.points = points
         self.revision += 1
 
     def mismatch(self, scope, client, defaults=None):
@@ -429,6 +454,11 @@ class History:
 
 
 _MISSING = object()
+
+
+def _final_answer(snapshot):
+    """True for a kept reply that called no tool: the end of a turn, where a client's undo can go back to."""
+    return not any(isinstance(block, dict) and block.get("type") == "tool_call" for block in snapshot.assistant or ())
 
 
 def transient(message):

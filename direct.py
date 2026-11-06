@@ -1429,10 +1429,12 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools)
         body["rit"] = make_rit(body["messages"], tools)
         reminders = native_history.dropped(parent, client, messages)
+        # A turn the client took back (an undo, an edit, a retry) continues the final answer of the turn before it.
+        rewound = parent is not history.branches[-1] and any(parent is p for p in getattr(history, "points", ()))
         journal.emit("native_history.resume", "Сохранённые assistant/thinking blocks возвращены upstream", "info",
                      blocks=len(parent.assistant), messages=len(body["messages"]),
                      signatures=sum(b["type"] == "thinking" for b in parent.assistant),
-                     **({"reminders_kept": reminders} if reminders else {}))
+                     **({"reminders_kept": reminders} if reminders else {}), **({"rewound": True} if rewound else {}))
         req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
         console_log.write("[%s] [history] native continuation restored thinking=%d tool_calls=%d" % (
             req_id, sum(b["type"] in ("thinking", "redacted_thinking") for b in parent.assistant),
