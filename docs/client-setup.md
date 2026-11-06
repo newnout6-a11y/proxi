@@ -541,9 +541,9 @@ server-side Responses web search is not implemented; client function tools for
 search use the ordinary tool bridge.
 
 Codex's memory jobs ask for `gpt-6-luna`, which Retool does not serve (404 on 2026-11-06, so no memory was
-ever made). The relay answers such a request with `gpt-5.6-luna`, the same tier one generation back, at the nearest
-effort that model takes (`none` becomes `low`, `max` becomes `high`). Each one is journaled as
-`request.model_substituted` (`requested`, `served`) and carries `x-proxi-model-substituted: gpt-6-luna=gpt-5.6-luna`;
+ever made). The relay answers such a request with `gpt-6.1-terra` at the effort the client asked for (both models take
+the same levels). Each one is journaled as
+`request.model_substituted` (`requested`, `served`) and carries `x-proxi-model-substituted: gpt-6-luna=gpt-6.1-terra`;
 `/v1/models` and the Codex catalog still list only the models that are served. `models.SUBSTITUTES` is the table.
 
 `codex exec --output-schema FILE` sends the schema as Responses `text.format`

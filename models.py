@@ -240,11 +240,11 @@ _UNSUPPORTED_ROUTES = {
                                  'Retool Assist returns provider 404 not_found for this model.'),
     'gpt-6-luna': 'Unavailable on the Retool React route; Assist rejects this model.',
 }
-# A model a client names that no account serves (an unsupported route), and the nearest model the relay does serve: the
-# same tier of the generation before. Codex's memory jobs ask for gpt-6-luna by name; Retool refused it (404, request
+# A model a client names that no account serves (an unsupported route), and the model the relay serves in its place (the
+# owner's choice). Codex's memory jobs ask for gpt-6-luna by name; Retool refused it (404, request
 # 423d2c23bbc8 of 2026-11-06), so Codex never made a memory. A request for one is served by its substitute and says so in
 # the journal (request.model_substituted); /v1/models and the Codex catalog still list only what is served.
-SUBSTITUTES = {'gpt-6-luna': 'gpt-5.6-luna'}
+SUBSTITUTES = {'gpt-6-luna': 'gpt-6.1-terra'}
 _BYOK_ROUTES = {'gpt-6-astra'}
 _RETENTION_ROUTES = {'claude-fable-5'}
 _VERIFIED_ROUTES = {
@@ -866,7 +866,7 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
 
     A model that no account serves but that has a substitute (SUBSTITUTES) comes back as the substitute. Its effort
     is validated as the model the client asked for, so a level that model rejects is still a 400, and then moved to the
-    nearest level the substitute takes (gpt-6-luna takes "none" and "max", gpt-5.6-luna does not).
+    nearest level the substitute takes, when it lacks one (gpt-6-luna and gpt-6.1-terra take the same levels).
     """
     entry, level = _resolve_requested(model, effort, strict=strict, default_model=default_model,
                                       allow_downgrade=allow_downgrade)
