@@ -104,8 +104,12 @@ _RECORDED_VALUE_LIMIT = 4096
 SDK_TITLE_PREFIX = "You are naming a coding session so the user can pick it out of a long list of sessions."
 # Claude Code before 2.1.234 asked for the same title in these words.
 LEGACY_TITLE_PREFIX = "Generate a concise, sentence-case title"
+# DeepSeek Harness names a session with its own system prompt (llm-pi-ai session title job). Not recognised, the
+# request took the profile of a GLM rule (39k characters) like a chat: 0.61 credits a title instead of 0.02.
+HARNESS_TITLE_PREFIX = "Create a concise title for an AI coding-assistant session"
 _TITLE_PREFIXES = (SDK_TITLE_PREFIX, LEGACY_TITLE_PREFIX,
-                   "You write short session titles. Reply with only the tagged fields the prompt asks for.")
+                   "You write short session titles. Reply with only the tagged fields the prompt asks for.",
+                   HARNESS_TITLE_PREFIX)
 _ATTRIBUTION = "x-anthropic-billing-header:"
 # One-line identity blocks that Claude Code and the Agent SDK put before their real prompt.
 _IDENTITY = re.compile(r"You are (?:Claude Code|a Claude agent)\b[^\n]*")

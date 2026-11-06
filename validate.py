@@ -824,17 +824,22 @@ def _effort(data):
         selected.append(_opt_str(data, "effort"))
     provider_opts = data.get("providerOptions")
     openai_opts = provider_opts.get("openai") if isinstance(provider_opts, dict) else None
+    # Containers a client copies its model or variant settings into. OpenCode CLI 1.x sends every key of a variant as a
+    # body field, and a title request merged two variants: reasoning_effort "high" beside settings/body "low". The
+    # request then failed as a conflict and no session ever got a title. The fields of the dialect itself decide; the
+    # containers count only when the request has none of them.
+    nested = []
     for container in (data.get("settings"), data.get("options"), data.get("body"),
                       data.get("extra_body"), openai_opts):
         if isinstance(container, dict):
             if container.get("reasoning_effort") is not None:
-                selected.append(_opt_str(container, "reasoning_effort"))
+                nested.append(_opt_str(container, "reasoning_effort"))
             if container.get("reasoningEffort") is not None:
-                selected.append(_opt_str(container, "reasoningEffort"))
+                nested.append(_opt_str(container, "reasoningEffort"))
             if container.get("effort") is not None:
-                selected.append(_opt_str(container, "effort"))
+                nested.append(_opt_str(container, "effort"))
             if isinstance(container.get("reasoning"), dict) and container["reasoning"].get("effort") is not None:
-                selected.append(_opt_str(container["reasoning"], "effort"))
+                nested.append(_opt_str(container["reasoning"], "effort"))
     reasoning = data.get("reasoning")
     if reasoning is not None and not isinstance(reasoning, dict):
         raise unprocessable("'reasoning' must be an object", param="reasoning")
@@ -862,7 +867,7 @@ def _effort(data):
             if isinstance(kind, str) and kind.lower() in ("disabled", "adaptive"):
                 raise unprocessable("budget_tokens requires enabled thinking", param="thinking.budget_tokens")
             selected.append(model_catalog.effort_from_budget(thinking["budget_tokens"]))
-    selected = [value.lower() for value in selected]
+    selected = [value.lower() for value in (selected or nested)]
     # Codex's Ultra is maximum reasoning plus delegation it runs itself; it sends max for it, and a client that sends
     # the name instead means the same effort (openai/codex df1199f: "the inference backend expects max").
     selected = ["max" if value == "ultra" else value for value in selected]
