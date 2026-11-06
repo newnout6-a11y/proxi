@@ -579,7 +579,12 @@ def _tools(data):
                                 param=where + ".function.name")
         if any(item["function"]["name"] == name for item in result):
             raise unprocessable(f"duplicate tool name '{name}'", param=where + ".name")
-        parameters = fn.get("parameters", fn.get("input_schema", {}))
+        parameters = fn.get("parameters")
+        if parameters is None:
+            # Responses writes a tool without parameters as null (FunctionTool.parameters is nullable)
+            parameters = fn.get("input_schema")
+        if parameters is None:
+            parameters = {}
         if kind == "custom":
             parameters = {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}
         if not isinstance(parameters, dict):
