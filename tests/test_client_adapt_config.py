@@ -38,7 +38,7 @@ def test_the_example_config_shows_the_defaults_and_names_what_the_options_are_fo
     from pathlib import Path
     example = json.loads((Path(__file__).resolve().parents[1] / "config.example.json").read_text(encoding="utf-8"))
     for key in ("infer_conversations", "stabilize_client_prompts", "stable_prompt_date", "tool_union_clients", "tool_union_ttl",
-                "claude_tool_search", "effort_caps"):
+                "claude_tool_search"):
         assert example[key] == config.DEFAULTS[key], key
         assert key in example["client_adaptation_note"], key
 

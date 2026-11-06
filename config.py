@@ -100,11 +100,6 @@ DEFAULTS = {
     # tool search with a 400, which makes Claude Code send it again with every tool loaded up front; "native" serves
     # the deferral as the client sends it.
     "claude_tool_search": "eager",
-    # Per client and model: the highest reasoning effort a request may use, whatever the client asks for. Claude at "max" thinks
-    # 15-66 s on a trivial step through Codex (a GPT model stays at ~3 s), and the cap is the only way to lower that without
-    # changing the effort inside a conversation, which resets its history. [] = the client's effort is used as it is. A rule is
-    # {"client": "codex", "model": "claude-*", "max": "high"} (client and model are globs, the first matching rule applies).
-    "effort_caps": [],
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
     "transport": "direct",
     "direct_cache": True,
@@ -447,21 +442,6 @@ def _whole_number(value):
     return None
 
 
-def _check_effort_caps(rules):
-    """effort_caps: a list of {"client": glob, "model": glob, "max": effort level}; client and model default to "*"."""
-    if not isinstance(rules, list):
-        raise service_unavailable("effort_caps must be a list of rules {\"client\": ..., \"model\": ..., \"max\": ...}")
-    for number, rule in enumerate(rules):
-        where = "effort_caps[%d]" % number
-        if not isinstance(rule, dict) or set(rule) - {"client", "model", "max"}:
-            raise service_unavailable(f"{where} must be an object with the keys client, model and max")
-        for key in ("client", "model"):
-            if not isinstance(rule.setdefault(key, "*"), str) or not rule[key].strip():
-                raise service_unavailable(f"{where}.{key} must be a glob string (default \"*\")")
-        if rule.get("max") not in models.EFFORT_ORDER:
-            raise service_unavailable(f"{where}.max must be one of: {', '.join(models.EFFORT_ORDER)}")
-
-
 def _check_pool_fields(record, name):
     """Admin pool controls: enabled (bool), priority (0..99, lower first), label (short text)."""
     if "enabled" in record and type(record["enabled"]) is not bool:
@@ -562,7 +542,6 @@ def _load(path):
         raise service_unavailable("tool_union_ttl must be a positive whole number of seconds")
     if cfg["claude_tool_search"] not in ("eager", "native"):
         raise service_unavailable("claude_tool_search must be \"eager\" or \"native\"")
-    _check_effort_caps(cfg["effort_caps"])
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
                 "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
                 "trace_max_folders"):

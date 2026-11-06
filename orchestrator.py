@@ -961,11 +961,6 @@ class TurnRunner:
             profile_effort = getattr(parsed, "prompt_effort", None)
             asked = getattr(parsed, "requested_effort", None)
             requested_effort = asked if profile_effort else (asked or parsed.effort)
-            # An effort_caps rule lowered parsed.effort (proxy._cap_effort): what the client asked for is what was lowered, and
-            # a client that sent none was lowered from the default it would have had.
-            capped_from = None if profile_effort else getattr(parsed, "effort_capped", None)
-            if capped_from and not asked:
-                requested_effort = capped_from
             effort_source = "client"
             if requested_effort is None:
                 requested_effort = self.cfg.get("reasoning_effort") if parsed.entry.get("reasoning") else None
@@ -1001,8 +996,6 @@ class TurnRunner:
             elif effort_source == "profile":
                 effort_note = " (effort профиля «%s», клиент просил %s)" % (
                     getattr(getattr(parsed, "prompt_plan", None), "profile", None), requested_effort or "по умолчанию")
-            elif capped_from and requested_effort != effort:
-                effort_note = " (effort ограничен настройкой effort_caps, запрошен %s)" % requested_effort
             log("turn.begin", "Ход %s · effort %s · %s%s%s" % (
                     parsed.model, effort or "—", "direct" if direct_mode else "agent",
                     " · сжатие истории" if task == client_context.COMPACTION else "", effort_note),
@@ -1012,7 +1005,6 @@ class TurnRunner:
                 effort_resolution=("cache_continuity" if kept else
                                    "provider_managed" if effort_source == "profile" and effort is None else
                                    "profile" if effort_source == "profile" else
-                                   "capped" if capped_from and requested_effort != effort else
                                    "model_default" if requested_effort in (None, "auto") else
                                    "provider_managed" if effort is None else
                                    "exact" if requested_effort == effort else "compatibility"),

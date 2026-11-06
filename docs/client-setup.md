@@ -624,30 +624,11 @@ matter is Claude: at the user's global `model_reasoning_effort = "max"` claude-o
 8 493 tokens on "call list_projects twice", 7.4 s at low; sonnet 21.4 and 39.0 s), where gpt-6.1-sol stays at about 3 s. On
 Claude Code the same model took 23 s on a realistic task at high and 130 s at max (thinking 105 s, 13.5k tokens, 8.2 credits).
 
-What the relay can and cannot do about it:
-
-- **The catalog cannot.** Codex sends an explicit effort whatever the model catalog lists (the catalog's `supported_reasoning_levels`
-  fill the picker, they do not clamp what the user set), and the catalog's `default_reasoning_level` applies only when the user has
-  set none; the relay already publishes `medium` (or `low`/`high` for a few models) as that default. With `model_reasoning_effort =
-  "max"` in `config.toml` it is never read. (Source: codex-rs `core/src/client.rs`, `protocol/src/openai_models`; `ultra` is sent as
-  `max`.)
-- **Changing the effort inside a conversation costs a rewrite.** The effort is part of the key of a signed branch and of the
-  provider's prompt, so the relay never changes it between two requests of one conversation (a change of effort is 1.2 credits
-  at 24k tokens and 31 at 330k).
-- **A cap can**, because it is a function of the client and the model alone and so holds for the whole conversation:
-  `effort_caps` in `config.json` lists rules `{"client": "codex", "model": "claude-*", "max": "high"}` (globs, case-insensitive,
-  the first matching rule applies; `client` and `model` default to `*`). It lowers the effort the client sent, or the default the
-  request would otherwise get, to the highest level of the route that does not exceed `max`; it never raises one, and an effort a
-  prompt profile sets (`generation.effort`) is the profile's own. The journal says what happened: `turn.begin` has
-  `requested_effort` (what the client asked), `effective_effort` and `effort_resolution: "capped"`. A client that switches
-  its effort in the middle of a conversation (Codex's picker) no longer resets the history of a capped model, because the relay's
-  effort does not move. The default is no rule, which is the behaviour of before.
-
-Whether to cap Claude through Codex, and at which level, is the user's decision: `max` is what the user chose for every model, and
-the cost is thinking time (and credits), not correctness. The same result is available without the relay: a Codex profile with
-`model_reasoning_effort = "high"` for the Claude models (`[profiles.claude]`, `codex -p claude`), or a prompts.json profile with
-`generation.effort` and a rule on `client: codex` and `model: claude-*`, which sets the effort for those requests (and raises a lower
-one, which a cap does not).
+The relay never lowers the effort a client asks for: that is the owner's rule. The one mapping is `xhigh` on a route that has no
+such level, which the admin settings turn into `high` or `max`. A faster Claude through Codex is a choice made in Codex: a profile
+with `model_reasoning_effort = "high"` for the Claude models (`[profiles.claude]`, `codex -p claude`), or the effort picker of
+Codex Desktop. Changing the effort inside a conversation costs a rewrite (the effort is part of the key of a signed branch and of
+the provider's prompt: 1.2 credits at 24k tokens and 31 at 330k), so it is best set before a conversation starts.
 
 ### The workspace-write sandbox on Windows
 
@@ -680,7 +661,6 @@ effective configuration (`config.toml`, or `-c tools.update_plan.enabled=true` f
 flag, and the registration reads only that setting (`core/src/tools/spec_plan.rs`, `update_plan_enabled`). A provider's catalog
 cannot enable it for its models, and a tool the relay made up would never reach Codex's plan view. It works with the
 setting: the nested `plan[]` arguments arrive intact (4 calls in the test run).
-
 ## Claude Code
 
 Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and
