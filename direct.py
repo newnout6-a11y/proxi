@@ -1963,6 +1963,16 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         session._active_direct_abort = None
 
 
+def _delta_target(event, current):
+    """The call a tool-call delta belongs to: the one it names, else the newest open one.
+
+    ReplyCapture, which records the signed history, has always read a delta's toolCallId; this read the newest open
+    call whatever the delta said, so with two calls open the client and the history disagreed about their arguments
+    (ultracode audit of the relay, G1.1). Retool tags no delta today, and then the newest open call is the one."""
+    named = event.get("toolCallId")
+    return named if isinstance(named, str) and named else current
+
+
 async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None, *, cache_scope=None):
     started = loop_now()
     think_started = None
@@ -2095,8 +2105,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 think_started = None
                 if event.get("partialSignature"):
                     yield {"type": "thinking_signature", "signature": event["partialSignature"]}
-            elif block == "tool_call" and current in calls:
-                call = calls[current]
+            elif block == "tool_call" and (target := _delta_target(event, current)) in calls:
+                call = calls[target]
                 piece = event.get("partialInputs") or ""
                 call["args"].append(piece)
                 emitted = call["stream"].feed(piece)
