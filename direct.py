@@ -1083,6 +1083,17 @@ def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen):
             "content" if usable else "thinking_only" if thinking_seen else "empty")
 
 
+def _hit_the_cap(body, flags):
+    """True when the attempt ended on exactly the output cap its request carried and holds no whole tool call.
+
+    GPT and GLM keep the cap and report the tokens they wrote: 60 of 60, 150 of 150, 300 of 300 and 400 of 400 in probes
+    through the relay (2026-11-06). Claude's route ignores it (the same caps of 16, 64 and 300 gave 750 to 980 tokens), so
+    its replies never end on the cap, and a reply that happens to is not taken for a cut here; a whole tool call in the
+    reply says that the end was no cut either."""
+    cap, written = body.get("maxCompletionTokens"), (flags.get("last_usage") or {}).get("outputTokens")
+    return (type(cap) is int and type(written) in (int, float) and written == cap and not flags.get("whole_calls"))
+
+
 def _rewrite_of(usage):
     """The size of a rewrite when a ping wrote the cached prefix again instead of reading it, else None."""
     if not isinstance(usage, dict):
@@ -1470,7 +1481,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         session._turn_final = ended == "stop" and not asked_tool and not getattr(session, "_cancelled", False)
         # The consumer may drop the generator right after an error event (a cut stream): that is not a cancel.
         stopped_early = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) and not errored
-        outcome = "truncated" if errored else attempt_outcome(
+        # A reply the cap or a cut cut short is no answer to keep warm, whatever it holds.
+        outcome = "truncated" if errored or ended == "length" else attempt_outcome(
             cancelled=bool(getattr(session, "_cancelled", False)) or ended == "cancelled" or stopped_early,
             failed=failure is not None, ended=ended is not None, usable=wrote_text or asked_tool,
             thinking_seen=thinking_seen)
@@ -1512,7 +1524,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     def note(event):
         nonlocal asked_tool, ended, wrote_text, thinking_seen, errored
         kind = event.get("type")
-        if kind == "tool_call" and not event.get("partial"):
+        if kind == "tool_call" and not event.get("partial") and not event.get("invalid"):
             asked_tool = True
         elif kind == "end":
             ended = event.get("reason")
@@ -1928,10 +1940,16 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 # An empty/no-telemetry attempt can still have been billed. Keep
                 # its unknown price visible when a later retry reports a cost.
                 yield {'type': 'usage', 'usage': {}}
-            if not usable and saw_end:
+            # Where the route keeps the cap, a reply that ends on exactly that many output tokens was cut by it (GPT and
+            # GLM, 5 of 5 probes; Claude's route ignores it and writes on). A whole call in the reply says the end was
+            # no cut. A reasoning model that spends a small cap on reasoning ends so, with nothing to show for it:
+            # asking again pays the same cap for the same nothing (two paid attempts, then a 502).
+            capped = _hit_the_cap(body, flags)
+            cut = bool(flags.get("cut_calls"))
+            if not usable and saw_end and not capped:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if (usable or not saw_end or service_request or not budget.remaining
-                    or empty_retries >= max_empty_retries):
+                    or empty_retries >= max_empty_retries or capped):
                 # This attempt is the final one: whatever it produced is the answer.
                 for pending in held:
                     yield pending
@@ -1955,13 +1973,23 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             yield {"type": "error", "error": budget.attach(apierr.upstream_error(
                 "upstream stream ended without end_of_stream; the response may be incomplete"))}
             return
+        # The reply is cut: by the cap, or inside a tool call. It is told as such (max_tokens, length, incomplete) and
+        # never recorded as a branch to continue, nor taken for a whole answer.
+        truncated = (capped or cut) and not is_cancelled()
         blocks = flags.get("assistant_blocks")
-        if usable and blocks and not is_cancelled():
+        if usable and blocks and not is_cancelled() and not truncated:
             session._direct_reply = (blocks, native_history.echo(blocks, param_types or {}, coerce_arguments))
-        elif usable and "assistant_blocks" in flags and blocks is None and not is_cancelled():
+        elif usable and "assistant_blocks" in flags and blocks is None and not is_cancelled() and not truncated:
             journal.emit("native_history.unavailable", "Ответ upstream нельзя сохранить для нативного продолжения",
                          "warn", reason="unsupported_or_incomplete_blocks")
-        yield {"type": "end", "reason": "stop"}
+        if truncated:
+            journal.emit("upstream.truncated", "Ответ upstream оборван: %s" % (
+                            "вызов инструмента не дописан" if cut else "потрачен весь лимит вывода"), "warn",
+                         model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
+                         cap=body.get("maxCompletionTokens"), cut_calls=flags.get("cut_calls", 0),
+                         output_tokens=(flags.get("last_usage") or {}).get("outputTokens"),
+                         empty=not usable, effort=body.get("reasoningEffort"))
+        yield {"type": "end", "reason": "length" if truncated else "stop"}
     finally:
         session._active_direct_abort = None
 
@@ -1992,14 +2020,24 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         if call is None:
             return None
         streamed = call["out"] + call["stream"].finish()
-        raw = "".join(call["args"])
-        # The streamed text is already coerced; fall back for non-JSON or empty input.
+        event = {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": streamed}
         try:
             json.loads(streamed)
-            final = streamed
+            flags["whole_calls"] = flags.get("whole_calls", 0) + 1
         except ValueError:
-            final = coerce_arguments(raw, (param_types or {}).get(call["name"]))
-        return {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": final}
+            if "".join(call["args"]).strip():
+                # Arguments that are not JSON at the end: the output stopped inside the call (the cap, a cut). The
+                # text is what the client has seen so far and stays that, so that its deltas always add up: this was
+                # rebuilt from the raw arguments before, which differ from the streamed text wherever a number or a
+                # boolean had been written as a string, and the client got both one after the other (ultracode
+                # audit, C13). The event says the call is not whole and no adapter reports it as finished (C5).
+                event["invalid"] = True
+                flags["cut_calls"] = flags.get("cut_calls", 0) + 1
+            else:
+                # A call without arguments arrives as one empty partialInputs.
+                event["arguments"] = "{}"
+                flags["whole_calls"] = flags.get("whole_calls", 0) + 1
+        return event
     while True:
         if session._cancelled:
             yield {"type": "end", "reason": "cancelled"}

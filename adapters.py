@@ -14,7 +14,10 @@ def approx_tokens(text: str) -> int:
     return max(0, len(text or "") // 4)
 
 
-FINISH_MAP = {"stop": "stop", "tool_calls": "tool_calls", "hitl": "stop", "timeout": "length", "cancelled": "stop", "max_exec": "length"}
+FINISH_MAP = {"stop": "stop", "tool_calls": "tool_calls", "hitl": "stop", "timeout": "length", "length": "length",
+              "cancelled": "stop", "max_exec": "length"}
+# The reasons a reply ends before it is whole: the turn ran out of time, or the output stopped (the cap, inside a call).
+CUT_REASONS = ("timeout", "length")
 
 
 class _Base:
@@ -190,6 +193,10 @@ class _Base:
             self.tool_calls.append(current)
         if arguments.startswith(current["arguments"]):
             delta = arguments[len(current["arguments"]):]
+        elif self.writer is not None and self._streams_arguments(current):
+            # What the client has been sent cannot be taken back, and a delta that does not continue it would break
+            # its JSON (the whole new text used to be sent after the old: C13). The call keeps the text the client has.
+            delta, arguments = "", current["arguments"]
         else:
             delta = arguments
         current["arguments"] = arguments
@@ -199,6 +206,11 @@ class _Base:
 
     def _tool_call(self, index, call, delta, new=False):
         pass
+
+    @staticmethod
+    def _streams_arguments(call):
+        """Whether the adapter sends the text of this call's arguments to the client as it arrives."""
+        return True
 
     def payload(self, reason, prompt_text=None):
         raise NotImplementedError
@@ -342,6 +354,8 @@ class ResponsesAdapter(_Base):
         self._items = []
         self._indices = {}
         self._custom_inputs = {}
+        # Whether the reply being closed was cut (CUT_REASONS): a custom call the output stopped inside has no input.
+        self._cut = False
         self._tool_definitions = {
             tool.get("function", {}).get("name"): tool.get("function", {})
             for tool in getattr(parsed, "tools", [])
@@ -426,6 +440,32 @@ class ResponsesAdapter(_Base):
             return None if not stripped or stripped.startswith("{") else arguments
         return value["input"] if isinstance(value, dict) and isinstance(value.get("input"), str) else arguments
 
+    def _whole(self, index):
+        """Whether the item at `index` is whole: a message or reasoning item always is, a call when upstream ended it."""
+        kind, _, call = self._items[index]
+        if kind not in ("function_call", "custom_tool_call"):
+            return True
+        if call.get("done"):
+            return True
+        try:
+            json.loads(call["arguments"] or "{}")
+        except ValueError:
+            return kind == "custom_tool_call" and self._custom_input(call) is not None
+        return True
+
+    def _statuses(self, reason):
+        """The status of every item of a reply that ends for `reason`.
+
+        A timeout leaves all of them incomplete. A reply the output stopped (the cap, a cut inside a call) has its last
+        item incomplete, and every call that upstream did not end: the items before them were finished."""
+        count = len(self._items)
+        if reason == "timeout":
+            return ["incomplete"] * count
+        if reason == "length":
+            return ["incomplete" if index == count - 1 or not self._whole(index) else "completed"
+                    for index in range(count)]
+        return ["completed"] * count
+
     def _item(self, index, *, started=False, status="completed"):
         kind, item_id, call = self._items[index]
         status = "in_progress" if started else status
@@ -443,7 +483,10 @@ class ResponsesAdapter(_Base):
         if kind == "custom_tool_call":
             value = "" if started else self._custom_input(call)
             if value is None:
-                raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                if not self._cut:
+                    raise apierr.upstream_error("Retool returned incomplete custom tool input")
+                # The output stopped inside the envelope: nothing of the input is final, so it is what was sent.
+                value = self._custom_inputs.get(call["id"], "")
             item["input"] = value
         else:
             item["arguments"] = "" if started else call["arguments"]
@@ -465,6 +508,12 @@ class ResponsesAdapter(_Base):
         if label and self.writer:
             self._think(label)
 
+    @staticmethod
+    def _streams_arguments(call):
+        # A custom call's input is unwrapped from its envelope and held back until that is known (_custom_streamable),
+        # so the text of its arguments never reaches the client as it is.
+        return call.get("tool_type") != "custom"
+
     def _tool_call(self, index, call, delta, new=False):
         custom = call.get("tool_type") == "custom"
         kind = "custom_tool_call" if custom else "function_call"
@@ -484,8 +533,10 @@ class ResponsesAdapter(_Base):
     def end(self, reason, prompt_text=None):
         if not self._items:
             self._ensure_item("message", self.item_id)
-        status = "incomplete" if reason == "timeout" else "completed"
+        cut = self._cut = reason in CUT_REASONS
+        statuses = self._statuses(reason)
         for index, (kind, item_id, call) in enumerate(self._items):
+            status = statuses[index]
             fields = {"item_id": item_id, "output_index": index}
             if kind == "message":
                 fields["content_index"] = 0
@@ -500,20 +551,20 @@ class ResponsesAdapter(_Base):
                     **fields, "part": {"type": "summary_text", "text": self.thinking},
                 })
             elif kind == "custom_tool_call":
-                final = self._item(index)["input"]
+                final = self._item(index, status=status)["input"]
                 sent = self._custom_inputs.get(call["id"], "")
                 if len(final) > len(sent) and final.startswith(sent):
                     # What was held back while the envelope could still change: the deltas add up to the input.
                     self._emit("response.custom_tool_call_input.delta", {**fields, "delta": final[len(sent):]})
                     self._custom_inputs[call["id"]] = final
                 self._emit("response.custom_tool_call_input.done", {**fields, "input": final})
-            else:
+            elif status == "completed" or not cut:
                 self._emit("response.function_call_arguments.done", {**fields, "arguments": call["arguments"]})
             self._emit("response.output_item.done", {
                 "output_index": index, "item": self._item(index, status=status),
             })
         final = self.payload(reason, prompt_text)
-        self._emit("response.incomplete" if reason == "timeout" else "response.completed", {"response": final})
+        self._emit("response.incomplete" if cut else "response.completed", {"response": final})
         if self.writer:
             self.writer.done()
         return final
@@ -523,11 +574,15 @@ class ResponsesAdapter(_Base):
         reasoning_details = self._reasoning_details()
         if not self._items:
             self._ensure_item("message", self.item_id)
-        status = "incomplete" if reason == "timeout" else "completed"
+        cut = self._cut = reason in CUT_REASONS
+        statuses = self._statuses(reason)
         return {"id": self.id, "object": "response", "created_at": self.created,
                 "model": self.parsed.model,
-                "status": status,
-                "output": [self._item(index, status=status) for index in range(len(self._items))],
+                "status": "incomplete" if cut else "completed",
+                # What Responses clients read as the reason of an incomplete reply (Codex stops at once, without a
+                # retry, and prints it): the output stopped at its limit. A timeout names none.
+                **({"incomplete_details": {"reason": "max_output_tokens"}} if reason == "length" else {}),
+                "output": [self._item(index, status=statuses[index]) for index in range(len(self._items))],
                 "output_text": self.text,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "total_tokens": prompt + completion,
@@ -645,7 +700,7 @@ class AnthropicAdapter(_Base):
             self._open_indices.discard(block_index)
 
     def _stop_reason(self, reason):
-        if reason == "timeout":
+        if reason in CUT_REASONS:
             return "max_tokens"
         if self.stop_sequence is not None:
             return "stop_sequence"

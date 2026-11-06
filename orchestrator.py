@@ -1204,7 +1204,10 @@ class TurnRunner:
                                         holder['_attempt_credited'] = False
                                     out.put(event)
                                 elif event["type"] == "tool_call" and event.get("name") in tool_names:
-                                    if not event.get("partial"):
+                                    # A call whose arguments stop short of valid JSON (the cap, a cut) is not a whole
+                                    # call: it is not reported as one (C5), and the turn ends as cut, not as a tool call.
+                                    complete = not event.get("partial") and not event.get("invalid")
+                                    if complete:
                                         streamed_tool_call = True
                                     definition = tool_definitions[event["name"]]
                                     call_key = event.get("id") or event["name"]
@@ -1213,15 +1216,21 @@ class TurnRunner:
                                         ms = round((tool_started[call_key] - holder["upstream_started_at"]) * 1000)
                                         log("upstream.tool_start", "Модель начала вызов %s через %d мс" % (event["name"], ms),
                                             "debug", name=event["name"], call_id=event.get("id"), ms=ms)
-                                    if not event.get("partial"):
+                                    if complete:
                                         args_ms = round((time.time() - tool_started[call_key]) * 1000)
                                         log("tool.call", "Инструмент клиента: %s (аргументы %d мс)" % (event["name"], args_ms),
                                             "info", name=event["name"], call_id=event.get("id"),
                                             arguments=_preview(event.get("arguments")), streamed=True,
                                             args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
-                                    out.put({key: value for key, value in event.items() if key != "partial"}
+                                    elif event.get("invalid"):
+                                        log("tool.call_incomplete",
+                                            "Вызов %s оборван: аргументы не дописаны до конца JSON" % event["name"], "warn",
+                                            name=event["name"], call_id=event.get("id"),
+                                            arguments=_preview(event.get("arguments")),
+                                            args_chars=len(event.get("arguments") or ""))
+                                    out.put({key: value for key, value in event.items() if key not in ("partial", "invalid")}
                                             | {"tool_type": definition.get("x-client-type", "function"),
-                                               "done": not event.get("partial")})
+                                               "done": complete})
                                 elif event["type"] == "tool_call":
                                     # A call of a tool the client did not declare (under a forced choice, of another
                                     # tool) has nothing to run it on the client and is not passed on; the journal names
@@ -1285,8 +1294,8 @@ class TurnRunner:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "cancelled"})
                         return
-                    if holder.get("reason") == "timeout":
-                        out.put({"type": "end", "reason": "timeout"})
+                    if holder.get("reason") in ("timeout", "length"):
+                        out.put({"type": "end", "reason": holder["reason"]})
                         return
 
                     native_calls = (executor.extract_tool_calls(final_text, tool_names) if tool_names else []) if not direct_mode else []
@@ -1505,7 +1514,7 @@ class TurnRunner:
             else:
                 reason = outcome["reason"] or holder.get("reason") or "stop"
             log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
-                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout") else "success",
+                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout", "length") else "success",
                 reason=reason, duration_ms=duration, exec_steps=exec_steps,
                 retries=empty_retries + tool_retries)
             out.put(None)
