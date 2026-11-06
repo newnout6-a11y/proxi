@@ -18,6 +18,21 @@ import {
 import { describeChange, describeGroup, describeReport, describeUnmatched, editTarget, groupChanges, opLabel, scopeLabel, shortList } from '../src/prompts/changes.js';
 import { fmtInt } from '../src/format.js';
 import { emptySample, newestSample, recentLabel, resolveSample } from '../src/prompts/sample.js';
+import { publishedModels } from '../src/prompts/publish.js';
+
+test('publish masks match the full model id the way the relay does: case-insensitive fnmatch', () => {
+  const catalog = ['claude-opus-5-5', 'claude-sonnet-5-5', 'zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash', 'gpt-5.5'];
+  assert.equal(publishedModels(['glm-*'], catalog).length, 0);                       // the GLM ids start with their organisation
+  assert.deepEqual(publishedModels(['*glm*'], catalog), ['zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash']);
+  assert.deepEqual(publishedModels(['ZAI-ORG/glm-5.?'], catalog), ['zai-org/GLM-5.3']);
+  assert.deepEqual(publishedModels(['claude-[os]*'], catalog), ['claude-opus-5-5', 'claude-sonnet-5-5']);
+  assert.deepEqual(publishedModels(['claude-[!o]*'], catalog), ['claude-sonnet-5-5']);
+  assert.deepEqual(publishedModels(true, catalog), catalog);
+  assert.deepEqual(publishedModels(false, catalog), []);
+  assert.deepEqual(publishedModels(['gpt-5.5'], catalog), ['gpt-5.5']);              // a dot is a dot, not any character
+  assert.deepEqual(publishedModels(['gpt-5x5'], catalog), []);
+  assert.equal(publishedModels(['*'], null), null);                                     // the catalog is not loaded yet
+});
 
 // --- template ------------------------------------------------------------------------------------------------
 

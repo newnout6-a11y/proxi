@@ -8,7 +8,7 @@ import LivePreview from './LivePreview.jsx';
 import NewProfile from './NewProfile.jsx';
 import ProfileEditor from './ProfileEditor.jsx';
 
-export default function ProfilesTab({ apiKey, doc, setDoc, builtin, selected, select, onAddRule, live, onUnauthorized }) {
+export default function ProfilesTab({ apiKey, doc, setDoc, builtin, selected, select, onAddRule, live, onUnauthorized, catalog = null }) {
   const [creating, setCreating] = useState(false);
   const root = useRef(null);
   const focusLater = useFocusLater();
@@ -70,7 +70,7 @@ export default function ProfilesTab({ apiKey, doc, setDoc, builtin, selected, se
       {!creating && !isBuiltin && current && (
         <div className="p-profile-layout">
           <section className="panel p-profile-panel" aria-label={`Профиль ${current}`}>
-            <ProfileEditor key={current} doc={doc} setDoc={setDoc} name={current} builtin={builtin} textNames={textNames}
+            <ProfileEditor key={current} doc={doc} setDoc={setDoc} name={current} builtin={builtin} textNames={textNames} catalog={catalog}
               usage={profileUsage(doc, current)} onRename={rename} onDuplicate={duplicate} onDelete={remove} onAddRule={() => onAddRule(current)} />
           </section>
           <LivePreview apiKey={apiKey} doc={doc} profile={current} {...live} onUnauthorized={onUnauthorized} />
