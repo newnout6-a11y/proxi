@@ -1866,6 +1866,8 @@ test('every control of the prompts screen has a name', async ({ page }) => {
 // The design gate looks at every tab; this looks at the states it does not reach: refused saves, banners, forms, switched-off rules.
 for (const theme of ['dark', 'light']) {
   test(`axe finds nothing in the states with errors, warnings and forms (${theme})`, async ({ page }) => {
+    // a dozen axe scans in one test: on a CI runner they take longer than the default 30 s
+    test.slow();
     await page.addInitScript((value) => localStorage.setItem('relay.admin.theme', value), theme);
     await page.setViewportSize({ width: 1280, height: 1000 });
     const { prompts } = await openPrompts(page, { errors: [{ message: 'bad file', param: 'profiles.x', ts: 1 }] });

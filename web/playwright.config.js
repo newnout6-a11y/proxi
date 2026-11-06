@@ -10,6 +10,9 @@ export default defineConfig({
   forbidOnly: Boolean(process.env.CI),
   retries: 0,
   workers: 2,
+  // On the CI runner the tests that scan the whole page (axe, the computed style of every element) take several
+  // times as long as on a workstation, past 30 s on the prompts screen
+  timeout: process.env.CI ? 60_000 : 30_000,
   reporter: 'list',
   outputDir: path.join(os.tmpdir(), 'relay-admin-playwright'),
   use: {
