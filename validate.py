@@ -14,6 +14,7 @@ import urllib.request
 
 from apierr import bad_request, unprocessable, ApiError
 import models as model_catalog
+import tool_names
 
 MAX_TOKENS_CAP = 1_000_000  # absolute ceiling when a model has no catalog value
 
@@ -473,7 +474,7 @@ def _responses_item(item):
                      if kind == "custom_tool_call" else item.get("arguments") or "")
         name = item.get("name") or "tool"
         if item.get("namespace"):
-            name = str(item["namespace"]) + "." + name
+            name = tool_names.namespaced(str(item["namespace"]), name)
         return {"role": "assistant", "content": "",
                 "tool_calls": [{"id": item.get("call_id") or item.get("id") or "call",
                                 "function": {"name": name,
@@ -482,6 +483,10 @@ def _responses_item(item):
         raise unprocessable("item_reference is not supported; send the full conversation items", param="input")
     if kind == "reasoning" and "role" not in item:
         return {"role": "assistant", "content": item.get("summary") or ""}
+    if kind == "agent_message" and "role" not in item:
+        # Codex's multi-agent v2: a message between the agents of one task (author -> recipient), such as a task or
+        # a sub-agent's final answer. Upstream has no such item; to the agent that holds it, it is a turn it received.
+        return {"role": "user", "content": item.get("content") if item.get("content") is not None else ""}
     return item
 
 
@@ -550,7 +555,7 @@ def _tools(data):
                 client_name = fn["name"]
                 fn["x-namespace"] = namespace
                 fn["x-client-name"] = client_name
-                fn["name"] = namespace + "." + client_name
+                fn["name"] = tool_names.namespaced(namespace, client_name)
                 if any(item["function"]["name"] == fn["name"] for item in result):
                     raise unprocessable(f"duplicate tool name '{fn['name']}'", param=where + ".name")
                 result.append(nested)
@@ -614,12 +619,12 @@ def _tool_choice(value):
         if choice_type in ("tool", "custom") and isinstance(value.get("name"), str):
             name = value["name"]
             if value.get("namespace"):
-                name = str(value["namespace"]) + "." + name
+                name = tool_names.namespaced(str(value["namespace"]), name)
             return {"type": "function", "function": {"name": name}}
         if choice_type == "function" and fn is None and isinstance(value.get("name"), str):
             name = value["name"]
             if value.get("namespace"):
-                name = str(value["namespace"]) + "." + name
+                name = tool_names.namespaced(str(value["namespace"]), name)
             return {"type": "function", "function": {"name": name}}
         if value.get("type") != "function" or not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
             raise unprocessable("'tool_choice' function form is invalid", param="tool_choice")
@@ -740,6 +745,12 @@ def parse_responses(data, cfg):
         messages = [{"role": "user", "content": raw_input}]
     elif isinstance(raw_input, list):
         messages = [_responses_item(item) for item in raw_input]
+        for index, message in enumerate(messages):
+            if (isinstance(message, dict) and message.get("role") is None and not message.get("tool_calls")
+                    and message.get("type") not in (None, "message")):
+                # Without this the item failed later as "messages[N].role must be a string", which names no type.
+                raise unprocessable("input[%d]: input items of type %r are not supported by the Retool route"
+                                    % (index, message.get("type")), param="input[%d].type" % index)
     elif raw_input is None:
         raise bad_request("'input' is required", param="input")
     else:
@@ -850,6 +861,9 @@ def _effort(data):
                 raise unprocessable("budget_tokens requires enabled thinking", param="thinking.budget_tokens")
             selected.append(model_catalog.effort_from_budget(thinking["budget_tokens"]))
     selected = [value.lower() for value in selected]
+    # Codex's Ultra is maximum reasoning plus delegation it runs itself; it sends max for it, and a client that sends
+    # the name instead means the same effort (openai/codex df1199f: "the inference backend expects max").
+    selected = ["max" if value == "ultra" else value for value in selected]
     if len(set(selected)) > 1:
         raise unprocessable("conflicting reasoning effort controls", param="reasoning_effort")
     # Current Claude clients can place effort updates in system entries, including
@@ -872,6 +886,7 @@ def _effort(data):
                                     param=f'messages[{index}].output_config')
             if output.get('effort') is not None:
                 latest = _opt_str(output, 'effort').lower()
+                latest = 'max' if latest == 'ultra' else latest
     if latest is not None and isinstance(thinking, dict):
         kind = thinking.get('type')
         explicit = thinking.get('effort')

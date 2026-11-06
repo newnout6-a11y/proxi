@@ -8,6 +8,7 @@ import time
 import uuid
 
 from redact import redact
+import tool_names
 
 EXEC_REGEX = re.compile(r"<exec_command>(.*?)</exec_command>", re.DOTALL | re.IGNORECASE)
 TOOL_REGEX = re.compile(r"<tool_call\b([^>]*)>(.*?)</tool_call>",
@@ -130,13 +131,22 @@ def extract_tool_call(text: str, allowed=None):
     if not isinstance(name, str) or not name.strip():
         return None
     name = name.strip()
-    if (isinstance(value.get("namespace"), str) and value["namespace"]
-            and not name.startswith(value["namespace"] + ".")):
-        name = value["namespace"] + "." + name
+    namespace = value.get("namespace")
+    if isinstance(namespace, str) and namespace:
+        if name.startswith(namespace + "."):
+            name = name[len(namespace) + 1:]
+        if not name.startswith(tool_names.namespaced(namespace, "")):
+            name = tool_names.namespaced(namespace, name)
+    if allowed and name not in allowed and "." in name:
+        # The dotted form of a namespaced tool ("mcp__exa.web_search_exa") is the one the model reads in the schema
+        head, _, tail = name.partition(".")
+        if tool_names.namespaced(head, tail) in allowed:
+            name = tool_names.namespaced(head, tail)
     if allowed and name not in allowed:
         # Models may use the short function name from a namespace schema.
         # Restore the namespace only when it is unambiguous.
-        matches = [candidate for candidate in allowed if candidate.endswith("." + name)]
+        matches = [candidate for candidate in allowed
+                   if candidate.endswith("." + name) or candidate.endswith(tool_names.SEPARATOR + name)]
         if len(matches) == 1:
             name = matches[0]
     if allowed and name not in allowed:

@@ -62,6 +62,7 @@ EXPECTED_ANTHROPIC_TYPE = {
     'unsupported_media_type': 'invalid_request_error', 'method_not_allowed': 'invalid_request_error',
     'unauthorized': 'authentication_error', 'forbidden': 'permission_error', 'not_found_error': 'not_found_error',
     'conflict': 'conflict_error', 'payload_too_large': 'request_too_large', 'prompt_too_large': 'request_too_large',
+    'context_length_exceeded': 'invalid_request_error',
     'rate_limit_error': 'rate_limit_error', 'insufficient_credits': 'billing_error',
     'service_unavailable': 'overloaded_error', 'upstream_timeout': 'timeout_error',
     'upstream_error': 'api_error', 'upstream_auth_error': 'api_error', 'upstream_invalid_output': 'api_error',

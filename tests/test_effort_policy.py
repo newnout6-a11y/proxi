@@ -22,8 +22,9 @@ CFG = {"strict_models": True, "model": "claude-opus-5-5", "show_thinking": True}
 
 
 @pytest.mark.parametrize("dialect", ["chat", "responses", "anthropic"])
-@pytest.mark.parametrize("effort", ["xhigh", "none", "extra", "ultra"])
+@pytest.mark.parametrize("effort", ["xhigh", "none", "extra"])
 def test_strict_effort_rejects_unsupported_controls(dialect, effort):
+    # ultra is not among them: it is Codex's name for max with delegation (tests/test_codex_ultra.py)
     with pytest.raises(ApiError) as caught:
         getattr(validate, "parse_" + dialect)(body(dialect, effort), CFG)
     assert caught.value.status == 400
