@@ -14,6 +14,19 @@ KEY = "test-key-123"
 
 
 @pytest.fixture(autouse=True)
+def no_rate_limit_pauses(monkeypatch):
+    """The transport waits seconds before it asks again after Retool's 429 (direct.RATE_LIMIT_WAITS); a test must not.
+
+    test_rate_limit_retry.py records the pauses itself and has a test of the real wait."""
+    import direct
+
+    async def at_once(seconds, is_cancelled):
+        return not is_cancelled()
+
+    monkeypatch.setattr(direct, "_pause", at_once)
+
+
+@pytest.fixture(autouse=True)
 def pinned_calendar(monkeypatch):
     """Anthropic's retirement dates hide models by the calendar (models._today).
 

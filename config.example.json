@@ -14,6 +14,8 @@
   "client_trace_dir": "",
   "upstream_trace_dir": "",
   "upstream_empty_retries": 1,
+  "upstream_rate_limit_retries": 3,
+  "upstream_rate_limit_retries_note": "Retool отвечает 429 «Retool models are rate limited right now, try again shortly» до того, как начал генерацию: тот же запрос уходит снова на том же аккаунте (смена аккаунта переписала бы кэш диалога) через паузы около 2, 4 и 8 с, в пределах 5 POST на шаг. Это бесплатно. 0 — отдать 429 клиенту сразу, максимум 4",
   "upstream_empty_retries_note": "доп. одинаковые платные POST после пустого/thinking_only ответа (1 = всего 2 POST, 0 выключает); не больше 5 POST на шаг",
   "upstream_error_max_dumps": 50,
   "upstream_attempt_summaries_max": 200,

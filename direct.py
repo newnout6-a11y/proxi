@@ -14,6 +14,7 @@ import http.client
 import json
 import math
 import pathlib
+import random
 import re
 import socket
 import threading
@@ -48,6 +49,32 @@ def _int_setting(cfg, key, default):
         return max(0, int(cfg.get(key, default)))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+# Retool's "Retool models are rate limited right now. Please try again shortly." (HTTP 429, or an error event inside a 200): a
+# limit of the moment on the models, not the account's hourly quota (that one parks the account: apierr.is_account_quota).
+# The request is refused before anything is generated, so asking again on the same account costs nothing, and moving to
+# another account would start the conversation's history and cache from nothing (79,000 tokens in one measured case).
+# These are the pauses before the 1st, 2nd and 3rd retry, on top of the 0.5, 1 and 2 seconds that AttemptBudget.take
+# adds before any further POST of a step.
+RATE_LIMIT_WAITS = (1.5, 3.0, 6.0)
+
+
+def _refused_for_now(error):
+    return (isinstance(error, apierr.ApiError) and error.status == 429 and error.code == "rate_limit_error"
+            and not apierr.is_account_quota(error))
+
+
+async def _pause(seconds, is_cancelled):
+    """Wait `seconds` in short slices; False when the request was cancelled meanwhile."""
+    deadline = loop_now() + seconds
+    while loop_now() < deadline:
+        if is_cancelled():
+            return False
+        await asyncio.sleep(min(0.25, max(0.0, deadline - loop_now())))
+    return not is_cancelled()
+
+
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku", 'gpt-4.1',
                 'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2'}
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
@@ -1898,9 +1925,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     try:
         max_empty_retries = _int_setting(cfg, "upstream_empty_retries", 1)
         empty_retries = 0
+        max_limit_retries = _int_setting(cfg, "upstream_rate_limit_retries", 3)
+        limit_retries = 0
         while True:
             usable = False
             thinking_seen = False
+            spoke = False  # whether this attempt gave the consumer anything but billing and display status
             # Events of an attempt are held back until it proves usable, so a retried
             # attempt can never leak thinking blocks, signatures or blank text.
             held = []
@@ -1933,8 +1963,10 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         for pending in held:
                             yield pending
                         held.clear()
+                        spoke = True
                         yield event
                     elif kind in _LIVE_EVENTS or not may_retry:
+                        spoke = spoke or kind not in _LIVE_EVENTS
                         yield event
                     else:
                         held.append(event)
@@ -1950,6 +1982,8 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 # Without a status the request may still be in flight, unless it provably never left.
                 possibly_billed = (current_trace is not None and (
                     200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
+                if _refused_for_now(failure) and not flags.get("usage_seen"):
+                    possibly_billed = False  # refused before anything was generated: it cost nothing, as an HTTP 429 never does
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
                     flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
@@ -1972,6 +2006,23 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             if flags.get('cost_unknown') and not flags.get('usage_seen'):
                 # Include possibly billed failures/truncations before failover.
                 yield {'type': 'usage', 'usage': {}}
+            if (_refused_for_now(failure) and not spoke and not usable and limit_retries < max_limit_retries
+                    and budget.remaining and not is_cancelled()):
+                wait = RATE_LIMIT_WAITS[min(limit_retries, len(RATE_LIMIT_WAITS) - 1)] * random.uniform(0.75, 1.25)
+                limit_retries += 1
+                journal.emit("upstream.rate_limited",
+                             "Retool ограничил частоту запросов к моделям (429): повтор на том же аккаунте через %.1f с "
+                             "(%d из %d)" % (wait, limit_retries, max_limit_retries), "warn", model=body.get("model"),
+                             attempt=budget.used, wait=round(wait, 2), retry=limit_retries, retries=max_limit_retries,
+                             account=account_tag(getattr(session, "backend", None)),
+                             thread=journal.tag(getattr(session, "thread_id", None)))
+                if not await _pause(wait, is_cancelled):
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                text.clear()
+                thinking.clear()
+                holder["response"] = None
+                continue
             if failure is not None:
                 raise failure
             saw_end = bool(flags.get("end"))

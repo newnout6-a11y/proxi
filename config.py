@@ -117,6 +117,10 @@ DEFAULTS = {
     "direct_cache": True,
     "upstream_trace_dir": "",  # explicit private raw request/response traces; disabled by default
     "upstream_empty_retries": 1,           # extra identical POSTs after an empty/thinking-only answer (paid)
+    # Retool answers "models are rate limited right now, try again shortly" (429) before it generates anything: the same body is
+    # sent again on the same account after a short pause (about 2, 4 and 8 s in all), inside the 5-POST budget of a step. Free,
+    # so it is not counted as paid; 0 passes the 429 on to the client at once.
+    "upstream_rate_limit_retries": 3,
     "upstream_error_max_dumps": 50,        # newest private request-body dump sets kept; 0 = unlimited
     "upstream_attempt_summaries_max": 200,  # newest per-attempt *-response.json kept; 0 = unlimited
     "client_trace_dir": "",    # explicit private client request/response traces; disabled by default
@@ -537,7 +541,8 @@ def _load(path):
                     "cache_keepwarm_subagent_idle",
                     "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
                     "account_rate_limit_cooldown",
-                    "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
+                    "upstream_empty_retries", "upstream_rate_limit_retries", "upstream_error_max_dumps",
+                    "upstream_attempt_summaries_max",
                     "trace_max_folders", "conversation_state_max_conversations", "conversation_state_ttl",
                     "conversation_state_max_file_bytes", "conversation_state_max_total_bytes"):
         try:
@@ -581,6 +586,9 @@ def _load(path):
                 "trace_max_folders"):
         if cfg[key] < 0:
             raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
+    if not 0 <= cfg["upstream_rate_limit_retries"] <= 4:
+        raise service_unavailable("upstream_rate_limit_retries must be from 0 (pass a 429 on at once) to 4: a step has "
+                                  "at most 5 POSTs")
     if cfg["cache_keepwarm_subagent_idle"] < 0:
         raise service_unavailable("cache_keepwarm_subagent_idle must be non-negative (0 = no idle warming for subagents)")
     for key in ("turn_timeout", "recv_timeout", "upstream_timeout", "command_timeout", "max_workers",
