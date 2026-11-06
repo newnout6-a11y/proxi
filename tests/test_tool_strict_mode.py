@@ -31,6 +31,9 @@ def test_explicit_tool_strict_mode_survives_normalization_and_upstream_translati
     assert body == original
 
 
-def test_unspecified_strict_mode_preserves_the_existing_retool_default():
+def test_unspecified_strict_mode_is_not_strict():
+    # Retool's strict mode makes every parameter required: a live probe (2026-11-06, claude-haiku-4-5, one required and
+    # three optional fields) got {"fruit": "apple", "count": 0, "mode": "fast", "note": ""} with strict and
+    # {"fruit": "apple"} without. No client asks for it, and Anthropic and Chat Completions do not default to it.
     tools = [{'type': 'function', 'function': {'name': 'read', 'parameters': {'type': 'object'}}}]
-    assert direct.tools_to_retool(tools)[0]['strict'] is True
+    assert direct.tools_to_retool(tools)[0]['strict'] is False
