@@ -381,11 +381,8 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
             call_id = message.get("tool_call_id") or message.get("call_id") or name
             convo_text = f"[tool result {name} id={call_id}]: {text}".strip()
             if images:
-                blocks = []
-                if text:
-                    blocks.append({"type": "text", "text": convo_text})
-                blocks.extend(images)
-                convo.append(blocks)
+                # The label stays when the result is nothing but the picture: it says which call the picture answers.
+                convo.append([{"type": "text", "text": convo_text}, *images])
             else:
                 convo.append(convo_text)
             continue
