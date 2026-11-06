@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import contextvars
 import decimal
+import functools
 import hashlib
 import http.client
 import json
@@ -236,6 +237,57 @@ def _allowed_values(schema):
     return None
 
 
+_STRICT_TOOL = contextvars.ContextVar("proxi_strict_tool", default=False)
+
+
+def _allows_null(schema):
+    """True when a schema says "X or null": a union with a null branch and another, a type list that holds "null" and
+    another type, or an enum with null among other values."""
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        return "null" in kind and any(item != "null" for item in kind)
+    options = schema.get("anyOf") if isinstance(schema.get("anyOf"), list) else schema.get("oneOf")
+    if isinstance(options, list):
+        branches = [option for option in options if isinstance(option, dict)]
+        if any(option.get("type") == "null" for option in branches):
+            return any(option.get("type") != "null" for option in branches)
+    values = schema.get("enum")
+    return isinstance(values, list) and None in values and any(value is not None for value in values)
+
+
+def _with_null(schema, node):
+    """`node`, what _param_schema made of `schema`, as an anyOf that still has a null branch when the schema allows null."""
+    if not _allows_null(schema) or node.get("type") == "null":
+        return node
+    null = {"type": "null", "required": False}
+    if node.get("type") == "anyOf":
+        if any(isinstance(branch, dict) and branch.get("type") == "null" for branch in node["anyOf"]):
+            return node
+        return dict(node, anyOf=list(node["anyOf"]) + [null])
+    inner = {key: value for key, value in node.items() if key not in ("required", "description")}
+    outer = {"type": "anyOf", "anyOf": [dict(inner, required=False), null], "required": node["required"]}
+    if "description" in node:
+        outer["description"] = node["description"]
+    return outer
+
+
+def _keeps_null(convert):
+    """Declare a field that may be null as "X or null" in a strict tool, at every depth.
+
+    Retool's strict mode makes every parameter required, and a field declared as plain X left the model no way to say
+    "none": it gave a placeholder (live, 2026-11-06: max_results 10, order "desc", since "1970-01-01" for a search that
+    wanted none of them) or refused to call the tool. With the null branch, which Retool accepts, both said null
+    (ultracode audit of the relay, C7). The children of a field are converted by the same function, so one wrapper
+    covers the properties and items below it; a tool that is not strict keeps the plain type, as its optional field can
+    be left out."""
+    @functools.wraps(convert)
+    def wrapper(schema, required):
+        node = convert(schema, required)
+        return _with_null(schema, node) if _STRICT_TOOL.get() and isinstance(schema, dict) else node
+    return wrapper
+
+
+@_keeps_null
 def _param_schema(schema, required):
     """Convert one JSON-Schema property to Retool's typed param shape.
 
@@ -357,8 +409,12 @@ def tools_to_retool(tools):
         schema = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
         required = set(_required_names(schema))
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-        for name in sorted(properties.keys()):
-            params[name] = _param_schema(properties[name], name in required)
+        token = _STRICT_TOOL.set(function.get("strict") is True)
+        try:
+            for name in sorted(properties.keys()):
+                params[name] = _param_schema(properties[name], name in required)
+        finally:
+            _STRICT_TOOL.reset(token)
         converted.append({"name": function["name"],
                           "description": function.get("description") or "",
                           "params": params, "strict": function.get("strict", False)})
@@ -392,9 +448,20 @@ def coerce_arguments(raw, params):
 _JSON_NULL = object()
 
 
+def _coerced_kind(spec):
+    """The type a string is coerced to for a field. A field that is "X or null" (an anyOf of X and null, how a strict
+    tool declares it) is an X, as it was before the null branch; a union of two types is not guessed at."""
+    kind = spec.get("type") if isinstance(spec, dict) else None
+    if kind == "anyOf":
+        kinds = {branch.get("type") for branch in spec.get("anyOf") or []
+                 if isinstance(branch, dict) and branch.get("type") != "null"}
+        return kinds.pop() if len(kinds) == 1 else None
+    return kind
+
+
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
-    kind = spec.get("type") if isinstance(spec, dict) else None
+    kind = _coerced_kind(spec)
     if value == "null" and kind in ("number", "boolean", "array", "object"):
         # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
         # writes the string "null" when it means null: the client's tool refused middle="null", active="null" (protocol
@@ -436,7 +503,7 @@ class ArgStream:
         except ValueError:
             return False
         spec = self.params.get(name)
-        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean", "array", "object")
+        return isinstance(spec, dict) and _coerced_kind(spec) in ("number", "boolean", "array", "object")
 
     def feed(self, chunk):
         out = []
