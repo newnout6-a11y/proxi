@@ -34,6 +34,15 @@ def test_every_option_can_be_set_back_to_what_the_relay_did_before(tmp_path, mon
     assert cfg["tool_union_clients"] == [] and cfg["tool_union_ttl"] == 60 and cfg["claude_tool_search"] == "native"
 
 
+def test_the_example_config_shows_the_defaults_and_names_what_the_options_are_for():
+    from pathlib import Path
+    example = json.loads((Path(__file__).resolve().parents[1] / "config.example.json").read_text(encoding="utf-8"))
+    for key in ("infer_conversations", "stabilize_client_prompts", "stable_prompt_date", "tool_union_clients", "tool_union_ttl",
+                "claude_tool_search", "effort_caps"):
+        assert example[key] == config.DEFAULTS[key], key
+        assert key in example["client_adaptation_note"], key
+
+
 @pytest.mark.parametrize("setting,message", [
     ({"infer_conversations": "yes"}, "infer_conversations must be a boolean"),
     ({"stabilize_client_prompts": 1}, "stabilize_client_prompts must be a boolean"),
