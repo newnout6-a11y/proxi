@@ -1302,7 +1302,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             journal.emit("native_history.reset", "История или настройки изменились; прежняя подпись не переиспользуется",
                          "warn", reason="prefix_or_settings_mismatch",
                          restored=any(getattr(branch, "restored", False) for branch in history.branches),
-                         why=history.mismatch(scope, client))
+                         why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
         body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
         cold = (native_history.unsigned_tool_transcript(client)
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)

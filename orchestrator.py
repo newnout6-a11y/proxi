@@ -20,6 +20,7 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
+import native_history
 import prompt_body
 import structured
 from accounts import UNNAMED, account_tag
@@ -464,10 +465,11 @@ class TurnRunner:
             return direct.native_scope(key, provider, head or "", tools, choice)
 
         refused = False
+        defaults = native_history.tool_defaults(parsed.tools)
         for effort in dict.fromkeys(direct.scope_effort(branch.scope) for branch in reversed(list(history.branches))):
             if effort is None:
                 continue
-            found, _ = history.resume(scope_of(effort), client)
+            found, _ = history.resume(scope_of(effort), client, defaults)
             if found is None:
                 continue
             if effort == wanted:
@@ -491,7 +493,7 @@ class TurnRunner:
             differs = []
         if differs:
             return None, {"reason": "scope", "differs": differs}
-        if history.resume(newest.scope, client)[0] is None:
+        if history.resume(newest.scope, client, defaults)[0] is None:
             return None, {"reason": "history"}
         return None, ({"reason": "effort"} if refused else None)
 
@@ -1120,6 +1122,8 @@ class TurnRunner:
                             chunks)
                         direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
                                                                  if native_tools else None)
+                        direct_target._native_tool_defaults = (native_history.tool_defaults(parsed.tools)
+                                                               if native_tools else None)
                         # Relay-only retry instructions live in chunks; a cold
                         # canonical replay must not discard those later attempts.
                         direct_target._native_allow_cold_replay = not (empty_retries or tool_retries or exec_steps)

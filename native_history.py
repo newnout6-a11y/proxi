@@ -344,11 +344,11 @@ class History:
         self.branches = []
         self.revision = 0
 
-    def resume(self, scope, client):
+    def resume(self, scope, client, defaults=None):
         for snapshot in reversed(self.branches):
             offset = len(snapshot.client)
             if (scope != snapshot.scope or len(client) <= offset + 1
-                    or client[:offset] != snapshot.client or client[offset] != snapshot.echo):
+                    or client[:offset] != snapshot.client or not same_echo(client[offset], snapshot.echo, defaults)):
                 continue
             tail = client[offset + 1:]
             calls = [b["toolCallId"] for b in snapshot.assistant if b["type"] == "tool_call"]
@@ -365,7 +365,7 @@ class History:
         self.branches = self.branches[-8:]
         self.revision += 1
 
-    def mismatch(self, scope, client):
+    def mismatch(self, scope, client, defaults=None):
         """Which check of resume() the newest branch fails for this request, for the journal of a reset.
 
         Names only: a part of the scope, a message index and role, a part of the echo; never text."""
@@ -380,9 +380,52 @@ class History:
         for index, (ours, theirs) in enumerate(zip(client, snapshot.client)):
             if ours != theirs:
                 return "message:%d:%s" % (index, ours.get("role"))
-        if client[offset] != snapshot.echo:
+        if not same_echo(client[offset], snapshot.echo, defaults):
             return "echo:" + _echo_difference(client[offset], snapshot.echo)
         return "tool_results"
+
+
+_MISSING = object()
+
+
+def tool_defaults(tools):
+    """{tool name: {argument: default}} from the client's own tool schemas, for the arguments that declare a default."""
+    found = {}
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        schema = function.get("parameters") if isinstance(function, dict) else None
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if not isinstance(properties, dict):
+            continue
+        values = {name: spec["default"] for name, spec in properties.items() if isinstance(spec, dict) and "default" in spec}
+        if values and function.get("name"):
+            found[function["name"]] = values
+    return found
+
+
+def same_echo(theirs, ours, defaults=None):
+    """True when the client's echo of the kept reply is that reply.
+
+    Claude Code fills the default of an optional argument the model left out before it echoes the call ("replace_all":
+    false of Edit), so an argument that holds its schema default counts as absent on both sides. Before, such an echo
+    failed the check and the next turn went cold, rewriting the whole cached conversation (Claude Desktop test run of
+    2026-11-06: 233k tokens, 30.7 credits for one Edit)."""
+    if theirs == ours:
+        return True
+    if not defaults or not isinstance(theirs, dict) or not isinstance(ours, dict):
+        return False
+
+    def without_defaults(message):
+        blocks = []
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_call" and isinstance(block.get("toolInput"), dict):
+                known = defaults.get(block.get("toolName")) or {}
+                block = dict(block, toolInput={key: value for key, value in block["toolInput"].items()
+                                               if known.get(key, _MISSING) != value})
+            blocks.append(block)
+        return dict(message, content=blocks)
+
+    return without_defaults(theirs) == without_defaults(ours)
 
 
 _SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")
