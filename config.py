@@ -90,6 +90,11 @@ DEFAULTS = {
     # it is off by default.
     "stabilize_client_prompts": True,
     "stable_prompt_date": False,
+    # Codex declares its MCP tools late (request 1: 44-46 tools, request 2: 50-60), and each change rewrites the cache.
+    # A client of these families is given the union of the tools it declared before and this request's, per project,
+    # so the list the model sees stops changing; [] switches it off. A tool not declared for tool_union_ttl seconds is dropped.
+    "tool_union_clients": ["codex"],
+    "tool_union_ttl": 6 * 3600,
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
     "transport": "direct",
     "direct_cache": True,
@@ -525,6 +530,11 @@ def _load(path):
     for key in ("stabilize_client_prompts", "stable_prompt_date"):
         if type(cfg[key]) is not bool:
             raise service_unavailable(f"{key} must be a boolean")
+    if (not isinstance(cfg["tool_union_clients"], list)
+            or not all(isinstance(item, str) for item in cfg["tool_union_clients"])):
+        raise service_unavailable("tool_union_clients must be a list of client families (for example [\"codex\"]; [] is off)")
+    if type(cfg["tool_union_ttl"]) is not int or cfg["tool_union_ttl"] < 1:
+        raise service_unavailable("tool_union_ttl must be a positive whole number of seconds")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
                 "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
                 "trace_max_folders"):

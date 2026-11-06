@@ -885,6 +885,8 @@ class TurnRunner:
         try:
             native_tools = getattr(parsed, "tools", None) or []
             tool_definitions = {item["function"]["name"]: item["function"] for item in native_tools}
+            # The tools the model is given beyond the ones this request declares: the client's earlier ones (tool_union).
+            carried_tools = getattr(parsed, "carried_tools", None) or frozenset()
             choice = getattr(parsed, "tool_choice", "auto")
             tool_names = list(tool_definitions) if choice != "none" else []
             if isinstance(choice, dict):
@@ -1243,7 +1245,8 @@ class TurnRunner:
                                         log("tool.call", "Инструмент клиента: %s (аргументы %d мс)" % (event["name"], args_ms),
                                             "info", name=event["name"], call_id=event.get("id"),
                                             arguments=_preview(event.get("arguments")), streamed=True,
-                                            args_ms=args_ms, args_chars=len(event.get("arguments") or ""))
+                                            args_ms=args_ms, args_chars=len(event.get("arguments") or ""),
+                                            **({"carried": True} if event["name"] in carried_tools else {}))
                                     out.put({key: value for key, value in event.items() if key != "partial"}
                                             | {"tool_type": definition.get("x-client-type", "function"),
                                                "done": not event.get("partial")})
@@ -1325,7 +1328,8 @@ class TurnRunner:
                                 definition = tool_definitions[native_call["name"]]
                                 log("tool.call", "Инструмент клиента: %s" % native_call["name"], "info",
                                     name=native_call["name"], call_id=native_call.get("id"),
-                                    arguments=_preview(native_call.get("arguments")), streamed=False)
+                                    arguments=_preview(native_call.get("arguments")), streamed=False,
+                                    **({"carried": True} if native_call["name"] in carried_tools else {}))
                                 out.put({"type": "tool_call", **native_call,
                                          "tool_type": definition.get("x-client-type", "function")})
                         holder["reason"] = "tool_calls"

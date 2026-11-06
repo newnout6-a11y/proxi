@@ -33,6 +33,7 @@ import models
 import prompt_body
 import prompt_policy
 import prompt_stabilizer
+import tool_union
 import validate
 from accounts import UNNAMED, AccountDispatcher, account_tag
 from credits import CreditsManager
@@ -126,6 +127,8 @@ class Runtime:
         self.runner.prompts = self.prompts
         # Requests that carry no conversation identity find theirs by their history (conversation_infer).
         self.conversations = conversation_infer.ConversationIndex()
+        # The tools a client declared before, for a client that declares them late (tool_union).
+        self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL))
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
         self.journal = journal.JOURNAL
@@ -723,6 +726,7 @@ def make_handler(runtime: Runtime):
                 raise refusal
             parsed = self._apply_prompts(data, parsed, dialect, len(raw), fetches)
             self._stabilize_prompt(parsed)
+            self._carry_tools(parsed)
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"))
@@ -801,6 +805,32 @@ def make_handler(runtime: Runtime):
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
             adapter.end(reason, prompt_text)
+
+        def _carry_tools(self, parsed):
+            """Give a client of the listed families the union of the tools it has declared before and this request's.
+
+            Codex starts its MCP servers after its first request, so request 1 carries 44-46 tools and request 2 50-60, and
+            every such change rewrites the cached prefix (31 credits at 334k tokens). See tool_union."""
+            union = getattr(runtime, "tool_union", None)
+            families = cfg.get("tool_union_clients") or ()
+            if union is None or not families or not parsed.tools:
+                return
+            family = prompt_policy.prompt_client(client_context.current(), self.headers)
+            if family not in families:
+                return
+            key = tool_union.client_key(family, self.headers, parsed)
+            if key is None:
+                return
+            merged, carried = union.apply(key, parsed.tools)
+            if union.announce(key, carried) and carried:
+                journal.emit("tools.carried",
+                             "Клиент объявил %d инструментов, ещё %d взяты из его прежних запросов: список для модели не меняется"
+                             % (len(parsed.tools), len(carried)), "info", request_id=self.request_id,
+                             declared=len(parsed.tools), carried=len(carried), names=sorted(carried)[:12],
+                             client=family)
+            if carried:
+                parsed.tools = merged
+                parsed.carried_tools = frozenset(carried)
 
         def _stabilize_prompt(self, parsed):
             """The client's system prompt with the parts that change between requests held as the conversation has them.

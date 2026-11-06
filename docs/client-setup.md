@@ -580,6 +580,40 @@ limitations were in the review of
 [PR #1](https://github.com/newnout6-a11y/proxi/pull/1), `docs/pr-1-review.md`; the file
 was removed from the repository, its last version is `git show 60cc80f^:docs/pr-1-review.md`.
 
+### Tools that Codex declares late
+
+Codex starts its MCP servers after it has sent the first request (the grace period for optional servers is one second,
+`mcp_optional_startup_grace_ms`), so request 1 of a conversation carries 44 to 46 tools and request 2 carries 50 to 60: 27 of
+27 models of the test run of 2026-11-06 and every run on the default configuration. The tool list is part of the cached prefix
+and of the key of a signed branch, so each change was a cache rewrite and a reset: 4.4 credits at 44k tokens, 31 credits at
+334k (22 times a warm request), and `codex exec resume`, which is a new process on every turn, paid two rewrites per turn (the
+list shrinks to 46 when the process starts and grows back inside the turn). Codex Desktop does the same after `thread/start`
+and `thread/resume`. The setting that makes Codex itself wait (`mcp_optional_startup_grace_ms = 10000`) works and costs 3.5 to
+4 s before every first request; the relay does not need it.
+
+The relay keeps, per client and project, the tools a Codex has declared (`tool_union.py`) and gives each request the union of
+those and the ones it declares itself, so request 1 already carries what request 2 will bring and nothing changes upstream when
+a server comes up. What decides it:
+
+- **Whose list.** The client family (`tool_union_clients`, `["codex"]` by default, `[]` is off), the originator (the CLI and
+  the Desktop differ: 60 tools against 97), the model (the client builds a list per model), root agent or sub-agent
+  (`x-openai-subagent`, `x-codex-parent-thread-id`), the working folder (`<cwd>` of the environment context) and the prompt
+  profile and its revision. A conversation in another project, with another model, or a sub-agent does not inherit a list.
+- **Which definition.** A tool the client names in this request is the client's, in its newest definition; a tool it does not
+  name is carried with the definition it had last. The upstream order is by name, so the order of declaration never matters.
+- **How long.** A tool the client has not declared for `tool_union_ttl` seconds (six hours) is dropped, so a server the user
+  removes is gone from the list within hours; one union holds 400 tools at most, 64 clients are kept, a definition over 64 KB is
+  not carried. The memory is in the relay process: after a restart the first conversation learns the list again.
+- **When the model calls a tool the client did not declare in this request.** If the client declared it before, the call goes to
+  the client like any other (`tool.call` carries `"carried": true`). Codex 0.167 answers it with the tool result `unsupported
+  call: ...` and goes on with the turn, also when the server has come up since (it routes a call with the tool list of the request
+  that produced it); the model reads the error, and from the next request on the client declares the tool, so a retry works. A
+  name the client never declared stays what it was: it is not passed on, and `tool.call_dropped` names it.
+
+`tools.carried` (info) says once per change how many tools were carried and which. Only the family `codex` is listed by default:
+Claude Code's list changes with what its ToolSearch loads, and OpenCode's with the agent, and a union would give an agent tools
+it was not given.
+
 ## Claude Code
 
 Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and
