@@ -2,6 +2,7 @@
 import asyncio
 import collections
 import contextlib
+import contextvars
 import hashlib
 
 import direct
@@ -201,6 +202,19 @@ class _FailoverOut:
         if event.get("type") not in ("credits", "usage", "usage_start"):
             self.started = True
         self.out.put(event)
+
+
+async def _off_loop(fn, *args):
+    """Run a blocking call (a web search, a balance check) on the relay's daemon IO workers, with the caller's context.
+
+    The default executor (run_in_executor(None), asyncio.to_thread) is joined at interpreter exit: a search or a balance
+    call under way kept a stopped relay alive for its 10-20 s of network timeouts after Ctrl+C. Without the relay's pool
+    (a bare loop in tests) it is the default executor, as before."""
+    loop = asyncio.get_running_loop()
+    io_executor = getattr(loop, "_relay_io_executor", None)
+    if io_executor is None:
+        return await asyncio.to_thread(fn, *args)
+    return await loop.run_in_executor(io_executor, contextvars.copy_context().run, fn, *args)
 
 
 def _may_be_balance_related(error):
@@ -865,7 +879,6 @@ class TurnRunner:
         A call counts against max_uses whether it succeeds or not (Anthropic's rule), and the ones past it get the
         max_uses_exceeded error as their result, so the model goes on with what it has. A provider that fails, or answers
         with a refusal, is an error result too: it never fails the turn."""
-        loop = asyncio.get_running_loop()
         outcomes = []
         for index, call in enumerate(calls):
             started, error, detail, results, query = time.time(), None, "", [], None
@@ -883,7 +896,7 @@ class TurnRunner:
             else:
                 try:
                     # Off the event loop: the provider is an HTTP call that may take seconds.
-                    found = await loop.run_in_executor(None, searcher.search, query.strip(), spec)
+                    found = await _off_loop(searcher.search, query.strip(), spec)
                     results = web_search.within_domains(found, spec)
                 except web_search.SearchError as failure:
                     error, detail = failure.code, failure.detail
@@ -979,12 +992,12 @@ class TurnRunner:
                     # The pool refused before any upstream call: confirm the excluded
                     # balances once, so a top-up is used without waiting for the timer.
                     rechecked = True
-                    if await asyncio.to_thread(accounts.recheck_exhausted):
+                    if await _off_loop(accounts.recheck_exhausted):
                         continue
                 if (retryable and backend is not None and backend not in exclude
                         and _may_be_balance_related(error)):
                     # With no account left, the next acquire raises a clear 402.
-                    exhausted = await asyncio.to_thread(accounts.check_balance_now, backend)
+                    exhausted = await _off_loop(accounts.check_balance_now, backend)
             except BaseException:
                 out.put({"type": "error", "error": error})
                 out.put(None)

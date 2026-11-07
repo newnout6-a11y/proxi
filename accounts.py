@@ -12,11 +12,11 @@ import math
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import apierr
 import console_log
 import journal
+from io_workers import DaemonIOExecutor
 
 DEAD_AFTER = 3            # consecutive auth failures before an account leaves the pool
 FORCED_CHECK_GAP = 15.0   # at most one on-demand balance fetch per account per gap
@@ -128,7 +128,9 @@ class AccountDispatcher:
             for state in self.state.values():
                 state["running"].clear()
         self._stop.clear()
-        self._executor = ThreadPoolExecutor(max_workers=self.parallel, thread_name_prefix="account-check")
+        # Daemon workers: a ThreadPoolExecutor is joined at interpreter exit, and a balance or renewal call under way
+        # (10-15 s network timeouts) kept a stopped relay alive after Ctrl+C.
+        self._executor = DaemonIOExecutor(self.parallel, thread_name_prefix="account-check")
         self._thread = threading.Thread(target=self._loop, name="account-dispatcher", daemon=True)
         self._thread.start()
 

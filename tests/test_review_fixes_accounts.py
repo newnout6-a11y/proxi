@@ -358,7 +358,7 @@ def test_18_12_failed_submit_releases_the_claim(monkeypatch):
         def shutdown(self, *a, **k):
             pass
 
-    monkeypatch.setattr(accounts_module, "ThreadPoolExecutor", Broken)
+    monkeypatch.setattr(accounts_module, "DaemonIOExecutor", Broken)  # the dispatcher's workers (daemon threads)
     accounts = [Account("a"), Account("b")]
     value, _ = dispatcher(accounts)
     value.start()
