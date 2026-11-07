@@ -752,7 +752,7 @@ def make_handler(runtime: Runtime):
             parsed = self._apply_prompts(data, parsed, dialect, len(raw), fetches)
             parsed.client_chars = client_chars
             self._stabilize_prompt(parsed)
-            self._carry_tools(parsed)
+            self._carry_tools(parsed, data)
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"),
@@ -868,14 +868,20 @@ def make_handler(runtime: Runtime):
             error.expected = True
             raise error
 
-        def _carry_tools(self, parsed):
+        def _carry_tools(self, parsed, data=None):
             """Give a client of the listed families the union of the tools it has declared before and this request's.
 
             Codex starts its MCP servers after its first request, so request 1 carries 44-46 tools and request 2 50-60, and
-            every such change rewrites the cached prefix (31 credits at 334k tokens). See tool_union."""
+            every such change rewrites the cached prefix (31 credits at 334k tokens). See tool_union.
+
+            A request that carries Claude Code's tool search (served as it asks when claude_tool_search is "native", or after
+            the guard saw a loop) declares the deferred list, a handful of tools, ToolSearch and a placeholder: neither the
+            union nor the list of a session that loads its tools up front may be mixed with it."""
             union = getattr(runtime, "tool_union", None)
             families = cfg.get("tool_union_clients") or ()
             if union is None or not families or not parsed.tools:
+                return
+            if isinstance(data, dict) and tool_search_policy.deferral(data) is not None:
                 return
             family = prompt_policy.prompt_client(client_context.current(), self.headers)
             if family not in families:

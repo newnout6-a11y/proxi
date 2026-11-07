@@ -43,9 +43,20 @@ _SEARCHED = 40000
 FILE_NAME = "tool-union.json"
 SAVE_EVERY = 60
 # The families whose sub-agents differ by kind (Claude Code's Explore agent has fewer tools than a general-purpose one):
-# their system text tells the kinds apart.
+# their system text tells the kinds apart. Its first line, Claude Code's attribution, is left out: its version carries three
+# characters drawn from the session's first message (cc_version=2.1.310.2e4, .6cd, .29f... in one test run), so with it no
+# two sessions would share a table, and every session would push another client's table out of the bounded union.
 _KINDS_BY_SYSTEM = ("claude-code", "claude-desktop")
 _KIND_CHARS = 400
+_ATTRIBUTION = "x-anthropic-billing-header:"
+
+
+def _opening(system):
+    """The first characters of a system text that say which kind of agent it is, without the attribution line."""
+    text = (system or "").lstrip()
+    if text.startswith(_ATTRIBUTION):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    return text.lstrip()[:_KIND_CHARS]
 
 
 def project_of(parsed):
@@ -75,7 +86,7 @@ def client_key(family, headers, parsed):
     plan = getattr(parsed, "prompt_plan", None)
     role = ""
     if family in _KINDS_BY_SYSTEM:
-        opening = (getattr(parsed, "system", "") or "")[:_KIND_CHARS]
+        opening = _opening(getattr(parsed, "system", ""))
         role = hashlib.sha256(opening.encode("utf-8", "surrogatepass")).hexdigest()[:16]
     return (family, str(lowered.get("originator") or "").strip().lower(), getattr(parsed, "model", "") or "",
             "sub" if sub else "root", project_of(parsed), getattr(plan, "profile", None) or "",

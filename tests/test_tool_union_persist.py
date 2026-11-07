@@ -89,6 +89,17 @@ def test_claude_code_keeps_its_kinds_of_agent_apart_and_codex_keys_do_not_change
     assert client_key("codex", {}, general) == client_key("codex", {}, explore)
 
 
+def test_the_attribution_line_of_claude_code_does_not_split_its_sessions():
+    """Its version ends in three characters drawn from the session's first message: with it in the key no two sessions
+    shared a table, and every session pushed another client's table out of the bounded union."""
+    def parsed(suffix, rest="You are Claude Code, Anthropic's official CLI for Claude."):
+        return SimpleNamespace(tools=[tool("a")], model="m", prompt="", system=(
+            "x-anthropic-billing-header: cc_version=2.1.310.%s; cc_entrypoint=cli;\n%s" % (suffix, rest)))
+    assert client_key("claude-code", {}, parsed("2e4")) == client_key("claude-code", {}, parsed("6cd"))
+    assert client_key("claude-code", {}, parsed("2e4")) != client_key(
+        "claude-code", {}, parsed("2e4", "You are a file search specialist for Claude Code."))
+
+
 def test_claude_code_is_a_client_of_the_union_by_default():
     import config
     assert config.DEFAULTS["tool_union_clients"] == ["codex", "claude-code"]
