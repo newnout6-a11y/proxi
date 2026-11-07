@@ -377,3 +377,30 @@ def test_an_account_whose_hourly_pause_ends_while_its_balance_is_low_is_not_anno
     assert account.unavailable["reason"] == "exhausted"
     output = capsys.readouterr().out
     assert "снова в пуле" not in output and "баланс" in output
+
+
+def test_a_signed_out_account_gets_no_balance_checks_until_a_renewal_brings_it_back():
+    # its balance fetch meets a 401 and renews the session itself: one POST a minute, past the backoff of the renewals
+    refresher = FakeRefresher([(False, "auth")] * DEAD_AFTER + [(True, None)])
+    dead = Account("a", refresher)
+    manager = FakeManager(100.0)
+    value, clock = dispatcher([dead], {dead: manager})
+    for _ in range(DEAD_AFTER):
+        value.refresh(dead)
+    assert dead.unavailable["reason"] == "auth_dead"
+    state = value.state[dead]
+    state["next_balance"] = clock.now
+    state["next_refresh"] = clock.now + 600
+    for _ in range(10):  # ten minutes of ticks before the next scheduled renewal
+        clock.now += 59
+        jobs = value.due()
+        assert all(kind != "balance" for _, kind in jobs)
+        for backend, kind in jobs:
+            state["running"].discard(kind)
+    assert manager.fetches == 0
+    clock.now = state["next_refresh"]
+    assert value.due() == [(dead, "refresh")]
+    state["running"].clear()
+    value.refresh(dead)  # signed in again: the balance is checked at once
+    assert dead.unavailable is None
+    assert (dead, "balance") in value.due()

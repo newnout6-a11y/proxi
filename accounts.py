@@ -193,7 +193,11 @@ class AccountDispatcher:
                         state["last_forced"] = now
                 if self.interval > 0 and now >= state["next_refresh"]:
                     kind = "refresh"
-                elif manager is not None and now >= state["next_balance"]:
+                elif (manager is not None and now >= state["next_balance"]
+                      and not ("auth_dead" in state["reasons"] and self.interval > 0)):
+                    # A signed-out account's balance fetch meets a 401 and renews the session itself (Refresher.call): one
+                    # POST /api/refreshtoken a minute, past the backoff of the renewals above. Its balance is checked
+                    # again as soon as a renewal brings it back (next_balance is in the past by then).
                     kind = "balance"
                 else:
                     continue
