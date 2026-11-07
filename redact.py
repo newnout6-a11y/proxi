@@ -29,6 +29,18 @@ _SENSITIVE_NAMES = re.compile(
     r"(?i)(\.env(\..*)?$|credentials.*\.json$|\.pem$|\.pfx$|\.key$|id_rsa.*|\.npmrc$|\.netrc$|config\.json$|cookies?\.txt$|relay_key\.txt$)"
 )
 
+# What a text must hold for any of the patterns above to match it. Each of them needs one of the literals of _LITERALS, or a keyword
+# of _KEYWORDS together with a ":" or "=" (the two patterns for `name: value` and `name=value`; accessToken= and xsrfToken= hold
+# "token" and "="). Both are case-insensitive here, wherever the pattern itself is not, so the test is never narrower than a
+# pattern, Unicode case folding included. Nearly every string the journal and the console see (keys, ids, models, messages)
+# holds none of them, and it is returned as it is: 14 regular expressions took 3.3 us for such a string, this test 0.4 us.
+_LITERALS = re.compile(r"(?i)eyj|key=|sk-|retool_|relay-|ghp_|xox|akia|cf_clearance=")
+_KEYWORDS = re.compile(r"(?i)api[_-]?key|secret|password|passwd|token")
+
+
+def _may_hold_a_secret(text: str) -> bool:
+    return bool(_LITERALS.search(text)) or ((":" in text or "=" in text) and bool(_KEYWORDS.search(text)))
+
 
 def redact(text: str, *, cookie_values=()) -> str:
     """Mask known secret shapes plus any literal cookie value we hold."""
@@ -38,6 +50,8 @@ def redact(text: str, *, cookie_values=()) -> str:
     for value in cookie_values:
         if value and len(value) >= 12:
             out = out.replace(value, MASK)
+    if not _may_hold_a_secret(out):
+        return out
     for pattern, replacement in _PATTERNS:
         if replacement is None:
             # Keep the key, mask only the value.

@@ -14,6 +14,9 @@ from test_account_rate_limit import HOURLY_BODY, serve_ok
 from test_native_context_reuse import FIRST, Backend, request, run, setup
 from upstream_attempts import AttemptBudget
 
+# The delays of AttemptBudget.wait are what these tests are about: they run the real one (on a clock they control, or with a spy).
+pytestmark = pytest.mark.real_backoff
+
 
 class FakeTime:
     """Replaces the `time` module of upstream_attempts: sleeping moves the clock, nothing really waits."""

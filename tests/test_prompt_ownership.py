@@ -270,7 +270,11 @@ def test_direct_exec_budget_counts_retained_chunks_and_trims_only_new_output(tmp
     _, _, runner = setup(tmp_path, transport='direct', base='https://fixture.invalid', project_context=False,
                          exec_policy='allow_all', exec_allowlist=[], command_timeout=3, command_output_limit=10000,
                          show_exec_output=False, max_exec_turns=step_cap, cookie_values=[],
-                         relay_system_prompt='POLICY', max_prompt_bytes=1500, cache_keepwarm_seconds=0)
+                         relay_system_prompt='POLICY', max_prompt_bytes=1500, cache_keepwarm_seconds=0,
+                         # The prompt names the workspace and the budget is tight (1500 bytes): the directory above the test's own is as
+                         # good a workspace here (no command runs) and 32 characters shorter, so that the length of the temp path
+                         # (a long user name, the extra directory of every pytest-xdist worker) does not decide the test.
+                         workspace_root=str(tmp_path.parent))
     runner.pool.backend.headers = lambda: {}
     bodies, commands = [], []
     def opener(req, **kw):
