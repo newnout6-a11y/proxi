@@ -89,6 +89,12 @@ _TOOL_RESULT_HINTS = {"refused": False}
 _PRUNING = {"refused": False}
 
 
+def _unmarked(body):
+    """The body without the App Builder marker (metadata.sandpackAgent): a model of the Assist list (_ASSIST_ONLY) is served
+    by the same route without it, and the route of the marker answers it with "not available right now"."""
+    return {key: value for key, value in body.items() if key != "metadata"}
+
+
 def _provider_of(model):
     """The provider the catalog gives this model, or None for a model it does not know."""
     try:
@@ -1978,7 +1984,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     session._direct_reply = None
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
-        body = {key: value for key, value in body.items() if key != "metadata"}
+        body = _unmarked(body)
     identity = client_context.current()
     session._busy = True
     session._turn_identity = identity
@@ -2101,7 +2107,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                and client_context.current().get("compaction_tools") == "restored")
 
     def text_only():
-        return build_body(cfg, model_provider, head, prompt, None, "none", max_tokens, chunks, session=None, mark_tail=False)
+        # Built anew, this body carried the App Builder marker however the request went: on a model of the Assist list, whose
+        # two tries with tools went without it, the route refused this third one ("not available right now") and the
+        # compaction failed after two paid tries. It goes the way the request goes, as the retry below sends it too.
+        sent = build_body(cfg, model_provider, head, prompt, None, "none", max_tokens, chunks, session=None, mark_tail=False)
+        return sent if "metadata" in body else _unmarked(sent)
 
     def open_stream(sent):
         # A compaction whose tools the relay declared again must end in text (summary_guard); a route that refuses a forced choice
@@ -2186,7 +2196,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
                 journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
                              model=model_name)
-                body = {key: value for key, value in body.items() if key != "metadata"}
+                body = _unmarked(body)
                 if body.get("openAICacheKey"):
                     session._turn_body = body
                 learned = False
