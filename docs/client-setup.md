@@ -306,7 +306,11 @@ by that name and display name.
 To preview or update an existing profile, use `scripts/sync_harness_catalog.py
 --settings PATH`. Preview writes only with `--output`; replacing the profile
 requires `--write --backup-dir`. The utility splices only the Proxi blocks and
-keeps other bytes intact, including date headers and plugin source. The active
+keeps other bytes intact, including date headers and plugin source. It writes at
+the profile's own indentation (two spaces or four), and an anchor or tag on the
+provider's key line (`retool: &relay`) stays there; a Proxi block that another key
+shares through an alias (`*relay`, `<<: *relay`) is refused until the alias is
+expanded, because changing it would change that key too. The active
 provider/model and credentials are preserved. Both installed SDK versions
 passed default, off, high and rejection checks with the exact generated files;
 the SDK bundles and Desktop ASAR were not modified.

@@ -198,6 +198,7 @@ def encode_document(original, document, result):
     providers = child(child(root.value[index], 'config'), 'providers')
     if providers.start_mark.index < root.value[index].start_mark.index:
         raise ValueError('Expand the aliased Proxi provider block before synchronizing')
+    keys = {key.value: key for key, _ in providers.value}
     nodes = {key.value: value for key, value in providers.value}
     lines = source.splitlines(keepends=True)
     offsets = [0]
@@ -209,6 +210,18 @@ def encode_document(original, document, result):
         yaml.dump(provider, output)
         return ''.join(' ' * indent + line + newline for line in output.getvalue().splitlines())
 
+    def shared(target):
+        """Whether an alias elsewhere in the profile refers to `target`: the composer gives it the same node."""
+        found, stack, seen = 0, [root], set()
+        while stack:
+            node = stack.pop()
+            found += node is target
+            if id(node) not in seen and isinstance(node.value, list):
+                seen.add(id(node))
+                for item in node.value:
+                    stack.extend(item if isinstance(item, tuple) else (item,))
+        return found > 1
+
     edits = []
     for name in ('retool', 'retool-text'):
         if name not in after:
@@ -217,14 +230,21 @@ def encode_document(original, document, result):
             node = nodes[name]
             if node.flow_style or node.start_mark.line == node.end_mark.line:
                 raise ValueError('Expand the Proxi provider to a block mapping before synchronizing')
-            start, end = offsets[node.start_mark.line], offsets[node.end_mark.line]
-            edits.append((start, end, block(after[name], node.start_mark.column)))
+            if shared(node):
+                raise ValueError("The Proxi provider %r shares its block with another key through a YAML anchor and "
+                                 "alias; expand the alias before synchronizing" % name)
+            # The body starts at its first key: an anchor or a tag on the key line (`retool: &relay`) is where the
+            # node itself starts, and that line stays as it is.
+            first = node.value[0][0]
+            start, end = offsets[first.start_mark.line], offsets[node.end_mark.line]
+            edits.append((start, end, block(after[name], first.start_mark.column)))
         else:
+            # The new key goes where the retool key is and its body where retool's body is, at the profile's own
+            # indentation (two spaces or four).
             main = nodes['retool']
             position = offsets[main.end_mark.line]
-            indent = main.start_mark.column - 2
-            edits.append((position, position, ' ' * indent + name + ':' + newline
-                          + block(after[name], main.start_mark.column)))
+            edits.append((position, position, ' ' * keys['retool'].start_mark.column + name + ':' + newline
+                          + block(after[name], main.value[0][0].start_mark.column)))
     # Apply an insertion at a replacement's end first so its bytes are retained.
     for start, end, replacement in sorted(edits, key=lambda edit: (edit[0], edit[1]), reverse=True):
         source = source[:start] + replacement + source[end:]
@@ -233,7 +253,8 @@ def encode_document(original, document, result):
     try:
         reloaded = yaml.load(source)
     except YAMLError as error:
-        raise ValueError('The updated profile is not valid YAML (%s); refusing to write it' % _problem(error)) from None
+        raise ValueError('The updated profile is not valid YAML (%s; a position counts in the updated text, not in '
+                         'the profile); refusing to write it' % _problem(error)) from None
     if _semantic(reloaded) != _semantic(result):
         raise ValueError('YAML serialization changed a value; refusing to write the profile')
     return source.encode('utf-8')
