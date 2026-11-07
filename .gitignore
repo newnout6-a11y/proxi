@@ -16,7 +16,8 @@ relay.log
 relay.pid
 crash.log
 journal.jsonl
-journal.jsonl.1
+# the old journal files the relay keeps beside it (journal_keep_files: .1 to .5 by default)
+journal.jsonl.*
 /conversations/
 .session-*.tmp
 .pytest_cache/
