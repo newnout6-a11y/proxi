@@ -48,6 +48,7 @@ BATCH_BYTES = 256 * 1024  # JSON text handed to zlib at once
 RAW_FACTOR = 4  # a state may expand to this many times the file limit
 REPLACE_ATTEMPTS = 4
 RESTORE_TIMEOUT = 15.0  # seconds a request waits for a stored state to be read
+SETTLE_TIMEOUT = 5.0  # seconds a restore waits for the newest state of its conversation to reach the disk
 RESTORE_KEEP = 120.0  # seconds a state that was read ahead of its request waits to be used
 RESTORE_READAHEAD = 8  # states that may wait that way at once
 IO_PAUSE = 30.0  # seconds without a write attempt after a failed one (the disk is told about once, not every turn)
@@ -588,6 +589,7 @@ class ConversationStore:
         self._paused_until = 0.0  # no write is attempted before this (a failed disk), unless the relay is stopping
         self._disk_said = None  # when a failing disk was last mentioned; None once a write has worked again
         self._busy = False
+        self._writing = None  # the key_id the writer is writing now
         self._closed = False
         self._thread = None
         self.enabled = False
@@ -812,6 +814,34 @@ class ConversationStore:
         with self._cond:
             return key_id in self._failed
 
+    def unsettled(self, key):
+        """True while a state of `key` waits for the writer or is being written (it does not wait)."""
+        try:
+            key_id = key_digest(key)
+        except TypeError:
+            return False
+        with self._cond:
+            return key_id in self._pending or self._writing == key_id
+
+    def settle(self, key, timeout=None):
+        """Wait until no state of `key` waits for the writer or is being written, at most `timeout` seconds (blocking:
+        call it from an executor). True when none is left.
+
+        A conversation evicted right after its request has its newest state on the way to the disk: read before the writer
+        got to it, the file gave the turn before, and the returning request wrote its whole prefix again."""
+        try:
+            key_id = key_digest(key)
+        except TypeError:
+            return True
+        deadline = time.monotonic() + (SETTLE_TIMEOUT if timeout is None else timeout)
+        with self._cond:
+            while key_id in self._pending or self._writing == key_id:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+        return True
+
     def submit(self, captured, urgent=False):
         """Queue a state for the writer; a newer state of the same conversation replaces a waiting one.
 
@@ -867,6 +897,7 @@ class ConversationStore:
                     self._cond.notify_all()
                     continue
                 self._busy = True
+                self._writing = captured.key_id
             try:
                 self._save(captured)
             except Exception as exc:  # noqa: BLE001 - the writer outlives any one conversation
@@ -874,6 +905,7 @@ class ConversationStore:
             finally:
                 with self._cond:
                     self._busy = False
+                    self._writing = None
                     self._cond.notify_all()
 
     def _fail(self, captured, reason, error=None, **fields):

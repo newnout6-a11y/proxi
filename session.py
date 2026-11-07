@@ -1125,6 +1125,11 @@ class SessionPool:
             return None
         gate = reading = None
         try:
+            if getattr(store, "unsettled", None) is not None and store.unsettled(key):
+                # Its newest state is still on the way to the disk (the conversation was evicted right after its last
+                # request): the file holds the turn before, and restored from it the request writes its whole prefix
+                # again. The read waits for the writer, a few seconds at most, on the executor.
+                await asyncio.get_running_loop().run_in_executor(None, store.settle, key)
             meta = store.peek(key)
             if meta is None:
                 return None

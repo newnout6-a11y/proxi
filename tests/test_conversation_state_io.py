@@ -977,3 +977,61 @@ def test_a_standalone_job_of_a_restored_conversation_goes_where_the_conversation
         await after.pool.release(other)
 
     asyncio.run(story())
+
+
+# -- a restore reads the newest state, not the one the writer has not replaced yet ----------------------------------------
+def slow_disk(monkeypatch, entered=None):
+    """os.replace of the store waits until the returned event is set: the writer is busy with a state meanwhile."""
+    real, go = os.replace, threading.Event()
+
+    def replace(source, target):
+        if entered is not None:
+            entered.set()
+        assert go.wait(10)
+        return real(source, target)
+
+    monkeypatch.setattr(cs.os, "replace", replace)
+    return go
+
+
+def test_settle_waits_for_the_state_of_a_conversation_that_is_being_written(tmp_path, monkeypatch):
+    store = cs.ConversationStore(tmp_path / "state")
+    go = slow_disk(monkeypatch)
+    store.submit(capture_of("busy"))
+    deadline = time.monotonic() + 5
+    while not store.unsettled("busy") and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert store.unsettled("busy") and not store.unsettled("other")
+    assert store.settle("busy", timeout=0.2) is False  # still being written
+    threading.Timer(0.2, go.set).start()
+    assert store.settle("busy", timeout=5) is True and not store.unsettled("busy")
+    assert store.peek("busy") is not None
+    store.close()
+
+
+def test_a_conversation_that_comes_back_while_its_newest_state_is_written_restores_that_state(
+        tmp_path, monkeypatch, processes):
+    """Evicted right after its request, a conversation had its newest state still on the way to the disk. Its client came
+    back at once: the restore read the file of the turn before, and the request wrote its whole prefix again."""
+    state = tmp_path / "state"
+    process = processes(state, scripts=tool_scripts(3))
+
+    async def story():
+        await converse(process, "chat", 1)
+        before = process.store.peek(KEY)
+        entered = threading.Event()
+        go = slow_disk(monkeypatch, entered)
+        process.store.submit(capture_of("another conversation"))  # the writer is busy with this one on a slow disk
+        assert await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+        pool = process.pool
+        (key,) = list(pool._conversations)
+        session = pool._conversations[key]
+        session._last_prefix_tokens = 777_777  # what its last request changed: queued behind the other write
+        session._state_mark = None
+        pool._persist(key)
+        threading.Timer(0.3, go.set).start()  # the disk answers after the request has come back
+        fresh = type(session)(session.backend, "direct-fresh")
+        restored = await pool._restore_state(key, fresh)
+        return before is not None, restored is not None, fresh._last_prefix_tokens
+
+    assert asyncio.run(story()) == (True, True, 777_777)  # the newest state, not the one of the turn before
