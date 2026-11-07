@@ -102,6 +102,22 @@ def client_hints(ua, brands=None) -> dict:
             "sec-ch-ua-platform": platform}
 
 
+# A cookie or xsrf token read with its line break (Get-Content -Raw, a hand edit of config.json) made http.client refuse the
+# header with a ValueError that quoted the value whole, the session JWT included, and that text reached the startup banner,
+# /v1/balance and the completion errors. The ends are trimmed; a control character inside is refused without the value.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _header_secret(value, name, variable):
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    if _CONTROL.search(value) or any(ord(char) > 0xFF for char in value):
+        raise ValueError("the Retool %s holds a line break, a control character or a character outside Latin-1: "
+                         "correct it in config.json or %s" % (name, variable))
+    return value
+
+
 def upstream_headers(cfg) -> dict:
     """Retool session headers. Cookie/xsrf stay the source of upstream auth."""
     cfg = dict(cfg)  # read cookie and xsrf from the same credential snapshot
@@ -112,8 +128,8 @@ def upstream_headers(cfg) -> dict:
         "origin": cfg["base"],
         "referer": cfg["base"] + "/",
         "user-agent": ua,
-        "cookie": cfg["cookie"],
-        "x-xsrf-token": cfg["xsrf"],
+        "cookie": _header_secret(cfg["cookie"], "cookie", "RETOOL_COOKIE"),
+        "x-xsrf-token": _header_secret(cfg["xsrf"], "xsrf", "RETOOL_XSRF"),
         "x-retool-client-version": CLIENT_VERSION,
         # The version in the hints is the one the User-Agent names (an account with Chrome/141 used to send v="131").
         **client_hints(ua, cfg.get("sec_ch_ua")),
@@ -188,9 +204,14 @@ def merge_set_cookie(cfg, headers) -> bool:
 
 
 def mask(key: str) -> str:
+    """What the startup banner shows of the relay key (the supervisor keeps stdout in relay.log): its length, and the ends
+    of a long key only. It printed a key of up to 12 characters whole and 12 characters of a longer one, so a short key
+    stood in the log in clear and one of up to 20 characters left 1 to 8 to guess."""
     if not key:
         return "(none)"
-    return key[:8] + "…" + key[-4:] if len(key) > 12 else key
+    if len(key) >= 32:
+        return "%s…%s (%d characters)" % (key[:4], key[-4:], len(key))
+    return "(set, %d characters)" % len(key)
 
 
 def relay_key_source() -> str:

@@ -1,4 +1,8 @@
 """The browser headers the relay sends Retool agree with the account's User-Agent."""
+import http.client
+
+import pytest
+
 import auth
 
 BASE = {"base": "https://tenant.invalid", "cookie": "accessToken=a", "xsrf": "x"}
@@ -39,3 +43,37 @@ def test_the_platform_and_mobile_flag_follow_the_user_agent():
     assert auth.client_hints(mac)["sec-ch-ua-platform"] == '"macOS"'
     hints = auth.client_hints(android)
     assert hints["sec-ch-ua-platform"] == '"Android"' and hints["sec-ch-ua-mobile"] == "?1"
+
+
+JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.c2lnbmF0dXJl"
+
+
+def test_a_cookie_read_with_its_line_break_is_sent_without_it():
+    """RETOOL_COOKIE from Get-Content -Raw ends in a line break: http.client refused the header with a ValueError that quoted
+    it whole, the session JWT included, and the banner, /v1/balance and the completion errors showed that text."""
+    headers = auth.upstream_headers({**BASE, "cookie": "accessToken=%s; xsrfToken=t\r\n" % JWT, "xsrf": " t\n"})
+    assert headers["cookie"] == "accessToken=%s; xsrfToken=t" % JWT and headers["x-xsrf-token"] == "t"
+    connection = http.client.HTTPConnection("tenant.invalid")
+    connection.putrequest("GET", "/")
+    for name, value in headers.items():
+        connection.putheader(name, value)  # the check http.client makes before anything is sent
+
+
+@pytest.mark.parametrize("field, value", [("cookie", "accessToken=%s\nxsrfToken=t" % JWT), ("cookie", "a=%s\x00" % JWT),
+                                          ("xsrf", JWT + "…")])
+def test_a_secret_with_a_control_character_inside_is_refused_without_showing_it(field, value):
+    with pytest.raises(ValueError) as refused:
+        auth.upstream_headers({**BASE, field: value})
+    assert JWT not in str(refused.value) and "eyJ" not in str(refused.value) and field in str(refused.value)
+
+
+@pytest.mark.parametrize("key", ["mysecretkey1", "short", "a-key-of-20-letters!", "x" * 31])
+def test_the_banner_shows_no_part_of_a_short_relay_key(key):
+    """The banner goes to relay.log: a key of up to 12 characters was printed whole, a longer one by 12 of its characters."""
+    shown = auth.mask(key)
+    assert shown == "(set, %d characters)" % len(key)
+
+
+def test_the_banner_shows_the_ends_and_the_length_of_a_long_relay_key():
+    key = "Q2v7Hk9mPq4WzR8tLx3nBc6YdF1gJs5eUa0iOo2pVh"
+    assert auth.mask(key) == "Q2v7…2pVh (42 characters)" and auth.mask("") == auth.mask(None) == "(none)"
