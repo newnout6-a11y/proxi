@@ -23,6 +23,7 @@ import journal
 import client_context
 import console_log
 from redact import redact
+import compaction_tools
 import config as config_module
 import conversation_infer
 import conversation_state
@@ -145,6 +146,8 @@ class Runtime:
         # The tools a client declared before, for a client that declares them late (tool_union).
         self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL),
                                                path=os.path.join(folder, tool_union.FILE_NAME) if folder else None)
+        # The tools each Codex chat declared last, for the compaction of that chat, which Codex sends without any.
+        self.chat_tools = compaction_tools.ChatTools()
         # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
         self.stabilizer = prompt_stabilizer.Stabilizer(
             cfg, os.path.join(folder, prompt_stabilizer.FILE_NAME) if folder else None)
@@ -667,6 +670,44 @@ def make_handler(runtime: Runtime):
                 effort = reasoning.get("effort")
             self._effort_str = client_context.clean(effort, 30)
 
+        def _codex_chat_tools(self, data, dialect):
+            """The body to parse: a Codex compaction with the chat's tools declared again, any other body as it came.
+
+            Codex sends a compaction with no tools, and tools stand first in the provider's cached prefix, so that request
+            shared nothing with the chat and wrote all of its history again (compaction_tools: 31,943 tokens, 1.65 credits,
+            where the chat's own request wrote 9,807). With the tools the chat declared last, the request is the next
+            request of the chat plus its instruction, and takes the path of every compaction that carries tools: the chat's
+            session, head and signed history, nothing written for the instruction. The guard that keeps a tool call from
+            ever reaching Codex in reply to it is in the transport (direct.iter_events, summary_guard)."""
+            if dialect != "responses" or not isinstance(data, dict) or cfg.get("transport") != "direct":
+                return data
+            chats = getattr(runtime, "chat_tools", None)
+            identity = client_context.current()
+            if chats is None or prompt_policy.prompt_client(identity, self.headers) != "codex":
+                return data
+            key, _ = validate.conversation_affinity(data, self.headers, identity)
+            if not key:
+                return data
+            if data.get("tools"):
+                chats.remember(key, data.get("model"), data["tools"])
+                return data
+            if identity.get("codex_task") != client_context.COMPACTION or not cfg.get("codex_compaction_cache", True):
+                return data
+            tools = chats.recall(key, data.get("model"))
+            if tools is None:
+                journal.emit("codex.compaction_tools_unknown",
+                             "Сжатие Codex без инструментов чата: relay их не знает (перезапуск, чат без инструментов или другая "
+                             "модель), сводка идёт как раньше", "info", request_id=self.request_id,
+                             conversation=journal.tag(key))
+                return data
+            client_context.bind({**identity, "compaction_tools": "restored"})
+            journal.emit("codex.compaction_tools_restored",
+                         "Сжатие Codex: объявлены инструменты чата (%d), сводка читает его кэш вместо записи всей истории"
+                         % len(tools), "info", request_id=self.request_id, tools=len(tools), conversation=journal.tag(key))
+            console_log.write("[%s] [cache] Codex compaction declares the chat's %d tools again: the summary reads the chat's "
+                              "cache" % (self.request_id, len(tools)))
+            return {**data, "tools": tools, "parallel_tool_calls": True}
+
         def _read_body(self):
             raw_len = self.headers.get("content-length")
             if raw_len is None:
@@ -707,6 +748,7 @@ def make_handler(runtime: Runtime):
                 self._client_trace.event("client_request", method=self.command, path=self.path, dialect=dialect)
             data = validate.load_json(raw)
             self._bind_client(data)
+            data = self._codex_chat_tools(data, dialect)
             self._refuse_tool_search(data, dialect)
             fetches = validate.ImageFetches()
             with fetches:

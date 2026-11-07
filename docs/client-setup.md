@@ -617,6 +617,30 @@ a server comes up. What decides it:
 Claude Code's list changes with what its ToolSearch loads, and OpenCode's with the agent, and a union would give an agent tools
 it was not given.
 
+### Compaction in Codex reads the cache of the chat
+
+Nothing needs to be set in Codex. For a custom provider Codex compacts locally (`core/src/compact.rs` of rust-v0.167.0): the
+history of the chat, its last reply and the summary prompt go out as one request with **no tools** (`x-codex-turn-metadata`
+says `request_kind: compaction`, with the phase `pre_turn`, `mid_turn`, ...). The tools stand first in the provider's cached
+prefix, so that request shared nothing with the chat and wrote the whole history again: 31,943 tokens and 1.65 credits where the
+chat's own last request wrote 9,807 (`363bb3d49ff4`), 52,527 uncached tokens and 4.80 credits on claude-opus-5-5
+(`0697b894535c`), about 31 credits at 330k tokens.
+
+With `codex_compaction_cache` (on by default, live in the admin) the relay remembers the tools each chat declared in its last
+request and declares them again in that chat's compaction, so the request is the next request of the chat plus its summary
+prompt: the chat's session, head and cache key, the signed history continued, nothing written for the prompt. Live replays of
+captured compactions: gpt-6.1-sol read 34,118 of 34,121 tokens for 0.13 credits, claude-opus-5-5 read 60,446 of 60,616 for 0.50.
+The tools are only for the prefix: Codex takes the last assistant message of its history as the summary and runs no call, so a
+reply that calls a tool is dropped (`turn.compaction_tool_call`), the request is asked again with one more user message that asks
+for the summary as text, and a second call sends the request as Codex made it, without tools (the price it had before). The
+models answered in text in 50 of 50 live compactions (gpt-6.1-sol 36, claude-opus-5-5 8, claude-sonnet-5-5 6). The relay keeps
+the tools in memory and per model: after a restart, or when the model changed, the compaction is served as before
+(`codex.compaction_tools_unknown`).
+
+Codex can also compact remotely (`[model_providers.<id>.capabilities] remote_compaction = "v2"`: the chat's request with a
+`compaction_trigger` item at the end, answered with one `compaction` item). The relay does not support it and answers 422, after
+which Codex stops the turn; leave it off.
+
 ### Speed and effort in Codex
 
 Codex's wall time is the number of agent steps, not the reasoning effort: the same bugfix task on gpt-6.1-sol took 45.7 s at
