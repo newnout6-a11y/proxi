@@ -23,7 +23,7 @@ def test_the_defaults_adapt_to_the_clients_except_for_the_date(tmp_path, monkeyp
     cfg = load_with(tmp_path, monkeypatch)
     assert cfg["infer_conversations"] is True and cfg["stabilize_client_prompts"] is True
     assert cfg["stable_prompt_date"] is False
-    assert cfg["tool_union_clients"] == ["codex"] and cfg["tool_union_ttl"] == 6 * 3600
+    assert cfg["tool_union_clients"] == ["codex", "claude-code"] and cfg["tool_union_ttl"] == 6 * 3600
     assert cfg["claude_tool_search"] == "eager"
 
 

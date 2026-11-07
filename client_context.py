@@ -53,6 +53,12 @@ OPENCODE_SERVICE_PROMPTS = (
 )
 # client_task of a request that summarizes the whole conversation so that the client can replace it by the summary.
 COMPACTION = "compaction"
+# client_task of a client's own one-shot job that nothing continues (Codex's memory extraction of an old thread: a 209k-token
+# body kept warm by three pings, 0.63 credits, that nobody sent again; Codex run of 2026-11-07). See proxy.py for the signal.
+BACKGROUND = "background"
+# The tasks whose request is a side request: no branch is kept for it, it is not kept warm, and it writes to the cache only
+# what it reads (direct.iter_events). A one-shot job also leaves the session it runs on as it was.
+SIDE_TASKS = (COMPACTION, BACKGROUND)
 # OpenCode 2.x (every tag from v2.0.0 to v2.2.5, packages/core/src/session/compaction.ts buildPrompt) ends
 # the chat's own request with one more user message: the first compaction asks for a summary, a later one for an
 # update of the checkpoint. The start of the message is the sign, never the text, which is reworded between releases

@@ -747,10 +747,28 @@ def _coerced_kind(spec):
     return kind
 
 
+# The text of an integer as JSON writes it: no sign but a minus, no leading zero, no exponent, within the safe integers.
+_CANONICAL_INTEGER = re.compile(r"-?(?:0|[1-9][0-9]{0,14})")
+
+
+def _number_or_text(spec):
+    """True for a field that is "number or string" (a client's integer or string, possibly also null)."""
+    if not isinstance(spec, dict) or spec.get("type") != "anyOf":
+        return False
+    kinds = {branch.get("type") for branch in spec.get("anyOf") or [] if isinstance(branch, dict) and branch.get("type") != "null"}
+    return kinds == {"number", "string"}
+
+
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
     if _marked(spec):
         return _decode_map(value)
+    if _number_or_text(spec):
+        # The model writes the number of a "number or string" field as text, and a client tool that branches on the type
+        # got the string "42" for 42 (an MCP server of the Claude Code test run of 2026-11-07, 72e6f9f0a91a, 993110d098d2,
+        # 13dcf0681ac0). The canonical text of an integer is that integer; any other text ("007", "4.0", "x1") stays as
+        # the model wrote it, which the schema allows as well.
+        return int(value) if _CANONICAL_INTEGER.fullmatch(value) else None
     kind = _coerced_kind(spec)
     if value == "null" and kind in ("number", "boolean", "array", "object"):
         # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
@@ -798,7 +816,7 @@ class ArgStream:
             return False
         spec = self.params.get(name)
         return isinstance(spec, dict) and (_coerced_kind(spec) in ("number", "boolean", "array", "object")
-                                           or _marked(spec))
+                                           or _marked(spec) or _number_or_text(spec))
 
     def feed(self, chunk):
         if self.buffer is not None:
@@ -1088,6 +1106,12 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
                     chosen.add(idx)
 
             cache_indices = chosen
+            if not mark_tail:
+                # A client's compaction: the client replaces its history by the summary, so nothing written for this
+                # request is read again. Only the hint the chat's last request wrote (read now) stays: the flattened dialog
+                # of OpenCode 2.2.6's automatic compaction was written to the cache (2,281 and 3,075 tokens, v3 run of
+                # 2026-11-07, 3d0b8da709e7, 6a61f23eef9b) and never read.
+                cache_indices = {max(previous)} if previous else set()
 
         for index, part in enumerate(history):
             should_cache = index in cache_indices
@@ -1744,8 +1768,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
     # The summary of a client's compaction is a side request: the client replaces its history by that summary and
-    # never continues this one (see where the branches are recorded below, and what keepwarm does after it).
-    side_request = client_context.current().get("client_task") == client_context.COMPACTION
+    # never continues this one (see where the branches are recorded below, and what keepwarm does after it). So is a
+    # client's own one-shot job (client_context.BACKGROUND: Codex's memory extraction of an old thread).
+    task = client_context.current().get("client_task")
+    side_request = task in client_context.SIDE_TASKS
     # A hint on the result of a tool is new to upstream: `rebuild` makes the same messages without one, for the retry that
     # a refusal of it gets (see below). It stays None unless a body carries such a hint.
     hint_results = _hints_tool_results(model_provider.get("model"))
@@ -1790,7 +1816,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             sum(b["type"] in ("thinking", "redacted_thinking") for b in replayed),
             sum(b["type"] == "tool_call" for b in replayed)))
     else:
-        if history is not None and history.branches and client is not None:
+        # A one-shot job continues nothing of the session it runs on, so it changes nothing of it either: Codex can run
+        # its memory jobs on the session of a chat, whose signed history, cache points and keepwarm body stay the chat's.
+        background = task == client_context.BACKGROUND
+        if history is not None and history.branches and client is not None and not background:
             # Never attach an old signature to a rebuilt/edited prefix.
             session._cached_turn_ends = []
             session._warm_body = None
@@ -1798,8 +1827,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                          "warn", reason="prefix_or_settings_mismatch",
                          restored=any(getattr(branch, "restored", False) for branch in history.branches),
                          why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
-        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session,
-                          mark_tail=not side_request)
+        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks,
+                          session=None if background else session, mark_tail=not side_request)
         cold = (native_history.unsigned_tool_transcript(client)
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
         if cold is not None:
@@ -1864,16 +1893,19 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             thinking_seen=thinking_seen)
         if rejected:
             outcome = "rejected"
-        if body.get("openAICacheKey"):
+        # A one-shot job is judged by nobody's keepwarm and moves no cache key of the session: its verdict and its prefix
+        # are its own, and a chat it shares the session with keeps its own.
+        own = task != client_context.BACKGROUND
+        if body.get("openAICacheKey") and own:
             # Only a usable answer (never an empty, thinking-only, cut off, failed or cancelled turn) may
             # become the keepwarm body; any other verdict stops the cycle until a good turn comes.
             session._turn_outcome = outcome
-        if body.get("openAICacheKey") and not rejected:
+        if body.get("openAICacheKey") and not rejected and own:
             prior_key = getattr(session, "_last_cache_key", None)
             if prior_key and prior_key != body["openAICacheKey"]:
                 # A new key means the upstream prefix cache starts from zero: every
                 # history breakpoint misses and the whole prompt is written again.
-                journal.emit("cache.key_changed", "╨Ъ╤Н╤И-╨║╨╗╤О╤З ╤Б╨╝╨╡╨╜╨╕╨╗╤Б╤П тАФ ╨┐╤А╨╡╤Д╨╕╨║╤Б ╨▒╤Г╨┤╨╡╤В ╨┐╨╡╤А╨╡╨╖╨░╨┐╨╕╤Б╨░╨╜", "info",
+                journal.emit("cache.key_changed", "Кэш-ключ сменился — префикс будет перезаписан", "info",
                              old=prior_key, new=body["openAICacheKey"], model=body.get("model"),
                              tools=len(body.get("tools") or []),
                              thread=journal.tag(getattr(session, "thread_id", None)))
@@ -1916,10 +1948,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             errored = True
             settle()
 
-    if body.get("openAICacheKey"):
+    if body.get("openAICacheKey") and task != client_context.BACKGROUND:
         session._turn_body = body
         # Start the scheduler with the turn, not after it: a session's first long
-        # turn needs its anchored during-turn ping too.
+        # turn needs its anchored during-turn ping too. A one-shot job has no next request to keep a prefix for.
         _ensure_keepwarm(session, cfg)
 
     def open_stream(sent):
@@ -1997,7 +2029,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                     _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
                 _ASSIST_ONLY.add(model_provider.get("model"))
                 print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
-                journal.emit("upstream.assist_retry", "╨Ь╨╛╨┤╨╡╨╗╤М ╤В╨╛╨╗╤М╨║╨╛ ╨▓ ╤Б╨┐╨╕╤Б╨║╨╡ Assist тАФ ╨┐╨╛╨▓╤В╨╛╤А ╨▒╨╡╨╖ ╨╝╨░╤А╨║╨╡╤А╨░", "warn",
+                journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
                              model=model_provider.get("model"))
                 body = {key: value for key, value in body.items() if key != "metadata"}
                 if body.get("openAICacheKey"):

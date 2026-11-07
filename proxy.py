@@ -129,8 +129,6 @@ class Runtime:
         self.runner.prompts = self.prompts
         # Requests that carry no conversation identity find theirs by their history (conversation_infer).
         self.conversations = conversation_infer.ConversationIndex()
-        # The tools a client declared before, for a client that declares them late (tool_union).
-        self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL))
         # Conversations Claude Code's tool search was refused for (tool_search_policy).
         self.tool_search_guard = tool_search_policy.LoopGuard()
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
@@ -140,10 +138,16 @@ class Runtime:
         self.admin = admin_module.Admin(self)
         # After the journal is configured: scanning the stored conversations reports what it removed.
         self.pool.attach_store(conversation_state.open_store(cfg))
-        # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
+        # Where what the relay learns about its clients is kept between runs (the union of tools, the skill locations):
+        # the folder of the stored conversations, which the store above has made.
         folder = cfg.get("conversation_state_dir") if cfg.get("conversation_state", True) else None
+        folder = os.fspath(folder) if folder and os.path.isdir(folder) else None
+        # The tools a client declared before, for a client that declares them late (tool_union).
+        self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL),
+                                               path=os.path.join(folder, tool_union.FILE_NAME) if folder else None)
+        # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
         self.stabilizer = prompt_stabilizer.Stabilizer(
-            cfg, os.path.join(os.fspath(folder), prompt_stabilizer.FILE_NAME) if folder and os.path.isdir(folder) else None)
+            cfg, os.path.join(folder, prompt_stabilizer.FILE_NAME) if folder else None)
 
     def submit(self, coroutine):
         with self._lifecycle_lock:
@@ -728,6 +732,14 @@ def make_handler(runtime: Runtime):
             # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
             # identity, so that every event of the request, the transport's included, says what it is.
             parsed.client_task = client_context.client_task(parsed)
+            if (not parsed.client_task and parsed.request_purpose == "generation" and parsed.structured_output
+                    and prompt_policy.prompt_client(client_context.current(), self.headers) == "codex"):
+                # A tool-less request of Codex for a strict schema is one of its own one-shot jobs: the memory
+                # extraction of an old thread (codex-rs memories/write phase1: no tools, output_schema_strict, one
+                # request per thread). Nothing continues it, so it is not kept warm, keeps no branch, writes nothing
+                # past what it reads and leaves the session it runs on as it was. Its main agent and its sub-agents (the
+                # guardian's reused trunk too) always carry tools.
+                parsed.client_task = client_context.BACKGROUND
             if parsed.client_task:
                 client_context.bind({**client_context.current(), "client_task": parsed.client_task})
             # The pool is asked about the accounts this very request would run on (acquire reads the same plan). The plan
@@ -740,7 +752,7 @@ def make_handler(runtime: Runtime):
             parsed = self._apply_prompts(data, parsed, dialect, len(raw), fetches)
             parsed.client_chars = client_chars
             self._stabilize_prompt(parsed)
-            self._carry_tools(parsed)
+            self._carry_tools(parsed, data)
             fetches.found.clear()  # the parsed request holds the images; no second reference for the length of a stream
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"),
@@ -837,10 +849,13 @@ def make_handler(runtime: Runtime):
             if identity.get("client") not in ("claude-code", "claude-desktop"):
                 return
             version = tool_search_policy.client_version(self.headers.get("user-agent"))
-            where = tool_search_policy.deferral(data) if version and version >= tool_search_policy.MIN_VERSION else None
-            if where is None:
+            if not (version and version >= tool_search_policy.MIN_VERSION):
                 return
+            where = tool_search_policy.deferral(data)
             conversation = (identity.get("client_session_id") or "", identity.get("agent") or "")
+            if where is None:
+                runtime.tool_search_guard.forgive(conversation)  # the client fell back: no loop
+                return
             if not runtime.tool_search_guard.allow(conversation):
                 journal.emit("tool_search.refusal_loop",
                              "Claude Code продолжает слать tool search после отказов: запрос обслужен как есть", "warn",
@@ -853,14 +868,20 @@ def make_handler(runtime: Runtime):
             error.expected = True
             raise error
 
-        def _carry_tools(self, parsed):
+        def _carry_tools(self, parsed, data=None):
             """Give a client of the listed families the union of the tools it has declared before and this request's.
 
             Codex starts its MCP servers after its first request, so request 1 carries 44-46 tools and request 2 50-60, and
-            every such change rewrites the cached prefix (31 credits at 334k tokens). See tool_union."""
+            every such change rewrites the cached prefix (31 credits at 334k tokens). See tool_union.
+
+            A request that carries Claude Code's tool search (served as it asks when claude_tool_search is "native", or after
+            the guard saw a loop) declares the deferred list, a handful of tools, ToolSearch and a placeholder: neither the
+            union nor the list of a session that loads its tools up front may be mixed with it."""
             union = getattr(runtime, "tool_union", None)
             families = cfg.get("tool_union_clients") or ()
             if union is None or not families or not parsed.tools:
+                return
+            if isinstance(data, dict) and tool_search_policy.deferral(data) is not None:
                 return
             family = prompt_policy.prompt_client(client_context.current(), self.headers)
             if family not in families:

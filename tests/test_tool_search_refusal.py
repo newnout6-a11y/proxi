@@ -136,6 +136,25 @@ def test_a_subagent_is_counted_on_its_own(relay):
     assert ask(relay, request(), {**CLAUDE, "x-claude-code-agent-id": "agent-1"})[0] == 400
 
 
+def test_the_refusals_after_each_compaction_do_not_add_up_while_the_client_falls_back_each_time(relay):
+    """Claude Code asks for tool search again after every compaction and falls back after two refusals. Four such rounds in
+    a few minutes are 8 refusals: the guard tripped at the third compaction (the deferred list was served, tools 29 -> 15,
+    23,247 tokens written, 9bf6cbebe345). A request without tool search in between means the client is not looping."""
+    seq = journal.JOURNAL.last_seq
+    for _ in range(4):
+        assert [ask(relay, request())[0] for _ in range(2)] == [400, 400]
+        assert ask(relay, request(deferred=False))[0] == 200
+    assert not stored(seq, "tool_search.refusal_loop")
+
+
+def test_the_guard_counts_refusals_in_a_row_only():
+    guard = policy.LoopGuard(limit=6, window=600, clock=lambda: 0.0)
+    for _ in range(4):
+        assert guard.allow("c") and guard.allow("c")
+        guard.forgive("c")
+    assert [guard.allow("c") for _ in range(7)] == [True] * 6 + [False]
+
+
 def test_the_retry_without_tool_search_keeps_its_tools_in_the_list_the_model_gets(relay):
     body = request(deferred=False)
     body["tools"].append({"name": "mcp__demo__ping", "description": "Ping", "input_schema": SCHEMA})

@@ -374,7 +374,7 @@ def test_startup_keeps_the_stored_conversations_in_the_state_directory(tmp_path,
 # -- configuration ----------------------------------------------------------------------------------------------------
 def test_the_settings_have_the_documented_defaults(tmp_path, monkeypatch):
     loaded = load_with(tmp_path, monkeypatch)
-    assert [loaded[key] for key in SETTINGS] == [True, "", 200, 24 * 3600, 32 * 1024 * 1024, 512 * 1024 * 1024]
+    assert [loaded[key] for key in SETTINGS] == [True, "", 1000, 24 * 3600, 32 * 1024 * 1024, 512 * 1024 * 1024]
     assert all(loaded[key] == config.DEFAULTS[key] for key in SETTINGS)
     chosen = load_with(tmp_path, monkeypatch, conversation_state=False, conversation_state_dir="x",
                        conversation_state_max_conversations="7", conversation_state_ttl=60,

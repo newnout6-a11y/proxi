@@ -588,6 +588,9 @@ class Journal:
             if isinstance(account, dict):
                 values += [account.get(key) for key in ("cookie", "xsrf", "thread_id", "page_uuid")]
                 values += list(account.get("cookie_values") or [])
+        # The search provider's key lives in the environment, never in the config, and it still turned up in the journal:
+        # a client's tool call that set it (a shell command) was journaled with its arguments (v3 run of 2026-11-07).
+        values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))
         return [value for value in values if isinstance(value, str) and len(value) >= 4]
 
     def _clean(self, value, secrets, depth=0):
