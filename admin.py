@@ -1288,9 +1288,16 @@ class Admin:
         handler.send_header("content-length", str(len(body)))
         handler.send_header("x-request-id", handler.request_id)
         security_headers(handler)
+        # The status line is out from here on: a failure must not answer a second time (_respond_error reads this flag).
+        handler._response_started = True
         handler.end_headers()
         if handler.command != "HEAD":
-            handler.wfile.write(body)
+            try:
+                handler.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                # The browser went away mid-download (a reload while the bundle loads): not an error of the relay, which
+                # used to log it as a 500 internal error and try to send that 500 on the same connection.
+                handler.close_connection = True
 
     def _events(self, query):
         data = self.runtime.journal.query(
@@ -1318,6 +1325,11 @@ class Admin:
         handler.end_headers()
         # The status line is out: a failure from here on closes the connection instead of writing a second one into the body.
         handler._response_started = True
+        # A journal stream lasts up to STREAM_MAX_SECONDS and every open admin tab keeps one: it gives its max_workers slot
+        # back, as an idle keep-alive connection does, or with a small max_workers model requests waited behind the admin.
+        if getattr(handler, "_holds_slot", False):
+            handler._holds_slot = False
+            handler.server.release_slot()
         writer = sse.StreamWriter(handler)
         writer.event("hello", {"last_seq": events.last_seq, "server_time": time.time()})
         deadline = time.monotonic() + STREAM_MAX_SECONDS
