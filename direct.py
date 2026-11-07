@@ -1299,15 +1299,39 @@ class _HeadGate:
         self.started, self.released, self.opened_at, self.used_at, self.owner = False, False, now, 0.0, owner
 
 
+# A head shorter than this (system text and tool definitions together) cannot be a provider cache entry: the smallest
+# cacheable prefix is 1,024 tokens, about 2,048 characters of Cyrillic or code. Gating such a head only delays requests:
+# three parallel requests with the system "Be brief." waited for the first one's first event, 1.5 s each, for nothing.
+HEAD_MIN_CHARS = 2048
+
+
+def _attribution_only(block):
+    """A system block that holds only Claude Code's attribution line, which Anthropic consumes and does not cache."""
+    text = block.get("text") if isinstance(block, dict) else None
+    return isinstance(text, str) and text.startswith("x-anthropic-billing-header:") and "\n" not in text
+
+
 def _head_key(body):
     """The digest of what a body shares with every request of its kind: the model, the tools and the system message that
-    carries the head's cache hint. None for a body without such a head."""
+    carries the head's cache hint. None for a body without such a head, or with one too small to be cached.
+
+    Claude Code's attribution line is left out: it carries a fingerprint of each conversation's (each sub-agent's) first
+    message, so sub-agents started together with the same head never shared one write, though upstream ignores the line
+    and their cached prefix is the same."""
     messages = body.get("messages") or []
     first = messages[0] if messages and isinstance(messages[0], dict) else None
-    if first is None or first.get("role") != "system" or not any(
-            isinstance(block, dict) and block.get("cache") for block in first.get("content") or []):
+    if first is None or first.get("role") != "system":
         return None
-    payload = json.dumps([body.get("model"), body.get("tools"), first], sort_keys=True, ensure_ascii=False, default=str)
+    blocks = [block for block in first.get("content") or [] if not _attribution_only(block)]
+    if not any(isinstance(block, dict) and block.get("cache") for block in blocks):
+        return None
+    tools = body.get("tools")
+    size = sum(len(block["text"]) for block in blocks if isinstance(block, dict) and isinstance(block.get("text"), str))
+    size += len(json.dumps(tools, ensure_ascii=False, default=str)) if tools else 0
+    if size < HEAD_MIN_CHARS:
+        return None
+    payload = json.dumps([body.get("model"), tools, {**first, "content": blocks}], sort_keys=True, ensure_ascii=False,
+                         default=str)
     return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
 
 
