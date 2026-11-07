@@ -1303,6 +1303,11 @@ class SessionPool:
     def mode(self):
         return self.cfg["session_mode"]
 
+    def inflight(self, backend):
+        """(turns in flight on `backend`, turns in flight on all accounts): the leases given out and not yet released."""
+        sessions = [record[0] for record in self._active.values()]
+        return sum(1 for session in sessions if getattr(session, "backend", None) is backend), len(sessions)
+
     def _carry_history(self, key, old, new):
         """Put the signed branches of a conversation that changes account into its new session (account_move_keeps_history);
         how many went, 0 when the setting is off or there was nothing to take.
