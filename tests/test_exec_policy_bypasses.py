@@ -1,18 +1,21 @@
-"""Ways around the default allowlist found by the audit of 2026-11-07: each ran any program the model wrote."""
+"""Ways around the default allowlist found by the audits of 2026-11-07 and 2026-11-08: each ran any program the model
+wrote."""
 import json
 from pathlib import Path
 
 import pytest
 
+import config
 import executor
 
 ALLOWLIST = json.loads((Path(__file__).resolve().parents[1] / "config.example.json").read_text(encoding="utf-8"))[
     "exec_allowlist"]
+DEFAULTS = config.DEFAULTS["exec_allowlist"]
 
 
-def verdict(cmd):
+def verdict(cmd, allowlist=ALLOWLIST):
     try:
-        executor.check_policy(cmd, "allowlist", ALLOWLIST)
+        executor.check_policy(cmd, "allowlist", allowlist)
     except executor.PolicyError:
         return "denied"
     return "allowed"
@@ -75,3 +78,50 @@ def test_ordinary_long_options_are_not_taken_for_abbreviations(cmd):
 ])
 def test_reading_commands_still_run(cmd):
     assert verdict(cmd) == "allowed"
+
+
+@pytest.mark.parametrize("allowlist", [DEFAULTS, ALLOWLIST], ids=["defaults", "example"])
+@pytest.mark.parametrize("cmd", [
+    "powershell -NoProfile -Command Get-Date ; dir (whoami.exe)",
+    "powershell -NoProfile -Command Get-Date;dir (whoami.exe)",
+    "pwsh -NoProfile -c Get-Date ; dir ([IO.File]::WriteAllText('pwned.txt','x'))",
+    "pwsh -c Get-Date;type ([IO.File]::WriteAllText('pwned.txt','x'))",
+    'cmd /c "powershell -Command Get-Date ; dir (whoami.exe)"',
+    'cmd /c "pwsh -c Get-Date;dir (whoami.exe)"',
+    "powershell -NoProfile -Command Get-Date\rdir (whoami.exe)",
+    "pwsh -c Get-Date\rtype (whoami.exe)",
+    'cmd /c "powershell -Command Get-Date\rdir (whoami.exe)"',
+])
+def test_a_powershell_statement_behind_a_semicolon_or_a_carriage_return_is_not_skipped(cmd, allowlist):
+    """cmd.exe splits a line neither at ';' nor at a carriage return (it drops the CR), so powershell.exe got the whole
+    line and ran `(whoami.exe)`, while the policy split there and judged Get-Date alone as the body and dir as a command
+    of its own (audit of 2026-11-08: a file written by a statement the check never saw)."""
+    assert verdict(cmd, allowlist) == "denied"
+
+
+@pytest.mark.parametrize("cmd", [
+    "git status\ngit log", "git status\r\ngit log", "powershell -Command Get-Date\ndir",
+    'powershell -Command "Get-ChildItem\nGet-Date"', 'echo "a\nb"', 'cmd /c "dir\necho x"',
+])
+def test_a_line_break_is_refused_because_cmd_runs_only_the_first_line(cmd):
+    """cmd.exe stops at the first line feed, inside quotes too: the policy judged lines that never ran."""
+    assert verdict(cmd, DEFAULTS) == "denied"
+
+
+@pytest.mark.parametrize("cmd", [
+    'powershell -Command "Get-ChildItem; Get-Date"', 'pwsh -c "Get-ChildItem;Get-Date"',
+    'powershell -NoProfile -Command "Get-Content a.txt ; Select-String foo a.txt"',
+    'findstr "a;b" x.txt', 'echo "a ; b"', 'git log --grep="fix;" -1',
+])
+def test_a_semicolon_inside_quotes_still_runs(cmd):
+    """Inside a quoted PowerShell body a ';' separates statements that the PowerShell rules judge one by one; in an
+    argument it is text."""
+    assert verdict(cmd, DEFAULTS) == "allowed"
+
+
+@pytest.mark.parametrize("cmd", [
+    'powershell -Command "Get-Date; echo (whoami.exe)"', 'pwsh -c "Get-Date;Start-Process calc"',
+    'powershell -Command "Get-Date ; Remove-Item x.txt"',
+])
+def test_a_quoted_statement_after_a_semicolon_is_judged_by_the_powershell_rules(cmd):
+    assert verdict(cmd, DEFAULTS) == "denied"

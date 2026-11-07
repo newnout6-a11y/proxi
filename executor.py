@@ -30,7 +30,10 @@ CMD_LETS_RE = re.compile("^(" + CMD_LETS + r")\b", re.IGNORECASE)
 
 
 def split_segments(cmd: str, powershell=False, reject_redirection=False):
-    """Split a command line on shell separators, ignoring ones inside quotes."""
+    """Split a command line on shell separators, ignoring ones inside quotes.
+
+    reject_redirection is the allowlist's reading: it refuses a redirection and, on a cmd.exe line, a ';' outside quotes.
+    """
     segments, buf = [], []
     quote = ""
     chars = list(cmd or "")
@@ -50,6 +53,12 @@ def split_segments(cmd: str, powershell=False, reject_redirection=False):
             continue
         if reject_redirection and ch in "<>":
             raise PolicyError("redirection requires allow_all")
+        if reject_redirection and not powershell and ch == ";":
+            # cmd.exe does not end a command at ';': `powershell -Command Get-Date ; echo (whoami.exe)` gave PowerShell
+            # both statements, while a split here judged Get-Date alone as its body and echo as a command of its own
+            # (audit of 2026-11-08). Between PowerShell statements a ';' belongs inside the quoted body.
+            raise PolicyError("';' outside quotes requires allow_all: cmd.exe does not split commands there "
+                              "(join commands with &&, quote a PowerShell body)")
         two = cmd[i:i + 2]
         if two in ("&&", "||"):
             segments.append("".join(buf))
@@ -330,6 +339,11 @@ def check_policy(cmd: str, policy: str, allowlist) -> None:
         raise PolicyError("local command execution is disabled")
     if not cmd or re.search(r"[%!^]", cmd):
         raise PolicyError("cmd expansion/escaping is not supported by allowlist")
+    if re.search(r"[\r\n]", cmd):
+        # cmd.exe runs a line up to its first line feed, inside quotes too, and drops every carriage return: the lines
+        # after the first were judged and never ran, and a CR glued the next line onto a PowerShell body that PowerShell
+        # then evaluated unchecked (audit of 2026-11-08).
+        raise PolicyError("a line break requires allow_all: cmd.exe runs only the first line (join commands with &&)")
     patterns = [re.compile(p, re.IGNORECASE) for p in (allowlist or [])]
     _check_segments(split_segments(cmd, reject_redirection=True), patterns)
 
