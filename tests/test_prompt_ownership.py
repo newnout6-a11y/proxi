@@ -280,7 +280,10 @@ def test_direct_exec_budget_counts_retained_chunks_and_trims_only_new_output(tmp
     bodies, commands = [], []
     def opener(req, **kw):
         bodies.append(json.loads(req.data))
-        return response(text('<exec_command>synthetic-command</exec_command>' if len(bodies) == 1 else 'done'), *END)
+        # With the cap, the reply after the one command asks for another, so the summary request is sent and its body is
+        # held to the budget too (a reply that answers ends the turn at the cap: test_exec_step_cap.py).
+        asks = len(bodies) == 1 or (step_cap and len(bodies) == 2)
+        return response(text('<exec_command>synthetic-command</exec_command>' if asks else 'done'), *END)
     monkeypatch.setattr(direct.urllib.request, 'urlopen', opener)
     monkeypatch.setattr(executor, 'run_command', lambda command, *a, **kw: (commands.append(command) or 0, 'ж' * output_chars))
     p = request([{'role': 'user', 'content': 'ж' * 100}], tools=[], system='')

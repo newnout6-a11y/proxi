@@ -1618,8 +1618,11 @@ class TurnRunner:
                     can_exec = self._can_exec(exec_steps) and not final_summary and not client_owns_instructions
                     command = executor.extract_command(final_text) if can_exec and not client_has_tools else None
 
-                    if not final_summary and exec_steps and not self._can_exec(exec_steps):
-                        # Explicit step cap reached (max_exec_turns > 0 only).
+                    if (not final_summary and exec_steps and not self._can_exec(exec_steps)
+                            and (executor.extract_command(final_text) or not final_text.strip())):
+                        # Explicit step cap reached (max_exec_turns > 0 only) by a reply that asks for one more command, or by
+                        # an empty one. A reply that answers without a command is the final answer: the client has it already,
+                        # and asking again paid one more request and streamed a second answer after it.
                         final_summary = True
                         summary = ("\n\n[ИТОГ] Команды больше не выполняй. "
                                    "Дай итоговый ответ по уже собранной информации, на русском.")
