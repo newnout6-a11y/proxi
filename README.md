@@ -1388,8 +1388,11 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   the summary, try to stick to this template» (v1.14.19–v1.14.20), «Create a new anchored summary…» или «Update the
   anchored summary below…» (v1.14.21–v1.18.16), «Here is the conversation so far:» (v1.18.17–v1.19.5). Relay узнаёт
   сжатие по началу сообщения (весь текст не нужен: он меняется от релиза к релизу), по этим заголовкам, по имени агента
-  `compaction` (плагин OpenCode 1.x), по явному `X-Proxi-Task: compaction` и по `x-codex-turn-metadata` Codex
-  (`request_kind: compaction`). Метка `client_task: "compaction"` стоит у
+  `compaction` (плагин OpenCode 1.x), по явному `X-Proxi-Task: compaction`, по `x-codex-turn-metadata` Codex
+  (`request_kind: compaction`) и по началу инструкции DeepSeek Harness («You are now acting as a compaction engine for this
+  AI coding assistant.»: Harness сжимает самый старый кусок истории с тем же system, теми же tools и теми же первыми
+  сообщениями чата, без заголовка и без идентификатора сессии; сводка такого запроса не греется: раньше его тело пинговали
+  три раза, а Harness его больше не присылает). Метка `client_task: "compaction"` стоит у
   каждого события запроса в журнале (`turn.begin`, `upstream.usage`, `turn.end`, `native_history.*`), в консоли —
   `TASK: compaction`, в админке — «сжатие» у хода. `request_purpose`, повторы пустого ответа и профиль промпта от метки
   не зависят: сжатие идёт по профилю чата, иначе его head отличался бы от head чата и переписал бы кэш. Ответ сжатия

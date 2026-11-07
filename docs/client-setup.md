@@ -336,6 +336,27 @@ Harness 0.2.2-alpha.3 and later also offer the explicit way, the `llm-pi-ai/requ
 sets `x-proxi-session-id` to the hook's `request.sessionId` (and `x-proxi-client: harness`) gives an exact identity that
 survives an edited history and a relay restart. It is optional now.
 
+### Compaction in Harness
+
+Harness condenses the oldest span of its history with one more request (`@deepseek-ai/dsh-compaction-basic`, `summarizer.ts`;
+`/compact` and the retry after a context overflow send the same one): the chat's system prompt, the same tools and the first
+messages of the chat byte for byte, then one user message that opens "You are now acting as a compaction engine for this AI
+coding assistant." There is no header and no session id, so the relay knows it by that opening (`client_task: "compaction"`).
+Harness replaces the span with the summary and never sends that body again, so the relay puts no cache hint on the instruction
+and stops the keepwarm of the session with the reason `compacted` once the summary is back. Before that each compaction was an
+ordinary turn and its body was pinged three times (every 240 s until the session had been idle for 900 s): 7 of 7 compactions of
+the runs of 2026-11-07, 0.5 to 1.1 credits for bodies of 14.7-18.7k tokens, and the price of a ping grows with the prefix.
+
+On GLM-5.3 the request reads the chat's cache: five of seven compactions read 97-98% of their 14.7-18.7k tokens (0.54-0.67
+credits); two read 43-44%, a partial hit of the provider's cache that the chat's own steps show now and then, on the same or on
+another account. Nothing is signed there, so no thinking can be lost. On a Claude model the compaction cannot continue the signed
+history: its messages are the first ones of the chat's last request, not that request and one more, so there is no branch to
+resume (`native_history.reset`, reason `history:N_of_M_messages`, then `cold` without the thinking blocks) and the provider's
+cache ends at the system prompt and the tools. Three compactions of a chat of 33-35k tokens (Sonnet 5.5) read 8,060 tokens and
+wrote 12.0-12.8k of a span of about 20k: 0.80-0.90 credits, about three times what reading the span would cost. With the label the
+span is plain input and not a write, and still not read. Continuing a signed branch from a shorter request needs a lookup of the
+conversation by a prefix of its history and a resume of a branch by a prefix of its messages; neither exists.
+
 ### Historical Harness setup — 0.1.5-rc.2
 
 The earlier installed `DeepSeek Harness.lnk` setup launched the
