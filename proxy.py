@@ -841,10 +841,13 @@ def make_handler(runtime: Runtime):
             if identity.get("client") not in ("claude-code", "claude-desktop"):
                 return
             version = tool_search_policy.client_version(self.headers.get("user-agent"))
-            where = tool_search_policy.deferral(data) if version and version >= tool_search_policy.MIN_VERSION else None
-            if where is None:
+            if not (version and version >= tool_search_policy.MIN_VERSION):
                 return
+            where = tool_search_policy.deferral(data)
             conversation = (identity.get("client_session_id") or "", identity.get("agent") or "")
+            if where is None:
+                runtime.tool_search_guard.forgive(conversation)  # the client fell back: no loop
+                return
             if not runtime.tool_search_guard.allow(conversation):
                 journal.emit("tool_search.refusal_loop",
                              "Claude Code продолжает слать tool search после отказов: запрос обслужен как есть", "warn",
