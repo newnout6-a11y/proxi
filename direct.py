@@ -1276,6 +1276,89 @@ KEEPWARM_NUDGE = ("Keep-alive check: answer right away with the single word OK, 
                   "tool.")
 
 
+# Requests that go upstream at the same moment with one head (tools and system) that no request has cached yet: Claude
+# Code starts several sub-agents of a kind in one message, each with the same 23k-token head, and each wrote it to the
+# cache (cc6707c87d82, 1a360b011428 in the Claude Code test run of 2026-11-07: about 1.1 credits per extra agent). A cache
+# entry can be read only once the response that writes it has begun, so the first of them (the leader) goes at once, and
+# the others wait for its first event, then read the head it wrote. A head used within HEAD_WARM is taken as cached and
+# nothing waits; a follower never waits longer than HEAD_WAIT, nor for a leader that failed or has not started in
+# HEAD_STALE.
+HEAD_WARM = 270.0
+HEAD_WAIT = 10.0
+HEAD_STALE = 30.0
+_HEAD_GATES_MAX = 2048
+_HEAD_GATES = {}
+_HEAD_GATES_LOCK = threading.Lock()
+
+
+class _HeadGate:
+    __slots__ = ("started", "released", "opened_at", "used_at", "owner")
+
+    def __init__(self, now, owner=None):
+        self.started, self.released, self.opened_at, self.used_at, self.owner = False, False, now, 0.0, owner
+
+
+def _head_key(body):
+    """The digest of what a body shares with every request of its kind: the model, the tools and the system message that
+    carries the head's cache hint. None for a body without such a head."""
+    messages = body.get("messages") or []
+    first = messages[0] if messages and isinstance(messages[0], dict) else None
+    if first is None or first.get("role") != "system" or not any(
+            isinstance(block, dict) and block.get("cache") for block in first.get("content") or []):
+        return None
+    payload = json.dumps([body.get("model"), body.get("tools"), first], sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _claim_head(key, now, owner=None):
+    """("cached", gate) when the head was used within HEAD_WARM, ("follow", gate) when another request is writing it now,
+    ("lead", gate) when this request is the one that writes it. `owner` is the session: a retry of a turn on the session
+    that leads (the only requests a session sends at once) leads again instead of waiting for itself."""
+    with _HEAD_GATES_LOCK:
+        gate = _HEAD_GATES.get(key)
+        if gate is not None and gate.started and now - gate.used_at <= HEAD_WARM:
+            return "cached", gate
+        if (gate is not None and not gate.started and not gate.released and now - gate.opened_at <= HEAD_STALE
+                and (owner is None or gate.owner != owner)):
+            return "follow", gate
+        gate = _HEAD_GATES[key] = _HeadGate(now, owner)
+        if len(_HEAD_GATES) > _HEAD_GATES_MAX:
+            for old in sorted(_HEAD_GATES, key=lambda k: max(_HEAD_GATES[k].used_at, _HEAD_GATES[k].opened_at))[
+                    :len(_HEAD_GATES) - _HEAD_GATES_MAX]:
+                del _HEAD_GATES[old]
+        return "lead", gate
+
+
+def _head_started(gate, key=None):
+    """A response that reads or writes the head has begun: from now on the head is cached for HEAD_WARM."""
+    with _HEAD_GATES_LOCK:
+        gate.started = True
+        gate.used_at = time.monotonic()
+        current = _HEAD_GATES.get(key) if key is not None else gate
+        if key is not None and (current is None or not current.started):
+            _HEAD_GATES[key] = gate  # a follower whose leader failed wrote the head itself
+
+
+def _head_released(key, gate):
+    """The leader ended without a response: nobody waits for it, and the next request leads."""
+    with _HEAD_GATES_LOCK:
+        gate.released = True
+        if _HEAD_GATES.get(key) is gate and not gate.started:
+            del _HEAD_GATES[key]
+
+
+async def _wait_for_head(gate, limit=None):
+    """Wait until the leader's response has begun (or failed), at most `limit` seconds; the reason it stopped waiting."""
+    deadline = time.monotonic() + (HEAD_WAIT if limit is None else limit)
+    while time.monotonic() < deadline:
+        if gate.started:
+            return "leader_started"
+        if gate.released:
+            return "leader_failed"
+        await asyncio.sleep(0.05)
+    return "timeout"
+
+
 def ping_body(body):
     """The request a keep-alive sends: the last body, then one more user message that asks for a one-word answer.
 
@@ -1885,6 +1968,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     wrote_text = thinking_seen = errored = began = False
     failure = None
     settled = False
+    # Requests that go at the same moment with one head nobody has cached: the first writes it, the others wait for its
+    # response to begin and then read it (_claim_head). A retry of this turn on the same session never waits for itself.
+    head_key = _head_key(body) if cfg.get("direct_cache", True) else None
+    head_role, head_gate = _claim_head(head_key, time.monotonic(), id(session)) if head_key else (None, None)
+    head_marked = False
 
     def settle():
         """Record what this turn came to on the session: once, and only while it is still the session's turn.
@@ -1950,9 +2038,12 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 _ensure_keepwarm(session, cfg)
 
     def note(event):
-        nonlocal asked_tool, ended, wrote_text, thinking_seen, errored, began
+        nonlocal asked_tool, ended, wrote_text, thinking_seen, errored, began, head_marked
         # Every attempt announces itself with usage_start before upstream has said anything: not an answer.
         began = began or event.get("type") != "usage_start"
+        if began and head_gate is not None and not head_marked:
+            head_marked = True
+            _head_started(head_gate, head_key)
         kind = event.get("type")
         if kind == "tool_call" and not event.get("partial") and not event.get("invalid"):
             asked_tool = asked_tool or callable_names is None or event.get("name") in callable_names
@@ -1981,6 +2072,13 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 
     try:
         try:
+            if head_role == "follow":
+                waiting_since = time.monotonic()
+                outcome = await _wait_for_head(head_gate)
+                journal.emit("cache.head_wait",
+                             "Запрос ждал начала ответа соседнего запроса с той же головой: голова читается из кэша, "
+                             "а не пишется второй раз", "info", outcome=outcome, model=body.get("model"),
+                             waited_ms=round((time.monotonic() - waiting_since) * 1000))
             async with contextlib.aclosing(open_stream(body)) as stream:
                 async for event in stream:
                     note(event)
@@ -2093,6 +2191,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         raise
     finally:
         settle()
+        if head_role == "lead" and not head_gate.started:
+            _head_released(head_key, head_gate)  # nobody waits for a leader that got no response
 
 
 def _warm_refused(session, busy):
