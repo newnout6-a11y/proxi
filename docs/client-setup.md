@@ -664,7 +664,8 @@ The tools are only for the prefix: Codex takes the last assistant message of its
 reply that calls a tool is dropped (`turn.compaction_tool_call`), the request is asked again with one more user message that asks
 for the summary as text, and a second call sends the request as Codex made it, without tools (the price it had before). The
 models answered in text in 50 of 50 live compactions (gpt-6.1-sol 36, claude-opus-5-5 8, claude-sonnet-5-5 6). The relay keeps
-the tools in memory and per model: after a restart, or when the model changed, the compaction is served as before
+the tools per model, on disk (`chat-tools.json` beside the stored conversations, so a compaction right after a relay restart
+reads the chat's cache too): for a chat it never saw with tools, or when the model changed, the compaction is served as before
 (`codex.compaction_tools_unknown`).
 
 Codex can also compact remotely (`[model_providers.<id>.capabilities] remote_compaction = "v2"`: the chat's request with a

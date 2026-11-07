@@ -146,8 +146,9 @@ class Runtime:
         # The tools a client declared before, for a client that declares them late (tool_union).
         self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL),
                                                path=os.path.join(folder, tool_union.FILE_NAME) if folder else None)
-        # The tools each Codex chat declared last, for the compaction of that chat, which Codex sends without any.
-        self.chat_tools = compaction_tools.ChatTools()
+        # The tools each Codex chat declared last, for the compaction of that chat, which Codex sends without any; kept on disk.
+        self.chat_tools = compaction_tools.ChatTools(
+            path=os.path.join(folder, compaction_tools.FILE_NAME) if folder else None)
         # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
         self.stabilizer = prompt_stabilizer.Stabilizer(
             cfg, os.path.join(folder, prompt_stabilizer.FILE_NAME) if folder else None)
