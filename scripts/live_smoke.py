@@ -75,7 +75,8 @@ def test_streaming_openai():
                 continue
             if s.startswith("data: "):
                 chunk = json.loads(s[6:])
-                delta = chunk["choices"][0]["delta"].get("content", "")
+                choices = chunk.get("choices") or []  # the last chunk carries only usage
+                delta = choices[0].get("delta", {}).get("content", "") if choices else ""
                 if delta:
                     collected.append(delta)
     full_text = "".join(collected)
@@ -103,7 +104,8 @@ def test_local_exec_and_context():
                 continue
             if s.startswith("data: "):
                 chunk = json.loads(s[6:])
-                delta = chunk["choices"][0]["delta"].get("content", "")
+                choices = chunk.get("choices") or []  # the last chunk carries only usage
+                delta = choices[0].get("delta", {}).get("content", "") if choices else ""
                 if delta:
                     collected.append(delta)
                     sys.stdout.write(delta)
