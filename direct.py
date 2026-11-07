@@ -2182,19 +2182,27 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 # the Assist list, which is the same route without the agent marker.
                 if not assist:
                     raise
-                if len(_ASSIST_ONLY) > 200:
-                    # Flush only self-learned names: wiping the proven seeds would make
-                    # known assist models pay a 400 + retry cycle all over again.
-                    _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
-                _ASSIST_ONLY.add(model_provider.get("model"))
+                model_name = model_provider.get("model")
                 print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
                 journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
-                             model=model_provider.get("model"))
+                             model=model_name)
                 body = {key: value for key, value in body.items() if key != "metadata"}
                 if body.get("openAICacheKey"):
                     session._turn_body = body
+                learned = False
                 async with contextlib.aclosing(open_stream(body)) as stream:
                     async for event in stream:
+                        if not learned and event.get("type") != "usage_start":
+                            # Learned only once the request without the marker is answered, as the other fallbacks are:
+                            # "not available right now" also comes for a while from a model that is on the App Builder list
+                            # (or from one account of a pool), and the retry then fails too. Learned before it, the model was
+                            # sent without the marker by every account until a restart, and every request of it failed.
+                            learned = True
+                            if len(_ASSIST_ONLY) > 200:
+                                # Flush only self-learned names: wiping the proven seeds would make
+                                # known assist models pay a 400 + retry cycle all over again.
+                                _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
+                            _ASSIST_ONLY.add(model_name)
                         note(event)
                         yield event
         reply = getattr(session, "_direct_reply", None)

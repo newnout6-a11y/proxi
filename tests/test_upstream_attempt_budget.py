@@ -399,3 +399,32 @@ def test_http_error_exposes_final_diagnostic_and_attempt_count(relay, stream):
         assert status == 502
     assert result["diagnostic_id"] == "response-diag" and result["upstream_attempts"] == 5
     assert result["error"]["code"] == "upstream_empty_turn"
+
+
+def test_a_model_is_learned_as_assist_only_only_once_the_request_without_the_marker_is_answered(harness, monkeypatch):
+    # "not available right now" comes for a while from a model on the App Builder list too, and the retry without the marker
+    # then fails as well (Assist refuses a managed key): learned before that, every later request of the model failed.
+    original = direct.urllib.request.urlopen
+    posts = []
+    monkeypatch.setattr(direct, "_ASSIST_ONLY", set(direct._ASSIST_SEEDS))
+    model = request(FIRST).entry.get("id") or "claude-opus-5-5"
+
+    def refused(req, **kw):
+        posts.append(json.loads(req.data))
+        if "metadata" in posts[-1]:
+            raise urllib.error.HTTPError(req.full_url, 400, "unavailable", {},
+                                         io.BytesIO(b'{"message":"model is not available right now"}'))
+        raise urllib.error.HTTPError(req.full_url, 422, "assist", {},
+                                     io.BytesIO(b'{"message":"not available when using Retool managed key for Assist"}'))
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", refused)
+    send(harness)
+    assert posts and "metadata" in posts[0]
+    assert not (direct._ASSIST_ONLY - direct._ASSIST_SEEDS)  # nothing learned from a retry that failed
+    posts.clear()
+    monkeypatch.setattr(direct.urllib.request, "urlopen", lambda req, **kw: (posts.append(json.loads(req.data)),
+                                                                             original(req, **kw))[1])
+    harness.success = None
+    send(harness)
+    assert posts and "metadata" in posts[0]  # the model recovered: its requests carry the marker again
+    assert model not in direct._ASSIST_ONLY - direct._ASSIST_SEEDS
