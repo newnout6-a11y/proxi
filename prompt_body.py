@@ -817,8 +817,7 @@ class _Tool:
 
     def __init__(self, top, holder, item, name, namespace=None):
         self.top, self.holder, self.item = top, holder, item
-        function = item.get("function")
-        self.fields = function if isinstance(function, dict) else item
+        self.fields = _tool_fields(item)
         self.names = (namespace + "." + name, name) if namespace else (name,)
 
     @property
@@ -826,11 +825,20 @@ class _Tool:
         return self.names[0]
 
 
+def _tool_fields(item):
+    """Where a tool's name and description live: "function" of a function tool, "custom" of a Chat custom tool in its nested
+    form ({type: custom, custom: {name}}, which validate accepts; the edits used to miss it), else the tool itself."""
+    for field in ("function", "custom"):
+        nested = item.get(field)
+        if isinstance(nested, dict) and (field == "function" or item.get("type") == "custom"):
+            return nested
+    return item
+
+
 def _tool_name(item):
     if not isinstance(item, dict):
         return None
-    function = item.get("function")
-    name = (function if isinstance(function, dict) else item).get("name")
+    name = _tool_fields(item).get("name")
     return name if isinstance(name, str) and name else None
 
 
@@ -856,8 +864,8 @@ def _collect_tools(tools):
 def _choice_names(choice):
     names = set()
     if isinstance(choice, dict):
-        function = choice.get("function")
-        for holder in (choice, function if isinstance(function, dict) else {}):
+        function, custom = choice.get("function"), choice.get("custom")
+        for holder in (choice, function if isinstance(function, dict) else {}, custom if isinstance(custom, dict) else {}):
             name = holder.get("name")
             if isinstance(name, str) and name:
                 names.add(name)
@@ -885,8 +893,7 @@ def _called_names(out, dialect):
         calls = message.get("tool_calls")
         for call in calls if isinstance(calls, list) else []:
             if isinstance(call, dict):
-                function = call.get("function")
-                name = (function if isinstance(function, dict) else call).get("name")
+                name = _tool_fields(call).get("name")  # a function call, or a Chat custom call {type: custom, custom: {name}}
                 if isinstance(name, str):
                     names.add(name)
         legacy = message.get("function_call")
@@ -894,7 +901,9 @@ def _called_names(out, dialect):
             names.add(legacy["name"])
         content = message.get("content")
         for block in content if isinstance(content, list) else []:
-            if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("name"), str):
+            # server_tool_use: a server tool (web_search) the conversation already used is a called tool too
+            if (isinstance(block, dict) and block.get("type") in ("tool_use", "server_tool_use")
+                    and isinstance(block.get("name"), str)):
                 names.add(block["name"])
     return names
 
