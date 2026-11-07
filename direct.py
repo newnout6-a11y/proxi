@@ -283,7 +283,11 @@ def _js_delta(value):
         elif isinstance(item, float):
             delta += len(_js_number(item)) - len(json.dumps(item))
         elif isinstance(item, int) and abs(item) >= 2 ** 53:
-            delta += len(_js_number(float(item))) - len(str(item))
+            try:
+                written = _js_number(float(item))
+            except OverflowError:  # past the range of a double: JavaScript holds Infinity, and writes null
+                written = "null"
+            delta += len(written) - len(str(item))
     return delta
 
 

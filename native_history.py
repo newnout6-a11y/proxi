@@ -176,8 +176,10 @@ def client_messages(messages, image_converter, *, lead=None):
         return blocks
 
     def call(call_id, name, arguments):
-        if isinstance(arguments, str):
-            arguments = json.loads(arguments or "{}")
+        # Read as the kept reply was read (ReplyCapture, loads_finite): a number past the range of a double (1e400) is null
+        # on both sides. With plain json.loads the echo of such a call held inf and never matched the kept reply, so the
+        # next turn went cold and wrote its whole prefix again.
+        arguments = loads_finite(arguments or "{}") if isinstance(arguments, str) else finite_values(arguments)
         if not call_id or not name or not isinstance(arguments, dict):
             raise ValueError("incomplete tool call")
         return {"type": "tool_call", "toolCallId": call_id,
@@ -319,6 +321,17 @@ def unsigned_tool_transcript(client, without_results=False):
 def _finite_float(text):
     value = float(text)
     return value if math.isfinite(value) else None
+
+
+def finite_values(value):
+    """`value` with every float that is no number (inf, nan) as None, as loads_finite reads it; integers stay exact."""
+    if isinstance(value, dict):
+        return {key: finite_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [finite_values(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _no_constant(name):
