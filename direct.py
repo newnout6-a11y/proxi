@@ -527,11 +527,16 @@ def _keeps_null(convert):
     wanted none of them) or refused to call the tool. With the null branch, which Retool accepts, both said null
     (ultracode audit of the relay, C7). The children of a field are converted by the same function, so one wrapper
     covers the properties and items below it; a tool that is not strict keeps the plain type, as its optional field can
-    be left out."""
+    be left out. Whether the field may be null is asked of the schema it stands for, its $ref and allOf followed: a
+    reference to a nullable definition is as nullable as the definition."""
     @functools.wraps(convert)
     def wrapper(schema, required, *args, **kwargs):
         node = convert(schema, required, *args, **kwargs)
-        return _with_null(schema, node) if _STRICT_TOOL.get() and isinstance(schema, dict) else node
+        if not (_STRICT_TOOL.get() and isinstance(schema, dict)):
+            return node
+        root = args[0] if args else kwargs.get("root")
+        trail = args[1] if len(args) > 1 else kwargs.get("trail", ())
+        return _with_null(_deref(schema, schema if root is None else root, trail)[0], node)
     return wrapper
 
 
