@@ -34,6 +34,26 @@ def no_rate_limit_pauses(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_retry_backoff(request, monkeypatch):
+    """The transport waits 0.5, 1, 2 and 4 s before it asks the same account again after a failed attempt (AttemptBudget.wait).
+
+    That is real time a test only sits through: the retry tests that did not silence it themselves took 1.5 to 3.5 s each (35 s
+    in all, the ones of test_model_and_effort_untouched.py because they use the helpers of test_forced_choice.py without the
+    fixture that file has). The tests that check the delays record them with a wait of their own, and the ones that are about
+    the waiting itself (a clock they control) carry the marker real_backoff."""
+    if request.node.get_closest_marker("real_backoff"):
+        return
+    import upstream_attempts
+
+    def wait(self, delay, cancelled):
+        # What the real one does before it sleeps: an attempt cancelled while it would have waited does not go on.
+        if delay > 0 and (cancelled() or (self.cancel_event and self.cancel_event.is_set())):
+            raise InterruptedError("upstream retry cancelled")
+
+    monkeypatch.setattr(upstream_attempts.AttemptBudget, "wait", wait)
+
+
+@pytest.fixture(autouse=True)
 def pinned_calendar(monkeypatch):
     """Anthropic's retirement dates hide models by the calendar (models._today).
 
