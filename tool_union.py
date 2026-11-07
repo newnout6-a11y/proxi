@@ -43,6 +43,9 @@ _SEARCHED = 40000
 # tool was last declared is written again.
 FILE_NAME = "tool-union.json"
 SAVE_EVERY = 60
+# Running conversations whose tool list is remembered (see ToolUnion.apply): the oldest is forgotten first, and a forgotten
+# conversation is treated as a new one (it gets the whole union, as every conversation did before).
+MAX_CONVERSATIONS = 512
 # The families whose sub-agents differ by kind (Claude Code's Explore agent has fewer tools than a general-purpose one):
 # their system text tells the kinds apart. Its first line, Claude Code's attribution, is left out: its version carries three
 # characters drawn from the session's first message (cc_version=2.1.310.2e4, .6cd, .29f... in one test run), so with it no
@@ -153,6 +156,8 @@ class ToolUnion:
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()
         self._clients = collections.OrderedDict()
+        # (key, conversation) -> {name: definition} of the tools that conversation was last given, newest use last.
+        self._given = collections.OrderedDict()
         self._announced = {}
         self._path = path
         self._dirty = False
@@ -160,8 +165,14 @@ class ToolUnion:
         self._warned = False
         self._load()
 
-    def apply(self, key, tools):
-        """(the tools to give the model, the names that were carried from earlier requests)."""
+    def apply(self, key, tools, conversation=None):
+        """(the tools to give the model, the names that were carried from earlier requests).
+
+        A new conversation (or one without an identity) gets the whole union of its key. A conversation that is already
+        running keeps the list it was given: the tools it declares, plus the ones it was given before and did not declare
+        now, in the definitions it was given. Every conversation of a key used to get the whole union on every request, so
+        a tool one session declared (an IDE's MCP server beside a terminal session) changed the list of every other running
+        one: its whole prefix was written to the cache again and its signed history reset, and again when the tool expired."""
         now = self._clock()
         declared = {}
         for tool in tools:
@@ -187,8 +198,22 @@ class ToolUnion:
                     table.move_to_end(name)
             while len(table) > self._max_tools:
                 table.popitem(last=False)
-            carried = [name for name in table if name not in declared]
-            merged = list(tools) + [table[name][0] for name in carried]
+            given = self._given.get((key, conversation)) if conversation else None
+            if given is None:
+                carried = [name for name in table if name not in declared]
+                extra = [table[name][0] for name in carried]
+            else:
+                carried = [name for name in given if name not in declared]
+                extra = [given[name] for name in carried]
+            merged = list(tools) + extra
+            if conversation:
+                self._given[(key, conversation)] = collections.OrderedDict(
+                    (tool["function"]["name"], tool) for tool in merged
+                    if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+                    and isinstance(tool["function"].get("name"), str))
+                self._given.move_to_end((key, conversation))
+                while len(self._given) > MAX_CONVERSATIONS:
+                    self._given.popitem(last=False)
             self._dirty = True
             due = changed or now - self._saved_at >= SAVE_EVERY
         if due:

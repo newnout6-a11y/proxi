@@ -282,3 +282,27 @@ def test_a_tool_the_profile_hides_is_not_carried_in_from_a_conversation_whose_hi
     assert names_upstream(relay) == ["a", "b", "c"]
     send(relay, ["a", "b", "c"], codex("t2"))  # a new conversation: c is hidden, and must not come back from the union
     assert names_upstream(relay) == ["a", "b"]
+
+
+def test_a_tool_another_session_declares_does_not_change_the_list_of_a_running_conversation(prompt_relay):
+    relay = prompt_relay()
+    send(relay, ["a", "b"], codex("t1"))
+    assert names_upstream(relay) == ["a", "b"]
+    send(relay, ["a", "b", "d"], codex("t2"))  # another session of the same project, with one more server
+    send(relay, ["a", "b"], codex("t1"))       # the running conversation keeps its list: no cache rewrite, no reset
+    assert names_upstream(relay) == ["a", "b"]
+    send(relay, ["a", "b"], codex("t3"))       # a new conversation still gets the whole union (late servers)
+    assert names_upstream(relay) == ["a", "b", "d"]
+
+
+def test_a_running_conversation_keeps_a_carried_tool_after_the_union_expired_it():
+    clock = [1000.0]
+    union = ToolUnion(ttl=100, clock=lambda: clock[0])
+    key = ("codex", "codex_exec", "m", "root", "c:/p", "", "", "")
+    first = parsed_with("a", "b", "late").tools
+    union.apply(key, first, "conv-1")
+    clock[0] += 500  # "late" was not declared by anyone for longer than the ttl
+    merged, carried = union.apply(key, parsed_with("a", "b").tools, "conv-1")
+    assert [tool["function"]["name"] for tool in merged] == ["a", "b", "late"] and carried == ["late"]
+    merged, _ = union.apply(key, parsed_with("a", "b").tools, "conv-2")  # a new conversation: the union has dropped it
+    assert [tool["function"]["name"] for tool in merged] == ["a", "b"]

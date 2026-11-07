@@ -634,6 +634,11 @@ a server comes up. What decides it:
   environment context, or Claude Code's "Primary working directory"), the prompt profile and what it does to tools, and for
   Claude Code the kind of agent (the opening of its system text, the attribution line left out). A conversation in another
   project, with another model, or a sub-agent does not inherit a list. A tool the profile hides is never carried in.
+- **Who gets the whole union.** A new conversation (and a request without a conversation identity). A conversation that is
+  already running keeps the list it was given: what it declares, plus what it was given before, in the same definitions, so a
+  tool another session of the same key declares (an IDE's MCP server beside a terminal session) does not change its list, and
+  neither does the expiry of a carried tool. The relay remembers this for the last 512 conversations, in memory: after a
+  restart a running conversation is given the whole union once.
 - **Which definition.** A tool the client names in this request is the client's, in its newest definition; a tool it does not
   name is carried with the definition it had last. The upstream order is by name, so the order of declaration never matters.
 - **How long.** A tool the client has not declared for `tool_union_ttl` seconds (six hours) is dropped, so a server the user

@@ -957,7 +957,7 @@ def make_handler(runtime: Runtime):
             key = tool_union.client_key(family, self.headers, parsed)
             if key is None:
                 return
-            merged, carried = union.apply(key, parsed.tools)
+            merged, carried = union.apply(key, parsed.tools, getattr(parsed, "conversation_key", None))
             hidden = tool_union.hide_patterns(getattr(parsed, "prompt_plan", None)) if carried else []
             if hidden:
                 # A tool the profile hides is never carried in: another conversation of the key may declare it because its
