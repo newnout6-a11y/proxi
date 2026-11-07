@@ -748,6 +748,15 @@ def make_handler(runtime: Runtime):
                 # past what it reads and leaves the session it runs on as it was. Its main agent and its sub-agents (the
                 # guardian's reused trunk too) always carry tools.
                 parsed.client_task = client_context.BACKGROUND
+                if not cfg.get("codex_memory_jobs", True):
+                    # Switched off in the admin: answered before anything is spent (about 5 credits a thread otherwise).
+                    # A 400 is not retried by Codex: the job fails, and the thread waits for a later start of Codex.
+                    journal.emit("codex.memory_job_refused",
+                                 "Задача памяти Codex отклонена: память Codex выключена в админке (codex_memory_jobs)",
+                                 "info", request_id=self.request_id, model=parsed.requested_model)
+                    error = apierr.bad_request("Codex memory jobs are switched off in the relay (codex_memory_jobs)")
+                    error.expected = True
+                    raise error
             if parsed.client_task:
                 client_context.bind({**client_context.current(), "client_task": parsed.client_task})
             # The pool is asked about the accounts this very request would run on (acquire reads the same plan). The plan

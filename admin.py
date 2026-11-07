@@ -40,7 +40,7 @@ BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
 LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
                  "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort",
                  "max_conversations", "conversation_wait", "account_rate_limit_wait", "account_move_keeps_history",
-                 "journal_max_file_bytes", "journal_keep_files"}
+                 "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 POOL_FIELDS = {"enabled", "priority", "label"}
@@ -158,6 +158,11 @@ def _schema():
          "смена effort сбрасывает её и кэш сообщений, и весь диалог записывается заново. Effort диалога берётся, "
          "только если он не ниже effort запроса: relay никогда не понижает effort ради кэша. Применяется сразу",
          None, None, None, None),
+        ("codex_memory_jobs", "boolean", "Память Codex", "model",
+         "Обслуживать задачи памяти Codex: при запуске он извлекает память из старых тредов, по запросу без "
+         "инструментов на тред, около 5 кредитов каждый. Выключено — relay отвечает на них ошибкой, ничего не "
+         "тратя, и Codex не пополняет память, пока задачи снова не включат. Применяется сразу",
+         None, None, None, None),
         ("show_thinking", "boolean", "Передавать мышление модели", "model",
          "Отдавать клиенту блоки мышления модели, когда Retool их присылает",
          None, None, None, None),
@@ -167,9 +172,12 @@ def _schema():
          "Перечислять в /v1/models модели, для которых у аккаунтов нет ресурса Retool",
          None, None, None, None),
         ("project_context", "boolean", "Контекст проекта", "model",
-         "Добавлять к запросу краткое описание рабочей папки relay", None, None, None, None),
+         "Добавлять краткое описание рабочей папки relay к запросам, которые relay ведёт сам: без системного "
+         "промпта клиента и без его инструментов. Запросы Claude Code, Codex, OpenCode и других клиентов со своими "
+         "инструментами его не получают", None, None, None, None),
         ("context_max_bytes", "integer", "Размер контекста проекта", "model",
-         "Предел описания рабочей папки, которое добавляется к каждому запросу", "байт", 1, 10_000_000, None),
+         "Предел описания рабочей папки relay ([PROJECT CONTEXT]). Оно добавляется только к запросам без системного "
+         "промпта клиента и без его инструментов, не к каждому", "байт", 1, 10_000_000, None),
         ("relay_system_prompt_mode", "string", "Применение инструкций", "instructions",
          "Где применяется собственная роль relay; служебные запросы IDE сохраняют свои инструкции",
          None, None, None, ["standalone", "append", "replace"]),

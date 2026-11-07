@@ -102,6 +102,10 @@ DEFAULTS = {
     # of the signed branch it resends: another effort restarts that history and the provider's cached messages, and the
     # whole conversation is written again. False lets the effort the client sends decide, as for any other request.
     "compaction_keep_effort": True,
+    # Codex's memory jobs: the extraction of memories from an old thread, one tool-less request per thread for a strict schema
+    # (client_task "background"), about 5 credits each on gpt-6.1-terra. False answers them with a 400 before anything is
+    # spent, so Codex makes no memories until they are switched on again; a switch in the admin, applied at once.
+    "codex_memory_jobs": True,
     # A request with tools and no conversation identity (DeepSeek Harness sends no session header) takes the conversation
     # whose request its history extends, so its signed history continues; False gives each such request a session of its own.
     "infer_conversations": True,
@@ -602,6 +606,8 @@ def _load(path):
     _check_web_search(cfg)
     if type(cfg["compaction_keep_effort"]) is not bool:
         raise service_unavailable("compaction_keep_effort must be a boolean")
+    if type(cfg["codex_memory_jobs"]) is not bool:
+        raise service_unavailable("codex_memory_jobs must be a boolean")
     if type(cfg["infer_conversations"]) is not bool:
         raise service_unavailable("infer_conversations must be a boolean")
     for key in ("stabilize_client_prompts", "stable_prompt_date"):
