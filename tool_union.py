@@ -69,15 +69,33 @@ def project_of(parsed):
     return ""
 
 
+def _tool_edits(plan):
+    """A digest of what the request's prompts profile does to tools; "" on the legacy path (no profile).
+
+    It used to be the revision number of prompts.json, which starts at 1 in every process: after any save of the prompts
+    and a restart the saved union went unused (the first request of a Codex process lost its late tools, and its history
+    was written again), or the table of an earlier document under the same number was applied, with tools the current
+    profile hides. The digest stays across restarts and changes only when the tool edits do."""
+    name, snapshot = getattr(plan, "profile", None), getattr(plan, "snapshot", None)
+    if not name or snapshot is None:
+        return ""
+    try:
+        tools = snapshot.profile(name).get("tools")
+    except (KeyError, AttributeError, TypeError):
+        return ""
+    text = json.dumps(tools, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
 def client_key(family, headers, parsed):
-    """(family, originator, model, which kind of agent, project, profile, revision, agent role) for a request, or None
-    when it has no tools of its own.
+    """(family, originator, model, which kind of agent, project, profile, its tool edits, agent role) for a request, or
+    None when it has no tools of its own.
 
     The originator keeps Codex's CLI and its Desktop apart (their servers differ: 60 tools against 97), the model keeps the
     lists apart that the client builds per model (multi-agent v1 or v2, image tools), root and sub-agents apart (a sub-agent
-    has its own, smaller list), and a prompts profile and its revision apart (a profile may hide tools). For Claude Code the
-    opening of the system text keeps the kinds of agent apart too: an Explore sub-agent must not be offered the tools of a
-    general-purpose one."""
+    has its own, smaller list), and a prompts profile and what it does to tools apart (a profile may hide tools). For Claude
+    Code the opening of the system text keeps the kinds of agent apart too: an Explore sub-agent must not be offered the
+    tools of a general-purpose one."""
     if not getattr(parsed, "tools", None):
         return None
     lowered = {str(name).lower(): value for name, value in (headers or {}).items()}
@@ -90,7 +108,7 @@ def client_key(family, headers, parsed):
         role = hashlib.sha256(opening.encode("utf-8", "surrogatepass")).hexdigest()[:16]
     return (family, str(lowered.get("originator") or "").strip().lower(), getattr(parsed, "model", "") or "",
             "sub" if sub else "root", project_of(parsed), getattr(plan, "profile", None) or "",
-            getattr(plan, "rev", None) or 0, role)
+            _tool_edits(plan), role)
 
 
 class ToolUnion:
