@@ -98,8 +98,14 @@ def render(line, *, color=None):
 
 
 def write(line):
+    """Best effort, as the journal is: a console that cannot be written (the supervisor that read the relay's stdout was
+    killed without /T, and the pipe is gone) used to raise OSError out of request handling, so every completion and every
+    error ended with no response at all, and the journal lost the event too."""
     with _LOCK:
-        print(render(line), flush=True)
+        try:
+            print(render(line), flush=True)
+        except (OSError, ValueError):
+            pass
 
 
 class CacheMonitor:
