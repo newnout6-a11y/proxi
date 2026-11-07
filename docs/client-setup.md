@@ -167,6 +167,15 @@ still shows why it was dear. The experimental `background_compaction` is the sam
 history up to the latest reply, without that reply, and a signed branch continues only a request
 that carries the reply it was made with.
 
+The flattened request is not small on a long session. It is sized to OpenCode's own estimate of the room (four characters to a
+token), the oldest exchanges shortened first, so it fills that room. Measured on 2026-11-07 (OpenCode 2.2.6, Sonnet 5.5, the
+window declared as 60,000 over a chat of 149,081 tokens made of seven reads of 20k tokens): 68,433 tokens, of them 63,480 plain
+input and 4,953 written (the system prompt), nothing read, 2.86 credits, where reading the whole chat from its cache would cost about
+0.7 at the prices of that run (read 0.004, plain input 0.04, write 0.05, output 0.2 credits per 1,000 tokens). The relay bills the
+dialog as plain input (no cache hint on it), labels the request and stops the keepwarm of its session at
+once. It happens when a chat overshoots the room in one step or the provider has rejected it as too long; the compactions of
+850k-token chats that the journal holds (the whole history, with the chat's tools) read 99.5% of their prompt.
+
 The hidden `compaction` agent decides who writes the summary: with no `agents.compaction.model`
 it is the session's model and variant, with one it is that model and the variant after its `#`
 ([compaction → model](https://opencode.ai/v2/docs/compaction/#model),
