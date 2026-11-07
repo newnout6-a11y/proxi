@@ -17,6 +17,11 @@ RESPONSES = {"model": "claude-opus-5-5", "input": [
 ANTHROPIC = {"model": "claude-opus-5-5", "max_tokens": 10, "messages": [
     {"role": "user", "content": [{"type": "text", "text": "look"},
                                  {"type": "image_url", "image_url": {"url": URL}}]}]}
+# adapters-3: the Messages API names a picture by URL as well. Only source.data was read, so this block failed with 422
+# "missing image attachments data" and nothing was downloaded, while the same link as an image_url was.
+MESSAGES_URL = {"model": "claude-opus-5-5", "max_tokens": 10, "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "look"},
+                                 {"type": "image", "source": {"type": "url", "url": URL}}]}]}
 
 
 class Download(io.BytesIO):
@@ -49,7 +54,7 @@ def pictures(chunks):
 
 
 @pytest.mark.parametrize("parse,body", [(validate.parse_chat, CHAT), (validate.parse_responses, RESPONSES),
-                                        (validate.parse_anthropic, ANTHROPIC)])
+                                        (validate.parse_anthropic, ANTHROPIC), (validate.parse_anthropic, MESSAGES_URL)])
 def test_one_parse_downloads_a_picture_once(downloads, parse, body):
     parsed = parse(copy.deepcopy(body), CFG)
     assert downloads == [URL]
@@ -88,7 +93,50 @@ def test_a_slow_link_that_fails_the_first_time_still_fails_the_request_once(monk
     assert error.value.status == 422 and calls == [URL]
 
 
-def test_count_tokens_downloads_a_picture_once(relay, downloads):
-    status, answer = relay.json("/v1/messages/count_tokens", copy.deepcopy(ANTHROPIC))
+@pytest.mark.parametrize("body", [ANTHROPIC, MESSAGES_URL], ids=["image_url", "url source"])
+def test_count_tokens_downloads_a_picture_once(relay, downloads, body):
+    status, answer = relay.json("/v1/messages/count_tokens", copy.deepcopy(body))
     assert status == 200 and answer["input_tokens"] > 0
     assert downloads == [URL]
+
+
+def test_a_messages_request_with_a_picture_named_by_url_reaches_the_model(relay, downloads):
+    # the request was answered 422 before the runner was called
+    status, _ = relay.json("/v1/messages", copy.deepcopy(MESSAGES_URL))
+    assert status == 200 and downloads == [URL]
+    assert pictures(relay.fake.seen[-1].message_chunks) == ["picture 1 of " + URL]
+
+
+def test_a_picture_named_by_url_in_a_tool_result_is_downloaded_once(downloads):
+    # A tool may answer with a picture by URL: the tool result took the same 422 as a user turn.
+    body = {"model": "claude-opus-5-5", "max_tokens": 10, "messages": [
+        {"role": "user", "content": "draw"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "render", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                      "content": [{"type": "image", "source": {"type": "url", "url": URL}}]}]}]}
+    parsed = validate.parse_anthropic(body, CFG)
+    assert downloads == [URL]
+    assert pictures(parsed.message_chunks) == ["picture 1 of " + URL]
+    result = parsed.native_messages[-1]["content"]
+    assert result["toolCallId"] == "toolu_1"
+    assert [base64.b64decode(block["imageData"]).decode() for block in result["toolResult"]] == ["picture 1 of " + URL]
+
+
+def test_one_link_as_an_image_url_and_as_a_url_source_is_one_download(downloads):
+    body = copy.deepcopy(MESSAGES_URL)
+    body["messages"][0]["content"].append({"type": "image_url", "image_url": {"url": URL}})
+    parsed = validate.parse_anthropic(body, CFG)
+    assert downloads == [URL]
+    assert pictures(parsed.message_chunks) == ["picture 1 of " + URL] * 2
+
+
+def test_a_messages_image_from_the_files_api_is_refused_with_its_source_type_named(downloads):
+    # A file_id names a picture kept at Anthropic, which the relay has no bytes of. The 422 said the data was missing,
+    # which tells the client nothing it can change.
+    body = copy.deepcopy(MESSAGES_URL)
+    body["messages"][0]["content"][1]["source"] = {"type": "file", "file_id": "file_011CNha8iCJcU1wXNR6q4V8w"}
+    with pytest.raises(validate.ApiError) as error:
+        validate.parse_anthropic(body, CFG)
+    assert (error.value.status, error.value.param) == (422, "messages[0].content[1]")
+    assert "image source type 'file' is not supported" in error.value.message
+    assert downloads == []

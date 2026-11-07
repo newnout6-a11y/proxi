@@ -2825,6 +2825,9 @@ def _signature(path):
 
 
 _PIXEL = "data:image/png;base64,AAAA"
+# The same pixel as the source of a Messages image: a URL source takes only an http(s) link, which the parse would
+# download, so the whole source becomes base64 data.
+_PIXEL_SOURCE = {"type": "base64", "media_type": "image/png", "data": "AAAA"}
 
 
 def _remote(url):
@@ -2832,7 +2835,7 @@ def _remote(url):
 
 
 def _offline(value):
-    """value with the remote images swapped for a data URL: preview parses a body and must not download anything."""
+    """value with the remote images swapped for an inline pixel: preview parses a body and must not download anything."""
     if isinstance(value, list):
         items = [_offline(item) for item in value]
         return items if any(new is not old for new, old in zip(items, value)) else value
@@ -2849,6 +2852,9 @@ def _offline(value):
             out = {**value, "url": _PIXEL}
         if out is not None:
             return out
+    source = value.get("source")
+    if value.get("type") == "image" and isinstance(source, dict) and source.get("type") == "url" and _remote(source.get("url")):
+        return {**value, "source": dict(_PIXEL_SOURCE)}
     for key, item in value.items():
         new = _offline(item)
         if new is not item:

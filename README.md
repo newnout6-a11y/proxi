@@ -1185,7 +1185,10 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   аккаунта сбрасывает несовместимый подписанный prefix.
 - Изображения (Vision) поддерживаются для мультимодальных моделей (Claude Opus 5.5,
   Sonnet 5, GPT-5.5 и др.) через OpenAI `image_url` и Anthropic `image` блоки. В каталоге
-  `/v1/models` для них выставлен флаг `vision: true`.
+  `/v1/models` для них выставлен флаг `vision: true`. Картинку по http(s)-ссылке (`image_url`, `input_image`,
+  Anthropic `image` с `source.type: "url"`) relay скачивает сам, один раз за запрос, только с публичного адреса
+  и не больше 10 МБ. Картинку из Files API Anthropic (`source.type: "file"`) relay передать не может: ответ 422
+  называет тип источника.
 - Файлы (PDF и другие) до модели не доходят: у маршрута Retool нет блока файла, а в relay нет библиотеки,
   которая достала бы текст из PDF (замеры a4 от 2026-11-06: 0 из 11 PDF прочитаны во всех диалектах). Текстовый
   файл (`text/*`, JSON, XML в `data:` URL Chat `file` и Responses `input_file`) передаётся текстом. Всё остальное

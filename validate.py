@@ -247,6 +247,39 @@ def _opt_float(data, key):
     return float(value)
 
 
+def _fetch_remote(url, where):
+    """(mime type, base64 data) of the picture at an http(s) URL, downloaded once per request (ImageFetches).
+
+    The one download path of every image a client names by URL: an image_url, an input_image and a Messages image whose
+    source is a URL. The address is checked before the request, at every redirect and on the socket the request landed
+    on, and a picture past 10 MB is refused."""
+    fetches = _IMAGE_FETCHES.get()
+    kept = fetches.found.get(url) if fetches is not None else None
+    if kept is not None:
+        return kept
+    _assert_public_http_url(url, where)
+    mime_type = "image/png"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    max_bytes = 10 * 1024 * 1024
+    try:
+        with _IMAGE_OPENER.open(req, timeout=10) as r:
+            _assert_public_peer(r, where)
+            ct = r.headers.get("content-type", "").split(";")[0].strip()
+            if ct:
+                mime_type = ct
+            buf = r.read(max_bytes + 1)
+            if len(buf) > max_bytes:
+                raise unprocessable("failed to fetch image attachments: image exceeds maximum allowed size (10MB)", param=where)
+            data_b64 = base64.b64encode(buf).decode("ascii")
+    except ApiError:
+        raise
+    except Exception:
+        raise unprocessable(f"failed to fetch image attachments from {url}", param=where)
+    if fetches is not None:
+        fetches.found[url] = (mime_type, data_b64)
+    return mime_type, data_b64
+
+
 def _extract_image_data(block, where):
     """Extract Retool-compatible image dict {'type': 'image', 'imageData': str, 'mimeType': str}."""
     btype = block.get("type")
@@ -255,8 +288,24 @@ def _extract_image_data(block, where):
     if btype == "image":
         source = block.get("source")
         if isinstance(source, dict):
+            kind = source.get("type")
             mime_type = source.get("media_type") or "image/png"
             data_b64 = source.get("data")
+            if not data_b64 and kind == "url":
+                # The Messages API names a picture by URL as well. Only source.data was read, so such a block failed
+                # with "missing image attachments data" while the same link as an image_url was downloaded. As for an
+                # image_url, only a link that starts with http(s) goes out: the preview swaps every such link for a
+                # pixel (prompt_policy._offline), and urlparse reads " https://..." as https, so the guard alone would
+                # have resolved its host, from a preview too.
+                url = source.get("url")
+                if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                    raise unprocessable(f"{where}: image source url must be an http(s) URL", param=where)
+                mime_type, data_b64 = _fetch_remote(url, where)
+            elif not data_b64 and kind not in (None, "base64"):
+                # A picture in Anthropic's Files API (source "file", a file_id) exists only there and the relay has no
+                # bytes to pass on: the client is told which source the route cannot take, not that the data is missing.
+                raise unprocessable(f"{where}: image source type {kind!r} is not supported; send the image as base64 data "
+                                    "or an http(s) URL", param=where)
         elif "imageData" in block:
             mime_type = block.get("mimeType") or "image/png"
             data_b64 = block.get("imageData")
@@ -272,30 +321,7 @@ def _extract_image_data(block, where):
                         mime_type = mime
                     data_b64 = rest.strip()
             elif url.startswith("http://") or url.startswith("https://"):
-                fetches = _IMAGE_FETCHES.get()
-                kept = fetches.found.get(url) if fetches is not None else None
-                if kept is not None:
-                    mime_type, data_b64 = kept
-                else:
-                    _assert_public_http_url(url, where)
-                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    max_bytes = 10 * 1024 * 1024
-                    try:
-                        with _IMAGE_OPENER.open(req, timeout=10) as r:
-                            _assert_public_peer(r, where)
-                            ct = r.headers.get("content-type", "").split(";")[0].strip()
-                            if ct:
-                                mime_type = ct
-                            buf = r.read(max_bytes + 1)
-                            if len(buf) > max_bytes:
-                                raise unprocessable("failed to fetch image attachments: image exceeds maximum allowed size (10MB)", param=where)
-                            data_b64 = base64.b64encode(buf).decode("ascii")
-                    except ApiError:
-                        raise
-                    except Exception:
-                        raise unprocessable(f"failed to fetch image attachments from {url}", param=where)
-                    if fetches is not None:
-                        fetches.found[url] = (mime_type, data_b64)
+                mime_type, data_b64 = _fetch_remote(url, where)
     elif "imageData" in block:
         mime_type = block.get("mimeType") or "image/png"
         data_b64 = block.get("imageData")
