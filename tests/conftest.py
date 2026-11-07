@@ -154,6 +154,16 @@ def diagnostics_in_a_temporary_folder(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def edits_remembered_by_this_test_only(monkeypatch):
+    """prompt_body remembers what a regular expression edit made of a text for as long as the revision lives: a test starts
+    with nothing remembered, so a refusal one test forced is not the result of another."""
+    import collections
+    import prompt_body
+    monkeypatch.setattr(prompt_body, "_EDIT_MEMO", collections.OrderedDict(), raising=False)
+    monkeypatch.setattr(prompt_body, "_EDIT_MEMO_HELD", [0], raising=False)
+
+
+@pytest.fixture(autouse=True)
 def upstream_shapes_unknown(monkeypatch):
     """What upstream refuses is learned once per run (direct._TOOL_RESULT_HINTS: a cache hint on a tool result;
     direct._PRUNING: a history that lost a call): a test starts from not having learned it, whatever an earlier one

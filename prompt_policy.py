@@ -979,6 +979,11 @@ class RegexTimeout(EditRefused):
     reason = "timeout"
 
 
+class OperationTimeout(RegexTimeout):
+    """One operation ran out of REGEX_TIMEOUT on its text: a matter of the pattern and the text (and of how busy the machine
+    is), unlike the budget of a whole call."""
+
+
 class EditTooLarge(EditRefused):
     """An edit would make its text longer than the limits allow."""
     reason = "too_large"
@@ -1014,18 +1019,23 @@ class Deadline:
     def run(self, call, size=0):
         """call(timeout) with the time that is left, after charging `size` characters of work; RegexTimeout when no work or
         time is left, or when the call used all of it."""
+        self.charge(size)
+        started = time.perf_counter()
+        try:
+            return call(min(self.per_operation, self.left))
+        except TimeoutError:
+            raise OperationTimeout("a regular expression ran out of time") from None
+        finally:
+            self.left -= time.perf_counter() - started
+
+    def charge(self, size):
+        """Count `size` characters of work as run (RegexTimeout when no work or time is left): an edit whose result for a
+        text is remembered counts as if it ran, so what the budget refuses is the same whether it was remembered or not."""
         if size > self.work:
             raise RegexTimeout("the work for regular expressions is spent")
         if self.left < _MIN_SLICE:
             raise RegexTimeout("the time for regular expressions is spent")
         self.work -= size
-        started = time.perf_counter()
-        try:
-            return call(min(self.per_operation, self.left))
-        except TimeoutError:
-            raise RegexTimeout("a regular expression ran out of time") from None
-        finally:
-            self.left -= time.perf_counter() - started
 
 
 def _limits(compiled, timeout):
