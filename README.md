@@ -812,7 +812,7 @@ Anthropic принимает историю без вызова после по�
 Сборка фронтенда: `cd web; npm ci; npm run build` (результат в `web/dist`). Сборка закоммичена,
 и CI падает, если свежая пересборка отличается от неё: после правок в `web/src` пересоберите
 и закоммитьте `web/dist`.
-Проверки админки (синтетические данные, relay не нужен): `node --test web/tests/turns.test.mjs`;
+Проверки админки (синтетические данные, relay не нужен): `node --test web/tests/turns.test.mjs web/tests/prompts.test.mjs web/tests/journalPause.test.mjs`;
 браузерные сценарии `cd web; npx playwright test` (нужен Chromium: `npx playwright install chromium`
 или путь к установленному в `PW_CHROMIUM`); дизайн-гейт с axe и проверкой переполнения
 `cd web; npm run test:design`.
