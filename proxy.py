@@ -313,6 +313,40 @@ class SlottedRequestHandler(BaseHTTPRequestHandler):
                 self.server.release_slot()
 
 
+# A refusal sent before the request body was read (413 over max_body_bytes, 415, a wrong key's 401) goes to a client that is
+# usually still sending that body. Closed with the body unread, the connection is reset, and on Windows the reset throws away
+# the answer the client has not read yet: Claude Code, Node and Python clients saw ECONNRESET or WinError 10053 instead of
+# the 413, took it for a network error and asked again, to the same end. Such a connection is closed in stages instead: the
+# relay shuts its sending side after the answer and reads what the client still sends until the client closes, for at most
+# this long and this many times max_body_bytes, so a slow or endless sender cannot keep the thread.
+LINGER_SECONDS = 3.0
+LINGER_BODIES = 4
+
+
+def linger_close(sock, limit):
+    """Shut the sending side of `sock`, then read and discard what the client still sends until it closes its side, for at
+    most LINGER_SECONDS and about `limit` bytes. The caller closes the socket: with nothing left unread, that close is no
+    reset."""
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        return
+    deadline = time.monotonic() + LINGER_SECONDS
+    buffer = bytearray(65536)
+    try:
+        while limit > 0:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            sock.settimeout(left)
+            received = sock.recv_into(buffer)
+            if not received:
+                return  # the client has read the answer and closed its side
+            limit -= received
+    except OSError:  # the time ran out, or the client reset the connection itself
+        return
+
+
 def make_handler(runtime: Runtime):
     cfg = runtime.cfg
 
@@ -576,11 +610,18 @@ def make_handler(runtime: Runtime):
         def _close_if_body_unread(self):
             """A request answered without reading the body it declared (a wrong key, an unknown route, a disabled API) leaves
             that body on the connection: kept alive, the next request was read glued to it and failed with 400 or 501 (or
-            the body, itself an HTTP request, was run). Such a connection is closed after the answer."""
+            the body, itself an HTTP request, was run). Such a connection is closed after the answer, in stages (finish)."""
             declared = (self.headers is not None and (self.headers.get("transfer-encoding")
                         or (self.headers.get("content-length") or "0").strip() not in ("", "0")))
             if declared and not getattr(self, "_body_read", False):
                 self.close_connection = True
+                self._linger = True
+
+        def finish(self):
+            super().finish()
+            # After the last request of the connection, so the max_workers slot is already free (SlottedRequestHandler).
+            if getattr(self, "_linger", False):
+                linger_close(self.connection, LINGER_BODIES * cfg["max_body_bytes"])
 
         def _stream_failure(self, dialect, err):
             """End a stream that failed after it started. Only Responses has a terminal failure event."""
