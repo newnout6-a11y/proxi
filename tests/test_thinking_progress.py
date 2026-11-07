@@ -12,7 +12,7 @@ import journal
 import orchestrator
 import validate
 from test_native_context_reuse import FIRST, request, run, setup
-from test_review_fixes_pr19 import END, THINKING, response, signature, stream_direct, text
+from test_review_fixes_pr19 import END, THINKING, signature, stream_direct, text
 
 
 def test_thinking_status_arrives_while_the_answer_is_still_blocked(tmp_path, monkeypatch):

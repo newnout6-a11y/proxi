@@ -16,7 +16,7 @@ import pytest
 import direct
 import native_history
 from prompt_support import prompt_relay, strip_cache  # noqa: F401 - prompt_relay is a fixture
-from test_compaction_cache import Chat, SUMMARY, tail_after
+from test_compaction_cache import Chat, tail_after
 from test_native_history import tool_reply
 
 TOOLS = [{"name": "read"}]

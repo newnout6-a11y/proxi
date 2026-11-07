@@ -90,7 +90,6 @@ def alternation_reference(text, find, replacement, replace_all):
 
 def test_replace_text_with_a_replacement_that_holds_the_searched_text_answers_as_the_alternation_did():
     import random
-    import prompt_policy as pp
     from types import SimpleNamespace
     rnd = random.Random(20261107)
     context = SimpleNamespace(allowance=lambda scope: 10 ** 9)

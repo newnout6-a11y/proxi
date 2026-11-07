@@ -12,7 +12,7 @@ import pytest
 import journal
 import prompt_policy as pp
 from prompt_support import client_request, prompt_relay  # noqa: F401
-from test_prompt_policy_common import Sources, compose, document, inp, make_store
+from test_prompt_policy_common import compose, document, make_store
 from test_prompt_policy_preview import chat
 
 SECRET = "ACME-INTERNAL-CODENAME-PHOENIX"

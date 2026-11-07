@@ -8,7 +8,6 @@ import urllib.error
 
 import pytest
 
-import client_context
 import direct
 import journal
 from upstream_attempts import AttemptBudget

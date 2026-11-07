@@ -14,7 +14,6 @@ import urllib.request
 
 import pytest
 
-import apierr
 import proxy
 import config as config_module
 

@@ -1,7 +1,14 @@
-import argparse, http.client, json, sys, time, urllib.request, urllib.error
-from auth import client_headers
+"""Send one prompt to a running relay, or list its models or balance: a manual check of a live relay.
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    python scripts/relay_client.py --models
+    python scripts/relay_client.py --balance
+    python scripts/relay_client.py "Проверь проект" --effort high
+"""
+import argparse, http.client, json, sys, time, urllib.request, urllib.error
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from auth import client_headers  # noqa: E402  (the relay modules live in the repository root)
 
 
 def _open_with_retry(req, timeout):
@@ -108,4 +115,5 @@ def main():
         print(f"\nERROR: {e}")
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     main()

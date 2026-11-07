@@ -3,7 +3,7 @@ import pytest
 
 import apierr
 import prompt_policy as pp
-from test_prompt_policy_common import Clock, document, inp, make_store
+from test_prompt_policy_common import document, inp, make_store
 
 PROFILES = {"a": {"head": "A"}, "b": {"head": "B"}, "edit-mid": {"history": {"mid_system": "drop"}},
             "edit-blocks": {"history": {"user_blocks": [{"op": "drop_tag", "tag": "t"}]}},

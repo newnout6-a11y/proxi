@@ -338,7 +338,7 @@ Legacy `thinking.budget_tokens` переводится в уровень;
 
 Haiku 4.5 и оба GLM — исключение. Retool принимает для них `reasoningEffort` и ничего
 не меняет: проба 2026-11-05 не нашла ни thinking, ни упорядочения по токенам и времени
-([результаты](docs/model-route-availability-2026-11-05.md#проба-effort-2026-11-05)).
+([результаты](docs/reports/model-route-availability-2026-11-05.md#проба-effort-2026-11-05)).
 У них `reasoning_effort_levels` пуст, а `reasoning_effort_control` равен
 `accepted-ignored`: любое известное значение (`none`…`max`) и `thinking.budget_tokens`
 принимаются без 400, в Retool не уходят, а имя параметра перечисляется в заголовке
@@ -641,7 +641,7 @@ thinking-блок на `usage_start`. Если все попытки пусты,
 не обещание будущей работы: `502 upstream_empty_turn`, текст которой называет возможную причину — отказ
 классификатора провайдера. Так провайдер отказывает: HTTP 200 без текста и без причины остановки. Платные
 пробы 2026-11-06 связали такие отказы с инструкциями в system клиента (блок persona-файла из `AGENTS.md`), а не с
-формой запроса ([расследование](docs/thinking-only-replies-2026-11-05.md)). Маркер `[RETRY]` существует только в agent-транспорте
+формой запроса ([расследование](docs/reports/thinking-only-replies-2026-11-05.md)). Маркер `[RETRY]` существует только в agent-транспорте
 (WebSocket); в direct он не используется.
 
 Пустой ответ, на котором закончился лимит вывода клиента, пустым отказом не считается. GPT и GLM
@@ -816,7 +816,7 @@ Anthropic принимает историю без вызова после по�
 с вычтенными локальными списаниями; `CACHED` — снимок моложе 30 с без списаний после
 замера. Баланс запрашивается раз в 300 с, поэтому обычно видно `STALE` (это возраст
 данных, не обязательно ошибка). Ради этой строки сетевой запрос не выполняется и
-ответ модели не задерживается. Подробнее — [docs/console-logs-2026-11-03.md](docs/console-logs-2026-11-03.md).
+ответ модели не задерживается. Подробнее — [docs/reports/console-logs-2026-11-03.md](docs/reports/console-logs-2026-11-03.md).
 
 `python scripts/watch_relay.py` показывает цветной хвост фонового `relay.log`
 из `%LOCALAPPDATA%/Proxi/state/` (или укажите путь первым аргументом).
@@ -871,7 +871,7 @@ Windows PowerShell 5.1 через `*>>`, могут быть в UTF-16 или с
 | tool_union_clients | `["codex", "claude-code"]` — клиенты, которым relay объявляет модели объединение инструментов, объявленных ими раньше (для проекта, модели, originator и вида агента; у Claude Code и по роли агента, чтобы Explore не получил инструменты general-purpose), и инструментов этого запроса. Codex поднимает MCP-серверы после первого запроса (запрос 1: 44-46 инструментов, запрос 2: 50-60), Claude Code в интерактивном режиме подключает медленный MCP-сервер после первого запроса (59 → 90 инструментов, 107 тыс. токенов записано заново), и каждое изменение списка переписывает кэш (31 кредит при 334 тыс. токенов); с объединением запрос 1 объявляет то, что принесёт запрос 2. Объединение хранится в `<conversation_state_dir>/tool-union.json` и переживает перезапуск relay. `[]` — выключено. Подробности: [docs/client-setup.md](docs/client-setup.md#tools-that-codex-declares-late) |
 | tool_union_ttl | 21600 — через сколько секунд инструмент, который клиент не объявлял, выпадает из объединения (убранный пользователем MCP-сервер уходит из списка за часы) |
 | claude_tool_search | `"eager"` — Claude Code 2.1.305+ прячет MCP-инструменты за ToolSearch, и каждая загрузка меняет список инструментов и переписывает весь кэш диалога (до 33,8 кредита). `eager` отвечает на такой запрос ошибкой 400, после чего клиент присылает его заново со всеми инструментами сразу (два отклонённых запроса на диалог, апстрим не тратится). `native` — отложенная загрузка как у клиента. Подробности: [docs/client-setup.md](docs/client-setup.md#tool-search-of-claude-code-21304-and-later) |
-| provider_access | В записи аккаунта (`accounts[]`; в одиночной конфигурации без `accounts[]` — в корне): подтверждённые BYOK/retention свойства, привязанные к точному UUID ресурса: `{"openai": {"resource_name": "<тот же UUID, что в openai_provider_resource_name>", "byok": true}}`. Собственный ресурс без дескриптора не открывает Astra/Fable, сообщение об отказе называет нужные ключи. Дескриптор в корне при наличии `accounts[]` не применяется (relay предупреждает при старте), поэтому админка его там не оставляет: при добавлении аккаунта к одиночной конфигурации дескриптор переезжает в запись первого аккаунта, при удалении первого аккаунта корневой дескриптор убирается; `byok: true` вместе с `__managed__` отклоняется; [доступность маршрутов](docs/model-route-availability-2026-11-05.md) |
+| provider_access | В записи аккаунта (`accounts[]`; в одиночной конфигурации без `accounts[]` — в корне): подтверждённые BYOK/retention свойства, привязанные к точному UUID ресурса: `{"openai": {"resource_name": "<тот же UUID, что в openai_provider_resource_name>", "byok": true}}`. Собственный ресурс без дескриптора не открывает Astra/Fable, сообщение об отказе называет нужные ключи. Дескриптор в корне при наличии `accounts[]` не применяется (relay предупреждает при старте), поэтому админка его там не оставляет: при добавлении аккаунта к одиночной конфигурации дескриптор переезжает в запись первого аккаунта, при удалении первого аккаунта корневой дескриптор убирается; `byok: true` вместе с `__managed__` отклоняется; [доступность маршрутов](docs/reports/model-route-availability-2026-11-05.md) |
 | upstream_empty_retries | 1 — дополнительные одинаковые платные POST после пустого/thinking-only ответа (всего 2 POST); 0 отключает; не больше 5 POST на шаг |
 | upstream_rate_limit_retries | 3 — сколько раз повторить тот же запрос на том же аккаунте, если Retool ответил 429 «models are rate limited right now» (паузы около 2, 4 и 8 с; бесплатно, но входит в 5 POST на шаг); 0 — отдать 429 клиенту сразу; максимум 4 |
 | upstream_error_max_dumps | 50 — сколько последних комплектов приватных тел (`body`/`error`/`metadata`) хранить в `logs/upstream-400/`; `0` — без ограничения, отрицательное значение relay не принимает при запуске |
@@ -908,7 +908,7 @@ Windows PowerShell 5.1 через `*>>`, могут быть в UTF-16 или с
 стоит предохранитель от цикла: если одна и та же команда повторяется, исполнение
 останавливается и агент обязан дать сводку.
 `max_tokens` валидируется по модели. Контексты, output caps, рекомендуемые уровни
-и границы подтверждения сведены в [аудите каталога](docs/model-catalog-audit.md).
+и границы подтверждения сведены в [аудите каталога](docs/reports/model-catalog-audit.md).
 
 ### Системный промпт: `prompts.json`, инструкции клиента и роль relay
 
@@ -1012,7 +1012,7 @@ GPT-4.1 и работающий Haiku 4.5 через Assist. Временная 
 и условия BYOK/retention. Fable требует доступной организации настройки retention
 или подходящего BYOK; Astra и Google требуют собственных ресурсов провайдера.
 Статус метаданных отдельно от доступности. Причины и точные Model ID приведены в
-[актуальной матрице маршрутов](docs/model-route-availability-2026-11-05.md).
+[актуальной матрице маршрутов](docs/reports/model-route-availability-2026-11-05.md).
 Каталог считается так же, как маршрутизация: ресурсы корня наследуются аккаунтом
 того же tenant (как в `SessionPool`), а в режиме `session_mode: shared` без области
 контекста запросы обслуживает только первый аккаунт, поэтому учитывается только он.
@@ -1057,7 +1057,7 @@ Claude Code за `ANTHROPIC_BASE_URL` считает у Opus 4.7 и новее, 
 например `CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000` (допустимо от 100000 до 1000000; суффиксы
 `200k`/`1M` с версии 2.1.304; значение общее для всех моделей сессии и ограничено окном
 модели). Без него Claude Code сжимает контекст нативных 1M-моделей примерно на 967K токенов,
-выше резерва маршрута. Источники и подробности: [аудит каталога](docs/model-catalog-audit.md).
+выше резерва маршрута. Источники и подробности: [аудит каталога](docs/reports/model-catalog-audit.md).
 
 ## Коды ответов
 
@@ -1495,7 +1495,7 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   содержимого попытки. Принятые thinking-блоки и подписи сохраняются на стороне
   relay и возвращаются с нативными assistant/tool messages при следующем результате
   инструмента. Состояние привязано к исходному префиксу, настройкам, диалогу и
-  аккаунту; [разбор задержек и live-проверка](docs/thinking-latency-2026-11-04.md).
+  аккаунту; [разбор задержек и live-проверка](docs/reports/thinking-latency-2026-11-04.md).
 - Подтверждённый `verbosity` передаётся модели; для моделей без подтверждённых уровней
   (все Claude, GPT-4.x) это необязательная подсказка: она принимается, не передаётся в
   Retool и называется в `x-proxi-ignored-parameters`. JSON-форматы вывода
@@ -1668,17 +1668,44 @@ relay с этим делает. 429 приходит до начала гене�
 
     python -m pytest -q          # offline, без сети
     python -m pytest -q -n 4     # то же в четыре процесса (pytest-xdist из requirements.txt): около минуты вместо четырёх
-    python test_client.py --models
-    python test_client.py "Проверь проект" --effort high
+    python scripts/relay_client.py --models                          # живой relay: список моделей
+    python scripts/relay_client.py "Проверь проект" --effort high    # живой relay: один запрос
+    python scripts/live_smoke.py                                     # живой relay: короткий смоук (тратит кредиты)
 
-## Архитектура
+## Структура проекта
 
-proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
-(контекст, exec-цикл) -> session.py (диалоги: direct/WS, ретраи, отмена) -> direct.py
+    proxy.py                точка входа: python proxy.py [--config путь] [--state-dir папка]
+    *.py (корень)           модули relay, плоским набором; карта по слоям ниже
+    scripts/                служебные скрипты: синхронизация каталогов клиентов, пробы, живые проверки, run_relay.ps1
+    tests/                  offline-тесты pytest: relay в процессе и поддельный upstream, сеть не нужна
+    web/                    админка (React + Vite); web/dist — собранная версия в Git, её отдаёт relay
+    docs/                   руководства и устройство подсистем; docs/reports/ — датированные отчёты, аудиты, ревью
+    PROTOCOL.md             разбор протокола Retool
+    config.example.json     образец config.json со всеми настройками и пояснениями
+    prompts.example.json    образец prompts.json
+    ruff.toml               правила `ruff check .`: только ошибки (неиспользуемые и неопределённые имена, bugbear), не стиль
+
+Файлы работы relay в Git не попадают (`.gitignore`): `config.json`, `relay_key.txt`, `prompts.json` и `prompts/`,
+`journal.jsonl` с прежними `journal.jsonl.N`, `commands.log`, `relay.log`, `conversations/`, `logs/upstream-400/`,
+блокировки `config.json.lock` и `config.json.auth-*.lock` (по одной на аккаунт). Журнал, лог команд, дампы отказов и
+состояние диалогов можно держать в отдельной папке: `python proxy.py --state-dir state` (папка `state/` тоже в `.gitignore`).
+
+### Модули по слоям
+
+| Слой | Модули |
+|---|---|
+| HTTP и входящие запросы | `proxy.py` (сервер, маршруты, лимиты, слоты), `auth.py` (ключ relay, заголовки upstream), `validate.py` (строгий разбор трёх диалектов), `apierr.py` (ошибки в форме OpenAI/Anthropic), `sse.py`, `io_workers.py` |
+| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `upstream_attempts.py`, `upstream_diagnostics.py` |
+| История между ходами и перезапусками | `native_history.py`, `conversation_state.py`, `conversation_infer.py`, `compaction_tools.py`, `summary_guard.py` |
+| Ответ клиенту | `adapters.py` (Chat, Responses, Messages), `structured.py`, `forced_choice.py`, `generation.py`, `web_search.py` |
+| Клиенты и системный промпт | `client_context.py`, `context.py`, `prompt_policy.py` (профили и правила `prompts.json`), `prompt_body.py` (правки истории и tools), `prompt_stabilizer.py`, `tool_names.py`, `tool_union.py`, `tool_search_policy.py` |
+| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей) |
+| Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
+
+Путь запроса: proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
+(контекст, exec-цикл) -> session.py (диалоги, ретраи, отмена) -> direct.py
 (direct-транспорт, prompt caching) -> adapters.py (три диалекта) + sse.py.
-Вспомогательное: auth.py, upstream_refresh.py, credits.py, executor.py, context.py,
-redact.py, apierr.py, models.py, prompt_policy.py (профили и правила системного промпта),
-prompt_body.py (правки истории и tools).
 Реверс-инжиниринг протокола — PROTOCOL.md. Локальные capture/probe-артефакты
 исключены из Git: они могут содержать credentials. Удаление файлов из текущей
 ветки не удаляет ранее опубликованные секреты из истории; их следует отозвать.
+Оглавление документации — [docs/README.md](docs/README.md).

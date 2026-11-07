@@ -1,6 +1,5 @@
 """Administration API and static build security, with an offline HTTP server."""
 import json
-from pathlib import Path
 import threading
 import time
 import urllib.error

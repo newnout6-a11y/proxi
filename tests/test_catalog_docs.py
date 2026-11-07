@@ -37,7 +37,7 @@ def cells(line):
 
 
 def effort_rows():
-    lines = (DOCS / 'model-catalog-audit.md').read_text(encoding='utf-8').splitlines()
+    lines = (DOCS / 'reports' / 'model-catalog-audit.md').read_text(encoding='utf-8').splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith('## Effort controls'))
     rows = []
     for line in lines[start:]:
@@ -68,7 +68,7 @@ def test_effort_table_row_matches_the_registry(group):
 
 def route_rows():
     rows = {}
-    for line in (DOCS / 'model-route-availability-2026-11-05.md').read_text(encoding='utf-8').splitlines():
+    for line in (DOCS / 'reports' / 'model-route-availability-2026-11-05.md').read_text(encoding='utf-8').splitlines():
         match = re.match(r'\| (\S+) \| (.*) \| (публикуется|скрыт)[^|]*\|$', line)
         if match:
             rows[match.group(1)] = match.group(3)
@@ -86,7 +86,7 @@ def test_route_table_lists_the_registry_in_order_and_publishes_what_the_code_pub
 
 
 def test_route_table_states_the_retirement_of_the_models_anthropic_retired():
-    text = (DOCS / 'model-route-availability-2026-11-05.md').read_text(encoding='utf-8')
+    text = (DOCS / 'reports' / 'model-route-availability-2026-11-05.md').read_text(encoding='utf-8')
     for name, date in (('claude-opus-4-20250514', '2026-06-15'), ('claude-opus-4-1-20250805', '2026-08-05'),
                        ('claude-sonnet-4-20250514', '2026-06-15')):
         row = next(line for line in text.splitlines() if line.startswith('| %s |' % name))
@@ -97,7 +97,7 @@ def test_route_table_states_the_retirement_of_the_models_anthropic_retired():
 
 
 def test_catalog_counts_in_the_audit_header_match_the_registry():
-    text = ' '.join((DOCS / 'model-catalog-audit.md').read_text(encoding='utf-8').split())
+    text = ' '.join((DOCS / 'reports' / 'model-catalog-audit.md').read_text(encoding='utf-8').split())
     entries = models.catalog()
     counts = {provider: sum(entry['provider'] == provider for entry in entries)
               for provider in ('openai', 'anthropic', 'google', 'retool-fast')}

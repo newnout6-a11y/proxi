@@ -1,5 +1,4 @@
 """Refresh/auth hardening: tolerant body parsing, deletion sync, journal level, caps."""
-import threading
 
 import auth
 import journal

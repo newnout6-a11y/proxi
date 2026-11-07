@@ -1,4 +1,4 @@
-"""Audited model metadata; see docs/model-catalog-audit.md for provenance.
+"""Audited model metadata; see docs/reports/model-catalog-audit.md for provenance.
 
 Effort capabilities describe the Retool route rather than the provider-wide union.
 """
@@ -281,7 +281,7 @@ _BY_ID['claude-sonnet-4-5-20250929']['route_reason'] = (
     '2026-11-30; the relay stops publishing it on that date.')
 
 # Input limits Retool applies per route (COPILOT_MODEL_INPUT_CONTEXT_SIZE_MAP, see
-# docs/model-catalog-audit.md). A model missing here has no verified route limit, so discovery
+# docs/reports/model-catalog-audit.md). A model missing here has no verified route limit, so discovery
 # publishes no max_input_tokens for it.
 _ROUTE_INPUT_TOKENS = {
     'claude-opus-4-6': 872000, 'claude-opus-4-7': 872000, 'claude-opus-4-8': 872000, 'claude-opus-5': 872000,

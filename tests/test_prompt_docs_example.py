@@ -8,7 +8,6 @@ The second half pins what the guide says about the final engine against the code
 the journal events it lists, the examples it quotes (a regular expression, a text file, a tag, a hidden tool) and the order
 in which the store judges the rules.
 """
-import copy
 import json
 import re
 from pathlib import Path

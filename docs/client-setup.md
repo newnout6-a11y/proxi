@@ -1,7 +1,7 @@
 # Coding clients
 
 Current route availability and installed-client evidence are recorded in
-[the model/client audit](model-client-audit-2026-11-04.md). A previous client
+[the model/client audit](reports/model-client-audit-2026-11-04.md). A previous client
 setup or historical benchmark below does not establish that today's installed
 profile contains the same provider or that an old model/effort is still accepted.
 
@@ -541,7 +541,7 @@ were disabled for the diagnostic; client project instructions were preserved.
 These are captured-request replay observations, not a live GUI latency promise.
 
 Direct model API findings and access limitations are recorded in
-[direct-inference-audit.md](direct-inference-audit.md). This follow-up does not
+[direct-inference-audit.md](reports/direct-inference-audit.md). This follow-up does not
 silently switch the client's model, credential or inference context.
 
 ## Codex

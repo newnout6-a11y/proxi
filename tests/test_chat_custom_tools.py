@@ -15,7 +15,6 @@ import pytest
 import adapters
 import apierr
 import direct
-import native_history
 import validate
 from test_adapter_protocols import Writer
 from test_client_contracts import CFG, _body

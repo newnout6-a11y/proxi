@@ -3,7 +3,6 @@
 The text bridge writes "[tool result <name> id=<call id>]:" before what a tool returned, and that label is how the model
 tells which call a result answers. A result that was nothing but an image (a screenshot, a rendered page) lost the label
 along with its text, and the chunk was the bare image (ultracode audit of the relay, C17)."""
-import pytest
 
 import validate
 from test_client_contracts import CFG, _body

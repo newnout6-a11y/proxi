@@ -1,5 +1,4 @@
 """Security hardening: /health redaction, wrong-key throttling, settings bounds."""
-import json
 
 
 def test_health_hides_financials_and_error_text(relay):

@@ -20,12 +20,18 @@ jobs:
           node-version: "22"
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      # Only the bug-class rules of ruff.toml (unused or undefined names, bugbear); the code is not reformatted.
+      - name: Lint
+        run: |
+          python -m pip install ruff==0.15.13
+          ruff check .
       - name: Run offline test suite
         run: python -m pytest tests -q
       - name: Run OpenCode label plugin tests
         run: node --test tests/test_opencode_labels.mjs
-      - name: Run admin trace model tests
-        run: node --test web/tests/turns.test.mjs
+      # Every unit test file of the admin UI (npm run test:unit runs the same set): the trace model and the Prompts screen.
+      - name: Run admin UI unit tests
+        run: node --test web/tests/turns.test.mjs web/tests/prompts.test.mjs
 
   admin-ui:
     # web/dist is committed and served as is, so CI rebuilds it and fails on drift. The browser

@@ -4,7 +4,6 @@ import json
 import os
 import stat
 import threading
-import time
 import urllib.error
 from types import SimpleNamespace
 
@@ -16,8 +15,7 @@ import config
 import models
 import upstream_refresh
 from accounts import AccountDispatcher
-from session import RelaySession
-from test_account_dispatcher import Account, Clock, FakeManager, FakeRefresher, dispatcher
+from test_account_dispatcher import Account, FakeManager, FakeRefresher, dispatcher
 from test_admin import admin_relay  # noqa: F401 - fixture
 from test_native_context_reuse import Backend, setup
 from upstream_refresh import Refresher

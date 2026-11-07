@@ -17,7 +17,7 @@ import direct
 import journal
 import validate
 from upstream_attempts import AttemptBudget
-from test_native_context_reuse import FIRST, PARSE_CFG, run, setup
+from test_native_context_reuse import PARSE_CFG, run, setup
 from test_review_fixes_pr19 import END, response, stream_direct, text
 
 LIMIT = "Retool models are rate limited right now. Please try again shortly."

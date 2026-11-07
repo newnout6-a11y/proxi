@@ -1,0 +1,17 @@
+# `ruff check .` (CI runs it too). Only rules that point at bugs are on: pyflakes (F: unused or undefined names),
+# syntax errors (E9), bugbear (B) and pylint errors (PLE). The code is not reformatted: no formatter, no style rules.
+target-version = "py311"
+line-length = 130
+extend-exclude = ["web/node_modules", "web/dist"]
+
+[lint]
+select = ["E9", "F", "B", "PLE"]
+ignore = [
+    "B904",  # raise inside except without "from": the relay turns errors into API envelopes on purpose
+    "B905",  # zip() without strict=: the zipped lists are built together with equal lengths
+]
+
+[lint.per-file-ignores]
+# Tests import fixtures from other test modules and request them by parameter name (F811), check exception
+# types loosely (B017), call closures inside the loop that made them (B023) and keep unused loop names for clarity.
+"tests/**" = ["F811", "F841", "B007", "B017", "B023", "B028"]

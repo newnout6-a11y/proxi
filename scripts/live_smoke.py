@@ -1,7 +1,15 @@
-import json, sys, time, urllib.request, urllib.error
-from auth import client_headers
+"""Live smoke checks of a running relay on 127.0.0.1:8787: models, balance, a plain and a streamed answer, a local command.
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+Spends credits of the real accounts. Not part of the offline suite (tests/):
+
+    python scripts/live_smoke.py
+"""
+import json, sys, urllib.request, urllib.error
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from auth import client_headers  # noqa: E402  (the relay modules live in the repository root)
+
 BASE = "http://127.0.0.1:8787"
 
 
@@ -107,6 +115,7 @@ def test_local_exec_and_context():
     print("PASS: local command execution & context")
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     test_models()
     test_balance()
     test_non_streaming()

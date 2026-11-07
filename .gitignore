@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 *.bak
 *.log
+.ruff_cache/
 
 # runtime secrets and state (keep config.example.json in git)
 config.json
@@ -44,3 +45,11 @@ probes/chunks/
 
 # agent scratch work
 .agents/
+
+# Editor and agent tool state of this machine
+.zcode/
+.claude/worktrees/
+.claude/settings.local.json
+
+# A state folder for `python proxy.py --state-dir state` (journal, command log, conversations, upstream-400 dumps)
+/state/

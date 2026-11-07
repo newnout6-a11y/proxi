@@ -18,7 +18,7 @@ import direct
 from prompt_support import client_request, prompt_relay  # noqa: F401 - prompt_relay is a fixture
 from test_native_context_reuse import FIRST, request, run
 from test_native_history import TOOLS, close, harness
-from test_review_fixes_pr19 import response, text
+from test_review_fixes_pr19 import text
 
 CAP = 64
 CUT_ARGS = '{"path": "a.py", "limit": "3", "note": "hel'

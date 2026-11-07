@@ -3,7 +3,6 @@ warm body, the cycle ends with the reason `compacted`, and the next real turn of
 import asyncio
 import time
 
-import pytest
 
 import client_context
 import direct

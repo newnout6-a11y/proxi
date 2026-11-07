@@ -16,7 +16,7 @@ import pytest
 import direct
 from test_native_context_reuse import FIRST, request, run
 from test_native_history import close, harness
-from test_review_fixes_pr19 import END, text
+from test_review_fixes_pr19 import END
 
 NULL = {"type": "null", "required": False}
 

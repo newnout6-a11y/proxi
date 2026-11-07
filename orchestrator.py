@@ -1679,7 +1679,7 @@ class TurnRunner:
                         code, output = await asyncio.get_running_loop().run_in_executor(
                             None,
                             lambda: executor.run_command(
-                                command, self.cfg["workspace_root"],
+                                command, self.cfg["workspace_root"],  # noqa: B023 (awaited before the loop moves on)
                                 timeout=self.cfg["command_timeout"],
                                 limit=self.cfg["command_output_limit"],
                                 policy=self.cfg["exec_policy"],

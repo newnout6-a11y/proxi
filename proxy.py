@@ -1,4 +1,4 @@
-"""OpenAI/Anthropic compatible relay over the Retool AI agent WebSocket."""
+"""OpenAI/Anthropic compatible relay over the Retool AI direct streaming protocol (POST /api/gpt/copilotStreamGPT)."""
 import asyncio
 import argparse
 import concurrent.futures

@@ -3,7 +3,6 @@
 The relay answered len(text) // 4. Four saved Claude Desktop bodies of 779k to 829k characters were counted by upstream
 at 290k to 311k tokens, so the estimate was 0.67 of the truth (a5, 2026-11-06): the context meter of Claude Desktop showed
 256.5k when 487k were real, and nothing compacted on its own up to 492k real tokens."""
-import copy
 import json
 
 import pytest
