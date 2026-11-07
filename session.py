@@ -1407,6 +1407,10 @@ class SessionPool:
         for key in order:
             if key not in gone and len(self._conversation_locks) < capacity:
                 break
+            # The newest state of a conversation whose last write failed (or was dropped while the disk was paused) was
+            # retried only at its next release or at a stop: one evicted meanwhile came back with the turn before, and its
+            # next request wrote the whole prefix again. Urgent: the store's pause after a failure does not hold it back.
+            self._persist(key, urgent=True)
             session = self._conversations.pop(key, None)
             self._conversation_locks.pop(key, None)
             self._conversation_refs.pop(key, None)

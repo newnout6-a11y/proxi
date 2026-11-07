@@ -67,6 +67,41 @@ def test_a_failing_write_never_breaks_the_turn_and_the_next_change_or_the_stop_r
     asyncio.run(story())
 
 
+def test_a_conversation_whose_last_write_failed_is_stored_when_it_leaves_the_pool(tmp_path, monkeypatch, processes):
+    """A write that failed (the disk refused it, or a scanner held the file past the retries and the store paused) was
+    retried only at the conversation's next release or at a normal stop of a conversation still in the pool. One evicted
+    meanwhile was never stored again: when its client came back, the relay restored the turn before and the request
+    wrote the whole prefix again."""
+    state = tmp_path / "state"
+    process = processes(state, scripts=tool_scripts(2))
+    real, broken = os.replace, {"on": True}
+
+    def replace(source, target):
+        if broken["on"]:
+            raise OSError(errno.EIO, "the disk is gone")
+        return real(source, target)
+
+    monkeypatch.setattr(cs.os, "replace", replace)
+
+    async def story():
+        await converse(process, "chat", 1)
+        assert files(state) == [] and process.store.failed(cs.key_digest(KEY))
+        broken["on"] = False  # the disk is back; nothing of this conversation changes any more
+        pool = process.pool
+        (key,) = list(pool._conversations)
+        warm = pool._conversations[key]._warm_task  # its keepwarm ended by its own limit
+        if warm is not None:
+            warm.cancel()
+            await asyncio.gather(warm, return_exceptions=True)
+        pool._last_used[key] -= 10 ** 6  # idle far past conversation_idle_timeout
+        await pool._evict_idle()
+        assert key not in pool._conversations
+        assert process.store.flush(5)
+        return files(state), process.store.failed(cs.key_digest(KEY))
+
+    assert asyncio.run(story()) == ([cs.key_digest(KEY) + cs.SUFFIX], False)
+
+
 def test_a_scanner_holding_the_file_for_a_moment_does_not_lose_the_state(tmp_path, monkeypatch):
     real, refusals = os.replace, [PermissionError(13, "in use"), PermissionError(13, "in use")]
 
