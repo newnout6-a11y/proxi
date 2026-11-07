@@ -125,6 +125,25 @@ def upstream_headers(cfg) -> dict:
     }
 
 
+# Cookie values that are just host names (lastSubdomain=tenant.retool.com) are not secrets: masking them hides the tenant.
+HOST_NAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
+
+
+def secret_values(cookie, extra=()):
+    """What the relay masks for a session: every cookie value but a host name, then the other secrets config.load found
+    (cfg["_extra_secrets"]: the web search key). A renewal or a new sign-in rebuilds the list with this; it used to keep
+    only the raw cookie values, so the search key stopped being masked and the tenant's host name started to be."""
+    values = []
+    for segment in (cookie or "").split(";"):
+        if "=" not in segment:
+            continue
+        value = segment.split("=", 1)[1].strip()
+        if value and not HOST_NAME.fullmatch(value) and value not in values:
+            values.append(value)
+    values += [value for value in extra or () if isinstance(value, str) and value and value not in values]
+    return values
+
+
 def merge_set_cookie(cfg, headers) -> bool:
     """Apply Set-Cookie values from a refresh response onto the in-memory config.
 
@@ -163,8 +182,8 @@ def merge_set_cookie(cfg, headers) -> bool:
             xsrf = value
             xsrf_set = True
     if dirty:
-        cfg.update(cookie="; ".join(key + "=" + value for key, value in jar.items()),
-                   cookie_values=list(jar.values()), xsrf=xsrf)
+        cookie = "; ".join(key + "=" + value for key, value in jar.items())
+        cfg.update(cookie=cookie, cookie_values=secret_values(cookie, cfg.get("_extra_secrets", ())), xsrf=xsrf)
     return changed
 
 

@@ -13,6 +13,7 @@ import threading
 import time
 
 from apierr import service_unavailable
+import auth
 import models
 import web_search
 
@@ -466,7 +467,7 @@ def reload_auth(cfg):
         if not cookie or not xsrf or (cookie, xsrf) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"])):
             return False
         cfg.update(cookie=cookie, xsrf=xsrf, _disk_auth=(cookie, xsrf),
-                   cookie_values=[p.strip().split("=", 1)[1] for p in cookie.split(";") if "=" in p])
+                   cookie_values=auth.secret_values(cookie, cfg.get("_extra_secrets", ())))
         if isinstance(cfg.get("_account_ref"), dict):
             cfg["_account_ref"].update(cookie=cookie, xsrf=xsrf)
         return True
@@ -795,6 +796,8 @@ def _load(path):
     search_key = web_search.key_of(cfg)
     if search_key and search_key not in cookie_vals:
         cookie_vals.append(search_key)  # masked wherever the relay redacts secrets, should it ever show up in a message
+    # The secrets that are no cookie: a renewal or a new sign-in rebuilds cookie_values and keeps these (auth.secret_values).
+    cfg["_extra_secrets"] = [search_key] if search_key else []
     if cfg["web_search_provider"] and not search_key:
         warnings.append("web_search_provider is %s, but the environment variable %s holds no key: WebSearch stays refused"
                         % (cfg["web_search_provider"], cfg["web_search_key_env"]))
