@@ -337,6 +337,18 @@ def _account_record(saved, cfg):
     return record
 
 
+def _derived_account_id(record, saved, occurrence):
+    """The id an account without one gets: the same on every start, saved or not.
+
+    It used to be random, and where it could not be saved (secrets in RETOOL_COOKIE/RETOOL_XSRF, a read-only config.json)
+    every start made a new one: the stored conversations, bound to the account's id, never came back after a restart and
+    each wrote its whole prefix again. Derived from the tenant and the page, it is stable, and a later writable start
+    saves the very same value."""
+    base = str(record.get("base") or saved.get("base") or "").rstrip("/").lower()
+    page = str(record.get("page_uuid") or saved.get("page_uuid") or "").lower()
+    return hashlib.sha256(("%s|%s|%d" % (base, page, occurrence)).encode("utf-8")).hexdigest()[:32]
+
+
 def _assign_account_ids(saved):
     records = saved.get("accounts") if isinstance(saved.get("accounts"), list) else [saved]
     seen = set()
@@ -347,11 +359,17 @@ def _assign_account_ids(saved):
             if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) or value in seen:
                 raise service_unavailable("account_id must be a unique, nonempty identifier")
             seen.add(value)
+    occurrences = {}
     for record in records:
         if not record.get("account_id"):
-            value = secrets.token_hex(16)
-            while value in seen:
-                value = secrets.token_hex(16)
+            place = (str(record.get("base") or saved.get("base") or "").rstrip("/").lower(),
+                     str(record.get("page_uuid") or saved.get("page_uuid") or "").lower())
+            occurrence = occurrences.get(place, 0)
+            value = _derived_account_id(record, saved, occurrence)
+            while value in seen:  # an explicit id of another record that happens to be this one
+                occurrence += 1
+                value = _derived_account_id(record, saved, occurrence)
+            occurrences[place] = occurrence + 1
             record["account_id"] = value
             seen.add(value)
             changed = True
@@ -782,7 +800,7 @@ def _load(path):
         try:
             _write_file(path, saved)
         except OSError as exc:
-            # Read-only config: the generated ids live in memory until the next writable start.
+            # Read-only config: the ids derived from base and page_uuid are the same at every start until one can save them.
             print("warning: cannot save account_id to %s (%s); ids are kept in memory" % (
                 path, type(exc).__name__), file=sys.stderr)
     return cfg

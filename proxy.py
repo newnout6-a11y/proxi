@@ -108,6 +108,11 @@ class Runtime:
         self.loop._relay_io_executor = self._io_executor
         self._loop_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self._loop_thread.start()
+        # First, before anything that reports to it: PromptStore journals prompt.reload and prompt.pins_loaded (or their
+        # errors) as it reads prompts.json and the pins. Configured after it, the journal held those events without a file:
+        # they never reached journal.jsonl, and the restored history of the last run buried or evicted them.
+        self.journal = journal.JOURNAL
+        self.journal.configure(cfg, cfg.get("journal_path"))
         self.backend = Backend(cfg)
         self.pool = SessionPool(self.backend)
         if getattr(self.pool, "backends", None):
@@ -134,8 +139,6 @@ class Runtime:
         self.tool_search_guard = tool_search_policy.LoopGuard()
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
-        self.journal = journal.JOURNAL
-        self.journal.configure(cfg, cfg.get("journal_path"))
         self.admin = admin_module.Admin(self)
         # After the journal is configured: scanning the stored conversations reports what it removed.
         self.pool.attach_store(conversation_state.open_store(cfg))
