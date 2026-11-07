@@ -847,11 +847,13 @@ def _unrolled(node):
 _REPEAT_COUNT = re.compile(r"\{(?:\d+(?:,\d*)?|,\d*)\}")
 
 
-def _fuzzy_lookalike(pattern):
+def _fuzzy_lookalike(pattern, verbose=False):
     """True when a `{` that `re` takes for a literal brace starts a fuzzy-match constraint in the `regex` module.
 
     a{e<=1} matches only the text "a{e<=1}" in `re`, and "a" with one error in `regex`. A pattern written for `re` keeps
     its meaning only if such a brace is escaped, so the pattern is refused. Braces inside a character set are literal in both.
+    In verbose mode `regex` also skips the blanks inside the braces, and `re` does not: (?x)a{ e<=1} and (?x)a{ 2 } were
+    taken as literal text by the check and ran as a fuzzy match and a repeat count, so `verbose` looks past them.
     """
     index, size, in_set = 0, len(pattern), False
     while index < size:
@@ -872,10 +874,15 @@ def _fuzzy_lookalike(pattern):
             if counted:
                 index = counted.end()
                 continue
-            if index + 1 < size and (pattern[index + 1] in "deis" or pattern[index + 1].isdecimal()):
+            following = pattern[index + 1:].lstrip(" \t\n\r\f\v")[:1] if verbose else pattern[index + 1:index + 2]
+            if following and (following in "deis" or following.isdecimal()):
                 return True
         index += 1
     return False
+
+
+# A group that turns verbose mode on for its own part, (?x:...) or (?ix-m:...): the parser reports only the global flags.
+_SCOPED_VERBOSE = re.compile(r"\(\?[a-zA-Z]*x[a-zA-Z]*(?:-[a-zA-Z]*)?:")
 
 
 def _re_bits(flags):
@@ -932,7 +939,7 @@ def _compile_pattern(pattern, flags, path):
     if weight > MAX_PATTERN_WEIGHT:
         _err(path, "the pattern repeats too much: nested repeat counts make it about %d pieces long (up to %d are "
                    "allowed)" % (min(weight, 10 ** 12), MAX_PATTERN_WEIGHT))
-    if _fuzzy_lookalike(pattern):
+    if _fuzzy_lookalike(pattern, bool(tree.state.flags & re.VERBOSE) or bool(_SCOPED_VERBOSE.search(pattern))):
         _err(path, "a '{' that is not a repeat count (a{2,3}) starts a fuzzy-match constraint in the regex engine: "
                    "write \\{ for a literal brace")
     try:
