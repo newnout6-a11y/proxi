@@ -7,8 +7,6 @@ import math
 import os
 from pathlib import Path
 import re
-import stat
-import tempfile
 import threading
 import time
 from urllib.parse import unquote, urlsplit
@@ -1059,23 +1057,11 @@ class Admin:
                                         xhigh_as=candidate["claude_xhigh_effort"])
             self._check_role_budget(candidate, changes)
             changed = [key for key, value in changes.items() if desired[key] != value]
-            temporary = None
-            try:
-                saved.update(changes)
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
-                                                 prefix=".admin-", suffix=".tmp", delete=False) as output:
-                    temporary = output.name
-                    json.dump(saved, output, ensure_ascii=False, indent=2, allow_nan=False)
-                    output.write("\n")
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
-                os.replace(temporary, path)
-            except (OSError, ValueError):
-                raise apierr.service_unavailable("Cannot save relay settings")
-            finally:
-                if temporary and os.path.exists(temporary):
-                    os.unlink(temporary)
+            saved.update(changes)
+            # Through config._write_file, as the account pool writes: its temporary file is git-ignored and removed even when
+            # config.json is read-only. This one copied the read-only mode onto its own temporary file, whose removal then
+            # failed on Windows: a 500 instead of the 503, and a copy of config.json with every cookie left beside it.
+            self._write(path, saved)
             applied = [key for key in changes if key in LIVE_SETTINGS]
             journal.emit("admin.settings", "Настройки сохранены: %s" % (", ".join(changed) or "без изменений"),
                          "success", changed={key: {"from": self._loggable(key, desired[key]),
