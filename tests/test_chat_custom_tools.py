@@ -151,6 +151,25 @@ def test_a_custom_call_cut_by_a_timeout_or_a_cancel_is_dropped_not_sent_half_wri
 
 
 @pytest.mark.parametrize("stream", [False, True])
+def test_a_custom_call_the_output_stopped_inside_is_dropped_and_the_reply_ends_with_length(stream):
+    # The output limit (GPT's max_completion_tokens, the relay's cap on Claude) or a stream that ended inside the call
+    # ends the turn as "length". That raised 502 upstream_error "Retool returned incomplete custom tool input", in a
+    # stream an error event with no finish_reason: an error for a reply that only reached its limit, which a function
+    # call of the same cut, or Responses' custom call, ends with as "length" (incomplete).
+    writer, adapter = chat_adapter(stream=stream)
+    adapter.feed({"type": "text", "delta": "Querying."})
+    adapter.feed(custom_call('{"input": "SELECT 1\\nFR', done=False))
+    choice = adapter.end("length")["choices"][0]
+    assert choice["finish_reason"] == "length" and "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == "Querying."
+    if stream:
+        assert streamed_calls(writer) == []  # no half of the input reaches the client
+        finishes = [c["finish_reason"] for k, p in writer.events if k == "data" and isinstance(p, dict)
+                    for c in p.get("choices") or [] if c.get("finish_reason")]
+        assert finishes == ["length"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("reason", ["tool_calls", "stop"])
 def test_a_cut_input_of_a_turn_upstream_completed_is_an_upstream_error(reason, stream):
     _, adapter = chat_adapter(stream=stream)

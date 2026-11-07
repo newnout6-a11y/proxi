@@ -346,8 +346,9 @@ class ChatAdapter(_Base):
     def _wire_calls(self, reason):
         """The calls of the reply as Chat writes them: a function call, or a custom one with its one input string.
 
-        A custom call whose input is cut off is dropped when the client left or the turn timed out, and an upstream
-        fault when upstream said the turn was complete: half a patch is never passed on."""
+        A custom call whose input is cut off is dropped when the client left or the reply was cut (the turn timed out,
+        the output stopped inside the call: CUT_REASONS, finish_reason "length"), and an upstream fault when upstream
+        said the turn was complete: half a patch is never passed on."""
         calls = []
         for call in self.tool_calls:
             if call.get("tool_type") != "custom":
@@ -356,7 +357,7 @@ class ChatAdapter(_Base):
                 continue
             value = self._custom_text(call)
             if value is None:
-                if reason not in ("cancelled", "timeout"):
+                if reason not in ("cancelled",) + CUT_REASONS:
                     raise apierr.upstream_error("Retool returned incomplete custom tool input")
                 continue
             calls.append({"id": call["id"], "type": "custom", "custom": {"name": call["name"], "input": value}})
@@ -367,7 +368,7 @@ class ChatAdapter(_Base):
         if self.writer:
             for index, call in enumerate(self.tool_calls):
                 if call.get("tool_type") == "custom" and not call.get("sent"):
-                    if self._send_custom(index, call) is None and reason not in ("cancelled", "timeout"):
+                    if self._send_custom(index, call) is None and reason not in ("cancelled",) + CUT_REASONS:
                         raise apierr.upstream_error("Retool returned incomplete custom tool input")
             self.writer.data(self._chunk({}, finish))
             prompt, completion = self.usage(prompt_text)
