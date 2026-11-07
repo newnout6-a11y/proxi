@@ -1905,7 +1905,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             if prior_key and prior_key != body["openAICacheKey"]:
                 # A new key means the upstream prefix cache starts from zero: every
                 # history breakpoint misses and the whole prompt is written again.
-                journal.emit("cache.key_changed", "╨Ъ╤Н╤И-╨║╨╗╤О╤З ╤Б╨╝╨╡╨╜╨╕╨╗╤Б╤П тАФ ╨┐╤А╨╡╤Д╨╕╨║╤Б ╨▒╤Г╨┤╨╡╤В ╨┐╨╡╤А╨╡╨╖╨░╨┐╨╕╤Б╨░╨╜", "info",
+                journal.emit("cache.key_changed", "Кэш-ключ сменился — префикс будет перезаписан", "info",
                              old=prior_key, new=body["openAICacheKey"], model=body.get("model"),
                              tools=len(body.get("tools") or []),
                              thread=journal.tag(getattr(session, "thread_id", None)))
@@ -2029,7 +2029,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                     _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
                 _ASSIST_ONLY.add(model_provider.get("model"))
                 print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
-                journal.emit("upstream.assist_retry", "╨Ь╨╛╨┤╨╡╨╗╤М ╤В╨╛╨╗╤М╨║╨╛ ╨▓ ╤Б╨┐╨╕╤Б╨║╨╡ Assist тАФ ╨┐╨╛╨▓╤В╨╛╤А ╨▒╨╡╨╖ ╨╝╨░╤А╨║╨╡╤А╨░", "warn",
+                journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
                              model=model_provider.get("model"))
                 body = {key: value for key, value in body.items() if key != "metadata"}
                 if body.get("openAICacheKey"):
