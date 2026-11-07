@@ -113,6 +113,18 @@ def _live_thinking(model):
     return provider is not None and provider != "anthropic"
 
 
+def _cold_from_the_start(model):
+    """Whether a request on this route takes the client's own messages and roles from its first request on.
+
+    GLM's reasoning arrives without a signature, so a reply that reasons is never kept as a branch and the next request
+    is rebuilt from the client's transcript. That transcript was taken only once it held a tool result; before, the
+    history went flattened (`User: ...`, `Assistant: ...` as user text), so the first tool result re-rendered every earlier
+    message and the provider read none of it: 11,094 tokens re-read uncached in a Harness conversation on GLM-5.3
+    (72b51698, 1.1 credits) and three more such flips in two hours (journal watch of 2026-11-07); a long chat that starts
+    using tools late pays its whole history once. On such a route the history has one form from the first request."""
+    return _provider_of(model) == "retool-fast"
+
+
 def _hints_tool_results(model):
     """Whether the result of a tool may carry a cache hint in a request for this model.
 
@@ -1829,7 +1841,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                          why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
         body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks,
                           session=None if background else session, mark_tail=not side_request)
-        cold = (native_history.unsigned_tool_transcript(client)
+        cold = (native_history.unsigned_tool_transcript(
+                    client, without_results=_cold_from_the_start(model_provider.get("model")))
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
         if cold is not None:
             # The opaque signed branch may have expired or belonged to another
