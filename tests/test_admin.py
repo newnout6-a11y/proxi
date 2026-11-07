@@ -288,6 +288,14 @@ def test_journal_redacts_configured_secrets_and_known_shapes(admin_relay):
     assert event["category"] == "test" and event["seq"] == 1
 
 
+def test_journal_redacts_the_search_providers_key_from_the_environment(admin_relay, monkeypatch):
+    monkeypatch.setenv("EXA_API_KEY", "0a1b2c3d-search-provider-key")
+    journal.JOURNAL.reset()
+    event = journal.emit("tool.call", "a shell command", "info",
+                         arguments="[Environment]::SetEnvironmentVariable('EXA_API_KEY', '0a1b2c3d-search-provider-key', 'User')")
+    assert "0a1b2c3d-search-provider-key" not in json.dumps(event) and "[redacted]" in event["data"]["arguments"]
+
+
 def test_events_api_filters_by_level_category_text_and_since(admin_relay):
     journal.JOURNAL.reset()
     journal.emit("turn.begin", "alpha", "info", turn_id="t1", model="m")
