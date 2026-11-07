@@ -404,3 +404,41 @@ def test_a_signed_out_account_gets_no_balance_checks_until_a_renewal_brings_it_b
     value.refresh(dead)  # signed in again: the balance is checked at once
     assert dead.unavailable is None
     assert (dead, "balance") in value.due()
+
+
+@pytest.mark.parametrize("state", ["reserve", "signed_out"])
+def test_a_conversation_stays_on_its_degraded_account_when_no_account_is_better(tmp_path, state):
+    # every account below the reserve (or every one signed out): a conversation moved to another, equally degraded
+    # account on every request, and each move wrote its whole prefix again
+    _, pool, _ = setup(tmp_path, transport="direct", project_context=False)
+    other = Backend(tmp_path, provider_resource_name="other-account")
+    pool.backends.append(other)
+    first_account = pool.backends[0]
+
+    def degrade(backend, available):
+        backend.unavailable = ({"reason": "exhausted", "available": available, "threshold": 20.0} if state == "reserve"
+                               else {"reason": "auth_dead"})
+
+    async def scenario():
+        lease = await pool.acquire("chat")
+        assert lease.backend is first_account
+        first = lease.session
+        await pool.release(lease)
+        degrade(first_account, 9.0)
+        degrade(other, 11.0)  # "richer", or as signed out as the first
+        for _ in range(3):
+            lease = await pool.acquire("chat")
+            assert lease.session is first and lease.backend is first_account
+            await pool.release(lease)
+        # a new conversation still goes where a new one should
+        lease = await pool.acquire("another-chat")
+        if state == "reserve":
+            assert lease.backend is other
+        await pool.release(lease)
+        # once an account is healthy again, the conversation moves there
+        other.unavailable = None
+        lease = await pool.acquire("chat")
+        assert lease.backend is other
+        await pool.release(lease)
+
+    asyncio.run(scenario())

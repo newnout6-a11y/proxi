@@ -986,6 +986,21 @@ class SessionPool:
         if store is not None:
             store.close(timeout)
 
+    def _keeps(self, backend, model_entry, exclude=()):
+        """Whether a conversation stays on its account: the account can serve it, or no account is in a better state and
+        its own is one of the degraded ones still served (in reserve, or signed out).
+
+        Without the second half, when every account was in reserve or signed out, a conversation moved to the "richest" or
+        least loaded other account on every request (its own session counts as load on its account), and each move dropped
+        its signed history and wrote its whole prefix again, more credits than an account in reserve has left."""
+        if self._usable(backend, exclude) and self._routable(backend, model_entry):
+            return True
+        try:
+            kind, candidates = self._candidates(self.backends, model_entry, exclude)
+        except apierr.ApiError:
+            return False
+        return kind != "ready" and backend in candidates
+
     def _state_refusal(self, backend, model_entry, exclude):
         """Why a stored conversation cannot return to its account now (a name for the journal), else None."""
         if backend is None:
@@ -994,7 +1009,7 @@ class SessionPool:
             return "account_excluded"
         if not account_enabled(backend):
             return "account_disabled"
-        if getattr(backend, "unavailable", None) is not None:
+        if getattr(backend, "unavailable", None) is not None and not self._keeps(backend, model_entry, exclude):
             return "account_unavailable"
         return None if self._routable(backend, model_entry) else "no_route"
 
@@ -1528,8 +1543,7 @@ class SessionPool:
                                self._conversations.get((conversation_key, "text")))
             affinity_backend = (self.backend if self.mode == "shared" else
                                 affinity_parent.backend if affinity_parent is not None else None)
-            if affinity_backend is not None and not (self._usable(affinity_backend, exclude)
-                                                     and self._routable(affinity_backend, model_entry)):
+            if affinity_backend is not None and not self._keeps(affinity_backend, model_entry, exclude):
                 # Affinity is strict only while the account can still serve this model.
                 affinity_backend = None
             if affinity_backend is None and affinity_parent is None:
@@ -1576,8 +1590,7 @@ class SessionPool:
                                       or self.cfg.get("transport") == "direct"
                                       or len(self.backends) > 1):
                     parent = self._conversations.get(key)
-                    backend = (parent.backend if parent is not None and self._usable(parent.backend, exclude)
-                               and self._routable(parent.backend, model_entry)
+                    backend = (parent.backend if parent is not None and self._keeps(parent.backend, model_entry, exclude)
                                else affinity_backend or self._next_backend(model_entry, exclude))
                     self._check_route(backend, model_entry)
                     session = RelaySession(backend, await self._new_thread_id(backend))
@@ -1605,8 +1618,7 @@ class SessionPool:
                     await lock.acquire()
                     locked = True
                     session = self._conversations.get(key)
-                    if session is not None and not (self._usable(session.backend, exclude)
-                                                    and self._routable(session.backend, model_entry)):
+                    if session is not None and not self._keeps(session.backend, model_entry, exclude):
                         # The account ran out, was signed out or has no route for this
                         # model: move the conversation.
                         # Resolve the replacement first, so a 402/503 keeps the old state;
