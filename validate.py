@@ -764,6 +764,12 @@ def conversation_affinity(data, headers, identity=None):
         parent = parent or key
         digest = hashlib.sha256(json.dumps([key, agent.strip()]).encode()).hexdigest()
         key = "agent:" + digest
+    elif key and headers.get("x-codex-parent-thread-id") and headers.get("thread-id"):
+        # A Codex sub-agent (spawned, review, guardian) sends its root's session-id, a thread-id of its own and the id of
+        # its parent thread: its own conversation, whose prompt and tools are not the parent's.
+        parent = parent or key
+        digest = hashlib.sha256(json.dumps([key, "codex-thread", headers["thread-id"]]).encode()).hexdigest()
+        key = "agent:" + digest
     return key, parent if parent != key else None
 
 

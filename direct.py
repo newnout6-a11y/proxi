@@ -527,11 +527,16 @@ def _keeps_null(convert):
     wanted none of them) or refused to call the tool. With the null branch, which Retool accepts, both said null
     (ultracode audit of the relay, C7). The children of a field are converted by the same function, so one wrapper
     covers the properties and items below it; a tool that is not strict keeps the plain type, as its optional field can
-    be left out."""
+    be left out. Whether the field may be null is asked of the schema it stands for, its $ref and allOf followed: a
+    reference to a nullable definition is as nullable as the definition."""
     @functools.wraps(convert)
     def wrapper(schema, required, *args, **kwargs):
         node = convert(schema, required, *args, **kwargs)
-        return _with_null(schema, node) if _STRICT_TOOL.get() and isinstance(schema, dict) else node
+        if not (_STRICT_TOOL.get() and isinstance(schema, dict)):
+            return node
+        root = args[0] if args else kwargs.get("root")
+        trail = args[1] if len(args) > 1 else kwargs.get("trail", ())
+        return _with_null(_deref(schema, schema if root is None else root, trail)[0], node)
     return wrapper
 
 
@@ -1732,6 +1737,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     another tool is dropped by the caller and is not part of what the turn delivered, nor of the branch recorded for it."""
     # A route that refuses a forced choice is sent `auto` (forced_choice): the choice is neither sent nor part of the scope
     # of the branch, which the next request continues whatever it forces.
+    asked = tools, tool_choice  # what the caller sent: the request that is asked again after a refusal is this one
     required = forced_choice.requirement(model_provider.get("model"), tools, tool_choice)
     if required is not None:
         tool_choice = "auto"
@@ -1944,7 +1950,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 history.forget_pruned()
                 upstream_status = getattr(error, "upstream_status", None) or error.status
                 answered = False
-                async with contextlib.aclosing(iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice,
+                async with contextlib.aclosing(iter_events(cfg, session, model_provider, prompt, head, *asked,
                                                            max_tokens, chunks)) as again:
                     async for event in again:
                         if not answered and event.get("type") != "usage_start":
