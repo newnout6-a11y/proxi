@@ -857,7 +857,11 @@ def cache_messages(messages, enabled, tools, mark_tail=True, tool_results=False)
         newest = len(eligible) - 1
         while newest >= 0 and not allowed(newest):
             newest -= 1
-        chosen = {newest} if newest >= 0 else set()
+        # A client's compaction (mark_tail=False): the client replaces its history by the summary, so nothing this request
+        # writes is read again. Only the hint the chat's last request wrote, which this one reads, and the head stay;
+        # content the chat never cached is input, not a write (OpenCode 2.2.6's automatic compaction wrote the newest tool
+        # result, 27,171 tokens and 1.62 credits, v3 run of 2026-11-07, 532118816fc1).
+        chosen = {newest} if newest >= 0 and mark_tail else set()
         if previous and allowed(previous[-1]):
             chosen.add(previous[-1])
         if allowed(0):

@@ -1106,6 +1106,12 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
                     chosen.add(idx)
 
             cache_indices = chosen
+            if not mark_tail:
+                # A client's compaction: the client replaces its history by the summary, so nothing written for this
+                # request is read again. Only the hint the chat's last request wrote (read now) stays: the flattened dialog
+                # of OpenCode 2.2.6's automatic compaction was written to the cache (2,281 and 3,075 tokens, v3 run of
+                # 2026-11-07, 3d0b8da709e7, 6a61f23eef9b) and never read.
+                cache_indices = {max(previous)} if previous else set()
 
         for index, part in enumerate(history):
             should_cache = index in cache_indices
