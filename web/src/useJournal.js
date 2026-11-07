@@ -121,16 +121,24 @@ export function usePolling(task, interval, deps) {
   useEffect(() => {
     let cancelled = false;
     let handle = null;
+    // One chain at a time: a tab shown again while a poll was in flight used to start a second chain beside the first,
+    // which re-armed itself too, so every Alt-Tab during a slow poll added a polling loop for good.
+    let running = false;
     const tick = async () => {
-      if (cancelled) return;
-      if (document.visibilityState === 'visible') {
-        try { await saved.current(); } catch { /* surfaced by the task */ }
+      if (cancelled || running) return;
+      running = true;
+      try {
+        if (document.visibilityState === 'visible') {
+          try { await saved.current(); } catch { /* surfaced by the task */ }
+        }
+      } finally {
+        running = false;
       }
       if (!cancelled) handle = setTimeout(tick, interval);
     };
     tick();
     const onVisible = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && !running) {
         clearTimeout(handle);
         tick();
       }
