@@ -1,4 +1,5 @@
 """Thread-safe credits tracking and usage history."""
+import collections
 import json
 import math
 import threading
@@ -7,6 +8,10 @@ import urllib.request
 
 CACHE_TTL = 30.0
 HISTORY_MAX = 200
+# The turn ids a manager remembers to count each billed attempt once. Every id is new (a uuid per attempt, per keepwarm
+# ping), so a repeat can only come from the same attempt reported twice, moments apart: a few thousand cover that, where
+# the set kept every id of the process's life (about 120 bytes each, some 2,000 a day).
+SEEN_TURNS_MAX = 4096
 
 # Retool rates measured by a least-squares fit over 350 journal turns (2026-10-31).
 # Retool passes Anthropic pricing through: cache read 0.05x, cache write ~1.25x and
@@ -82,7 +87,7 @@ class CreditsManager:
         self._cached_at = float("-inf")
         self.session_used = 0.0
         self._history = []
-        self._seen_turns = set()
+        self._seen_turns = collections.OrderedDict()  # the newest SEEN_TURNS_MAX turn ids, oldest first
         self.last_error = None
         self._balance_estimated = False
         self._unreported_usage = False
@@ -170,7 +175,9 @@ class CreditsManager:
             if turn_id and turn_id in self._seen_turns:
                 return
             if turn_id:
-                self._seen_turns.add(turn_id)
+                self._seen_turns[turn_id] = None
+                if len(self._seen_turns) > SEEN_TURNS_MAX:
+                    self._seen_turns.popitem(last=False)
             self._usage_revision += 1
             self.session_used += cost
             self._history.append({"ts": time.time(), "turn_id": turn_id, "credits": round(cost, 5)})
