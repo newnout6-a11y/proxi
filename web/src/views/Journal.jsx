@@ -7,6 +7,7 @@ import { Button, CopyButton, Empty, Tag, useToast } from '../ui.jsx';
 import { CATEGORIES, LEVELS, category } from '../catalog.js';
 import { fmtClock, fmtDateTime, fmtInt } from '../format.js';
 import { JournalArt } from '../stage/Art.jsx';
+import { pausedView } from '../journalPause.js';
 
 const PAGE = 400;
 const LEVEL_TONE = { success: 'pos', error: 'neg', warn: 'warn' };
@@ -46,24 +47,28 @@ export default function Journal({ apiKey, journal, overview, onUnauthorized, emb
   const [open, setOpen] = useState(null);
   const [limit, setLimit] = useState(PAGE);
   const [follow, setFollow] = useState(true);
+  // The pause holds this list still and nothing else (journalPause.js); leaving the page ends it.
+  const [frozen, setFrozen] = useState(null);
+  const paused = frozen !== null;
+  const view = useMemo(() => pausedView(journal.events, frozen), [journal.events, frozen]);
   const listRef = useRef(null);
 
   const needle = query.trim().toLowerCase();
-  const filtered = useMemo(() => journal.events.filter((event) => (
+  const filtered = useMemo(() => view.events.filter((event) => (
     (!levels.size || levels.has(event.level))
     && (!cats.size || cats.has(event.category))
     && (!needle || `${event.message} ${event.kind} ${event.turn_id || ''} ${event.request_id || ''} ${JSON.stringify(event.data)}`.toLowerCase().includes(needle))
-  )), [journal.events, levels, cats, needle]);
+  )), [view.events, levels, cats, needle]);
   const shown = filtered.slice(-limit).reverse();
 
   const counts = useMemo(() => {
     const result = { level: {}, category: {} };
-    for (const event of journal.events) {
+    for (const event of view.events) {
       result.level[event.level] = (result.level[event.level] || 0) + 1;
       result.category[event.category] = (result.category[event.category] || 0) + 1;
     }
     return result;
-  }, [journal.events]);
+  }, [view.events]);
 
   useEffect(() => {
     if (follow && listRef.current) listRef.current.scrollTo({ top: 0 });
@@ -92,6 +97,7 @@ export default function Journal({ apiKey, journal, overview, onUnauthorized, emb
     try {
       await api(apiKey, 'events/clear', { method: 'POST', body: {} });
       journal.reset();
+      setFrozen(null);
       setOpen(null);
       toast({ tone: 'warn', title: 'Журнал очищен' });
     } catch (failure) {
@@ -108,16 +114,16 @@ export default function Journal({ apiKey, journal, overview, onUnauthorized, emb
       <header className="page-head">
         <div>
           {!embedded && <h1>Журнал событий</h1>}
-          <p className="page-meta">в буфере {fmtInt(journal.events.length)} · показано {fmtInt(shown.length)} из {fmtInt(filtered.length)}</p>
+          <p className="page-meta">в буфере {fmtInt(view.events.length)} · показано {fmtInt(shown.length)} из {fmtInt(filtered.length)}</p>
         </div>
         <div className="head-actions">
           <span className="status">
-            <Dot tone={live && !journal.paused ? 'pos' : 'warn'} live={live && !journal.paused} />
-            {journal.paused ? 'на паузе' : live ? 'live' : 'переподключение'}
+            <Dot tone={live && !paused ? 'pos' : 'warn'} live={live && !paused} />
+            {paused ? 'на паузе' : live ? 'live' : 'переподключение'}
           </span>
-          <Button icon={journal.paused ? Play : Pause} tone={journal.paused ? 'primary' : 'default'}
-            onClick={() => journal.setPaused(!journal.paused)}>
-            {journal.paused ? `Продолжить${journal.pending ? ` (+${journal.pending})` : ''}` : 'Пауза'}
+          <Button icon={paused ? Play : Pause} tone={paused ? 'primary' : 'default'}
+            onClick={() => setFrozen(paused ? null : journal.events)}>
+            {paused ? `Продолжить${view.pending ? ` (+${view.pending})` : ''}` : 'Пауза'}
           </Button>
           <Button icon={Download} onClick={exportJsonl} disabled={!filtered.length}>Экспорт</Button>
           <Button icon={Trash} tone="danger" onClick={clearAll}>Очистить</Button>
@@ -166,9 +172,9 @@ export default function Journal({ apiKey, journal, overview, onUnauthorized, emb
           </label>
         </div>
         <div className="log" ref={listRef} role="log" aria-label="События журнала">
-          {journal.paused && journal.pending > 0 && (
-            <button type="button" className="pending-bar" onClick={() => journal.setPaused(false)}>
-              <ArrowDown size={16} strokeWidth={1.5} /> {fmtInt(journal.pending)} новых событий, показать
+          {paused && view.pending > 0 && (
+            <button type="button" className="pending-bar" onClick={() => setFrozen(null)}>
+              <ArrowDown size={16} strokeWidth={1.5} /> {fmtInt(view.pending)} новых событий, показать
             </button>
           )}
           {shown.map((event) => {
