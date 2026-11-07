@@ -233,15 +233,18 @@ class SlottedRequestHandler(BaseHTTPRequestHandler):
         acquire = getattr(self.server, "acquire_slot", None)
         if acquire is None:
             return True
+        waiting_since = time.monotonic()
         if not acquire():
             # The server is stopping: the request goes with its connection, unanswered.
             self.close_connection = True
             return False
         self._holds_slot = True
+        self._slot_wait = time.monotonic() - waiting_since
         return True
 
     def handle_one_request(self):
         self._holds_slot = False
+        self._slot_wait = 0.0
         try:
             super().handle_one_request()
         finally:
@@ -349,9 +352,13 @@ def make_handler(runtime: Runtime):
             effort_tag = f" [{effort}]" if effort and model != "-" else ""
             route = getattr(self, "_log_route", None)
             local_note = {"count_tokens": "[local-token-count]", "models": "[local-model-catalog]"}.get(route, "")
+            # Time spent before the request was read: the wait for one of the max_workers slots (SlottedRequestHandler).
+            # It is not part of duration_ms, which starts when the request is handled.
+            slot_wait = getattr(self, "_slot_wait", 0.0) or 0.0
+            queued = "[queued %.1fs for a max_workers slot]" % slot_wait if slot_wait >= SLOT_WAIT_NOTE else ""
             console_log.write("relay %s %s %s %s %s%s %.0fms %s" % (
                 self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
-                " ".join(part for part in (client_context.label(), local_note, note) if part)))
+                " ".join(part for part in (client_context.label(), local_note, queued, note) if part)))
             if route in ("chat", "responses", "anthropic") and getattr(self, "_model_called", False):
                 backend, manager = self._serving_account()
                 snapshot = getattr(manager, "balance_snapshot", None)
@@ -364,7 +371,8 @@ def make_handler(runtime: Runtime):
             level = "error" if status >= 500 or status == 0 else "warn" if status >= 400 else "success"
             journal.emit("http.request", "%s %s → %s" % (self.command, self.path, status or "—"), level,
                          request_id=self.request_id, method=self.command, path=self.path, route=route,
-                         status=status, duration_ms=round(took), model=None if model == "-" else model,
+                         status=status, duration_ms=round(took), slot_wait_ms=round(slot_wait * 1000),
+                         model=None if model == "-" else model,
                          stream=bool(getattr(self, "_streaming", False)),
                          user_agent=self.headers.get("user-agent", "")[:120] if self.headers else "",
                          error=getattr(self, "_error_code", None), **self._account_fields())
@@ -1162,6 +1170,8 @@ def make_handler(runtime: Runtime):
 # Client connections open at once, idle keep-alive ones included: each is a thread, but only a request in progress holds
 # one of the max_workers slots (SlottedRequestHandler).
 MAX_CONNECTIONS = 512
+# A request that waited this long for a slot says so in the console line of its reply.
+SLOT_WAIT_NOTE = 0.5
 
 
 class BoundedServer(ThreadingHTTPServer):
