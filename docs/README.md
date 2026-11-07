@@ -40,3 +40,4 @@
 | 2026-11-05 | [model-route-availability-2026-11-05.md](reports/model-route-availability-2026-11-05.md) | Доступность маршрутов моделей |
 | 2026-11-05 | [thinking-only-replies-2026-11-05.md](reports/thinking-only-replies-2026-11-05.md) | Ответы «только thinking» и пустые ответы Claude 5.5 |
 | 2026-11-06 | [bug-summary-2026-11-06.md](reports/bug-summary-2026-11-06.md) | Сводка ошибок relay и клиентов после живых прогонов |
+| 2026-11-07 | [fixes-2026-11-07.md](reports/fixes-2026-11-07.md) | Уборка проекта, структура и исправленные ошибки: что, где и почему |
