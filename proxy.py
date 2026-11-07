@@ -83,14 +83,17 @@ class RateLimiter:
         self.lock = threading.Lock()
 
     def take(self):
-        if self.rate <= 0:
-            return 0.0
+        # The rate is read under the lock the admin's settings save changes it under: read before the lock, a limit turned
+        # off between the look and the lock divided by zero (a 500 for the request that was taking a token)
         with self.lock:
+            rate = self.rate
+            if rate <= 0:
+                return 0.0
             now = time.monotonic()
-            self.tokens = min(self.burst, self.tokens + (now - self.stamp) * self.rate)
+            self.tokens = min(self.burst, self.tokens + (now - self.stamp) * rate)
             self.stamp = now
             if self.tokens < 1.0:
-                return max(0.05, (1.0 - self.tokens) / self.rate)
+                return max(0.05, (1.0 - self.tokens) / rate)
             self.tokens -= 1.0
             return 0.0
 
