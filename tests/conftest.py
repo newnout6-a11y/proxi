@@ -1,5 +1,6 @@
 """Offline harness: a real HTTP server with a scripted upstream (no network)."""
 import json
+import socketserver
 import threading
 import urllib.error
 import urllib.request
@@ -11,6 +12,12 @@ import proxy
 import config as config_module
 
 KEY = "test-key-123"
+
+# shutdown() returns when serve_forever's loop looks at the stop request, which it does only when its select() returns: after
+# poll_interval (0.5 s) of silence, and a test that stops its server has just sent its last request. That wait was two thirds
+# of the suite (about 1,400 teardowns of 0.5 s in 983 s). Every server of the tests, the relay's own and the stdlib fakes,
+# polls at this rate instead; nothing a test checks depends on it.
+socketserver.BaseServer.serve_forever.__defaults__ = (0.01,)
 
 
 @pytest.fixture(autouse=True)
