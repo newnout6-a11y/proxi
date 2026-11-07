@@ -1548,7 +1548,8 @@ PING_RETRY = 10.0
 # A ping that WROTE the prefix instead of reading it found the entry gone. It counts as a rewrite when it wrote
 # half of the cached prefix (a miss on a small prompt) or REWRITE_TOKENS tokens: the console flags the same
 # size as [WRITE HIGH], and at the write price (1e-4 credits per token) it is 5 credits, as much as six
-# healthy pings of a 190k-token prefix (4e-6 per token). Below one cache block it is noise.
+# healthy pings of a 190k-token prefix (4e-6 per token). Below one cache block it is noise. A route that reports
+# no write (GLM, gpt-5.5) bills the missed prefix as plain input instead, held to the same sizes (_rewrite_of).
 REWRITE_SHARE = 0.5
 REWRITE_TOKENS = 50_000
 REWRITE_FLOOR = 1_024
@@ -1588,18 +1589,30 @@ def _hit_the_cap(body, flags):
     return (type(cap) is int and type(written) in (int, float) and written == cap and not flags.get("whole_calls"))
 
 
-def _rewrite_of(usage):
-    """The size of a rewrite when a ping wrote the cached prefix again instead of reading it, else None."""
+def _rewrite_of(usage, model=None):
+    """The size of a rewrite when a ping wrote the cached prefix again instead of reading it, else None.
+
+    GLM and gpt-5.5 report no cache write (credits.py): a prefix they did not read is billed as plain input, 10 times the
+    price of a read (5 times on GLM-5.3-Flash), and a check of the write counter alone let every such ping pass for a healthy
+    one until the idle limit. Where the usage has no write counter, or the model is one that never writes (its write is
+    priced as its input, credits.rates), the uncached input is the part the ping missed (named input_tokens: nothing was
+    reported written), held to the same thresholds against what it read. A ping that reads its prefix leaves only the nudge
+    and the tail past the provider's last cached block as input, a few hundred tokens. A route that reports writes is judged
+    by its write counter alone, as before."""
     if not isinstance(usage, dict):
         return None
-    written = int(console_log.number(usage.get("promptTokensWrittenToCache")) or 0)
-    if written < REWRITE_FLOOR:
+    missed, key = console_log.number(usage.get("promptTokensWrittenToCache")), "written_tokens"
+    rate = credits.rates(model)
+    if missed is None or (not missed and rate["cache_write"] == rate["input"]):
+        missed, key = console_log.number(usage.get("inputTokens")), "input_tokens"
+    missed = int(missed or 0)
+    if missed < REWRITE_FLOOR:
         return None
     read = int(console_log.number(usage.get("promptTokensReadFromCache")) or 0)
-    prefix = read + written
-    if written < REWRITE_TOKENS and written < prefix * REWRITE_SHARE:
+    prefix = read + missed
+    if missed < REWRITE_TOKENS and missed < prefix * REWRITE_SHARE:
         return None
-    return {"written_tokens": written, "read_tokens": read, "prefix_tokens": prefix}
+    return {key: missed, "read_tokens": read, "prefix_tokens": prefix}
 
 
 class _WarmCycle:
@@ -1714,7 +1727,8 @@ async def _keepwarm(session, cfg):
       (a failed ping touches nothing: its result is unknown), is older than
       PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN: cache_expired. This also ends a retry that no longer fits (the touch
       is read again after the failure: a request that began while the ping hung read the cache itself);
-    - a ping reported that it wrote the prefix instead of reading it: cache_rewritten. One rewrite is the most a
+    - a ping reported that it wrote the prefix instead of reading it, or, on a route that reports no write (GLM,
+      gpt-5.5), that it paid the prefix as plain input: cache_rewritten. One rewrite is the most a
       session pays for: the session is marked, and no cycle is started for it again (_ensure_keepwarm, which the pool
       calls at every request of a child) until a real turn gives a usable answer;
     - five failed pings in a row: failures (with the default interval the window closes first, see PING_RETRY).
@@ -1827,11 +1841,12 @@ async def _keepwarm(session, cfg):
                     session._keepwarm_estimated_cost = round(
                         getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
                 usage = getattr(session, "_last_warm_usage", {})
-                rewrite = _rewrite_of(usage)
+                rewrite = _rewrite_of(usage, body.get("model"))
                 touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
                     "promptTokensReadFromCache", "promptTokensWrittenToCache"))
                 journal.emit("cache.keepwarm",
-                             "Прогрев перезаписал кэш: префикс записан заново, а не прочитан" if rewrite else
+                             ("Прогрев не прочитал кэш: префикс оплачен как обычный вход" if "input_tokens" in rewrite else
+                              "Прогрев перезаписал кэш: префикс записан заново, а не прочитан") if rewrite else
                              "Кэш прочитан или записан при прогреве" if touched else
                              "Запрос прогрева завершён; использование кэша не подтверждено",
                              "warn" if rewrite else "info" if busy else "debug",
@@ -1844,7 +1859,8 @@ async def _keepwarm(session, cfg):
                              cache_verified=touched, usage=usage)
                 if rewrite:
                     # The cache the cycle was keeping alive was gone: whatever kept it from being read
-                    # (a lapse, an eviction, another shard) can happen again, and every miss pays a full write.
+                    # (a lapse, an eviction, another shard) can happen again, and every miss pays a full write
+                    # (or, where the route reports no write, the whole prefix as plain input).
                     # The session is marked, not just this cycle: the pool starts a new cycle for a parent at every
                     # request of its child, and each would pay for one more rewrite.
                     session._warm_blocked = "cache_rewritten"
