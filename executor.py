@@ -236,6 +236,22 @@ GIT_READ_ONLY = frozenset((
     "whatchanged", "cherry", "range-diff", "check-ignore", "check-attr", "version", "help", "fetch", "push"))
 # --exec is the short name of --upload-pack/--receive-pack for push, fetch and the transport helpers: it runs a program.
 GIT_EXEC_RE = re.compile(r'(?:^|\s)--exec\b', re.IGNORECASE)
+# git takes any unique prefix of a long option: `fetch --upload=<cmd>` is --upload-pack, `push --exe=<cmd>` and
+# `push --rece=<cmd>` are --exec and --receive-pack, `grep --open=<cmd>` is --open-files-in-pager, and each ran the program
+# (audit of 2026-11-07). The patterns above name the whole option; a long option that can be the start of one of these is
+# refused here. No option git reads is a prefix of these names but the names themselves.
+GIT_DANGEROUS_LONG = ("upload-pack", "receive-pack", "exec", "exec-path", "open-files-in-pager", "output", "config-env",
+                      "git-dir", "work-tree")
+
+
+def _git_dangerous_option(words):
+    """The first long option of a git segment that is a dangerous option or a prefix of one, else None."""
+    for word in words[1:]:
+        if word.startswith("--") and len(word) > 2:
+            name = word[2:].split("=", 1)[0].lower()
+            if name and any(dangerous.startswith(name) for dangerous in GIT_DANGEROUS_LONG):
+                return word.split("=", 1)[0]
+    return None
 # branch and tag list by default; these flags rename, delete, create or rewrite (-a lists every branch but annotates a tag).
 GIT_LIST_ONLY_RE = {
     "branch": re.compile(r'(?:^|\s)(?:-[a-zA-Z]*[dDmMfu]\b|--(?:delete|move|copy|force|set-upstream-to|unset-upstream|'
@@ -277,6 +293,10 @@ def _check_segments(segments, patterns, depth=0) -> None:
                 raise PolicyError("git %s requires allow_all: the allowlist runs only git commands that read, fetch and "
                                   "push, without --exec (%s)"
                                   % (subcommand or "without a subcommand", ", ".join(sorted(GIT_READ_ONLY))))
+            dangerous = _git_dangerous_option(words)
+            if dangerous:
+                raise PolicyError("git option %s requires allow_all: git takes it for an option that runs a program or "
+                                  "writes a file" % dangerous)
             if (subcommand in GIT_LIST_ONLY_RE
                     and GIT_LIST_ONLY_RE[subcommand].search(" ".join(words[words.index(subcommand) + 1:]))):
                 raise PolicyError("git %s may only list under the allowlist" % subcommand)

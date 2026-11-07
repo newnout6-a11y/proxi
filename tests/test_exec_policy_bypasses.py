@@ -47,6 +47,24 @@ def test_a_way_to_run_any_program_or_change_the_work_is_refused(cmd):
 
 
 @pytest.mark.parametrize("cmd", [
+    'git fetch --upload="calc" .', 'git fetch --upl=calc .', 'git push --exe="calc" .', 'git push --rece="calc" .',
+    'git push --receive=calc .', 'git grep --open-files-in-p="calc" -e x', 'git grep --open=calc -e x',
+    'git log --outp=x.txt', 'git push "--exe=calc" .', 'git fetch --UPLOAD=calc .',
+])
+def test_an_abbreviated_option_that_git_completes_to_one_that_runs_a_program_is_refused(cmd):
+    """git takes any unique prefix of a long option, so a list of whole option names let these run any program (the
+    verifiers of the audit of 2026-11-07 ran each of them)."""
+    assert verdict(cmd) == "denied"
+
+
+@pytest.mark.parametrize("cmd", ["git log --output-indicator-new=+ -p", "git diff --exit-code", "git log --reverse",
+                                 "git grep --extended-regexp foo", "git log --remotes", "git fetch --prune origin",
+                                 "git diff --relative", "git log --oneline --", "git grep --count foo"])
+def test_ordinary_long_options_are_not_taken_for_abbreviations(cmd):
+    assert verdict(cmd) == "allowed"
+
+
+@pytest.mark.parametrize("cmd", [
     "git status", "git log --oneline -5", "git diff HEAD~1", "git show HEAD", "git blame a.py", "git grep -n foo",
     "git ls-files", "git rev-parse HEAD", "git branch --list", "git branch -a", "git tag --list", "git describe --tags",
     "git push -u origin main", "git fetch origin",
