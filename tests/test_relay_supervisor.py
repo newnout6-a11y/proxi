@@ -158,3 +158,30 @@ def test_a_python_that_cannot_be_started_counts_as_a_failed_start(tmp_path):
     assert code == 1 and delays == [2] and starts == 0
     assert sum(line.startswith("supervisor: cannot start the relay with ") for line in lines) == 2
     assert lines[-1].startswith("supervisor: the relay exited within 30 s of its start 2 times in a row")
+
+
+# relay.log took every console line of the relay, forever and across restarts, while the journal of the same events
+# is capped: tens of MB a day under %LOCALAPPDATA%\Proxi\state, never removed.
+MIB = 1024 * 1024
+
+
+def test_relay_log_starts_again_past_twenty_mib_while_a_viewer_holds_it_open(tmp_path):
+    log = tmp_path / "relay.log"
+    log.write_bytes(b"old line\r\n" * (2 * MIB))
+    # watch_relay.py keeps the log open: on Windows that forbids renaming it, so it is copied and emptied in place
+    # (the viewer reads a file that shrank from its start again).
+    with open(log, encoding="utf-8") as viewer:
+        assert viewer.readline() == "old line\n"
+        powershell(tmp_path, "Write-RelayLog $env:LOG 'new line'; '{}'", LOG=str(log))
+    assert log.read_bytes() == b"new line\r\n"
+    assert (tmp_path / "relay.log.1").stat().st_size == 20 * MIB
+    assert sorted(path.name for path in tmp_path.glob("relay.log*")) == ["relay.log", "relay.log.1"]
+
+
+def test_only_the_newest_old_relay_logs_are_kept(tmp_path):
+    log = tmp_path / "relay.log"
+    powershell(tmp_path, "1..12 | ForEach-Object { Write-RelayLog $env:LOG (('line {0:d2} ' -f $_) + ('x' * 20)) "
+                         "-MaxBytes 64 -Keep 2 }; '{}'", LOG=str(log))
+    files = {path.name: path.read_text(encoding="utf-8").split() for path in tmp_path.glob("relay.log*")}
+    numbers = {name: [int(word) for word in words if word.isdigit()] for name, words in files.items()}
+    assert numbers == {"relay.log.2": [4, 5, 6], "relay.log.1": [7, 8, 9], "relay.log": [10, 11, 12]}

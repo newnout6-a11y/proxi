@@ -10,7 +10,26 @@ param(
     [int]$MaxFastExits = 8
 )
 
-function Write-RelayLog([string]$Path, [string]$Line) {
+function Write-RelayLog([string]$Path, [string]$Line, [long]$MaxBytes = 20MB, [int]$Keep = 3) {
+    # Bounded like the journal: past $MaxBytes the log becomes relay.log.1 (relay.log.2 .. $Keep are older ones) and
+    # starts again. It is copied and emptied in place rather than renamed: watch_relay.py holds the file open, which
+    # on Windows forbids a rename, and it reads a file that shrank from its start again.
+    try {
+        $file = [IO.FileInfo]::new($Path)
+        if ($file.Exists -and $file.Length -ge $MaxBytes) {
+            if ($Keep -gt 0) {
+                if ([IO.File]::Exists("$Path.$Keep")) { [IO.File]::Delete("$Path.$Keep") }
+                for ($n = $Keep - 1; $n -ge 1; $n--) {
+                    if ([IO.File]::Exists("$Path.$n")) { [IO.File]::Move("$Path.$n", "$Path.$($n + 1)") }
+                }
+                [IO.File]::Copy($Path, "$Path.1")
+            }
+            [IO.FileStream]::new($Path, [IO.FileMode]::Truncate, [IO.FileAccess]::Write,
+                                 [IO.FileShare]::ReadWrite).Dispose()
+        }
+    } catch {
+        # A rotation that fails (an old file held open, a full disk) leaves the log growing; no line is lost.
+    }
     [IO.File]::AppendAllText($Path, "$Line`r`n", [Text.UTF8Encoding]::new($false))
 }
 
