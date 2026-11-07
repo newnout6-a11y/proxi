@@ -19,6 +19,20 @@ _USER_ID_LIMIT = 4096
 _CODEX_TURN_LIMIT = 16 * 1024
 _LOCK = threading.Lock()
 _CLIENTS = {"claude-code": "Claude Code", "claude-desktop": "Claude Desktop", "opencode": "OpenCode"}
+# The client families and the spellings people put into x-proxi-client, as prompt_policy reads them (prompt_policy.CLIENTS,
+# _family: a test keeps the two in step). This module imports no project module, so prompt_policy cannot be imported here.
+FAMILIES = ("opencode", "claude-code", "claude-desktop", "codex", "harness", "unknown")
+FAMILY_ALIASES = {"claude-cli": "claude-code", "deepseek-harness": "harness", "dsh": "harness"}
+
+
+def family(value) -> str:
+    """The client family a spelling names ("Claude Code", "claude_code", "claude-cli" -> "claude-code"); "" for none."""
+    name = re.sub(r"[\s_]+", "-", str(value or "").strip().lower())
+    if name in FAMILIES:
+        return name
+    if name.startswith("codex"):
+        return "codex"
+    return FAMILY_ALIASES.get(name, "")
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 _READ_LIMIT = 256 * 1024
 # Lookups scan local client folders on the request path. A found title is
@@ -441,7 +455,10 @@ def describe(data, headers, cfg=None):
                 identity = {"session_id": match[1]}
     identity = identity if isinstance(identity, dict) else {}
     identity_session = _first(identity.get("session_id"))
-    client = clean(headers.get("x-proxi-client"), 60).lower()
+    # The documented spellings of a family ("Claude Code", "claude_code", "claude-cli") are that family: kept as written, they
+    # switched off what the relay does for it (the refusal of Claude Code's tool search, local titles, request kinds).
+    raw = clean(headers.get("x-proxi-client"), 60)
+    client = family(raw) or raw.lower()
     ua = str(headers.get("user-agent", "")).lower()
     if not client:
         client = next((name for name in _CLIENTS if name in ua), "")
