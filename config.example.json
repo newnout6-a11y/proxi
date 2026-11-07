@@ -39,7 +39,7 @@
   "journal_note": "журнал (journal.jsonl) начинает новый файл на journal_max_file_bytes и хранит journal_keep_files прежних (journal.jsonl.1 — самый новый): на диске не больше (journal_keep_files + 1) × journal_max_file_bytes, по умолчанию 300 МиБ, при нагрузке нескольких агентов это часы, а не минуты. 0 в journal_keep_files — прежние файлы не хранить",
   "conversation_state": true,
   "conversation_state_dir": "",
-  "conversation_state_max_conversations": 200,
+  "conversation_state_max_conversations": 1000,
   "conversation_state_ttl": 86400,
   "conversation_state_max_file_bytes": 33554432,
   "conversation_state_max_total_bytes": 536870912,
