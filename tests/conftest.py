@@ -1,7 +1,9 @@
 """Offline harness: a real HTTP server with a scripted upstream (no network)."""
+import collections
 import http.client
 import json
 import os
+import re
 import socket
 import socketserver
 import struct
@@ -61,6 +63,24 @@ def _socketpair_that_resets_on_close(*args, **kwargs):
 
 
 socket.socketpair = _socketpair_that_resets_on_close
+
+_made = collections.Counter()
+
+
+@pytest.fixture
+def tmp_path(request, tmp_path_factory):
+    """A directory of the test's own, made without pytest's way of numbering it.
+
+    pytest finds the number of a tmp_path by listing the whole base directory, which holds one directory for every test run so far,
+    so the cost of each grows with them, and over 9,000 tests the total with their square. A counter per name numbers the
+    directories instead, and they are named as pytest names them (the test's name cut at 30 characters, then the number), so the
+    path is as long as it was: test_prompt_ownership.py sets a byte budget of 1500 that a path a few characters longer overruns."""
+    name = re.sub(r"\W", "_", request.node.name)[:30]
+    number = _made[name]
+    _made[name] += 1
+    path = tmp_path_factory.getbasetemp() / ("%s%d" % (name, number))
+    path.mkdir()
+    return path
 
 
 @pytest.fixture(autouse=True)
