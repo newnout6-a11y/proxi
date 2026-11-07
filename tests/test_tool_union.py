@@ -267,3 +267,18 @@ def test_a_request_without_tools_is_left_without_tools(prompt_relay):
     body.pop("tools")
     assert relay.post("responses", body, codex("t2"))[0] == 200
     assert not relay.posts[-1].get("tools")
+
+
+def test_a_tool_the_profile_hides_is_not_carried_in_from_a_conversation_whose_hide_was_refused(prompt_relay, tmp_path):
+    # a conversation whose history called c keeps c (hide is refused for it, as documented), and the union stored it
+    (tmp_path / "prompts.json").write_text(json.dumps({
+        "version": 1, "default_profile": "hider",
+        "profiles": {"hider": {"tools": {"edits": [{"tool": "c", "hide": True}]}}}}), encoding="utf-8")
+    relay = prompt_relay()
+    called = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+              {"type": "function_call", "call_id": "x1", "name": "c", "arguments": "{}"},
+              {"type": "function_call_output", "call_id": "x1", "output": "done"}]
+    send(relay, ["a", "b", "c"], codex("t1"), messages=called)
+    assert names_upstream(relay) == ["a", "b", "c"]
+    send(relay, ["a", "b", "c"], codex("t2"))  # a new conversation: c is hidden, and must not come back from the union
+    assert names_upstream(relay) == ["a", "b"]

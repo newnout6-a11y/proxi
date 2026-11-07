@@ -958,6 +958,17 @@ def make_handler(runtime: Runtime):
             if key is None:
                 return
             merged, carried = union.apply(key, parsed.tools)
+            hidden = tool_union.hide_patterns(getattr(parsed, "prompt_plan", None)) if carried else []
+            if hidden:
+                # A tool the profile hides is never carried in: another conversation of the key may declare it because its
+                # hide was refused (its history called the tool), and the union used to hand it to every other one.
+                dropped = {tool["function"]["name"] for tool in merged
+                           if tool.get("function", {}).get("name") in carried
+                           and any(pattern.fullmatch(name.lower()) for pattern in hidden
+                                   for name in tool_union.client_names(tool))}
+                if dropped:
+                    merged = [tool for tool in merged if tool.get("function", {}).get("name") not in dropped]
+                    carried = [name for name in carried if name not in dropped]
             if union.announce(key, carried) and carried:
                 journal.emit("tools.carried",
                              "Клиент объявил %d инструментов, ещё %d взяты из его прежних запросов: список для модели не меняется"

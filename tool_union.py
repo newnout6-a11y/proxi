@@ -20,6 +20,7 @@ even when the server has come up since) and declares the tool from the next requ
 declared stays what it was: not passed on, and journaled (tool.call_dropped).
 """
 import collections
+import fnmatch
 import hashlib
 import json
 import os
@@ -85,6 +86,35 @@ def _tool_edits(plan):
         return ""
     text = json.dumps(tools, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def hide_patterns(plan):
+    """The tool name globs the request's prompts profile hides (prompt_body matches them the same way); [] when none."""
+    name, snapshot = getattr(plan, "profile", None), getattr(plan, "snapshot", None)
+    if not name or snapshot is None:
+        return []
+    try:
+        edits = (snapshot.profile(name).get("tools") or {}).get("edits") or []
+    except (KeyError, AttributeError, TypeError):
+        return []
+    patterns = []
+    for spec in edits:
+        if isinstance(spec, dict) and (spec.get("hide") is True or spec.get("op") == "hide"):
+            globs = spec.get("tool")
+            patterns += [re.compile(fnmatch.translate(glob.lower()))
+                         for glob in ([globs] if isinstance(globs, str) else globs or []) if isinstance(glob, str) and glob]
+    return patterns
+
+
+def client_names(tool):
+    """The names a profile's tool edits match a parsed tool by: namespace.name and name, or its name."""
+    function = tool.get("function") if isinstance(tool, dict) else None
+    if not isinstance(function, dict):
+        return ()
+    namespace, name = function.get("x-namespace"), function.get("x-client-name") or function.get("name")
+    if not isinstance(name, str):
+        return ()
+    return (namespace + "." + name, name) if isinstance(namespace, str) and namespace else (name,)
 
 
 def client_key(family, headers, parsed):
