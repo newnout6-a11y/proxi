@@ -628,24 +628,28 @@ The relay keeps, per client and project, the tools a Codex has declared (`tool_u
 those and the ones it declares itself, so request 1 already carries what request 2 will bring and nothing changes upstream when
 a server comes up. What decides it:
 
-- **Whose list.** The client family (`tool_union_clients`, `["codex"]` by default, `[]` is off), the originator (the CLI and
-  the Desktop differ: 60 tools against 97), the model (the client builds a list per model), root agent or sub-agent
-  (`x-openai-subagent`, `x-codex-parent-thread-id`), the working folder (`<cwd>` of the environment context) and the prompt
-  profile and its revision. A conversation in another project, with another model, or a sub-agent does not inherit a list.
+- **Whose list.** The client family (`tool_union_clients`, `["codex", "claude-code"]` by default, `[]` is off), the
+  originator (the CLI and the Desktop differ: 60 tools against 97), the model (the client builds a list per model), root agent
+  or sub-agent (`x-openai-subagent`, `x-codex-parent-thread-id`, `x-claude-code-agent-id`), the working folder (`<cwd>` of the
+  environment context, or Claude Code's "Primary working directory"), the prompt profile and what it does to tools, and for
+  Claude Code the kind of agent (the opening of its system text, the attribution line left out). A conversation in another
+  project, with another model, or a sub-agent does not inherit a list. A tool the profile hides is never carried in.
 - **Which definition.** A tool the client names in this request is the client's, in its newest definition; a tool it does not
   name is carried with the definition it had last. The upstream order is by name, so the order of declaration never matters.
 - **How long.** A tool the client has not declared for `tool_union_ttl` seconds (six hours) is dropped, so a server the user
   removes is gone from the list within hours; one union holds 400 tools at most, 64 clients are kept, a definition over 64 KB is
-  not carried. The memory is in the relay process: after a restart the first conversation learns the list again.
+  not carried. The union is kept in `<conversation_state_dir>/tool-union.json` and read back at start (without the tools not
+  declared for `tool_union_ttl`), so it survives a restart; it is in memory only when `conversation_state` is `false`.
 - **When the model calls a tool the client did not declare in this request.** If the client declared it before, the call goes to
   the client like any other (`tool.call` carries `"carried": true`). Codex 0.167 answers it with the tool result `unsupported
   call: ...` and goes on with the turn, also when the server has come up since (it routes a call with the tool list of the request
   that produced it); the model reads the error, and from the next request on the client declares the tool, so a retry works. A
   name the client never declared stays what it was: it is not passed on, and `tool.call_dropped` names it.
 
-`tools.carried` (info) says once per change how many tools were carried and which. Only the family `codex` is listed by default:
-Claude Code's list changes with what its ToolSearch loads, and OpenCode's with the agent, and a union would give an agent tools
-it was not given.
+`tools.carried` (info) says once per change how many tools were carried and which. The families `codex` and `claude-code` are
+listed by default. A request that carries Claude Code's tool search (`claude_tool_search` `native`, or after the loop guard)
+neither feeds the union nor is given it, since its list changes with what ToolSearch loads. OpenCode stays out: its list
+changes with the agent, and a union would give an agent tools it was not given.
 
 ### Compaction in Codex reads the cache of the chat
 
