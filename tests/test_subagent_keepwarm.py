@@ -13,7 +13,8 @@ import config
 import direct
 import journal
 from keepwarm_harness import CFG, START, drive, install, session as warm_session, stops
-from test_pool_eviction import fill, pool_of
+from session import Backend, SessionPool
+from test_pool_eviction import fill, new_conversation, pool_of
 
 DEFAULT = config.DEFAULTS["cache_keepwarm_subagent_idle"]
 TOOL_RUN = 15.2 * 60  # the longer of the two test runs that cost a rewrite
@@ -150,3 +151,85 @@ def test_to_make_room_a_conversation_whose_cache_is_not_kept_warm_goes_before_a_
     # Before: the cheapest to rebuild went, the small warm one, whose keepwarm ended with it; the big one's cache was not kept
     # warm, so closing it costs nothing more (its history is stored).
     assert asyncio.run(story()) == (["newcomer", "warm"], False, True)
+
+
+# -- a parent that changes account while its child runs -------------------------------------------------------------------
+def two_accounts(**settings):
+    """A pool of two accounts, acc-a and acc-b, on the direct transport: thread ids are made here, nothing is sent."""
+    cfg = dict(config.DEFAULTS, base="https://tenant.invalid", ua="test", cookie="synthetic", xsrf="synthetic",
+               cookie_values=[], page_uuid="page", session_refresh_interval=0, max_workers=8,
+               accounts=[{"page_uuid": "page", "account_id": "acc-a"}, {"page_uuid": "page", "account_id": "acc-b"}])
+    cfg.update(settings)
+    return SessionPool(Backend(cfg))
+
+
+async def move_while_the_child_runs(pool):
+    """main on acc-a, its subagent's request running; the admin switches acc-a off and on again, and main's next request
+    moves it to acc-b. Returns (the child's lease, main's closed session on acc-a, main's session on acc-b)."""
+    acc_a, acc_b = pool.backends
+    old = await warm_parent(pool)
+    child = await pool.acquire("child", parent_key="main")
+    acc_a.cfg["enabled"] = False
+    await pool.release(await pool.acquire("main"))
+    acc_a.cfg["enabled"] = True
+    new = pool._conversations["main"]
+    assert (old.backend, new.backend) == (acc_a, acc_b) and old._closed
+    return child, old, new
+
+
+def test_the_release_of_a_child_warms_its_parent_where_it_lives_now_never_the_session_it_left(monkeypatch):
+    """A conversation that moved to another account while its subagent ran was warmed on its old, closed session.
+
+    The child's release touched the session its lease had found at its start and started a keepwarm cycle on it: acc-a was
+    usable again and the old session's cache had been touched less than 280 s before. The pool no longer held that session,
+    so nothing ended the cycle: it pinged acc-a with the old body every 240 s until its idle limit, 900 s after the
+    release, four paid pings (about 3 credits at 190k tokens on Opus 5.5) of a prefix nobody continued, while the
+    conversation's own session on acc-b was not touched at all."""
+    clock, _ = install(monkeypatch, seconds=3000)
+
+    async def story():
+        pool = two_accounts()
+        child, old, new = await move_while_the_child_runs(pool)
+        new._warm_body, new._warm_at = {"model": "claude-opus-5-5"}, START  # its turn on acc-b gave a usable answer
+        clock.now += 30
+        await pool.release(child)  # the subagent's request ends
+        return (direct._kept_warm(old), direct._kept_warm(new), new._last_request_at - START,
+                child.session in getattr(new, "_cache_children", ()))
+
+    # Before: (True, False, 0, False): a cycle on the closed session, and nothing of the release on the session in use.
+    assert asyncio.run(story()) == (False, True, 30, True)
+
+
+def test_a_parent_that_changes_account_while_its_child_runs_keeps_its_pin_against_eviction():
+    """The new session of a conversation that moved to another account had none of the pin of the subagent that ran: in a
+    full pool a new conversation evicted the parent the subagent was working for, while the pin stayed on the closed
+    session."""
+    async def story():
+        pool = two_accounts(max_conversations=2, conversation_wait=0, cache_keepwarm_seconds=0)
+        child, _, new = await move_while_the_child_runs(pool)
+        pinned = getattr(new, "_cache_dependents", 0)
+        newcomer = await new_conversation(pool, "newcomer")
+        kept = pool._conversations.get("main") is new
+        await pool.release(child)
+        return (pinned, newcomer, kept, getattr(new, "_cache_dependents", 0),
+                len(getattr(new, "_cache_dependent_records", ())))
+
+    # Before: (0, "ok", False, 0, 0); the slot goes back once the subagent's request ends, the pin with it.
+    assert asyncio.run(story()) == (1, "503", True, 0, 0)
+
+
+def test_no_keepwarm_cycle_starts_on_a_session_the_pool_has_closed(monkeypatch):
+    """Whatever asks for it, an evicted session is not warmed: the pool no longer holds it, so nothing would end the
+    cycle before its idle limit, and it would ping a prefix nobody continues."""
+    install(monkeypatch)
+
+    async def story():
+        pool = pool_of(**CFG)
+        session = await warm_parent(pool)
+        pool._last_used["main"] -= 10_000
+        await pool._evict_idle()
+        assert "main" not in pool._conversations and session._closed
+        direct._ensure_keepwarm(session, session.cfg)
+        return session._warm_task
+
+    assert asyncio.run(story()) is None

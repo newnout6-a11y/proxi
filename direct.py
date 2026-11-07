@@ -2299,7 +2299,10 @@ def _warm_refused(session, busy):
 
 
 def _ensure_keepwarm(session, cfg):
-    if getattr(session, "_cancelled", False) or getattr(asyncio.get_running_loop(), "_relay_closing", False):
+    if (getattr(session, "_cancelled", False) or getattr(session, "_closed", False)
+            or getattr(asyncio.get_running_loop(), "_relay_closing", False)):
+        # A closed session is out of the pool (evicted, released for good, left for another account): nothing would end
+        # a cycle started on it, which would ping a prefix nobody continues until its idle limit.
         return
     busy = bool(getattr(session, "_busy", False))
     if _warm_refused(session, busy) is not None or (

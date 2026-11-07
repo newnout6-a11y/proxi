@@ -417,9 +417,9 @@ class RelaySession:
 
     async def aclose(self):
         # Marked before anything is awaited. A session the pool has closed (evicted, released for good, left for another
-        # account) is not coming back: as a child it no longer pins its parent's keepwarm (direct._dependents_live). A kept
-        # session whose socket is only reset (the drain of a cancelled request) serves again once it is leased, which lifts
-        # the mark (begin_request, stream).
+        # account) is not coming back: no keepwarm cycle starts on it (direct._ensure_keepwarm), and as a child it no
+        # longer pins its parent's keepwarm (direct._dependents_live). A kept session whose socket is only reset (the drain
+        # of a cancelled request) serves again once it is leased, which lifts the mark (begin_request, stream).
         self._closed = True
         abort = getattr(self, "_active_direct_abort", None)
         if callable(abort):
@@ -1471,7 +1471,14 @@ class SessionPool:
         return parents
 
     def _touch_cache_parents(self, parents, delta, dependent=None):
-        for key, session in parents:
+        for key, _ in parents:
+            # The parent as the pool holds it now, not the session the child's lease found: a conversation that moved to
+            # another account while its child ran lives in a new session, which took the pin along (acquire), and the
+            # old one is closed. A parent the pool no longer holds is neither pinned nor warmed: nothing would end a
+            # cycle started on it, which would ping a prefix nobody continues until its idle limit.
+            session = self._shared if key is None else self._conversations.get(key)
+            if session is None:
+                continue
             # Never below zero: an unbalanced release must not corrupt the next request's pin.
             session._cache_dependents = max(0, getattr(session, "_cache_dependents", 0) + delta)
             if dependent is not None:
@@ -1643,6 +1650,12 @@ class SessionPool:
                             old = session
                             session = RelaySession(replacement, await self._new_thread_id(replacement))
                             carried = self._carry_history(key, old, session)
+                            # The children that run against this conversation pin it wherever it lives: their releases
+                            # find the new session by key (_touch_cache_parents), and it is not evicted while one of
+                            # them still works for it.
+                            for name in ("_cache_dependents", "_cache_dependent_records", "_cache_children"):
+                                if hasattr(old, name):
+                                    setattr(session, name, getattr(old, name))
                             self._conversations[key] = session
                             await old.aclose()
                             # Unless account_move_keeps_history took the signed branches along, the new account's first request
