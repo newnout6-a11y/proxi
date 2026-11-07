@@ -419,6 +419,7 @@ def make_handler(runtime: Runtime):
             self._response_started = False
             self._client_trace = None
             self._adapter = None
+            self._body_read = False
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -477,6 +478,7 @@ def make_handler(runtime: Runtime):
                     self._health()
             except apierr.ApiError as err:
                 self._error_code = err.code
+                self._close_if_body_unread()
                 self._log_error(err)
                 if err.status >= 400 and not getattr(err, "expected", False):
                     console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
@@ -485,6 +487,7 @@ def make_handler(runtime: Runtime):
                 else:
                     self._respond_error(err, dialect)
             except Exception as exc:  # never leak a bare traceback
+                self._close_if_body_unread()
                 console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]))
                 self._error_code = "internal_error"
                 journal.emit("http.exception", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "error",
@@ -495,6 +498,7 @@ def make_handler(runtime: Runtime):
                 else:
                     self._respond_error(err, dialect)
             finally:
+                self._close_if_body_unread()
                 try:
                     self._log()
                 finally:
@@ -514,6 +518,15 @@ def make_handler(runtime: Runtime):
                     # collector frees, a few turns later, so a 300k-token conversation held 10 MB per turn more than it used
                     # (RSS 203 MB after 30 turns, 81 MB with this). The next request of a kept-alive connection sets them again.
                     self._writer = self._adapter = self._holder = None
+        def _close_if_body_unread(self):
+            """A request answered without reading the body it declared (a wrong key, an unknown route, a disabled API) leaves
+            that body on the connection: kept alive, the next request was read glued to it and failed with 400 or 501 (or
+            the body, itself an HTTP request, was run). Such a connection is closed after the answer."""
+            declared = (self.headers is not None and (self.headers.get("transfer-encoding")
+                        or (self.headers.get("content-length") or "0").strip() not in ("", "0")))
+            if declared and not getattr(self, "_body_read", False):
+                self.close_connection = True
+
         def _stream_failure(self, dialect, err):
             """End a stream that failed after it started. Only Responses has a terminal failure event."""
             payload = self._error_payload(dialect, err)
@@ -558,6 +571,8 @@ def make_handler(runtime: Runtime):
             # and responses routes; the flat responses shape is for SSE events only.
             body = self._error_payload("chat" if dialect == "responses" else dialect, err)
             extra = dict(getattr(err, "headers", None) or {})
+            if self.close_connection:
+                extra["connection"] = "close"  # the client must not send its next request on this connection
             retry_after = apierr.retry_after_header(err.retry_after)
             if retry_after:
                 extra["retry-after"] = retry_after
@@ -740,7 +755,9 @@ def make_handler(runtime: Runtime):
                 self.close_connection = True
                 raise apierr.ApiError(415, "unsupported_media_type", "content-type must be application/json")
             try:
-                return self.rfile.read(length)
+                body = self.rfile.read(length)
+                self._body_read = True
+                return body
             except Exception:
                 # The body was not fully consumed: keep-alive would parse the
                 # remainder as the next request line.
