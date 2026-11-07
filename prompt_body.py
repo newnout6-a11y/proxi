@@ -699,7 +699,9 @@ class _Walk:
         if before == "A" and after == "A":
             return "would put two assistant messages next to each other"
         following = self.messages[index + 1] if index + 1 < size else None
-        if index == self.lead and isinstance(following, dict) and _kind(following, self.dialect) == "S":
+        # Judged by what is kept, not by the position: when two leading user messages both go, the second is no longer at
+        # self.lead, and the later system message used to be pulled into the head anyway.
+        if before is None and isinstance(following, dict) and _kind(following, self.dialect) == "S":
             return "would move a later system message into the head"
         return None
 
