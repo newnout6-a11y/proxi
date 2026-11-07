@@ -12,6 +12,7 @@ import types
 import urllib.error
 import urllib.request
 import uuid
+import weakref
 
 import direct
 import native_history
@@ -285,6 +286,8 @@ class RelaySession:
         self.ws = None
         self._reader = None
         self._cancelled = False
+        # Set by aclose() until the pool leases the session again (begin_request): see aclose().
+        self._closed = False
         self._needs_drain = False
         self._drain_task = None
         self._loop = None
@@ -345,6 +348,7 @@ class RelaySession:
     def begin_request(self):
         """Reset cancellation only when the pool grants a new request lease."""
         self._cancelled = False
+        self._closed = False
         self._last_request_at = time.time()
 
     def cancel(self):
@@ -412,6 +416,11 @@ class RelaySession:
         await _answer_control(self.ws, raw)
 
     async def aclose(self):
+        # Marked before anything is awaited. A session the pool has closed (evicted, released for good, left for another
+        # account) is not coming back: as a child it no longer pins its parent's keepwarm (direct._dependents_live). A kept
+        # session whose socket is only reset (the drain of a cancelled request) serves again once it is leased, which lifts
+        # the mark (begin_request, stream).
+        self._closed = True
         abort = getattr(self, "_active_direct_abort", None)
         if callable(abort):
             try:
@@ -450,6 +459,8 @@ class RelaySession:
         if self._needs_drain:
             await self.aclose()
             self._needs_drain = False
+            # The drain closed the socket of the request that was cancelled, not the session this request runs on.
+            self._closed = False
         if self._cancelled:
             yield {"type": "end", "reason": "cancelled"}
             return
@@ -879,12 +890,6 @@ class _Dependent:
     def __init__(self):
         self.since = time.time()
         self.session = None
-
-
-def _kept_warm(session):
-    """True while the keepwarm cycle of `session` runs: its cache is being kept alive."""
-    task = getattr(session, "_warm_task", None)
-    return task is not None and not task.done()
 
 
 class SessionPool:
@@ -1391,12 +1396,12 @@ class SessionPool:
                 and not getattr(self._conversations.get(key), "_cache_dependents", 0)]
         expired = [key for key in sorted(idle, key=lambda key: self._last_used.get(key, 0))
                    if ttl > 0 and now - self._last_used.get(key, now) >= ttl
-                   and not _kept_warm(self._conversations.get(key))]
+                   and not direct._kept_warm(self._conversations.get(key))]
         gone = set(expired)
         order = list(expired)
         if make_room:
             order += sorted((key for key in idle if key not in gone),
-                            key=lambda key: (_kept_warm(self._conversations.get(key)), self._rebuild_cost(key),
+                            key=lambda key: (direct._kept_warm(self._conversations.get(key)), self._rebuild_cost(key),
                                              self._last_used.get(key, 0)))
         closing = []
         for key in order:
@@ -1477,6 +1482,15 @@ class SessionPool:
                     records.add(dependent)
                 else:
                     records.discard(dependent)
+                    if dependent.session is not None:
+                        # The request is over, not the child: a subagent whose request ended with a call of a 20-minute
+                        # test run comes back with its result, and the parent goes on from its whole prefix then. The
+                        # parent's keepwarm keeps it warm while the child is expected back (direct._dependents_live);
+                        # the lease count above stays what protects the parent from eviction.
+                        children = getattr(session, "_cache_children", None)
+                        if children is None:
+                            children = session._cache_children = weakref.WeakSet()
+                        children.add(dependent.session)
             session._last_request_at = time.time()
             if key in self._conversations:
                 self._last_used[key] = time.monotonic()

@@ -1643,12 +1643,26 @@ class _WarmCycle:
             pass
 
 
+def _kept_warm(session):
+    """True while the keepwarm cycle of `session` runs: its cache is being kept alive."""
+    task = getattr(session, "_warm_task", None)
+    return task is not None and not task.done()
+
+
 def _dependents_live(session, now, turn_timeout, limit):
-    """True while a child request that pins this conversation is really alive.
+    """True while a child request that pins this conversation is really alive, or a child is still expected back.
 
     The pool counts leases, and a release that never comes would pin the count forever.
     Only activity counts here: a child turn busy for at most turn_timeout, or any child
-    request within its own idle limit; a request still being set up counts for turn_timeout."""
+    request within its own idle limit; a request still being set up counts for turn_timeout.
+
+    A child whose request has ended (session._cache_children) is still expected back while it has not given its final
+    answer, or its own cycle still warms it, for `limit` from its last request: a subagent waits for a long tool and
+    comes back with the result. Pinned by the lease alone, the parent's cycle ended cache_keepwarm_idle after the
+    child's request while the child was warmed for cache_keepwarm_subagent_idle, and the parent wrote its whole prefix
+    again when it went on. A closed or evicted child does not come back to this session. The limit counts from the
+    child's own last request even while its cycle runs, so that conversations that name each other as parents cannot
+    keep each other warm forever."""
     for record in tuple(getattr(session, "_cache_dependent_records", None) or ()):
         child, since = getattr(record, "session", None), getattr(record, "since", 0) or 0
         if child is None:
@@ -1661,6 +1675,15 @@ def _dependents_live(session, now, turn_timeout, limit):
                 return True
             continue
         if now - max(getattr(child, "_last_request_at", 0) or 0, since) <= limit:
+            return True
+    for child in tuple(getattr(session, "_cache_children", None) or ()):
+        if child is session or getattr(child, "_closed", False):
+            continue
+        started = getattr(child, "_turn_started_at", 0) or 0
+        if getattr(child, "_busy", False) and started and now - started > turn_timeout:
+            continue  # a stuck turn keeps nothing warm
+        if now - (getattr(child, "_last_request_at", 0) or 0) <= limit and (
+                _kept_warm(child) or not getattr(child, "_turn_final", False)):
             return True
     return False
 
@@ -1677,7 +1700,8 @@ async def _keepwarm(session, cfg):
     cache_keepwarm_idle seconds without a real request (pings do not count), after
     cache_keepwarm_subagent_idle for a subagent whose answer asked for a tool, at once
     for a subagent that answered without one. A turn busy for longer than turn_timeout and
-    a child request that went quiet keep nothing warm. The reason, the pings and the credits
+    a child request that went quiet keep nothing warm; a child that waits for a tool keeps
+    its parent warm while it is expected back (_dependents_live). The reason, the pings and the credits
     of the cycle are journaled as cache.keepwarm_stop.
 
     A ping is paid for, so it is only sent while it can still read the cache. The guards:
