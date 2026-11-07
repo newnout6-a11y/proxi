@@ -1733,7 +1733,9 @@ async def _keepwarm(session, cfg):
       calls at every request of a child) until a real turn gives a usable answer;
     - five failed pings in a row: failures (with the default interval the window closes first, see PING_RETRY).
     Inside a running turn only the last three apply. A turn in flight is judged when it ends, not before, so the
-    verdict on the turn before it (last_turn_failed, compacted) and the idle limits stop nothing there.
+    verdict on the turn before it (last_turn_failed, compacted) and the idle limits stop nothing there. A compaction
+    in flight gets no ping at all, of its own body or of the chat's last one: the client replaces that history by the
+    summary, and the cycle stops with compacted once the summary is back.
     """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
     if interval <= 0:
@@ -1792,7 +1794,9 @@ async def _keepwarm(session, cfg):
                 identity = getattr(session, "_warm_identity", None) or {}
                 touch_at = getattr(session, "_warm_at", 0) or 0
                 if busy:
-                    if not during_turns or not started:
+                    # A compaction pings nothing while it runs: it arms no body of its own (iter_events), and the chat's
+                    # last body, which this branch pings for a turn without one, is the history the client replaces.
+                    if not during_turns or not started or getattr(session, "_turn_compaction", False):
                         await asyncio.sleep(0.95)
                         continue
                     turn_body = getattr(session, "_turn_body", None)
@@ -2032,6 +2036,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     session._turn_started_at = time.time()
     session._turn_pinged = False
     session._turn_final = False
+    # A compaction is warmed by nobody while it runs (_keepwarm): the client replaces its history by the summary.
+    session._turn_compaction = task == client_context.COMPACTION
     session._turn_seq = getattr(session, "_turn_seq", 0) + 1
     turn_seq = session._turn_seq
     session._last_request_at = time.time()
@@ -2067,6 +2073,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         session._busy = False
         session._turn_body = None
         session._turn_identity = None
+        session._turn_compaction = False
         session._turn_final = ended == "stop" and not asked_tool and not getattr(session, "_cancelled", False)
         # The consumer may drop the generator right after an error event (a cut stream): that is not a cancel.
         stopped_early = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) and not errored
@@ -2137,10 +2144,12 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             errored = True
             settle()
 
-    if body.get("openAICacheKey") and task != client_context.BACKGROUND:
+    if body.get("openAICacheKey") and not side_request:
         session._turn_body = body
         # Start the scheduler with the turn, not after it: a session's first long
-        # turn needs its anchored during-turn ping too. A one-shot job has no next request to keep a prefix for.
+        # turn needs its anchored during-turn ping too. A one-shot job has no next request to keep a prefix for, and
+        # neither has a compaction: the client replaces its history by the summary, so a ping of this body (one at 200 s
+        # and every 240 s of a long summary, each reading the whole chat) keeps a prefix nobody sends again.
         _ensure_keepwarm(session, cfg)
 
     # The compaction of a Codex chat, whose tools the relay declared again so that it reads the chat's cache (proxy.
@@ -2215,7 +2224,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 body["rit"] = make_rit(body["messages"], tools)
                 rebuild = None
                 upstream_status = getattr(error, "upstream_status", None) or error.status
-                if body.get("openAICacheKey"):
+                if body.get("openAICacheKey") and not side_request:  # what the turn keeps warm, as above
                     session._turn_body = body
                 answered = False
                 async with contextlib.aclosing(open_stream(body)) as stream:
@@ -2240,7 +2249,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
                              model=model_name)
                 body = _unmarked(body)
-                if body.get("openAICacheKey"):
+                if body.get("openAICacheKey") and not side_request:  # what the turn keeps warm, as above
                     session._turn_body = body
                 learned = False
                 async with contextlib.aclosing(open_stream(body)) as stream:

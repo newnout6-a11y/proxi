@@ -40,7 +40,9 @@ def test_a_compaction_turn_is_not_a_warm_body_and_marks_the_dialog(monkeypatch):
     assert session._turn_outcome == "content" and session._warm_blocked == "compacted"
     # the body the chat last warmed stays, the summary request neither replaces it nor moves its touch
     assert session._warm_body is BODY_A and session._warm_identity == IDENTITY_A and session._warm_at == 5.0
-    assert len(ensured) == 1, "a scheduler is started with the turn and not again at the end of a compaction"
+    # No scheduler is started for a compaction, neither with the turn nor at its end: its body is no prefix anybody sends
+    # again, and a ping of it during a long summary paid for nothing (lens-credits-4).
+    assert ensured == [] and getattr(session, "_turn_body", None) is None
     assert session._last_cache_key == "key-B"  # the cache itself was written under this key all the same
 
 
