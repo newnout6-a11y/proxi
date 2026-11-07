@@ -658,7 +658,9 @@ class Admin:
     def _records(saved):
         if isinstance(saved.get("accounts"), list):
             return [record for record in saved["accounts"] if isinstance(record, dict)]
-        return [saved] if saved.get("base") or saved.get("page_uuid") else []
+        # A file without accounts[] is the one account, whatever it holds: its base and page_uuid may come from RETOOL_BASE
+        # and RETOOL_PAGE_UUID (README), and then the account the relay runs on was listed as removed from config.json.
+        return [saved]
 
     @staticmethod
     def _same_account(record, cfg):
@@ -679,17 +681,21 @@ class Admin:
         runtime = self.runtime
         entries = account_report.collect(runtime)
         usage = account_report.usage_report(runtime, [(entry["backend"], entry["manager"]) for entry in entries])
-        records = self._records(self._saved()) if self.cfg.get("_config_path") else None
+        saved = self._saved() if self.cfg.get("_config_path") else None
+        records = self._records(saved) if saved is not None else None
+        # Without accounts[] the file's root and the one loaded account are the same account: nothing to match, nothing added.
+        single = saved is not None and not isinstance(saved.get("accounts"), list)
         pool = []
         for entry, item in zip(entries, self._accounts(entries, usage)):
             backend = entry["backend"]
-            removed = records is not None and not any(self._same_account(r, backend.cfg) for r in records)
+            removed = (records is not None and not single
+                       and not any(self._same_account(r, backend.cfg) for r in records))
             pool.append({**item, "label": backend.cfg.get("label") or "", "enabled": account_enabled(backend),
                          "priority": account_priority(backend),
                          "last_balance_at": getattr(entry["manager"], "last_fetched_at", None),
                          "pending": "removed" if removed else None, "_backend": backend})
         loaded = [entry["backend"].cfg for entry in entries]
-        for record in records or []:
+        for record in [] if single else records or []:
             if any(self._same_account(record, cfg) for cfg in loaded):
                 continue
             pool.append({
@@ -733,6 +739,8 @@ class Admin:
 
     def _saved_record(self, saved, account):
         backend = account.get("_backend")
+        if not isinstance(saved.get("accounts"), list) and backend is not None:
+            return saved  # the one account of a file without accounts[]
         for record in self._records(saved):
             if (self._same_account(record, backend.cfg) if backend is not None
                     else self._record_tag(record) == account["account"]):
