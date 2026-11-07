@@ -265,8 +265,15 @@ selector GLM has today.
 `scripts/probe_client_settings.py` runs the installed clients against a local fake
 server with a deliberately invalid key. It finds the newest OpenCode Desktop CLI
 itself (override any client with `--executable`) and removes credential-like
-variables from the child environment. OpenCode gets no model request until its
-resolved configuration shows the fake endpoint, and the probe fails unless the fake
+variables from the child environment. The override moves only the `retool-relay`
+provider, so the OpenCode run is pinned to it as well: the probe passes `--model`
+and puts the default, small and agent models (build, explore, general, title,
+summary, compaction) in the override, keeping your own `retool-relay` choices and
+replacing a model of any other provider, which would otherwise get a real request
+with your own credentials (`auth.json`). OpenCode gets no model request until its
+resolved configuration shows the fake endpoint and only `retool-relay` models
+(OpenCode 2 lists its configuration sources unmerged, so there a model of another
+provider in any of them refuses the run), and the probe fails unless the fake
 server received requests, so an ignored endpoint override cannot pass silently; a
 client that ignored it would still carry only the invalid key, which the real relay
 rejects.
