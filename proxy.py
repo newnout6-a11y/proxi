@@ -129,8 +129,6 @@ class Runtime:
         self.runner.prompts = self.prompts
         # Requests that carry no conversation identity find theirs by their history (conversation_infer).
         self.conversations = conversation_infer.ConversationIndex()
-        # The tools a client declared before, for a client that declares them late (tool_union).
-        self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL))
         # Conversations Claude Code's tool search was refused for (tool_search_policy).
         self.tool_search_guard = tool_search_policy.LoopGuard()
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
@@ -140,10 +138,16 @@ class Runtime:
         self.admin = admin_module.Admin(self)
         # After the journal is configured: scanning the stored conversations reports what it removed.
         self.pool.attach_store(conversation_state.open_store(cfg))
-        # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
+        # Where what the relay learns about its clients is kept between runs (the union of tools, the skill locations):
+        # the folder of the stored conversations, which the store above has made.
         folder = cfg.get("conversation_state_dir") if cfg.get("conversation_state", True) else None
+        folder = os.fspath(folder) if folder and os.path.isdir(folder) else None
+        # The tools a client declared before, for a client that declares them late (tool_union).
+        self.tool_union = tool_union.ToolUnion(ttl=cfg.get("tool_union_ttl", tool_union.TTL),
+                                               path=os.path.join(folder, tool_union.FILE_NAME) if folder else None)
+        # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
         self.stabilizer = prompt_stabilizer.Stabilizer(
-            cfg, os.path.join(os.fspath(folder), prompt_stabilizer.FILE_NAME) if folder and os.path.isdir(folder) else None)
+            cfg, os.path.join(folder, prompt_stabilizer.FILE_NAME) if folder else None)
 
     def submit(self, coroutine):
         with self._lifecycle_lock:

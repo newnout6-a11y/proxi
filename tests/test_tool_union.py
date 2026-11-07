@@ -198,10 +198,21 @@ def test_a_sub_agent_and_a_different_originator_keep_their_own_lists(prompt_rela
 
 def test_other_clients_get_exactly_the_tools_they_declare(prompt_relay):
     relay = prompt_relay()
-    claude = {"user-agent": "claude-cli/2.1.310 (external, sdk-cli)", "x-claude-code-session-id": "s1"}
-    send(relay, ["a", "b", "c"], claude)
-    send(relay, ["a", "b"], claude)
+    opencode = {"user-agent": "opencode/1.19.3 ai-sdk/provider-utils/3.0.20 runtime/bun/1.3.5", "x-opencode-session": "s1"}
+    send(relay, ["a", "b", "c"], opencode)
+    send(relay, ["a", "b"], opencode)
     assert names_upstream(relay) == ["a", "b"] and len(relay.runtime.tool_union) == 0
+
+
+def test_a_claude_code_session_that_starts_before_its_mcp_server_declares_the_tools_the_server_will_bring(prompt_relay):
+    """Claude Code starts MCP servers in the background: request 1 of an interactive session can go out without a slow
+    server's tools (59 against 90 in a real session, 107,650 tokens written by request 2). A later session of the project
+    is given the tools its sessions declared before, so nothing changes upstream when the server comes up."""
+    relay = prompt_relay()
+    claude = {"user-agent": "claude-cli/2.1.310 (external, cli)", "x-claude-code-session-id": "s1"}
+    send(relay, ["a", "b", "c"], claude)
+    send(relay, ["a", "b"], dict(claude, **{"x-claude-code-session-id": "s2"}))
+    assert names_upstream(relay) == ["a", "b", "c"]
 
 
 def test_the_union_can_be_switched_off(prompt_relay):

@@ -109,10 +109,12 @@ DEFAULTS = {
     # it is off by default.
     "stabilize_client_prompts": True,
     "stable_prompt_date": False,
-    # Codex declares its MCP tools late (request 1: 44-46 tools, request 2: 50-60), and each change rewrites the cache.
-    # A client of these families is given the union of the tools it declared before and this request's, per project,
-    # so the list the model sees stops changing; [] switches it off. A tool not declared for tool_union_ttl seconds is dropped.
-    "tool_union_clients": ["codex"],
+    # Codex declares its MCP tools late (request 1: 44-46 tools, request 2: 50-60), and so does Claude Code when an MCP server
+    # connects after its first request (59 -> 90 tools, 107k tokens written); each change rewrites the cache. A client of these
+    # families is given the union of the tools it declared before and this request's, per project (and per kind of agent),
+    # kept in conversation_state_dir between runs, so the list the model sees stops changing; [] switches it off. A tool not
+    # declared for tool_union_ttl seconds is dropped.
+    "tool_union_clients": ["codex", "claude-code"],
     "tool_union_ttl": 6 * 3600,
     # Claude Code (2.1.305 and later) defers its MCP tools behind ToolSearch when the base URL is a gateway, and every tool the
     # model loads changes the tool list, which rewrites the whole cached conversation. "eager" answers a request that carries
