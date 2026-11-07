@@ -25,3 +25,12 @@ def test_the_remembered_ids_stay_bounded_over_a_long_run():
     used = value.session_used
     value.record_turn("turn-%d" % (credits.SEEN_TURNS_MAX * 3 - 1), 0.001)
     assert value.session_used == used
+
+
+def test_usage_counts_every_billed_turn_since_start_not_only_the_kept_history():
+    value = manager()
+    for number in range(credits.HISTORY_MAX + 50):
+        value.record_turn("turn-%d" % number, 0.01)
+    usage = value.usage()
+    assert usage["turns"] == credits.HISTORY_MAX + 50  # it stopped at 200 while session_used kept growing
+    assert len(usage["recent"]) <= 50 and round(usage["session_used"], 2) == round(0.01 * (credits.HISTORY_MAX + 50), 2)

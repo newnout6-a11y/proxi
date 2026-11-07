@@ -86,6 +86,8 @@ class CreditsManager:
         self._balance = None
         self._cached_at = float("-inf")
         self.session_used = 0.0
+        # Billed turns since start: _history keeps only the last HISTORY_MAX of them, and its length was shown as this count.
+        self.turns = 0
         self._history = []
         self._seen_turns = collections.OrderedDict()  # the newest SEEN_TURNS_MAX turn ids, oldest first
         self.last_error = None
@@ -180,6 +182,7 @@ class CreditsManager:
                     self._seen_turns.popitem(last=False)
             self._usage_revision += 1
             self.session_used += cost
+            self.turns += 1
             self._history.append({"ts": time.time(), "turn_id": turn_id, "credits": round(cost, 5)})
             if len(self._history) > HISTORY_MAX:
                 del self._history[: len(self._history) - HISTORY_MAX]
@@ -205,7 +208,7 @@ class CreditsManager:
     def usage(self):
         with self._lock:
             total = sum(item["credits"] for item in self._history)
-            return {"session_used": round(self.session_used, 4), "turns": len(self._history),
+            return {"session_used": round(self.session_used, 4), "turns": self.turns,
                     "recent": list(self._history[-50:]), "recent_total": round(total, 4),
                     "unreported_usage": self._unreported_usage,
                     "available": (self._balance or {}).get("available")}
