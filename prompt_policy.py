@@ -3301,10 +3301,14 @@ class PromptStore:
     def _note(self, pin, now):
         """Say that the pins file is out of date when what it holds about this pin is not what the pin is now.
 
-        The touch is rough on purpose: the file hears of it when the stored one is PIN_TOUCH_INTERVAL old."""
+        The touch is rough on purpose: the file hears of it when the stored one is PIN_TOUCH_INTERVAL old. A pin on a revision
+        that has no fingerprint is never written (see _write_pins): only its move there is news for the file, which then
+        drops the row the pin had. Its touches were news too, and the file was rewritten once a second (with an fsync and two
+        folder scans, on the request thread) for as long as the conversation went on."""
         disk = pin.disk
+        named = pin.print is not None or pin.rev == LEGACY_REV
         if (disk is None or disk[0] != pin.print or disk[1] != pin.profile
-                or now - pin.disk_touched >= PIN_TOUCH_INTERVAL):
+                or (named and now - pin.disk_touched >= PIN_TOUCH_INTERVAL)):
             self._dirty = True
 
     def _trim_pins(self, now):
@@ -3694,6 +3698,7 @@ class PromptStore:
         rows, marks = [], []
         for key, pin, rev, print_, profile, created, touched in live:
             if print_ is None and rev != LEGACY_REV:
+                marks.append((pin, None, profile, touched))  # known as not written, so _note does not ask again
                 continue                # a revision with no fingerprint cannot be named after a restart
             if print_ is not None and not stored(print_):
                 continue
