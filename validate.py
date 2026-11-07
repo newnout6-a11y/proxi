@@ -36,9 +36,15 @@ def _assert_public_http_url(url, where="image"):
             ip_obj = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
-        if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
-                or ip_obj.is_reserved or ip_obj.is_multicast or ip_obj.is_unspecified):
+        if _internal(ip_obj):
             raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
+
+
+def _internal(ip_obj):
+    """An address that is not on the public internet. not is_global also covers 100.64.0.0/10 (carrier-grade NAT and every
+    Tailscale node), which is neither private nor reserved: an image URL there made the relay fetch from inside the tailnet."""
+    return (not ip_obj.is_global or ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+            or ip_obj.is_reserved or ip_obj.is_multicast or ip_obj.is_unspecified)
 
 
 class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -59,8 +65,7 @@ def _assert_public_peer(resp, where="image"):
         peer = ipaddress.ip_address(sock.getpeername()[0])
     except (AttributeError, OSError, ValueError):
         return
-    if (peer.is_private or peer.is_loopback or peer.is_link_local
-            or peer.is_reserved or peer.is_multicast):
+    if _internal(peer):
         raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
 
 
