@@ -163,6 +163,7 @@ class Runtime:
         # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
         self.stabilizer = prompt_stabilizer.Stabilizer(
             cfg, os.path.join(folder, prompt_stabilizer.FILE_NAME) if folder else None)
+        self.prompts.stabilizer = self.stabilizer  # the admin's preview shows the client's system as it is held
 
     def submit(self, coroutine):
         with self._lifecycle_lock:

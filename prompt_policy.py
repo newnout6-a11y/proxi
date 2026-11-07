@@ -2973,6 +2973,8 @@ class PromptStore:
         self._ring = collections.deque(maxlen=RECENT_LIMIT)
         self._watched = [str(self.path)]
         self._signature = ((str(self.path), None),)
+        # The runtime's prompt_stabilizer.Stabilizer (set by proxy.Runtime): preview shows the client's system as it holds it.
+        self.stabilizer = None
         self._missing_since = None
         self._checked = clock()
         with self._reload_lock:
@@ -3827,7 +3829,10 @@ class PromptStore:
         inp = PlanInput.from_request(parsed, identity, headers, dialect)
         plan = self._select(snapshot, inp, False)
         if plan.legacy:
-            return self._preview_legacy(plan, inp, parsed, identity, cfg, snapshot)
+            held = self._held_client_prompt(parsed)
+            result = self._preview_legacy(plan, inp, parsed, identity, cfg, snapshot)
+            result["warnings"].extend(held)
+            return result
         warnings = []
         history_changes, tools_changes, after = [], [], parsed
         body_unmatched = []
@@ -3853,6 +3858,8 @@ class PromptStore:
         if after is not parsed:
             # Who owns the request and whether it is a relay task follow the body the client sent (plan I9), as at run time.
             after.prompt_origin = orchestrator.client_origin(parsed)
+        # Last, as at run time (proxy._stabilize_prompt runs on the request the turn runs on, after the body edits).
+        warnings.extend(self._held_client_prompt(after))
         native_tools = after.tools or []
         owned = orchestrator._client_owns_instructions(after, orchestrator._purpose(after), native_tools)
         contract = structured_contract(snapshot, after.structured_output, tools=bool(native_tools),
@@ -3865,6 +3872,22 @@ class PromptStore:
             warnings.append(_PLACEHOLDER_WARNING)
         return self._preview_result(plan, inp, head, parts, history_changes, tools_changes, report, warnings,
                                     body_unmatched)
+
+    def _held_client_prompt(self, parsed):
+        """Give `parsed` the client's system as the relay holds it (prompt_stabilizer, without remembering anything) and
+        return the note that says so. The preview showed the system as the client sent it: for OpenCode, which lists a
+        skill from whichever folder its process met first, another location and another head than the model got."""
+        stabilizer = getattr(self, "stabilizer", None)
+        if stabilizer is None or not getattr(parsed, "system", None):
+            return []
+        try:
+            system, done = stabilizer.look(parsed.system)
+        except Exception:  # noqa: BLE001 - the preview then shows the system as the client sent it, as before
+            return []
+        if not done:
+            return []
+        parsed.system = system
+        return ["the client's system prompt is shown as the relay holds it (%s)" % ", ".join(done)]
 
     @staticmethod
     def _preview_result(plan, inp, head, parts, history_changes, tools_changes, report, warnings, body_unmatched=()):

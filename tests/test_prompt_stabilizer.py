@@ -280,3 +280,21 @@ def test_the_date_is_held_only_when_asked_for(prompt_relay, asked, expected):
     sent = two_processes(relay, system(FIRST, date="Fri Nov 06 2026"), system(FIRST, date="Sat Nov 07 2026"))
     assert "Today's date: " + expected in head_of(sent[1])
     assert (head_of(sent[0]) == head_of(sent[1])) is asked
+
+
+def test_the_admin_preview_shows_the_locations_the_relay_holds_and_remembers_nothing(prompt_relay):
+    """The preview showed the client's system as the client sent it: for an OpenCode process that lists a skill from the
+    other folder, another location and another head than the model got, so a user hunting a cache reset was pointed at a
+    difference that never reached the model."""
+    relay = prompt_relay()
+    two_processes(relay, system(FIRST), system(FIRST))
+    memory = relay.runtime.stabilizer.skills
+    before = copy.deepcopy(dict(memory._memory))
+    result = relay.runtime.prompts.preview(client_request("chat", copy.deepcopy(USER), system=system(OTHER)), "chat",
+                                           OPENCODE)
+    assert AGENTS % "stageshow" in result["head"] and CLAUDE % "stageshow" not in result["head"]
+    assert any("as the relay holds it" in line for line in result["warnings"])
+    elsewhere = relay.runtime.prompts.preview(
+        client_request("chat", copy.deepcopy(USER), system=system(OTHER, folder="C:\\work\\new")), "chat", OPENCODE)
+    assert CLAUDE % "stageshow" in elsewhere["head"]  # a folder the relay has not seen: shown as sent
+    assert dict(memory._memory) == before  # the preview learned and touched nothing

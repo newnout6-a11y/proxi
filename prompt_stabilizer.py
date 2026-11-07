@@ -60,8 +60,10 @@ class SkillLocations:
         self._warned = False
         self._load()
 
-    def stabilize(self, system):
-        """(system text with the remembered locations, names of the skills whose location was replaced)."""
+    def stabilize(self, system, remember=True):
+        """(system text with the remembered locations, names of the skills whose location was replaced).
+
+        remember=False only looks (the admin's preview): nothing is learned, touched or written."""
         if "<available_skills>" not in system:
             return system, []
         folder = _FOLDER.search(system)
@@ -81,7 +83,8 @@ class SkillLocations:
             # escape) made encode raise, and the whole prompt of every request of that client went unstabilized
             digest = hashlib.sha256((description.group(1).strip() if description else "").encode(
                 "utf-8", "surrogatepass")).hexdigest()[:16]
-            chosen = self._choose((folder, name.group(1).strip(), digest), seen)
+            key = (folder, name.group(1).strip(), digest)
+            chosen = self._choose(key, seen) if remember else self._peek(key, seen)
             if chosen == seen:
                 return match.group(0)
             replaced.append(name.group(1).strip())
@@ -89,8 +92,19 @@ class SkillLocations:
             return "<skill>" + body[:location.start(1)] + fixed + body[location.end(1):] + "</skill>"
 
         text = _SKILL.sub(skill, system)
-        self._save()
+        if remember:
+            self._save()
         return text, replaced
+
+    def _peek(self, key, seen):
+        """The location _choose would give, without remembering anything."""
+        with self._lock:
+            entry = self._memory.get(key)
+            if entry is None or self._clock() - entry[1] > self._ttl or entry[0] == seen:
+                return seen
+            if not self._exists(entry[0]) and self._exists(seen):
+                return seen
+            return entry[0]
 
     def _choose(self, key, seen):
         with self._lock:
@@ -230,3 +244,13 @@ class Stabilizer:
             if changed:
                 done.append("date")
         return system, done
+
+    def look(self, system):
+        """What apply makes of `system` for a new conversation, without remembering anything: the admin's preview.
+
+        The preview showed the client's system as the client sent it, so for OpenCode it named another skill location (and
+        another head sha8) than the model got. A new conversation has no pinned date, so only the locations apply."""
+        if self.skills is None:
+            return system, []
+        system, names = self.skills.stabilize(system, remember=False)
+        return system, (["skill_locations:" + ",".join(dict.fromkeys(names))] if names else [])
