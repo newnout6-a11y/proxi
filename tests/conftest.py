@@ -1,6 +1,11 @@
 """Offline harness: a real HTTP server with a scripted upstream (no network)."""
+import http.client
 import json
+import os
+import socket
 import socketserver
+import struct
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -18,6 +23,44 @@ KEY = "test-key-123"
 # of the suite (about 1,400 teardowns of 0.5 s in 983 s). Every server of the tests, the relay's own and the stdlib fakes,
 # polls at this rate instead; nothing a test checks depends on it.
 socketserver.BaseServer.serve_forever.__defaults__ = (0.01,)
+
+# Every request a test sends opens a connection of its own, and the end that closes first is held by Windows for 120 s
+# (TIME_WAIT). A full run made about 5,300 of them, and the dynamic range has 16,384 ports: three runs within two minutes (the
+# suites of several agents on one machine, or a parallel one beside another) met WinError 10048. A client of the tests closes
+# with a reset instead (linger 0), which leaves nothing to hold. Only a connection opened by a test file is changed: the
+# relay's own clients, which the tests run, are not.
+_TESTS = os.path.dirname(os.path.abspath(__file__))
+_STDLIB = os.path.dirname(os.path.dirname(os.path.abspath(http.client.__file__)))
+_http_connect = http.client.HTTPConnection.connect
+
+
+def _connect_that_resets_on_close(self):
+    _http_connect(self)
+    frame = sys._getframe(1)
+    while frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(_STDLIB):
+        frame = frame.f_back
+    if frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(_TESTS):
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("hh", 1, 0))
+
+
+http.client.HTTPConnection.connect = _connect_that_resets_on_close
+
+# The same for the self-pipe of every asyncio event loop (a Runtime has one, and so does every asyncio.run): on Windows
+# socket.socketpair() is a TCP connection through the loopback, about 2,500 of them in a run, and it only carries wake-up bytes.
+_socketpair = socket.socketpair
+
+
+def _socketpair_that_resets_on_close(*args, **kwargs):
+    pair = _socketpair(*args, **kwargs)
+    for end in pair:
+        try:
+            end.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("hh", 1, 0))
+        except OSError:
+            pass
+    return pair
+
+
+socket.socketpair = _socketpair_that_resets_on_close
 
 
 @pytest.fixture(autouse=True)
