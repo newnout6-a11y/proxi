@@ -1024,12 +1024,16 @@ class Admin:
             yield path, self._saved()
 
     @staticmethod
-    def _check_role_budget(candidate, changes):
+    def _check_role_budget(candidate, changes, live_cap=None):
         """The role travels with every request, so it must leave room under max_prompt_bytes.
 
-        Judged only when this save touches the role or the cap: an old over-long role never blocks other settings.
+        Judged only when this save touches the role or the cap: an old over-long role never blocks other settings. The role
+        applies at once and the cap only after a restart, so a role this save changes must also fit the cap in force now
+        (`live_cap`): checked against a raised cap still waiting for the restart, it went live and every request got 413.
         """
         role, cap = candidate.get("relay_system_prompt"), candidate.get("max_prompt_bytes")
+        if "relay_system_prompt" in changes and _role_limit(live_cap) < _role_limit(cap):
+            cap = live_cap
         if not isinstance(role, str) or not {"relay_system_prompt", "max_prompt_bytes"} & set(changes):
             return
         try:
@@ -1063,7 +1067,7 @@ class Admin:
                 models.resolve_tolerant(candidate["model"], candidate["reasoning_effort"], strict=True,
                                         allow_downgrade=candidate["allow_effort_downgrade"],
                                         xhigh_as=candidate["claude_xhigh_effort"])
-            self._check_role_budget(candidate, changes)
+            self._check_role_budget(candidate, changes, self.cfg.get("max_prompt_bytes"))
             changed = [key for key, value in changes.items() if desired[key] != value]
             saved.update(changes)
             # Through config._write_file, as the account pool writes: its temporary file is git-ignored and removed even when

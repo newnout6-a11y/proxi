@@ -264,3 +264,12 @@ def test_overview_publishes_the_turn_timeout_in_force_that_the_ui_judges_a_silen
     assert timeouts() == (900, 900)
     assert admin_relay.patch({"turn_timeout": 7200})[0] == 200
     assert timeouts() == (900, 7200)  # saved for the next start: the running relay still times a turn out after 900 s
+
+
+def test_a_role_that_applies_at_once_must_fit_the_cap_in_force_not_only_a_raised_one_waiting_for_a_restart(admin_relay):
+    admin_relay.cfg["max_prompt_bytes"] = 40_000  # the cap the running relay enforces
+    assert admin_relay.patch({"max_prompt_bytes": 0})[0] == 200  # raised in the file: applies after a restart
+    assert admin_relay.cfg["max_prompt_bytes"] == 40_000
+    status, body, _ = admin_relay.patch({"relay_system_prompt": "x" * 30_000})
+    assert status == 400 and body["error"]["param"] == "relay_system_prompt" and "40000" in body["error"]["message"]
+    assert admin_relay.patch({"relay_system_prompt": "x" * 20_000})[0] == 200  # fits both
