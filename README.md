@@ -914,11 +914,17 @@ Windows PowerShell 5.1 через `*>>`, могут быть в UTF-16 или с
 (`Get-Content`, `Get-ChildItem`, `Select-String`, `dir`, `type`, `findstr`, `ping` и т. п.).
 Поэтому `powershell -Command "Get-ChildItem; Get-Date"` проходит, а `powershell -c "calc"` — нет.
 `git` под allowlist выполняет только команды чтения (`status`, `log`, `diff`, `show`, `blame`, `grep`, `ls-files`,
-`branch`/`tag` для списка и т. п.), а также `fetch` и `push` к настроенным remote, без `--exec`. Остальные подкоманды
+`branch`/`tag` для списка и т. п.) и `fetch` из настроенного remote по его имени (`git fetch origin`), без `--exec`.
+`push` и `fetch` по адресу (URL, `user@host:path`, путь, общая папка) требуют `allow_all`: модель, которую сбил прочитанный
+текст, могла отправить репозиторий на любой сервер. Остальные подкоманды
 (`rebase`, `clone`, `ls-remote`, `archive`, `commit`, `reset`, `checkout`, `clean`…) требуют `allow_all`: среди них
-были формы, которые запускали любую программу (`rebase -x`, `clone -u`, `ls-remote --exec`). В теле PowerShell запрещены
-`$` в любом месте, `ForEach-Object` (он вызывает методы, например `InvokeScript`) и провайдеры `variable:`, `env:`,
-`function:`, реестра: свойства читает `Select-Object -ExpandProperty`.
+были формы, которые запускали любую программу (`rebase -x`, `clone -u`, `ls-remote --exec`). Шаблон allowlist должен
+совпасть с именем программы целиком: `^git\b` не пропускает `git-lfs` (у него свой `clone -u <программа>`).
+В теле PowerShell запрещены `$` в любом месте, `ForEach-Object` (он вызывает методы, например `InvokeScript`) и провайдеры
+`variable:`, `env:`, `function:`, реестра: свойства читает `Select-Object -ExpandProperty`. Двойные кавычки внутри
+`-Command` без кавычек вокруг тела PowerShell не видит (их снимает powershell.exe), поэтому тело проверяется без них, а
+`\"` и `""` в нём требуют `allow_all`; строку внутри тела пишите в одинарных кавычках. Команда не получает ввода
+(stdin пуст), так что `findstr` без файла сразу завершается.
 `allowlist` ограничивает **список программ**, а не файловую систему: `type C:\Windows\win.ini`
 или чтение другого абсолютного пути возможны. Allowlist не является песочницей
 файловой системы. Подстановки cmd, PowerShell script blocks/вложенные выражения,

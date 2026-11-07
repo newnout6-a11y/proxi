@@ -77,7 +77,7 @@ def split_segments(cmd: str, powershell=False, reject_redirection=False):
 
 
 def _shell_body(segment: str):
-    """Return the command body of a powershell/cmd segment, if it has one."""
+    """Return the command body of a powershell/cmd segment, if it has one: the text that shell reads."""
     parts = segment.split(None, 1)
     if len(parts) < 2:
         return None
@@ -89,8 +89,20 @@ def _shell_body(segment: str):
     if match is None:
         return None
     body = match.group(1).strip()
-    if body[:1] in ('"', "'") and body[-1:] == body[:1]:
-        body = body[1:-1]
+    if shell == "cmd":
+        # cmd /c drops the first quote and the last one, wherever that is: `cmd /c "dir & calc" x` runs dir, then calc
+        # (audit of 2026-11-08). A single quote is no quote to cmd.exe.
+        if body[:1] == '"':
+            last = body.rfind('"')
+            body = body[1:last] + body[last + 1:] if last > 0 else body[1:]
+    else:
+        # powershell.exe joins its arguments after -Command with blanks, so PowerShell reads the text without the double
+        # quotes of the command line: `-Command Write-Output "x ; calc"` ran calc, and `"a > b"` wrote b (audit of
+        # 2026-11-08). Single quotes reach PowerShell, which reads them as a string. \" and "" are escapes that the
+        # command line parsers read in different ways.
+        if '\\"' in body or '""' in body:
+            raise PolicyError('\\" and "" in a PowerShell body require allow_all (use single quotes for a string)')
+        body = body.replace('"', "")
     return body.strip() or None
 
 # Variables kept from the parent environment; everything else is dropped.
@@ -238,11 +250,16 @@ GIT_PAGER_RE = re.compile(r'(?:^|\s)-[a-zA-Z]*O')
 # to refuse kept missing a spelling: rebase -x, ls-remote/archive/fetch-pack/push --exec, clone -u and clone --config
 # core.sshCommand all ran any program the model wrote (audit of 2026-11-07), and commit/reset/checkout/clean change the
 # user's work, which the relay's local commands are not for (README: edits go through the client's own tools). allow_all
-# runs any of them.
+# runs any of them. push is not here either: a model steered by text it read could send the repository with its history
+# to any address (decided by the owner on 2026-11-08); fetch stays, from a configured remote only (_git_fetch_source).
 GIT_READ_ONLY = frozenset((
     "status", "log", "diff", "show", "blame", "annotate", "grep", "ls-files", "ls-tree", "rev-parse", "rev-list",
     "describe", "branch", "tag", "shortlog", "reflog", "cat-file", "show-ref", "name-rev", "merge-base", "count-objects",
-    "whatchanged", "cherry", "range-diff", "check-ignore", "check-attr", "version", "help", "fetch", "push"))
+    "whatchanged", "cherry", "range-diff", "check-ignore", "check-attr", "version", "help", "fetch"))
+# A word of `git fetch` that names a place instead of a configured remote: a URL, user@host:path or host.tld:path, a UNC or
+# absolute path, a relative path. A fetch from such a place reaches any server the model names (or the local network, or
+# an SMB share that takes the user's credentials) from this machine.
+GIT_FETCH_PLACE_RE = re.compile(r"://|@|^[\\/~.]|^[A-Za-z]:[\\/]|^[^:/\\]*\.[^:/\\]*:")
 # --exec is the short name of --upload-pack/--receive-pack for push, fetch and the transport helpers: it runs a program.
 GIT_EXEC_RE = re.compile(r'(?:^|\s)--exec\b', re.IGNORECASE)
 # git takes any unique prefix of a long option: `fetch --upload=<cmd>` is --upload-pack, `push --exe=<cmd>` and
@@ -281,6 +298,45 @@ def _git_subcommand(words):
             return word.lower()
     return ""
 
+
+def _git_fetch_source(words):
+    """The first word after `git fetch` that names a place rather than a configured remote, else None."""
+    after = words[words.index(next(word for word in words[1:] if word.lower() == "fetch")) + 1:]
+    for word in after:
+        if not word.startswith("-") and GIT_FETCH_PLACE_RE.search(word):
+            return word
+    return None
+
+
+# The extensions under which Windows runs a program named without one: git.cmd is git, git-lfs.exe is git-lfs.
+PROGRAM_EXTENSIONS = (".exe", ".cmd", ".bat", ".com")
+
+
+def _program_name(head):
+    """The program a segment runs, as the policy names it: the last part of the path, lower case, without the extension."""
+    base = os.path.basename(head.lower())
+    for extension in PROGRAM_EXTENSIONS:
+        if base.endswith(extension):
+            return base[:-len(extension)]
+    return base
+
+
+def _allowlisted(pattern, segment, head):
+    """Whether `pattern` allows the segment. `\\b` ends a word at '-' and '.', so `^git\\b` let `git-lfs` through (and `^rg\\b`
+    `rg-anything`): a pattern that matches only the start of the program's name allows nothing (audit of 2026-11-08:
+    `git-lfs clone -u <program>` ran the program, the git rules never looked at it). A name followed by one of the
+    PROGRAM_EXTENSIONS is the program itself."""
+    for text in (segment, head):
+        match = pattern.match(text)
+        if match is None:
+            continue
+        if match.end() >= len(head):
+            return True  # the pattern took the whole name (and maybe more of the segment)
+        rest = head[match.end():].lower()
+        if rest[:1] not in ("-", ".") or rest in PROGRAM_EXTENSIONS:
+            return True
+    return False
+
 GLOBAL_BLOCKED_RE = re.compile(r'(?:^|\s)--pre(?:\s|=)', re.IGNORECASE)  # rg preprocessor = arbitrary exec
 
 
@@ -288,7 +344,8 @@ def _check_segments(segments, patterns, depth=0) -> None:
     for segment in segments:
         parts = segment.split()
         head = parts[0].strip('"') if parts else ""
-        base = os.path.basename(head.lower().removesuffix(".exe"))
+        # git.cmd is git and pwsh.exe is pwsh to Windows, so they are to the rules too
+        base = _program_name(head)
         # Quote-stripped copy: cmd strips quotes, so `git "-c" x=y` must be judged
         # the same as the bare flag. Deliberate over-blocks: `git diff -C`, and any
         # argument merely containing a blocked word.
@@ -299,13 +356,18 @@ def _check_segments(segments, patterns, depth=0) -> None:
             words = flattened.split()
             subcommand = _git_subcommand(words)
             if subcommand not in GIT_READ_ONLY or GIT_EXEC_RE.search(flattened):
-                raise PolicyError("git %s requires allow_all: the allowlist runs only git commands that read, fetch and "
-                                  "push, without --exec (%s)"
+                raise PolicyError("git %s requires allow_all: the allowlist runs only git commands that read, and fetch "
+                                  "from a configured remote, without --exec (%s)"
                                   % (subcommand or "without a subcommand", ", ".join(sorted(GIT_READ_ONLY))))
             dangerous = _git_dangerous_option(words)
             if dangerous:
                 raise PolicyError("git option %s requires allow_all: git takes it for an option that runs a program or "
                                   "writes a file" % dangerous)
+            if subcommand == "fetch":
+                place = _git_fetch_source(words)
+                if place:
+                    raise PolicyError("git fetch from %s requires allow_all: the allowlist fetches only from a configured "
+                                      "remote, by its name (git fetch origin)" % place)
             if (subcommand in GIT_LIST_ONLY_RE
                     and GIT_LIST_ONLY_RE[subcommand].search(" ".join(words[words.index(subcommand) + 1:]))):
                 raise PolicyError("git %s may only list under the allowlist" % subcommand)
@@ -314,7 +376,7 @@ def _check_segments(segments, patterns, depth=0) -> None:
         shell = base in SHELLS
         # Anchored at the segment start: narrow rules like `^git (status|log)\b`
         # work again, and a pattern still cannot match a word mid-segment.
-        if not any(pattern.match(segment) or pattern.match(head) for pattern in patterns):
+        if not any(_allowlisted(pattern, segment, head) for pattern in patterns):
             raise PolicyError(
                 "command not allowlisted: '" + head + "' "
                 "(exec_policy=allowlist; add a pattern to exec_allowlist)")
@@ -388,7 +450,9 @@ def run_command(cmd: str, cwd: str, timeout: int = 30, limit: int = 4000,
     started = time.time()
     env = clean_env(cwd)
     try:
-        proc = subprocess.Popen(cmd, shell=True, cwd=cwd, env=env,
+        # stdin: the command reads nothing. It used to share the relay's console: `findstr x` without a file read what the
+        # operator typed there, or waited for input until command_timeout with the turn and its slot held (audit 2026-11-08).
+        proc = subprocess.Popen(cmd, shell=True, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     except Exception as exc:
