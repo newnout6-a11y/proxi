@@ -332,6 +332,12 @@ def _account_record(saved, cfg):
         record = saved
         if cfg.get("account_id") and record.get("account_id") != cfg["account_id"]:
             record = _legacy_match([record], cfg)
+        # The single account's tenant as the file names it: RETOOL_BASE changes cfg["base"] in memory only, and comparing
+        # the file with it refused every save of a rotated cookie and every new sign-in. A file edited to name another
+        # tenant than the one it named at load is still refused.
+        if record is not None and "_file_base" in cfg:
+            file_base = (record.get("base") or "").rstrip("/")
+            return record if file_base == str(cfg["_file_base"] or "").rstrip("/") else None
     if record is None or (record.get("base") or saved.get("base", "")).rstrip("/") != cfg["base"].rstrip("/"):
         return None
     return record
@@ -574,6 +580,9 @@ def _load(path):
     cfg["_config_path"] = os.path.abspath(path)
     cfg["prompts_file"] = _prompts_path(cfg.get("prompts_file"), cfg["_config_path"])
     cfg["_persist_auth"] = not (os.environ.get("RETOOL_COOKIE") or os.environ.get("RETOOL_XSRF"))
+    # The tenant the file itself names, before RETOOL_BASE overrides it in memory: the file's record is matched against
+    # this (_account_record), or with RETOOL_BASE set no rotated cookie was ever saved and no new sign-in adopted.
+    cfg["_file_base"] = saved.get("base") if isinstance(saved.get("base"), str) else ""
 
     # Secrets may live outside the repo: env wins over file.
     env_map = {

@@ -76,3 +76,47 @@ def test_the_startup_events_of_the_prompts_layer_reach_the_journal_file(tmp_path
     finally:
         runtime.close()
         journal.JOURNAL.configure(None, None, load=False)
+
+
+def env_base_config(tmp_path, monkeypatch, file_base):
+    clean_env(monkeypatch)
+    monkeypatch.setenv("RETOOL_BASE", "https://tenant.invalid")
+    path = tmp_path / "config.json"
+    saved = {**BASE, "page_uuid": "p0", "cookie": "accessToken=old-token", "xsrf": "old-xsrf",
+             "workspace_root": str(tmp_path)}
+    if file_base is not None:
+        saved["base"] = file_base
+    write(path, saved)
+    return config.load(str(path)), path
+
+
+def test_with_retool_base_in_the_environment_a_rotated_cookie_is_saved(tmp_path, monkeypatch):
+    for file_base in ("https://<your-subdomain>.retool.com", None):
+        cfg, path = env_base_config(tmp_path, monkeypatch, file_base)
+        assert cfg["base"] == "https://tenant.invalid"
+        cfg.update(cookie="accessToken=rotated-token", xsrf="new-xsrf")
+        assert config.persist_auth(cfg) is True
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored["cookie"] == "accessToken=rotated-token" and stored.get("base") == file_base
+
+
+def test_with_retool_base_in_the_environment_a_new_sign_in_is_adopted(tmp_path, monkeypatch):
+    cfg, path = env_base_config(tmp_path, monkeypatch, "https://<your-subdomain>.retool.com")
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    write(path, {**stored, "cookie": "accessToken=signed-in-again", "xsrf": "fresh-xsrf"})
+    assert config.reload_auth(cfg) is True and cfg["cookie"] == "accessToken=signed-in-again"
+
+
+def test_with_retool_base_a_file_edited_to_another_tenant_is_still_refused(tmp_path, monkeypatch):
+    cfg, path = env_base_config(tmp_path, monkeypatch, "https://first.invalid")
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    write(path, {**stored, "base": "https://another.invalid", "cookie": "accessToken=foreign"})
+    assert config.reload_auth(cfg) is False
+    cfg.update(cookie="accessToken=rotated-token")
+    try:
+        config.persist_auth(cfg)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a session was written into another tenant's record")
+    assert json.loads(path.read_text(encoding="utf-8"))["cookie"] == "accessToken=foreign"
