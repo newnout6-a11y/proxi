@@ -20,7 +20,9 @@ SHELL_FLAGS = ("-command", "-c", "/c", "-encodedcommand", "-e")
 # cmdlets allowed inside a powershell/cmd body (head of the inner segment).
 CMD_LETS = "|".join((
     "get-content|get-childitem|get-item|get-itemproperty|get-location|get-date|get-command",
-    "get-process|get-service|select-string|select-object|sort-object|where-object|foreach-object",
+    # No foreach-object: without a script block its -MemberName calls any method (InvokeScript runs any code, Delete and
+    # Kill act on what the pipe brings). Select-Object -ExpandProperty reads a property.
+    "get-process|get-service|select-string|select-object|sort-object|where-object",
     "measure-object|resolve-path|test-path|write-output|write-host|split-path|join-path",
     "dir|type|more|findstr|where|tasklist|ping|start-sleep|cls|echo",
 ))
@@ -223,6 +225,36 @@ GIT_BLOCKED_RE = re.compile(
     re.IGNORECASE)
 # Case-sensitive: `git grep -O<prog>` runs <prog>, `git grep -o` is a legit flag.
 GIT_PAGER_RE = re.compile(r'(?:^|\s)-[a-zA-Z]*O')
+# Under the allowlist git runs only the subcommands that read, plus fetch and push to the configured remotes. A list of what
+# to refuse kept missing a spelling: rebase -x, ls-remote/archive/fetch-pack/push --exec, clone -u and clone --config
+# core.sshCommand all ran any program the model wrote (audit of 2026-11-07), and commit/reset/checkout/clean change the
+# user's work, which the relay's local commands are not for (README: edits go through the client's own tools). allow_all
+# runs any of them.
+GIT_READ_ONLY = frozenset((
+    "status", "log", "diff", "show", "blame", "annotate", "grep", "ls-files", "ls-tree", "rev-parse", "rev-list",
+    "describe", "branch", "tag", "shortlog", "reflog", "cat-file", "show-ref", "name-rev", "merge-base", "count-objects",
+    "whatchanged", "cherry", "range-diff", "check-ignore", "check-attr", "version", "help", "fetch", "push"))
+# --exec is the short name of --upload-pack/--receive-pack for push, fetch and the transport helpers: it runs a program.
+GIT_EXEC_RE = re.compile(r'(?:^|\s)--exec\b', re.IGNORECASE)
+# branch and tag list by default; these flags rename, delete, create or rewrite (-a lists every branch but annotates a tag).
+GIT_LIST_ONLY_RE = {
+    "branch": re.compile(r'(?:^|\s)(?:-[a-zA-Z]*[dDmMfu]\b|--(?:delete|move|copy|force|set-upstream-to|unset-upstream|'
+                         r'edit-description|create-reflog)\b)'),
+    "tag": re.compile(r'(?:^|\s)(?:-[a-zA-Z]*[asudmfFe]\b|--(?:annotate|sign|local-user|delete|message|file|force|'
+                      r'edit|create-reflog)\b)'),
+}
+# A PowerShell provider drive that is no file system: variables (an object reaches every command), functions, the
+# environment, the registry.
+PS_PROVIDER_RE = re.compile(r"""(?:^|[\s'"=,:])(?:variable|function|env|alias|cert|wsman|hklm|hkcu|registry)::?""",
+                            re.IGNORECASE)
+
+
+def _git_subcommand(words):
+    """The subcommand of a git segment: the first word after git that is no option ("" when there is none)."""
+    for word in words[1:]:
+        if not word.startswith("-"):
+            return word.lower()
+    return ""
 
 GLOBAL_BLOCKED_RE = re.compile(r'(?:^|\s)--pre(?:\s|=)', re.IGNORECASE)  # rg preprocessor = arbitrary exec
 
@@ -238,6 +270,16 @@ def _check_segments(segments, patterns, depth=0) -> None:
         flattened = segment.replace('"', "")
         if base == "git" and (GIT_BLOCKED_RE.search(flattened) or GIT_PAGER_RE.search(flattened)):
             raise PolicyError("git command/config overrides require allow_all")
+        if base == "git":
+            words = flattened.split()
+            subcommand = _git_subcommand(words)
+            if subcommand not in GIT_READ_ONLY or GIT_EXEC_RE.search(flattened):
+                raise PolicyError("git %s requires allow_all: the allowlist runs only git commands that read, fetch and "
+                                  "push, without --exec (%s)"
+                                  % (subcommand or "without a subcommand", ", ".join(sorted(GIT_READ_ONLY))))
+            if (subcommand in GIT_LIST_ONLY_RE
+                    and GIT_LIST_ONLY_RE[subcommand].search(" ".join(words[words.index(subcommand) + 1:]))):
+                raise PolicyError("git %s may only list under the allowlist" % subcommand)
         if GLOBAL_BLOCKED_RE.search(flattened):
             raise PolicyError("command preprocessing flags require allow_all")
         shell = base in SHELLS
@@ -253,8 +295,10 @@ def _check_segments(segments, patterns, depth=0) -> None:
         if body:
             # The shell body must satisfy the policy on its own.
             ps = head.lower().removesuffix(".exe") != "cmd"
-            if ps and re.search(r"[{}()\x60]|(?:^|[;\r\n])\s*\$", body):
-                raise PolicyError("PowerShell script blocks, expansion and assignments require allow_all")
+            # $ anywhere, not only at the start of a statement: $ExecutionContext in the middle of a segment reached every
+            # command. A provider drive that is no file system reads what is no file.
+            if ps and (re.search(r"[{}()\x60$]", body) or PS_PROVIDER_RE.search(body)):
+                raise PolicyError("PowerShell script blocks, variables, expansion and provider drives require allow_all")
             inner = split_segments(body, powershell=ps, reject_redirection=True)
             _check_segments(inner, [CMD_LETS_RE] if ps else patterns, depth + 1)
 

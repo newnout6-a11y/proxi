@@ -890,6 +890,12 @@ Windows PowerShell 5.1 через `*>>`, могут быть в UTF-16 или с
 `-Command` / `-c` / `/c` проверяется рекурсивно по списку разрешённых cmdlet-ов
 (`Get-Content`, `Get-ChildItem`, `Select-String`, `dir`, `type`, `findstr`, `ping` и т. п.).
 Поэтому `powershell -Command "Get-ChildItem; Get-Date"` проходит, а `powershell -c "calc"` — нет.
+`git` под allowlist выполняет только команды чтения (`status`, `log`, `diff`, `show`, `blame`, `grep`, `ls-files`,
+`branch`/`tag` для списка и т. п.), а также `fetch` и `push` к настроенным remote, без `--exec`. Остальные подкоманды
+(`rebase`, `clone`, `ls-remote`, `archive`, `commit`, `reset`, `checkout`, `clean`…) требуют `allow_all`: среди них
+были формы, которые запускали любую программу (`rebase -x`, `clone -u`, `ls-remote --exec`). В теле PowerShell запрещены
+`$` в любом месте, `ForEach-Object` (он вызывает методы, например `InvokeScript`) и провайдеры `variable:`, `env:`,
+`function:`, реестра: свойства читает `Select-Object -ExpandProperty`.
 `allowlist` ограничивает **список программ**, а не файловую систему: `type C:\Windows\win.ini`
 или чтение другого абсолютного пути возможны. Allowlist не является песочницей
 файловой системы. Подстановки cmd, PowerShell script blocks/вложенные выражения,
