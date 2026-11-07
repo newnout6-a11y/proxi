@@ -379,6 +379,11 @@ def _prompts_path(value, config_path):
     return os.path.abspath(os.path.join(os.path.dirname(config_path), value.strip() or PROMPTS_FILE))
 
 
+def _placeholder(value):
+    """A value copied unchanged from config.example.json, which describes what goes there in angle brackets."""
+    return isinstance(value, str) and value.strip().startswith("<") and value.strip().endswith(">")
+
+
 def _ensure_relay_key(cfg):
     key = os.environ.get("RELAY_API_KEY") or cfg.get("relay_api_key")
     if key:
@@ -737,6 +742,12 @@ def _load(path):
     if not os.path.isdir(cfg["workspace_root"]):
         raise service_unavailable(f"workspace_root is not a directory: {cfg['workspace_root']}")
 
+    if _placeholder(cfg.get("relay_api_key")):
+        # config.example.json carries a description in angle brackets here; copied unchanged it was the relay key itself,
+        # a string anyone can read in the repository.
+        warnings.append("relay_api_key holds the placeholder of config.example.json and is ignored: the key comes from "
+                        "RELAY_API_KEY or relay_key.txt")
+        cfg["relay_api_key"] = None
     cfg["relay_api_key"] = _ensure_relay_key(cfg)
     # Mask cookie secrets, but not plain host names (else the subdomain gets hidden).
     cookie_strings = []
