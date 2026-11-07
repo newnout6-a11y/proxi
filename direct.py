@@ -1272,7 +1272,8 @@ def _error_from_event(event):
     return apierr.upstream_error(text)
 
 
-KEEPWARM_NUDGE = "Reply with the single word OK and nothing else. Do not call any tool."
+KEEPWARM_NUDGE = ("Keep-alive check: answer right away with the single word OK, without thinking it over, and call no "
+                  "tool.")
 
 
 def ping_body(body):
@@ -1287,7 +1288,13 @@ def ping_body(body):
     credits, this body 4 output tokens and 0.057, both reading all 13,752 tokens; Opus 5.5 on high 1505 against 50
     output tokens, on max about 150-370 (it thinks a little even about this); after a tool result, with tools declared,
     the model answers OK and calls none. The model and the effort stay the turn's own: the relay does not lower an
-    effort or change a model to make a request cheaper, a ping included."""
+    effort or change a model to make a request cheaper, a ping included.
+
+    What the model thinks before its OK is output too: a quarter of the pings on Claude with thinking wrote more than 20
+    tokens (16.1 credits in 2.5 hours, journal watch of 2026-11-07). Telling it that this is a keep-alive check to answer
+    without thinking it over halves that, measured through the relay on a tool-result tail: Opus 5.5 max 190 -> 91 and
+    98 (median of 3 and 4 pings), Opus high 54 -> 36, Sonnet max 79 -> 82, Sonnet high 4 -> 4. A bare "Say OK." made the
+    model go on with the task and call a tool."""
     messages = [*(body.get("messages") or []), {"role": "user", "content": [{"type": "text", "text": KEEPWARM_NUDGE}]}]
     payload = dict(body)
     payload["messages"] = messages
