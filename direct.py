@@ -2727,6 +2727,14 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
                 if _refused_for_now(failure) and not flags.get("usage_seen"):
                     possibly_billed = False  # refused before anything was generated: it cost nothing, as an HTTP 429 never does
+                elif (apierr.is_account_quota(failure) and not flags.get("usage_seen")
+                      and not (usable or thinking_seen or spoke or held)):
+                    # The account's hourly limit as an error event inside a 200, before the model gave anything: the same
+                    # refusal as its HTTP 429 form, which costs nothing. Taken for a possible charge, it marked the balance
+                    # unreported, told the client an unknown cost and sent the empty usage event that zeroed the
+                    # conversation's prefix size, so account_rate_limit_wait moved it at once. One that comes after text or
+                    # thinking may have been billed, and stays unknown.
+                    possibly_billed = False
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
                     flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)

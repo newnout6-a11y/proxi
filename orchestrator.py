@@ -1450,7 +1450,11 @@ class TurnRunner:
                                         'info' if known else 'warn', credits=None, attempt=journal_attempt,
                                         credits_reported=bool(known), **delta,
                                         **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
-                                    if session is not None:
+                                    if session is not None and breakdown['prompt_tokens'] > 0:
+                                        # Only counts tell the size of the prefix. The empty usage of an attempt whose
+                                        # price is unknown (a timeout or a cut stream on a 200) has none: written as 0,
+                                        # it switched account_rate_limit_wait off for the conversation (_limit_pause)
+                                        # and made the pool take it for the cheapest to evict (_rebuild_cost).
                                         acquired._last_prefix_tokens = breakdown['prompt_tokens']
                                         _remember_prompt_size(acquired, parsed, breakdown['prompt_tokens'])
                                     out.put(event)
@@ -1471,10 +1475,11 @@ class TurnRunner:
                                         "%d%%" % round(hit * 100) if hit is not None else "—"),
                                         "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
                                         **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
-                                    if session is not None:
+                                    if session is not None and breakdown["prompt_tokens"] > 0:
                                         # Write through the lease: SessionLease only proxies
                                         # reads, so keepwarm (which holds the real session)
-                                        # saw prefix_tokens=0 forever.
+                                        # saw prefix_tokens=0 forever. A credits event without
+                                        # token counts says nothing of the prefix (see usage).
                                         acquired._last_prefix_tokens = breakdown["prompt_tokens"]
                                         _remember_prompt_size(acquired, parsed, breakdown["prompt_tokens"])
                                     out.put(event)
