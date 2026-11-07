@@ -145,6 +145,15 @@ def pinned_calendar(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def diagnostics_in_a_temporary_folder(monkeypatch, tmp_path_factory):
+    """A config without upstream_error_dir writes its refused bodies to upstream_diagnostics.DEFAULT_DIR, relative to the
+    folder the run started in. A run from a checkout filled its logs/upstream-400 with scripted refusals (102 sets a run)
+    and pruned it to the newest 50: from the folder the relay works in, that deleted the real diagnostics kept there."""
+    import upstream_diagnostics
+    monkeypatch.setattr(upstream_diagnostics, "DEFAULT_DIR", str(tmp_path_factory.getbasetemp() / "upstream-400"))
+
+
+@pytest.fixture(autouse=True)
 def upstream_shapes_unknown(monkeypatch):
     """What upstream refuses is learned once per run (direct._TOOL_RESULT_HINTS: a cache hint on a tool result;
     direct._PRUNING: a history that lost a call): a test starts from not having learned it, whatever an earlier one

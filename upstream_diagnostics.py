@@ -21,6 +21,11 @@ _KNOWN = frozenset({"content_block_start", "content_block_delta", "content_block
                     "metadata", "end_of_stream", "error", "ping", "message_start", "message_delta", "message_stop"})
 _HEADERS = ("request-id", "x-request-id", "cf-ray", "content-type", "x-retool-api-version")
 _SIGNALS = ("stop_reason", "stopReason", "finish_reason", "finishReason", "statusCode", "code")
+# Where the rejected bodies and attempt summaries go when the config names no upstream_error_dir (proxy.main always names
+# one beside the state it was given). One name for both writers, so the test suite can point it into a temporary folder:
+# a run from a checkout wrote its scripted refusals into that checkout's logs/upstream-400 and pruned it to the newest 50
+# sets, so a run from the folder the relay works in deleted the real diagnostics kept there.
+DEFAULT_DIR = os.path.join("logs", "upstream-400")
 # Request-body dump sets are pruned only when their name is exactly what _dump_rejected_body writes.
 _DUMP_SET = re.compile(r"^\d{8}-\d{6}-[^\W_]*-[0-9a-f]{12}-body\.json$")
 # Wire-trace folders are named by a sortable start stamp; anything else in the root is left alone.
@@ -376,7 +381,7 @@ class AttemptTrace:
         saved = False
         if self._text is not None:
             try:
-                folder = pathlib.Path(self.cfg.get("upstream_error_dir") or "logs/upstream-400")
+                folder = pathlib.Path(self.cfg.get("upstream_error_dir") or DEFAULT_DIR)
                 folder.mkdir(parents=True, exist_ok=True)
                 (folder / (self.id + "-response.json")).write_text(self._text + "\n", encoding="utf-8")
                 saved = True

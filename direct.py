@@ -34,6 +34,7 @@ import console_log
 import native_history
 import models as model_catalog
 import summary_guard
+import upstream_diagnostics
 from accounts import account_tag, idle_block
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
@@ -2329,7 +2330,7 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
     """
     try:
         cfg = cfg or {}
-        folder = pathlib.Path(cfg.get("upstream_error_dir") or "logs/upstream-400")
+        folder = pathlib.Path(cfg.get("upstream_error_dir") or upstream_diagnostics.DEFAULT_DIR)
         folder.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(payload).hexdigest()
         key = (str(folder.resolve()), digest)
