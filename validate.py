@@ -541,8 +541,10 @@ def _message_fingerprints(messages, lead=None):
     """Hash each bridge-visible message, preserving boundaries but not cache markers."""
     if lead is None:
         lead = native_history.leading_instructions(messages)
+    # surrogatepass: half of a surrogate pair that a JavaScript client cut inside an emoji (JSON carries it as an escape) is
+    # hashed as it is. Encoded strictly it raised UnicodeEncodeError, and every request of that conversation got a 500.
     return tuple(hashlib.sha256(json.dumps(_render_messages([message], lead=int(index < lead)), ensure_ascii=False,
-                                          sort_keys=True, separators=(",", ":")).encode("utf-8")).digest()
+                                          sort_keys=True, separators=(",", ":")).encode("utf-8", "surrogatepass")).digest()
                  for index, message in enumerate(messages))
 
 
