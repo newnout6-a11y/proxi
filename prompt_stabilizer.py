@@ -117,7 +117,8 @@ class SkillLocations:
             for folder, name, digest, location, seen in document["skills"]:
                 if all(isinstance(item, str) for item in (folder, name, digest, location)) and now - seen < self._ttl:
                     self._memory[(folder, name, digest)] = [location, float(seen)]
-        except (OSError, ValueError, KeyError, TypeError):
+        except Exception:  # noqa: BLE001 - any file it cannot use (a hand edit, another layout, AttributeError, RecursionError,
+            # OverflowError) is no reason to keep the relay from starting: it is overwritten by the next save
             self._memory.clear()  # nothing to go on: the next prompt seen is the first
 
     def _save(self):

@@ -250,7 +250,8 @@ class ToolUnion:
                     self._clients[tuple(key)] = table
             while len(self._clients) > self._max_clients:
                 self._clients.popitem(last=False)
-        except (OSError, ValueError, KeyError, TypeError):
+        except Exception:  # noqa: BLE001 - any file it cannot use (a hand edit, another layout, AttributeError, RecursionError,
+            # OverflowError) is no reason to keep the relay from starting: it is overwritten by the next save
             self._clients.clear()  # nothing to go on: the next request of each client starts its table
 
     def _save(self, now):
