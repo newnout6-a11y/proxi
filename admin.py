@@ -39,7 +39,7 @@ BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
 # TurnRunner._run_once reads when a client's compaction begins.
 LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
                  "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort",
-                 "max_conversations", "conversation_wait", "account_rate_limit_wait",
+                 "max_conversations", "conversation_wait", "account_rate_limit_wait", "account_move_keeps_history",
                  "journal_max_file_bytes", "journal_keep_files"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
@@ -120,6 +120,12 @@ def _schema():
          "прежде чем диалог переедет на другой аккаунт (там весь префикс записывается заново). Если Retool прислал "
          "Retry-After, ждём столько, когда это не больше предела; 0 — переезжать сразу. Применяется сразу",
          "с", 0, 120, None),
+        ("account_move_keeps_history", "boolean", "Подписанная история едет с диалогом", "routing",
+         "Когда диалог вынужден сменить аккаунт (баланс, вход, часовой лимит, нет маршрута), его подписанные блоки "
+         "рассуждений едут с ним, и первый запрос на новом аккаунте совпадает с закэшированным: кэш провайдера общий "
+         "для аккаунтов, а префикс приходилось писать заново из-за потерянных подписей. Если upstream отклонит подпись, "
+         "следующий запрос уйдёт без неё, как раньше. Выключено, пока переезд не проверен на живом relay. "
+         "Применяется сразу", None, None, None, None),
         ("session_refresh_interval", "integer", "Продление сессии", "routing",
          "Как часто продлевать сессию Retool каждого включённого аккаунта; 0 — не продлевать по таймеру",
          "с", 0, 86400, None),
