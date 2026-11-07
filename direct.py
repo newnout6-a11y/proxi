@@ -1732,6 +1732,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     another tool is dropped by the caller and is not part of what the turn delivered, nor of the branch recorded for it."""
     # A route that refuses a forced choice is sent `auto` (forced_choice): the choice is neither sent nor part of the scope
     # of the branch, which the next request continues whatever it forces.
+    asked = tools, tool_choice  # what the caller sent: the request that is asked again after a refusal is this one
     required = forced_choice.requirement(model_provider.get("model"), tools, tool_choice)
     if required is not None:
         tool_choice = "auto"
@@ -1944,7 +1945,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 history.forget_pruned()
                 upstream_status = getattr(error, "upstream_status", None) or error.status
                 answered = False
-                async with contextlib.aclosing(iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice,
+                async with contextlib.aclosing(iter_events(cfg, session, model_provider, prompt, head, *asked,
                                                            max_tokens, chunks)) as again:
                     async for event in again:
                         if not answered and event.get("type") != "usage_start":
