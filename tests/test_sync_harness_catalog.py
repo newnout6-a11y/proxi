@@ -434,3 +434,16 @@ def test_missing_profile_and_unexpected_structure_are_reported_cleanly(tmp_path,
     assert code == 1 and 'Harness profile not found' in capsys.readouterr().err
     code, summary, error, _ = client(tmp_path, capsys, raw=b'just: a mapping\n')
     assert code == 1 and 'Expected a Harness plugin patch list' in error and 'Traceback' not in error
+
+
+def test_a_model_that_moves_between_the_two_groups_keeps_its_own_fields():
+    # the layout before the split: every model in retool, GLM with fields of its own
+    before = source()
+    relay = before[1]['config']['providers']['retool']
+    relay['models'].append({'id': 'zai-org/GLM-5.3-Flash', 'compat': {'thinkingFormat': 'zai'}, 'cost': {'input': 1}})
+    relay['models'].append({'id': 'gpt-4.1', 'cost': {'input': 2}})
+    entries = [models.resolve(name)[0] for name in ('gpt-6-sol', 'gpt-4.1', 'zai-org/GLM-5.3-Flash')]
+    result = update_document(before, entries)
+    text = {model['id']: model for model in result[1]['config']['providers']['retool-text']['models']}
+    assert text['zai-org/GLM-5.3-Flash']['compat'] == {'thinkingFormat': 'zai'}
+    assert text['zai-org/GLM-5.3-Flash']['cost'] == {'input': 1} and text['gpt-4.1']['cost'] == {'input': 2}

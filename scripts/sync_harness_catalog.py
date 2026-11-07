@@ -83,9 +83,16 @@ def update_document(document, entries):
     if len({item['id'] for item in entries}) != len(entries):
         raise ValueError('Duplicate canonical model IDs')
 
-    def catalog(previous, selected):
-        old = {item['id']: item for item in previous.get('models', [])
-               if isinstance(item, dict) and isinstance(item.get('id'), str)}
+    # The entries of both groups as they were, by id: a model that lands in, or moves between, retool and retool-text keeps
+    # the fields of its own (a per-model compat, cost); read from one group, it lost them at the move, and only the backup
+    # kept them.
+    old = {}
+    for group in (parent.get('retool-text'), parent['retool']):
+        for item in (group.get('models') or []) if isinstance(group, dict) else []:
+            if isinstance(item, dict) and isinstance(item.get('id'), str):
+                old[item['id']] = item
+
+    def catalog(selected):
         updated = []
         for entry in selected:
             item = _copy(old.get(entry['id']) or {})
@@ -110,13 +117,13 @@ def update_document(document, entries):
             raise ValueError('Existing retool-text does not match the managed Proxi provider')
         if not text or not reasoning:
             raise ValueError('Existing retool-text requires the complete split catalog')
-    provider['models'] = catalog(provider, reasoning or text)
+    provider['models'] = catalog(reasoning or text)
     if not reasoning:
         provider['reasoning'] = 'off'
     if reasoning and text:
         second = _copy(secondary or provider)
         second['displayName'] = str(provider.get('displayName') or 'Retool Relay') + ' (без thinking)'
-        second['models'] = catalog(secondary or provider, text)
+        second['models'] = catalog(text)
         second['reasoning'] = 'off'
         parent['retool-text'] = second
     parent['retool'] = provider
