@@ -262,6 +262,23 @@ def merge_set_cookie(cfg, headers) -> bool:
     return changed
 
 
+SHORT_KEY = 32
+
+
+def short_key_warning(key):
+    """The startup warning for a relay key short enough to guess, else None.
+
+    Wrong keys from 127.0.0.1 have no attempt budget (every local client shares that address, and one with a stale key
+    used to lock the others out); a tunnel or reverse proxy on this machine makes every remote client 127.0.0.1 too, so
+    only the length of the key stands between them and the relay. The generated key (relay_key.txt) is long enough."""
+    length = len(key.strip()) if isinstance(key, str) else 0
+    if 0 < length < SHORT_KEY:
+        return ("the relay key has only %d characters: wrong keys from 127.0.0.1 are not limited, and a tunnel or reverse "
+                "proxy on this machine makes every client 127.0.0.1; set one of %d or more in RELAY_API_KEY or "
+                "relay_api_key, or remove both to use the generated relay_key.txt" % (length, SHORT_KEY))
+    return None
+
+
 def mask(key: str) -> str:
     """What the startup banner shows of the relay key (the supervisor keeps stdout in relay.log): its length, and the ends
     of a long key only. It printed a key of up to 12 characters whole and 12 characters of a longer one, so a short key

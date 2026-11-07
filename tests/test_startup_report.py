@@ -86,6 +86,7 @@ def test_default_model_warning_covers_an_unknown_name_and_honours_show_unrouted(
 
 def test_startup_collects_the_hidden_default_and_config_warnings(multi):
     runtime = multi.runner_.runtime
+    runtime.cfg["relay_api_key"] = "relay-" + "k" * 40  # long enough to need no warning of its own
     assert proxy.startup_warnings(runtime) == []
     runtime.cfg.update(model='claude-fable-5', config_warnings=['top-level provider_access is ignored'])
     warnings = proxy.startup_warnings(runtime)
@@ -101,7 +102,8 @@ def test_main_writes_the_warning_to_the_journal_and_the_banner(tmp_path, monkeyp
     monkeypatch.setattr(journal, 'JOURNAL', journal.Journal())
     monkeypatch.setattr(threading, 'excepthook', threading.excepthook)
     cfg = runtime_config(tmp_path)
-    cfg.update(model='claude-fable-5', provider_resource_name='__managed__')
+    cfg.update(model='claude-fable-5', provider_resource_name='__managed__',
+               relay_api_key='fixture-relay-key-' + 'x' * 20)  # long: the one warning here is the model's
     runtime = proxy.Runtime(cfg)
     monkeypatch.setattr(runtime.accounts, 'start', lambda: None)
     monkeypatch.setattr(runtime.credits, 'get_balance', lambda **_kw: {'available': 100})
@@ -190,3 +192,18 @@ def test_discovery_is_empty_while_every_account_is_switched_off(multi, path, key
     assert status == 200 and body[key] == []
     multi.backends[1].cfg['enabled'] = True
     assert multi.call(path)[1][key]
+
+
+@pytest.mark.parametrize("key", ["short-key", "x" * 31])
+def test_a_short_relay_key_is_warned_about_by_its_length_and_never_shown(multi, key):
+    """Wrong keys from 127.0.0.1 have no attempt budget, and a tunnel on the machine makes every client 127.0.0.1."""
+    runtime = multi.runner_.runtime
+    runtime.cfg["relay_api_key"] = key
+    (warning,) = proxy.startup_warnings(runtime)
+    assert "%d characters" % len(key) in warning and key not in warning
+
+
+def test_a_relay_key_of_32_characters_or_more_needs_no_warning(multi):
+    runtime = multi.runner_.runtime
+    runtime.cfg["relay_api_key"] = "x" * 32
+    assert proxy.startup_warnings(runtime) == []

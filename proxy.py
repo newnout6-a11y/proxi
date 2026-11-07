@@ -1473,7 +1473,8 @@ def startup_warnings(runtime):
     """Conditions that make requests fail later without any other hint, in banner order."""
     backends = getattr(runtime.accounts, "backends", None)
     hidden = model_catalog.default_model_warning(runtime.cfg, backends)
-    return ([hidden] if hidden else []) + list(runtime.cfg.get("config_warnings") or [])
+    short = auth.short_key_warning(runtime.cfg.get("relay_api_key"))
+    return [text for text in (hidden, short) if text] + list(runtime.cfg.get("config_warnings") or [])
 
 
 def banner_lines(cfg, balance, warnings=()):
