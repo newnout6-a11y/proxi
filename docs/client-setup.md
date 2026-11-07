@@ -132,8 +132,8 @@ The relay holds such a location where it first saw it (`prompt_stabilizer.SkillL
 (by working folder, name and description) is written into every later prompt, so the head stays put. The name and the
 description are the skill and are never touched, and `skill({name})` loads by name, so the model can still load every skill.
 A remembered file that is gone while the new one exists gives way to the new one, so the model is never pointed at a file that
-does not exist; an entry is forgotten after a week. The memory is written to `<conversation_state_dir>/client-prompts.json`
-and survives a relay restart. `prompt.stabilized` (debug) names what was held. `stabilize_client_prompts: false` in
+does not exist; an entry not used for a week is forgotten. The memory is written to `<conversation_state_dir>/client-prompts.json`
+(the time of use of a skill at most an hour late) and survives a relay restart. `prompt.stabilized` (debug) names what was held. `stabilize_client_prompts: false` in
 `config.json` switches this off.
 
 The same prompt carries `Today's date: ...`, regenerated on every request, so a conversation that crosses midnight rewrites its

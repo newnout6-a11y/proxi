@@ -112,6 +112,36 @@ def test_a_prompt_with_no_skills_is_returned_as_it_is():
     assert SkillLocations().stabilize("You are an agent.") == ("You are an agent.", [])
 
 
+def test_skills_used_every_day_survive_a_restart_a_week_after_they_were_first_seen(tmp_path):
+    """Only a new skill wrote the file, so the times in it stayed those of the first day: the first restart a week later
+    dropped every skill in daily use, and each conversation going on got a new head (native_history.reset)."""
+    now = [1000.0]
+    path = str(tmp_path / prompt_stabilizer.FILE_NAME)
+    memory = SkillLocations(path, clock=lambda: now[0], exists=lambda path: True)
+    memory.stabilize(system(FIRST))
+    for _ in range(8):
+        now[0] += 24 * 3600
+        assert memory.stabilize(system(OTHER)) == (system(FIRST), ["stageshow", "unslop"])
+    now[0] += 60
+    again = SkillLocations(path, clock=lambda: now[0], exists=lambda path: True)
+    assert again.stabilize(system(OTHER)) == (system(FIRST), ["stageshow", "unslop"])
+
+
+def test_a_skill_in_use_rewrites_the_file_at_most_once_an_hour(tmp_path, monkeypatch):
+    now = [1000.0]
+    memory = SkillLocations(str(tmp_path / prompt_stabilizer.FILE_NAME), clock=lambda: now[0], exists=lambda path: True)
+    writes, write = [], memory._write
+    monkeypatch.setattr(memory, "_write", lambda document: writes.append(now[0]) or write(document))
+    memory.stabilize(system(FIRST))  # new skills: written at once
+    for later in (10, 600, 2000):
+        now[0] = 1000.0 + later
+        memory.stabilize(system(OTHER))
+    assert writes == [1000.0]
+    now[0] = 1000.0 + prompt_stabilizer.TOUCH_SAVE_EVERY
+    memory.stabilize(system(OTHER))
+    assert writes == [1000.0, 1000.0 + prompt_stabilizer.TOUCH_SAVE_EVERY]
+
+
 def test_requests_that_learn_skills_at_the_same_time_leave_the_newest_memory_on_disk(tmp_path, monkeypatch):
     """Two request threads wrote one temporary file at once: the rename of one failed while the other held the file open
     (Windows), and the file put in place was the older document written over the start of the newer one."""

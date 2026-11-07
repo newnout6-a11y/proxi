@@ -34,6 +34,10 @@ _LOCATION = re.compile(r"<location>(.*?)</location>", re.S)
 _FOLDER = re.compile(r"^[ \t]*Working directory:[ \t]*(.+?)[ \t]*$", re.M)
 _DATE = re.compile(r"(Today's date: )([A-Z][a-z]{2} [A-Z][a-z]{2} \d{2} \d{4})")
 FILE_NAME = "client-prompts.json"
+# A skill in use has its time written to the file at most this late (seconds). Only a new skill wrote the file before, so the
+# times in it stayed those of the day the skills were first seen: the first restart a week later dropped every skill in daily
+# use, and each conversation going on got a new head (native_history.reset, the whole prefix written to the cache again).
+TOUCH_SAVE_EVERY = 3600
 
 
 def _is_path(text):
@@ -50,7 +54,9 @@ class SkillLocations:
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()  # held by the one thread writing the file (see _save)
         self._memory = collections.OrderedDict()
-        self._dirty = False
+        self._dirty = False  # the memory holds a location the file does not
+        self._touched = False  # the memory holds a later time of use than the file (written every TOUCH_SAVE_EVERY)
+        self._saved_at = float("-inf")
         self._warned = False
         self._load()
 
@@ -96,6 +102,7 @@ class SkillLocations:
                 self._remember(key, seen, now)
                 return seen
             entry[1] = now
+            self._touched = True
             self._memory.move_to_end(key)
             if entry[0] == seen:
                 return seen
@@ -132,16 +139,18 @@ class SkillLocations:
         process) at the same time: on Windows the rename of one failed while the other held the file open, the other
         renamed a mix of both documents into place, and a write that took the older snapshot last put it over the newer.
         A thread that finds the file being written leaves its change to the writer, which looks again before it lets go."""
-        if not (self._dirty and self._path):
+        if not ((self._dirty or self._touched) and self._path):
             return
         if not self._save_lock.acquire(blocking=False):
             return
         while True:
             with self._lock:
-                if not self._dirty:
+                now = self._clock()
+                if not (self._dirty or (self._touched and now - self._saved_at >= TOUCH_SAVE_EVERY)):
                     self._save_lock.release()  # under self._lock: a change made after this look finds the file free
                     return
-                self._dirty = False
+                self._dirty = self._touched = False
+                self._saved_at = now
                 document = {"version": 1, "skills": [[*key, value[0], value[1]] for key, value in self._memory.items()]}
             if not self._write(document):
                 with self._lock:
