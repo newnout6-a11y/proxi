@@ -445,7 +445,9 @@ SHA-256 от `account_id` (или `page_uuid`); сам идентификато�
 affinity. ID вызывающей сессии (`x-proxi-session-id`, `x-opencode-session-id`,
 `x-claude-code-session-id`) имеет приоритет над общим `x-session-affinity` родителя:
 субагент получает отдельный диалог, историю, инструменты и прогрев кэша.
-`x-claude-code-agent-id` также разделяет субагентов с общим ID сессии.
+`x-claude-code-agent-id` также разделяет субагентов с общим ID сессии. Субагент Codex (порождённый, review, guardian) шлёт
+`session-id` корня, свой `thread-id` и `x-codex-parent-thread-id`: с обоими заголовками он получает собственный диалог, а
+родителем становится корень.
 Связь с родителем берётся из `x-proxi-parent-session-id`,
 `x-opencode-parent-session-id`, metadata или локальной базы OpenCode.
 Пока идёт запрос субагента, родитель и его предки защищены от вытеснения,
