@@ -732,6 +732,14 @@ def make_handler(runtime: Runtime):
             # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
             # identity, so that every event of the request, the transport's included, says what it is.
             parsed.client_task = client_context.client_task(parsed)
+            if (not parsed.client_task and parsed.request_purpose == "generation" and parsed.structured_output
+                    and prompt_policy.prompt_client(client_context.current(), self.headers) == "codex"):
+                # A tool-less request of Codex for a strict schema is one of its own one-shot jobs: the memory
+                # extraction of an old thread (codex-rs memories/write phase1: no tools, output_schema_strict, one
+                # request per thread). Nothing continues it, so it is not kept warm, keeps no branch, writes nothing
+                # past what it reads and leaves the session it runs on as it was. Its main agent and its sub-agents (the
+                # guardian's reused trunk too) always carry tools.
+                parsed.client_task = client_context.BACKGROUND
             if parsed.client_task:
                 client_context.bind({**client_context.current(), "client_task": parsed.client_task})
             # The pool is asked about the accounts this very request would run on (acquire reads the same plan). The plan

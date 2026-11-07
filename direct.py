@@ -1768,8 +1768,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
     # The summary of a client's compaction is a side request: the client replaces its history by that summary and
-    # never continues this one (see where the branches are recorded below, and what keepwarm does after it).
-    side_request = client_context.current().get("client_task") == client_context.COMPACTION
+    # never continues this one (see where the branches are recorded below, and what keepwarm does after it). So is a
+    # client's own one-shot job (client_context.BACKGROUND: Codex's memory extraction of an old thread).
+    task = client_context.current().get("client_task")
+    side_request = task in client_context.SIDE_TASKS
     # A hint on the result of a tool is new to upstream: `rebuild` makes the same messages without one, for the retry that
     # a refusal of it gets (see below). It stays None unless a body carries such a hint.
     hint_results = _hints_tool_results(model_provider.get("model"))
@@ -1814,7 +1816,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             sum(b["type"] in ("thinking", "redacted_thinking") for b in replayed),
             sum(b["type"] == "tool_call" for b in replayed)))
     else:
-        if history is not None and history.branches and client is not None:
+        # A one-shot job continues nothing of the session it runs on, so it changes nothing of it either: Codex can run
+        # its memory jobs on the session of a chat, whose signed history, cache points and keepwarm body stay the chat's.
+        background = task == client_context.BACKGROUND
+        if history is not None and history.branches and client is not None and not background:
             # Never attach an old signature to a rebuilt/edited prefix.
             session._cached_turn_ends = []
             session._warm_body = None
@@ -1822,8 +1827,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                          "warn", reason="prefix_or_settings_mismatch",
                          restored=any(getattr(branch, "restored", False) for branch in history.branches),
                          why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
-        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session,
-                          mark_tail=not side_request)
+        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks,
+                          session=None if background else session, mark_tail=not side_request)
         cold = (native_history.unsigned_tool_transcript(client)
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
         if cold is not None:
@@ -1888,11 +1893,14 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             thinking_seen=thinking_seen)
         if rejected:
             outcome = "rejected"
-        if body.get("openAICacheKey"):
+        # A one-shot job is judged by nobody's keepwarm and moves no cache key of the session: its verdict and its prefix
+        # are its own, and a chat it shares the session with keeps its own.
+        own = task != client_context.BACKGROUND
+        if body.get("openAICacheKey") and own:
             # Only a usable answer (never an empty, thinking-only, cut off, failed or cancelled turn) may
             # become the keepwarm body; any other verdict stops the cycle until a good turn comes.
             session._turn_outcome = outcome
-        if body.get("openAICacheKey") and not rejected:
+        if body.get("openAICacheKey") and not rejected and own:
             prior_key = getattr(session, "_last_cache_key", None)
             if prior_key and prior_key != body["openAICacheKey"]:
                 # A new key means the upstream prefix cache starts from zero: every
@@ -1940,10 +1948,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             errored = True
             settle()
 
-    if body.get("openAICacheKey"):
+    if body.get("openAICacheKey") and task != client_context.BACKGROUND:
         session._turn_body = body
         # Start the scheduler with the turn, not after it: a session's first long
-        # turn needs its anchored during-turn ping too.
+        # turn needs its anchored during-turn ping too. A one-shot job has no next request to keep a prefix for.
         _ensure_keepwarm(session, cfg)
 
     def open_stream(sent):
