@@ -104,6 +104,7 @@ class Runtime:
         self.loop = asyncio.new_event_loop()
         self._lifecycle_lock = threading.Lock()
         self._closing = False
+        self._turns = {}  # id(holder) -> holder of each turn in flight: its cancel event is set when the relay stops
         # Each direct turn holds one executor thread for its whole stream; the
         # default pool (~min(32, cpu+4)) silently capped concurrent turns below
         # max_workers and starved keepwarm pings / refreshes behind them.
@@ -145,6 +146,10 @@ class Runtime:
         self.admin = admin_module.Admin(self)
         # After the journal is configured: scanning the stored conversations reports what it removed.
         self.pool.attach_store(conversation_state.open_store(cfg))
+        # The pool let an idle conversation go only when some request came by: a relay that went quiet kept every pooled
+        # conversation (its warm body, its signed history, the chunks of its last request: a few times the size of the
+        # conversation each) in memory until the next request of any conversation, hours later.
+        self.loop.call_soon_threadsafe(self._sweep_idle)
         # Where what the relay learns about its clients is kept between runs (the union of tools, the skill locations):
         # the folder of the stored conversations, which the store above has made.
         folder = cfg.get("conversation_state_dir") if cfg.get("conversation_state", True) else None
@@ -166,8 +171,53 @@ class Runtime:
                 raise apierr.service_unavailable("relay is shutting down")
             return asyncio.run_coroutine_threadsafe(coroutine, self.loop)
 
+    def submit_turn(self, parsed, events, holder):
+        """runner.run for one request, with its holder known to _shutdown_tasks until the turn ends."""
+        turns = self._turns
+
+        async def turn():
+            try:
+                return await self.runner.run(parsed, events, holder)
+            finally:
+                turns.pop(id(holder), None)
+
+        turns[id(holder)] = holder
+        try:
+            return self.submit(turn())
+        except BaseException:
+            turns.pop(id(holder), None)
+            raise
+
+    def _sweep_idle(self):
+        """Closes the conversations past conversation_idle_timeout whose cache is not kept warm, without waiting for a request.
+
+        A timer on the loop, where the pool's state lives: each look runs as a short task and sets the next timer when it
+        ends, and nothing more is set once the relay is stopping (_shutdown_tasks cancels a look that is running)."""
+        if getattr(self.loop, "_relay_closing", False):
+            return
+        ttl = float(self.pool.cfg.get("conversation_idle_timeout", 900) or 900)
+
+        def look():
+            if not getattr(self.loop, "_relay_closing", False):
+                self.loop.create_task(self.pool._evict_idle()).add_done_callback(looked)
+
+        def looked(task):
+            if not task.cancelled() and task.exception() is not None:  # the next request evicts as before
+                journal.emit("session.sweep_error", "Проверка простаивающих диалогов не удалась: %s"
+                             % type(task.exception()).__name__, "debug")
+            self._sweep_idle()
+
+        self.loop.call_later(min(60.0, max(1.0, ttl / 2)), look)
+
     async def _shutdown_tasks(self):
         self.loop._relay_closing = True
+        # A relay exec command runs in a thread that only its turn's cancel event stops (executor.run_command polls it), and
+        # the interpreter waits for that thread at exit: cancelling the turn's task left the process alive until the
+        # command ended or command_timeout (300 s) killed it, and a second Ctrl+C did nothing.
+        for holder in tuple(self._turns.values()):
+            event = holder.get("cancel_event")
+            if event is not None:
+                event.set()
         # Conversations that moved since their last stored copy go to the writer before turns are cancelled.
         self.pool.persist_pending()
         sessions = {record[0] for record in self.pool._active.values()}
@@ -900,7 +950,7 @@ def make_handler(runtime: Runtime):
             holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
             self._holder = holder
             self._model_called = True
-            fut = runtime.submit(runtime.runner.run(parsed, events, holder))
+            fut = runtime.submit_turn(parsed, events, holder)
 
             prompt_text = parsed.system + "\n" + parsed.prompt
             if not parsed.stream:
