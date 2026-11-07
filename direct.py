@@ -1666,7 +1666,7 @@ async def _keepwarm(session, cfg):
     if interval <= 0:
         return
     idle = float(cfg.get("cache_keepwarm_idle", 900) or 900)
-    subagent_idle = float(_int_setting(cfg, "cache_keepwarm_subagent_idle", 600))
+    subagent_idle = float(_int_setting(cfg, "cache_keepwarm_subagent_idle", 1800))
     turn_timeout = float(_int_setting(cfg, "turn_timeout", 900) or 900)
     during_turns = bool(cfg.get("cache_keepwarm_during_turns", True))
     turn_offset = min(max(float(cfg.get("cache_keepwarm_turn_offset", 200) or 200), 30.0), PING_LATEST)
