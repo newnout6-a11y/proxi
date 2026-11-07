@@ -883,6 +883,36 @@ def _fuzzy_lookalike(pattern, verbose=False):
 
 # A group that turns verbose mode on for its own part, (?x:...) or (?ix-m:...): the parser reports only the global flags.
 _SCOPED_VERBOSE = re.compile(r"\(\?[a-zA-Z]*x[a-zA-Z]*(?:-[a-zA-Z]*)?:")
+# The global flags a pattern may start with, and the one-character atom repeated "one or more" (greedy or possessive, not
+# lazy) that may start it: a set, a class escape or a plain character.
+_LEADING_FLAGS = re.compile(r"\(\?[aiLmsux]+\)")
+_LEADING_RUN = re.compile(r"(\[\^?\]?(?:\\.|[^\]\\])*\]|\\[dDsSwW]|[^\\\[\](){}|*+?.^$#\s])\+(?!\?)")
+
+
+def _starting_runs_once(pattern, tree):
+    """The pattern with (?<!C) in front when it starts with C+ for a one-character atom C, else the pattern as it is.
+
+    A search tried C+ at every position of a run of C and, where the rest failed, scanned the run to its end again: quadratic
+    on a long run (`[ \t]+$` on a table padded with blanks took 1.7-2.4 s for one run of 20k blanks, and the 1 s limit of an
+    operation decided whether the edit applied). A match that starts inside a run also matches from the start of that run
+    (the repeat takes the part before it as well), and the leftmost match is the one taken, so starting only where a run
+    starts finds the same matches; a repeat of at least one character never matches empty, so no empty match is lost
+    either. Patterns of another shape, and verbose ones (whose text this reading would misread), are left as they are."""
+    if not tree.data or tree.state.flags & re.VERBOSE or _SCOPED_VERBOSE.search(pattern):
+        return pattern
+    op, value = tree.data[0]
+    if op not in (_sre_const.MAX_REPEAT, getattr(_sre_const, "POSSESSIVE_REPEAT", None)):
+        return pattern
+    low, high, item = value
+    if low < 1 or high != _sre_const.MAXREPEAT or len(item.data) != 1 or item.data[0][0] not in (
+            _sre_const.IN, _sre_const.LITERAL, _sre_const.NOT_LITERAL):
+        return pattern
+    flags = _LEADING_FLAGS.match(pattern)
+    start = flags.end() if flags else 0
+    run = _LEADING_RUN.match(pattern, start)
+    if run is None:
+        return pattern
+    return pattern[:start] + "(?<!" + run.group(1) + ")" + pattern[start:]
 
 
 def _re_bits(flags):
@@ -943,7 +973,7 @@ def _compile_pattern(pattern, flags, path):
         _err(path, "a '{' that is not a repeat count (a{2,3}) starts a fuzzy-match constraint in the regex engine: "
                    "write \\{ for a literal brace")
     try:
-        return _regex.compile(pattern, _regex_bits(flags))
+        return _regex.compile(_starting_runs_once(pattern, tree), _regex_bits(flags))
     except (_regex.error, RecursionError, OverflowError, ValueError, MemoryError) as exc:
         _err(path, "invalid regular expression: %s" % exc, _brief_regex_error(exc))
 
