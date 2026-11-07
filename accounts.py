@@ -221,7 +221,8 @@ class AccountDispatcher:
 
     # -- state ---------------------------------------------------------------
     def _set_reason(self, backend, reason, details):
-        """Returns True when routing eligibility changed. Caller holds the lock."""
+        """Returns True when the reason the account is out of the pool changed: it left, came back, or is out for another
+        reason now. Caller holds the lock."""
         state = self.state[backend]
         before = backend.unavailable
         if details is None:
@@ -229,9 +230,12 @@ class AccountDispatcher:
         else:
             state["reasons"][reason] = dict(details, reason=reason)
         reasons = state["reasons"]
-        # A parked account is never a reserve candidate, even when its balance is also low.
-        backend.unavailable = reasons.get("rate_limited") or reasons.get("exhausted") or reasons.get("auth_dead")
-        return (before is None) != (backend.unavailable is None)
+        # A parked account is never a reserve candidate, even when its balance is also low; nor is a signed-out one, whose
+        # requests all fail. Below the balance threshold too, a signed-out account used to show as "exhausted": it stayed a
+        # reserve, the richest one took every turn (a 401, then a failover logged as an empty balance), the alert that it
+        # needs a new sign-in never came, and a lone such account answered 402 "top up" instead of 503.
+        backend.unavailable = reasons.get("rate_limited") or reasons.get("auth_dead") or reasons.get("exhausted")
+        return (before or {}).get("reason") != (backend.unavailable or {}).get("reason")
 
     def _announce(self, backend, changed, reason=None):
         """`reason` is the state captured under the lock that changed it."""
@@ -241,6 +245,8 @@ class AccountDispatcher:
         if reason is None:
             text = "[account] %s снова в пуле" % label
             journal.emit("account.available", text, "success", account=tag)
+        elif reason["reason"] == "rate_limited":
+            return  # mark_rate_limited says it itself, with the time the account comes back
         elif reason["reason"] == "exhausted":
             text = "[account] %s исключён: баланс %s < %s" % (
                 label, console_log.amount(reason.get("available"), signed=True), console_log.amount(self.threshold))
@@ -368,9 +374,10 @@ class AccountDispatcher:
                     continue
                 state["rl_released"] = now
                 if self._set_reason(backend, "rate_limited", None):
-                    released.append(backend)
-        for backend in released:
-            self._announce(backend, True, None)
+                    # Back in the pool, or out for another reason it had meanwhile (a low balance, a dead session).
+                    released.append((backend, backend.unavailable))
+        for backend, reason in released:
+            self._announce(backend, True, reason)
         return bool(released)
 
     def recheck_exhausted(self):

@@ -350,3 +350,30 @@ def test_a_local_debit_to_zero_forces_a_server_check_even_with_a_threshold_of_ze
     value, clock = dispatcher([account], {account: manager}, session_refresh_interval=0, min_account_balance=0)
     value.state[account]["next_balance"] = clock.now + 10_000
     assert value.due() == [(account, "balance")]
+
+
+def test_a_signed_out_account_below_the_threshold_says_so_and_is_no_reserve(capsys):
+    dead = Account("a", FakeRefresher([(False, "auth")] * DEAD_AFTER + [(True, None)]))
+    value, _ = dispatcher([dead], {dead: FakeManager(15.0)})
+    value.check_balance(dead)
+    assert dead.unavailable["reason"] == "exhausted"  # a reserve: 15 credits, below the threshold of 20
+    for _ in range(DEAD_AFTER):
+        value.refresh(dead)
+    assert dead.unavailable["reason"] == "auth_dead"  # no longer a reserve: nothing can run on it
+    assert "нужен новый вход" in capsys.readouterr().out
+    value.refresh(dead)  # a new sign-in: back to what its balance says
+    assert dead.unavailable["reason"] == "exhausted"
+
+
+def test_an_account_whose_hourly_pause_ends_while_its_balance_is_low_is_not_announced_as_back(capsys):
+    account = Account("a")
+    value, clock = dispatcher([account], {account: FakeManager(5.0)})
+    value.mark_rate_limited(account, retry_after=60)
+    value.check_balance(account)
+    assert account.unavailable["reason"] == "rate_limited"
+    capsys.readouterr()
+    clock.now += 61
+    assert value.release_rate_limited() is True
+    assert account.unavailable["reason"] == "exhausted"
+    output = capsys.readouterr().out
+    assert "снова в пуле" not in output and "баланс" in output
