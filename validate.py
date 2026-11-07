@@ -155,6 +155,8 @@ def load_json(raw: bytes):
         raise bad_request("request body must use valid UTF-8")
     except json.JSONDecodeError as exc:
         raise bad_request(f"invalid JSON body: {exc.msg} at line {exc.lineno}")
+    except RecursionError:  # a body nested past the decoder's depth was a 500 internal_error
+        raise bad_request("request body is nested too deeply")
     if not isinstance(data, dict):
         raise bad_request(f"request body must be a JSON object, got {type(data).__name__}")
     return data
@@ -477,7 +479,11 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
                 for call in calls:
                     if not isinstance(call, dict):
                         continue
-                    fn = call.get("function") or {}
+                    fn = call.get("function")
+                    if fn is not None and not isinstance(fn, dict):
+                        # a string or a number here used to raise AttributeError: a 500 instead of the field named
+                        raise unprocessable("tool_calls[].function must be an object", param="messages")
+                    fn = fn or {}
                     name = fn.get("name") or call.get("name") or "tool"
                     args = fn.get("arguments") or call.get("arguments") or ""
                     if isinstance(call.get("custom"), dict):

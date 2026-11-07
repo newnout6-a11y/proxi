@@ -428,7 +428,8 @@ def make_handler(runtime: Runtime):
             route = ROUTES.get((self.command, path))
             # /v1/responses clients need their own error envelope: a chat-shaped
             # error without type:"error" leaves a strict SDK waiting forever.
-            dialect = {"anthropic": "anthropic", "responses": "responses"}.get(route, "chat")
+            # count_tokens is a route of the Messages API: its errors take Anthropic's envelope too.
+            dialect = {"anthropic": "anthropic", "count_tokens": "anthropic", "responses": "responses"}.get(route, "chat")
             try:
                 self._log_route = route
                 if admin_module.is_admin_path(path):
