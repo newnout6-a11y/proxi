@@ -304,7 +304,9 @@ def test_dependent_bookkeeping_is_balanced_and_the_count_never_goes_below_zero(t
 
 
 def test_eviction_reports_why_the_warm_up_ended(tmp_path, monkeypatch):
-    _, pool, runner = pooled(tmp_path)
+    # A conversation whose cache is kept warm is not closed for idleness (the pool waits for its keepwarm to end), so the
+    # eviction here is the one that makes room for a new conversation in a full pool.
+    _, pool, runner = pooled(tmp_path, max_conversations=1)
     answers(monkeypatch, FINAL)
     mark = journal.JOURNAL.last_seq
 
@@ -317,6 +319,8 @@ def test_eviction_reports_why_the_warm_up_ended(tmp_path, monkeypatch):
         await asyncio.sleep(0.2)  # the scheduler is really running, not cancelled before its first step
         pool._last_used[next(iter(pool._conversations))] = time.monotonic() - 10_000
         await pool._evict_idle()
+        assert not task.done() and pool._conversations, "idleness alone does not close a conversation kept warm"
+        await pool._evict_idle(make_room=True)
         assert task.done() and not pool._conversations
 
     asyncio.run(scenario())
@@ -343,8 +347,8 @@ def quiet_environment(monkeypatch):
 
 def test_keepwarm_limit_defaults_and_validation(tmp_path, quiet_environment):
     assert config.DEFAULTS["cache_keepwarm_idle"] == 900 == config.DEFAULTS["conversation_idle_timeout"]
-    assert config.DEFAULTS["cache_keepwarm_subagent_idle"] == 600
-    assert config.load(write_config(tmp_path))["cache_keepwarm_subagent_idle"] == 600
+    assert config.DEFAULTS["cache_keepwarm_subagent_idle"] == 1800
+    assert config.load(write_config(tmp_path))["cache_keepwarm_subagent_idle"] == 1800
     assert config.load(write_config(tmp_path, cache_keepwarm_subagent_idle="300"))["cache_keepwarm_subagent_idle"] == 300
     assert config.load(write_config(tmp_path, cache_keepwarm_subagent_idle=0))["cache_keepwarm_subagent_idle"] == 0
     for bad in (-1, "soon", None):
@@ -356,7 +360,7 @@ def test_admin_exposes_and_validates_the_subagent_limit(admin_relay):
     _, body, _ = admin_relay.request("/admin/api/settings")
     field = body["schema"]["cache_keepwarm_subagent_idle"]
     assert (field["type"], field["group"], field["unit"], field["min"], field["max"]) == ("integer", "cache", "с", 0, 86400)
-    assert len(field["description"]) > 25 and body["settings"]["cache_keepwarm_subagent_idle"] == 600
+    assert len(field["description"]) > 25 and body["settings"]["cache_keepwarm_subagent_idle"] == 1800
     status, result, _ = admin_relay.patch({"cache_keepwarm_subagent_idle": 300})
     assert status == 200 and result["settings"]["cache_keepwarm_subagent_idle"] == 300
     assert "cache_keepwarm_subagent_idle" in result["pending_restart"]
