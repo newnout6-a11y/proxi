@@ -40,7 +40,7 @@ BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
 LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
                  "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort",
                  "max_conversations", "conversation_wait", "account_rate_limit_wait", "account_move_keeps_history",
-                 "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs"}
+                 "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs", "codex_compaction_cache"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 POOL_FIELDS = {"enabled", "priority", "label"}
@@ -162,6 +162,12 @@ def _schema():
          "Обслуживать задачи памяти Codex: при запуске он извлекает память из старых тредов, по запросу без "
          "инструментов на тред, около 5 кредитов каждый. Выключено — relay отвечает на них ошибкой, ничего не "
          "тратя, и Codex не пополняет память, пока задачи снова не включат. Применяется сразу",
+         None, None, None, None),
+        ("codex_compaction_cache", "boolean", "Сжатие Codex читает кэш чата", "model",
+         "Сжатие истории Codex уходит без инструментов и ничего не делит с кэшем чата: вся история пишется заново, около "
+         "31 кредита на 330 тысячах токенов. Включено — relay объявляет в сжатии инструменты чата, и сводка читает его кэш "
+         "(около 1,5 кредита); ответ с вызовом инструмента Codex не получает. Выключено — запрос идёт как его прислал Codex. "
+         "Применяется сразу",
          None, None, None, None),
         ("show_thinking", "boolean", "Передавать мышление модели", "model",
          "Отдавать клиенту блоки мышления модели, когда Retool их присылает",

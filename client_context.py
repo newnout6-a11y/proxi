@@ -15,6 +15,8 @@ _CURRENT = contextvars.ContextVar("proxi_client", default=None)
 _CACHE = collections.OrderedDict()
 _CACHE_MAX = 1024
 _USER_ID_LIMIT = 4096
+# x-codex-turn-metadata is ASCII JSON of a few hundred bytes (the tool inventory is left out of the header); bound it before json.loads.
+_CODEX_TURN_LIMIT = 16 * 1024
 _LOCK = threading.Lock()
 _CLIENTS = {"claude-code": "Claude Code", "claude-desktop": "Claude Desktop", "opencode": "OpenCode"}
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
@@ -71,12 +73,17 @@ SIDE_TASKS = (COMPACTION, BACKGROUND)
 # since 2025 without that line, "Your task is to create a detailed summary of the conversation so far".
 # Codex's local compaction (the path of every provider but OpenAI's own) sends the history without tools and ends it with
 # its template, codex-rs/prompts/templates/compact/prompt.md: "You are performing a CONTEXT CHECKPOINT COMPACTION.".
+# DeepSeek Harness (@deepseek-ai/dsh-compaction-basic, summarizer.ts) condenses the OLDEST span of its history: the chat's system
+# prompt, its tools and the first messages byte for byte (a prefix of its last request, so the provider's cache is read), then
+# its instruction as one more user message, which opens "You are now acting as a compaction engine for this AI coding
+# assistant." It sends no header that says so (only the text, a 4,096 cap and the chat's own tools).
 COMPACTION_INSTRUCTIONS = (
     "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the work.",
     "Update the existing checkpoint in the conversation above into one consolidated summary.",
     "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
     "Your task is to create a detailed summary of the conversation so far",
     "You are performing a CONTEXT CHECKPOINT COMPACTION.",
+    "You are now acting as a compaction engine for this AI coding assistant.",
 )
 # The reminder OpenCode 2.x adds as a further user message when the reply skipped the summary template.
 COMPACTION_NUDGE = "The previous response did not fill in the required summary template."
@@ -234,7 +241,7 @@ def client_task(parsed, identity=None):
     info = current() if identity is None else identity
     agent = str(info.get("agent") or "").strip().lower()
     if (info.get("request_class") == COMPACTION or info.get("compaction_trigger") or info.get("task_hint") == COMPACTION
-            or (info.get("client") == "opencode" and agent == COMPACTION)):
+            or info.get("codex_task") == COMPACTION or (info.get("client") == "opencode" and agent == COMPACTION)):
         return COMPACTION
     texts = [text.lstrip() for text in _trailing_user_texts(parsed)]
     if texts and texts[0].startswith(COMPACTION_INSTRUCTIONS):
@@ -402,6 +409,22 @@ def _local_title(client, session_id, home):
     return dict(result)
 
 
+def _codex_turn(headers):
+    """The x-codex-turn-metadata of a Codex request as a dict, {} when it has none or it does not read.
+
+    Codex 0.167 names what each Responses request is for there (codex-rs core/src/responses_metadata.rs): request_kind
+    "turn", "compaction", "prewarm" or "memory", and for a compaction {trigger, reason, implementation, phase}. It is the
+    sign of a compaction whatever its prompt says (a compact_prompt in the user's config replaces the template)."""
+    raw = headers.get("x-codex-turn-metadata")
+    if not isinstance(raw, str) or not raw or len(raw) > _CODEX_TURN_LIMIT:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def describe(data, headers, cfg=None):
     headers = {str(key).lower(): value for key, value in headers.items()}
     metadata = data.get("metadata")
@@ -437,10 +460,20 @@ def describe(data, headers, cfg=None):
     # What triggered a Claude Code compaction (auto, manual, reactive), and a task a plugin names itself.
     compaction = clean(headers.get("x-claude-code-compaction"), 64).lower()
     task = clean(headers.get("x-proxi-task"), 64).lower()
+    # What Codex says about its own request: a compaction is named by request_kind, with the trigger (auto, manual) and the
+    # phase (pre_turn, mid_turn, post_turn, standalone_turn) it ran in.
+    codex = _codex_turn(headers)
+    codex_compaction = codex.get("request_kind") == COMPACTION
+    codex_detail = codex.get("compaction") if isinstance(codex.get("compaction"), dict) else {}
+    if codex_compaction and not compaction:
+        compaction = clean(codex_detail.get("trigger"), 64).lower() or "auto"
+    phase = clean(codex_detail.get("phase"), 64).lower() if codex_compaction else ""
     info = {key: value for key, value in {"client": client, "client_session_id": session_id,
             "chat_title": title, "title_source": "client-header" if title else "",
             "request_class": request_class if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", request_class) else "",
             "compaction_trigger": compaction if re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", compaction) else "",
+            "codex_task": COMPACTION if codex_compaction else "",
+            "compaction_phase": phase if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", phase) else "",
             "task_hint": task if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", task) else "",
             "agent": clean(_first(headers.get("x-proxi-agent"), headers.get("x-claude-code-agent-id"),
                                   metadata.get("agent_id"), identity.get("agent_id")), 100),

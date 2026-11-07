@@ -167,6 +167,15 @@ still shows why it was dear. The experimental `background_compaction` is the sam
 history up to the latest reply, without that reply, and a signed branch continues only a request
 that carries the reply it was made with.
 
+The flattened request is not small on a long session. It is sized to OpenCode's own estimate of the room (four characters to a
+token), the oldest exchanges shortened first, so it fills that room. Measured on 2026-11-07 (OpenCode 2.2.6, Sonnet 5.5, the
+window declared as 60,000 over a chat of 149,081 tokens made of seven reads of 20k tokens): 68,433 tokens, of them 63,480 plain
+input and 4,953 written (the system prompt), nothing read, 2.86 credits, where reading the whole chat from its cache would cost about
+0.7 at the prices of that run (read 0.004, plain input 0.04, write 0.05, output 0.2 credits per 1,000 tokens). The relay bills the
+dialog as plain input (no cache hint on it), labels the request and stops the keepwarm of its session at
+once. It happens when a chat overshoots the room in one step or the provider has rejected it as too long; the compactions of
+850k-token chats that the journal holds (the whole history, with the chat's tools) read 99.5% of their prompt.
+
 The hidden `compaction` agent decides who writes the summary: with no `agents.compaction.model`
 it is the session's model and variant, with one it is that model and the variant after its `#`
 ([compaction → model](https://opencode.ai/v2/docs/compaction/#model),
@@ -335,6 +344,27 @@ so after a relay restart a Harness chat continues under a new key once and then 
 Harness 0.2.2-alpha.3 and later also offer the explicit way, the `llm-pi-ai/request-headers` plugin hook; a plugin that
 sets `x-proxi-session-id` to the hook's `request.sessionId` (and `x-proxi-client: harness`) gives an exact identity that
 survives an edited history and a relay restart. It is optional now.
+
+### Compaction in Harness
+
+Harness condenses the oldest span of its history with one more request (`@deepseek-ai/dsh-compaction-basic`, `summarizer.ts`;
+`/compact` and the retry after a context overflow send the same one): the chat's system prompt, the same tools and the first
+messages of the chat byte for byte, then one user message that opens "You are now acting as a compaction engine for this AI
+coding assistant." There is no header and no session id, so the relay knows it by that opening (`client_task: "compaction"`).
+Harness replaces the span with the summary and never sends that body again, so the relay puts no cache hint on the instruction
+and stops the keepwarm of the session with the reason `compacted` once the summary is back. Before that each compaction was an
+ordinary turn and its body was pinged three times (every 240 s until the session had been idle for 900 s): 7 of 7 compactions of
+the runs of 2026-11-07, 0.5 to 1.1 credits for bodies of 14.7-18.7k tokens, and the price of a ping grows with the prefix.
+
+On GLM-5.3 the request reads the chat's cache: five of seven compactions read 97-98% of their 14.7-18.7k tokens (0.54-0.67
+credits); two read 43-44%, a partial hit of the provider's cache that the chat's own steps show now and then, on the same or on
+another account. Nothing is signed there, so no thinking can be lost. On a Claude model the compaction cannot continue the signed
+history: its messages are the first ones of the chat's last request, not that request and one more, so there is no branch to
+resume (`native_history.reset`, reason `history:N_of_M_messages`, then `cold` without the thinking blocks) and the provider's
+cache ends at the system prompt and the tools. Three compactions of a chat of 33-35k tokens (Sonnet 5.5) read 8,060 tokens and
+wrote 12.0-12.8k of a span of about 20k: 0.80-0.90 credits, about three times what reading the span would cost. With the label the
+span is plain input and not a write, and still not read. Continuing a signed branch from a shorter request needs a lookup of the
+conversation by a prefix of its history and a resume of a branch by a prefix of its messages; neither exists.
 
 ### Historical Harness setup — 0.1.5-rc.2
 
@@ -616,6 +646,31 @@ a server comes up. What decides it:
 `tools.carried` (info) says once per change how many tools were carried and which. Only the family `codex` is listed by default:
 Claude Code's list changes with what its ToolSearch loads, and OpenCode's with the agent, and a union would give an agent tools
 it was not given.
+
+### Compaction in Codex reads the cache of the chat
+
+Nothing needs to be set in Codex. For a custom provider Codex compacts locally (`core/src/compact.rs` of rust-v0.167.0): the
+history of the chat, its last reply and the summary prompt go out as one request with **no tools** (`x-codex-turn-metadata`
+says `request_kind: compaction`, with the phase `pre_turn`, `mid_turn`, ...). The tools stand first in the provider's cached
+prefix, so that request shared nothing with the chat and wrote the whole history again: 31,943 tokens and 1.65 credits where the
+chat's own last request wrote 9,807 (`363bb3d49ff4`), 52,527 uncached tokens and 4.80 credits on claude-opus-5-5
+(`0697b894535c`), about 31 credits at 330k tokens.
+
+With `codex_compaction_cache` (on by default, live in the admin) the relay remembers the tools each chat declared in its last
+request and declares them again in that chat's compaction, so the request is the next request of the chat plus its summary
+prompt: the chat's session, head and cache key, the signed history continued, nothing written for the prompt. Live replays of
+captured compactions: gpt-6.1-sol read 34,118 of 34,121 tokens for 0.13 credits, claude-opus-5-5 read 60,446 of 60,616 for 0.50.
+The tools are only for the prefix: Codex takes the last assistant message of its history as the summary and runs no call, so a
+reply that calls a tool is dropped (`turn.compaction_tool_call`), the request is asked again with one more user message that asks
+for the summary as text, and a second call sends the request as Codex made it, without tools (the price it had before). The
+models answered in text in 50 of 50 live compactions (gpt-6.1-sol 36, claude-opus-5-5 8, claude-sonnet-5-5 6). The relay keeps
+the tools per model, on disk (`chat-tools.json` beside the stored conversations, so a compaction right after a relay restart
+reads the chat's cache too): for a chat it never saw with tools, or when the model changed, the compaction is served as before
+(`codex.compaction_tools_unknown`).
+
+Codex can also compact remotely (`[model_providers.<id>.capabilities] remote_compaction = "v2"`: the chat's request with a
+`compaction_trigger` item at the end, answered with one `compaction` item). The relay does not support it and answers 422, after
+which Codex stops the turn; leave it off.
 
 ### Speed and effort in Codex
 
