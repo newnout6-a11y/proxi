@@ -1284,7 +1284,11 @@ class TurnRunner:
                             chunks.append(stream_prompt.strip())
                         elif chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
-                        self._check_prompt(self._direct_text(instructions, chunks or [stream_prompt]))
+                        sent = self._check_prompt(self._direct_text(instructions, chunks or [stream_prompt]))
+                        if exec_chunks:
+                            # The token estimate counts what the model reads: a follow-up holds only its own step, after
+                            # the client's messages and the steps before it.
+                            parsed._full_prompt_text = sent
 
                         if native_tools:
                             tools_converted = direct.tools_to_retool(parsed.tools)
@@ -1726,6 +1730,14 @@ class TurnRunner:
                     # output is already redacted above. Mask commands before upstream.
                     header = task_block + "\n\nPrevious steps: " + trail
                     safe_command = redact(command, cookie_values=self.cfg.get("cookie_values", ()))
+                    if direct_mode:
+                        # The task and the trail are for the agent transport, whose follow-up replaces its whole prompt.
+                        # The direct body keeps the client's messages and every earlier step after them, so a step adds
+                        # only the reply that asked for its command and the result: with the task in each follow-up, k
+                        # commands sent the conversation k + 1 times, and each step wrote one more copy of it to the cache.
+                        header = ""
+                        exec_chunks.append(("Assistant: " + redact(
+                            final_text, cookie_values=self.cfg.get("cookie_values", ()))).strip())
                     last_followup = (safe_command, code, output, header)
                     followup_text = executor.format_command_followup(safe_command, code, output, header)
                     exec_chunks.append(followup_text)
