@@ -34,17 +34,28 @@ class ConversationIndex:
         self._chains = collections.OrderedDict()
         self._lengths = collections.Counter()
 
-    def identify(self, model, system, digests):
-        """(key, how) for a request, and remember its history for the next one.
-
-        `digests` is the tuple of per-message digests of the request (bytes). how is "extended" when the request carries
-        the whole history of a request seen before (the key is that request's), "identical" when it is that history
-        exactly (a retry), "new" when no request seen so far is a prefix of it (a key of its own, made from this history)."""
-        now = self._clock()
+    @staticmethod
+    def _hasher(model, system):
         hasher = hashlib.sha256()
         hasher.update(str(model or "").encode("utf-8", "surrogatepass"))
         hasher.update(b"\x00")
         hasher.update(hashlib.sha256(str(system or "").encode("utf-8", "surrogatepass")).digest())
+        return hasher
+
+    def identify(self, model, system, digests, stored=None):
+        """(key, how) for a request, and remember its history for the next one.
+
+        `digests` is the tuple of per-message digests of the request (bytes). how is "extended" when the request carries
+        the whole history of a request seen before (the key is that request's), "identical" when it is that history
+        exactly (a retry), "stored" when no request seen in this process is a prefix of it but a conversation kept on disk
+        is (`stored(key)` says whether a key has a stored state: the first request after a restart), "new" otherwise (a key
+        of its own, made from this history).
+
+        The index lives in memory, so after a restart the first request of a conversation used to get a new key from its
+        whole history, and the signed history stored under the old key was never read again: the request went cold, its
+        prefix was written to the cache again, and the old file was orphaned."""
+        now = self._clock()
+        hasher = self._hasher(model, system)
         total = len(digests)
         with self._lock:
             self._expire(now)
@@ -64,9 +75,26 @@ class ConversationIndex:
                 key = self._touch(seen, now)
             else:
                 key = "inferred:" + full[1].hex()[:20]
+                found = self._stored_prefix(model, system, digests, stored) if stored is not None else None
+                if found is not None:
+                    key, how = found, "stored"
             if full != seen:
                 self._add(full, key, now)
         return key, how
+
+    def _stored_prefix(self, model, system, digests, stored):
+        """The key of the longest history prefix (shorter than the request) that a stored conversation was started with."""
+        hasher, keys = self._hasher(model, system), []
+        for digest in digests[:-1]:
+            hasher.update(digest)
+            keys.append("inferred:" + hasher.copy().digest().hex()[:20])
+        for key in reversed(keys):
+            try:
+                if stored(key):
+                    return key
+            except Exception:  # noqa: BLE001 - a store that cannot answer leaves the request a new conversation
+                return None
+        return None
 
     def _touch(self, chain, now):
         entry = self._chains[chain]

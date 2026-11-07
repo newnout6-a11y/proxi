@@ -338,8 +338,10 @@ The first request of each conversation is journaled as `conversation.inferred` (
 metadata, a plugin that sets `x-proxi-session-id`) keeps it: nothing is inferred for it.
 
 An inferred conversation is a pool conversation like any other: it is kept 15 minutes after its last request, warmed
-by the cache keepwarm while it lasts, and stored for a restart. The index is in memory (24 hours, 20000 histories),
-so after a relay restart a Harness chat continues under a new key once and then as before.
+by the cache keepwarm while it lasts, and stored for a restart. The index is in memory (24 hours, 20000 histories); after
+a relay restart the first request of a Harness chat finds its stored conversation by its history (the longest history prefix
+a stored conversation began with) and resumes its signed history under the same key (`conversation.inferred`, `how:
+stored`).
 
 Harness 0.2.2-alpha.3 and later also offer the explicit way, the `llm-pi-ai/request-headers` plugin hook; a plugin that
 sets `x-proxi-session-id` to the hook's `request.sessionId` (and `x-proxi-client: harness`) gives an exact identity that

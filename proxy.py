@@ -1009,7 +1009,13 @@ def make_handler(runtime: Runtime):
                 return
             if not parsed.tools or not digests:
                 return
-            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests)
+            stored = getattr(runtime.pool, "has_stored", None)
+            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests, stored)
+            if how == "stored":
+                journal.emit("conversation.inferred",
+                             "Запрос без идентификатора диалога: продолжен сохранённый диалог (после перезапуска relay)",
+                             "info", request_id=self.request_id, messages=len(digests), how="stored",
+                             conversation=journal.tag(parsed.conversation_key))
             if how == "new":
                 journal.emit("conversation.inferred",
                              "Запрос без идентификатора диалога: начат диалог по его истории (%d сообщений)" % len(digests),

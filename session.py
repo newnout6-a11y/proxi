@@ -941,6 +941,11 @@ class SessionPool:
         self._reads = {}
         self._restoring = {}
 
+    def has_stored(self, conversation_key):
+        """Whether a usable state is stored for this conversation (conversation_infer finds a conversation after a restart)."""
+        store = self._store
+        return store is not None and self.mode == "per_conversation" and store.peek(conversation_key) is not None
+
     def attach_store(self, store):
         """Keep the state of conversations in `store` (None switches it off) from now on."""
         self._store = store
