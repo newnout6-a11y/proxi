@@ -279,11 +279,13 @@ def canonical_assistant(blocks):
     return {"role": "assistant", "content": ([{"type": "text", "text": text}] if text else []) + calls}
 
 
-def unsigned_tool_transcript(client):
+def unsigned_tool_transcript(client, without_results=False):
     """Keep logical tool roles on a cold context; never invent/replay signatures.
 
     Only a complete canonical client transcript is usable. Incomplete batches
     keep the existing compatibility path instead of attaching orphan results.
+    A transcript without a tool result is taken as well when `without_results`: a route that keeps no branch (see
+    direct._cold_from_the_start) must render its history in one form from the first request on.
     """
     if not client:
         return None
@@ -311,7 +313,7 @@ def unsigned_tool_transcript(client):
                         pending.add(call_id)
             elif role != 'user':
                 return None
-    return copy.deepcopy(client) if has_results and not pending else None
+    return copy.deepcopy(client) if (has_results or without_results) and not pending else None
 
 
 def _finite_float(text):
