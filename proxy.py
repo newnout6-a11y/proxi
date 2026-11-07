@@ -420,6 +420,7 @@ def make_handler(runtime: Runtime):
             self._client_trace = None
             self._adapter = None
             self._body_read = False
+            self._client_left = False
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -901,6 +902,7 @@ def make_handler(runtime: Runtime):
             if not parsed.stream:
                 adapter = adapters.for_dialect(dialect, parsed)
                 reason = self._collect(fut, events, adapter, prompt_text, holder)
+                self._refuse_cut_reply(reason, fut)
                 payload = adapter.end(reason, prompt_text)
                 self._json(200, payload, compatibility_headers)
                 return
@@ -918,7 +920,18 @@ def make_handler(runtime: Runtime):
             self._stream_status = 200
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
+            self._refuse_cut_reply(reason, fut)
             adapter.end(reason, prompt_text)
+
+        def _refuse_cut_reply(self, reason, fut):
+            """A turn the relay cancelled while its client was still there (the relay is stopping) is an error, not an answer.
+
+            The adapters end a "cancelled" turn as a normal one (stop, end_turn, completed): meant for a client that already
+            left, it gave a client that was still reading when the relay stopped a half or empty reply as final, with a cut
+            tool call marked complete, and Claude Code and Codex did not ask again. A 503 (an error event once streaming) is
+            what they retry."""
+            if (reason == "cancelled" or fut.cancelled()) and not self._client_left:
+                raise apierr.service_unavailable("the relay is shutting down: the reply was cut, ask again")
 
         def _refuse_tool_search(self, data, dialect):
             """Turn down Claude Code's tool search so that it loads every tool up front (see tool_search_policy).
@@ -1209,6 +1222,7 @@ def make_handler(runtime: Runtime):
                 trace.event("relay_event", event=item)
 
         def _cancel_turn(self, fut, holder):
+            self._client_left = True  # the turn was cancelled because its client went away (or the write to it failed)
             event = holder.get("cancel_event")
             if event is not None:
                 event.set()
