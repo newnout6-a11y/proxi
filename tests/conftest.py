@@ -54,6 +54,23 @@ def no_retry_backoff(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def invalid_names_do_not_resolve(monkeypatch):
+    """A name under .invalid never resolves (RFC 6761), and the tests use such names for hosts that must not be reached.
+
+    A resolver that has to find that out by asking can take many seconds: one test spent 11 s on example.invalid, in
+    validate's guard against private image hosts. They fail at once, as the real answer would."""
+    import socket
+    real = socket.getaddrinfo
+
+    def getaddrinfo(host, *args, **kwargs):
+        if isinstance(host, str) and host.rstrip(".").lower().endswith(".invalid"):
+            raise socket.gaierror(getattr(socket, "EAI_NONAME", -2), "Name or service not known")
+        return real(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+
+@pytest.fixture(autouse=True)
 def pinned_calendar(monkeypatch):
     """Anthropic's retirement dates hide models by the calendar (models._today).
 
