@@ -1,5 +1,7 @@
 """Relay-side authentication and upstream (Retool) auth headers."""
+import collections
 import hmac
+import ipaddress
 import os
 import re
 import threading
@@ -15,22 +17,58 @@ _CHROME_MAJOR = re.compile(r"\bChrome/(\d+)")
 _PLATFORMS = (("Windows", '"Windows"'), ("Android", '"Android"'), ("CrOS", '"Chrome OS"'),
               ("Macintosh", '"macOS"'), ("Mac OS X", '"macOS"'), ("Linux", '"Linux"'))
 
-# Always-on budget for wrong-key attempts (rate_limit_rps is off by default and
-# covers only completions). Memory is bounded: at most one entry per source IP.
+# Always-on budget for wrong-key attempts (rate_limit_rps is off by default and covers only completions). Memory is bounded:
+# at most one entry per source IP, and an entry keeps the last _FAILURE_LIMIT + 1 failures, as far back as the budget looks.
+# It used to keep every failure of the window and filter them all under the lock on each new one: a flood levelled off near
+# 30,000 stamps, at 2 ms of CPU a wrong key. A source past the budget is refused before its key is compared
+# (auth_failure_wait): looked at only after a wrong key, the budget changed the status of the answer and nothing else, and a
+# right guess was still let in. Loopback has no budget: every local client shares 127.0.0.1, so once any local process had
+# spent it, a local client with a stale key got a 429 with Retry-After, which SDKs retry, instead of the final 401.
 _FAILURE_WINDOW = 60.0
 _FAILURE_LIMIT = 200
 _FAILURES = {}
 _FAILURES_LOCK = threading.Lock()
 
 
+def is_loopback(client_ip) -> bool:
+    """127.0.0.0/8 or ::1, also as an IPv4-mapped address (::ffff:127.0.0.1 from a dual-stack listener)."""
+    try:
+        address = ipaddress.ip_address(str(client_ip).split("%", 1)[0])
+    except ValueError:
+        return False
+    return (getattr(address, "ipv4_mapped", None) or address).is_loopback
+
+
+def _budget_wait(stamps, now):
+    """Seconds until the oldest of the last _FAILURE_LIMIT + 1 failures leaves the window, or None while fewer than that
+    fall within it. Counted from the oldest stamp of the window, a wait that a source honoured ended too early."""
+    if not stamps or len(stamps) <= _FAILURE_LIMIT:
+        return None
+    waited = now - stamps[len(stamps) - _FAILURE_LIMIT - 1]
+    return max(1.0, _FAILURE_WINDOW - waited) if waited < _FAILURE_WINDOW else None
+
+
+def auth_failure_wait(client_ip):
+    """The seconds a source past its budget must still wait before a key it presents is compared at all, else None."""
+    if is_loopback(client_ip):
+        return None
+    with _FAILURES_LOCK:
+        return _budget_wait(_FAILURES.get(client_ip), time.time())
+
+
 def register_auth_failure(client_ip):
     """Record a failed key attempt for the source address. Returns the seconds a
-    repeat attempt must wait when the budget is exhausted, else None."""
+    repeat attempt must wait when the budget is exhausted, else None. Loopback records nothing."""
+    if is_loopback(client_ip):
+        return None
     now = time.time()
     with _FAILURES_LOCK:
-        stamps = [t for t in _FAILURES.get(client_ip, []) if now - t < _FAILURE_WINDOW]
+        stamps = _FAILURES.get(client_ip)
+        if stamps is None:
+            stamps = _FAILURES[client_ip] = collections.deque()
         stamps.append(now)
-        _FAILURES[client_ip] = stamps
+        while len(stamps) > _FAILURE_LIMIT + 1:
+            stamps.popleft()
         if len(_FAILURES) > 1024:
             for ip in [ip for ip, s in _FAILURES.items() if not s or now - s[-1] > _FAILURE_WINDOW]:
                 _FAILURES.pop(ip, None)
@@ -38,9 +76,7 @@ def register_auth_failure(client_ip):
             # Absolute bound: a flood of fresh IPs must not grow the table forever.
             oldest = min(_FAILURES.items(), key=lambda item: item[1][-1])[0]
             _FAILURES.pop(oldest, None)
-        if len(stamps) > _FAILURE_LIMIT:
-            return max(1.0, _FAILURE_WINDOW - (now - stamps[0]))
-    return None
+        return _budget_wait(stamps, now)
 
 
 def client_headers(key=None):

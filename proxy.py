@@ -528,6 +528,8 @@ def make_handler(runtime: Runtime):
                         raise apierr.method_not_allowed()
                     raise apierr.not_found()
                 if route != "health":
+                    # A source past its budget of wrong keys is refused before its key is compared (auth.py).
+                    self._throttle_auth_failure(failed=False)
                     query = parse_qs(parsed_url.query)
                     try:
                         auth.verify(self.headers, (query.get("key") or [""])[0], cfg["relay_api_key"])
@@ -674,10 +676,11 @@ def make_handler(runtime: Runtime):
                 extra["retry-after"] = retry_after
             self._json(err.status, body, extra or None)
 
-        def _throttle_auth_failure(self):
+        def _throttle_auth_failure(self, failed=True):
             # rate_limit_rps is off by default and covers only completions, so key
             # brute-forcing gets its own always-on budget per source address.
-            wait = auth.register_auth_failure(self.client_address[0])
+            source = self.client_address[0]
+            wait = auth.register_auth_failure(source) if failed else auth.auth_failure_wait(source)
             if wait:
                 raise apierr.too_many_requests("too many auth failures", round(wait, 1))
 

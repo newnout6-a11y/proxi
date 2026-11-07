@@ -1359,6 +1359,10 @@ class Admin:
             self._static(handler, path)
             return
         # Credentials stay in headers, never URLs, static markup or responses.
+        # A source past its budget of wrong keys is refused before its key is compared (auth.py).
+        wait = auth.auth_failure_wait(handler.client_address[0])
+        if wait:
+            raise apierr.too_many_requests("too many auth failures", round(wait, 1))
         try:
             auth.verify(handler.headers, "", self.cfg["relay_api_key"])
         except apierr.ApiError as exc:
