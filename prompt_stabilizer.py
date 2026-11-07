@@ -48,6 +48,7 @@ class SkillLocations:
         self._path, self._ttl, self._max = path, ttl, max_entries
         self._clock, self._exists = clock, exists
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()  # held by the one thread writing the file (see _save)
         self._memory = collections.OrderedDict()
         self._dirty = False
         self._warned = False
@@ -70,7 +71,10 @@ class SkillLocations:
             seen = raw.strip()
             if not _is_path(seen):
                 return match.group(0)
-            digest = hashlib.sha256((description.group(1).strip() if description else "").encode("utf-8")).hexdigest()[:16]
+            # surrogatepass: half of a surrogate pair (a client that cut a description inside an emoji sends it as a JSON
+            # escape) made encode raise, and the whole prompt of every request of that client went unstabilized
+            digest = hashlib.sha256((description.group(1).strip() if description else "").encode(
+                "utf-8", "surrogatepass")).hexdigest()[:16]
             chosen = self._choose((folder, name.group(1).strip(), digest), seen)
             if chosen == seen:
                 return match.group(0)
@@ -122,21 +126,51 @@ class SkillLocations:
             self._memory.clear()  # nothing to go on: the next prompt seen is the first
 
     def _save(self):
-        with self._lock:
-            if not (self._dirty and self._path):
+        """Writes the memory if it changed. One thread writes at a time, and it writes until nothing is left unsaved.
+
+        Requests run in threads of their own. Two of them that each learned a skill wrote one temporary file (named by the
+        process) at the same time: on Windows the rename of one failed while the other held the file open, the other
+        renamed a mix of both documents into place, and a write that took the older snapshot last put it over the newer.
+        A thread that finds the file being written leaves its change to the writer, which looks again before it lets go."""
+        if not (self._dirty and self._path):
+            return
+        if not self._save_lock.acquire(blocking=False):
+            return
+        while True:
+            with self._lock:
+                if not self._dirty:
+                    self._save_lock.release()  # under self._lock: a change made after this look finds the file free
+                    return
+                self._dirty = False
+                document = {"version": 1, "skills": [[*key, value[0], value[1]] for key, value in self._memory.items()]}
+            if not self._write(document):
+                with self._lock:
+                    self._dirty = True  # the next request tries again
+                    self._save_lock.release()
                 return
-            self._dirty = False
-            document = {"version": 1, "skills": [[*key, value[0], value[1]] for key, value in self._memory.items()]}
+
+    def _write(self, document):
+        temporary = "%s.%d.tmp" % (self._path, os.getpid())
         try:
-            temporary = "%s.%d.tmp" % (self._path, os.getpid())
-            with open(temporary, "w", encoding="utf-8") as handle:
-                json.dump(document, handle, ensure_ascii=False)
+            text = json.dumps(document, ensure_ascii=False)
+            try:
+                data = text.encode("utf-8")
+            except UnicodeEncodeError:  # half of a surrogate pair in a skill: the file keeps it as a JSON escape
+                data = json.dumps(document).encode("ascii")
+            with open(temporary, "wb") as handle:
+                handle.write(data)
             os.replace(temporary, self._path)
-        except OSError as exc:
+            return True
+        except Exception as exc:  # noqa: BLE001 - the memory is a convenience: no failure to keep it may fail a request
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
             if not self._warned:
                 self._warned = True
                 journal.emit("prompt.stabilizer_save_failed", "Расположения навыков клиента не сохранены на диск: %s"
                              % type(exc).__name__, "warn")
+            return False
 
 
 class PinnedDate:
