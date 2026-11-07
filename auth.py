@@ -1,12 +1,19 @@
 """Relay-side authentication and upstream (Retool) auth headers."""
 import hmac
 import os
+import re
 import threading
 import time
 
 from apierr import unauthorized
 
 CLIENT_VERSION = "4.84.0-16f3123 (Build 409813)"
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/131.0.0.0 Safari/537.36")
+_CHROME_MAJOR = re.compile(r"\bChrome/(\d+)")
+# Checked in this order: an Android user agent names Linux too, and Chrome OS names X11.
+_PLATFORMS = (("Windows", '"Windows"'), ("Android", '"Android"'), ("CrOS", '"Chrome OS"'),
+              ("Macintosh", '"macOS"'), ("Mac OS X", '"macOS"'), ("Linux", '"Linux"'))
 
 # Always-on budget for wrong-key attempts (rate_limit_rps is off by default and
 # covers only completions). Memory is bounded: at most one entry per source IP.
@@ -79,10 +86,26 @@ def verify(headers, query_key, expected: str) -> None:
         raise unauthorized("invalid relay API key")
 
 
+def client_hints(ua, brands=None) -> dict:
+    """The Chromium client hints a browser with this User-Agent sends: the same major version, platform and mobile flag.
+
+    `brands` (the account's sec_ch_ua) replaces the brand list. A user agent that is not Chromium (Firefox, Safari)
+    sends no client hints at all, so none are made up for it."""
+    match = _CHROME_MAJOR.search(ua or "")
+    if not brands:
+        if match is None:
+            return {}
+        major = match.group(1)
+        brands = '"Google Chrome";v="%s", "Chromium";v="%s", "Not_A Brand";v="24"' % (major, major)
+    platform = next((value for needle, value in _PLATFORMS if needle in (ua or "")), '"Windows"')
+    return {"sec-ch-ua": brands, "sec-ch-ua-mobile": "?1" if "Mobile" in (ua or "") else "?0",
+            "sec-ch-ua-platform": platform}
+
+
 def upstream_headers(cfg) -> dict:
     """Retool session headers. Cookie/xsrf stay the source of upstream auth."""
     cfg = dict(cfg)  # read cookie and xsrf from the same credential snapshot
-    ua = cfg.get("ua") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ua = cfg.get("ua") or DEFAULT_UA
     return {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
@@ -92,9 +115,8 @@ def upstream_headers(cfg) -> dict:
         "cookie": cfg["cookie"],
         "x-xsrf-token": cfg["xsrf"],
         "x-retool-client-version": CLIENT_VERSION,
-        "sec-ch-ua": cfg.get("sec_ch_ua") or '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        # The version in the hints is the one the User-Agent names (an account with Chrome/141 used to send v="131").
+        **client_hints(ua, cfg.get("sec_ch_ua")),
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
