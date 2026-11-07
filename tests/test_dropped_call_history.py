@@ -272,9 +272,11 @@ def test_deliverable_builds_the_echo_the_way_the_stream_gave_it_to_the_client():
 SIGNATURE_REFUSAL = "messages.1.content.0: Invalid `signature` in `thinking` block"
 
 
-def refusing_second(tmp_path, monkeypatch, scripts, refusals):
+def refusing_second(tmp_path, monkeypatch, scripts, refusals, in_stream=()):
     """The harness of a conversation whose POSTs are answered from `scripts` in turn, except that POST number n for n in
-    `refusals` (1-based) is refused with HTTP 400 and that message. Returns (pool, runner, bodies sent, refusals made)."""
+    `refusals` (1-based) is refused with HTTP 400 and that message, or for n also in `in_stream` the way Retool passes a
+    provider's refusal on: an error event with the status inside an HTTP 200 stream. Returns (pool, runner, bodies sent,
+    refusals made)."""
     pool, runner, _ = harness(tmp_path, monkeypatch, scripts)
     bodies, refused = [], []
     answers = iter(scripts)
@@ -283,6 +285,9 @@ def refusing_second(tmp_path, monkeypatch, scripts, refusals):
         bodies.append(json.loads(req.data))
         if len(bodies) in refusals:
             refused.append(len(bodies))
+            if len(bodies) in in_stream:
+                return response({"event": "error", "statusCode": 400, "isRetryable": False,
+                                 "error": {"message": refusals[len(bodies)]}})
             raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {},
                                          io.BytesIO(json.dumps({"message": refusals[len(bodies)]}).encode()))
         return response(*next(answers))
@@ -355,6 +360,30 @@ def test_a_refusal_that_comes_back_without_the_branch_is_not_taken_for_the_pruni
     events = two_requests(pool, runner)
     assert events[-1]["type"] == "error" and refused == [2, 3] and len(bodies) == 3
     assert direct._PRUNING["refused"] is False  # the second try failed the same way: the shape was not the cause
+
+
+def test_a_refusal_inside_the_stream_that_blames_the_blocks_is_asked_again_from_the_clients_messages_too(tmp_path, monkeypatch):
+    """Retool passes a provider's refusal on as an error event inside an HTTP 200. The relay marks such an attempt as one whose
+    price is unknown before it raises the error, and that mark of its own was taken for the start of an answer: the request was
+    not asked again from the client's messages, the client got the 400, and replies went on being cut down that way."""
+    pool, runner, bodies, refused = refusing_second(
+        tmp_path, monkeypatch, [DROPPED, [text("done"), *END]], {2: SIGNATURE_REFUSAL}, in_stream={2})
+    seq = journal.JOURNAL.last_seq
+    events = two_requests(pool, runner)
+    assert not any(event["type"] == "error" for event in events) and any(e.get("delta") == "done" for e in events)
+    assert refused == [2] and len(bodies) == 3
+    assert [(block["type"], block["toolName"]) for block in assistant_of(bodies[2])] == [("tool_call", "read_file")]
+    assert direct._PRUNING["refused"] is True and len(stored(seq, "native_history.prune_refused")) == 1
+
+
+def test_a_retry_refused_inside_the_stream_is_not_taken_for_the_pruning(tmp_path, monkeypatch):
+    """The retry from the client's messages answered only by the relay's own mark of an unpriced attempt is no answer."""
+    pool, runner, bodies, refused = refusing_second(
+        tmp_path, monkeypatch, [DROPPED, [text("done"), *END]], {2: SIGNATURE_REFUSAL, 3: SIGNATURE_REFUSAL}, in_stream={3})
+    seq = journal.JOURNAL.last_seq
+    events = two_requests(pool, runner)
+    assert events[-1]["type"] == "error" and refused == [2, 3] and len(bodies) == 3
+    assert direct._PRUNING["refused"] is False and not stored(seq, "native_history.prune_refused")
 
 
 def test_a_branch_that_lost_nothing_is_never_asked_again(tmp_path, monkeypatch):

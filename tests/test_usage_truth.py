@@ -325,7 +325,7 @@ def drive(tmp_path, monkeypatch, script, **cfg_extra):
     return events, (errors[0] if errors else None), unknown, session
 
 
-MARKER = {'type': 'usage', 'usage': {}}
+MARKER = {'type': 'usage', 'usage': {}, 'unpriced': True}  # the relay's own mark of an attempt whose price is unknown
 NEVER_SENT = [
     pytest.param(lambda: urllib.error.URLError(socket.gaierror(-2, 'name resolution failed')), id='dns'),
     pytest.param(lambda: urllib.error.URLError(ConnectionRefusedError(111, 'refused')), id='connection refused'),

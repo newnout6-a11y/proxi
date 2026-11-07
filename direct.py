@@ -2074,8 +2074,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 
     def note(event):
         nonlocal asked_tool, ended, wrote_text, thinking_seen, errored, began, head_marked
-        # Every attempt announces itself with usage_start before upstream has said anything: not an answer.
-        began = began or event.get("type") != "usage_start"
+        # Every attempt announces itself with usage_start before upstream has said anything: not an answer. Nor is the mark
+        # the relay gives an attempt whose price is unknown before it raises the error of that attempt (_from_upstream): taken
+        # for one, a refusal inside an HTTP 200 never got the safety nets below.
+        began = began or _from_upstream(event)
         if began and head_gate is not None and not head_marked:
             head_marked = True
             _head_started(head_gate, head_key)
@@ -2154,7 +2156,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 async with contextlib.aclosing(iter_events(cfg, session, model_provider, prompt, head, *asked,
                                                            max_tokens, chunks)) as again:
                     async for event in again:
-                        if not answered and event.get("type") != "usage_start":
+                        if not answered and _from_upstream(event):
                             answered = True
                             _PRUNING["refused"] = True
                             journal.emit("native_history.prune_refused",
@@ -2177,7 +2179,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 answered = False
                 async with contextlib.aclosing(open_stream(body)) as stream:
                     async for event in stream:
-                        if not answered and event.get("type") != "usage_start":
+                        if not answered and _from_upstream(event):
                             answered = True
                             _TOOL_RESULT_HINTS["refused"] = True
                             journal.emit("upstream.tool_result_hint_refused",
@@ -2202,7 +2204,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 learned = False
                 async with contextlib.aclosing(open_stream(body)) as stream:
                     async for event in stream:
-                        if not learned and event.get("type") != "usage_start":
+                        if not learned and _from_upstream(event):
                             # Learned only once the request without the marker is answered, as the other fallbacks are:
                             # "not available right now" also comes for a while from a model that is on the App Builder list
                             # (or from one account of a pool), and the retry then fails too. Learned before it, the model was
@@ -2443,6 +2445,19 @@ async def _summary_stream(cfg, session, body, param_types, text_only):
                          "запрос идёт без инструментов, как его прислал Codex"),
                      "warn", model=body.get("model"), called=gate.called, wrote_text=gate.text, attempt=attempt,
                      tools_kept=attempt < summary_guard.TRIES_WITH_TOOLS)
+
+
+def _unpriced():
+    """The usage event the relay gives of its own for an attempt that may have been billed while upstream reported no price for
+    it: the client's adapter and the journal count that attempt as one whose price is unknown."""
+    return {"type": "usage", "usage": {}, "unpriced": True}
+
+
+def _from_upstream(event):
+    """Whether an event of the stream is something upstream said, and not the relay's own bookkeeping: usage_start, with which
+    every attempt starts before upstream has said anything, or the mark of an attempt whose price is unknown (_unpriced). That
+    mark comes before the error of an attempt that upstream refused inside an HTTP 200, or that timed out once it was sent."""
+    return event.get("type") != "usage_start" and not event.get("unpriced")
 
 
 async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
@@ -2689,7 +2704,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     budget.attach(failure)
             if flags.get('cost_unknown') and not flags.get('usage_seen'):
                 # Include possibly billed failures/truncations before failover.
-                yield {'type': 'usage', 'usage': {}}
+                yield _unpriced()
             if (_refused_for_now(failure) and not spoke and not usable and limit_retries < max_limit_retries
                     and budget.remaining and not is_cancelled()):
                 wait = RATE_LIMIT_WAITS[min(limit_retries, len(RATE_LIMIT_WAITS) - 1)] * random.uniform(0.75, 1.25)
@@ -2716,7 +2731,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             if saw_end and not flags.get('usage_seen') and not flags.get('cost_unknown'):
                 # An empty/no-telemetry attempt can still have been billed. Keep
                 # its unknown price visible when a later retry reports a cost.
-                yield {'type': 'usage', 'usage': {}}
+                yield _unpriced()
             # Where the route keeps the cap, a reply that ends on exactly that many output tokens was cut by it (GPT and
             # GLM, 5 of 5 probes; Claude's route ignores it and writes on). A whole call in the reply says the end was
             # no cut. A reasoning model that spends a small cap on reasoning ends so, with nothing to show for it:

@@ -428,3 +428,26 @@ def test_a_model_is_learned_as_assist_only_only_once_the_request_without_the_mar
     send(harness)
     assert posts and "metadata" in posts[0]  # the model recovered: its requests carry the marker again
     assert model not in direct._ASSIST_ONLY - direct._ASSIST_SEEDS
+
+
+@pytest.mark.parametrize("failure", ["refused inside the stream", "timed out once sent"])
+def test_a_retry_without_the_marker_that_upstream_never_answered_teaches_nothing(harness, monkeypatch, failure):
+    # Such an attempt may have been billed, so the relay marks it as one whose price is unknown before it raises the error.
+    # That mark of its own is no answer to the request without the marker: learned from it, the model went without the marker
+    # on every account until a restart, though nothing had shown it to be on the Assist list.
+    posts = []
+    monkeypatch.setattr(direct, "_ASSIST_ONLY", set(direct._ASSIST_SEEDS))
+
+    def unanswered(req, **kw):
+        posts.append(json.loads(req.data))
+        if "metadata" in posts[-1]:
+            raise urllib.error.HTTPError(req.full_url, 400, "unavailable", {},
+                                         io.BytesIO(b'{"message":"model is not available right now"}'))
+        if failure == "timed out once sent":
+            raise TimeoutError("read timed out")
+        return response({"event": "error", "statusCode": 400, "isRetryable": False, "error": {"message": "Invalid request"}})
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", unanswered)
+    events = send(harness)
+    assert events[-1]["type"] == "error" and len(posts) == 2 and "metadata" not in posts[1]
+    assert not (direct._ASSIST_ONLY - direct._ASSIST_SEEDS)
