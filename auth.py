@@ -2,6 +2,7 @@
 import collections
 import hmac
 import ipaddress
+import json
 import os
 import re
 import threading
@@ -79,19 +80,41 @@ def register_auth_failure(client_ip):
         return _budget_wait(stamps, now)
 
 
-def client_headers(key=None):
-    """Load the local relay credential without requiring upstream config."""
+def _configured_relay_key(path):
+    """relay_api_key of the config at `path`, read as plain JSON; None for none, an unreadable file or the placeholder."""
+    try:
+        with open(path, encoding="utf-8-sig") as source:
+            saved = json.load(source)
+    except (OSError, ValueError):
+        return None
+    value = saved.get("relay_api_key") if isinstance(saved, dict) else None
+    # config.example.json describes the value in angle brackets, and the relay ignores that text (config._placeholder).
+    if not isinstance(value, str) or (value.strip().startswith("<") and value.strip().endswith(">")):
+        return None
+    return value
+
+
+def client_headers(key=None, config_path=None):
+    """Load the local relay credential without requiring upstream config.
+
+    Without `key` it is found where the relay finds its own (config._ensure_relay_key): RELAY_API_KEY, then the
+    config's relay_api_key, then relay_key.txt beside that config. The config is config.json beside this file unless
+    `config_path` names the one the relay was started with. Nothing is validated or written, and no key is generated.
+    """
     if key is None:
-        key = os.environ.get("RELAY_API_KEY")
+        config_path = os.path.abspath(config_path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                  "config.json"))
+        key = os.environ.get("RELAY_API_KEY") or _configured_relay_key(config_path)
         if not key:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay_key.txt")
+            path = os.path.join(os.path.dirname(config_path), "relay_key.txt")
             try:
                 with open(path, encoding="utf-8") as source:
                     key = source.read().strip()
             except FileNotFoundError:
                 key = None
     if not isinstance(key, str) or not key.strip():
-        raise ValueError("missing relay API key: set RELAY_API_KEY or create relay_key.txt")
+        raise ValueError("missing relay API key: set RELAY_API_KEY, relay_api_key in the relay's config or "
+                         "relay_key.txt beside it (name that config with --config), or pass --key")
     return {"content-type": "application/json",
             "authorization": "Bearer " + key.strip().encode("utf-8").decode("latin-1")}
 

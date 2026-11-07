@@ -786,7 +786,8 @@ Anthropic принимает историю без вызова после по�
 Запуск проверенного checkout с существующими учётными данными и отдельными логами:
 `python proxy.py --config <repo>\config.json --state-dir "$env:LOCALAPPDATA\Proxi\state"` (PowerShell).
 `--config` использует `relay_key.txt` рядом с выбранным конфигом.
-Те же параметры поддерживает `scripts/run_relay.ps1` (`-Config`, `-StateDir`).
+Те же параметры поддерживает `scripts/run_relay.ps1` (`-Config`, `-StateDir`). Клиентам проверки
+(`scripts/relay_client.py`, `scripts/live_smoke.py`) передайте тот же `--config`: ключ они ищут там же, где relay.
 
 Настройки реальных клиентов и дочерних агентов можно проверить без запросов к
 провайдеру: `python scripts/probe_client_settings.py claude`, аналогично
@@ -1705,6 +1706,10 @@ relay с этим делает. 429 приходит до начала гене�
     python scripts/relay_client.py --models                          # живой relay: список моделей
     python scripts/relay_client.py "Проверь проект" --effort high    # живой relay: один запрос
     python scripts/live_smoke.py                                     # живой relay: короткий смоук (тратит кредиты)
+
+Ключ relay эти клиенты находят так же, как сам relay: `RELAY_API_KEY`, затем `relay_api_key` из `config.json`, затем
+`relay_key.txt` рядом с ним; сами они ключ не создают. Для relay, запущенного с `--config`, передайте тот же
+`--config` (или `--key`); `--url` задаёт адрес.
 
 ## Структура проекта
 
