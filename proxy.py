@@ -505,7 +505,11 @@ def make_handler(runtime: Runtime):
                             journal.emit("client.trace_failed", "Не удалось сохранить подробную трассу клиента",
                                          "warn", request_id=self.request_id)
                     client_context.reset(context_token)
-
+                    # The writer holds its handler, and the adapter and the holder reach the whole parsed request (every message
+                    # of the conversation, as text and as parsed JSON): left on the handler they are a cycle that only the garbage
+                    # collector frees, a few turns later, so a 300k-token conversation held 10 MB per turn more than it used
+                    # (RSS 203 MB after 30 turns, 81 MB with this). The next request of a kept-alive connection sets them again.
+                    self._writer = self._adapter = self._holder = None
         def _stream_failure(self, dialect, err):
             """End a stream that failed after it started. Only Responses has a terminal failure event."""
             payload = self._error_payload(dialect, err)
