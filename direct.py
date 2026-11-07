@@ -747,10 +747,28 @@ def _coerced_kind(spec):
     return kind
 
 
+# The text of an integer as JSON writes it: no sign but a minus, no leading zero, no exponent, within the safe integers.
+_CANONICAL_INTEGER = re.compile(r"-?(?:0|[1-9][0-9]{0,14})")
+
+
+def _number_or_text(spec):
+    """True for a field that is "number or string" (a client's integer or string, possibly also null)."""
+    if not isinstance(spec, dict) or spec.get("type") != "anyOf":
+        return False
+    kinds = {branch.get("type") for branch in spec.get("anyOf") or [] if isinstance(branch, dict) and branch.get("type") != "null"}
+    return kinds == {"number", "string"}
+
+
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
     if _marked(spec):
         return _decode_map(value)
+    if _number_or_text(spec):
+        # The model writes the number of a "number or string" field as text, and a client tool that branches on the type
+        # got the string "42" for 42 (an MCP server of the Claude Code test run of 2026-11-07, 72e6f9f0a91a, 993110d098d2,
+        # 13dcf0681ac0). The canonical text of an integer is that integer; any other text ("007", "4.0", "x1") stays as
+        # the model wrote it, which the schema allows as well.
+        return int(value) if _CANONICAL_INTEGER.fullmatch(value) else None
     kind = _coerced_kind(spec)
     if value == "null" and kind in ("number", "boolean", "array", "object"):
         # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
@@ -798,7 +816,7 @@ class ArgStream:
             return False
         spec = self.params.get(name)
         return isinstance(spec, dict) and (_coerced_kind(spec) in ("number", "boolean", "array", "object")
-                                           or _marked(spec))
+                                           or _marked(spec) or _number_or_text(spec))
 
     def feed(self, chunk):
         if self.buffer is not None:
