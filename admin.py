@@ -1318,6 +1318,8 @@ class Admin:
         handler.send_header("x-request-id", handler.request_id)
         security_headers(handler)
         handler.end_headers()
+        # The status line is out: a failure from here on closes the connection instead of writing a second one into the body.
+        handler._response_started = True
         writer = sse.StreamWriter(handler)
         writer.event("hello", {"last_seq": events.last_seq, "server_time": time.time()})
         deadline = time.monotonic() + STREAM_MAX_SECONDS

@@ -91,7 +91,9 @@ def _tail_lines(source, limit):
     if start:
         # The byte before the start tells whether the first line begins there or is the end of one that was cut.
         data = data[1:] if data[:1] == b"\n" else data.partition(b"\n")[2]
-    return data.decode("utf-8", "replace").splitlines(), len(data)
+    # Records end at a newline only: str.splitlines() also breaks at U+0085, U+2028 and U+2029, which json.dumps writes raw
+    # inside a record (a User-Agent header, a tool's arguments), and both halves of such a record were lost on restart.
+    return [raw.decode("utf-8", "replace").rstrip("\r") for raw in data.split(b"\n") if raw.strip()], len(data)
 
 
 def _number(value):
@@ -618,7 +620,10 @@ class Journal:
         if depth > 6:
             return "…"
         if isinstance(value, str):
-            text = redact(value, cookie_values=(self._cfg or {}).get("cookie_values", ()))
+            # A lone UTF-16 surrogate (a client's "\ud83d") cannot be written as UTF-8: the event never reached journal.jsonl,
+            # and the admin event list and live stream broke on it. It is kept as its escape.
+            text = value if value.isascii() else value.encode("utf-8", "backslashreplace").decode("utf-8")
+            text = redact(text, cookie_values=(self._cfg or {}).get("cookie_values", ()))
             # Each secret is replaced in turn, as before; a text that holds none of them (nearly every one) skips the loop.
             pattern = getattr(secrets, "pattern", False)  # False: a plain list, whose secrets are all tried
             if pattern is False or (pattern is not None and pattern.search(text)):
@@ -678,21 +683,30 @@ class Journal:
                 keep if type(keep) is int and keep >= 0 else KEEP_FILES)
 
     def _rotate(self, keep):
-        """The live file becomes journal.jsonl.1, and every rotated file takes the next number; what would pass `keep` goes.
+        """The live file becomes journal.jsonl.1 and the rotated files move up one number; the one past `keep` goes.
 
-        The caller holds the file lock. The oldest file is moved (or removed) first, so a rotation that stops halfway
-        (a file another program holds open) has lost nothing: the next one carries on from the numbers it finds."""
+        The caller holds the file lock. Only the run .1, .2, ... up to the first missing number moves, because a missing
+        number is room, and the oldest kept file is removed only when that run fills every kept number. A rotation that
+        stops halfway (a file another program holds open on Windows) therefore loses at most the generation a whole
+        rotation drops anyway, and the retry a minute later tries only the move that failed. It used to shift every file
+        again, gaps included, and delete one more generation on each retry, until none was left."""
         self._file.close()
         self._file = None
-        for index, old in reversed(_rotated(self._path)):
-            if index >= keep:
-                os.remove(old)
-            else:
-                os.replace(old, "%s.%d" % (self._path, index + 1))
-        if keep:
-            os.replace(self._path, self._path + ".1")
-        else:
+        found = dict(_rotated(self._path))
+        for index in sorted(number for number in found if number > keep):  # left by a lower journal_keep_files
+            os.remove(found.pop(index))
+        if not keep:
             open(self._path, "w", encoding="utf-8").close()
+            return
+        run = 0
+        while run + 1 in found:
+            run += 1
+        if run >= keep:
+            os.remove(found[keep])
+            run = keep - 1
+        for index in range(run, 0, -1):
+            os.replace(found[index], "%s.%d" % (self._path, index + 1))
+        os.replace(self._path, self._path + ".1")
 
     def _write(self, event):
         if not self._path:

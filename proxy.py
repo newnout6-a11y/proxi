@@ -291,7 +291,8 @@ def make_handler(runtime: Runtime):
         def _json(self, status, payload, extra=None):
             self._status = status
             self._response_started = True
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            # backslashreplace: an error that echoes a lone surrogate of the client (U+D83D alone) still reaches the client
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8", "backslashreplace")
             self.send_response(status)
             self.send_header("content-type", "application/json; charset=utf-8")
             self.send_header("content-length", str(len(body)))
