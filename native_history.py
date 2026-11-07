@@ -492,6 +492,40 @@ class History:
                     or not _complete_turns(tail[len(calls):], set(calls))):
                 continue
             return snapshot, snapshot.messages + [{"role": "assistant", "content": snapshot.assistant}] + tail
+        return self._resume_cut(scope, client)
+
+    def _resume_cut(self, scope, client):
+        """(snapshot, upstream messages) when the client's echo is a cut version of a kept reply, else (None, None).
+
+        The relay ends a reply at the output cap the client set (a cap below 16,384 on Claude, OutputCapAdapter) while
+        upstream writes it whole, so the kept reply held more text, or a call, than the client got and its echo never
+        matched: a reset and a cold replay, the whole conversation written again (6.1k of a 27k prompt in all three
+        dialects; about 14 credits at 300k tokens on Sonnet; v4 protocol audit of 2026-11-07, 121bb5f5, a51006ce,
+        6bac31da). The echo is accepted when its text begins the kept text and its calls begin the kept calls, one of them
+        shorter; upstream gets the kept signed thinking and what the client was given, its delivered calls as the model
+        wrote them."""
+        for snapshot in reversed(self.branches):
+            at = _echo_index(snapshot.client, client) if scope == snapshot.scope else None
+            if at is None or len(client) <= at + 1 or not isinstance(client[at], dict) or client[at].get("role") != "assistant":
+                continue
+            theirs, kept = client[at].get("content") or [], snapshot.echo.get("content") or []
+            text = "".join(b.get("text", "") for b in theirs if isinstance(b, dict) and b.get("type") == "text")
+            kept_text = "".join(b.get("text", "") for b in kept if isinstance(b, dict) and b.get("type") == "text")
+            delivered = [b for b in theirs if isinstance(b, dict) and b.get("type") == "tool_call"]
+            kept_calls = [b for b in kept if isinstance(b, dict) and b.get("type") == "tool_call"]
+            if (not kept_text.startswith(text) or not same_json(delivered, kept_calls[:len(delivered)])
+                    or not (text or delivered) or (len(text), len(delivered)) == (len(kept_text), len(kept_calls))):
+                continue
+            tail = client[at + 1:]
+            calls = [b["toolCallId"] for b in delivered]
+            results = [m["content"]["toolCallId"] for m in tail[:len(calls)] if m.get("role") == "tool"]
+            if (len(results) != len(calls) or set(results) != set(calls)
+                    or not _complete_turns(tail[len(calls):], set(calls))):
+                continue
+            raw = {b["toolCallId"]: b for b in snapshot.assistant if b.get("type") == "tool_call"}
+            given = ([b for b in snapshot.assistant if b.get("type") in ("thinking", "redacted_thinking")]
+                     + ([{"type": "text", "text": text}] if text else []) + [raw[call_id] for call_id in calls])
+            return snapshot, snapshot.messages + [{"role": "assistant", "content": given}] + tail
         return None, None
 
     def resume_fork(self, scope, client):
