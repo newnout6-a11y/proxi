@@ -86,7 +86,9 @@ export default function Journal({ apiKey, journal, overview, onUnauthorized, emb
   }
 
   async function clearAll() {
-    if (!window.confirm('Очистить журнал в памяти relay? Файл journal.jsonl на диске сохранится')) return;
+    // The server empties the memory AND deletes journal.jsonl with every rotated journal.jsonl.N (admin.py, journal.reset):
+    // the dialog used to promise the file was kept, and hours of evidence went with one click.
+    if (!window.confirm('Очистить журнал? Будут стёрты события в памяти relay и файлы на диске: journal.jsonl и все journal.jsonl.N. Восстановить их будет нельзя.')) return;
     try {
       await api(apiKey, 'events/clear', { method: 'POST', body: {} });
       journal.reset();

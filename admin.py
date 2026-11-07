@@ -1418,7 +1418,7 @@ class Admin:
             self._mutation_guard(handler)
             validate.load_json(handler._read_body())
             self.runtime.journal.reset()
-            journal.emit("admin.journal_cleared", "Журнал в памяти очищен оператором", "warn")
+            journal.emit("admin.journal_cleared", "Журнал очищен оператором: события в памяти и файлы journal.jsonl на диске", "warn")
             payload = {"ok": True, "last_seq": self.runtime.journal.last_seq}
         elif handler.command == "PATCH" and path == "/admin/api/settings":
             # Guard failures must close a connection whose body was not consumed.
