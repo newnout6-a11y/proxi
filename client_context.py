@@ -492,7 +492,9 @@ def describe(data, headers, cfg=None):
             "codex_task": COMPACTION if codex_compaction else "",
             "compaction_phase": phase if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", phase) else "",
             "task_hint": task if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", task) else "",
-            "agent": clean(_first(headers.get("x-proxi-agent"), headers.get("x-claude-code-agent-id"),
+            # The OpenCode labels plugin percent-encodes an agent name that is not ASCII (HTTP/1 headers must be).
+            "agent": clean(_first(unquote(str(headers.get("x-proxi-agent") or "")) or None,
+                                  headers.get("x-claude-code-agent-id"),
                                   metadata.get("agent_id"), identity.get("agent_id")), 100),
             "parent_session_id": clean(headers.get("x-proxi-parent-session-id") or
                                        headers.get("x-opencode-parent-session-id") or

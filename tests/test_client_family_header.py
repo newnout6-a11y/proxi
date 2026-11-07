@@ -30,3 +30,10 @@ def test_the_tool_search_of_claude_code_is_refused_whatever_the_spelling(relay):
     from test_tool_search_refusal import CLAUDE, request
     status, _ = relay.json_any("/v1/messages", request(), headers={**CLAUDE, "x-proxi-client": "Claude Code"})
     assert status == 400
+
+
+def test_an_agent_name_the_opencode_plugin_percent_encoded_is_read_back():
+    from urllib.parse import quote
+    identity = client_context.describe({}, {"x-proxi-client": "opencode", "x-proxi-agent": quote("ревьюер")})
+    assert identity["agent"] == "ревьюер"
+    assert client_context.describe({}, {"x-proxi-agent": "build"})["agent"] == "build"
