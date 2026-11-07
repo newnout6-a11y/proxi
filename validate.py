@@ -3,6 +3,7 @@ import base64
 import contextvars
 import functools
 import hashlib
+import http.client
 import ipaddress
 import json
 import native_history
@@ -69,8 +70,115 @@ def _assert_public_peer(resp, where="image"):
         raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
 
 
-_IMAGE_OPENER = urllib.request.build_opener(_GuardedRedirectHandler())
 _IMAGE_FETCHES = contextvars.ContextVar("proxi_image_fetches", default=None)
+
+
+class _Disallowed(Exception):
+    """A connection that would have reached an address off the public internet."""
+
+
+def _connect_public(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, **_kwargs):
+    """socket.create_connection that connects only to public addresses, the very ones it checked.
+
+    The guard resolved the name and the connection resolved it again: a name that answered with a public address and
+    then with 127.0.0.1 (DNS rebinding) had its GET, path and query delivered inside the network before the peer check
+    refused the answer (audit of 2026-11-07). One lookup now serves both the check and the connect."""
+    host, port = address
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise OSError("cannot resolve %s" % host) from exc
+    checked = []
+    for family, socktype, proto, _name, sockaddr in infos:
+        try:
+            internal = _internal(ipaddress.ip_address(sockaddr[0]))
+        except ValueError:
+            internal = True
+        if internal:
+            raise _Disallowed(host)
+        checked.append((family, socktype, proto, sockaddr))
+    error = None
+    for family, socktype, proto, sockaddr in checked:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            error = exc
+            sock.close()
+    raise error or OSError("no address to connect to for %s" % host)
+
+
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_public
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    """TLS still verifies the certificate and sends SNI for the host name; only the address it connects to is pinned."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_public
+
+
+def _connection_class(req, plain, public):
+    # A request that goes through a proxy connects to the proxy (often 127.0.0.1): the proxy, not this connection,
+    # reaches the image host, whose address the guard checked before the request.
+    return plain if req.has_proxy() or getattr(req, "_tunnel_host", None) else public
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_connection_class(req, http.client.HTTPConnection, _PublicHTTPConnection), req)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_connection_class(req, http.client.HTTPSConnection, _PublicHTTPSConnection), req,
+                            context=self._context)
+
+
+def _image_proxies():
+    """The proxies of the system for http and https, read at each download (urllib reads the environment and, on Windows,
+    the registry): the opener of the module took them once, at import."""
+    proxies = urllib.request.getproxies()
+    return {scheme: proxies[scheme] for scheme in ("http", "https") if proxies.get(scheme)}
+
+
+def _via_proxy(url, proxies):
+    parsed = urllib.parse.urlparse(url)
+    if not proxies.get(parsed.scheme):
+        return False
+    try:
+        return not urllib.request.proxy_bypass(parsed.hostname or "")
+    except Exception:  # noqa: BLE001 - a bypass list it cannot read: the proxy applies, as urllib would decide
+        return True
+
+
+class _ImageOpener:
+    """Opens an image URL through the proxy of the system when one applies to it, else directly, to a public address checked
+    at the connect (_connect_public).
+
+    With a system proxy (v2rayN, Clash and the like set one on Windows) every image URL was refused: the peer check after
+    the request looked at the socket, which led to the proxy on 127.0.0.1. Through a proxy the address of the image host
+    is checked before the request (the proxy connects to it), and the peer check is left out."""
+
+    def open(self, req, timeout=None):
+        proxies = _image_proxies()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), _PublicHTTPHandler(),
+                                             _PublicHTTPSHandler(), _GuardedRedirectHandler())
+        response = opener.open(req, timeout=timeout)
+        response._proxi_via_proxy = _via_proxy(req.full_url, proxies)
+        return response
+
+
+_IMAGE_OPENER = _ImageOpener()
 
 
 class ImageFetches:
@@ -263,7 +371,8 @@ def _fetch_remote(url, where):
     max_bytes = 10 * 1024 * 1024
     try:
         with _IMAGE_OPENER.open(req, timeout=10) as r:
-            _assert_public_peer(r, where)
+            if not getattr(r, "_proxi_via_proxy", False):
+                _assert_public_peer(r, where)  # the socket of a proxied request leads to the proxy
             ct = r.headers.get("content-type", "").split(";")[0].strip()
             if ct:
                 mime_type = ct
@@ -273,6 +382,8 @@ def _fetch_remote(url, where):
             data_b64 = base64.b64encode(buf).decode("ascii")
     except ApiError:
         raise
+    except _Disallowed:
+        raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
     except Exception:
         raise unprocessable(f"failed to fetch image attachments from {url}", param=where)
     if fetches is not None:
