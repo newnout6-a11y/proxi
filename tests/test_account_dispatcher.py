@@ -332,3 +332,21 @@ def test_service_empty_turn_is_not_resent_and_is_saved_once(tmp_path, monkeypatc
     asyncio.run(scenario())
     assert len(calls) == expected
     assert len(list(tmp_path.glob("*-body.json"))) == 1
+
+
+def test_a_balance_of_zero_is_exhausted_even_with_a_threshold_of_zero():
+    # min_account_balance 0 is allowed; 0.0 < 0 is false, so an empty account stayed in rotation and got no failover
+    account = Account("a")
+    manager = FakeManager(0.0)
+    value, _ = dispatcher([account], {account: manager}, min_account_balance=0)
+    assert value.check_balance(account) is True and account.unavailable["reason"] == "exhausted"
+    manager.available = 0.01
+    assert value.check_balance(account) is False and account.unavailable is None
+
+
+def test_a_local_debit_to_zero_forces_a_server_check_even_with_a_threshold_of_zero():
+    account = Account("a")
+    manager = FakeManager(0.0)
+    value, clock = dispatcher([account], {account: manager}, session_refresh_interval=0, min_account_balance=0)
+    value.state[account]["next_balance"] = clock.now + 10_000
+    assert value.due() == [(account, "balance")]

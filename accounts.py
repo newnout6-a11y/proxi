@@ -188,7 +188,7 @@ class AccountDispatcher:
                 if snapshot and "exhausted" not in state["reasons"] and now - state["last_forced"] >= FORCED_CHECK_GAP:
                     # A local debit crossed the threshold: confirm with the server now.
                     local = console_log.number(snapshot().get("available"), signed=True)
-                    if local is not None and local < self.threshold:
+                    if local is not None and (local <= 0 or local < self.threshold):
                         state["next_balance"] = min(state["next_balance"], now)
                         state["last_forced"] = now
                 if self.interval > 0 and now >= state["next_refresh"]:
@@ -399,7 +399,8 @@ class AccountDispatcher:
                                                        else 60.0 if not fresh else 3600.0)
             if fresh:
                 state["available"] = available
-                if available < self.threshold:
+                # A balance of 0 buys nothing whatever the threshold (min_account_balance 0 left such an account usable).
+                if available <= 0 or available < self.threshold:
                     changed = self._set_reason(backend, "exhausted",
                                                {"available": available, "threshold": self.threshold})
                 else:
