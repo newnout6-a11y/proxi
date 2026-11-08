@@ -2,7 +2,6 @@
 import asyncio
 import os
 import re
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +13,7 @@ import validate
 from orchestrator import TurnRunner
 from session import RelaySession
 from upstream_attempts import AttemptBudget
-from test_native_context_reuse import FIRST, Backend, request, run, setup
+from test_native_context_reuse import FIRST, request, run, setup
 from test_service_requests import capture_direct
 
 

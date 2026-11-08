@@ -1,3 +1,4 @@
+import copy
 import json
 import subprocess
 import sys
@@ -171,23 +172,62 @@ def test_probe_stops_before_starting_anything_when_the_client_cannot_be_found(tm
     assert 'missing.exe' in capsys.readouterr().err and not probe.records
 
 
-def fake_client(monkeypatch, *, honor_override=True, requests=3, marker='PROXI_SMOKE_OK', code=0):
-    """Replace the installed client: it reads the override, may post to the probe server, and never starts a process."""
+RELAY_USER = {'provider': {'retool-relay': {'models': {'gpt-6-sol': {}}}}, 'model': 'retool-relay/gpt-6-sol'}
+ELSEWHERE = 'anthropic/claude-sonnet-4-5'
+
+
+def merged(base, extra):
+    """OpenCode merges OPENCODE_CONFIG_CONTENT over the user's configuration, last."""
+    if not (isinstance(base, dict) and isinstance(extra, dict)):
+        return copy.deepcopy(extra)
+    return {**base, **{key: merged(base.get(key), value) for key, value in extra.items()}}
+
+
+def as_v2(config):
+    return {{'provider': 'providers', 'agent': 'agents'}.get(key, key): value for key, value in config.items()}
+
+
+def fake_client(monkeypatch, *, honor_override=True, requests=3, marker='PROXI_SMOKE_OK', code=0, user=RELAY_USER,
+                dropped=(), recent=None, elsewhere=None):
+    """Replace the installed client: it resolves its configuration like OpenCode, may post to the probe server, and
+    never starts a process.
+
+    The resolved configuration is the user's with the override merged last, less its `dropped` keys; OpenCode 2 lists
+    the two sources apart. `run` sends the parent turns to --model, else the build agent's model, else `model`, else
+    the model the TUI used last (`recent`), and the child turn to the explore agent's model, else the parent's. A
+    turn for any other endpoint is never sent: it is added to `elsewhere`, or fails the test.
+    """
     calls = []
 
     def run(args, env=None, **kwargs):
         calls.append((list(args), dict(env or {})))
-        override = json.loads(env['OPENCODE_CONFIG_CONTENT']) if 'OPENCODE_CONFIG_CONTENT' in env else None
+        if 'OPENCODE_CONFIG_CONTENT' not in (env or {}):
+            return subprocess.CompletedProcess(args, code, marker, 'client failed' if code else '')
+        sent = json.loads(env['OPENCODE_CONFIG_CONTENT'])
+        override = {key: value for key, value in sent.items() if key not in dropped} if honor_override else {}
+        config = merged(user, override)
         if 'debug' in args:
-            options = override['provider']['retool-relay']['options'] if honor_override else {
-                'baseURL': 'http://127.0.0.1:8787/v1', 'apiKey': 'user-configured-key'}
-            return subprocess.CompletedProcess(args, 0, json.dumps({'provider': {'retool-relay': {'options': options}}}), '')
+            if '--standalone' in args:
+                sources = [{'type': 'document', 'info': as_v2(info)} for info in (user, override) if info]
+                return subprocess.CompletedProcess(args, 0, json.dumps(sources + [{'type': 'directory', 'path': '.'}]), '')
+            return subprocess.CompletedProcess(args, 0, json.dumps(config), '')
         if 'models' in args:
             return subprocess.CompletedProcess(args, 0, 'retool-relay/gpt-6-sol\n', '')
-        for _ in range(requests if override else 0):
-            base = override['provider']['retool-relay']['options']['baseURL']
+        agents = config.get('agent') or {}
+        parent = ((args[args.index('--model') + 1] if '--model' in args else None)
+                  or agents.get('build', {}).get('model') or config.get('model') or recent)
+        child = agents.get('explore', {}).get('model') or parent
+        base = config['provider']['retool-relay']['options']['baseURL']
+        probe_base = sent['provider']['retool-relay']['options']['baseURL']
+        for model in [parent, child, parent][:requests]:
+            if not (str(model).startswith('retool-relay/') and base == probe_base):
+                if elsewhere is None:
+                    pytest.fail('a model request for %s left the probe' % model)
+                elsewhere.append(model)
+                continue
             request = urllib.request.Request(base + '/chat/completions', method='POST',
-                                             data=json.dumps({'model': 'gpt-6-sol', 'reasoning_effort': 'high'}).encode(),
+                                             data=json.dumps({'model': model.split('/', 1)[1],
+                                                              'reasoning_effort': 'high'}).encode(),
                                              headers={'content-type': 'application/json'})
             urllib.request.urlopen(request, timeout=10).read()
         return subprocess.CompletedProcess(args, code, marker, 'client failed' if code else '')
@@ -207,7 +247,7 @@ def test_probe_passes_only_when_the_fake_server_received_the_client_requests(tmp
     code, report, error = run_probe(tmp_path, capsys)
     assert code == 0 and report['passed'] is True and 'error' not in report and not error
     assert len(report['requests']) == 3 and report['executable'] == sys.executable
-    assert [args[1] for args, _ in calls] == ['debug', 'models', 'run']
+    assert [args[1] for args, _ in calls] == ['debug', 'debug', 'models', 'run']
     assert all(args[0] == sys.executable for args, _ in calls)
 
 
@@ -220,12 +260,112 @@ def test_probe_fails_when_the_client_never_reached_the_fake_server(tmp_path, mon
 
 
 def test_probe_sends_no_model_request_when_the_endpoint_override_was_not_applied(tmp_path, monkeypatch, capsys):
-    calls = fake_client(monkeypatch, honor_override=False)
+    user = merged(RELAY_USER, {'provider': {'retool-relay': {'options': {
+        'baseURL': 'http://127.0.0.1:8787/v1', 'apiKey': 'user-configured-key'}}}})
+    calls = fake_client(monkeypatch, honor_override=False, user=user)
     code, report, error = run_probe(tmp_path, capsys, 'opencode2')
     assert code == 1 and report['passed'] is False and 'probe endpoint' in report['error']
     assert 'probe endpoint' in error and report['requests'] == []
     assert not [args for args, _ in calls if 'run' in args]
     assert [args for args, _ in calls if 'debug' in args][0][-1] == '--standalone'
+
+
+@pytest.mark.parametrize('user,recent', [
+    ({**RELAY_USER, 'model': ELSEWHERE}, None),
+    ({'provider': RELAY_USER['provider']}, ELSEWHERE),
+    ({**RELAY_USER, 'agent': {'build': {'model': ELSEWHERE}}}, None),
+    ({**RELAY_USER, 'agent': {'explore': {'model': ELSEWHERE}}}, None),
+], ids=['default model', 'last model of the TUI', 'build agent', 'explore child'])
+def test_opencode_probe_keeps_every_model_request_on_the_fake_provider(tmp_path, monkeypatch, capsys, user, recent):
+    """The probe overrides only the retool-relay endpoint, and the run used the user's own models: a default, build
+    or explore model on another provider (or, with no `model` set, the one the TUI used last) got a real, paid
+    request with the user's own key from auth.json, and the probe noticed only afterwards that its fake got nothing.
+    The run is now pinned to the relay provider: --model, and every model of the run in the override."""
+    elsewhere = []
+    calls = fake_client(monkeypatch, user=user, recent=recent, elsewhere=elsewhere)
+    code, report, _ = run_probe(tmp_path, capsys)
+    assert elsewhere == []
+    assert code == 0 and report['passed'] is True and len(report['requests']) == 3
+    args, env = calls[-1]
+    assert args[args.index('--model') + 1] == report['pinned_models']['--model'] == 'retool-relay/gpt-6-sol'
+    pins = json.loads(env['OPENCODE_CONFIG_CONTENT'])
+    assert pins['model'] == pins['small_model'] == 'retool-relay/gpt-6-sol'
+    assert {name: agent['model'] for name, agent in pins['agent'].items()} == dict.fromkeys(
+        probe.RUN_AGENTS, 'retool-relay/gpt-6-sol')
+
+
+def test_opencode_probe_still_tests_the_users_own_relay_models(tmp_path, monkeypatch, capsys):
+    user = merged(RELAY_USER, {'provider': {'retool-relay': {'models': {'claude-opus-5-5': {}, 'claude-sonnet-5-5': {}}}},
+                               'model': 'retool-relay/claude-opus-5-5', 'small_model': ELSEWHERE,
+                               'agent': {'explore': {'model': 'retool-relay/claude-sonnet-5-5'}}})
+    calls = fake_client(monkeypatch, user=user)
+    code, report, _ = run_probe(tmp_path, capsys)
+    assert code == 0 and [row['model'] for row in report['requests']] == [
+        'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5']
+    pins = json.loads(calls[-1][1]['OPENCODE_CONFIG_CONTENT'])
+    assert pins['small_model'] == pins['agent']['title']['model'] == 'retool-relay/claude-opus-5-5'
+    assert pins['agent']['explore']['model'] == 'retool-relay/claude-sonnet-5-5'
+
+
+@pytest.mark.parametrize('user,dropped,refusal', [
+    # A client that applied the endpoint but not the pinned models would still run the user's model elsewhere.
+    ({**RELAY_USER, 'model': ELSEWHERE}, ('model', 'small_model', 'agent'), 'other providers'),
+    # The relay under another provider name: its requests would carry the real relay key of the file.
+    ({'provider': {'proxi': {'options': {'baseURL': 'http://127.0.0.1:9/v1', 'apiKey': 'real-relay-key'},
+                             'models': {'gpt-6-sol': {}}}}, 'model': 'proxi/gpt-6-sol'}, (), 'defines no retool-relay'),
+], ids=['pins ignored', 'relay under another name'])
+def test_opencode_probe_sends_nothing_when_the_run_cannot_be_pinned(tmp_path, monkeypatch, capsys, user, dropped,
+                                                                    refusal):
+    elsewhere = []
+    calls = fake_client(monkeypatch, user=user, dropped=dropped, elsewhere=elsewhere)
+    code, report, error = run_probe(tmp_path, capsys)
+    assert elsewhere == [] and not [args for args, _ in calls if 'run' in args]
+    assert code == 1 and report['passed'] is False and refusal in report['error'] and refusal in error
+    assert report['requests'] == []
+
+
+def documents(*sources):
+    return [{'type': 'document', 'info': as_v2(info)} for info in sources] + [{'type': 'directory', 'path': '.'}]
+
+
+@pytest.mark.parametrize('mode', ['opencode', 'opencode2'])
+@pytest.mark.parametrize('field,reference', [('model', ELSEWHERE), ('small_model', ELSEWHERE),
+                                             ('agent.build.model', ELSEWHERE), ('agent.explore.model', ELSEWHERE),
+                                             ('agent.general.model', 'proxi/gpt-6-sol'),
+                                             ('agent.title.model', ELSEWHERE), ('agent.compaction.model', ELSEWHERE)])
+def test_the_run_is_refused_while_any_model_it_can_reach_is_on_another_provider(mode, field, reference):
+    """The check that guarded the run looked only for the endpoint the probe had injected itself."""
+    *path, key = field.split('.')
+    stray = {key: reference}
+    for part in reversed(path):
+        stray = {part: stray}
+    config = merged(RELAY_USER, stray)
+    with pytest.raises(probe.ProbeError, match='other providers') as refusal:
+        probe.check_pinned(documents(config) if mode == 'opencode2' else config, mode)
+    named = field.replace('agent.', 'agents.', 1) if mode == 'opencode2' else field
+    assert '(%s=%s)' % (named, reference) in str(refusal.value)
+
+
+@pytest.mark.parametrize('mode', ['opencode', 'opencode2'])
+def test_a_run_on_relay_models_only_passes_the_check(mode):
+    config = merged(RELAY_USER, {'small_model': 'retool-relay/gpt-6-sol',
+                                 'agent': {name: {'model': 'retool-relay/gpt-6-sol#high'} for name in probe.RUN_AGENTS},
+                                 # A command, or an agent the run never starts, gets no request from the probe.
+                                 'command': {'review': {'model': ELSEWHERE}}})
+    config['agent']['reviewer'] = {'model': ELSEWHERE}
+    probe.check_pinned(documents(config) if mode == 'opencode2' else config, mode)
+
+
+def test_opencode2_sources_are_checked_apart_because_they_are_listed_unmerged():
+    pinned = {'model': 'retool-relay/gpt-6-sol', 'agent': {'explore': {'model': 'retool-relay/gpt-6-sol'}}}
+    with pytest.raises(probe.ProbeError, match='agents.explore.model=' + ELSEWHERE):
+        probe.check_pinned(documents({'agent': {'explore': {'model': ELSEWHERE}}}, pinned), 'opencode2')
+
+
+@pytest.mark.parametrize('mode,config', [('opencode', []), ('opencode2', {'model': 'retool-relay/gpt-6-sol'})])
+def test_a_resolved_configuration_of_an_unexpected_shape_is_refused(mode, config):
+    with pytest.raises(probe.ProbeError, match='unexpected shape'):
+        probe.check_pinned(config, mode)
 
 
 def test_probe_children_get_a_deliberately_invalid_key_and_no_inherited_credentials(tmp_path, monkeypatch, capsys):

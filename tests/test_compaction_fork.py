@@ -14,7 +14,7 @@ import pytest
 import native_history
 import validate
 from prompt_support import client_request, prompt_relay, strip_cache  # noqa: F401 - prompt_relay is a fixture
-from test_compaction_cache import (CLAUDE_CODE, INSTRUCTION, Chat, Idle, OPENCODE, SUMMARY, count, tail_after,
+from test_compaction_cache import (CLAUDE_CODE, INSTRUCTION, Chat, Idle, SUMMARY, count, tail_after,
                                    thinking, with_instruction)
 from test_client_contracts import CFG
 from test_native_context_reuse import FIRST as TASK

@@ -165,9 +165,20 @@ def test_peek_shows_a_stored_conversation_only_once_it_is_read_and_never_makes_a
 def test_a_stored_conversation_that_cannot_go_back_to_its_account_is_not_even_read_ahead(tmp_path, processes, loads):
     messages, after = restart(tmp_path, processes)
     entry = parsed(messages).entry
+    # the request may not go to its account (a failover excluded it): nothing to read for it
+    asyncio.run(after.pool.load_stored(KEY, model_entry=entry, exclude=(after.backends[0],)))
+    assert loads == [] and not after.pool._reads
+
+
+def test_a_stored_conversation_whose_lone_account_is_signed_out_is_read_ahead_as_its_request_goes_there(
+        tmp_path, processes, loads):
+    # a signed-out account is still tried when no other can serve (its 401 re-reads config.json for a new sign-in), and
+    # the conversation stays on it rather than starting cold (session._keeps)
+    messages, after = restart(tmp_path, processes)
+    entry = parsed(messages).entry
     after.backends[0].unavailable = {"reason": "auth_dead"}
     asyncio.run(after.pool.load_stored(KEY, model_entry=entry))
-    assert loads == [] and after.pool.peek(KEY, model_entry=entry) is None and not after.pool._reads
+    assert loads
 
 
 def test_the_stored_state_is_read_ahead_without_stopping_the_event_loop(tmp_path, monkeypatch, processes):

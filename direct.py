@@ -34,6 +34,7 @@ import console_log
 import native_history
 import models as model_catalog
 import summary_guard
+import upstream_diagnostics
 from accounts import account_tag, idle_block
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
@@ -87,6 +88,12 @@ _TOOL_RESULT_HINTS = {"refused": False}
 # Whether upstream refused a body whose branch had lost a call (native_history.deliverable) and answered the same request
 # without that branch; once it did, no reply is cut down that way for the rest of the run.
 _PRUNING = {"refused": False}
+
+
+def _unmarked(body):
+    """The body without the App Builder marker (metadata.sandpackAgent): a model of the Assist list (_ASSIST_ONLY) is served
+    by the same route without it, and the route of the marker answers it with "not available right now"."""
+    return {key: value for key, value in body.items() if key != "metadata"}
 
 
 def _provider_of(model):
@@ -283,7 +290,11 @@ def _js_delta(value):
         elif isinstance(item, float):
             delta += len(_js_number(item)) - len(json.dumps(item))
         elif isinstance(item, int) and abs(item) >= 2 ** 53:
-            delta += len(_js_number(float(item))) - len(str(item))
+            try:
+                written = _js_number(float(item))
+            except OverflowError:  # past the range of a double: JavaScript holds Infinity, and writes null
+                written = "null"
+            delta += len(written) - len(str(item))
     return delta
 
 
@@ -1267,6 +1278,8 @@ def _error_from_event(event):
     if status == 429:
         return apierr.too_many_requests(text)
     if status in (401, 403):
+        if event.get("isUsingRetoolManagedKey") and ("invalid x-api-key" in text or "authentication_error" in text):
+            return apierr.upstream_error(text)
         return apierr.upstream_auth_failed(text)
     if status in (400, 404, 422):
         return apierr.bad_request(text)
@@ -1299,15 +1312,39 @@ class _HeadGate:
         self.started, self.released, self.opened_at, self.used_at, self.owner = False, False, now, 0.0, owner
 
 
+# A head shorter than this (system text and tool definitions together) cannot be a provider cache entry: the smallest
+# cacheable prefix is 1,024 tokens, about 2,048 characters of Cyrillic or code. Gating such a head only delays requests:
+# three parallel requests with the system "Be brief." waited for the first one's first event, 1.5 s each, for nothing.
+HEAD_MIN_CHARS = 2048
+
+
+def _attribution_only(block):
+    """A system block that holds only Claude Code's attribution line, which Anthropic consumes and does not cache."""
+    text = block.get("text") if isinstance(block, dict) else None
+    return isinstance(text, str) and text.startswith("x-anthropic-billing-header:") and "\n" not in text
+
+
 def _head_key(body):
     """The digest of what a body shares with every request of its kind: the model, the tools and the system message that
-    carries the head's cache hint. None for a body without such a head."""
+    carries the head's cache hint. None for a body without such a head, or with one too small to be cached.
+
+    Claude Code's attribution line is left out: it carries a fingerprint of each conversation's (each sub-agent's) first
+    message, so sub-agents started together with the same head never shared one write, though upstream ignores the line
+    and their cached prefix is the same."""
     messages = body.get("messages") or []
     first = messages[0] if messages and isinstance(messages[0], dict) else None
-    if first is None or first.get("role") != "system" or not any(
-            isinstance(block, dict) and block.get("cache") for block in first.get("content") or []):
+    if first is None or first.get("role") != "system":
         return None
-    payload = json.dumps([body.get("model"), body.get("tools"), first], sort_keys=True, ensure_ascii=False, default=str)
+    blocks = [block for block in first.get("content") or [] if not _attribution_only(block)]
+    if not any(isinstance(block, dict) and block.get("cache") for block in blocks):
+        return None
+    tools = body.get("tools")
+    size = sum(len(block["text"]) for block in blocks if isinstance(block, dict) and isinstance(block.get("text"), str))
+    size += len(json.dumps(tools, ensure_ascii=False, default=str)) if tools else 0
+    if size < HEAD_MIN_CHARS:
+        return None
+    payload = json.dumps([body.get("model"), tools, {**first, "content": blocks}], sort_keys=True, ensure_ascii=False,
+                         default=str)
     return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
 
 
@@ -1513,7 +1550,8 @@ PING_RETRY = 10.0
 # A ping that WROTE the prefix instead of reading it found the entry gone. It counts as a rewrite when it wrote
 # half of the cached prefix (a miss on a small prompt) or REWRITE_TOKENS tokens: the console flags the same
 # size as [WRITE HIGH], and at the write price (1e-4 credits per token) it is 5 credits, as much as six
-# healthy pings of a 190k-token prefix (4e-6 per token). Below one cache block it is noise.
+# healthy pings of a 190k-token prefix (4e-6 per token). Below one cache block it is noise. A route that reports
+# no write (GLM, gpt-5.5) bills the missed prefix as plain input instead, held to the same sizes (_rewrite_of).
 REWRITE_SHARE = 0.5
 REWRITE_TOKENS = 50_000
 REWRITE_FLOOR = 1_024
@@ -1553,18 +1591,30 @@ def _hit_the_cap(body, flags):
     return (type(cap) is int and type(written) in (int, float) and written == cap and not flags.get("whole_calls"))
 
 
-def _rewrite_of(usage):
-    """The size of a rewrite when a ping wrote the cached prefix again instead of reading it, else None."""
+def _rewrite_of(usage, model=None):
+    """The size of a rewrite when a ping wrote the cached prefix again instead of reading it, else None.
+
+    GLM and gpt-5.5 report no cache write (credits.py): a prefix they did not read is billed as plain input, 10 times the
+    price of a read (5 times on GLM-5.3-Flash), and a check of the write counter alone let every such ping pass for a healthy
+    one until the idle limit. Where the usage has no write counter, or the model is one that never writes (its write is
+    priced as its input, credits.rates), the uncached input is the part the ping missed (named input_tokens: nothing was
+    reported written), held to the same thresholds against what it read. A ping that reads its prefix leaves only the nudge
+    and the tail past the provider's last cached block as input, a few hundred tokens. A route that reports writes is judged
+    by its write counter alone, as before."""
     if not isinstance(usage, dict):
         return None
-    written = int(console_log.number(usage.get("promptTokensWrittenToCache")) or 0)
-    if written < REWRITE_FLOOR:
+    missed, key = console_log.number(usage.get("promptTokensWrittenToCache")), "written_tokens"
+    rate = credits.rates(model)
+    if missed is None or (not missed and rate["cache_write"] == rate["input"]):
+        missed, key = console_log.number(usage.get("inputTokens")), "input_tokens"
+    missed = int(missed or 0)
+    if missed < REWRITE_FLOOR:
         return None
     read = int(console_log.number(usage.get("promptTokensReadFromCache")) or 0)
-    prefix = read + written
-    if written < REWRITE_TOKENS and written < prefix * REWRITE_SHARE:
+    prefix = read + missed
+    if missed < REWRITE_TOKENS and missed < prefix * REWRITE_SHARE:
         return None
-    return {"written_tokens": written, "read_tokens": read, "prefix_tokens": prefix}
+    return {key: missed, "read_tokens": read, "prefix_tokens": prefix}
 
 
 class _WarmCycle:
@@ -1609,12 +1659,26 @@ class _WarmCycle:
             pass
 
 
+def _kept_warm(session):
+    """True while the keepwarm cycle of `session` runs: its cache is being kept alive."""
+    task = getattr(session, "_warm_task", None)
+    return task is not None and not task.done()
+
+
 def _dependents_live(session, now, turn_timeout, limit):
-    """True while a child request that pins this conversation is really alive.
+    """True while a child request that pins this conversation is really alive, or a child is still expected back.
 
     The pool counts leases, and a release that never comes would pin the count forever.
     Only activity counts here: a child turn busy for at most turn_timeout, or any child
-    request within its own idle limit; a request still being set up counts for turn_timeout."""
+    request within its own idle limit; a request still being set up counts for turn_timeout.
+
+    A child whose request has ended (session._cache_children) is still expected back while it has not given its final
+    answer, or its own cycle still warms it, for `limit` from its last request: a subagent waits for a long tool and
+    comes back with the result. Pinned by the lease alone, the parent's cycle ended cache_keepwarm_idle after the
+    child's request while the child was warmed for cache_keepwarm_subagent_idle, and the parent wrote its whole prefix
+    again when it went on. A closed or evicted child does not come back to this session. The limit counts from the
+    child's own last request even while its cycle runs, so that conversations that name each other as parents cannot
+    keep each other warm forever."""
     for record in tuple(getattr(session, "_cache_dependent_records", None) or ()):
         child, since = getattr(record, "session", None), getattr(record, "since", 0) or 0
         if child is None:
@@ -1627,6 +1691,15 @@ def _dependents_live(session, now, turn_timeout, limit):
                 return True
             continue
         if now - max(getattr(child, "_last_request_at", 0) or 0, since) <= limit:
+            return True
+    for child in tuple(getattr(session, "_cache_children", None) or ()):
+        if child is session or getattr(child, "_closed", False):
+            continue
+        started = getattr(child, "_turn_started_at", 0) or 0
+        if getattr(child, "_busy", False) and started and now - started > turn_timeout:
+            continue  # a stuck turn keeps nothing warm
+        if now - (getattr(child, "_last_request_at", 0) or 0) <= limit and (
+                _kept_warm(child) or not getattr(child, "_turn_final", False)):
             return True
     return False
 
@@ -1643,7 +1716,8 @@ async def _keepwarm(session, cfg):
     cache_keepwarm_idle seconds without a real request (pings do not count), after
     cache_keepwarm_subagent_idle for a subagent whose answer asked for a tool, at once
     for a subagent that answered without one. A turn busy for longer than turn_timeout and
-    a child request that went quiet keep nothing warm. The reason, the pings and the credits
+    a child request that went quiet keep nothing warm; a child that waits for a tool keeps
+    its parent warm while it is expected back (_dependents_live). The reason, the pings and the credits
     of the cycle are journaled as cache.keepwarm_stop.
 
     A ping is paid for, so it is only sent while it can still read the cache. The guards:
@@ -1655,12 +1729,15 @@ async def _keepwarm(session, cfg):
       (a failed ping touches nothing: its result is unknown), is older than
       PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN: cache_expired. This also ends a retry that no longer fits (the touch
       is read again after the failure: a request that began while the ping hung read the cache itself);
-    - a ping reported that it wrote the prefix instead of reading it: cache_rewritten. One rewrite is the most a
+    - a ping reported that it wrote the prefix instead of reading it, or, on a route that reports no write (GLM,
+      gpt-5.5), that it paid the prefix as plain input: cache_rewritten. One rewrite is the most a
       session pays for: the session is marked, and no cycle is started for it again (_ensure_keepwarm, which the pool
       calls at every request of a child) until a real turn gives a usable answer;
     - five failed pings in a row: failures (with the default interval the window closes first, see PING_RETRY).
     Inside a running turn only the last three apply. A turn in flight is judged when it ends, not before, so the
-    verdict on the turn before it (last_turn_failed, compacted) and the idle limits stop nothing there.
+    verdict on the turn before it (last_turn_failed, compacted) and the idle limits stop nothing there. A compaction
+    in flight gets no ping at all, of its own body or of the chat's last one: the client replaces that history by the
+    summary, and the cycle stops with compacted once the summary is back.
     """
     interval = float(cfg.get("cache_keepwarm_seconds", 0) or 0)
     if interval <= 0:
@@ -1719,7 +1796,9 @@ async def _keepwarm(session, cfg):
                 identity = getattr(session, "_warm_identity", None) or {}
                 touch_at = getattr(session, "_warm_at", 0) or 0
                 if busy:
-                    if not during_turns or not started:
+                    # A compaction pings nothing while it runs: it arms no body of its own (iter_events), and the chat's
+                    # last body, which this branch pings for a turn without one, is the history the client replaces.
+                    if not during_turns or not started or getattr(session, "_turn_compaction", False):
                         await asyncio.sleep(0.95)
                         continue
                     turn_body = getattr(session, "_turn_body", None)
@@ -1768,11 +1847,12 @@ async def _keepwarm(session, cfg):
                     session._keepwarm_estimated_cost = round(
                         getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)
                 usage = getattr(session, "_last_warm_usage", {})
-                rewrite = _rewrite_of(usage)
+                rewrite = _rewrite_of(usage, body.get("model"))
                 touched = any(isinstance(usage.get(key), (int, float)) and usage[key] > 0 for key in (
                     "promptTokensReadFromCache", "promptTokensWrittenToCache"))
                 journal.emit("cache.keepwarm",
-                             "Прогрев перезаписал кэш: префикс записан заново, а не прочитан" if rewrite else
+                             ("Прогрев не прочитал кэш: префикс оплачен как обычный вход" if "input_tokens" in rewrite else
+                              "Прогрев перезаписал кэш: префикс записан заново, а не прочитан") if rewrite else
                              "Кэш прочитан или записан при прогреве" if touched else
                              "Запрос прогрева завершён; использование кэша не подтверждено",
                              "warn" if rewrite else "info" if busy else "debug",
@@ -1785,7 +1865,8 @@ async def _keepwarm(session, cfg):
                              cache_verified=touched, usage=usage)
                 if rewrite:
                     # The cache the cycle was keeping alive was gone: whatever kept it from being read
-                    # (a lapse, an eviction, another shard) can happen again, and every miss pays a full write.
+                    # (a lapse, an eviction, another shard) can happen again, and every miss pays a full write
+                    # (or, where the route reports no write, the whole prefix as plain input).
                     # The session is marked, not just this cycle: the pool starts a new cycle for a parent at every
                     # request of its child, and each would pay for one more rewrite.
                     session._warm_blocked = "cache_rewritten"
@@ -1950,13 +2031,15 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     session._direct_reply = None
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
-        body = {key: value for key, value in body.items() if key != "metadata"}
+        body = _unmarked(body)
     identity = client_context.current()
     session._busy = True
     session._turn_identity = identity
     session._turn_started_at = time.time()
     session._turn_pinged = False
     session._turn_final = False
+    # A compaction is warmed by nobody while it runs (_keepwarm): the client replaces its history by the summary.
+    session._turn_compaction = task == client_context.COMPACTION
     session._turn_seq = getattr(session, "_turn_seq", 0) + 1
     turn_seq = session._turn_seq
     session._last_request_at = time.time()
@@ -1992,6 +2075,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         session._busy = False
         session._turn_body = None
         session._turn_identity = None
+        session._turn_compaction = False
         session._turn_final = ended == "stop" and not asked_tool and not getattr(session, "_cancelled", False)
         # The consumer may drop the generator right after an error event (a cut stream): that is not a cancel.
         stopped_early = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) and not errored
@@ -2040,8 +2124,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 
     def note(event):
         nonlocal asked_tool, ended, wrote_text, thinking_seen, errored, began, head_marked
-        # Every attempt announces itself with usage_start before upstream has said anything: not an answer.
-        began = began or event.get("type") != "usage_start"
+        # Every attempt announces itself with usage_start before upstream has said anything: not an answer. Nor is the mark
+        # the relay gives an attempt whose price is unknown before it raises the error of that attempt (_from_upstream): taken
+        # for one, a refusal inside an HTTP 200 never got the safety nets below.
+        began = began or _from_upstream(event)
         if began and head_gate is not None and not head_marked:
             head_marked = True
             _head_started(head_gate, head_key)
@@ -2060,10 +2146,12 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             errored = True
             settle()
 
-    if body.get("openAICacheKey") and task != client_context.BACKGROUND:
+    if body.get("openAICacheKey") and not side_request:
         session._turn_body = body
         # Start the scheduler with the turn, not after it: a session's first long
-        # turn needs its anchored during-turn ping too. A one-shot job has no next request to keep a prefix for.
+        # turn needs its anchored during-turn ping too. A one-shot job has no next request to keep a prefix for, and
+        # neither has a compaction: the client replaces its history by the summary, so a ping of this body (one at 200 s
+        # and every 240 s of a long summary, each reading the whole chat) keeps a prefix nobody sends again.
         _ensure_keepwarm(session, cfg)
 
     # The compaction of a Codex chat, whose tools the relay declared again so that it reads the chat's cache (proxy.
@@ -2073,7 +2161,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                and client_context.current().get("compaction_tools") == "restored")
 
     def text_only():
-        return build_body(cfg, model_provider, head, prompt, None, "none", max_tokens, chunks, session=None, mark_tail=False)
+        # Built anew, this body carried the App Builder marker however the request went: on a model of the Assist list, whose
+        # two tries with tools went without it, the route refused this third one ("not available right now") and the
+        # compaction failed after two paid tries. It goes the way the request goes, as the retry below sends it too.
+        sent = build_body(cfg, model_provider, head, prompt, None, "none", max_tokens, chunks, session=None, mark_tail=False)
+        return sent if "metadata" in body else _unmarked(sent)
 
     def open_stream(sent):
         # A compaction whose tools the relay declared again must end in text (summary_guard); a route that refuses a forced choice
@@ -2116,7 +2208,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 async with contextlib.aclosing(iter_events(cfg, session, model_provider, prompt, head, *asked,
                                                            max_tokens, chunks)) as again:
                     async for event in again:
-                        if not answered and event.get("type") != "usage_start":
+                        if not answered and _from_upstream(event):
                             answered = True
                             _PRUNING["refused"] = True
                             journal.emit("native_history.prune_refused",
@@ -2134,12 +2226,12 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 body["rit"] = make_rit(body["messages"], tools)
                 rebuild = None
                 upstream_status = getattr(error, "upstream_status", None) or error.status
-                if body.get("openAICacheKey"):
+                if body.get("openAICacheKey") and not side_request:  # what the turn keeps warm, as above
                     session._turn_body = body
                 answered = False
                 async with contextlib.aclosing(open_stream(body)) as stream:
                     async for event in stream:
-                        if not answered and event.get("type") != "usage_start":
+                        if not answered and _from_upstream(event):
                             answered = True
                             _TOOL_RESULT_HINTS["refused"] = True
                             journal.emit("upstream.tool_result_hint_refused",
@@ -2154,19 +2246,27 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 # the Assist list, which is the same route without the agent marker.
                 if not assist:
                     raise
-                if len(_ASSIST_ONLY) > 200:
-                    # Flush only self-learned names: wiping the proven seeds would make
-                    # known assist models pay a 400 + retry cycle all over again.
-                    _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
-                _ASSIST_ONLY.add(model_provider.get("model"))
-                print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
+                model_name = model_provider.get("model")
+                console_log.write("[assist] retry without agent marker: %s" % (error.message or "")[:80])
                 journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
-                             model=model_provider.get("model"))
-                body = {key: value for key, value in body.items() if key != "metadata"}
-                if body.get("openAICacheKey"):
+                             model=model_name)
+                body = _unmarked(body)
+                if body.get("openAICacheKey") and not side_request:  # what the turn keeps warm, as above
                     session._turn_body = body
+                learned = False
                 async with contextlib.aclosing(open_stream(body)) as stream:
                     async for event in stream:
+                        if not learned and _from_upstream(event):
+                            # Learned only once the request without the marker is answered, as the other fallbacks are:
+                            # "not available right now" also comes for a while from a model that is on the App Builder list
+                            # (or from one account of a pool), and the retry then fails too. Learned before it, the model was
+                            # sent without the marker by every account until a restart, and every request of it failed.
+                            learned = True
+                            if len(_ASSIST_ONLY) > 200:
+                                # Flush only self-learned names: wiping the proven seeds would make
+                                # known assist models pay a 400 + retry cycle all over again.
+                                _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
+                            _ASSIST_ONLY.add(model_name)
                         note(event)
                         yield event
         reply = getattr(session, "_direct_reply", None)
@@ -2227,7 +2327,10 @@ def _warm_refused(session, busy):
 
 
 def _ensure_keepwarm(session, cfg):
-    if getattr(session, "_cancelled", False) or getattr(asyncio.get_running_loop(), "_relay_closing", False):
+    if (getattr(session, "_cancelled", False) or getattr(session, "_closed", False)
+            or getattr(asyncio.get_running_loop(), "_relay_closing", False)):
+        # A closed session is out of the pool (evicted, released for good, left for another account): nothing would end
+        # a cycle started on it, which would ping a prefix nobody continues until its idle limit.
         return
     busy = bool(getattr(session, "_busy", False))
     if _warm_refused(session, busy) is not None or (
@@ -2254,14 +2357,14 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
     """
     try:
         cfg = cfg or {}
-        folder = pathlib.Path(cfg.get("upstream_error_dir") or "logs/upstream-400")
+        folder = pathlib.Path(cfg.get("upstream_error_dir") or upstream_diagnostics.DEFAULT_DIR)
         folder.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(payload).hexdigest()
         key = (str(folder.resolve()), digest)
         with _DUMP_LOCK:
             known = _DUMP_RECENT.get(key)
             if known and (folder / ("%s-body.json" % known)).exists():
-                print("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known), flush=True)
+                console_log.write("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known))
                 return known
             request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
             stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
@@ -2277,7 +2380,7 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
             while len(_DUMP_RECENT) > 256:
                 del _DUMP_RECENT[next(iter(_DUMP_RECENT))]
             prune_diagnostics(cfg, folder, keep=stamp)
-        print("[debug] upstream %s diagnostic: %s" % (status, stamp), flush=True)
+        console_log.write("[debug] upstream %s diagnostic: %s" % (status, stamp))
         return stamp
     except Exception:  # noqa: BLE001 - diagnostics must never break the turn
         pass
@@ -2399,6 +2502,19 @@ async def _summary_stream(cfg, session, body, param_types, text_only):
                      tools_kept=attempt < summary_guard.TRIES_WITH_TOOLS)
 
 
+def _unpriced():
+    """The usage event the relay gives of its own for an attempt that may have been billed while upstream reported no price for
+    it: the client's adapter and the journal count that attempt as one whose price is unknown."""
+    return {"type": "usage", "usage": {}, "unpriced": True}
+
+
+def _from_upstream(event):
+    """Whether an event of the stream is something upstream said, and not the relay's own bookkeeping: usage_start, with which
+    every attempt starts before upstream has said anything, or the mark of an attempt whose price is unknown (_unpriced). That
+    mark comes before the error of an attempt that upstream refused inside an HTTP 200, or that timed out once it was sent."""
+    return event.get("type") != "usage_start" and not event.get("unpriced")
+
+
 async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     if payload is None:
         payload = _wire_json(body)
@@ -2409,7 +2525,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         body_summary = {k: v for k, v in body.items() if k not in ("messages", "tools")}
         if "tools" in body:
             body_summary["tools_count"] = len(body["tools"])
-        print("[body]", json.dumps(body_summary, ensure_ascii=False), flush=True)
+        console_log.write("[body] " + json.dumps(body_summary, ensure_ascii=False))
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
     headers["accept"] = "application/json"
@@ -2622,6 +2738,14 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
                 if _refused_for_now(failure) and not flags.get("usage_seen"):
                     possibly_billed = False  # refused before anything was generated: it cost nothing, as an HTTP 429 never does
+                elif (apierr.is_account_quota(failure) and not flags.get("usage_seen")
+                      and not (usable or thinking_seen or spoke or held)):
+                    # The account's hourly limit as an error event inside a 200, before the model gave anything: the same
+                    # refusal as its HTTP 429 form, which costs nothing. Taken for a possible charge, it marked the balance
+                    # unreported, told the client an unknown cost and sent the empty usage event that zeroed the
+                    # conversation's prefix size, so account_rate_limit_wait moved it at once. One that comes after text or
+                    # thinking may have been billed, and stays unknown.
+                    possibly_billed = False
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
                     flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
@@ -2643,7 +2767,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     budget.attach(failure)
             if flags.get('cost_unknown') and not flags.get('usage_seen'):
                 # Include possibly billed failures/truncations before failover.
-                yield {'type': 'usage', 'usage': {}}
+                yield _unpriced()
             if (_refused_for_now(failure) and not spoke and not usable and limit_retries < max_limit_retries
                     and budget.remaining and not is_cancelled()):
                 wait = RATE_LIMIT_WAITS[min(limit_retries, len(RATE_LIMIT_WAITS) - 1)] * random.uniform(0.75, 1.25)
@@ -2670,7 +2794,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             if saw_end and not flags.get('usage_seen') and not flags.get('cost_unknown'):
                 # An empty/no-telemetry attempt can still have been billed. Keep
                 # its unknown price visible when a later retry reports a cost.
-                yield {'type': 'usage', 'usage': {}}
+                yield _unpriced()
             # Where the route keeps the cap, a reply that ends on exactly that many output tokens was cut by it (GPT and
             # GLM, 5 of 5 probes; Claude's route ignores it and writes on). A whole call in the reply says the end was
             # no cut. A reasoning model that spends a small cap on reasoning ends so, with nothing to show for it:
@@ -2803,7 +2927,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             raise item
 
         if cfg.get("direct_raw"):
-            print("[raw]", str(item)[:200], flush=True)
+            console_log.write("[raw] " + str(item)[:200])
         try:
             event = json.loads(item)
         except Exception:
@@ -2862,7 +2986,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             if block == "text":
                 piece = event.get("partialText") or ""
                 if piece and cfg.get("direct_debug") and not text:
-                    print("[ttft] %.2fs" % (time.time() - started), flush=True)
+                    console_log.write("[ttft] %.2fs" % (time.time() - started))
                 if piece:
                     text.append(piece)
                     yield {"type": "text", "delta": piece}

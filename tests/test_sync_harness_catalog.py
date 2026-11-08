@@ -434,3 +434,86 @@ def test_missing_profile_and_unexpected_structure_are_reported_cleanly(tmp_path,
     assert code == 1 and 'Harness profile not found' in capsys.readouterr().err
     code, summary, error, _ = client(tmp_path, capsys, raw=b'just: a mapping\n')
     assert code == 1 and 'Expected a Harness plugin patch list' in error and 'Traceback' not in error
+
+
+def test_a_model_that_moves_between_the_two_groups_keeps_its_own_fields():
+    # the layout before the split: every model in retool, GLM with fields of its own
+    before = source()
+    relay = before[1]['config']['providers']['retool']
+    relay['models'].append({'id': 'zai-org/GLM-5.3-Flash', 'compat': {'thinkingFormat': 'zai'}, 'cost': {'input': 1}})
+    relay['models'].append({'id': 'gpt-4.1', 'cost': {'input': 2}})
+    entries = [models.resolve(name)[0] for name in ('gpt-6-sol', 'gpt-4.1', 'zai-org/GLM-5.3-Flash')]
+    result = update_document(before, entries)
+    text = {model['id']: model for model in result[1]['config']['providers']['retool-text']['models']}
+    assert text['zai-org/GLM-5.3-Flash']['compat'] == {'thinkingFormat': 'zai'}
+    assert text['zai-org/GLM-5.3-Flash']['cost'] == {'input': 1} and text['gpt-4.1']['cost'] == {'input': 2}
+
+
+def indented(width):
+    """A profile whose mappings are indented by `width` spaces, the way PyYAML writes it with indent=width."""
+    pad = ' ' * width
+    return '\n'.join(['# header', '-' + pad[1:] + 'id: llm-pi-ai', pad + 'config:', pad * 2 + 'providers:',
+                      pad * 3 + 'other:', pad * 4 + 'apiKeyEnv: KEEP_OTHER_KEY',
+                      pad * 3 + 'retool:', pad * 4 + "displayName: 'Retool Relay'", pad * 4 + 'apiKeyEnv: KEEP_RELAY_KEY',
+                      pad * 4 + 'reasoning: medium', pad * 4 + 'models: []',
+                      pad * 3 + 'tail:', pad * 4 + 'enabled: true', ''])
+
+
+@pytest.mark.parametrize('width', [2, 3, 4])
+def test_retool_text_is_added_at_the_indentation_of_the_profile_itself(tmp_path, capsys, width):
+    # The new key was written two columns left of the retool body whatever the profile's indentation, so a profile
+    # indented by three or four spaces failed every first sync ('not valid YAML') and needed retool-text by hand.
+    code, summary, error, profile = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'),
+                                           text=indented(width))
+    assert code == 0 and summary['written'] is True, error
+    lines = profile.read_text(encoding='utf-8').splitlines()
+    pad = ' ' * width
+    group = lines.index(pad * 3 + 'retool-text:')
+    assert lines[group + 1].startswith(pad * 4 + 'displayName: ') and lines[-2:] == [pad * 3 + 'tail:',
+                                                                                       pad * 4 + 'enabled: true']
+    providers = YAML().load('\n'.join(lines))[0]['config']['providers']
+    assert len(providers['retool']['models']) == 23 and len(providers['retool-text']['models']) == 4
+    assert providers['other'] == {'apiKeyEnv': 'KEEP_OTHER_KEY'} and providers['tail'] == {'enabled': True}
+
+
+@pytest.mark.parametrize('mark', ['&relay', '!!map'])
+def test_an_anchor_or_a_tag_on_the_provider_key_line_is_kept_and_the_block_below_it_is_synced(tmp_path, capsys, mark):
+    # The node of `retool: &relay` starts at its anchor, on the key line, so the splice replaced the key line too and
+    # wrote the block at the anchor's column: every sync of such a profile failed, even with no retool-text to add.
+    text = PROFILE.replace('      retool:\n', '      retool: %s\n' % mark)
+    code, summary, error, profile = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'),
+                                           text=text)
+    assert code == 0 and summary['written'] is True, error
+    saved = profile.read_text(encoding='utf-8')
+    assert saved[:saved.index('        displayName: ')] == text[:text.index('        displayName: ')]
+    providers = YAML().load(saved)[1]['config']['providers']
+    assert len(providers['retool']['models']) == 23 and len(providers['retool-text']['models']) == 4
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    document = yaml.load(text)
+    reasoning_only = encode_document(text.encode('utf-8'), document,
+                                     update_document(document, [models.resolve('gpt-6-sol')[0]])).decode('utf-8')
+    assert '      retool: %s\n        displayName: ' % mark in reasoning_only and 'retool-text' not in reasoning_only
+    assert [item['id'] for item in YAML().load(reasoning_only)[1]['config']['providers']['retool']['models']] == [
+        'gpt-6-sol']
+
+
+@pytest.mark.parametrize('replace', [
+    {'      retool:\n': '      retool: &relay\n', '      tail:\n        enabled: true\n': '      tail: *relay\n'},
+    {'      retool:\n': '      retool: &relay\n', '      tail:\n': '      tail:\n        <<: *relay\n'},
+    {'      other:\n': '      other: &base\n', "      retool:\n        displayName: 'Retool Relay'\n"
+     '        baseURL: http://127.0.0.1:8787/v1\n        apiKeyEnv: KEEP_RELAY_KEY\n        reasoning: medium\n'
+     '        models: []\n': '      retool: *base\n'},
+], ids=['aliased by another provider', 'merged into another provider', 'an alias of another provider'])
+def test_a_provider_block_shared_through_an_alias_is_refused_with_a_message_that_says_so(tmp_path, capsys, replace):
+    # Splicing a shared block changes the other key too; that is refused, now with a message that names the layout
+    # instead of 'not valid YAML' about a position in the generated text.
+    text = PROFILE
+    for old, new in replace.items():
+        assert old in text
+        text = text.replace(old, new)
+    code, summary, error, profile = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'),
+                                           text=text)
+    assert code == 1 and summary is None
+    assert 'shares its block with another key through a YAML anchor and alias' in error
+    assert profile.read_text(encoding='utf-8') == text and not (tmp_path / 'backups').exists()

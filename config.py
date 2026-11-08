@@ -13,6 +13,8 @@ import threading
 import time
 
 from apierr import service_unavailable
+import auth
+import console_log
 import models
 import web_search
 
@@ -332,9 +334,27 @@ def _account_record(saved, cfg):
         record = saved
         if cfg.get("account_id") and record.get("account_id") != cfg["account_id"]:
             record = _legacy_match([record], cfg)
+        # The single account's tenant as the file names it: RETOOL_BASE changes cfg["base"] in memory only, and comparing
+        # the file with it refused every save of a rotated cookie and every new sign-in. A file edited to name another
+        # tenant than the one it named at load is still refused.
+        if record is not None and "_file_base" in cfg:
+            file_base = (record.get("base") or "").rstrip("/")
+            return record if file_base == str(cfg["_file_base"] or "").rstrip("/") else None
     if record is None or (record.get("base") or saved.get("base", "")).rstrip("/") != cfg["base"].rstrip("/"):
         return None
     return record
+
+
+def _derived_account_id(record, saved, occurrence):
+    """The id an account without one gets: the same on every start, saved or not.
+
+    It used to be random, and where it could not be saved (secrets in RETOOL_COOKIE/RETOOL_XSRF, a read-only config.json)
+    every start made a new one: the stored conversations, bound to the account's id, never came back after a restart and
+    each wrote its whole prefix again. Derived from the tenant and the page, it is stable, and a later writable start
+    saves the very same value."""
+    base = str(record.get("base") or saved.get("base") or "").rstrip("/").lower()
+    page = str(record.get("page_uuid") or saved.get("page_uuid") or "").lower()
+    return hashlib.sha256(("%s|%s|%d" % (base, page, occurrence)).encode("utf-8")).hexdigest()[:32]
 
 
 def _assign_account_ids(saved):
@@ -347,11 +367,17 @@ def _assign_account_ids(saved):
             if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) or value in seen:
                 raise service_unavailable("account_id must be a unique, nonempty identifier")
             seen.add(value)
+    occurrences = {}
     for record in records:
         if not record.get("account_id"):
-            value = secrets.token_hex(16)
-            while value in seen:
-                value = secrets.token_hex(16)
+            place = (str(record.get("base") or saved.get("base") or "").rstrip("/").lower(),
+                     str(record.get("page_uuid") or saved.get("page_uuid") or "").lower())
+            occurrence = occurrences.get(place, 0)
+            value = _derived_account_id(record, saved, occurrence)
+            while value in seen:  # an explicit id of another record that happens to be this one
+                occurrence += 1
+                value = _derived_account_id(record, saved, occurrence)
+            occurrences[place] = occurrence + 1
             record["account_id"] = value
             seen.add(value)
             changed = True
@@ -377,6 +403,11 @@ def _prompts_path(value, config_path):
     if len(value) > PROMPTS_FILE_MAX_CHARS:
         raise service_unavailable(f"prompts_file must be at most {PROMPTS_FILE_MAX_CHARS} characters")
     return os.path.abspath(os.path.join(os.path.dirname(config_path), value.strip() or PROMPTS_FILE))
+
+
+def _placeholder(value):
+    """A value copied unchanged from config.example.json, which describes what goes there in angle brackets."""
+    return isinstance(value, str) and value.strip().startswith("<") and value.strip().endswith(">")
 
 
 def _ensure_relay_key(cfg):
@@ -437,7 +468,7 @@ def reload_auth(cfg):
         if not cookie or not xsrf or (cookie, xsrf) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"])):
             return False
         cfg.update(cookie=cookie, xsrf=xsrf, _disk_auth=(cookie, xsrf),
-                   cookie_values=[p.strip().split("=", 1)[1] for p in cookie.split(";") if "=" in p])
+                   cookie_values=auth.secret_values(cookie, cfg.get("_extra_secrets", ())))
         if isinstance(cfg.get("_account_ref"), dict):
             cfg["_account_ref"].update(cookie=cookie, xsrf=xsrf)
         return True
@@ -551,6 +582,9 @@ def _load(path):
     cfg["_config_path"] = os.path.abspath(path)
     cfg["prompts_file"] = _prompts_path(cfg.get("prompts_file"), cfg["_config_path"])
     cfg["_persist_auth"] = not (os.environ.get("RETOOL_COOKIE") or os.environ.get("RETOOL_XSRF"))
+    # The tenant the file itself names, before RETOOL_BASE overrides it in memory: the file's record is matched against
+    # this (_account_record), or with RETOOL_BASE set no rotated cookie was ever saved and no new sign-in adopted.
+    cfg["_file_base"] = saved.get("base") if isinstance(saved.get("base"), str) else ""
 
     # Secrets may live outside the repo: env wins over file.
     env_map = {
@@ -737,6 +771,12 @@ def _load(path):
     if not os.path.isdir(cfg["workspace_root"]):
         raise service_unavailable(f"workspace_root is not a directory: {cfg['workspace_root']}")
 
+    if _placeholder(cfg.get("relay_api_key")):
+        # config.example.json carries a description in angle brackets here; copied unchanged it was the relay key itself,
+        # a string anyone can read in the repository.
+        warnings.append("relay_api_key holds the placeholder of config.example.json and is ignored: the key comes from "
+                        "RELAY_API_KEY or relay_key.txt")
+        cfg["relay_api_key"] = None
     cfg["relay_api_key"] = _ensure_relay_key(cfg)
     # Mask cookie secrets, but not plain host names (else the subdomain gets hidden).
     cookie_strings = []
@@ -757,13 +797,15 @@ def _load(path):
     search_key = web_search.key_of(cfg)
     if search_key and search_key not in cookie_vals:
         cookie_vals.append(search_key)  # masked wherever the relay redacts secrets, should it ever show up in a message
+    # The secrets that are no cookie: a renewal or a new sign-in rebuilds cookie_values and keeps these (auth.secret_values).
+    cfg["_extra_secrets"] = [search_key] if search_key else []
     if cfg["web_search_provider"] and not search_key:
         warnings.append("web_search_provider is %s, but the environment variable %s holds no key: WebSearch stays refused"
                         % (cfg["web_search_provider"], cfg["web_search_key_env"]))
     cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
     cfg["config_warnings"] = warnings
     for text in warnings:
-        print("warning: " + text, file=sys.stderr)
+        console_log.write("warning: " + text, file=sys.stderr)
     changed = _assign_account_ids(saved)
     if not isinstance(saved.get("accounts"), list):
         cfg["account_id"] = saved["account_id"]
@@ -771,7 +813,7 @@ def _load(path):
         try:
             _write_file(path, saved)
         except OSError as exc:
-            # Read-only config: the generated ids live in memory until the next writable start.
-            print("warning: cannot save account_id to %s (%s); ids are kept in memory" % (
+            # Read-only config: the ids derived from base and page_uuid are the same at every start until one can save them.
+            console_log.write("warning: cannot save account_id to %s (%s); ids are kept in memory" % (
                 path, type(exc).__name__), file=sys.stderr)
     return cfg

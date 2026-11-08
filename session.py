@@ -12,6 +12,7 @@ import types
 import urllib.error
 import urllib.request
 import uuid
+import weakref
 
 import direct
 import native_history
@@ -21,6 +22,7 @@ import websockets
 import apierr
 import conversation_state
 import journal
+import console_log
 import models as model_catalog
 from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled, priority as account_priority
 from auth import upstream_headers
@@ -285,6 +287,8 @@ class RelaySession:
         self.ws = None
         self._reader = None
         self._cancelled = False
+        # Set by aclose() until the pool leases the session again (begin_request): see aclose().
+        self._closed = False
         self._needs_drain = False
         self._drain_task = None
         self._loop = None
@@ -345,6 +349,7 @@ class RelaySession:
     def begin_request(self):
         """Reset cancellation only when the pool grants a new request lease."""
         self._cancelled = False
+        self._closed = False
         self._last_request_at = time.time()
 
     def cancel(self):
@@ -412,6 +417,11 @@ class RelaySession:
         await _answer_control(self.ws, raw)
 
     async def aclose(self):
+        # Marked before anything is awaited. A session the pool has closed (evicted, released for good, left for another
+        # account) is not coming back: no keepwarm cycle starts on it (direct._ensure_keepwarm), and as a child it no
+        # longer pins its parent's keepwarm (direct._dependents_live). A kept session whose socket is only reset (the drain
+        # of a cancelled request) serves again once it is leased, which lifts the mark (begin_request, stream).
+        self._closed = True
         abort = getattr(self, "_active_direct_abort", None)
         if callable(abort):
             try:
@@ -450,6 +460,8 @@ class RelaySession:
         if self._needs_drain:
             await self.aclose()
             self._needs_drain = False
+            # The drain closed the socket of the request that was cancelled, not the session this request runs on.
+            self._closed = False
         if self._cancelled:
             yield {"type": "end", "reason": "cancelled"}
             return
@@ -718,7 +730,7 @@ class RelaySession:
                         poller.cancel()
                     raise apierr.upstream_error(str(event)[:300])
                 elif os.environ.get("DEBUG_EVENTS"):
-                    print("dbg-unknown:", json.dumps(event, ensure_ascii=False)[:400], flush=True)
+                    console_log.write("dbg-unknown: " + json.dumps(event, ensure_ascii=False)[:400])
         finally:
             if receive_task is not None:
                 receive_task.cancel()
@@ -881,12 +893,6 @@ class _Dependent:
         self.session = None
 
 
-def _kept_warm(session):
-    """True while the keepwarm cycle of `session` runs: its cache is being kept alive."""
-    task = getattr(session, "_warm_task", None)
-    return task is not None and not task.done()
-
-
 class SessionPool:
     """Bounded persistent conversations with one exclusive lease per request."""
 
@@ -941,6 +947,11 @@ class SessionPool:
         self._reads = {}
         self._restoring = {}
 
+    def has_stored(self, conversation_key):
+        """Whether a usable state is stored for this conversation (conversation_infer finds a conversation after a restart)."""
+        store = self._store
+        return store is not None and self.mode == "per_conversation" and store.peek(conversation_key) is not None
+
     def attach_store(self, store):
         """Keep the state of conversations in `store` (None switches it off) from now on."""
         self._store = store
@@ -981,6 +992,21 @@ class SessionPool:
         if store is not None:
             store.close(timeout)
 
+    def _keeps(self, backend, model_entry, exclude=()):
+        """Whether a conversation stays on its account: the account can serve it, or no account is in a better state and
+        its own is one of the degraded ones still served (in reserve, or signed out).
+
+        Without the second half, when every account was in reserve or signed out, a conversation moved to the "richest" or
+        least loaded other account on every request (its own session counts as load on its account), and each move dropped
+        its signed history and wrote its whole prefix again, more credits than an account in reserve has left."""
+        if self._usable(backend, exclude) and self._routable(backend, model_entry):
+            return True
+        try:
+            kind, candidates = self._candidates(self.backends, model_entry, exclude)
+        except apierr.ApiError:
+            return False
+        return kind != "ready" and backend in candidates
+
     def _state_refusal(self, backend, model_entry, exclude):
         """Why a stored conversation cannot return to its account now (a name for the journal), else None."""
         if backend is None:
@@ -989,7 +1015,7 @@ class SessionPool:
             return "account_excluded"
         if not account_enabled(backend):
             return "account_disabled"
-        if getattr(backend, "unavailable", None) is not None:
+        if getattr(backend, "unavailable", None) is not None and not self._keeps(backend, model_entry, exclude):
             return "account_unavailable"
         return None if self._routable(backend, model_entry) else "no_route"
 
@@ -1100,6 +1126,11 @@ class SessionPool:
             return None
         gate = reading = None
         try:
+            if getattr(store, "unsettled", None) is not None and store.unsettled(key):
+                # Its newest state is still on the way to the disk (the conversation was evicted right after its last
+                # request): the file holds the turn before, and restored from it the request writes its whole prefix
+                # again. The read waits for the writer, a few seconds at most, on the executor.
+                await asyncio.get_running_loop().run_in_executor(None, store.settle, key)
             meta = store.peek(key)
             if meta is None:
                 return None
@@ -1371,17 +1402,21 @@ class SessionPool:
                 and not getattr(self._conversations.get(key), "_cache_dependents", 0)]
         expired = [key for key in sorted(idle, key=lambda key: self._last_used.get(key, 0))
                    if ttl > 0 and now - self._last_used.get(key, now) >= ttl
-                   and not _kept_warm(self._conversations.get(key))]
+                   and not direct._kept_warm(self._conversations.get(key))]
         gone = set(expired)
         order = list(expired)
         if make_room:
             order += sorted((key for key in idle if key not in gone),
-                            key=lambda key: (_kept_warm(self._conversations.get(key)), self._rebuild_cost(key),
+                            key=lambda key: (direct._kept_warm(self._conversations.get(key)), self._rebuild_cost(key),
                                              self._last_used.get(key, 0)))
         closing = []
         for key in order:
             if key not in gone and len(self._conversation_locks) < capacity:
                 break
+            # The newest state of a conversation whose last write failed (or was dropped while the disk was paused) was
+            # retried only at its next release or at a stop: one evicted meanwhile came back with the turn before, and its
+            # next request wrote the whole prefix again. Urgent: the store's pause after a failure does not hold it back.
+            self._persist(key, urgent=True)
             session = self._conversations.pop(key, None)
             self._conversation_locks.pop(key, None)
             self._conversation_refs.pop(key, None)
@@ -1446,7 +1481,14 @@ class SessionPool:
         return parents
 
     def _touch_cache_parents(self, parents, delta, dependent=None):
-        for key, session in parents:
+        for key, _ in parents:
+            # The parent as the pool holds it now, not the session the child's lease found: a conversation that moved to
+            # another account while its child ran lives in a new session, which took the pin along (acquire), and the
+            # old one is closed. A parent the pool no longer holds is neither pinned nor warmed: nothing would end a
+            # cycle started on it, which would ping a prefix nobody continues until its idle limit.
+            session = self._shared if key is None else self._conversations.get(key)
+            if session is None:
+                continue
             # Never below zero: an unbalanced release must not corrupt the next request's pin.
             session._cache_dependents = max(0, getattr(session, "_cache_dependents", 0) + delta)
             if dependent is not None:
@@ -1457,6 +1499,15 @@ class SessionPool:
                     records.add(dependent)
                 else:
                     records.discard(dependent)
+                    if dependent.session is not None:
+                        # The request is over, not the child: a subagent whose request ended with a call of a 20-minute
+                        # test run comes back with its result, and the parent goes on from its whole prefix then. The
+                        # parent's keepwarm keeps it warm while the child is expected back (direct._dependents_live);
+                        # the lease count above stays what protects the parent from eviction.
+                        children = getattr(session, "_cache_children", None)
+                        if children is None:
+                            children = session._cache_children = weakref.WeakSet()
+                        children.add(dependent.session)
             session._last_request_at = time.time()
             if key in self._conversations:
                 self._last_used[key] = time.monotonic()
@@ -1523,8 +1574,7 @@ class SessionPool:
                                self._conversations.get((conversation_key, "text")))
             affinity_backend = (self.backend if self.mode == "shared" else
                                 affinity_parent.backend if affinity_parent is not None else None)
-            if affinity_backend is not None and not (self._usable(affinity_backend, exclude)
-                                                     and self._routable(affinity_backend, model_entry)):
+            if affinity_backend is not None and not self._keeps(affinity_backend, model_entry, exclude):
                 # Affinity is strict only while the account can still serve this model.
                 affinity_backend = None
             if affinity_backend is None and affinity_parent is None:
@@ -1571,8 +1621,7 @@ class SessionPool:
                                       or self.cfg.get("transport") == "direct"
                                       or len(self.backends) > 1):
                     parent = self._conversations.get(key)
-                    backend = (parent.backend if parent is not None and self._usable(parent.backend, exclude)
-                               and self._routable(parent.backend, model_entry)
+                    backend = (parent.backend if parent is not None and self._keeps(parent.backend, model_entry, exclude)
                                else affinity_backend or self._next_backend(model_entry, exclude))
                     self._check_route(backend, model_entry)
                     session = RelaySession(backend, await self._new_thread_id(backend))
@@ -1600,8 +1649,7 @@ class SessionPool:
                     await lock.acquire()
                     locked = True
                     session = self._conversations.get(key)
-                    if session is not None and not (self._usable(session.backend, exclude)
-                                                    and self._routable(session.backend, model_entry)):
+                    if session is not None and not self._keeps(session.backend, model_entry, exclude):
                         # The account ran out, was signed out or has no route for this
                         # model: move the conversation.
                         # Resolve the replacement first, so a 402/503 keeps the old state;
@@ -1612,6 +1660,12 @@ class SessionPool:
                             old = session
                             session = RelaySession(replacement, await self._new_thread_id(replacement))
                             carried = self._carry_history(key, old, session)
+                            # The children that run against this conversation pin it wherever it lives: their releases
+                            # find the new session by key (_touch_cache_parents), and it is not evicted while one of
+                            # them still works for it.
+                            for name in ("_cache_dependents", "_cache_dependent_records", "_cache_children"):
+                                if hasattr(old, name):
+                                    setattr(session, name, getattr(old, name))
                             self._conversations[key] = session
                             await old.aclose()
                             # Unless account_move_keeps_history took the signed branches along, the new account's first request

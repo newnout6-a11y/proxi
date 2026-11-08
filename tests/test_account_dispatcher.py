@@ -332,3 +332,113 @@ def test_service_empty_turn_is_not_resent_and_is_saved_once(tmp_path, monkeypatc
     asyncio.run(scenario())
     assert len(calls) == expected
     assert len(list(tmp_path.glob("*-body.json"))) == 1
+
+
+def test_a_balance_of_zero_is_exhausted_even_with_a_threshold_of_zero():
+    # min_account_balance 0 is allowed; 0.0 < 0 is false, so an empty account stayed in rotation and got no failover
+    account = Account("a")
+    manager = FakeManager(0.0)
+    value, _ = dispatcher([account], {account: manager}, min_account_balance=0)
+    assert value.check_balance(account) is True and account.unavailable["reason"] == "exhausted"
+    manager.available = 0.01
+    assert value.check_balance(account) is False and account.unavailable is None
+
+
+def test_a_local_debit_to_zero_forces_a_server_check_even_with_a_threshold_of_zero():
+    account = Account("a")
+    manager = FakeManager(0.0)
+    value, clock = dispatcher([account], {account: manager}, session_refresh_interval=0, min_account_balance=0)
+    value.state[account]["next_balance"] = clock.now + 10_000
+    assert value.due() == [(account, "balance")]
+
+
+def test_a_signed_out_account_below_the_threshold_says_so_and_is_no_reserve(capsys):
+    dead = Account("a", FakeRefresher([(False, "auth")] * DEAD_AFTER + [(True, None)]))
+    value, _ = dispatcher([dead], {dead: FakeManager(15.0)})
+    value.check_balance(dead)
+    assert dead.unavailable["reason"] == "exhausted"  # a reserve: 15 credits, below the threshold of 20
+    for _ in range(DEAD_AFTER):
+        value.refresh(dead)
+    assert dead.unavailable["reason"] == "auth_dead"  # no longer a reserve: nothing can run on it
+    assert "нужен новый вход" in capsys.readouterr().out
+    value.refresh(dead)  # a new sign-in: back to what its balance says
+    assert dead.unavailable["reason"] == "exhausted"
+
+
+def test_an_account_whose_hourly_pause_ends_while_its_balance_is_low_is_not_announced_as_back(capsys):
+    account = Account("a")
+    value, clock = dispatcher([account], {account: FakeManager(5.0)})
+    value.mark_rate_limited(account, retry_after=60)
+    value.check_balance(account)
+    assert account.unavailable["reason"] == "rate_limited"
+    capsys.readouterr()
+    clock.now += 61
+    assert value.release_rate_limited() is True
+    assert account.unavailable["reason"] == "exhausted"
+    output = capsys.readouterr().out
+    assert "снова в пуле" not in output and "баланс" in output
+
+
+def test_a_signed_out_account_gets_no_balance_checks_until_a_renewal_brings_it_back():
+    # its balance fetch meets a 401 and renews the session itself: one POST a minute, past the backoff of the renewals
+    refresher = FakeRefresher([(False, "auth")] * DEAD_AFTER + [(True, None)])
+    dead = Account("a", refresher)
+    manager = FakeManager(100.0)
+    value, clock = dispatcher([dead], {dead: manager})
+    for _ in range(DEAD_AFTER):
+        value.refresh(dead)
+    assert dead.unavailable["reason"] == "auth_dead"
+    state = value.state[dead]
+    state["next_balance"] = clock.now
+    state["next_refresh"] = clock.now + 600
+    for _ in range(10):  # ten minutes of ticks before the next scheduled renewal
+        clock.now += 59
+        jobs = value.due()
+        assert all(kind != "balance" for _, kind in jobs)
+        for backend, kind in jobs:
+            state["running"].discard(kind)
+    assert manager.fetches == 0
+    clock.now = state["next_refresh"]
+    assert value.due() == [(dead, "refresh")]
+    state["running"].clear()
+    value.refresh(dead)  # signed in again: the balance is checked at once
+    assert dead.unavailable is None
+    assert (dead, "balance") in value.due()
+
+
+@pytest.mark.parametrize("state", ["reserve", "signed_out"])
+def test_a_conversation_stays_on_its_degraded_account_when_no_account_is_better(tmp_path, state):
+    # every account below the reserve (or every one signed out): a conversation moved to another, equally degraded
+    # account on every request, and each move wrote its whole prefix again
+    _, pool, _ = setup(tmp_path, transport="direct", project_context=False)
+    other = Backend(tmp_path, provider_resource_name="other-account")
+    pool.backends.append(other)
+    first_account = pool.backends[0]
+
+    def degrade(backend, available):
+        backend.unavailable = ({"reason": "exhausted", "available": available, "threshold": 20.0} if state == "reserve"
+                               else {"reason": "auth_dead"})
+
+    async def scenario():
+        lease = await pool.acquire("chat")
+        assert lease.backend is first_account
+        first = lease.session
+        await pool.release(lease)
+        degrade(first_account, 9.0)
+        degrade(other, 11.0)  # "richer", or as signed out as the first
+        for _ in range(3):
+            lease = await pool.acquire("chat")
+            assert lease.session is first and lease.backend is first_account
+            await pool.release(lease)
+        # a new conversation still goes where a new one should
+        lease = await pool.acquire("another-chat")
+        if state == "reserve":
+            assert lease.backend is other
+        await pool.release(lease)
+        # once an account is healthy again, the conversation moves there
+        other.unavailable = None
+        lease = await pool.acquire("chat")
+        assert lease.backend is other
+        await pool.release(lease)
+
+    asyncio.run(scenario())

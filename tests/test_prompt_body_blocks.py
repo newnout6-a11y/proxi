@@ -448,3 +448,13 @@ def test_the_other_tool_result_shapes_are_edited_as_tool_results_too():
     result, changes = rewrite(legacy, "chat", drop_tag())
     assert result["messages"][2] == {"role": "function", "name": "lookup", "content": "found"}
     assert [(c["index"], c["target"]) for c in changes] == [(2, "tool_result")]
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("reminders", [2, 3])
+def test_several_leading_user_messages_that_go_cannot_pull_a_system_message_into_the_head_either(dialect, reminders):
+    data = conversation(dialect, [("user", REMINDER)] * reminders + [("system", "Late rule."), ("user", "more"),
+                                                                     ("assistant", "ok")])
+    result, changes = rewrite(data, dialect, drop_tag())
+    assert parse(dialect, result).system == "HEAD"  # the late rule stays where it was, outside the head
+    assert any(change.get("reason") == "would move a later system message into the head" for change in changes)

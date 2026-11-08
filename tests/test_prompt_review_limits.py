@@ -15,7 +15,7 @@ import apierr
 import prompt_body
 import prompt_policy as pp
 from prompt_support import client_request, prompt_relay  # noqa: F401
-from test_prompt_policy_common import OPENCODE_SYSTEM, Sources, compile_doc, document, make_store, profile_doc
+from test_prompt_policy_common import OPENCODE_SYSTEM, Sources, compile_doc, document, make_store
 
 KIB = 1024
 

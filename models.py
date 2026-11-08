@@ -1,4 +1,4 @@
-"""Audited model metadata; see docs/model-catalog-audit.md for provenance.
+"""Audited model metadata; see docs/reports/model-catalog-audit.md for provenance.
 
 Effort capabilities describe the Retool route rather than the provider-wide union.
 """
@@ -6,6 +6,7 @@ import collections
 import copy
 import datetime
 import fnmatch
+import console_log
 
 from apierr import ApiError, bad_request, not_found, service_unavailable
 
@@ -281,7 +282,7 @@ _BY_ID['claude-sonnet-4-5-20250929']['route_reason'] = (
     '2026-11-30; the relay stops publishing it on that date.')
 
 # Input limits Retool applies per route (COPILOT_MODEL_INPUT_CONTEXT_SIZE_MAP, see
-# docs/model-catalog-audit.md). A model missing here has no verified route limit, so discovery
+# docs/reports/model-catalog-audit.md). A model missing here has no verified route limit, so discovery
 # publishes no max_input_tokens for it.
 _ROUTE_INPUT_TOKENS = {
     'claude-opus-4-6': 872000, 'claude-opus-4-7': 872000, 'claude-opus-4-8': 872000, 'claude-opus-5': 872000,
@@ -947,10 +948,10 @@ def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade,
         entry, _ = resolve(base_name, None, strict=strict, default_model=default_model)
         levels = entry.get("reasoning_effort_levels") or []
         if not levels or not entry.get("reasoning", True):
-            print("[effort] %s -> None (reasoning not supported) for %s" % (extracted_effort, entry["id"]), flush=True)
+            console_log.write("[effort] %s -> None (reasoning not supported) for %s" % (extracted_effort, entry["id"]))
             return entry, None
         clamped = nearest_effort(levels, extracted_effort)
-        print("[effort] %s -> %s for %s" % (extracted_effort, clamped, entry["id"]), flush=True)
+        console_log.write("[effort] %s -> %s for %s" % (extracted_effort, clamped, entry["id"]))
         return entry, clamped
 
 

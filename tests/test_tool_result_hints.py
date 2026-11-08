@@ -16,8 +16,9 @@ import pytest
 import direct
 import native_history
 from prompt_support import prompt_relay, strip_cache  # noqa: F401 - prompt_relay is a fixture
-from test_compaction_cache import Chat, SUMMARY, tail_after
+from test_compaction_cache import Chat, tail_after
 from test_native_history import tool_reply
+from test_review_fixes_pr19 import response
 
 TOOLS = [{"name": "read"}]
 RESULT = "file contents " * 20
@@ -172,10 +173,11 @@ def test_a_compaction_reads_the_last_result_of_the_chat_and_does_not_hint_its_ow
 
 # --- the safety net --------------------------------------------------------------------------------------------------
 
-def refusing(relay, monkeypatch, status=400, message="Invalid request format", only_hinted=True):
+def refusing(relay, monkeypatch, status=400, message="Invalid request format", only_hinted=True, in_stream=()):
     """Retool refuses every body that carries a hint on a tool result (or every body, only_hinted=False); nothing else.
 
-    Returns the bodies it refused."""
+    The refusals numbered in `in_stream` (1-based) come the way Retool passes a provider's refusal on: an error event with the
+    provider's status inside an HTTP 200 stream. Returns the bodies it refused."""
     original = direct.urllib.request.urlopen
     refused = []
 
@@ -184,6 +186,8 @@ def refusing(relay, monkeypatch, status=400, message="Invalid request format", o
         if not only_hinted or direct._has_tool_result_hint(body["messages"]):
             relay.posts.append(body)
             refused.append(body)
+            if len(refused) in in_stream:
+                return response({"event": "error", "statusCode": status, "isRetryable": False, "error": {"message": message}})
             raise urllib.error.HTTPError(request_.full_url, status, "refused", {},
                                          io.BytesIO(message.encode() if message in ("", "{}")
                                                     else json.dumps({"message": message}).encode()))
@@ -251,6 +255,36 @@ def test_a_refusal_that_comes_back_is_not_taken_for_the_hints(prompt_relay, monk
     assert len(refused) == 2  # the hinted body, and once more without the hint, which fails the same way
     assert direct._has_tool_result_hint(refused[0]["messages"]) and not direct._has_tool_result_hint(refused[1]["messages"])
     assert direct._TOOL_RESULT_HINTS["refused"] is False  # the retry was not answered: the hint was not the cause
+
+
+CACHE_REFUSAL = "messages.3.content.0.tool_result.content.0.text.cache_control: Extra inputs are not permitted"
+
+
+def test_a_refusal_inside_the_stream_is_asked_again_without_the_hint_too(prompt_relay, monkeypatch):
+    """Retool passes a provider's refusal on as an error event inside an HTTP 200. The relay marks such an attempt as one whose
+    price is unknown before it raises the error, and that mark of its own was taken for the start of an answer: the request was
+    not asked again without the hint, the client got the 400, and every later request with a tool result carried the hint."""
+    relay = prompt_relay()
+    chat = Chat(relay, effort="max")
+    chat.work(1)
+    refused = refusing(relay, monkeypatch, message=CACHE_REFUSAL, in_stream={1})
+    second = chat.ask(tool_reply("c2", "opaque-2"))
+    assert len(refused) == 1 and direct._has_tool_result_hint(refused[0]["messages"])
+    assert not direct._has_tool_result_hint(second["messages"]) and direct._TOOL_RESULT_HINTS["refused"] is True
+    third = chat.ask(tool_reply("c3", "opaque-3"))
+    assert not any(kind == "result" for kind, _ in hinted(third["messages"])) and len(refused) == 1
+
+
+def test_a_retry_refused_inside_the_stream_is_not_taken_for_the_hints(prompt_relay, monkeypatch):
+    """The retry without the hint answered only by the relay's own mark of an unpriced attempt is no answer: the hints stay."""
+    relay = prompt_relay()
+    chat = Chat(relay, effort="max")
+    chat.work(1)
+    refused = refusing(relay, monkeypatch, only_hinted=False, in_stream={2})  # the retry fails inside the stream
+    with pytest.raises(AssertionError):
+        chat.ask(tool_reply("c2", "opaque-2"))
+    assert len(refused) == 2 and not direct._has_tool_result_hint(refused[1]["messages"])
+    assert direct._TOOL_RESULT_HINTS["refused"] is False
 
 
 def test_a_server_error_is_not_retried_without_the_hint(prompt_relay, monkeypatch):

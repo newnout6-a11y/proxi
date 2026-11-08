@@ -262,9 +262,10 @@ def test_policy_budget_accepts_exact_utf8_boundary_without_truncating(tmp_path, 
         assert sent[0][1]['messages'][0]['content'][0]['text'] == 'Роль: редактор'
 
 
-@pytest.mark.parametrize('output_chars', [150, 250, 2000])
+@pytest.mark.parametrize('output_chars, trimmed', [(150, False), (250, True), (2000, True)])
 @pytest.mark.parametrize('step_cap', [0, 1])
-def test_direct_exec_budget_counts_retained_chunks_and_trims_only_new_output(tmp_path, monkeypatch, output_chars, step_cap):
+def test_direct_exec_budget_counts_retained_chunks_and_trims_only_new_output(tmp_path, monkeypatch, output_chars, trimmed,
+                                                                             step_cap):
     from test_review_fixes_pr19 import END, response, text
     import direct
     _, _, runner = setup(tmp_path, transport='direct', base='https://fixture.invalid', project_context=False,
@@ -279,7 +280,10 @@ def test_direct_exec_budget_counts_retained_chunks_and_trims_only_new_output(tmp
     bodies, commands = [], []
     def opener(req, **kw):
         bodies.append(json.loads(req.data))
-        return response(text('<exec_command>synthetic-command</exec_command>' if len(bodies) == 1 else 'done'), *END)
+        # With the cap, the reply after the one command asks for another, so the summary request is sent and its body is
+        # held to the budget too (a reply that answers ends the turn at the cap: test_exec_step_cap.py).
+        asks = len(bodies) == 1 or (step_cap and len(bodies) == 2)
+        return response(text('<exec_command>synthetic-command</exec_command>' if asks else 'done'), *END)
     monkeypatch.setattr(direct.urllib.request, 'urlopen', opener)
     monkeypatch.setattr(executor, 'run_command', lambda command, *a, **kw: (commands.append(command) or 0, 'ж' * output_chars))
     p = request([{'role': 'user', 'content': 'ж' * 100}], tools=[], system='')
@@ -293,7 +297,10 @@ def test_direct_exec_budget_counts_retained_chunks_and_trims_only_new_output(tmp
         assert parts[0].startswith('POLICY')
         assert any('ж' * 100 in part for part in parts)
     assert 'synthetic-command' in json.dumps(bodies[1])
-    assert 'truncated to configured prompt byte limit' in json.dumps(bodies[1])
+    # A step adds only its reply and the result to the body (test_direct_exec_steps.py), not the client's message again:
+    # 150 characters of output fit whole beside that message, and only a longer output is trimmed to the budget.
+    assert ('truncated to configured prompt byte limit' in json.dumps(bodies[1])) is trimmed
+    assert trimmed or 'ж' * output_chars in bodies[1]['messages'][-1]['content'][0]['text']
 
 
 @pytest.mark.parametrize('system', ['\n\n', ' ', '\t\n'])

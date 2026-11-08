@@ -2,7 +2,6 @@
 import json
 import threading
 
-import pytest
 
 import journal
 

@@ -5,8 +5,7 @@ import json
 import pytest
 
 from prompt_support import account, client_request, prompt_relay  # noqa: F401 - prompt_relay is a fixture
-from test_compaction_cache import Chat, INSTRUCTION, SYSTEM, count, effort_fields
-from test_native_history import tool_reply
+from test_compaction_cache import Chat, SYSTEM, count, effort_fields
 
 DOCUMENT = {"version": 1, "profiles": {
     "low": {"head": "{{client_system}}", "generation": {"effort": "low"}},

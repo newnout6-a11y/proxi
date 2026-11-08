@@ -3,7 +3,6 @@ long (310s+) opus MAX turns, which otherwise expired mid-generation and forced
 a full 190k-token rewrite on the next turn (30+ credits per turn)."""
 import asyncio
 import time
-from types import SimpleNamespace
 
 import pytest
 

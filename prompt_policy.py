@@ -847,11 +847,13 @@ def _unrolled(node):
 _REPEAT_COUNT = re.compile(r"\{(?:\d+(?:,\d*)?|,\d*)\}")
 
 
-def _fuzzy_lookalike(pattern):
+def _fuzzy_lookalike(pattern, verbose=False):
     """True when a `{` that `re` takes for a literal brace starts a fuzzy-match constraint in the `regex` module.
 
     a{e<=1} matches only the text "a{e<=1}" in `re`, and "a" with one error in `regex`. A pattern written for `re` keeps
     its meaning only if such a brace is escaped, so the pattern is refused. Braces inside a character set are literal in both.
+    In verbose mode `regex` also skips the blanks inside the braces, and `re` does not: (?x)a{ e<=1} and (?x)a{ 2 } were
+    taken as literal text by the check and ran as a fuzzy match and a repeat count, so `verbose` looks past them.
     """
     index, size, in_set = 0, len(pattern), False
     while index < size:
@@ -872,10 +874,45 @@ def _fuzzy_lookalike(pattern):
             if counted:
                 index = counted.end()
                 continue
-            if index + 1 < size and (pattern[index + 1] in "deis" or pattern[index + 1].isdecimal()):
+            following = pattern[index + 1:].lstrip(" \t\n\r\f\v")[:1] if verbose else pattern[index + 1:index + 2]
+            if following and (following in "deis" or following.isdecimal()):
                 return True
         index += 1
     return False
+
+
+# A group that turns verbose mode on for its own part, (?x:...) or (?ix-m:...): the parser reports only the global flags.
+_SCOPED_VERBOSE = re.compile(r"\(\?[a-zA-Z]*x[a-zA-Z]*(?:-[a-zA-Z]*)?:")
+# The global flags a pattern may start with, and the one-character atom repeated "one or more" (greedy or possessive, not
+# lazy) that may start it: a set, a class escape or a plain character.
+_LEADING_FLAGS = re.compile(r"\(\?[aiLmsux]+\)")
+_LEADING_RUN = re.compile(r"(\[\^?\]?(?:\\.|[^\]\\])*\]|\\[dDsSwW]|[^\\\[\](){}|*+?.^$#\s])\+(?!\?)")
+
+
+def _starting_runs_once(pattern, tree):
+    """The pattern with (?<!C) in front when it starts with C+ for a one-character atom C, else the pattern as it is.
+
+    A search tried C+ at every position of a run of C and, where the rest failed, scanned the run to its end again: quadratic
+    on a long run (`[ \t]+$` on a table padded with blanks took 1.7-2.4 s for one run of 20k blanks, and the 1 s limit of an
+    operation decided whether the edit applied). A match that starts inside a run also matches from the start of that run
+    (the repeat takes the part before it as well), and the leftmost match is the one taken, so starting only where a run
+    starts finds the same matches; a repeat of at least one character never matches empty, so no empty match is lost
+    either. Patterns of another shape, and verbose ones (whose text this reading would misread), are left as they are."""
+    if not tree.data or tree.state.flags & re.VERBOSE or _SCOPED_VERBOSE.search(pattern):
+        return pattern
+    op, value = tree.data[0]
+    if op not in (_sre_const.MAX_REPEAT, getattr(_sre_const, "POSSESSIVE_REPEAT", None)):
+        return pattern
+    low, high, item = value
+    if low < 1 or high != _sre_const.MAXREPEAT or len(item.data) != 1 or item.data[0][0] not in (
+            _sre_const.IN, _sre_const.LITERAL, _sre_const.NOT_LITERAL):
+        return pattern
+    flags = _LEADING_FLAGS.match(pattern)
+    start = flags.end() if flags else 0
+    run = _LEADING_RUN.match(pattern, start)
+    if run is None:
+        return pattern
+    return pattern[:start] + "(?<!" + run.group(1) + ")" + pattern[start:]
 
 
 def _re_bits(flags):
@@ -932,11 +969,11 @@ def _compile_pattern(pattern, flags, path):
     if weight > MAX_PATTERN_WEIGHT:
         _err(path, "the pattern repeats too much: nested repeat counts make it about %d pieces long (up to %d are "
                    "allowed)" % (min(weight, 10 ** 12), MAX_PATTERN_WEIGHT))
-    if _fuzzy_lookalike(pattern):
+    if _fuzzy_lookalike(pattern, bool(tree.state.flags & re.VERBOSE) or bool(_SCOPED_VERBOSE.search(pattern))):
         _err(path, "a '{' that is not a repeat count (a{2,3}) starts a fuzzy-match constraint in the regex engine: "
                    "write \\{ for a literal brace")
     try:
-        return _regex.compile(pattern, _regex_bits(flags))
+        return _regex.compile(_starting_runs_once(pattern, tree), _regex_bits(flags))
     except (_regex.error, RecursionError, OverflowError, ValueError, MemoryError) as exc:
         _err(path, "invalid regular expression: %s" % exc, _brief_regex_error(exc))
 
@@ -970,6 +1007,11 @@ class RegexTimeout(EditRefused):
     """A pattern did not finish in its share: REGEX_TIMEOUT for one operation, REGEX_BUDGET seconds or REGEX_WORK characters for
     a call."""
     reason = "timeout"
+
+
+class OperationTimeout(RegexTimeout):
+    """One operation ran out of REGEX_TIMEOUT on its text: a matter of the pattern and the text (and of how busy the machine
+    is), unlike the budget of a whole call."""
 
 
 class EditTooLarge(EditRefused):
@@ -1007,18 +1049,23 @@ class Deadline:
     def run(self, call, size=0):
         """call(timeout) with the time that is left, after charging `size` characters of work; RegexTimeout when no work or
         time is left, or when the call used all of it."""
+        self.charge(size)
+        started = time.perf_counter()
+        try:
+            return call(min(self.per_operation, self.left))
+        except TimeoutError:
+            raise OperationTimeout("a regular expression ran out of time") from None
+        finally:
+            self.left -= time.perf_counter() - started
+
+    def charge(self, size):
+        """Count `size` characters of work as run (RegexTimeout when no work or time is left): an edit whose result for a
+        text is remembered counts as if it ran, so what the budget refuses is the same whether it was remembered or not."""
         if size > self.work:
             raise RegexTimeout("the work for regular expressions is spent")
         if self.left < _MIN_SLICE:
             raise RegexTimeout("the time for regular expressions is spent")
         self.work -= size
-        started = time.perf_counter()
-        try:
-            return call(min(self.per_operation, self.left))
-        except TimeoutError:
-            raise RegexTimeout("a regular expression ran out of time") from None
-        finally:
-            self.left -= time.perf_counter() - started
 
 
 def _limits(compiled, timeout):
@@ -2818,6 +2865,9 @@ def _signature(path):
 
 
 _PIXEL = "data:image/png;base64,AAAA"
+# The same pixel as the source of a Messages image: a URL source takes only an http(s) link, which the parse would
+# download, so the whole source becomes base64 data.
+_PIXEL_SOURCE = {"type": "base64", "media_type": "image/png", "data": "AAAA"}
 
 
 def _remote(url):
@@ -2825,7 +2875,7 @@ def _remote(url):
 
 
 def _offline(value):
-    """value with the remote images swapped for a data URL: preview parses a body and must not download anything."""
+    """value with the remote images swapped for an inline pixel: preview parses a body and must not download anything."""
     if isinstance(value, list):
         items = [_offline(item) for item in value]
         return items if any(new is not old for new, old in zip(items, value)) else value
@@ -2842,6 +2892,9 @@ def _offline(value):
             out = {**value, "url": _PIXEL}
         if out is not None:
             return out
+    source = value.get("source")
+    if value.get("type") == "image" and isinstance(source, dict) and source.get("type") == "url" and _remote(source.get("url")):
+        return {**value, "source": dict(_PIXEL_SOURCE)}
     for key, item in value.items():
         new = _offline(item)
         if new is not item:
@@ -2960,6 +3013,8 @@ class PromptStore:
         self._ring = collections.deque(maxlen=RECENT_LIMIT)
         self._watched = [str(self.path)]
         self._signature = ((str(self.path), None),)
+        # The runtime's prompt_stabilizer.Stabilizer (set by proxy.Runtime): preview shows the client's system as it holds it.
+        self.stabilizer = None
         self._missing_since = None
         self._checked = clock()
         with self._reload_lock:
@@ -3294,10 +3349,14 @@ class PromptStore:
     def _note(self, pin, now):
         """Say that the pins file is out of date when what it holds about this pin is not what the pin is now.
 
-        The touch is rough on purpose: the file hears of it when the stored one is PIN_TOUCH_INTERVAL old."""
+        The touch is rough on purpose: the file hears of it when the stored one is PIN_TOUCH_INTERVAL old. A pin on a revision
+        that has no fingerprint is never written (see _write_pins): only its move there is news for the file, which then
+        drops the row the pin had. Its touches were news too, and the file was rewritten once a second (with an fsync and two
+        folder scans, on the request thread) for as long as the conversation went on."""
         disk = pin.disk
+        named = pin.print is not None or pin.rev == LEGACY_REV
         if (disk is None or disk[0] != pin.print or disk[1] != pin.profile
-                or now - pin.disk_touched >= PIN_TOUCH_INTERVAL):
+                or (named and now - pin.disk_touched >= PIN_TOUCH_INTERVAL)):
             self._dirty = True
 
     def _trim_pins(self, now):
@@ -3687,6 +3746,7 @@ class PromptStore:
         rows, marks = [], []
         for key, pin, rev, print_, profile, created, touched in live:
             if print_ is None and rev != LEGACY_REV:
+                marks.append((pin, None, profile, touched))  # known as not written, so _note does not ask again
                 continue                # a revision with no fingerprint cannot be named after a restart
             if print_ is not None and not stored(print_):
                 continue
@@ -3809,7 +3869,10 @@ class PromptStore:
         inp = PlanInput.from_request(parsed, identity, headers, dialect)
         plan = self._select(snapshot, inp, False)
         if plan.legacy:
-            return self._preview_legacy(plan, inp, parsed, identity, cfg, snapshot)
+            held = self._held_client_prompt(parsed)
+            result = self._preview_legacy(plan, inp, parsed, identity, cfg, snapshot)
+            result["warnings"].extend(held)
+            return result
         warnings = []
         history_changes, tools_changes, after = [], [], parsed
         body_unmatched = []
@@ -3835,6 +3898,8 @@ class PromptStore:
         if after is not parsed:
             # Who owns the request and whether it is a relay task follow the body the client sent (plan I9), as at run time.
             after.prompt_origin = orchestrator.client_origin(parsed)
+        # Last, as at run time (proxy._stabilize_prompt runs on the request the turn runs on, after the body edits).
+        warnings.extend(self._held_client_prompt(after))
         native_tools = after.tools or []
         owned = orchestrator._client_owns_instructions(after, orchestrator._purpose(after), native_tools)
         contract = structured_contract(snapshot, after.structured_output, tools=bool(native_tools),
@@ -3847,6 +3912,22 @@ class PromptStore:
             warnings.append(_PLACEHOLDER_WARNING)
         return self._preview_result(plan, inp, head, parts, history_changes, tools_changes, report, warnings,
                                     body_unmatched)
+
+    def _held_client_prompt(self, parsed):
+        """Give `parsed` the client's system as the relay holds it (prompt_stabilizer, without remembering anything) and
+        return the note that says so. The preview showed the system as the client sent it: for OpenCode, which lists a
+        skill from whichever folder its process met first, another location and another head than the model got."""
+        stabilizer = getattr(self, "stabilizer", None)
+        if stabilizer is None or not getattr(parsed, "system", None):
+            return []
+        try:
+            system, done = stabilizer.look(parsed.system)
+        except Exception:  # noqa: BLE001 - the preview then shows the system as the client sent it, as before
+            return []
+        if not done:
+            return []
+        parsed.system = system
+        return ["the client's system prompt is shown as the relay holds it (%s)" % ", ".join(done)]
 
     @staticmethod
     def _preview_result(plan, inp, head, parts, history_changes, tools_changes, report, warnings, body_unmatched=()):

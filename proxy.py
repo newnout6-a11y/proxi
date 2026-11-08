@@ -1,4 +1,4 @@
-"""OpenAI/Anthropic compatible relay over the Retool AI agent WebSocket."""
+"""OpenAI/Anthropic compatible relay over the Retool AI direct streaming protocol (POST /api/gpt/copilotStreamGPT)."""
 import asyncio
 import argparse
 import concurrent.futures
@@ -83,14 +83,17 @@ class RateLimiter:
         self.lock = threading.Lock()
 
     def take(self):
-        if self.rate <= 0:
-            return 0.0
+        # The rate is read under the lock the admin's settings save changes it under: read before the lock, a limit turned
+        # off between the look and the lock divided by zero (a 500 for the request that was taking a token)
         with self.lock:
+            rate = self.rate
+            if rate <= 0:
+                return 0.0
             now = time.monotonic()
-            self.tokens = min(self.burst, self.tokens + (now - self.stamp) * self.rate)
+            self.tokens = min(self.burst, self.tokens + (now - self.stamp) * rate)
             self.stamp = now
             if self.tokens < 1.0:
-                return max(0.05, (1.0 - self.tokens) / self.rate)
+                return max(0.05, (1.0 - self.tokens) / rate)
             self.tokens -= 1.0
             return 0.0
 
@@ -101,6 +104,7 @@ class Runtime:
         self.loop = asyncio.new_event_loop()
         self._lifecycle_lock = threading.Lock()
         self._closing = False
+        self._turns = {}  # id(holder) -> holder of each turn in flight: its cancel event is set when the relay stops
         # Each direct turn holds one executor thread for its whole stream; the
         # default pool (~min(32, cpu+4)) silently capped concurrent turns below
         # max_workers and starved keepwarm pings / refreshes behind them.
@@ -108,6 +112,11 @@ class Runtime:
         self.loop._relay_io_executor = self._io_executor
         self._loop_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self._loop_thread.start()
+        # First, before anything that reports to it: PromptStore journals prompt.reload and prompt.pins_loaded (or their
+        # errors) as it reads prompts.json and the pins. Configured after it, the journal held those events without a file:
+        # they never reached journal.jsonl, and the restored history of the last run buried or evicted them.
+        self.journal = journal.JOURNAL
+        self.journal.configure(cfg, cfg.get("journal_path"))
         self.backend = Backend(cfg)
         self.pool = SessionPool(self.backend)
         if getattr(self.pool, "backends", None):
@@ -134,11 +143,13 @@ class Runtime:
         self.tool_search_guard = tool_search_policy.LoopGuard()
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
         self.started = time.time()
-        self.journal = journal.JOURNAL
-        self.journal.configure(cfg, cfg.get("journal_path"))
         self.admin = admin_module.Admin(self)
         # After the journal is configured: scanning the stored conversations reports what it removed.
         self.pool.attach_store(conversation_state.open_store(cfg))
+        # The pool let an idle conversation go only when some request came by: a relay that went quiet kept every pooled
+        # conversation (its warm body, its signed history, the chunks of its last request: a few times the size of the
+        # conversation each) in memory until the next request of any conversation, hours later.
+        self.loop.call_soon_threadsafe(self._sweep_idle)
         # Where what the relay learns about its clients is kept between runs (the union of tools, the skill locations):
         # the folder of the stored conversations, which the store above has made.
         folder = cfg.get("conversation_state_dir") if cfg.get("conversation_state", True) else None
@@ -152,6 +163,7 @@ class Runtime:
         # The parts of a client's system prompt that change without the conversation changing (prompt_stabilizer).
         self.stabilizer = prompt_stabilizer.Stabilizer(
             cfg, os.path.join(folder, prompt_stabilizer.FILE_NAME) if folder else None)
+        self.prompts.stabilizer = self.stabilizer  # the admin's preview shows the client's system as it is held
 
     def submit(self, coroutine):
         with self._lifecycle_lock:
@@ -160,8 +172,53 @@ class Runtime:
                 raise apierr.service_unavailable("relay is shutting down")
             return asyncio.run_coroutine_threadsafe(coroutine, self.loop)
 
+    def submit_turn(self, parsed, events, holder):
+        """runner.run for one request, with its holder known to _shutdown_tasks until the turn ends."""
+        turns = self._turns
+
+        async def turn():
+            try:
+                return await self.runner.run(parsed, events, holder)
+            finally:
+                turns.pop(id(holder), None)
+
+        turns[id(holder)] = holder
+        try:
+            return self.submit(turn())
+        except BaseException:
+            turns.pop(id(holder), None)
+            raise
+
+    def _sweep_idle(self):
+        """Closes the conversations past conversation_idle_timeout whose cache is not kept warm, without waiting for a request.
+
+        A timer on the loop, where the pool's state lives: each look runs as a short task and sets the next timer when it
+        ends, and nothing more is set once the relay is stopping (_shutdown_tasks cancels a look that is running)."""
+        if getattr(self.loop, "_relay_closing", False):
+            return
+        ttl = float(self.pool.cfg.get("conversation_idle_timeout", 900) or 900)
+
+        def look():
+            if not getattr(self.loop, "_relay_closing", False):
+                self.loop.create_task(self.pool._evict_idle()).add_done_callback(looked)
+
+        def looked(task):
+            if not task.cancelled() and task.exception() is not None:  # the next request evicts as before
+                journal.emit("session.sweep_error", "Проверка простаивающих диалогов не удалась: %s"
+                             % type(task.exception()).__name__, "debug")
+            self._sweep_idle()
+
+        self.loop.call_later(min(60.0, max(1.0, ttl / 2)), look)
+
     async def _shutdown_tasks(self):
         self.loop._relay_closing = True
+        # A relay exec command runs in a thread that only its turn's cancel event stops (executor.run_command polls it), and
+        # the interpreter waits for that thread at exit: cancelling the turn's task left the process alive until the
+        # command ended or command_timeout (300 s) killed it, and a second Ctrl+C did nothing.
+        for holder in tuple(self._turns.values()):
+            event = holder.get("cancel_event")
+            if event is not None:
+                event.set()
         # Conversations that moved since their last stored copy go to the writer before turns are cancelled.
         self.pool.persist_pending()
         sessions = {record[0] for record in self.pool._active.values()}
@@ -257,6 +314,40 @@ class SlottedRequestHandler(BaseHTTPRequestHandler):
                 self.server.release_slot()
 
 
+# A refusal sent before the request body was read (413 over max_body_bytes, 415, a wrong key's 401) goes to a client that is
+# usually still sending that body. Closed with the body unread, the connection is reset, and on Windows the reset throws away
+# the answer the client has not read yet: Claude Code, Node and Python clients saw ECONNRESET or WinError 10053 instead of
+# the 413, took it for a network error and asked again, to the same end. Such a connection is closed in stages instead: the
+# relay shuts its sending side after the answer and reads what the client still sends until the client closes, for at most
+# this long and this many times max_body_bytes, so a slow or endless sender cannot keep the thread.
+LINGER_SECONDS = 3.0
+LINGER_BODIES = 4
+
+
+def linger_close(sock, limit):
+    """Shut the sending side of `sock`, then read and discard what the client still sends until it closes its side, for at
+    most LINGER_SECONDS and about `limit` bytes. The caller closes the socket: with nothing left unread, that close is no
+    reset."""
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        return
+    deadline = time.monotonic() + LINGER_SECONDS
+    buffer = bytearray(65536)
+    try:
+        while limit > 0:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            sock.settimeout(left)
+            received = sock.recv_into(buffer)
+            if not received:
+                return  # the client has read the answer and closed its side
+            limit -= received
+    except OSError:  # the time ran out, or the client reset the connection itself
+        return
+
+
 def make_handler(runtime: Runtime):
     cfg = runtime.cfg
 
@@ -291,7 +382,8 @@ def make_handler(runtime: Runtime):
         def _json(self, status, payload, extra=None):
             self._status = status
             self._response_started = True
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            # backslashreplace: an error that echoes a lone surrogate of the client (U+D83D alone) still reaches the client
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8", "backslashreplace")
             self.send_response(status)
             self.send_header("content-type", "application/json; charset=utf-8")
             self.send_header("content-length", str(len(body)))
@@ -401,6 +493,7 @@ def make_handler(runtime: Runtime):
             self.request_id = uuid.uuid4().hex[:12]
             context_token = client_context.bind({"request_id": self.request_id})
             self._started = time.time()
+            self._request_started_monotonic = time.monotonic() - max(0.0, getattr(self, "_slot_wait", 0.0) or 0.0)
             # Keep-alive reuses the handler: a stale status from the previous
             # request (e.g. a 404 probe) must not leak into this log line.
             self._status = 0
@@ -415,6 +508,8 @@ def make_handler(runtime: Runtime):
             self._response_started = False
             self._client_trace = None
             self._adapter = None
+            self._body_read = False
+            self._client_left = False
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -422,7 +517,8 @@ def make_handler(runtime: Runtime):
             route = ROUTES.get((self.command, path))
             # /v1/responses clients need their own error envelope: a chat-shaped
             # error without type:"error" leaves a strict SDK waiting forever.
-            dialect = {"anthropic": "anthropic", "responses": "responses"}.get(route, "chat")
+            # count_tokens is a route of the Messages API: its errors take Anthropic's envelope too.
+            dialect = {"anthropic": "anthropic", "count_tokens": "anthropic", "responses": "responses"}.get(route, "chat")
             try:
                 self._log_route = route
                 if admin_module.is_admin_path(path):
@@ -434,6 +530,8 @@ def make_handler(runtime: Runtime):
                         raise apierr.method_not_allowed()
                     raise apierr.not_found()
                 if route != "health":
+                    # A source past its budget of wrong keys is refused before its key is compared (auth.py).
+                    self._throttle_auth_failure(failed=False)
                     query = parse_qs(parsed_url.query)
                     try:
                         auth.verify(self.headers, (query.get("key") or [""])[0], cfg["relay_api_key"])
@@ -473,6 +571,7 @@ def make_handler(runtime: Runtime):
                     self._health()
             except apierr.ApiError as err:
                 self._error_code = err.code
+                self._close_if_body_unread()
                 self._log_error(err)
                 if err.status >= 400 and not getattr(err, "expected", False):
                     console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
@@ -481,6 +580,7 @@ def make_handler(runtime: Runtime):
                 else:
                     self._respond_error(err, dialect)
             except Exception as exc:  # never leak a bare traceback
+                self._close_if_body_unread()
                 console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]))
                 self._error_code = "internal_error"
                 journal.emit("http.exception", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "error",
@@ -491,6 +591,7 @@ def make_handler(runtime: Runtime):
                 else:
                     self._respond_error(err, dialect)
             finally:
+                self._close_if_body_unread()
                 try:
                     self._log()
                 finally:
@@ -510,6 +611,22 @@ def make_handler(runtime: Runtime):
                     # collector frees, a few turns later, so a 300k-token conversation held 10 MB per turn more than it used
                     # (RSS 203 MB after 30 turns, 81 MB with this). The next request of a kept-alive connection sets them again.
                     self._writer = self._adapter = self._holder = None
+        def _close_if_body_unread(self):
+            """A request answered without reading the body it declared (a wrong key, an unknown route, a disabled API) leaves
+            that body on the connection: kept alive, the next request was read glued to it and failed with 400 or 501 (or
+            the body, itself an HTTP request, was run). Such a connection is closed after the answer, in stages (finish)."""
+            declared = (self.headers is not None and (self.headers.get("transfer-encoding")
+                        or (self.headers.get("content-length") or "0").strip() not in ("", "0")))
+            if declared and not getattr(self, "_body_read", False):
+                self.close_connection = True
+                self._linger = True
+
+        def finish(self):
+            super().finish()
+            # After the last request of the connection, so the max_workers slot is already free (SlottedRequestHandler).
+            if getattr(self, "_linger", False):
+                linger_close(self.connection, LINGER_BODIES * cfg["max_body_bytes"])
+
         def _stream_failure(self, dialect, err):
             """End a stream that failed after it started. Only Responses has a terminal failure event."""
             payload = self._error_payload(dialect, err)
@@ -554,15 +671,18 @@ def make_handler(runtime: Runtime):
             # and responses routes; the flat responses shape is for SSE events only.
             body = self._error_payload("chat" if dialect == "responses" else dialect, err)
             extra = dict(getattr(err, "headers", None) or {})
+            if self.close_connection:
+                extra["connection"] = "close"  # the client must not send its next request on this connection
             retry_after = apierr.retry_after_header(err.retry_after)
             if retry_after:
                 extra["retry-after"] = retry_after
             self._json(err.status, body, extra or None)
 
-        def _throttle_auth_failure(self):
+        def _throttle_auth_failure(self, failed=True):
             # rate_limit_rps is off by default and covers only completions, so key
             # brute-forcing gets its own always-on budget per source address.
-            wait = auth.register_auth_failure(self.client_address[0])
+            source = self.client_address[0]
+            wait = auth.register_auth_failure(source) if failed else auth.auth_failure_wait(source)
             if wait:
                 raise apierr.too_many_requests("too many auth failures", round(wait, 1))
 
@@ -736,7 +856,9 @@ def make_handler(runtime: Runtime):
                 self.close_connection = True
                 raise apierr.ApiError(415, "unsupported_media_type", "content-type must be application/json")
             try:
-                return self.rfile.read(length)
+                body = self.rfile.read(length)
+                self._body_read = True
+                return body
             except Exception:
                 # The body was not fully consumed: keep-alive would parse the
                 # remainder as the next request line.
@@ -871,15 +993,17 @@ def make_handler(runtime: Runtime):
                     raise unavailable
 
             events = queue.Queue()
-            holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
+            holder = {"reason": "stop", "session": None, "cancel_event": threading.Event(),
+                      "_request_started_monotonic": self._request_started_monotonic}
             self._holder = holder
             self._model_called = True
-            fut = runtime.submit(runtime.runner.run(parsed, events, holder))
+            fut = runtime.submit_turn(parsed, events, holder)
 
             prompt_text = parsed.system + "\n" + parsed.prompt
             if not parsed.stream:
                 adapter = adapters.for_dialect(dialect, parsed)
                 reason = self._collect(fut, events, adapter, prompt_text, holder)
+                self._refuse_cut_reply(reason, fut)
                 payload = adapter.end(reason, prompt_text)
                 self._json(200, payload, compatibility_headers)
                 return
@@ -897,7 +1021,18 @@ def make_handler(runtime: Runtime):
             self._stream_status = 200
             adapter.begin()
             reason = self._pump(fut, events, adapter, holder, writer)
+            self._refuse_cut_reply(reason, fut)
             adapter.end(reason, prompt_text)
+
+        def _refuse_cut_reply(self, reason, fut):
+            """A turn the relay cancelled while its client was still there (the relay is stopping) is an error, not an answer.
+
+            The adapters end a "cancelled" turn as a normal one (stop, end_turn, completed): meant for a client that already
+            left, it gave a client that was still reading when the relay stopped a half or empty reply as final, with a cut
+            tool call marked complete, and Claude Code and Codex did not ask again. A 503 (an error event once streaming) is
+            what they retry."""
+            if (reason == "cancelled" or fut.cancelled()) and not self._client_left:
+                raise apierr.service_unavailable("the relay is shutting down: the reply was cut, ask again")
 
         def _refuse_tool_search(self, data, dialect):
             """Turn down Claude Code's tool search so that it loads every tool up front (see tool_search_policy).
@@ -953,7 +1088,18 @@ def make_handler(runtime: Runtime):
             key = tool_union.client_key(family, self.headers, parsed)
             if key is None:
                 return
-            merged, carried = union.apply(key, parsed.tools)
+            merged, carried = union.apply(key, parsed.tools, getattr(parsed, "conversation_key", None))
+            hidden = tool_union.hide_patterns(getattr(parsed, "prompt_plan", None)) if carried else []
+            if hidden:
+                # A tool the profile hides is never carried in: another conversation of the key may declare it because its
+                # hide was refused (its history called the tool), and the union used to hand it to every other one.
+                dropped = {tool["function"]["name"] for tool in merged
+                           if tool.get("function", {}).get("name") in carried
+                           and any(pattern.fullmatch(name.lower()) for pattern in hidden
+                                   for name in tool_union.client_names(tool))}
+                if dropped:
+                    merged = [tool for tool in merged if tool.get("function", {}).get("name") not in dropped]
+                    carried = [name for name in carried if name not in dropped]
             if union.announce(key, carried) and carried:
                 journal.emit("tools.carried",
                              "Клиент объявил %d инструментов, ещё %d взяты из его прежних запросов: список для модели не меняется"
@@ -994,7 +1140,13 @@ def make_handler(runtime: Runtime):
                 return
             if not parsed.tools or not digests:
                 return
-            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests)
+            stored = getattr(runtime.pool, "has_stored", None)
+            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests, stored)
+            if how == "stored":
+                journal.emit("conversation.inferred",
+                             "Запрос без идентификатора диалога: продолжен сохранённый диалог (после перезапуска relay)",
+                             "info", request_id=self.request_id, messages=len(digests), how="stored",
+                             conversation=journal.tag(parsed.conversation_key))
             if how == "new":
                 journal.emit("conversation.inferred",
                              "Запрос без идентификатора диалога: начат диалог по его истории (%d сообщений)" % len(digests),
@@ -1171,6 +1323,7 @@ def make_handler(runtime: Runtime):
                 trace.event("relay_event", event=item)
 
         def _cancel_turn(self, fut, holder):
+            self._client_left = True  # the turn was cancelled because its client went away (or the write to it failed)
             event = holder.get("cancel_event")
             if event is not None:
                 event.set()
@@ -1322,7 +1475,8 @@ def startup_warnings(runtime):
     """Conditions that make requests fail later without any other hint, in banner order."""
     backends = getattr(runtime.accounts, "backends", None)
     hidden = model_catalog.default_model_warning(runtime.cfg, backends)
-    return ([hidden] if hidden else []) + list(runtime.cfg.get("config_warnings") or [])
+    short = auth.short_key_warning(runtime.cfg.get("relay_api_key"))
+    return [text for text in (hidden, short) if text] + list(runtime.cfg.get("config_warnings") or [])
 
 
 def banner_lines(cfg, balance, warnings=()):
@@ -1369,7 +1523,7 @@ def main(argv=None):
         r.start()  # no-op for accounts the dispatcher schedules
     balance = startup_balance(runtime)
     for line in banner_lines(cfg, balance, warnings):
-        print(line)
+        console_log.write(line)
 
     stop_requested = threading.Event()
 
@@ -1377,7 +1531,7 @@ def main(argv=None):
         if stop_requested.is_set():
             return
         stop_requested.set()
-        print("\nshutting down…")
+        console_log.write("shutting down…")
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1387,7 +1541,7 @@ def main(argv=None):
             pass
 
     def _thread_crash(args):
-        print("thread crash:", args.exc_type.__name__, args.exc_value, flush=True)
+        console_log.write("thread crash: %s %s" % (args.exc_type.__name__, args.exc_value))
 
     threading.excepthook = _thread_crash
 
@@ -1399,7 +1553,7 @@ def main(argv=None):
             except Exception as exc:  # never lose the listener on a stray error
                 if stop_requested.is_set():
                     break
-                print("serve_forever crashed:", exc, flush=True)
+                console_log.write("serve_forever crashed: %s" % exc)
                 time.sleep(0.5)
     finally:
         try:

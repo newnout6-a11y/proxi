@@ -347,3 +347,40 @@ def test_a_replacement_follows_the_rules_of_python_re_templates(dialect):
     result, _ = edit(dialect, {"tool": "bash", "op": "replace_regex", "pattern": r"(?P<verb>\w+) a (\w+)",
                                "with": r"\g<2> \g<verb> \\ \n!"})
     assert description(result["tools"][0], dialect) == "command Run \\ \n!."
+
+
+def test_a_chat_custom_tool_in_its_nested_form_is_edited_and_hidden():
+    def chat(*extra_messages):
+        data = conversation("chat", TURNS)
+        data["messages"].extend(extra_messages)
+        data["tools"] = [{"type": "custom", "custom": {"name": "apply_patch", "description": "Patch files."}},
+                         {"type": "function", "function": {"name": "read", "description": "Read.",
+                                                           "parameters": {"type": "object"}}}]
+        return data
+
+    result, changes = prompt_body.rewrite(chat(), "chat", profile(tools=[
+        {"tool": "apply_patch", "op": "append", "text": "Small patches."}]), FakeSnapshot())
+    assert result["tools"][0]["custom"]["description"] == "Patch files.\n\nSmall patches." and len(changes) == 1
+    result, changes = prompt_body.rewrite(chat(), "chat", profile(tools=[{"tool": "apply_patch", "hide": True}]),
+                                          FakeSnapshot())
+    assert [tool.get("type") for tool in result["tools"]] == ["function"] and changes[0]["op"] == "hide"
+    # a conversation that already called it keeps it: the hide is refused, as for any other tool
+    called = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Begin Patch"}}]}
+    result, changes = prompt_body.rewrite(chat(called), "chat", profile(tools=[{"tool": "apply_patch", "hide": True}]),
+                                          FakeSnapshot())
+    assert len(result["tools"]) == 2
+    assert [change.get("reason") for change in changes if change.get("op") == "hide"] == [
+        "the conversation already called the tool"]
+
+
+def test_a_server_tool_the_history_already_used_is_not_hidden():
+    data = conversation("anthropic", TURNS, tools=SPECS)
+    data["tools"].append({"type": "web_search_20250305", "name": "web_search"})
+    data["messages"].append({"role": "assistant", "content": [
+        {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "x"}}]})
+    result, changes = prompt_body.rewrite(data, "anthropic", profile(tools=[{"tool": "web_search", "hide": True}]),
+                                          FakeSnapshot())
+    assert any(tool.get("name") == "web_search" for tool in result["tools"])
+    assert [change.get("reason") for change in changes if change.get("op") == "hide"] == [
+        "the conversation already called the tool"]

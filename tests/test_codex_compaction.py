@@ -7,13 +7,16 @@ prefix starts with the tools, so the request shared nothing with the chat and wr
 plus its instruction: the live replays read 34,118 of 34,121 tokens (gpt-6.1-sol, 0.13 credits) and 60,446 of 60,616 (Opus, 0.50).
 A tool call must never reach Codex in reply to it: its summary is the last assistant message of its history.
 """
+import io
 import json
+import urllib.error
 
 import pytest
 
 import admin
 import compaction_tools
 import config
+import direct
 from prompt_support import client_request, prompt_relay  # noqa: F401 - prompt_relay is a fixture
 from test_compaction_cache import SYSTEM, Chat, count, effort_fields, tail_after, thinking, OPENCODE
 from test_compaction_tail_cache import flags
@@ -243,6 +246,56 @@ def test_a_second_call_sends_the_request_codex_made_and_the_summary_still_arrive
     assert PROMPT[:50] in json.dumps(posted[2]["messages"][-1])
     assert [event["data"]["tools_kept"] for event in relay.events(mark, "turn.compaction_tool_call")] == [True, False]
     assert count(relay, mark, "turn.error") == 0 and count(relay, mark, "tool.call") == 0
+
+
+def app_builder_refuses(relay, monkeypatch, model):
+    """Retool answers a body of `model` that carries the App Builder marker (metadata.sandpackAgent) as it answers a model that
+    is only on the Assist list: HTTP 400 "<model> is not available right now". Every POST is kept in relay.posts."""
+    original = direct.urllib.request.urlopen
+
+    def app_builder(request_, **kwargs):
+        body = json.loads(request_.data)
+        if "metadata" in body and body["model"] == model:
+            relay.posts.append(body)
+            raise urllib.error.HTTPError(request_.full_url, 400, "Bad Request", {}, io.BytesIO(json.dumps({
+                "message": "%s is not available right now. Please try again later or select a different model." % model}).encode()))
+        return original(request_, **kwargs)
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", app_builder)
+
+
+@pytest.mark.parametrize("model", ["gpt-5.2", "claude-haiku-4-5-20251001"])
+def test_the_request_codex_made_goes_without_the_app_builder_marker_for_a_model_of_the_assist_list(prompt_relay, monkeypatch,
+                                                                                                    model):
+    """A model of the Assist list goes to Retool without the App Builder marker, which that route refuses. The two tries with the
+    chat's tools went without it, but the third one, the request Codex made, is built anew, and it carried the marker: the
+    compaction failed with "not available right now" after two paid tries."""
+    monkeypatch.setattr(direct, "_ASSIST_ONLY", set(direct._ASSIST_SEEDS))
+    relay = prompt_relay()
+    app_builder_refuses(relay, monkeypatch, model)
+    chat = codex_chat(relay, model=model)
+    chat.work(2)
+    mark = relay.mark()
+    payload, posted = compact(chat, [tool_reply("c3", "opaque-3"), tool_reply("c4", "opaque-4"), SUMMARY])
+    assert ["metadata" in body for body in posted] == [False, False, False]
+    assert "tools" not in posted[2] and payload["output_text"].startswith("## Progress")
+    assert count(relay, mark, "upstream.assist_retry") == 0
+
+
+def test_a_compaction_that_finds_its_model_on_the_assist_list_sends_the_request_codex_made_without_the_marker_too(
+        prompt_relay, monkeypatch):
+    """A model the route refuses with the marker is asked again without it (the assist retry), and that retry starts the guarded
+    compaction over: its third try was built with the marker again, and the 400 it got reached Codex."""
+    monkeypatch.setattr(direct, "_ASSIST_ONLY", set(direct._ASSIST_SEEDS))
+    relay = prompt_relay()
+    chat = codex_chat(relay)
+    chat.work(2)
+    app_builder_refuses(relay, monkeypatch, chat.model)  # the route no longer serves the model with the marker
+    mark = relay.mark()
+    payload, posted = compact(chat, [tool_reply("c3", "opaque-3"), tool_reply("c4", "opaque-4"), SUMMARY])
+    assert ["metadata" in body for body in posted] == [True, False, False, False]
+    assert "tools" not in posted[3] and payload["output_text"].startswith("## Progress")
+    assert count(relay, mark, "upstream.assist_retry") == 1
 
 
 def test_a_streamed_compaction_gets_no_call_either(prompt_relay):

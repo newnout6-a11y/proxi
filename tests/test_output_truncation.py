@@ -18,7 +18,7 @@ import direct
 from prompt_support import client_request, prompt_relay  # noqa: F401 - prompt_relay is a fixture
 from test_native_context_reuse import FIRST, request, run
 from test_native_history import TOOLS, close, harness
-from test_review_fixes_pr19 import response, text
+from test_review_fixes_pr19 import text
 
 CAP = 64
 CUT_ARGS = '{"path": "a.py", "limit": "3", "note": "hel'
@@ -323,3 +323,37 @@ def test_every_dialect_answers_an_empty_reply_at_the_cap_with_length_not_an_erro
     else:
         assert anthropic["stop_reason"] == "max_tokens" and chat["choices"][0]["finish_reason"] == "length"
         assert responses["status"] == "incomplete"
+
+
+# A custom tool of Chat: the model writes its input inside the envelope {"input": ...} it was offered the tool as, and the
+# relay hands the input on only once that is whole, so a call the output stopped inside has no input to hand on.
+PATCH_TOOL = {"type": "custom", "custom": {"name": "apply_patch", "description": "Patch the client's files"}}
+CUT_PATCH = '{"input": "*** Begin Patch\\n*** Add File: a.py\\n+print(1'
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model, cap", [("gpt-5", "max_completion_tokens"), ("claude-opus-5-5", "max_tokens")])
+def test_a_chat_custom_call_the_output_stopped_inside_ends_with_length_not_an_error(prompt_relay, stream, model, cap):
+    """The cut is told as a cut, as for a function call: the turn ends "length", and the call, which has no input, is
+    dropped. It was a 502 upstream_error (in a stream an error event and no finish_reason), with an error-level
+    http.error in the journal, for a reply that only reached its limit (GPT keeps the cap; on Claude the relay's cap
+    lets the call through as it stands); an OpenAI SDK asks again, and pays again, after a 502."""
+    relay = prompt_relay()
+    relay.scripts.append([{"event": "content_block_start", "type": "tool_call", "toolCallId": "p1",
+                           "toolName": "apply_patch"}, call_delta(CUT_PATCH[:24]), call_delta(CUT_PATCH[24:]),
+                          usage(CAP), END_OF_STREAM])
+    mark = relay.mark()
+    status, payload, headers = relay.post("chat", {"model": model, cap: CAP, "stream": stream, "tools": [PATCH_TOOL],
+                                                   "messages": [{"role": "user", "content": "add a.py"}]})
+    assert status == 200
+    if stream:
+        chunks = [p["choices"][0] for _, p in sse(payload) if p.get("choices")]
+        assert chunks[-1]["finish_reason"] == "length"
+        assert not any("tool_calls" in chunk["delta"] for chunk in chunks)  # no half of a patch reaches the client
+    else:
+        choice = payload["choices"][0]
+        assert choice["finish_reason"] == "length" and "tool_calls" not in choice["message"]
+    relay.settle(headers)
+    assert [event["kind"] for event in relay.events(mark) if event["kind"] in ("upstream.truncated", "http.error")] == [
+        "upstream.truncated"]
+    assert len(relay.posts) == 1  # nothing was asked again

@@ -11,14 +11,11 @@ function merge(previous, items) {
   return next.length > CAP ? next.slice(next.length - CAP) : next;
 }
 
-/** Live journal: initial page, then an auto-reconnecting SSE follower with pause buffering. */
+/** Live journal: initial page, then an auto-reconnecting SSE follower. The pause belongs to the list of events (journalPause.js):
+    the stream itself always flows, so turns, counts and the error badge stay live. */
 export function useJournal(key, onUnauthorized) {
   const [events, setEvents] = useState([]);
   const [status, setStatus] = useState('connecting');
-  const [paused, setPausedState] = useState(false);
-  const [pending, setPending] = useState(0);
-  const pausedRef = useRef(false);
-  const buffer = useRef([]);
   const queue = useRef([]);
   const timer = useRef(null);
   const lastSeq = useRef(0);
@@ -30,11 +27,6 @@ export function useJournal(key, onUnauthorized) {
     const items = queue.current;
     queue.current = [];
     if (!items.length) return;
-    if (pausedRef.current) {
-      buffer.current.push(...items);
-      setPending(buffer.current.length);
-      return;
-    }
     setEvents((previous) => merge(previous, items));
   }, []);
 
@@ -69,8 +61,6 @@ export function useJournal(key, onUnauthorized) {
             onReset: () => {
               lastSeq.current = 0;
               queue.current = [];
-              buffer.current = [];
-              setPending(0);
               setEvents([]);
             },
           });
@@ -92,26 +82,13 @@ export function useJournal(key, onUnauthorized) {
     };
   }, [key, push]);
 
-  const setPaused = useCallback((value) => {
-    pausedRef.current = value;
-    setPausedState(value);
-    if (!value && buffer.current.length) {
-      const items = buffer.current;
-      buffer.current = [];
-      setPending(0);
-      setEvents((previous) => merge(previous, items));
-    }
-  }, []);
-
   const reset = useCallback(() => {
     lastSeq.current = 0;
-    buffer.current = [];
     queue.current = [];
-    setPending(0);
     setEvents([]);
   }, []);
 
-  return { events, status, paused, pending, setPaused, reset };
+  return { events, status, reset };
 }
 
 /** Run ``task`` immediately and on an interval, but only while the tab is visible. */
@@ -121,16 +98,24 @@ export function usePolling(task, interval, deps) {
   useEffect(() => {
     let cancelled = false;
     let handle = null;
+    // One chain at a time: a tab shown again while a poll was in flight used to start a second chain beside the first,
+    // which re-armed itself too, so every Alt-Tab during a slow poll added a polling loop for good.
+    let running = false;
     const tick = async () => {
-      if (cancelled) return;
-      if (document.visibilityState === 'visible') {
-        try { await saved.current(); } catch { /* surfaced by the task */ }
+      if (cancelled || running) return;
+      running = true;
+      try {
+        if (document.visibilityState === 'visible') {
+          try { await saved.current(); } catch { /* surfaced by the task */ }
+        }
+      } finally {
+        running = false;
       }
       if (!cancelled) handle = setTimeout(tick, interval);
     };
     tick();
     const onVisible = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && !running) {
         clearTimeout(handle);
         tick();
       }

@@ -6,13 +6,11 @@ The relay put the newest cache hint at the end of it all the same: 98,956 tokens
 lets a compaction that shares the chat's system, tools and history read them."""
 import json
 
-import pytest
 
 import direct
 import native_history
 from prompt_support import client_request, prompt_relay  # noqa: F401 - prompt_relay is a fixture
 from test_compaction_cache import Chat, OPENCODE, SUMMARY, with_instruction
-from test_native_history import tool_reply
 
 OC_COMPACT = "You are an anchored context summarization assistant for coding sessions."
 CONVERSATION = "User: fix the parser\n\nAssistant: I read src/parser.py and changed it.\n\nUser: now run the tests " * 40

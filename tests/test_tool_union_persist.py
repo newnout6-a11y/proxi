@@ -103,3 +103,39 @@ def test_the_attribution_line_of_claude_code_does_not_split_its_sessions():
 def test_claude_code_is_a_client_of_the_union_by_default():
     import config
     assert config.DEFAULTS["tool_union_clients"] == ["codex", "claude-code"]
+
+
+class _Snapshot:
+    """What client_key reads of a prompts snapshot: the normalized profile, its tools section."""
+
+    def __init__(self, profiles):
+        self._profiles = profiles
+
+    def profile(self, name):
+        return self._profiles[name]
+
+
+def _key(plan):
+    from types import SimpleNamespace
+
+    import tool_union
+    parsed = SimpleNamespace(tools=[{"type": "function", "function": {"name": "a"}}], model="gpt-6.1-sol",
+                             system="", prompt="", prompt_plan=plan)
+    return tool_union.client_key("codex", {"originator": "codex_exec"}, parsed)
+
+
+def test_the_union_key_survives_a_restart_that_renumbers_the_prompts_revision():
+    from types import SimpleNamespace
+    profiles = {"p": {"tools": {"edits": [{"hide": "c"}]}}}
+    before = SimpleNamespace(profile="p", rev=2, snapshot=_Snapshot(profiles))   # after one save of prompts.json
+    after = SimpleNamespace(profile="p", rev=1, snapshot=_Snapshot(profiles))    # the same document after a restart
+    assert _key(before) == _key(after)
+
+
+def test_documents_that_edit_tools_differently_never_share_a_union():
+    from types import SimpleNamespace
+    first = SimpleNamespace(profile="p", rev=1, snapshot=_Snapshot({"p": {"tools": {"edits": []}}}))
+    second = SimpleNamespace(profile="p", rev=1, snapshot=_Snapshot({"p": {"tools": {"edits": [{"hide": "c"}]}}}))
+    assert _key(first) != _key(second)
+    legacy = SimpleNamespace(profile=None, rev=3, snapshot=None)
+    assert _key(legacy)[6] == ""

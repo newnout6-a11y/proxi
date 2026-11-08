@@ -7,7 +7,7 @@ import { CacheChart, RankedList, SpendChart, bucketLabel } from '../charts.jsx';
 import { MIN_FORECAST_SECONDS, burnRate, coverageOf, fmtSince, fmtSpan } from '../coverage.js';
 import { Button, Tag } from '../ui.jsx';
 import {
-  fmtDay, fmtDuration, fmtFixed, fmtInt, fmtMs, fmtPercent, fmtTokens, fmtUptime, isNum, parseDay, plural,
+  fmtDay, fmtDuration, fmtFixed, fmtInt, fmtMs, fmtPercent, fmtSpeed, fmtTokens, fmtUptime, isNum, parseDay, plural,
 } from '../format.js';
 
 export const WINDOWS = [
@@ -174,9 +174,9 @@ function spendNote(totals, busy, span) {
   ].filter(Boolean).join(' · ');
 }
 
-function Stat({ label, value, note, tone }) {
+function Stat({ label, value, note, tone, title }) {
   return (
-    <div className="stat">
+    <div className="stat" title={title}>
       <span className="stat-label">{label}</span>
       <span className="stat-value num">{value}</span>
       <span className={`stat-note${tone ? ` tone-${tone}` : ''}`}>{note}</span>
@@ -205,6 +205,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
 
   const current = metrics[windowSec] || null;
   const totals = current?.totals || {};
+  const speedSamples = Number.isInteger(totals.speed_samples) && totals.speed_samples > 0 ? totals.speed_samples : 0;
   const buckets = current?.buckets || [];
   const models = Object.entries(current?.models || {}).map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value);
   const ok = overview?.health?.ok;
@@ -255,6 +256,9 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
             tone={totals.errors ? 'neg' : undefined} />
           <Stat label="Первый токен, p50" value={fmtMs(totals.ttft_p50)} note={`p95 ${fmtMs(totals.ttft_p95)}`} />
           <Stat label="Ответ целиком, p50" value={fmtMs(totals.latency_p50)} note={`p95 ${fmtMs(totals.latency_p95)}`} />
+          <Stat label="Средняя скорость" value={fmtSpeed(speedSamples > 0 ? totals.tokens_per_second : null)}
+            note={speedSamples > 0 ? `выход / всё время · ${fmtInt(speedSamples)} завершённых` : 'нет полных данных'}
+            title="Сумма выходных токенов / сумма полного времени обработки успешно завершённых запросов с полными данными за выбранное окно. До завершения runner, включая очередь, мышление, повторы и смену аккаунта; без отправки последних байтов клиенту. Ошибки, отмена и обрезка лимитом исключены. Это не скорость декодирования." />
         </section>
       </div>
 

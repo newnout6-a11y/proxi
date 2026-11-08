@@ -439,6 +439,48 @@ test('turn rows price a turn by the relay rules: nothing for a refused attempt, 
   await expect(cost('model-waiting')).not.toContainText('нет данных');
 });
 
+test('request speed is shown per completed request and separately as the overview weighted average', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { tokens_per_second: 12.5, speed_samples: 2 } } });
+  await serveEvents(page, [
+    eventAt('speed-known', -100, 'turn.begin', { model: 'speed-known' }),
+    eventAt('speed-known', -96, 'turn.end', { reason: 'tool_calls', duration_ms: 1000 }),
+    eventAt('speed-known', -96, 'request.speed', { reason: 'tool_calls', duration_ms: 4000, output_tokens: 100, tokens_per_second: 25 }),
+    eventAt('speed-zero', -90, 'turn.begin', { model: 'speed-zero' }),
+    eventAt('speed-zero', -86, 'turn.end', { reason: 'stop', duration_ms: 4000 }),
+    eventAt('speed-zero', -86, 'request.speed', { reason: 'stop', duration_ms: 4000, output_tokens: 0, tokens_per_second: 0 }),
+    eventAt('speed-legacy', -80, 'turn.begin', { model: 'speed-legacy' }),
+    eventAt('speed-legacy', -76, 'turn.end', { reason: 'stop', duration_ms: 4000 }),
+    eventAt('speed-cancelled', -70, 'turn.begin', { model: 'speed-cancelled' }),
+    eventAt('speed-cancelled', -66, 'turn.end', { reason: 'cancelled', duration_ms: 4000 }),
+    eventAt('speed-cancelled', -66, 'request.speed', { reason: 'cancelled', duration_ms: 4000, output_tokens: 100, tokens_per_second: 25 }),
+    eventAt('speed-live', -2, 'turn.begin', { model: 'speed-live' }),
+  ]);
+  await login(page);
+  const average = page.locator('.stat', { hasText: 'Средняя скорость' });
+  await expect(average).toContainText('12,5\u00a0ток/с');
+  await expect(average).toContainText('2 завершённых');
+  await expect(average).toHaveAttribute('title', /Сумма выходных токенов \/ сумма полного времени/);
+  await nav(page, 'Активность');
+  const speed = (model) => page.locator('.trace', { hasText: model }).locator('.trace-speed');
+  await expect(speed('speed-known')).toHaveText('скорость 25\u00a0ток/с');
+  await expect(speed('speed-zero')).toHaveText('скорость 0\u00a0ток/с');
+  for (const model of ['speed-legacy', 'speed-cancelled', 'speed-live']) await expect(speed(model)).toHaveText('скорость —');
+  await expect(speed('speed-known')).toHaveAttribute('title', /включая ожидание, мышление, повторы/);
+  await page.locator('.trace', { hasText: 'speed-known' }).getByRole('button').click();
+  await expect(page.locator('.trace.open .steps')).toBeVisible();
+  // The rate belongs to the wrapping phase summary, not a desktop-only hidden numeric column.
+  await page.setViewportSize({ width: 414, height: 900 });
+  await expect(speed('speed-known')).toBeVisible();
+});
+
+test('overview speed without eligible samples stays unknown rather than zero', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { tokens_per_second: null, speed_samples: 0 } } });
+  await login(page);
+  const average = page.locator('.stat', { hasText: 'Средняя скорость' });
+  await expect(average.locator('.stat-value')).toHaveText('—');
+  await expect(average).toContainText('нет полных данных');
+});
+
 test('a local command is shown as its own time and is not counted as the answer', async ({ page }) => {
   await mockAdmin(page);
   await serveEvents(page, [

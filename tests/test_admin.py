@@ -1,6 +1,5 @@
 """Administration API and static build security, with an offline HTTP server."""
 import json
-from pathlib import Path
 import threading
 import time
 import urllib.error
@@ -170,7 +169,7 @@ def test_settings_are_whitelisted_and_changes_wait_for_restart(admin_relay):
     saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
     assert saved["show_thinking"] is False and saved["max_workers"] == 8
     assert saved["cookie"] == "accessToken=private-cookie-value" and saved["xsrf"] == "private-xsrf-token"
-    assert not list(admin_relay.path.parent.glob(".admin-*.tmp"))
+    assert not list(admin_relay.path.parent.glob(".*.tmp"))  # no temporary copy of config.json left behind
     assert admin_relay.request("/admin/api/settings")[1]["pending_restart"] == after["pending_restart"]
 
 
@@ -265,7 +264,7 @@ def test_atomic_save_failure_preserves_configuration_and_live_limiter(admin_rela
     status, _, _ = admin_relay.patch({"rate_limit_rps": 3})
     assert status == 503 and admin_relay.path.read_bytes() == before
     assert admin_relay.cfg["rate_limit_rps"] == 0 and admin_relay.runtime.limiter.rate == 0
-    assert not list(admin_relay.path.parent.glob(".admin-*.tmp"))
+    assert not list(admin_relay.path.parent.glob(".*.tmp"))  # no temporary copy of config.json left behind
 
 
 def test_environment_owned_session_mode_cannot_be_overwritten(admin_relay, monkeypatch):
@@ -535,3 +534,17 @@ def test_settings_reject_burst_below_one(admin_relay):
     assert status == 400
     status, _body, _headers = admin_relay.patch({"rate_limit_burst": 4})
     assert status == 200
+
+
+def test_a_settings_save_on_a_read_only_config_is_a_503_and_leaves_no_copy_of_the_secrets(admin_relay):
+    import os
+    import stat
+    before = admin_relay.path.read_bytes()
+    os.chmod(admin_relay.path, stat.S_IREAD)
+    try:
+        status, body, _ = admin_relay.patch({"rate_limit_rps": 5})
+    finally:
+        os.chmod(admin_relay.path, stat.S_IWRITE | stat.S_IREAD)
+    assert status == 503 and body["error"]["code"] == "service_unavailable"
+    assert admin_relay.path.read_bytes() == before
+    assert not list(admin_relay.path.parent.glob(".*.tmp"))

@@ -55,7 +55,7 @@ def test_preprocessor_flags_are_denied(cmd):
     "git status",
     "git log --pretty=oneline",
     "git diff --color",
-    "git push -u origin main",
+    # push needs allow_all since 2026-11-08 (test_exec_policy_bypasses.py): it could send the repository anywhere
     "git fetch origin",
     "rg pattern .",
 ])

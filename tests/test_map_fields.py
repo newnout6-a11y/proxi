@@ -18,7 +18,6 @@ import random
 import pytest
 
 import direct
-import journal
 import native_history
 from prompt_support import after_tool_call, prompt_relay  # noqa: F401 - prompt_relay is a fixture
 from test_compaction_cache import OPENCODE

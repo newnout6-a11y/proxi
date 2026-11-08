@@ -1,7 +1,6 @@
 """Journal hardening: key redaction, restore ordering/re-clean, rotation tail."""
 import json
 
-import journal as journal_module
 from journal import Journal
 
 

@@ -2,13 +2,11 @@
 import asyncio
 import json
 import queue
-import time
 import pytest
 
 import adapters
 import config
 import direct
-import journal
 import session as session_mod
 import validate
 from orchestrator import TurnRunner
@@ -422,7 +420,7 @@ async def test_branched_session_syncs_registered_tools_to_parent():
 
 
 @pytest.mark.asyncio
-async def test_direct_retry_clears_client_context_pending(monkeypatch):
+async def test_direct_retry_clears_client_context_pending(monkeypatch, tmp_path):
     from types import SimpleNamespace
     import io
     import direct
@@ -432,7 +430,7 @@ async def test_direct_retry_clears_client_context_pending(monkeypatch):
         "max_workers": 4,
         "max_conversations": 8,
         "conversation_idle_timeout": 900,
-        "workspace_root": "C:\\specialinay_papka",
+        "workspace_root": str(tmp_path),  # never the folder a relay of this machine works in
         "exec_policy": "off",
         "show_exec_output": False,
         "max_exec_turns": 0,

@@ -18,10 +18,12 @@ import math
 import operator
 import os
 import re
+import sys
 import threading
 import time
 
 import client_context
+import console_clock
 from redact import redact
 
 LEVELS = ("debug", "info", "success", "warn", "error")
@@ -91,7 +93,9 @@ def _tail_lines(source, limit):
     if start:
         # The byte before the start tells whether the first line begins there or is the end of one that was cut.
         data = data[1:] if data[:1] == b"\n" else data.partition(b"\n")[2]
-    return data.decode("utf-8", "replace").splitlines(), len(data)
+    # Records end at a newline only: str.splitlines() also breaks at U+0085, U+2028 and U+2029, which json.dumps writes raw
+    # inside a record (a User-Agent header, a tool's arguments), and both halves of such a record were lost on restart.
+    return [raw.decode("utf-8", "replace").rstrip("\r") for raw in data.split(b"\n") if raw.strip()], len(data)
 
 
 def _number(value):
@@ -110,6 +114,20 @@ def _whole(value):
         return int(value or 0)
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def request_speed(output_tokens, duration_ms):
+    """Reported output tokens / whole request seconds, not a guessed decoder speed; unknown is None."""
+    if type(output_tokens) not in (int, float) or type(duration_ms) not in (int, float):
+        return None
+    try:
+        if (not math.isfinite(output_tokens) or output_tokens < 0 or int(output_tokens) != output_tokens
+                or not math.isfinite(duration_ms) or duration_ms <= 0):
+            return None
+        value = output_tokens / duration_ms * 1000
+        return round(value, 3) if math.isfinite(value) else None
+    except (OverflowError, ValueError):
+        return None
 
 
 def _attempt_number(data):
@@ -200,13 +218,14 @@ class _Fine:
     """Numeric counters of one FINE-second interval: everything a chart bucket shows."""
     __slots__ = ("requests", "errors", "latency_sum", "latency_n", "ttft_sum", "ttft_n", "credits", "keepwarm",
                  "keepwarm_pings", "keepwarm_unknown", "cache_read", "cache_write", "input", "output",
-                 "turns", "tools", "commands", "unknown")
+                 "turns", "tools", "commands", "unknown", "speed_output", "speed_duration", "speed_samples")
 
     def __init__(self):
         self.requests = self.errors = self.latency_n = self.ttft_n = 0
         self.keepwarm_pings = self.keepwarm_unknown = self.cache_read = self.cache_write = 0
         self.input = self.output = self.turns = self.tools = self.commands = self.unknown = 0
         self.latency_sum = self.ttft_sum = self.credits = self.keepwarm = 0.0
+        self.speed_output = self.speed_duration = self.speed_samples = 0
 
 
 # A frozen copy of a _Fine slot (same attribute names) that metrics() can read outside the journal lock.
@@ -268,6 +287,7 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
     latency = [[0.0, 0] for _ in range(count)]
     ttft = [[0.0, 0] for _ in range(count)]
     pings = pings_unknown = 0
+    speed_output = speed_duration = speed_samples = 0
     statuses, models, categories, levels = {}, {}, {}, {}
     for index, slot in fine:
         at = min(count - 1, int((index * FINE - start) // bucket))
@@ -286,6 +306,9 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
         row["credits_unknown"] += slot.unknown
         pings += slot.keepwarm_pings
         pings_unknown += slot.keepwarm_unknown
+        speed_output += slot.speed_output
+        speed_duration += slot.speed_duration
+        speed_samples += slot.speed_samples
         pair = latency[at]
         pair[0] += slot.latency_sum
         pair[1] += slot.latency_n
@@ -329,6 +352,8 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
               "credits_in_progress": in_progress,
               "cache_write": total("cache_write"), "input_tokens": total("input"),
               "output_tokens": total("output"),
+              "tokens_per_second": request_speed(speed_output, speed_duration) if speed_samples else None,
+              "speed_samples": speed_samples,
               "cache_hit_ratio": round(cached / prompt, 4) if prompt else None,
               "latency_p50": percentile(latency_all, 0.5), "latency_p95": percentile(latency_all, 0.95),
               "ttft_p50": percentile(ttft_all, 0.5), "ttft_p95": percentile(ttft_all, 0.95)}
@@ -441,6 +466,14 @@ class _Rollup:
             attempt = turn.end(data.get("reason")) if turn is not None else None
             if attempt is not None:
                 self._shift_unknown(now, attempt.where, 1)
+        elif kind == "request.speed":
+            # Exactly one sample per client request, not per account turn/failover.
+            output, duration = data.get("output_tokens"), data.get("duration_ms")
+            if data.get("reason") in ("stop", "tool_calls") and request_speed(output, duration) is not None:
+                fine = self.fine_slot(index)
+                fine.speed_output += output
+                fine.speed_duration += duration
+                fine.speed_samples += 1
         elif kind == "upstream.first_token":
             ttft = _number(data.get("ttft_ms"))
             if ttft is not None:
@@ -618,7 +651,10 @@ class Journal:
         if depth > 6:
             return "…"
         if isinstance(value, str):
-            text = redact(value, cookie_values=(self._cfg or {}).get("cookie_values", ()))
+            # A lone UTF-16 surrogate (a client's "\ud83d") cannot be written as UTF-8: the event never reached journal.jsonl,
+            # and the admin event list and live stream broke on it. It is kept as its escape.
+            text = value if value.isascii() else value.encode("utf-8", "backslashreplace").decode("utf-8")
+            text = redact(text, cookie_values=(self._cfg or {}).get("cookie_values", ()))
             # Each secret is replaced in turn, as before; a text that holds none of them (nearly every one) skips the loop.
             pattern = getattr(secrets, "pattern", False)  # False: a plain list, whose secrets are all tried
             if pattern is False or (pattern is not None and pattern.search(text)):
@@ -678,21 +714,30 @@ class Journal:
                 keep if type(keep) is int and keep >= 0 else KEEP_FILES)
 
     def _rotate(self, keep):
-        """The live file becomes journal.jsonl.1, and every rotated file takes the next number; what would pass `keep` goes.
+        """The live file becomes journal.jsonl.1 and the rotated files move up one number; the one past `keep` goes.
 
-        The caller holds the file lock. The oldest file is moved (or removed) first, so a rotation that stops halfway
-        (a file another program holds open) has lost nothing: the next one carries on from the numbers it finds."""
+        The caller holds the file lock. Only the run .1, .2, ... up to the first missing number moves, because a missing
+        number is room, and the oldest kept file is removed only when that run fills every kept number. A rotation that
+        stops halfway (a file another program holds open on Windows) therefore loses at most the generation a whole
+        rotation drops anyway, and the retry a minute later tries only the move that failed. It used to shift every file
+        again, gaps included, and delete one more generation on each retry, until none was left."""
         self._file.close()
         self._file = None
-        for index, old in reversed(_rotated(self._path)):
-            if index >= keep:
-                os.remove(old)
-            else:
-                os.replace(old, "%s.%d" % (self._path, index + 1))
-        if keep:
-            os.replace(self._path, self._path + ".1")
-        else:
+        found = dict(_rotated(self._path))
+        for index in sorted(number for number in found if number > keep):  # left by a lower journal_keep_files
+            os.remove(found.pop(index))
+        if not keep:
             open(self._path, "w", encoding="utf-8").close()
+            return
+        run = 0
+        while run + 1 in found:
+            run += 1
+        if run >= keep:
+            os.remove(found[keep])
+            run = keep - 1
+        for index in range(run, 0, -1):
+            os.replace(found[index], "%s.%d" % (self._path, index + 1))
+        os.replace(self._path, self._path + ".1")
 
     def _write(self, event):
         if not self._path:
@@ -719,7 +764,13 @@ class Journal:
                 # A failed rotation (e.g. a locked .1 on Windows) would otherwise
                 # grow the file unbounded and silently; the journal cannot report
                 # on itself, so use stderr.
-                print("[journal] rotation failed: %s" % exc, flush=True)
+                # Do not re-enter console_log/journal.scrub here: this is the journal's own failure path. Raw exception
+                # text can contain a path or credential; the safe error class is enough to diagnose the failure category.
+                try:
+                    print(console_clock.timestamp() + "[journal] rotation failed: %s" % type(exc).__name__,
+                          file=sys.stderr, flush=True)
+                except (OSError, ValueError):
+                    pass
 
     # -- reading -----------------------------------------------------------
     @property
@@ -811,6 +862,8 @@ class Journal:
                                            "transport": None, "dialect": None, "client": clients.get(str(event.get("request_id"))),
                                            "credits": None, "credits_complete": False, "credits_unknown": 0,
                                            "ttft_ms": None, "duration_ms": None,
+                                           "output_tokens": None, "tokens_per_second": None,
+                                           "request_duration_ms": None,
                                            "tools": 0, "commands": 0,
                                            "errors": 0, "cache_read": 0, "cache_write": 0,
                                            "events": 0, "request_id": event.get("request_id")}
@@ -824,8 +877,15 @@ class Journal:
             elif kind == "turn.end":
                 trace["ended"] = event["ts"]
                 trace["duration_ms"] = data.get("duration_ms")
+                trace["output_tokens"] = data.get("output_tokens")
+                trace["tokens_per_second"] = None
                 trace["status"] = "error" if data.get("reason") == "error" else (data.get("reason") or "stop")
                 costs[turn_id].end(data.get("reason"))
+            elif kind == "request.speed":
+                trace["request_duration_ms"] = data.get("duration_ms")
+                trace["output_tokens"] = data.get("output_tokens")
+                trace["tokens_per_second"] = (request_speed(data.get("output_tokens"), data.get("duration_ms"))
+                                             if data.get("reason") in ("stop", "tool_calls", "length") else None)
             elif kind == "upstream.first_token":
                 trace["ttft_ms"] = data.get("ttft_ms")
             elif kind == "upstream.usage_start":

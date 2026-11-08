@@ -1,14 +1,27 @@
-import json, sys, time, urllib.request, urllib.error
-from auth import client_headers
+"""Live smoke checks of a running relay on 127.0.0.1:8787: models, balance, a plain and a streamed answer, a local command.
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+Spends credits of the real accounts. Not part of the offline suite (tests/):
+
+    python scripts/live_smoke.py [--url URL] [--key KEY] [--config PATH]
+
+The key is the relay's own: RELAY_API_KEY, else relay_api_key of the relay's config, else relay_key.txt beside it.
+For a relay started with --config <folder>\\config.json, pass the same --config.
+"""
+import argparse, json, sys, urllib.request, urllib.error
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from auth import client_headers  # noqa: E402  (the relay modules live in the repository root)
+
 BASE = "http://127.0.0.1:8787"
+KEY = None
+CONFIG = None  # the relay's config.json; None: this checkout's
 
 
 def _urlopen(request, **kwargs):
     if isinstance(request, str):
         request = urllib.request.Request(request)
-    for name, value in client_headers().items():
+    for name, value in client_headers(KEY, CONFIG).items():
         request.add_header(name, value)
     return urllib.request.urlopen(request, **kwargs)
 
@@ -67,7 +80,8 @@ def test_streaming_openai():
                 continue
             if s.startswith("data: "):
                 chunk = json.loads(s[6:])
-                delta = chunk["choices"][0]["delta"].get("content", "")
+                choices = chunk.get("choices") or []  # the last chunk carries only usage
+                delta = choices[0].get("delta", {}).get("content", "") if choices else ""
                 if delta:
                     collected.append(delta)
     full_text = "".join(collected)
@@ -95,7 +109,8 @@ def test_local_exec_and_context():
                 continue
             if s.startswith("data: "):
                 chunk = json.loads(s[6:])
-                delta = chunk["choices"][0]["delta"].get("content", "")
+                choices = chunk.get("choices") or []  # the last chunk carries only usage
+                delta = choices[0].get("delta", {}).get("content", "") if choices else ""
                 if delta:
                     collected.append(delta)
                     sys.stdout.write(delta)
@@ -106,7 +121,15 @@ def test_local_exec_and_context():
     assert "readme" in full_text.lower() or "relay" in full_text.lower()
     print("PASS: local command execution & context")
 
-if __name__ == "__main__":
+def main(argv=None):
+    global BASE, KEY, CONFIG
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--url", default=BASE, help="Base URL of the relay")
+    parser.add_argument("--key", help="Relay key (otherwise RELAY_API_KEY, the config's relay_api_key or the "
+                                      "relay_key.txt beside it)")
+    parser.add_argument("--config", help="The config.json the relay was started with (default: this checkout's)")
+    args = parser.parse_args(argv)
+    BASE, KEY, CONFIG = args.url.rstrip("/"), args.key, args.config
     test_models()
     test_balance()
     test_non_streaming()
@@ -115,3 +138,7 @@ if __name__ == "__main__":
     print("\n==============================")
     print(" ALL INTEGRATION TESTS PASSED ")
     print("==============================")
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    main()

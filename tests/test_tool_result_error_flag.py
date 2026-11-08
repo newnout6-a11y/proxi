@@ -4,7 +4,6 @@ An Anthropic tool_result with "is_error": true is how Claude Code says that a co
 native history carries it upstream as isError, but the text bridge (the cold replay, a history that cannot go native)
 wrote the same text for a failed result as for a good one, so the model read "exit 1" without being told that the tool
 had failed (ultracode audit of the relay, C21)."""
-import pytest
 
 import direct
 import validate

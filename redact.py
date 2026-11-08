@@ -4,8 +4,12 @@ import re
 MASK = "[redacted]"
 
 # Patterns are deliberately narrow so ordinary text survives.
+# The two `name = value` patterns start a name only where a run of [\w-] starts: with \b they tried again at every '-' of a
+# run and scanned the rest of it each time, quadratic time, and the relay runs them on its event loop: 32k characters of
+# 'build-build-...' in a command output took 13 s, 24 KB froze every client's stream for 25 s (audit of 2026-11-08). A name
+# that starts mid-run matches from the start of its run as well, so what is masked is the same.
 _PATTERNS = [
-    (re.compile(r'''(?i)["']?\b([\w-]*(?:api[_-]?key|secret|password|passwd|token))\b["']?\s*[:=]\s*(["'])(.*?)\2'''), None),
+    (re.compile(r'''(?i)["']?(?<![\w-])([\w-]*(?:api[_-]?key|secret|password|passwd|token))\b["']?\s*[:=]\s*(["'])(.*?)\2'''), None),
     # JWT (accessToken / sandboxToken style)
     (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), MASK),
     # Cloudflare clearance and generic long cookie values
@@ -22,7 +26,7 @@ _PATTERNS = [
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), MASK),
     (re.compile(r"\bAKIA[0-9A-Z]{12,}\b"), MASK),
     # Assignment style secrets in .env / yaml / json
-    (re.compile(r"(?i)[\"']?\b([\w-]*(?:api[_-]?key|secret|password|passwd|token))\b[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_\-./+=]{12,})[\"']?"), None),
+    (re.compile(r"(?i)[\"']?(?<![\w-])([\w-]*(?:api[_-]?key|secret|password|passwd|token))\b[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_\-./+=]{12,})[\"']?"), None),
 ]
 
 _SENSITIVE_NAMES = re.compile(

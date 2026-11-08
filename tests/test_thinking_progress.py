@@ -12,7 +12,7 @@ import journal
 import orchestrator
 import validate
 from test_native_context_reuse import FIRST, request, run, setup
-from test_review_fixes_pr19 import END, THINKING, response, signature, stream_direct, text
+from test_review_fixes_pr19 import END, THINKING, signature, stream_direct, text
 
 
 def test_thinking_status_arrives_while_the_answer_is_still_blocked(tmp_path, monkeypatch):
@@ -128,7 +128,7 @@ def test_runner_measures_from_live_status_instead_of_buffer_flush(tmp_path, monk
     backend, pool, runner = setup(tmp_path, transport="direct", cache_keepwarm_seconds=0)
     clock = [0.0]
     logs = []
-    monkeypatch.setattr(orchestrator, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(orchestrator, "time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
     monkeypatch.setattr(journal, "emit", lambda kind, message, level="info", **fields: logs.append((kind, fields)))
 
     async def script(*args, **kwargs):

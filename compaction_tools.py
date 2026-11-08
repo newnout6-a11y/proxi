@@ -116,7 +116,8 @@ class ChatTools:
                     self._chats[key] = (model, tools, float(seen))
             while len(self._chats) > self._max:
                 self._chats.popitem(last=False)
-        except (OSError, ValueError, KeyError, TypeError):
+        except Exception:  # noqa: BLE001 - any file it cannot use (a hand edit, another layout, AttributeError, RecursionError,
+            # OverflowError) is no reason to keep the relay from starting: it is overwritten by the next save
             self._chats.clear()  # nothing to go on: the next request of each chat remembers its tools again
 
     def _save(self, now):

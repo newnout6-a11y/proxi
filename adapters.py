@@ -346,8 +346,9 @@ class ChatAdapter(_Base):
     def _wire_calls(self, reason):
         """The calls of the reply as Chat writes them: a function call, or a custom one with its one input string.
 
-        A custom call whose input is cut off is dropped when the client left or the turn timed out, and an upstream
-        fault when upstream said the turn was complete: half a patch is never passed on."""
+        A custom call whose input is cut off is dropped when the client left or the reply was cut (the turn timed out,
+        the output stopped inside the call: CUT_REASONS, finish_reason "length"), and an upstream fault when upstream
+        said the turn was complete: half a patch is never passed on."""
         calls = []
         for call in self.tool_calls:
             if call.get("tool_type") != "custom":
@@ -356,7 +357,7 @@ class ChatAdapter(_Base):
                 continue
             value = self._custom_text(call)
             if value is None:
-                if reason not in ("cancelled", "timeout"):
+                if reason not in ("cancelled",) + CUT_REASONS:
                     raise apierr.upstream_error("Retool returned incomplete custom tool input")
                 continue
             calls.append({"id": call["id"], "type": "custom", "custom": {"name": call["name"], "input": value}})
@@ -367,7 +368,7 @@ class ChatAdapter(_Base):
         if self.writer:
             for index, call in enumerate(self.tool_calls):
                 if call.get("tool_type") == "custom" and not call.get("sent"):
-                    if self._send_custom(index, call) is None and reason not in ("cancelled", "timeout"):
+                    if self._send_custom(index, call) is None and reason not in ("cancelled",) + CUT_REASONS:
                         raise apierr.upstream_error("Retool returned incomplete custom tool input")
             self.writer.data(self._chunk({}, finish))
             prompt, completion = self.usage(prompt_text)
@@ -962,7 +963,8 @@ class StructuredOutputAdapter:
     Usage/cost events still reach the ordinary adapter; no invalid partial text
     reaches the client. This is post-validation, not native structured output.
     A turn that calls a client tool is no final answer: it is released as it is,
-    and only the reply without tool calls is validated.
+    and only the reply without tool calls is validated. A search the relay runs
+    itself (web_search) ends no turn: the text after the last search is validated.
     """
     def __init__(self, adapter, spec, *, tools=False, hint=''):
         self.adapter = adapter
@@ -998,6 +1000,12 @@ class StructuredOutputAdapter:
         elif kind == 'tool_call' and self.tools:
             self._release()
             self.adapter.feed(event)
+            if event.get('server'):
+                # The relay's own web_search: the relay answers the call and the reply goes on in this response, so the
+                # search is a step of the reply, not a turn the client continues. What came before it is out as it is;
+                # what the model writes after the last search is the answer, held and validated like any other.
+                self.released = False
+                self.size = 0
         elif kind == 'server_tool_result' and self.tools:
             self.adapter.feed(event)
         elif kind in ('tool_call', 'tool_call_delta', 'tool_start', 'hitl', 'exec_start', 'exec_result'):

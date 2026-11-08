@@ -23,6 +23,10 @@ ALLOW = [r"^(?:echo|type|findstr|cmd|powershell|pwsh)\b"]
     'powershell -NoProfile -Command "Write-Output x 2>&1"',
     'cmd /c "cmd /c echo x > file"',
     'cmd /c "powershell -Command Write-Output x > file"',
+    # powershell.exe drops the double quotes of its command line before PowerShell reads the text, so this is a
+    # redirection to PowerShell (`"a > b.txt"` wrote b.txt, audit of 2026-11-08); with single quotes cmd.exe redirects.
+    'powershell -Command Write-Output "a>b"',
+    "powershell -Command Write-Output 'a>b'",
 ])
 def test_allowlist_rejects_unquoted_redirection(command):
     with pytest.raises(executor.PolicyError, match="redirection requires allow_all"):
@@ -36,7 +40,6 @@ def test_allowlist_rejects_unquoted_redirection(command):
     'cmd /c echo "x>y"',
     'powershell -Command "Write-Output \'a>b\'"',
     'powershell -Command "Write-Output \'a<b\'"',
-    'powershell -Command Write-Output "a>b"',
     'pwsh -c "Write-Output \'a<b\' | Select-String a"',
 ])
 def test_allowlist_preserves_quoted_literals_and_pipelines(command):
