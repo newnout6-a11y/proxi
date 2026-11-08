@@ -1276,6 +1276,27 @@ class OutputCapAdapter:
         return self.adapter.payload(self._reason(reason), prompt_text)
 
 
+class RouteBoundAdapter:
+    """Bind only route-specific response enforcement after account acquisition."""
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.base_adapter = adapter
+
+    def __getattr__(self, name):
+        if name == 'adapter':
+            raise AttributeError(name)
+        return getattr(self.adapter, name)
+
+    def feed(self, event):
+        if event.get('type') == 'route_bound':
+            self.adapter = self.base_adapter
+            cap = event.get('output_cap')
+            if cap:
+                self.adapter = OutputCapAdapter(self.adapter, cap)
+            return
+        return self.adapter.feed(event)
+
+
 def for_dialect(dialect, parsed, writer=None):
     if dialect == "anthropic":
         adapter = AnthropicAdapter(parsed, writer)
@@ -1291,6 +1312,8 @@ def for_dialect(dialect, parsed, writer=None):
     if stops:
         # Outside the structured check: the reply is cut at its stop sequence first, and what is left is validated.
         adapter = StopSequenceAdapter(adapter, stops)
+    if getattr(parsed, 'entry', {}).get('upstream') == 'unified':
+        return RouteBoundAdapter(adapter)
     cap = getattr(parsed, 'output_cap', None)
     if cap:
         # Outermost: the cap counts what the model wrote, and a stop sequence that came first still ends the reply.

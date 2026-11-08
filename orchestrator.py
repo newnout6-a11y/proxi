@@ -3,6 +3,7 @@ import asyncio
 import collections
 import contextlib
 import contextvars
+import copy
 import hashlib
 import math
 
@@ -19,6 +20,7 @@ import apierr
 import adapters
 import executor
 import credits
+import generation
 import journal
 import client_context
 import console_log
@@ -200,7 +202,7 @@ class _FailoverOut:
         if event.get("type") == "error":
             self.error = event["error"]
             return
-        if event.get("type") not in ("credits", "usage", "usage_start"):
+        if event.get("type") not in ("credits", "usage", "usage_start", "route_bound"):
             self.started = True
         self.out.put(event)
 
@@ -1056,6 +1058,10 @@ class TurnRunner:
             return
 
     async def _run_once(self, parsed, out, holder, exclude=()):
+        # Binding a route is request-local; never mutate shared catalog/client metadata.
+        original_parsed = parsed
+        parsed = copy.copy(parsed)
+        public_entry = parsed.entry
         turn_id = str(uuid.uuid4())
         holder["turn_id"] = turn_id
         # Loop detection is per client turn, never shared by concurrent chats.
@@ -1088,6 +1094,10 @@ class TurnRunner:
                     request_attempts[(turn_id, fields["attempt"])] = count
             journal.emit(kind, message, level, **trace, **fields)
 
+        if public_entry.get("upstream") == "unified":
+            log("turn.request", "Начало хода %s" % parsed.model, model=parsed.model,
+                requested_effort=getattr(parsed, "requested_effort", None),
+                dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)))
         try:
             native_tools = getattr(parsed, "tools", None) or []
             tool_definitions = {item["function"]["name"]: item["function"] for item in native_tools}
@@ -1155,91 +1165,92 @@ class TurnRunner:
             task_block = ""
             previous_steps = []
             last_followup = None
-            if parsed.entry.get("upstream") != "minara" and not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"]):
-                raise apierr.service_unavailable(f"provider '{parsed.entry['provider']}' is not routed")
-            # The resource is per-account (org-scoped UUID or __managed__): it is
-            # resolved from the acquired session's backend cfg below. Resolving it
-            # from the global cfg here would 503 account-only configurations.
-            model_provider = {"model": parsed.entry.get("upstream_model", parsed.model)}
-            if parsed.entry.get("upstream") == "minara":
-                model_provider["route_model"] = parsed.model
-            effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"),
-                                                    self.cfg.get("claude_xhigh_effort", "high"))
-            # The effort of the request is the client's, then the profile's when the profile sets one (proxy applied it
-            # to parsed.effort); requested_effort is always what the client sent, effort_source says who decided.
-            profile_effort = getattr(parsed, "prompt_effort", None)
-            asked = getattr(parsed, "requested_effort", None)
-            requested_effort = asked if profile_effort else (asked or parsed.effort)
-            effort_source = "client"
-            if requested_effort is None:
-                requested_effort = self.cfg.get("reasoning_effort") if parsed.entry.get("reasoning") else None
-                effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
-            if profile_effort:
-                effort_source = "profile"
-            task = getattr(parsed, "client_task", "")
-            # A client's compaction runs on the effort of its dialog when that is what makes the dialog's signed
-            # history resume (README, "Сжатие истории"); the journal still says what the client asked for.
-            # That comes last: the profile sets the effort of the request, the compaction may keep the dialog's over it.
-            kept, why = None, None
-            holder.pop("kept_effort", None)  # a retry on another account decides again
-            if (task == client_context.COMPACTION and native_tools and direct_mode
-                    and self.cfg.get("compaction_keep_effort", True)):
-                try:
-                    if hasattr(self.pool, "load_stored"):
-                        # A dialog stored before a restart is only on disk: read it for the question below.
-                        await self.pool.load_stored(getattr(parsed, "conversation_key", None), model_entry=parsed.entry,
-                                                    exclude=exclude, **acquire_plan(self.cfg, parsed).kwargs)
-                    kept, why = self._dialog_effort(parsed, instructions, choice, exclude)
-                except Exception as exc:  # a lookup that only helps: without it the request runs on the client's effort
-                    log("cache.effort_check_failed", "Не удалось сверить effort сжатия с диалогом, запрос идёт как есть: "
-                        "%s: %s" % (type(exc).__name__, redact(str(exc)).replace("\n", " ")[:160]), "warn")
-            if kept:
-                effort, effort_source = kept, "dialog"
-            if effort is not None:
-                model_provider["reasoningEffort"] = effort
-            if getattr(parsed, 'verbosity', None) is not None:
-                model_provider['verbosity'] = parsed.verbosity
-            effort_note = ""
-            if kept:
-                effort_note = " (effort диалога, клиент просил %s)" % (requested_effort or "по умолчанию",)
-            elif effort_source == "profile":
-                effort_note = " (effort профиля «%s», клиент просил %s)" % (
-                    getattr(getattr(parsed, "prompt_plan", None), "profile", None), requested_effort or "по умолчанию")
-            log("turn.begin", "Ход %s · effort %s · %s%s%s" % (
-                    parsed.model, effort or "—", "direct" if direct_mode else "agent",
-                    " · сжатие истории" if task == client_context.COMPACTION else "", effort_note),
-                model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
-                requested_effort=requested_effort, effective_effort=effort,
-                effort_source=effort_source,
-                effort_resolution=("cache_continuity" if kept else
-                                   "provider_managed" if effort_source == "profile" and effort is None else
-                                   "profile" if effort_source == "profile" else
-                                   "model_default" if requested_effort in (None, "auto") else
-                                   "provider_managed" if effort is None else
-                                   "exact" if requested_effort == effort else "compatibility"),
-                dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
-                tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
-                prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
-                messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose,
-                **({"client_task": task} if task else {}))
-            if kept:
-                holder["kept_effort"] = kept
-                log("cache.effort_kept", "Сжатие истории: effort диалога %s вместо запрошенного %s, подписанная история "
-                    "продолжится" % (kept, requested_effort or "по умолчанию"), "info",
-                    requested_effort=requested_effort, dialog_effort=kept)
-                console_log.write("[%s] [cache] compaction keeps the dialog's effort %s (the client asked for %s): "
-                                  "the signed history continues" % (getattr(parsed, "request_id", None) or "req", kept,
-                                                                    requested_effort or "the default"))
-            elif why:
-                # What the compaction cannot continue is what it costs: say which part of the dialog it does not match.
-                reason = _RESTART_REASONS[why["reason"]]
-                if why.get("differs"):
-                    reason = reason % ", ".join(_SCOPE_NAMES.get(name, name) for name in why["differs"])
-                log("cache.compaction_restart", "Сжатие не продолжает подписанную историю диалога: %s; история будет "
-                    "записана заново" % reason, "info", requested_effort=requested_effort, **why)
-                console_log.write("[%s] [cache] compaction does not continue the signed history (%s)" % (
-                    getattr(parsed, "request_id", None) or "req", why["reason"] + (
-                        ": " + ", ".join(why["differs"]) if why.get("differs") else "")))
+            if public_entry.get("upstream") != "unified":
+                if parsed.entry.get("upstream") != "minara" and not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"]):
+                    raise apierr.service_unavailable(f"provider '{parsed.entry['provider']}' is not routed")
+                # The resource is per-account (org-scoped UUID or __managed__): it is
+                # resolved from the acquired session's backend cfg below. Resolving it
+                # from the global cfg here would 503 account-only configurations.
+                model_provider = {"model": parsed.entry.get("upstream_model", parsed.model)}
+                if parsed.entry.get("upstream") == "minara":
+                    model_provider["route_model"] = parsed.model
+                effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"),
+                                                        self.cfg.get("claude_xhigh_effort", "high"))
+                # The effort of the request is the client's, then the profile's when the profile sets one (proxy applied it
+                # to parsed.effort); requested_effort is always what the client sent, effort_source says who decided.
+                profile_effort = getattr(parsed, "prompt_effort", None)
+                asked = getattr(parsed, "requested_effort", None)
+                requested_effort = asked if profile_effort else (asked or parsed.effort)
+                effort_source = "client"
+                if requested_effort is None:
+                    requested_effort = self.cfg.get("reasoning_effort") if parsed.entry.get("reasoning") else None
+                    effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
+                if profile_effort:
+                    effort_source = "profile"
+                task = getattr(parsed, "client_task", "")
+                # A client's compaction runs on the effort of its dialog when that is what makes the dialog's signed
+                # history resume (README, "Сжатие истории"); the journal still says what the client asked for.
+                # That comes last: the profile sets the effort of the request, the compaction may keep the dialog's over it.
+                kept, why = None, None
+                holder.pop("kept_effort", None)  # a retry on another account decides again
+                if (task == client_context.COMPACTION and native_tools and direct_mode
+                        and self.cfg.get("compaction_keep_effort", True)):
+                    try:
+                        if hasattr(self.pool, "load_stored"):
+                            # A dialog stored before a restart is only on disk: read it for the question below.
+                            await self.pool.load_stored(getattr(parsed, "conversation_key", None), model_entry=parsed.entry,
+                                                        exclude=exclude, **acquire_plan(self.cfg, parsed).kwargs)
+                        kept, why = self._dialog_effort(parsed, instructions, choice, exclude)
+                    except Exception as exc:  # a lookup that only helps: without it the request runs on the client's effort
+                        log("cache.effort_check_failed", "Не удалось сверить effort сжатия с диалогом, запрос идёт как есть: "
+                            "%s: %s" % (type(exc).__name__, redact(str(exc)).replace("\n", " ")[:160]), "warn")
+                if kept:
+                    effort, effort_source = kept, "dialog"
+                if effort is not None:
+                    model_provider["reasoningEffort"] = effort
+                if getattr(parsed, 'verbosity', None) is not None:
+                    model_provider['verbosity'] = parsed.verbosity
+                effort_note = ""
+                if kept:
+                    effort_note = " (effort диалога, клиент просил %s)" % (requested_effort or "по умолчанию",)
+                elif effort_source == "profile":
+                    effort_note = " (effort профиля «%s», клиент просил %s)" % (
+                        getattr(getattr(parsed, "prompt_plan", None), "profile", None), requested_effort or "по умолчанию")
+                log("turn.begin", "Ход %s · effort %s · %s%s%s" % (
+                        parsed.model, effort or "—", "direct" if direct_mode else "agent",
+                        " · сжатие истории" if task == client_context.COMPACTION else "", effort_note),
+                    model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
+                    requested_effort=requested_effort, effective_effort=effort,
+                    effort_source=effort_source,
+                    effort_resolution=("cache_continuity" if kept else
+                                       "provider_managed" if effort_source == "profile" and effort is None else
+                                       "profile" if effort_source == "profile" else
+                                       "model_default" if requested_effort in (None, "auto") else
+                                       "provider_managed" if effort is None else
+                                       "exact" if requested_effort == effort else "compatibility"),
+                    dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
+                    tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
+                    prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
+                    messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose,
+                    **({"client_task": task} if task else {}))
+                if kept:
+                    holder["kept_effort"] = kept
+                    log("cache.effort_kept", "Сжатие истории: effort диалога %s вместо запрошенного %s, подписанная история "
+                        "продолжится" % (kept, requested_effort or "по умолчанию"), "info",
+                        requested_effort=requested_effort, dialog_effort=kept)
+                    console_log.write("[%s] [cache] compaction keeps the dialog's effort %s (the client asked for %s): "
+                                      "the signed history continues" % (getattr(parsed, "request_id", None) or "req", kept,
+                                                                        requested_effort or "the default"))
+                elif why:
+                    # What the compaction cannot continue is what it costs: say which part of the dialog it does not match.
+                    reason = _RESTART_REASONS[why["reason"]]
+                    if why.get("differs"):
+                        reason = reason % ", ".join(_SCOPE_NAMES.get(name, name) for name in why["differs"])
+                    log("cache.compaction_restart", "Сжатие не продолжает подписанную историю диалога: %s; история будет "
+                        "записана заново" % reason, "info", requested_effort=requested_effort, **why)
+                    console_log.write("[%s] [cache] compaction does not continue the signed history (%s)" % (
+                        getattr(parsed, "request_id", None) or "req", why["reason"] + (
+                            ": " + ", ".join(why["differs"]) if why.get("differs") else "")))
 
             client_chunks = list(getattr(parsed, 'message_chunks', None) or ([parsed.prompt] if parsed.prompt else []))
             if direct_mode:
@@ -1275,6 +1286,108 @@ class TurnRunner:
                 # must come from the backend cfg the turn actually runs on, not the
                 # global config (accounts[] can span tenants).
                 acc_cfg = getattr(getattr(acquired, "backend", None), "cfg", None) or self.cfg
+                route_for = getattr(model_catalog, "route_for", None)
+                parsed.entry = route_for(public_entry, acc_cfg) if route_for else public_entry
+                acquired._bound_route = parsed.entry
+                pricing_model = ('minara/' + parsed.entry.get('upstream_model', parsed.model)
+                                 if parsed.entry.get('upstream') == 'minara' else parsed.model)
+                if public_entry.get("upstream") == "unified":
+                    # Explicit controls are resolved against the serving route, not a
+                    # provider union. Public identity remains unchanged to the client.
+                    scoped = dict(self.cfg, _minara_models={parsed.model: parsed.entry})
+                    _, parsed.effort = model_catalog.resolve_tolerant(
+                        parsed.model, parsed.effort,
+                        strict=True, allow_downgrade=self.cfg.get("allow_effort_downgrade", False),
+                        xhigh_as=self.cfg.get("claude_xhigh_effort", "high"), cfg=scoped)
+                    out.put({"type": "route_bound", "upstream": acc_cfg.get("upstream", "retool"),
+                             "output_cap": generation.output_cap(parsed.entry, parsed.max_tokens)})
+                if public_entry.get("upstream") == "unified":
+                    if parsed.entry.get("upstream") != "minara" and not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"]):
+                        raise apierr.service_unavailable(f"provider '{parsed.entry['provider']}' is not routed")
+                    # The resource is per-account (org-scoped UUID or __managed__): it is
+                    # resolved from the acquired session's backend cfg below. Resolving it
+                    # from the global cfg here would 503 account-only configurations.
+                    model_provider = {"model": parsed.entry.get("upstream_model", parsed.model)}
+                    if parsed.entry.get("upstream") == "minara":
+                        model_provider["route_model"] = parsed.model
+                    effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"),
+                                                            self.cfg.get("claude_xhigh_effort", "high"))
+                    # The effort of the request is the client's, then the profile's when the profile sets one (proxy applied it
+                    # to parsed.effort); requested_effort is always what the client sent, effort_source says who decided.
+                    profile_effort = getattr(parsed, "prompt_effort", None)
+                    asked = getattr(parsed, "requested_effort", None)
+                    requested_effort = asked if profile_effort else (asked or parsed.effort)
+                    effort_source = "client"
+                    if requested_effort is None:
+                        requested_effort = self.cfg.get("reasoning_effort") if parsed.entry.get("reasoning") else None
+                        effort_source = "model_default" if requested_effort in (None, "auto") else "configured_default"
+                    if profile_effort:
+                        effort_source = "profile"
+                    task = getattr(parsed, "client_task", "")
+                    # A client's compaction runs on the effort of its dialog when that is what makes the dialog's signed
+                    # history resume (README, "Сжатие истории"); the journal still says what the client asked for.
+                    # That comes last: the profile sets the effort of the request, the compaction may keep the dialog's over it.
+                    kept, why = None, None
+                    holder.pop("kept_effort", None)  # a retry on another account decides again
+                    if (task == client_context.COMPACTION and native_tools and direct_mode
+                            and self.cfg.get("compaction_keep_effort", True)):
+                        try:
+                            if hasattr(self.pool, "load_stored"):
+                                # A dialog stored before a restart is only on disk: read it for the question below.
+                                await self.pool.load_stored(getattr(parsed, "conversation_key", None), model_entry=parsed.entry,
+                                                            exclude=exclude, **acquire_plan(self.cfg, parsed).kwargs)
+                            kept, why = self._dialog_effort(parsed, instructions, choice, exclude)
+                        except Exception as exc:  # a lookup that only helps: without it the request runs on the client's effort
+                            log("cache.effort_check_failed", "Не удалось сверить effort сжатия с диалогом, запрос идёт как есть: "
+                                "%s: %s" % (type(exc).__name__, redact(str(exc)).replace("\n", " ")[:160]), "warn")
+                    if kept:
+                        effort, effort_source = kept, "dialog"
+                    if effort is not None:
+                        model_provider["reasoningEffort"] = effort
+                    if getattr(parsed, 'verbosity', None) is not None:
+                        model_provider['verbosity'] = parsed.verbosity
+                    effort_note = ""
+                    if kept:
+                        effort_note = " (effort диалога, клиент просил %s)" % (requested_effort or "по умолчанию",)
+                    elif effort_source == "profile":
+                        effort_note = " (effort профиля «%s», клиент просил %s)" % (
+                            getattr(getattr(parsed, "prompt_plan", None), "profile", None), requested_effort or "по умолчанию")
+                    log("turn.begin", "Ход %s · effort %s · %s%s%s" % (
+                            parsed.model, effort or "—", "direct" if direct_mode else "agent",
+                            " · сжатие истории" if task == client_context.COMPACTION else "", effort_note),
+                        model=parsed.model, effort=effort, transport="direct" if direct_mode else "agent",
+                        requested_effort=requested_effort, effective_effort=effort,
+                        effort_source=effort_source,
+                        effort_resolution=("cache_continuity" if kept else
+                                           "provider_managed" if effort_source == "profile" and effort is None else
+                                           "profile" if effort_source == "profile" else
+                                           "model_default" if requested_effort in (None, "auto") else
+                                           "provider_managed" if effort is None else
+                                           "exact" if requested_effort == effort else "compatibility"),
+                        dialect=getattr(parsed, "dialect", None), stream=bool(getattr(parsed, "stream", False)),
+                        tools=len(native_tools), tool_choice=choice if isinstance(choice, str) else "function",
+                        prompt_chars=len(parsed.prompt or ""), system_chars=len(parsed.system or ""),
+                        messages=len(getattr(parsed, "message_chunks", None) or []), request_purpose=purpose,
+                        **({"client_task": task} if task else {}))
+                    if kept:
+                        holder["kept_effort"] = kept
+                        log("cache.effort_kept", "Сжатие истории: effort диалога %s вместо запрошенного %s, подписанная история "
+                            "продолжится" % (kept, requested_effort or "по умолчанию"), "info",
+                            requested_effort=requested_effort, dialog_effort=kept)
+                        console_log.write("[%s] [cache] compaction keeps the dialog's effort %s (the client asked for %s): "
+                                          "the signed history continues" % (getattr(parsed, "request_id", None) or "req", kept,
+                                                                            requested_effort or "the default"))
+                    elif why:
+                        # What the compaction cannot continue is what it costs: say which part of the dialog it does not match.
+                        reason = _RESTART_REASONS[why["reason"]]
+                        if why.get("differs"):
+                            reason = reason % ", ".join(_SCOPE_NAMES.get(name, name) for name in why["differs"])
+                        log("cache.compaction_restart", "Сжатие не продолжает подписанную историю диалога: %s; история будет "
+                            "записана заново" % reason, "info", requested_effort=requested_effort, **why)
+                        console_log.write("[%s] [cache] compaction does not continue the signed history (%s)" % (
+                            getattr(parsed, "request_id", None) or "req", why["reason"] + (
+                                ": " + ", ".join(why["differs"]) if why.get("differs") else "")))
+
                 resource = model_catalog.provider_resource(acc_cfg, parsed.entry)
                 if resource:
                     model_provider["providerResourceName"] = resource
@@ -1526,13 +1639,13 @@ class TurnRunner:
                                     usage, delta = self._usage_update(holder, event)
                                     if provider_recorder and sent_attempt.is_set():
                                         provider_recorder(provider_attempt, turn_id, usage)
-                                    breakdown = credits.cost_breakdown(usage, parsed.model)
+                                    breakdown = credits.cost_breakdown(usage, pricing_model)
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
                                     log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
                                                           'Токены получены; стоимость upstream не сообщена'),
                                         'info' if known else 'warn', credits=None, attempt=journal_attempt,
                                         credits_reported=bool(known), **delta,
-                                        **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                        **credits.cost_breakdown(delta, pricing_model), usage_snapshot=dict(usage))
                                     if session is not None and breakdown['prompt_tokens'] > 0:
                                         # Only counts tell the size of the prefix. The empty usage of an attempt whose
                                         # price is unknown (a timeout or a cut stream on a 200) has none: written as 0,
@@ -1551,13 +1664,13 @@ class TurnRunner:
                                         event["value"])
                                     holder['_attempt_credited'] = True
                                     usage, delta = self._usage_update(holder, event)
-                                    breakdown = credits.cost_breakdown(usage, parsed.model)
+                                    breakdown = credits.cost_breakdown(usage, pricing_model)
                                     hit = breakdown["cache_hit_ratio"]
                                     log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
                                         event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
                                         "%d%%" % round(hit * 100) if hit is not None else "—"),
                                         "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
-                                        **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                        **credits.cost_breakdown(delta, pricing_model), usage_snapshot=dict(usage))
                                     if session is not None and breakdown["prompt_tokens"] > 0:
                                         # Write through the lease: SessionLease only proxies
                                         # reads, so keepwarm (which holds the real session)
@@ -1855,6 +1968,8 @@ class TurnRunner:
             outcome["error"] = apierr.internal(str(exc))
             out.put({"type": "error", "error": outcome["error"]})
         finally:
+            if hasattr(parsed, "_full_prompt_text"):
+                original_parsed._full_prompt_text = parsed._full_prompt_text
             duration = round((time.monotonic() - turn_started) * 1000)
             err = outcome["error"]
             if err is not None:

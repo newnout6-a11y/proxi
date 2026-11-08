@@ -354,19 +354,93 @@ def build_minara_catalog(configs):
         for descriptor in cfg.get('minara_models', []):
             value = {'id': descriptor} if isinstance(descriptor, str) else dict(descriptor)
             upstream_id = value['id']
-            route_id = 'minara/' + upstream_id
+            route_id = value.get('public_id') or 'minara/' + upstream_id
             entry = {'id': route_id, 'upstream': 'minara', 'upstream_model': upstream_id,
                      'provider': value.get('provider', upstream_id.split('/')[0]),
                      'label': value.get('label', upstream_id), 'context': value.get('context'),
                      'max_output': value.get('max_output'), 'reasoning': value.get('reasoning', False),
                      'tools': value.get('tools', False), 'vision': value.get('image', False),
+                     'forced_tool_choice': value.get('forced_tool_choice', True),
                      'reasoning_effort_levels': list(value.get('reasoning_effort_levels', [])),
+                     'verbosity_levels': list(value.get('verbosity_levels', [])),
                      'default_reasoning_effort': None, 'reasoning_effort_control': 'selectable',
                      'metadata_source': 'operator-configured', 'metadata_status': 'unverified'}
-            if route_id in routes and routes[route_id] != entry:
-                raise service_unavailable('conflicting Minara model descriptors: ' + route_id)
-            routes[route_id] = entry
+            if value.get('public_id'):
+                entry['public_id'] = route_id
+                previous = routes.get(route_id)
+                alternatives = previous['_routes'] if previous is not None else []
+                if not alternatives and route_id in _BY_ID:
+                    alternatives = [dict(_BY_ID[route_id], upstream='retool', upstream_model=route_id)]
+                if any(route.get('upstream') == 'minara' and route != entry for route in alternatives):
+                    raise service_unavailable('conflicting Minara model descriptors: ' + route_id)
+                alternatives = [*alternatives] if entry in alternatives else [*alternatives, entry]
+                routes[route_id] = _public_route(route_id, alternatives)
+            else:
+                if route_id in routes and routes[route_id] != entry:
+                    raise service_unavailable('conflicting Minara model descriptors: ' + route_id)
+                routes[route_id] = entry
     return routes
+
+
+def _public_route(ident, alternatives):
+    """Public capabilities describe selectable routes; eligibility enforces every request."""
+    first = dict(alternatives[0])
+    first.update(id=ident, upstream='unified', _routes=copy.deepcopy(alternatives))
+    for key in ('tools', 'vision', 'reasoning'):
+        first[key] = any(route.get(key, False) for route in alternatives)
+    for field in ('reasoning_effort_levels', 'verbosity_levels'):
+        first[field] = list(dict.fromkeys(
+            level for route in alternatives for level in route.get(field, [])))
+    for key in ('context', 'max_output'):
+        values = [route.get(key) for route in alternatives]
+        first[key] = max(values) if all(type(value) is int for value in values) else None
+    first['metadata_source'] = 'configured-upstream-routes'
+    return first
+
+
+def route_for(entry, cfg):
+    """Detach the actual account route. Never inherit another provider's route facts."""
+    if entry.get('upstream') != 'unified':
+        return dict(entry)
+    upstream = cfg.get('upstream', 'retool')
+    routes = entry.get('_routes', [])
+    if upstream == 'minara':
+        descriptors = [({'id': value} if isinstance(value, str) else value)
+                       for value in cfg.get('minara_models', [])]
+        ids = {value['id'] for value in descriptors
+               if value.get('public_id') == entry['id']}
+        candidates = [route for route in routes if route.get('upstream') == 'minara'
+                      and route.get('upstream_model') in ids]
+    else:
+        candidates = [route for route in routes if route.get('upstream', 'retool') == upstream]
+    if not candidates:
+        raise service_unavailable("account has no route for model '%s'" % entry['id'])
+    route = copy.deepcopy(candidates[0])
+    route['_requirements'] = copy.deepcopy(entry.get('_requirements', {}))
+    return route
+
+
+def _requirements_reason(entry):
+    wanted = entry.get('_requirements', {})
+    for field in ('tools', 'vision'):
+        if wanted.get(field) and not entry.get(field, False):
+            return 'route does not support requested ' + field
+    if wanted.get('forced_tool_choice') and entry.get('forced_tool_choice') is False:
+        return 'route does not support requested forced tool choice'
+    effort = wanted.get('effort')
+    if effort is not None:
+        try:
+            resolve_tolerant(entry['id'], effort, cfg={'_minara_models': {entry['id']: entry}},
+                             xhigh_as=wanted.get('xhigh_as'), allow_downgrade=wanted.get('allow_downgrade', False))
+        except ApiError:
+            return 'route does not support requested reasoning effort'
+    verbosity = wanted.get('verbosity')
+    if verbosity is not None and verbosity not in entry.get('verbosity_levels', []):
+        return 'route does not support requested verbosity'
+    cap = wanted.get('max_tokens')
+    if cap is not None and entry.get('max_output') is not None and cap > entry['max_output']:
+        return 'requested output limit exceeds route limit'
+    return None
 
 
 def configure_minara(configs):
@@ -388,6 +462,14 @@ def _minara_reason(entry, cfg):
 
 
 def route_block_reason(entry, cfg):
+    if entry.get('upstream') == 'unified':
+        try:
+            entry = route_for(entry, cfg)
+        except ApiError as exc:
+            return exc.message
+    unsupported = _requirements_reason(entry)
+    if unsupported:
+        return unsupported
     reason = _minara_reason(entry, cfg)
     if reason or entry.get('upstream') == 'minara':
         return reason
@@ -417,6 +499,11 @@ def route_block_reason(entry, cfg):
 
 def resource_block_reason(entry, cfg):
     """Why this account has no provider resource for the model, or None."""
+    if entry.get('upstream') == 'unified':
+        try:
+            entry = route_for(entry, cfg)
+        except ApiError as exc:
+            return exc.message
     if entry.get('upstream') == 'minara':
         return _minara_reason(entry, cfg) or (None if cfg.get('bearer_token') else 'Minara token is not configured')
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
@@ -450,7 +537,7 @@ def minara_catalog(cfg=None):
 
 
 def catalog(cfg=None):
-    return CATALOG + list(minara_catalog(cfg).values())
+    return [entry for entry in CATALOG if entry['id'] not in minara_catalog(cfg)] + list(minara_catalog(cfg).values())
 
 
 def account_config(root, record):
@@ -544,6 +631,8 @@ def catalog_visibility(entry, cfg, backends=None):
         return True, None  # Unconfigured setup still exposes metadata; requests explain missing resources.
     if entry.get('upstream') == 'minara':
         return (True, None) if eligible else (False, 'no enabled Minara account')
+    if entry.get('upstream') == 'unified':
+        return (True, None) if any(not resource_block_reason(entry, item) for item in eligible) else (False, 'no enabled account configures this route')
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
     if key and any(item.get(key) for item in eligible):
         return True, None
@@ -959,7 +1048,7 @@ XHIGH_REPLACEMENTS = ("high", "max")
 
 def replaces_xhigh(entry):
     """True when xhigh is not an error on this route but another level: a Claude route whose levels the client can pick."""
-    return (entry.get('upstream') != 'minara' and entry.get('provider') == 'anthropic' and entry.get('reasoning_effort_control') == 'selectable'
+    return (entry.get('upstream') not in ('minara', 'unified') and entry.get('provider') == 'anthropic' and entry.get('reasoning_effort_control') == 'selectable'
             and 'xhigh' not in (entry.get('reasoning_effort_levels') or ()))
 
 
@@ -1007,7 +1096,10 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
     """
     entry, level = _resolve_requested(model, effort, strict=strict, default_model=default_model,
                                       allow_downgrade=allow_downgrade, xhigh_as=xhigh_as, cfg=cfg)
-    served = substitute_for(entry['id'])
+    unified_served = (entry.get('upstream') == 'unified' and any(
+        item.get('enabled', True) and not route_block_reason(entry, item) and not resource_block_reason(entry, item)
+        for item in pool_configs(cfg or {})))
+    served = None if unified_served or entry.get('upstream') == 'minara' else substitute_for(entry['id'])
     if served:
         entry = _BY_ID[served]
         levels = entry.get('reasoning_effort_levels') or []
@@ -1050,18 +1142,37 @@ def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
     if not name:
         raise bad_request("'model' is required", param='model')
     entry = minara_catalog(cfg).get(name) or _BY_ID.get(name)
+    if entry is None and name.startswith('minara/'):
+        target = name[len('minara/'):]
+        for candidate in minara_catalog(cfg).values():
+            route = next((route for route in candidate.get('_routes', [])
+                          if route.get('upstream') == 'minara' and route.get('upstream_model') == target), None)
+            if route is not None:
+                entry = dict(route, id=name)
+                break
     if entry is None and name.startswith("minara/"):
         raise not_found(f"unknown Minara model '{name}'; configure minara_models")
     if entry is None and '/' in name:
         stripped = _canonical(name.split('/', 1)[1])
-        if stripped in _BY_ID:
+        if stripped in minara_catalog(cfg) or stripped in _BY_ID:
             name = stripped
-            entry = _BY_ID.get(name)
+            entry = minara_catalog(cfg).get(name) or _BY_ID.get(name)
     if entry is None:
         if strict:
             raise not_found(f"unknown model '{name}'; see GET /v1/models")
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name,
                  'context': 200000, 'max_output': 128000}
+    if effort is not None and entry.get('upstream') == 'unified':
+        accepted = []
+        for route in entry['_routes']:
+            try:
+                _, level = resolve_tolerant(route['id'], effort,
+                    cfg={'_minara_models': {route['id']: route}}, xhigh_as='high')
+                accepted.append(level)
+            except ApiError:
+                pass
+        if accepted:
+            return entry, effort.lower() if isinstance(effort, str) else effort
     if effort is not None:
         if not entry.get('reasoning', True) and isinstance(effort, str) and effort.lower() == 'none':
             return entry, None  # An explicit disabled control is harmless; never forward it.
@@ -1085,6 +1196,8 @@ def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
 
 
 def provider_resource(cfg, entry):
+    if entry.get('upstream') == 'unified':
+        entry = route_for(entry, cfg)
     if entry.get('upstream') == 'minara':
         require_route(entry, cfg)
         return None

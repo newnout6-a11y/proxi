@@ -591,17 +591,23 @@ def _check_upstream(record, name):
         if not isinstance(ident, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:-]{0,199}', ident) or ident in seen:
             raise service_unavailable(f"{name}: Minara model IDs must be unique nonempty identifiers")
         seen.add(ident)
+        public = descriptor.get('public_id')
+        if public is not None and (not isinstance(public, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:-]{0,199}', public)):
+            raise service_unavailable(f"{name}: invalid public_id")
         for key in ('provider', 'label'):
             if key in descriptor and (not isinstance(descriptor[key], str) or not descriptor[key].strip()
                     or len(descriptor[key]) > 200 or any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF
                                                        for c in descriptor[key])):
                 raise service_unavailable(f"{name}: model {key} must be nonempty text")
-        for key in ('tools', 'reasoning', 'image'):
+        for key in ('tools', 'reasoning', 'image', 'forced_tool_choice'):
             if key in descriptor and type(descriptor[key]) is not bool:
                 raise service_unavailable(f"{name}: model {key} must be boolean")
         for key in ('context', 'max_output'):
             if descriptor.get(key) is not None and (type(descriptor[key]) is not int or descriptor[key] < 1):
                 raise service_unavailable(f"{name}: model {key} must be positive integer")
+        verbosity = descriptor.get('verbosity_levels', [])
+        if not isinstance(verbosity, list) or any(v not in ('low', 'medium', 'high') for v in verbosity):
+            raise service_unavailable(f"{name}: invalid model verbosity_levels")
         levels = descriptor.get('reasoning_effort_levels', [])
         if not isinstance(levels, list) or any(not isinstance(v, str) or v not in models.EFFORT_ORDER for v in levels):
             raise service_unavailable(f"{name}: invalid model reasoning_effort_levels")

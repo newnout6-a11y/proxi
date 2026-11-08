@@ -311,6 +311,18 @@ def _opt_int(data, key, low=1, high=MAX_TOKENS_CAP):
     return value
 
 
+def _contains_image(messages):
+    """Only canonical visual blocks are images, never metadata or JSON-schema data."""
+    for message in messages or []:
+        content = message.get('content') if isinstance(message, dict) else None
+        if message.get('role') == 'tool' and isinstance(content, dict):
+            content = content.get('toolResult')
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get('type') in ('image', 'image_url', 'input_image'):
+                return True
+    return False
+
+
 def _reject_images_unsupported(entry, data):
     """The catalog `vision` flag is otherwise declarative: upstream rejects image
     input for non-vision models with a bare 400. Fail fast with a clear 422."""
@@ -761,7 +773,15 @@ def _finish(data, parsed, dialect, search=False, cfg=None):
     parsed.tools = _tools(data, parsed if search else None)
     if parsed.entry.get("upstream") == "minara" and parsed.tools and not parsed.entry.get("tools", False):
         raise unprocessable("tools are not enabled for this Minara model", param="tools")
+    if parsed.entry.get('upstream') == 'unified':
+        parsed.entry = dict(parsed.entry, _requirements={
+            'tools': bool(parsed.tools), 'vision': _contains_image(parsed.native_messages),
+            'effort': parsed.requested_effort, 'verbosity': data.get('verbosity', (data.get('text') or {}).get('verbosity')),
+            'max_tokens': parsed.max_tokens, 'xhigh_as': (cfg or {}).get('claude_xhigh_effort', 'high'),
+            'allow_downgrade': (cfg or {}).get('allow_effort_downgrade', False)})
     parsed.tool_choice = _tool_choice(data.get("tool_choice"))
+    if parsed.entry.get('upstream') == 'unified':
+        parsed.entry['_requirements']['forced_tool_choice'] = (parsed.tool_choice == 'required' or isinstance(parsed.tool_choice, dict))
     names = [tool["function"]["name"] for tool in parsed.tools]
     if parsed.tool_choice == "required" and not names:
         raise unprocessable("tool_choice requires at least one tool", param="tool_choice")

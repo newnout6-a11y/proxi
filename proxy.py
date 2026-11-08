@@ -1247,6 +1247,11 @@ def make_handler(runtime: Runtime):
                 else:
                     warnings.append("generation.verbosity %s not applied: %s has no such level" % (verbosity, parsed.model))
 
+            if parsed.entry.get('upstream') == 'unified':
+                requirements = dict(parsed.entry.get('_requirements', {}))
+                requirements.update(effort=parsed.effort, verbosity=parsed.verbosity)
+                parsed.entry = dict(parsed.entry, _requirements=requirements)
+
         def _journal_skipped_edits(self, changes):
             """One prompt.edit_skipped per kind of edit the rewrite had to leave out of this request."""
             for group in journal_changes([change for change in changes if change.get("skipped")]):

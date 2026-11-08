@@ -8,6 +8,7 @@
 | Документ | О чём |
 |---|---|
 | [client-setup.md](client-setup.md) | Настройка клиентов под relay: Codex, Claude Code, Claude Desktop, OpenCode, DeepSeek Harness |
+| [unified-routing.md](unified-routing.md) | Единый пул моделей, affinity диалогов и субагентов, границы кэша |
 | [minara.md](minara.md) | Дополнительный Minara upstream: Bearer, аккаунты, модели и ограничения |
 | [prompt-control.md](prompt-control.md) | Управление системным промптом через `prompts.json`: профили, правила, правки истории и tools |
 | [prompt-control-plan.md](prompt-control-plan.md) | План работ по управлению промптом (5 ноября 2026) |

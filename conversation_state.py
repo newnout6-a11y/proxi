@@ -105,7 +105,7 @@ STAMP = _blocks_stamp()
 # signature, redacted data, tool_use/tool_result pairs and "content block" complaints), not the request's tail.
 _BLOCK_REFUSAL = re.compile(r"thinking|signature|redacted|\bblocks?\b|tool_use|tool_result", re.IGNORECASE)
 
-Meta = collections.namedtuple("Meta", "key_id tag account saved_at size branches signatures messages")
+Meta = collections.namedtuple("Meta", "key_id tag account saved_at size branches signatures messages binding", defaults=(None,))
 State = collections.namedtuple("State", "branches turn_ends cache_key prefix_tokens warm_at")
 Loaded = collections.namedtuple("Loaded", "header state size")
 
@@ -128,17 +128,18 @@ class Capture:
     The branches are immutable once recorded, so a background thread may serialize them while the session
     goes on; `mark` says whether the session has moved since the last copy."""
     __slots__ = ("key", "key_id", "account", "branches", "turn_ends", "cache_key", "prefix_tokens",
-                 "warm_at", "mark")
+                 "warm_at", "mark", "binding")
 
-    def __init__(self, key, key_id, account, branches, turn_ends, cache_key, prefix_tokens, warm_at, mark):
+    def __init__(self, key, key_id, account, branches, turn_ends, cache_key, prefix_tokens, warm_at, mark, binding=None):
         self.key, self.key_id, self.account = key, key_id, account
         self.branches, self.turn_ends, self.cache_key = branches, turn_ends, cache_key
         self.prefix_tokens, self.warm_at, self.mark = prefix_tokens, warm_at, mark
+        self.binding = binding
 
     @property
     def empty(self):
         """Nothing left worth keeping: the stored copy, if there is one, is to be removed."""
-        return not self.branches and not self.cache_key
+        return not self.branches and not self.cache_key and not self.binding
 
 
 # -- keys ----------------------------------------------------------------------------------------------------
@@ -187,10 +188,27 @@ def capture(key, session):
     branches = tuple(history.branches)[-STORED_BRANCHES:]
     cache_key = getattr(session, "_last_cache_key", None)
     turn_ends = tuple(getattr(session, "_cached_turn_ends", None) or ())
-    mark = (id(history), getattr(history, "revision", 0), cache_key, turn_ends, identity)
+    binding = provider_binding(session)
+    mark = (id(history), getattr(history, "revision", 0), cache_key, turn_ends, identity,
+            tuple(sorted(binding.items())) if binding else None)
     return Capture(key, key_id, identity, branches, turn_ends, cache_key,
                    int(getattr(session, "_last_prefix_tokens", 0) or 0),
-                   float(getattr(session, "_warm_at", 0) or 0), mark)
+                 float(getattr(session, "_warm_at", 0) or 0), mark, binding)
+
+
+def provider_binding(session):
+    """Non-secret route identity, never a claim that provider cache exists."""
+    previous = getattr(session, '_provider_binding', None)
+    if isinstance(previous, dict):
+        return dict(previous)
+    cfg = getattr(getattr(session, 'backend', None), 'cfg', None) or {}
+    route = getattr(session, '_bound_route', None)
+    if not isinstance(route, dict):
+        return None
+    binding = {'upstream': cfg.get('upstream', 'retool'), 'base': str(cfg.get('base') or '').rstrip('/'),
+               'model': route.get('id', ''), 'upstream_model': route.get('upstream_model', route.get('id', ''))}
+    session._provider_binding = binding
+    return dict(binding)
 
 
 def apply(session, state):
@@ -205,6 +223,7 @@ def apply(session, state):
 def adopt(session, key, loaded):
     """Put a state that has been read into the session, and remember that its stored copy is this very state."""
     apply(session, loaded.state)
+    session._provider_binding = loaded.header.get('binding')
     captured = capture(key, session)
     session._state_mark = captured.mark if captured is not None else None
 
@@ -422,6 +441,8 @@ def encode(capture_, saved_at, max_file, max_raw):
                       "saved_at": round(saved_at, 3), "raw": raw, "branches": len(branches),
                       "messages": len(branches[-1].messages) if branches else 0,
                       "signatures": sum(_thinking_blocks(item) for item in branches)}
+            if capture_.binding:
+                header['binding'] = capture_.binding
             blob = MAGIC + _dump(header).encode("ascii") + b"\n" + payload
             if len(blob) > max_file:
                 raise TooLarge("disk")
@@ -451,6 +472,11 @@ def _parse_header(line):
             or any(type(item) is not int or item < 0 for item in counts)
             or not (header.get("key") is None or isinstance(header.get("key"), (str, list)))):
         raise StateError("corrupt")
+    binding = header.get('binding')
+    if binding is not None and (not isinstance(binding, dict) or set(binding) != {'upstream', 'base', 'model', 'upstream_model'}
+            or any(not isinstance(value, str) or len(value) > 2048 for value in binding.values())
+            or binding['upstream'] not in ('retool', 'minara')):
+        raise StateError('corrupt')
     return header
 
 
@@ -611,7 +637,7 @@ class ConversationStore:
     def _meta(self, key_id, header, size):
         key = key_value(header.get("key"))
         return Meta(key_id, journal.tag(key), header["account"], float(header["saved_at"]), size,
-                    header["branches"], header["signatures"], header["messages"])
+                    header["branches"], header["signatures"], header["messages"], header.get('binding'))
 
     def _announce_drop(self, meta, reason, tag=None):
         journal.emit("conversation_state.dropped", "Сохранённое состояние диалога удалено: %s" % _REASONS[reason],

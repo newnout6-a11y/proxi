@@ -122,6 +122,8 @@ OUTPUT_CAP_EMULATED_BELOW = 16384
 
 def output_cap(entry, max_tokens):
     """The cap the relay enforces on the reply of a request, or None when the route keeps it or it cannot bind."""
+    if entry.get("upstream") == "minara":
+        return None
     if not max_tokens or max_tokens >= OUTPUT_CAP_EMULATED_BELOW or not models.ignores_output_cap(entry['id']):
         return None
     return max_tokens
