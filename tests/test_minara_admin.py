@@ -85,4 +85,3 @@ def test_pending_bearer_secret_is_masked_in_responses_and_journal(pool, monkeypa
     assert token not in json.dumps(events)
     assert pool.saved()['accounts'][-1]['bearer_token'] == token
     assert token not in json.dumps(list(journal.JOURNAL._events))
-

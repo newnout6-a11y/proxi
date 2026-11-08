@@ -290,4 +290,3 @@ def test_cancelled_minara_does_not_block_parallel_retool_turn(mixed):
         status, raw = pending.result(3)
         assert status == 503 and 'reply was cut' in raw
     assert mixed.cancelled.wait(2)
-
