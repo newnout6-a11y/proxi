@@ -722,11 +722,40 @@ class ConversationStore:
             self._unlink(self._path(meta.key_id))
             self._announce_drop(meta, reason)
 
-    def _forget(self, key_id, reason, tag=None, announce_missing=True):
-        """Remove one file because it cannot be used (or can no longer match anything)."""
-        with self._lock:
-            meta = self._index.pop(key_id, None)
-        removed = self._unlink(self._path(key_id))
+    @staticmethod
+    def _file_version(info):
+        """Identity and contents version of the file a reader actually opened."""
+        # Windows fstat/stat expose ctime differently on some filesystems; inode, size and modification time are
+        # comparable through both APIs (ctime is not needed to distinguish an atomic replacement).
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+    def _forget(self, key_id, reason, tag=None, announce_missing=True, *, version=None, expected_meta=None):
+        """Remove an unusable file; a reader may invalidate only the version it read.
+
+        Decoding is deliberately outside _io. A writer may replace the old corrupt/expired file while that decode
+        runs, so its failure must not delete the new state. Check and unlink under the same lock as replacement.
+        """
+        with self._io:
+            path = self._path(key_id)
+            if version is not None:
+                try:
+                    if self._file_version(os.stat(path)) != version:
+                        return
+                except FileNotFoundError:
+                    pass  # still forget this reader's stale index entry, but not a newer writer's
+                except OSError:
+                    return  # cannot establish which file this is; leave it alone
+            with self._lock:
+                if expected_meta is not None and self._index.get(key_id) is not expected_meta:
+                    return
+                meta = self._index.pop(key_id, None)
+            try:
+                os.unlink(path)
+                removed = True
+            except FileNotFoundError:
+                removed = True
+            except OSError:
+                removed = False
         if meta is not None or (announce_missing and removed):
             self._announce_drop(meta, reason, tag)
 
@@ -757,12 +786,15 @@ class ConversationStore:
             return None
         try:
             with self._io:
-                with open(self._path(key_id), "rb") as handle:
-                    blob = handle.read(self.max_file_bytes + 1)
-        except FileNotFoundError:
-            with self._lock:
-                self._index.pop(key_id, None)
-            return None
+                try:
+                    with open(self._path(key_id), "rb") as handle:
+                        version = self._file_version(os.fstat(handle.fileno()))
+                        blob = handle.read(self.max_file_bytes + 1)
+                except FileNotFoundError:
+                    with self._lock:
+                        if self._index.get(key_id) is meta:
+                            self._index.pop(key_id, None)
+                    return None
         except OSError as exc:
             journal.emit("conversation_state.load_failed", "Сохранённое состояние диалога не прочитано (%s)"
                          % type(exc).__name__, "warn", conversation=meta.tag, error=type(exc).__name__)
@@ -776,7 +808,7 @@ class ConversationStore:
             if self._clock() - header["saved_at"] > self.ttl:
                 raise StateError("expired")
         except StateError as error:
-            self._forget(key_id, error.reason, meta.tag)
+            self._forget(key_id, error.reason, meta.tag, version=version, expected_meta=meta)
             return None
         if header["account"] != meta.account:
             # Somebody (another relay on this directory) rewrote the file after it was indexed: the index is

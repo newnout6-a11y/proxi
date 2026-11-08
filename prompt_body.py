@@ -316,28 +316,37 @@ def _remembered(context, edit, text, run):
             _EDIT_MEMO.move_to_end(key)
     if entry is not None:
         context.deadline.charge(len(text))
-        kind, value = entry[0]
-        if kind == "refused":
-            raise value[0](value[1])
-        return value
+        return _memo_result(entry[0])
     try:
         result = run(text)
     except (policy.OperationTimeout, policy.EditTooLarge) as refused:
-        _remember(key, ("refused", (type(refused), str(refused))), 0)
-        raise
-    _remember(key, ("ok", result), len(result[0]) if result else 0)
-    return result
+        found = _remember(key, ("refused", (type(refused), str(refused))), 0)
+    else:
+        found = _remember(key, ("ok", result), len(result[0]) if result else 0)
+    # Two request threads may both miss before either commits. Both have already charged their own work; both must
+    # return the committed winner, not the private result of their run (a timeout in one thread, success in the other).
+    return _memo_result(found)
+
+
+def _memo_result(found):
+    kind, value = found
+    if kind == "refused":
+        raise value[0](value[1])
+    return value
 
 
 def _remember(key, found, held):
+    """Commit the first outcome, returning that same outcome to every concurrent caller."""
     with _EDIT_MEMO_LOCK:
         if key in _EDIT_MEMO:
-            return
+            _EDIT_MEMO.move_to_end(key)
+            return _EDIT_MEMO[key][0]
         _EDIT_MEMO[key] = (found, held)
         _EDIT_MEMO_HELD[0] += held
         while _EDIT_MEMO and (len(_EDIT_MEMO) > _EDIT_MEMO_ENTRIES or _EDIT_MEMO_HELD[0] > _EDIT_MEMO_CHARS):
             _dropped, (_found, size) = _EDIT_MEMO.popitem(last=False)
             _EDIT_MEMO_HELD[0] -= size
+        return found
 
 
 def _replace_text_fn(find, replacement, replace_all, context, scope):

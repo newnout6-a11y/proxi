@@ -1278,6 +1278,8 @@ def _error_from_event(event):
     if status == 429:
         return apierr.too_many_requests(text)
     if status in (401, 403):
+        if event.get("isUsingRetoolManagedKey") and ("invalid x-api-key" in text or "authentication_error" in text):
+            return apierr.upstream_error(text)
         return apierr.upstream_auth_failed(text)
     if status in (400, 404, 422):
         return apierr.bad_request(text)

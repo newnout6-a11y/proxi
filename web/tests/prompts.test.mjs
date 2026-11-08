@@ -27,6 +27,11 @@ test('publish masks match the full model id the way the relay does: case-insensi
   assert.deepEqual(publishedModels(['ZAI-ORG/glm-5.?'], catalog), ['zai-org/GLM-5.3']);
   assert.deepEqual(publishedModels(['claude-[os]*'], catalog), ['claude-opus-5-5', 'claude-sonnet-5-5']);
   assert.deepEqual(publishedModels(['claude-[!o]*'], catalog), ['claude-sonnet-5-5']);
+  assert.deepEqual(publishedModels(['claude-[^s]*'], catalog), ['claude-sonnet-5-5']);
+  assert.deepEqual(publishedModels(['[]]'], [']', 'a']), [']']);
+  assert.deepEqual(publishedModels(['[!]]'], [']', 'a']), ['a']);
+  assert.deepEqual(publishedModels(['[z-a]'], ['a', 'z']), []);
+  assert.deepEqual(publishedModels(['[!z-a]'], ['a', 'z']), ['a', 'z']);
   assert.deepEqual(publishedModels(true, catalog), catalog);
   assert.deepEqual(publishedModels(false, catalog), []);
   assert.deepEqual(publishedModels(['gpt-5.5'], catalog), ['gpt-5.5']);              // a dot is a dot, not any character

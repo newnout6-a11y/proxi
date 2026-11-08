@@ -278,13 +278,57 @@ def _git_dangerous_option(words):
             if name and any(dangerous.startswith(name) for dangerous in GIT_DANGEROUS_LONG):
                 return word.split("=", 1)[0]
     return None
-# branch and tag list by default; these flags rename, delete, create or rewrite (-a lists every branch but annotates a tag).
-GIT_LIST_ONLY_RE = {
-    "branch": re.compile(r'(?:^|\s)(?:-[a-zA-Z]*[dDmMfu]\b|--(?:delete|move|copy|force|set-upstream-to|unset-upstream|'
-                         r'edit-description|create-reflog)\b)'),
-    "tag": re.compile(r'(?:^|\s)(?:-[a-zA-Z]*[asudmfFe]\b|--(?:annotate|sign|local-user|delete|message|file|force|'
-                      r'edit|create-reflog)\b)'),
-}
+def _git_lists_refs(subcommand, args):
+    """Accept only known listing forms, not a blacklist of ref mutations.
+
+    Both commands create a ref from a bare name; Git also accepts abbreviated long options (including --del). Exact
+    known read options and explicit --list for positional patterns avoid both traps. Unknown/new options fail closed.
+    """
+    switches = {"--list", "--column", "--no-column", "--color", "--no-color", "--omit-empty", "--no-omit-empty",
+                "--ignore-case", "--no-ignore-case"}
+    optional_values = {"--contains", "--no-contains", "--merged", "--no-merged"}
+    required_values = {"--sort", "--format", "--points-at"}
+    attached_values = {"--column", "--color"}
+    short = "li"
+    if subcommand == "branch":
+        switches |= {"--all", "--remotes", "--verbose", "--no-verbose", "--quiet", "--no-quiet", "--show-current",
+                     "--no-show-current", "--abbrev", "--no-abbrev"}
+        attached_values |= {"--abbrev"}
+        short += "arvq"
+    listing = False
+    positional = False
+    index = 0
+    while index < len(args):
+        word = args[index]
+        index += 1
+        if word == "--":
+            return listing or (not positional and index == len(args))
+        if not word.startswith("-"):
+            positional = True
+            continue
+        if word.startswith("--"):
+            name, equal, _value = word.partition("=")
+            if name in required_values:
+                if not equal:
+                    if index == len(args):
+                        return False
+                    index += 1
+            elif name in optional_values:
+                if not equal and index < len(args) and not args[index].startswith("-"):
+                    index += 1
+            elif name in switches:
+                if equal and name not in attached_values:
+                    return False
+                listing |= name == "--list"
+            else:
+                return False
+        elif subcommand == "tag" and re.fullmatch(r"-n\d*", word):
+            continue
+        elif len(word) > 1 and all(char in short for char in word[1:]):
+            listing |= "l" in word[1:]
+        else:
+            return False
+    return not positional or listing
 # A PowerShell provider drive that is no file system: variables (an object reaches every command), functions, the
 # environment, the registry.
 PS_PROVIDER_RE = re.compile(r"""(?:^|[\s'"=,:])(?:variable|function|env|alias|cert|wsman|hklm|hkcu|registry)::?""",
@@ -368,8 +412,8 @@ def _check_segments(segments, patterns, depth=0) -> None:
                 if place:
                     raise PolicyError("git fetch from %s requires allow_all: the allowlist fetches only from a configured "
                                       "remote, by its name (git fetch origin)" % place)
-            if (subcommand in GIT_LIST_ONLY_RE
-                    and GIT_LIST_ONLY_RE[subcommand].search(" ".join(words[words.index(subcommand) + 1:]))):
+            if (subcommand in ("branch", "tag")
+                    and not _git_lists_refs(subcommand, words[words.index(subcommand) + 1:])):
                 raise PolicyError("git %s may only list under the allowlist" % subcommand)
         if GLOBAL_BLOCKED_RE.search(flattened):
             raise PolicyError("command preprocessing flags require allow_all")
