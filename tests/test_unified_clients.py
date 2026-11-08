@@ -240,3 +240,23 @@ def test_unified_minara_usage_never_estimates_retool_category_prices(unified):
     for event in events:
         assert event['data']['cost_input'] is None
         assert event['data']['cost_output'] is None
+
+@pytest.mark.parametrize('dialect', ['chat','responses','messages'])
+def test_explicit_max_never_selects_high_only_provider_even_with_legacy_downgrade(unified, dialect):
+    rt = unified.runtime
+    rt.cfg['allow_effort_downgrade'] = True
+    descriptor = rt.pool.backends[1].cfg['minara_models'][0]
+    descriptor['reasoning_effort_levels'] = ['high']
+    rt.cfg['_minara_models'] = models.build_minara_catalog([b.cfg for b in rt.pool.backends])
+    route, body = request(dialect, PUBLIC)
+    if dialect == 'chat':
+        body['reasoning_effort'] = 'max'
+    elif dialect == 'responses':
+        body['reasoning'] = {'effort': 'max'}
+    else:
+        body['output_config'] = {'effort': 'max'}
+    for i in range(3):
+        status, raw = unified.call(route, body, 'max-' + dialect + str(i))
+        assert status == 200, raw
+        assert 'RETOOL_OK' in raw
+    assert all(row['upstream'] == 'retool' for row in unified.observed)

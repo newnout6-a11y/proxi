@@ -1297,7 +1297,7 @@ class TurnRunner:
                     scoped = dict(self.cfg, _minara_models={parsed.model: parsed.entry})
                     _, parsed.effort = model_catalog.resolve_tolerant(
                         parsed.model, parsed.effort,
-                        strict=True, allow_downgrade=self.cfg.get("allow_effort_downgrade", False),
+                        strict=True, allow_downgrade=False,
                         xhigh_as=self.cfg.get("claude_xhigh_effort", "high"), cfg=scoped)
                     out.put({"type": "route_bound", "upstream": acc_cfg.get("upstream", "retool"),
                              "output_cap": generation.output_cap(parsed.entry, parsed.max_tokens)})

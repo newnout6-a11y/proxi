@@ -165,3 +165,29 @@ Retool credits. Cache counters были нулевыми. Временный п�
 ## Итоговая проверка исходников
 
 `uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest -n 4 -o addopts= -q --tb=short` — **9994 passed, 2 skipped, 3 warnings**, 72,15 с. Два предупреждения относятся к тестовому broken stdout, одно — curl chunk_size. Рабочий restart пока не выполнен: обнаружены активные запросы; принудительно обрывать их ради активации нельзя.
+
+
+## Активация и проверка после пользовательского перезапуска
+
+8 ноября 2026, после штатного запуска пользователем: рабочий admin API подтвердил
+25 аккаунтов, Minara `pending: null`, `enabled: true`, `routable: true`.
+`/v1/models` — 27 моделей, ровно один `gpt-6.1-sol` и один `claude-opus-5-5`,
+ноль дополнительных `minara/` пунктов. Это configured readiness, не замена live generation.
+В логе восстановлена Retool-история и сообщено чтение 425450 токенов кэша.
+Два HTTP 400 отдельно проверены по журналу: задачи памяти Codex отключены
+операторским `codex_memory_jobs: false`; генерация для них не запускалась.
+
+Строки `max -> high` выявили ошибку speculative candidate checking: старая
+`allow_effort_downgrade: true` применялась при проверке Minara-кандидата.
+Фактический показанный ход Retool остался на max, но будущий выбор high-only
+Minara мог ослабить запрос. Исправлены чистая строгая eligibility-проверка,
+публичная unified resolution и post-acquire binding: явный max не понижается
+ради другого upstream. Legacy standalone совместимость сохраняется отдельно.
+Три HTTP-диалекта многократно подтвердили выбор Retool для max при high-only
+Minara и включённой старой настройке. Независимый focused-прогон — 55 passed.
+
+Полный прогон после effort-исправления:
+`uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest -n 4 -o addopts= -q --tb=short`
+— **10001 passed, 2 skipped, 3 warnings**, 66,98 с. Ruff и diff-check прошли.
+Этот маленький follow-up требует очередной загрузки кода запущенным процессом;
+самостоятельный принудительный restart не выполнялся.

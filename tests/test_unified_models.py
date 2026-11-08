@@ -148,3 +148,48 @@ def test_auto_tools_allowed_when_native_forced_choice_disabled():
     parsed = validate.parse_chat({'messages': [{'role': 'user', 'content': 'hi'}],
         'tools': [{'type': 'function', 'function': {'name': 'echo', 'parameters': {'type': 'object'}}}]}, cfg)
     assert not models.route_block_reason(parsed.entry, m)
+
+
+def test_candidate_effort_is_strict_and_silent_even_with_legacy_downgrade_enabled(capsys):
+    cfg, r, m = setup()
+    cfg['allow_effort_downgrade'] = True
+    m['minara_models'][0]['reasoning_effort_levels'] = ['high']
+    cfg['_minara_models'] = models.build_minara_catalog([r, m])
+    parsed = validate.parse_chat({'messages': [{'role': 'user', 'content': 'hi'}],
+                                 'reasoning_effort': 'max'}, cfg)
+    for _ in range(10):
+        assert models.route_block_reason(parsed.entry, m) == 'route does not support requested reasoning effort'
+        assert models.route_block_reason(parsed.entry, r) is None
+    assert parsed.effort == 'max'
+    assert '[effort]' not in capsys.readouterr().out
+
+
+def test_effective_profile_effort_can_select_matching_minara_without_changing_client_diagnostic():
+    cfg, _, m = setup()
+    cfg['allow_effort_downgrade'] = True
+    parsed = validate.parse_chat({'messages': [{'role': 'user', 'content': 'hi'}],
+                                 'reasoning_effort': 'high'}, cfg)
+    parsed.effort, parsed.prompt_effort = 'low', 'low'
+    parsed.entry = dict(parsed.entry, _requirements={**parsed.entry['_requirements'], 'effort': 'low'})
+    assert models.route_block_reason(parsed.entry, m) is None
+    assert parsed.requested_effort == 'high' and parsed.effort == 'low'
+
+
+def test_public_unified_effort_is_not_downgraded_when_no_route_supports_it(capsys):
+    cfg, _, m = setup()
+    m['minara_models'] = [{'id': 'openai/unique', 'public_id': 'unique', 'provider': 'openai',
+                          'reasoning': True, 'reasoning_effort_levels': ['high']}]
+    cfg['_minara_models'] = models.build_minara_catalog([m])
+    with pytest.raises(ApiError):
+        models.resolve_tolerant('unique', 'max', allow_downgrade=True, cfg=cfg)
+    assert '[effort]' not in capsys.readouterr().out
+
+
+def test_documented_retool_xhigh_mapping_does_not_enable_minara_mapping():
+    cfg, r, m = setup()
+    m['minara_models'][0]['reasoning_effort_levels'] = ['high']
+    cfg['_minara_models'] = models.build_minara_catalog([r, m])
+    parsed = validate.parse_chat({'messages': [{'role': 'user', 'content': 'hi'}],
+                                 'reasoning_effort': 'xhigh'}, cfg)
+    assert models.route_block_reason(parsed.entry, r) is None
+    assert models.route_block_reason(parsed.entry, m) == 'route does not support requested reasoning effort'

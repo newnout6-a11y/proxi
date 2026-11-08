@@ -431,7 +431,7 @@ def _requirements_reason(entry):
     if effort is not None:
         try:
             resolve_tolerant(entry['id'], effort, cfg={'_minara_models': {entry['id']: entry}},
-                             xhigh_as=wanted.get('xhigh_as'), allow_downgrade=wanted.get('allow_downgrade', False))
+                             xhigh_as=wanted.get('xhigh_as'), allow_downgrade=False)
         except ApiError:
             return 'route does not support requested reasoning effort'
     verbosity = wanted.get('verbosity')
@@ -1119,6 +1119,12 @@ def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade,
         return resolve(base_name, extracted_effort, strict=strict, default_model=default_model, cfg=cfg)
     except ApiError as error:
         if not allow_downgrade:
+            raise
+        # A unified request must reach an exact compatible route, not have its
+        # explicit effort weakened before candidate selection. Legacy standalone
+        # opt-in compatibility retains its existing behavior below.
+        candidate, _ = resolve(base_name, None, strict=strict, default_model=default_model, cfg=cfg)
+        if candidate.get('upstream') == 'unified':
             raise
         if error.status != 400:
             raise
