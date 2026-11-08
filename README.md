@@ -8,6 +8,11 @@ Anthropic-клиентов (Codex, opencode, Aider, Continue, Claude Code, curl)
 Честная рамка: это адаптер к внутреннему протоколу, а не официальный API Retool.
 Совместимость ограничена списком ниже.
 
+Дополнительный upstream **Minara** поддерживает Bearer-авторизацию через
+`curl_cffi` с Chrome impersonation. Можно добавить отдельный Minara-аккаунт в пул
+или запустить relay без Retool. Настройка, имена моделей и ограничения:
+[Minara](docs/minara.md).
+
 ## Возможности
 
 - POST /v1/chat/completions — OpenAI Chat Completions, streaming и non-streaming.

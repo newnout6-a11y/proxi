@@ -71,6 +71,7 @@ def collect(runtime, *, force_refresh=False):
             "auth_failures": status.get("auth_failures") or 0, "available": available,
             "rate_limited_until": status.get("rate_limited_until"),
             "fresh": available is not None and not info.get("stale"),
+            "balance_supported": info.get("balance_supported", True),
             "routable": backend in active or backend in spare, "reserve": backend in spare,
         })
     return entries
@@ -91,7 +92,7 @@ def summarize(entries):
     for entry in entries:
         states[entry["state"]] = states.get(entry["state"], 0) + 1
     until = [entry["rate_limited_until"] for entry in entries if entry.get("rate_limited_until")]
-    return {"ok": any(entry["routable"] and entry["fresh"] for entry in entries),
+    return {"ok": any(entry["routable"] and (entry["fresh"] or not entry.get("balance_supported", True)) for entry in entries),
             "balance_known": any(entry["fresh"] for entry in entries),
             "total": len(entries), "routable": sum(entry["routable"] for entry in entries),
             "reserve": sum(entry["reserve"] for entry in entries), "states": states,
@@ -115,7 +116,8 @@ def aggregate_balance(infos):
         "used_month": round(sum(info.get("used_month") or 0.0 for info in with_balance), 4) if with_balance else None,
         "reset_date": next((info["reset_date"] for info in with_balance if info.get("reset_date")), None),
         "is_low": any(info.get("is_low") for info in with_balance),
-        "session_used": round(sum(known(info.get("session_used")) or 0.0 for info in infos), 4),
+        "session_used": (round(sum(known(info.get("session_used")) or 0.0 for info in infos), 4)
+                         if any(info.get("balance_supported", True) for info in infos) else None),
         "stale": any(info.get("stale") for info in with_balance),
         "unreported_usage": any(info.get("unreported_usage") for info in infos),
         "accounts_total": len(infos),
@@ -129,7 +131,9 @@ def balance_report(entries):
     for entry in entries:
         info = entry["info"]
         item = {"account": account_tag(entry["backend"], UNNAMED), "state": entry["state"],
-                "available": entry["available"], "monthly_allocation": info.get("monthly_allocation"),
+                "available": entry["available"], "upstream": entry["backend"].cfg.get("upstream", "retool"),
+                "unit": info.get("unit", "credits"), "balance_supported": entry.get("balance_supported", True),
+                "monthly_allocation": info.get("monthly_allocation"),
                 "reset_date": info.get("reset_date"), "stale": bool(info.get("stale"))}
         error = info.get("error") or info.get("stale_error")
         if error:
@@ -148,6 +152,7 @@ def usage_report(runtime, rows=None):
     rows, recent, accounts = rows or account_managers(runtime), [], []
     totals = {"session_used": 0.0, "turns": 0, "recent_total": 0.0}
     available, unreported = [], False
+    credit_accounts = 0
     for backend, manager in rows:
         usage = manager.usage()
         tag = account_tag(backend, UNNAMED)
@@ -155,7 +160,9 @@ def usage_report(runtime, rows=None):
         recent.extend(items)
         used = console_log.number(usage.get("session_used")) or 0.0
         turns = int(usage.get("turns") or 0)
-        totals["session_used"] += used
+        monetary = backend.cfg.get("upstream") == "minara"
+        credit_accounts += not monetary
+        totals["session_used"] += used if not monetary else 0
         totals["turns"] += turns
         totals["recent_total"] += console_log.number(usage.get("recent_total")) or sum(
             console_log.number(item.get("credits")) or 0.0 for item in items)
@@ -163,10 +170,14 @@ def usage_report(runtime, rows=None):
         balance = known(usage.get("available"))
         if balance is not None:
             available.append(balance)
-        accounts.append({"account": tag, "session_used": round(used, 4), "turns": turns, "available": balance})
+        accounts.append({"account": tag, "session_used": None if monetary else round(used, 4),
+                         "turns": turns, "available": balance,
+                         **({"upstream": "minara", **{key: usage[key] for key in (
+                             "attempts", "provider_cost", "provider_cost_currency", "provider_cost_complete",
+                             "provider_cost_records") if key in usage}} if monetary else {})})
     recent.sort(key=lambda item: item.get("ts") or 0)
-    return {"session_used": round(totals["session_used"], 4), "turns": totals["turns"],
-            "recent": recent[-50:], "recent_total": round(totals["recent_total"], 4),
+    return {"session_used": round(totals["session_used"], 4) if credit_accounts else None, "turns": totals["turns"],
+            "recent": recent[-50:], "recent_total": round(totals["recent_total"], 4) if credit_accounts else None,
             "unreported_usage": unreported,
             "available": round(sum(available), 4) if available else None,
             "accounts": accounts}

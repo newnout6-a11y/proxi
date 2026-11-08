@@ -1334,3 +1334,53 @@ for (const width of [280, 320, 414]) {
     await page.getByRole('tab', { name: /Все события/ }).count();
   });
 }
+
+test('adds a Minara bearer account without sending Retool credentials', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByRole('combobox', { name: 'Провайдер' }).selectOption('minara');
+  await page.getByLabel('Переменная окружения с токеном').fill('MINARA_API_TOKEN');
+  await page.getByLabel('Модели (JSON-массив)').fill('not json');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect.poll(() => state.accountRequests.length).toBe(0);
+  await page.getByLabel('Модели (JSON-массив)').fill('[{"id":"openai/gpt-oss-20b","tools":true}]');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect.poll(() => state.accountRequests.length).toBe(1);
+  expect(state.accountRequests[0].body).toEqual({ upstream: 'minara', base: 'https://api.minara.ai/v1',
+    label: '', bearer_token_env: 'MINARA_API_TOKEN', minara_models: [{ id: 'openai/gpt-oss-20b', tools: true }] });
+  await expect(page.getByRole('heading', { name: 'Новый аккаунт' })).toHaveCount(0);
+});
+
+
+test('Minara form stays readable in both themes and narrow screens', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByRole('combobox', { name: 'Провайдер' }).selectOption('minara');
+  for (const theme of ['dark', 'light']) {
+    await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
+    for (const width of [280, 320, 414, 1440]) {
+      await page.setViewportSize({ width, height: 1000 });
+      await expect(page.getByLabel('Или Bearer-токен')).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+    }
+    await page.screenshot({ path: `../.agents/minara-form-${theme}.png`, fullPage: true });
+  }
+});
+
+test('Minara account never labels monetary usage as Retool credits', async ({ page }) => {
+  const state = await mockAdmin(page);
+  Object.assign(state.pool[0], { upstream: 'minara', available: null, monthly_allocation: null,
+    session_used: null, turns: 3, attempts: 4, provider_cost: 0.12345, provider_cost_currency: null,
+    balance_supported: false, renewal_supported: false });
+  await login(page);
+  await nav(page, 'Аккаунты');
+  const row = page.locator('.pool-row').first();
+  await expect(row).toContainText('3 хода');
+  await expect(row).toContainText('валюта неизвестна');
+  await expect(row.getByRole('button', { name: 'Баланс', exact: true })).toBeDisabled();
+  await expect(row.getByRole('button', { name: 'Продлить', exact: true })).toBeDisabled();
+});

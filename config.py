@@ -550,6 +550,68 @@ def _whole_number(value):
     return None
 
 
+def _check_upstream(record, name):
+    kind = record.get('upstream', 'retool')
+    if kind not in ('retool', 'minara'):
+        raise service_unavailable(f"{name}: upstream must be retool or minara")
+    if kind != 'minara':
+        return
+    from urllib.parse import urlsplit
+    base = record.setdefault('base', 'https://api.minara.ai/v1')
+    if (not isinstance(base, str) or len(base) > 2048
+            or any(ord(c) < 33 or ord(c) > 126 for c in base)):
+        raise service_unavailable(f"{name}: base must be a printable ASCII HTTPS URL")
+    try:
+        url = urlsplit(base)
+        port = url.port
+    except ValueError:
+        raise service_unavailable(f"{name}: invalid Minara HTTPS URL or port") from None
+    if port is not None and not 1 <= port <= 65535:
+        raise service_unavailable(f"{name}: invalid Minara HTTPS port")
+    if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
+        raise service_unavailable(f"{name}: Minara base must be an HTTPS URL without credentials/query/fragment")
+    record['base'] = base.rstrip('/')
+    env = record.get('bearer_token_env')
+    if env is not None and (not isinstance(env, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', env)):
+        raise service_unavailable(f"{name}: bearer_token_env must name an environment variable")
+    token = os.environ.get(env, '') if env else record.get('bearer_token', '')
+    if (not isinstance(token, str) or not 1 <= len(token) <= 16384
+            or any(ord(c) < 33 or ord(c) > 126 for c in token)):
+        raise service_unavailable(f"{name}: Minara needs a bearer_token or populated bearer_token_env")
+    record['bearer_token'] = token
+    entries = record.get('minara_models')
+    if not isinstance(entries, list) or not entries:
+        raise service_unavailable(f"{name}: minara_models must be a nonempty list")
+    seen = set()
+    for item in entries:
+        descriptor = {'id': item} if isinstance(item, str) else item
+        if not isinstance(descriptor, dict):
+            raise service_unavailable(f"{name}: invalid Minara model descriptor")
+        ident = descriptor.get('id')
+        if not isinstance(ident, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:-]{0,199}', ident) or ident in seen:
+            raise service_unavailable(f"{name}: Minara model IDs must be unique nonempty identifiers")
+        seen.add(ident)
+        for key in ('provider', 'label'):
+            if key in descriptor and (not isinstance(descriptor[key], str) or not descriptor[key].strip()
+                    or len(descriptor[key]) > 200 or any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF
+                                                       for c in descriptor[key])):
+                raise service_unavailable(f"{name}: model {key} must be nonempty text")
+        for key in ('tools', 'reasoning', 'image'):
+            if key in descriptor and type(descriptor[key]) is not bool:
+                raise service_unavailable(f"{name}: model {key} must be boolean")
+        for key in ('context', 'max_output'):
+            if descriptor.get(key) is not None and (type(descriptor[key]) is not int or descriptor[key] < 1):
+                raise service_unavailable(f"{name}: model {key} must be positive integer")
+        levels = descriptor.get('reasoning_effort_levels', [])
+        if not isinstance(levels, list) or any(not isinstance(v, str) or v not in models.EFFORT_ORDER for v in levels):
+            raise service_unavailable(f"{name}: invalid model reasoning_effort_levels")
+
+
+def validate_minara_account(record, name='account'):
+    """Validate and resolve one provider record in memory (never persist resolved env secrets)."""
+    _check_upstream(record, name)
+
+
 def _check_pool_fields(record, name):
     """Admin pool controls: enabled (bool), priority (0..99, lower first), label (short text)."""
     if "enabled" in record and type(record["enabled"]) is not bool:
@@ -574,6 +636,8 @@ def _load(path):
     cfg = dict(DEFAULTS)
     saved = _read_file(path)
     cfg.update(saved)
+    if isinstance(saved.get("accounts"), list):
+        cfg["accounts"] = [dict(row) if isinstance(row, dict) else row for row in saved["accounts"]]
     # null selects the default role; "" and blank text mean no role of our own (context.relay_policy).
     if cfg.get('relay_system_prompt') is not None and not isinstance(cfg['relay_system_prompt'], str):
         raise service_unavailable("relay_system_prompt must be a string or null")
@@ -599,6 +663,8 @@ def _load(path):
         "transport": "RELAY_TRANSPORT",
     }
     for key, env_name in env_map.items():
+        if env_name.startswith("RETOOL_") and cfg.get("upstream") == "minara":
+            continue  # A Retool environment never changes a Bearer credential destination.
         value = os.environ.get(env_name)
         if value:
             cfg[key] = value
@@ -720,7 +786,9 @@ def _load(path):
         for i, acc in enumerate(accounts):
             if not isinstance(acc, dict):
                 raise service_unavailable(f"account #{i} must be an object")
-            acc_missing = [k for k in ("cookie", "xsrf", "base", "page_uuid") if not acc.get(k)]
+            _check_upstream(acc, f"account #{i}")
+            acc_missing = ([] if acc.get("upstream") == "minara" else
+                           [k for k in ("cookie", "xsrf", "base", "page_uuid") if not acc.get(k)])
             if acc_missing:
                 raise service_unavailable(f"account #{i} is missing required credentials: " + ", ".join(acc_missing))
             _check_pool_fields(acc, f"account #{i}")
@@ -729,26 +797,28 @@ def _load(path):
         if not cfg.get("base") and accounts:
             cfg["base"] = accounts[0]["base"]
         if not cfg.get("page_uuid") and accounts:
-            cfg["page_uuid"] = accounts[0]["page_uuid"]
+            cfg["page_uuid"] = accounts[0].get("page_uuid", "")
         if not cfg.get("cookie") and accounts:
-            cfg["cookie"] = accounts[0]["cookie"]
+            cfg["cookie"] = accounts[0].get("cookie", "")
         if not cfg.get("xsrf") and accounts:
-            cfg["xsrf"] = accounts[0]["xsrf"]
+            cfg["xsrf"] = accounts[0].get("xsrf", "")
         if saved.get("provider_access"):
             warnings.append("top-level provider_access is ignored when accounts[] is present; move it into the "
                             "entry of the account that owns the resource")
         for i, acc in enumerate(accounts):
             warnings.extend(_provider_access_warnings(cfg, acc, f"account #{i}"))
     else:
+        _check_upstream(cfg, "the account")
         _check_pool_fields(cfg, "the account")
         warnings.extend(_provider_access_warnings(cfg, cfg, "the account"))
 
-    missing = [k for k in REQUIRED if not cfg.get(k)]
+    retool_required = not accounts and cfg.get("upstream", "retool") != "minara"
+    missing = [k for k in REQUIRED if not cfg.get(k)] if retool_required else []
     if missing:
         raise service_unavailable("config is missing required keys: " + ", ".join(missing))
-    if not cfg.get("cookie"):
+    if retool_required and not cfg.get("cookie"):
         raise service_unavailable("config is missing 'cookie' (or RETOOL_COOKIE)")
-    if not cfg.get("xsrf"):
+    if retool_required and not cfg.get("xsrf"):
         raise service_unavailable("config is missing 'xsrf' (or RETOOL_XSRF)")
     if cfg["session_mode"] not in ("per_request", "per_conversation", "shared"):
         raise service_unavailable("session_mode must be 'per_request', 'per_conversation' or 'shared'")
@@ -760,10 +830,11 @@ def _load(path):
         raise service_unavailable("transport must be 'direct' (the legacy 'agent' WebSocket transport is disabled)")
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
         raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
+    cfg['_minara_models'] = models.build_minara_catalog(accounts or [cfg])
     if cfg.get("reasoning_effort") not in (None, "auto"):
         models.resolve_tolerant(cfg["model"], cfg["reasoning_effort"],
                                 strict=cfg["strict_models"], allow_downgrade=cfg["allow_effort_downgrade"],
-                                xhigh_as=cfg["claude_xhigh_effort"])
+                                xhigh_as=cfg["claude_xhigh_effort"], cfg=cfg)
 
     workspace = cfg.get("workspace_root") or os.getcwd()
     # Resolve symlinks/junctions so escapes are visible.
@@ -798,15 +869,20 @@ def _load(path):
     if search_key and search_key not in cookie_vals:
         cookie_vals.append(search_key)  # masked wherever the relay redacts secrets, should it ever show up in a message
     # The secrets that are no cookie: a renewal or a new sign-in rebuilds cookie_values and keeps these (auth.secret_values).
-    cfg["_extra_secrets"] = [search_key] if search_key else []
+    tokens = [r.get("bearer_token") for r in (accounts or [cfg]) if r.get("upstream") == "minara"]
+    cfg["_extra_secrets"] = ([search_key] if search_key else []) + [t for t in tokens if t]
+    cookie_vals.extend(t for t in tokens if t and t not in cookie_vals)
     if cfg["web_search_provider"] and not search_key:
         warnings.append("web_search_provider is %s, but the environment variable %s holds no key: WebSearch stays refused"
                         % (cfg["web_search_provider"], cfg["web_search_key_env"]))
-    cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
+    cfg["_disk_auth"] = (cfg.get("cookie", ""), cfg.get("xsrf", ""))
     cfg["config_warnings"] = warnings
     for text in warnings:
         console_log.write("warning: " + text, file=sys.stderr)
     changed = _assign_account_ids(saved)
+    if isinstance(cfg.get("accounts"), list):
+        for row, disk in zip(cfg["accounts"], saved["accounts"]):
+            row["account_id"] = disk["account_id"]
     if not isinstance(saved.get("accounts"), list):
         cfg["account_id"] = saved["account_id"]
     if changed and cfg["_persist_auth"]:

@@ -9,6 +9,7 @@ check succeeds. An account that spent Retool's hourly managed-key quota is parke
 for `account_rate_limit_cooldown` seconds and returns by itself.
 """
 import math
+import collections
 import random
 import threading
 import time
@@ -80,6 +81,109 @@ def idle_block(backend):
         return None
     reason = unavailable.get("reason") if isinstance(unavailable, dict) else None
     return reason or "unavailable"
+
+
+class UnmeteredAccount:
+    """Provider balance is unavailable, not zero and not Retool credits. No network calls."""
+    supports_balance = False
+
+    def __init__(self):
+        self.last_error = None
+        self.last_fetched_at = None
+        self.session_used = None
+        self._lock = threading.RLock()
+        self._attempts = collections.OrderedDict()
+        self._active = {}
+        self._turn_count = 0
+        self._attempt_count = 0
+        self._priced_count = 0
+        self._currencies = {}
+        self._currency_counts = {}
+        self._currency_overflow = False
+        self._unknown_cost_count = 0
+        self._only_unknown_cost = None
+
+    def start_provider_turn(self):
+        with self._lock:
+            self._turn_count += 1
+
+    def _account(self, row, sign=1):
+        cost = row.get('provider_cost')
+        if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
+            return
+        self._priced_count += sign
+        currency = row.get('provider_cost_currency')
+        if currency is None:
+            self._unknown_cost_count += sign
+            # On removal the remaining singleton is another row, never the removed cost.
+            # Its historical row may already be evicted: return unknown conservatively.
+            self._only_unknown_cost = cost if sign > 0 and self._unknown_cost_count == 1 else None
+        elif currency in self._currencies or len(self._currencies) < 16:
+            self._currency_counts[currency] = self._currency_counts.get(currency, 0) + sign
+            self._currencies[currency] = self._currencies.get(currency, 0.0) + sign * cost
+            if self._currency_counts[currency] == 0:
+                self._currency_counts.pop(currency, None)
+                self._currencies.pop(currency, None)
+        else:
+            self._currency_overflow = True
+
+    def record_provider_usage(self, attempt_id, turn_id, usage, *, final=False):
+        """Bounded active/recent dedup plus lifetime totals; IDs are not retained forever."""
+        with self._lock:
+            row = self._active.get(attempt_id) or self._attempts.get(attempt_id)
+            if row is None:
+                row = {'attempt_id': attempt_id, 'turn_id': turn_id, 'ts': time.time()}
+                self._attempt_count += 1
+                self._active[attempt_id] = row
+            else:
+                self._account(row, -1)
+            row.update(usage)
+            self._account(row)
+            if final:
+                self._active.pop(attempt_id, None)
+                self._attempts[attempt_id] = row
+                self._attempts.move_to_end(attempt_id)
+                while len(self._attempts) > 50:
+                    self._attempts.popitem(last=False)
+
+    def finish_provider_attempt(self, attempt_id, turn_id):
+        self.record_provider_usage(attempt_id, turn_id, {}, final=True)
+
+    def get_balance(self, force_refresh=False):
+        return {'available': None, 'session_used': None, 'balance_supported': False,
+                'unit': None, 'stale': False, 'unreported_usage': True}
+
+    def balance_snapshot(self):
+        return self.get_balance()
+
+    def usage(self):
+        from credits import provider_cost_summary
+        with self._lock:
+            rows = [*self._attempts.values(), *self._active.values()]
+            recent = rows[-50:]
+            summary = provider_cost_summary(recent)
+            total = None
+            currency = None
+            if not self._currency_overflow:
+                if len(self._currencies) == 1 and not self._unknown_cost_count:
+                    currency, total = next(iter(self._currencies.items()))
+                elif not self._currencies and self._unknown_cost_count == 1:
+                    total = self._only_unknown_cost
+            complete = self._attempt_count == self._priced_count
+            overflow = total is not None and not math.isfinite(total)
+            summary.update(provider_cost=round(total, 10) if total is not None and not overflow else None,
+                           provider_cost_overflow=overflow,
+                           provider_cost_currency=currency, provider_cost_complete=complete)
+            return {'session_used': None, 'turns': self._turn_count, 'attempts': self._attempt_count,
+                    'recent': [dict(row) for row in recent], 'recent_total': None,
+                    'available': None, 'unreported_usage': not complete,
+                    'unit': None, **summary}
+
+    def mark_usage_unknown(self):
+        pass  # begin-attempt records an unpriced attempt, including network failures
+
+    def record_turn(self, turn_id, cost):
+        pass  # Upstream monetary cost must never be debited as Retool credits.
 
 
 class AccountDispatcher:
@@ -193,9 +297,11 @@ class AccountDispatcher:
                     if local is not None and (local <= 0 or local < self.threshold):
                         state["next_balance"] = min(state["next_balance"], now)
                         state["last_forced"] = now
-                if self.interval > 0 and now >= state["next_refresh"]:
+                if (getattr(backend, "refresher", None) is not None
+                        and self.interval > 0 and now >= state["next_refresh"]):
                     kind = "refresh"
-                elif (manager is not None and now >= state["next_balance"]
+                elif (manager is not None and getattr(manager, "supports_balance", True)
+                      and now >= state["next_balance"]
                       and not ("auth_dead" in state["reasons"] and self.interval > 0)):
                     # A signed-out account's balance fetch meets a 401 and renews the session itself (Refresher.call): one
                     # POST /api/refreshtoken a minute, past the backoff of the renewals above. Its balance is checked

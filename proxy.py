@@ -38,7 +38,7 @@ import prompt_stabilizer
 import tool_search_policy
 import tool_union
 import validate
-from accounts import UNNAMED, AccountDispatcher, account_tag
+from accounts import UNNAMED, AccountDispatcher, UnmeteredAccount, account_tag
 from credits import CreditsManager
 from orchestrator import TurnRunner, acquire_plan, client_origin, journal_changes
 from session import Backend, SessionPool
@@ -124,6 +124,9 @@ class Runtime:
         backends = getattr(self.pool, "backends", None) or [self.backend]
         managers = {}
         for backend in backends:
+            if backend.cfg.get("upstream") == "minara":
+                managers[backend] = UnmeteredAccount()
+                continue
             if not hasattr(backend, "refresher"):
                 continue
             managers[backend] = CreditsManager(
@@ -560,7 +563,7 @@ def make_handler(runtime: Runtime):
                 elif route == "models":
                     self._models()
                 elif route == "codex_models":
-                    entries = [entry for entry in model_catalog.catalog() if self._model_routable(entry)]
+                    entries = [entry for entry in model_catalog.catalog(cfg) if self._model_routable(entry)]
                     self._json(200, self._with_prompts(lambda snapshot: model_catalog.codex_catalog(entries, snapshot)))
                 elif route == "balance":
                     report = self._balance_report()
@@ -704,7 +707,7 @@ def make_handler(runtime: Runtime):
                        {"x-proxi-token-count": "estimated", "x-proxi-token-count-basis": basis})
 
         def _models(self):
-            entries = [model for model in model_catalog.catalog() if self._model_routable(model)]
+            entries = [model for model in model_catalog.catalog(cfg) if self._model_routable(model)]
             published = self._with_prompts(lambda snapshot: entries + model_catalog.virtual_entries(entries, snapshot))
             data = [{
                 "id": model["id"],
@@ -766,13 +769,14 @@ def make_handler(runtime: Runtime):
             # expose readiness booleans, not organization financials or raw
             # upstream error text — those live behind /v1/balance with the key.
             refresher = getattr(account_report.serving_entry(entries)["backend"], "refresher", None)
-            session = {key: value for key, value in (refresher or runtime.backend.refresher).status().items()
-                       if not isinstance(value, str)}
+            refresher = refresher or getattr(runtime.backend, "refresher", None)
+            session = ({key: value for key, value in refresher.status().items()
+                        if not isinstance(value, str)} if refresher is not None else {"keepalive": False})
             payload = {
                 "ok": ok,
                 "uptime_seconds": round(time.time() - runtime.started, 1),
                 "session_mode": cfg["session_mode"],
-                "models": sum(1 for model in model_catalog.catalog() if self._model_routable(model)),
+                "models": sum(1 for model in model_catalog.catalog(cfg) if self._model_routable(model)),
                 "upstream": "ok" if ok else "degraded",
                 "balance_known": summary["balance_known"],
                 "session": session,
@@ -1227,7 +1231,7 @@ def make_handler(runtime: Runtime):
                     _, resolved = models.resolve_tolerant(
                         parsed.model, effort, strict=cfg["strict_models"], default_model=cfg.get("model"),
                         allow_downgrade=cfg.get("allow_effort_downgrade", False),
-                        xhigh_as=cfg.get("claude_xhigh_effort", "high"))
+                        xhigh_as=cfg.get("claude_xhigh_effort", "high"), cfg=cfg)
                 except apierr.ApiError as error:
                     raise apierr.bad_request("profile '%s' sets generation.effort to '%s': %s" % (
                         plan.profile, effort, error.message), param=where + "effort")
@@ -1495,6 +1499,8 @@ def banner_lines(cfg, balance, warnings=()):
             line += (("  (partial: %d of %d accounts unknown)" % (unknown, balance.get("accounts_total", unknown)))
                      if unknown else "  (partial: monthly allocation unknown for some accounts)")
         lines.append(line)
+    elif balance.get("accounts") and all(item.get("balance_supported") is False for item in balance["accounts"]):
+        lines.append(" balance:       unavailable (provider does not expose balance; configured routing only)")
     else:
         lines.append(" upstream:      DEGRADED " + str(balance.get("error")))
     lines += [" WARNING:       " + text for text in warnings]

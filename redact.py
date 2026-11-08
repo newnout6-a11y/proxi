@@ -9,6 +9,7 @@ MASK = "[redacted]"
 # 'build-build-...' in a command output took 13 s, 24 KB froze every client's stream for 25 s (audit of 2026-11-08). A name
 # that starts mid-run matches from the start of its run as well, so what is masked is the same.
 _PATTERNS = [
+    (re.compile(r"(?i)\bBearer[ \t]+[^\s\"'<>]+"), "Bearer " + MASK),
     (re.compile(r'''(?i)["']?(?<![\w-])([\w-]*(?:api[_-]?key|secret|password|passwd|token))\b["']?\s*[:=]\s*(["'])(.*?)\2'''), None),
     # JWT (accessToken / sandboxToken style)
     (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), MASK),
@@ -38,7 +39,7 @@ _SENSITIVE_NAMES = re.compile(
 # "token" and "="). Both are case-insensitive here, wherever the pattern itself is not, so the test is never narrower than a
 # pattern, Unicode case folding included. Nearly every string the journal and the console see (keys, ids, models, messages)
 # holds none of them, and it is returned as it is: 14 regular expressions took 3.3 us for such a string, this test 0.4 us.
-_LITERALS = re.compile(r"(?i)eyj|key=|sk-|retool_|relay-|ghp_|xox|akia|cf_clearance=")
+_LITERALS = re.compile(r"(?i)bearer|eyj|key=|sk-|retool_|relay-|ghp_|xox|akia|cf_clearance=")
 _KEYWORDS = re.compile(r"(?i)api[_-]?key|secret|password|passwd|token")
 
 

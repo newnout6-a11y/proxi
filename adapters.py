@@ -8,7 +8,7 @@ import uuid
 import apierr
 import journal
 import structured
-from credits import token_counter as _token_counter
+from credits import token_counter as _token_counter, provider_cost_summary
 from native_history import loads_finite
 
 
@@ -52,9 +52,9 @@ def count_input_tokens(chars, anchor=None):
 
 
 FINISH_MAP = {"stop": "stop", "tool_calls": "tool_calls", "hitl": "stop", "timeout": "length", "length": "length",
-              "cancelled": "stop", "max_exec": "length"}
+              "cancelled": "stop", "max_exec": "length", "content_filter": "content_filter"}
 # The reasons a reply ends before it is whole: the turn ran out of time, or the output stopped (the cap, inside a call).
-CUT_REASONS = ("timeout", "length")
+CUT_REASONS = ("timeout", "length", "content_filter")
 
 
 class _Base:
@@ -66,6 +66,8 @@ class _Base:
         self.text = ""
         self.thinking = ""
         self.credits = 0.0
+        self._provider_attempts = []
+        self._provider_current = None
         self.cache_read = 0
         self.cache_write = 0
         self.reasoning_tokens = 0
@@ -100,6 +102,9 @@ class _Base:
             self.input_tokens = self.output_tokens = None
             self._usage_offsets = (len(self.text), len(self.thinking), len(self.tool_calls))
             self._usage_boundary()
+        elif kind == 'request_sent':
+            self._provider_current = {}
+            self._provider_attempts.append(self._provider_current)
         elif kind == 'usage':
             self._attempt_observed = True
             self._set_usage(event.get('usage') or {})
@@ -154,6 +159,14 @@ class _Base:
     def _set_usage(self, usage):
         if not usage:
             return
+        cost = usage.get("provider_cost")
+        if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
+            if self._provider_current is None:
+                self._provider_current = {}
+                self._provider_attempts.append(self._provider_current)
+            self._provider_current["provider_cost"] = cost
+            currency = usage.get("provider_cost_currency")
+            self._provider_current["provider_cost_currency"] = currency if isinstance(currency, str) and currency else None
         # Counts are snapshots. A visible summary is not an exact hidden-token count.
         for key in ('cache_read', 'cache_write', 'input_tokens', 'output_tokens'):
             if key in usage:
@@ -174,7 +187,8 @@ class _Base:
     def _price_usage(self):
         complete = self._attempt_credited and not self._prior_cost_unknown
         return {'credits_used': round(self.credits, 5) if complete else None,
-                'reported_credits_used': round(self.credits, 5), 'credits_complete': complete}
+                'reported_credits_used': round(self.credits, 5), 'credits_complete': complete,
+                **(provider_cost_summary(self._provider_attempts) if self._provider_attempts else {})}
 
     def _completion_estimate(self):
         text_at, _, calls_at = self._usage_offsets
@@ -738,7 +752,8 @@ class ResponsesAdapter(_Base):
                 "status": "incomplete" if cut else "completed",
                 # What Responses clients read as the reason of an incomplete reply (Codex stops at once, without a
                 # retry, and prints it): the output stopped at its limit. A timeout names none.
-                **({"incomplete_details": {"reason": "max_output_tokens"}} if reason == "length" else {}),
+                **({"incomplete_details": {"reason": "max_output_tokens"}} if reason == "length" else
+                   {"incomplete_details": {"reason": "content_filter"}} if reason == "content_filter" else {}),
                 "output": [self._item(index, status=self._closed.get(index, statuses[index]))
                            for index in range(len(self._items))],
                 "output_text": self.text,
@@ -912,6 +927,8 @@ class AnthropicAdapter(_Base):
             self.web_searches += 1  # a search that failed is not billed, nor counted
 
     def _stop_reason(self, reason):
+        if reason == "content_filter":
+            return "refusal"
         if reason in CUT_REASONS:
             return "max_tokens"
         if self.stop_sequence is not None:

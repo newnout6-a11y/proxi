@@ -555,7 +555,7 @@ class TurnRunner:
             try:
                 _, resolved = model_catalog.resolve_tolerant(
                     parsed.model, effort, strict=self.cfg.get("strict_models", True), default_model=self.cfg.get("model"),
-                    allow_downgrade=self.cfg.get("allow_effort_downgrade", False))
+                    allow_downgrade=self.cfg.get("allow_effort_downgrade", False), cfg=self.cfg)
             except apierr.ApiError:
                 resolved = None
             if resolved == effort:
@@ -799,6 +799,11 @@ class TurnRunner:
             if value is not None:
                 delta[key] = value - snapshot.get(key, 0)
                 snapshot[key] = value
+        cost = (event.get('usage') or {}).get('provider_cost')
+        if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
+            snapshot['provider_cost'] = cost
+            currency = (event.get('usage') or {}).get('provider_cost_currency')
+            snapshot['provider_cost_currency'] = currency if isinstance(currency, str) and currency else None
         return snapshot, delta
 
     @staticmethod
@@ -1150,12 +1155,14 @@ class TurnRunner:
             task_block = ""
             previous_steps = []
             last_followup = None
-            if not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"]):
+            if parsed.entry.get("upstream") != "minara" and not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"]):
                 raise apierr.service_unavailable(f"provider '{parsed.entry['provider']}' is not routed")
             # The resource is per-account (org-scoped UUID or __managed__): it is
             # resolved from the acquired session's backend cfg below. Resolving it
             # from the global cfg here would 503 account-only configurations.
-            model_provider = {"model": parsed.model}
+            model_provider = {"model": parsed.entry.get("upstream_model", parsed.model)}
+            if parsed.entry.get("upstream") == "minara":
+                model_provider["route_model"] = parsed.model
             effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"),
                                                     self.cfg.get("claude_xhigh_effort", "high"))
             # The effort of the request is the client's, then the profile's when the profile sets one (proxy applied it
@@ -1340,7 +1347,8 @@ class TurnRunner:
                             parsed._full_prompt_text = sent
 
                         if native_tools:
-                            tools_converted = direct.tools_to_retool(parsed.tools)
+                            tools_converted = (parsed.tools if parsed.entry.get("upstream") == "minara"
+                                               else direct.tools_to_retool(parsed.tools))
                             if hasattr(direct_target, "register_tools"):
                                 direct_target.register_tools(tools_converted)
                             final_tools = tools_converted
@@ -1360,7 +1368,7 @@ class TurnRunner:
                             getattr(parsed, "max_tokens", None),
                             chunks)
                         direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
-                                                                 if native_tools else None)
+                                                                 if native_tools or parsed.entry.get("upstream") == "minara" else None)
                         # Which calls the client can receive: a call of another tool is dropped below, and is no part
                         # of what the turn delivered or of the branch kept for it (direct.iter_events).
                         direct_target._native_callable_tools = list(tool_names) if native_tools else None
@@ -1384,11 +1392,31 @@ class TurnRunner:
                     holder['_journal_attempt'] = journal_attempt
                     log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
                     usage_started = False
+                    provider_recorder = getattr(account_credits, "record_provider_usage", None)
+                    provider_attempt = "%s:%d" % (turn_id, journal_attempt)
+                    sent_attempt = threading.Event()
+                    accounting_finished = threading.Event()
+                    accounting_lock = threading.Lock()
+                    provider_target = session.session if isinstance(session, SessionLease) else session
+                    if provider_recorder:
+                        managers_seen = holder.setdefault('_provider_turn_managers', set())
+                        if id(account_credits) not in managers_seen:
+                            account_credits.start_provider_turn()
+                            managers_seen.add(id(account_credits))
+                        def request_sent(recorder=provider_recorder, attempt=provider_attempt, turn=turn_id,
+                                         sent=sent_attempt, lock=accounting_lock, finished=accounting_finished):
+                            with lock:
+                                recorder(attempt, turn, {}, final=finished.is_set())
+                                sent.set()
+                        provider_target._provider_request_sent = request_sent
                     try:
                         # Leaving the loop (an error event raises below) closes the generators of the stream at once:
                         # left to the garbage collector, a cut turn keeps its session "busy" until some later collection.
                         async with contextlib.aclosing(stream):
                             async for event in stream:
+                                if event["type"] == "request_sent":
+                                    out.put(event)
+                                    continue
                                 if not first_token and event["type"] in ("text", "thinking", "tool_call"):
                                     first_token = True
                                     ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
@@ -1496,6 +1524,8 @@ class TurnRunner:
                                             declared=len(tool_names))
                                 elif event['type'] == 'usage':
                                     usage, delta = self._usage_update(holder, event)
+                                    if provider_recorder and sent_attempt.is_set():
+                                        provider_recorder(provider_attempt, turn_id, usage)
                                     breakdown = credits.cost_breakdown(usage, parsed.model)
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
                                     log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
@@ -1548,13 +1578,23 @@ class TurnRunner:
                                     raise event["error"]
                     except apierr.ApiError:
                         raise
+                    finally:
+                        if provider_recorder:
+                            with accounting_lock:
+                                accounting_finished.set()
+                                if sent_attempt.is_set():
+                                    account_credits.finish_provider_attempt(provider_attempt, turn_id)
+                        if provider_recorder:
+                            provider_target._provider_request_sent = None
                     holder.setdefault("reason", "stop")
                     if holder.get("reason") == "cancelled" or cancelled.is_set():
                         holder["reason"] = "cancelled"
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "cancelled"})
                         return
-                    if holder.get("reason") in ("timeout", "length"):
+                    # A provider refusal is terminal even when it carries no visible text.
+                    # Never execute a filtered partial command or server-tool call.
+                    if holder.get("reason") in ("timeout", "length", "content_filter"):
                         out.put({"type": "end", "reason": holder["reason"]})
                         return
 

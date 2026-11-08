@@ -66,6 +66,10 @@ def cost_breakdown(usage, model=None):
     write = int(usage.get("cache_write") or 0)
     prompt = inp + read + write
     rate = rates(model)
+    if isinstance(model, str) and model.startswith("minara/"):
+        return {"cost_input": None, "cost_cache_read": None, "cost_cache_write": None,
+                "cost_output": None, "prompt_tokens": prompt,
+                "cache_hit_ratio": round(read / prompt, 4) if prompt else None}
     return {
         "cost_input": round(inp * rate["input"], 5),
         "cost_cache_read": round(read * rate["cache_read"], 5),
@@ -212,3 +216,19 @@ class CreditsManager:
                     "recent": list(self._history[-50:]), "recent_total": round(total, 4),
                     "unreported_usage": self._unreported_usage,
                     "available": (self._balance or {}).get("available")}
+
+
+def provider_cost_summary(records):
+    """Separate reported money from Retool credits; never infer a currency or sum unlike money."""
+    records = list(records)
+    priced = [r for r in records if type(r.get('provider_cost')) in (int, float)
+              and math.isfinite(r['provider_cost']) and r['provider_cost'] >= 0]
+    currencies = {r.get('provider_cost_currency') for r in priced}
+    summable = len(priced) == 1 or (bool(priced) and len(currencies) == 1 and None not in currencies)
+    total = sum(r['provider_cost'] for r in priced) if summable else None
+    overflow = total is not None and not math.isfinite(total)
+    return {'provider_cost': round(total, 10) if total is not None and not overflow else None,
+            'provider_cost_overflow': overflow,
+            'provider_cost_currency': next(iter(currencies)) if len(currencies) == 1 else None,
+            'provider_cost_complete': bool(records) and len(priced) == len(records),
+            'provider_cost_records': [dict(r) for r in records]}

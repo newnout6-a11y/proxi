@@ -62,12 +62,14 @@ function AccountRow({ account, busy, onAction, onPatch, onDelete, lastEnabled })
         </span>
         <span className="acc-bar">{share !== null && <span style={{ width: pct(share) }} />}</span>
         <span className="pool-meta">
-          сброс {fmtDay(account.reset_date)} · с запуска {fmtFixed(account.session_used, 2)} за {fmtInt(account.turns)} {plural(account.turns || 0, ['ход', 'хода', 'ходов'])}
+          {account.upstream === 'minara'
+            ? `${fmtInt(account.turns)} ${plural(account.turns || 0, ['ход', 'хода', 'ходов'])} · ${fmtInt(account.attempts)} попыток · цена ${isNum(account.provider_cost) ? `${fmtNum(account.provider_cost)} ${account.provider_cost_currency || '(валюта неизвестна)'}` : 'неизвестна'}`
+            : `сброс ${fmtDay(account.reset_date)} · с запуска ${fmtFixed(account.session_used, 2)} за ${fmtInt(account.turns)} ${plural(account.turns || 0, ['ход', 'хода', 'ходов'])}`}
         </span>
       </div>
       <div className="pool-health">
-        <span>баланс: {account.last_balance_at ? fmtAgo(account.last_balance_at) : 'ещё не проверялся'}</span>
-        <span>сессия: {account.last_renewed_at ? fmtAgo(account.last_renewed_at) : 'ещё не продлевалась'}</span>
+        <span>баланс: {account.balance_supported === false ? 'провайдер не сообщает' : account.last_balance_at ? fmtAgo(account.last_balance_at) : 'ещё не проверялся'}</span>
+        <span>сессия: {account.upstream === 'minara' ? 'Minara · Bearer' : account.last_renewed_at ? fmtAgo(account.last_renewed_at) : 'ещё не продлевалась'}</span>
         {account.auth_failures > 0 && <span className="neg-text">отказов входа подряд: {account.auth_failures}</span>}
         {account.error && <span className="neg-text" title={account.error}>{account.error}</span>}
       </div>
@@ -81,8 +83,8 @@ function AccountRow({ account, busy, onAction, onPatch, onDelete, lastEnabled })
           onChange={(enabled) => onPatch({ enabled })} />
       </div>
       <div className="pool-actions">
-        <Button icon={Wallet} disabled={busy || !!account.pending} onClick={() => onAction('balance')}>Баланс</Button>
-        <Button icon={RotateCw} disabled={busy || !!account.pending} onClick={() => onAction('renew')}>Продлить</Button>
+        <Button icon={Wallet} disabled={busy || !!account.pending || account.balance_supported === false} onClick={() => onAction('balance')}>Баланс</Button>
+        <Button icon={RotateCw} disabled={busy || !!account.pending || account.renewal_supported === false} onClick={() => onAction('renew')}>Продлить</Button>
         <button type="button" className="icon-button tone-danger" aria-label={`Удалить аккаунт ${name}`} title="Удалить из config.json"
           disabled={busy || account.pending === 'removed'} onClick={onDelete}>
           <Trash size={16} strokeWidth={1.5} />
@@ -92,21 +94,43 @@ function AccountRow({ account, busy, onAction, onPatch, onDelete, lastEnabled })
   );
 }
 
-const EMPTY_FORM = { label: '', base: '', page_uuid: '', cookie: '', xsrf: '', provider_resource_name: '', openai_provider_resource_name: '' };
+const EMPTY_FORM = { upstream: 'retool', label: '', base: '', page_uuid: '', cookie: '', xsrf: '', provider_resource_name: '', openai_provider_resource_name: '', bearer_token: '', bearer_token_env: '', minara_models: '' };
 const REQUIRED = ['base', 'page_uuid', 'cookie', 'xsrf'];
 
 function AddForm({ onCancel, onSubmit, busy }) {
   const [form, setForm] = useState(EMPTY_FORM);
+  const [modelError, setModelError] = useState('');
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
-  const ready = form.base.trim() && form.page_uuid.trim() && form.cookie.trim() && form.xsrf.trim();
+  const minara = form.upstream === 'minara';
+  const ready = minara ? (form.bearer_token.trim() || form.bearer_token_env.trim()) && form.minara_models.trim()
+    : form.base.trim() && form.page_uuid.trim() && form.cookie.trim() && form.xsrf.trim();
   return (
-    <form className="panel add-form" onSubmit={(e) => { e.preventDefault(); if (ready) onSubmit(form); }}>
+    <form className="panel add-form" onSubmit={(e) => {
+      e.preventDefault();
+      if (!ready) return;
+      if (minara) {
+        try { const value = JSON.parse(form.minara_models); if (!Array.isArray(value) || !value.length) throw new Error(); }
+        catch { setModelError('Укажите непустой JSON-массив моделей'); return; }
+      }
+      setModelError(''); onSubmit(form);
+    }}>
       <div className="panel-head">
         <h2>Новый аккаунт</h2>
         <button type="button" className="icon-button ghost" aria-label="Закрыть форму" onClick={onCancel}><X size={16} strokeWidth={1.5} /></button>
       </div>
-      <div className="add-layout">
+      <div className={`add-layout${minara ? ' add-layout-bearer' : ''}`}>
         <div className="form-grid">
+          <label className="field field-wide"><span>Провайдер</span>
+            <select aria-label="Провайдер" value={form.upstream} onChange={(e) => setForm((f) => ({ ...f, upstream: e.target.value, base: e.target.value === 'minara' ? 'https://api.minara.ai/v1' : '' }))}>
+              <option value="retool">Retool · Cookie</option><option value="minara">Minara · Bearer</option>
+            </select></label>
+          {minara ? <>
+            <label className="field field-wide"><span>Адрес API</span><input value={form.base} onChange={set('base')} spellCheck={false} /></label>
+            <label className="field"><span>Переменная окружения с токеном</span><input value={form.bearer_token_env} onChange={set('bearer_token_env')} placeholder="MINARA_API_TOKEN" spellCheck={false} autoComplete="off" /></label>
+            <label className="field"><span>Или Bearer-токен</span><input value={form.bearer_token} onChange={set('bearer_token')} type="password" spellCheck={false} autoComplete="off" /></label>
+            <label className="field field-wide"><span>Модели (JSON-массив)</span><textarea value={form.minara_models} onChange={(e) => { set('minara_models')(e); setModelError(''); }} aria-invalid={!!modelError} aria-describedby={modelError ? 'minara-model-error' : undefined} rows={4} placeholder={'[{"id":"openai/gpt-oss-20b","tools":true}]'} spellCheck={false} />{modelError && <span id="minara-model-error" className="neg-text" role="alert">{modelError}</span>}</label>
+            <label className="field"><span>Название</span><input value={form.label} onChange={set('label')} maxLength={40} /></label>
+          </> : <>
           <label className="field"><span><GuideNum n={1} />Адрес Retool</span>
             <input value={form.base} onChange={set('base')} placeholder="https://<tenant>.retool.com" spellCheck={false} /></label>
           <label className="field"><span><GuideNum n={2} />page_uuid приложения</span>
@@ -121,15 +145,16 @@ function AddForm({ onCancel, onSubmit, busy }) {
             <input value={form.provider_resource_name} onChange={set('provider_resource_name')} spellCheck={false} /></label>
           <label className="field"><span>Ресурс OpenAI (необязательно)</span>
             <input value={form.openai_provider_resource_name} onChange={set('openai_provider_resource_name')} spellCheck={false} /></label>
+          </>}
         </div>
-        <figure className="add-guide-figure">
+        {!minara && <figure className="add-guide-figure">
           <AddGuide />
           <figcaption className="muted small">Откройте приложение в редакторе Retool, затем DevTools → Network и любой запрос к Retool</figcaption>
-        </figure>
+        </figure>}
       </div>
       <p className="muted small">
-        Cookie и xsrf сохраняются только в config.json рядом с relay. Аккаунт подключится после перезапуска.
-        Ресурсы нужны, если у аккаунта другой адрес Retool: без них у него не будет маршрута к моделям
+        {minara ? 'Рекомендуется переменная окружения процесса relay. Если указан сам токен, он сохраняется в config.json. Модели публикуются с префиксом minara/. Баланс неизвестен, продление и keepwarm отключены.'
+          : 'Cookie и xsrf сохраняются только в config.json рядом с relay. Ресурсы нужны, если у аккаунта другой адрес Retool.'} Аккаунт подключится после перезапуска.
       </p>
       <div className="form-actions">
         <Button onClick={onCancel}>Отмена</Button>
@@ -185,7 +210,7 @@ export default function Accounts({ apiKey, onUnauthorized }) {
   const patch = (account) => (body) => run(account.account, 'Не сохранено',
     () => api(apiKey, `accounts/${account.account}`, { method: 'PATCH', body }), () => null);
   const remove = (account) => () => {
-    if (!window.confirm(`Удалить аккаунт ${account.label || account.account} из config.json? Его cookie будут стёрты`)) return;
+    if (!window.confirm(`Удалить аккаунт ${account.label || account.account} из config.json? Его учётные данные будут стёрты`)) return;
     run(account.account, 'Не удалено', () => api(apiKey, `accounts/${account.account}`, { method: 'DELETE', body: {} }),
       (result) => (result?.pending === 'removed'
         ? { tone: 'warn', title: 'Аккаунт удалён', text: 'Исчезнет из пула после перезапуска relay' }
@@ -194,7 +219,11 @@ export default function Accounts({ apiKey, onUnauthorized }) {
   const add = (form) => run('_new', 'Не добавлено',
     () => api(apiKey, 'accounts', { method: 'POST',
       // Optional resource names are sent only when filled in.
-      body: Object.fromEntries(Object.entries(form).map(([k, v]) => [k, v.trim()]).filter(([k, v]) => v || REQUIRED.includes(k))) }),
+      body: form.upstream === 'minara'
+        ? { upstream: 'minara', base: form.base.trim() || 'https://api.minara.ai/v1', label: form.label.trim(),
+          ...(form.bearer_token_env.trim() ? { bearer_token_env: form.bearer_token_env.trim() } : { bearer_token: form.bearer_token.trim() }),
+          minara_models: JSON.parse(form.minara_models) }
+        : Object.fromEntries(Object.entries(form).filter(([k]) => !['bearer_token', 'bearer_token_env', 'minara_models', 'upstream'].includes(k)).map(([k, v]) => [k, v.trim()]).filter(([k, v]) => v || REQUIRED.includes(k))) }),
     () => { setAdding(false); return { tone: 'success', title: 'Аккаунт добавлен', text: 'Подключится после перезапуска relay' }; });
 
   return (

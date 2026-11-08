@@ -90,7 +90,8 @@ class Backend:
         self.cfg = cfg
         self._http_post = http_post or self._default_post
         self._ws_connect = ws_connect or websockets.connect
-        self.refresher = refresher if refresher is not None else Refresher(cfg)
+        self.refresher = (None if cfg.get("upstream") == "minara" else
+                          refresher if refresher is not None else Refresher(cfg))
 
     # -- HTTP ---------------------------------------------------------------
     def headers(self):
@@ -496,7 +497,12 @@ class RelaySession:
         """Yield normalised provider events, cleaning its poller on every exit."""
         if self.cfg.get("transport") == "direct":
             args = self._direct or {}
-            async with contextlib.aclosing(direct.iter_events(
+            if self.cfg.get("upstream") == "minara":
+                import minara
+                transport = minara
+            else:
+                transport = direct
+            async with contextlib.aclosing(transport.iter_events(
                     self.cfg, self, model_provider, prompt, args.get("head"), args.get("tools"),
                     args.get("tool_choice"), args.get("max_tokens"), args.get("chunks"))) as events:
                 async for event in events:
@@ -909,15 +915,7 @@ class SessionPool:
             if custom_ws == getattr(websockets, "connect", None):
                 custom_ws = None
             for acc in self.cfg["accounts"]:
-                acc_cfg = dict(self.cfg)
-                if acc.get("base", self.cfg.get("base", "")).rstrip("/") != self.cfg.get("base", "").rstrip("/"):
-                    for resource_key in model_catalog.PROVIDER_RESOURCE_KEY.values():
-                        if resource_key not in acc:
-                            acc_cfg.pop(resource_key, None)
-                acc_cfg.update(acc)
-                # Pool controls belong to the account record, never inherited from the root.
-                acc_cfg.update(enabled=acc.get("enabled", True), priority=acc.get("priority", 0),
-                               label=acc.get("label", ""), provider_access=acc.get('provider_access', {}))
+                acc_cfg = model_catalog.account_config(self.cfg, acc)
                 acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
                 acc_cfg["_account_ref"] = acc
                 acc_cfg["_disk_auth"] = (acc.get("cookie"), acc.get("xsrf"))
