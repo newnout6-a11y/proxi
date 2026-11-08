@@ -14,6 +14,7 @@ import time
 
 from apierr import service_unavailable
 import auth
+import console_log
 import models
 import web_search
 
@@ -804,7 +805,7 @@ def _load(path):
     cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
     cfg["config_warnings"] = warnings
     for text in warnings:
-        print("warning: " + text, file=sys.stderr)
+        console_log.write("warning: " + text, file=sys.stderr)
     changed = _assign_account_ids(saved)
     if not isinstance(saved.get("accounts"), list):
         cfg["account_id"] = saved["account_id"]
@@ -813,6 +814,6 @@ def _load(path):
             _write_file(path, saved)
         except OSError as exc:
             # Read-only config: the ids derived from base and page_uuid are the same at every start until one can save them.
-            print("warning: cannot save account_id to %s (%s); ids are kept in memory" % (
+            console_log.write("warning: cannot save account_id to %s (%s); ids are kept in memory" % (
                 path, type(exc).__name__), file=sys.stderr)
     return cfg

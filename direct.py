@@ -2247,7 +2247,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 if not assist:
                     raise
                 model_name = model_provider.get("model")
-                print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
+                console_log.write("[assist] retry without agent marker: %s" % (error.message or "")[:80])
                 journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
                              model=model_name)
                 body = _unmarked(body)
@@ -2364,7 +2364,7 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
         with _DUMP_LOCK:
             known = _DUMP_RECENT.get(key)
             if known and (folder / ("%s-body.json" % known)).exists():
-                print("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known), flush=True)
+                console_log.write("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known))
                 return known
             request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
             stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
@@ -2380,7 +2380,7 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
             while len(_DUMP_RECENT) > 256:
                 del _DUMP_RECENT[next(iter(_DUMP_RECENT))]
             prune_diagnostics(cfg, folder, keep=stamp)
-        print("[debug] upstream %s diagnostic: %s" % (status, stamp), flush=True)
+        console_log.write("[debug] upstream %s diagnostic: %s" % (status, stamp))
         return stamp
     except Exception:  # noqa: BLE001 - diagnostics must never break the turn
         pass
@@ -2525,7 +2525,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         body_summary = {k: v for k, v in body.items() if k not in ("messages", "tools")}
         if "tools" in body:
             body_summary["tools_count"] = len(body["tools"])
-        print("[body]", json.dumps(body_summary, ensure_ascii=False), flush=True)
+        console_log.write("[body] " + json.dumps(body_summary, ensure_ascii=False))
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
     headers["accept"] = "application/json"
@@ -2927,7 +2927,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             raise item
 
         if cfg.get("direct_raw"):
-            print("[raw]", str(item)[:200], flush=True)
+            console_log.write("[raw] " + str(item)[:200])
         try:
             event = json.loads(item)
         except Exception:
@@ -2986,7 +2986,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             if block == "text":
                 piece = event.get("partialText") or ""
                 if piece and cfg.get("direct_debug") and not text:
-                    print("[ttft] %.2fs" % (time.time() - started), flush=True)
+                    console_log.write("[ttft] %.2fs" % (time.time() - started))
                 if piece:
                     text.append(piece)
                     yield {"type": "text", "delta": piece}

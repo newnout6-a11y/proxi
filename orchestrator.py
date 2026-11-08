@@ -4,6 +4,7 @@ import collections
 import contextlib
 import contextvars
 import hashlib
+import math
 
 import direct
 import json
@@ -834,7 +835,7 @@ class TurnRunner:
                 backend = self.pool.backend
             data = await backend.get_messages(session.thread_id)
         except Exception as exc:
-            print("[explain] fetch failed:", exc, flush=True)
+            console_log.write("[explain] fetch failed: %s" % exc)
             return None
         # Retool returns messages newest-first.
         for message in data.get("messages", []):
@@ -916,6 +917,30 @@ class TurnRunner:
         return outcomes
 
     async def run(self, parsed, out: queue.Queue, holder: dict):
+        """Measure the client request across account retries; account turns keep their own timelines."""
+        started = holder.get("_request_started_monotonic")
+        if type(started) not in (int, float) or not math.isfinite(started):
+            started = time.monotonic()
+        holder["_speed_attempts"] = {}
+        holder["_speed_reason"] = "error"
+        try:
+            await self._run_request(parsed, out, holder)
+        except BaseException:
+            holder["_speed_reason"] = "error"
+            raise
+        finally:
+            duration = max(0, round((time.monotonic() - started) * 1000))
+            counts = holder["_speed_attempts"]
+            output = sum(counts.values()) if counts and all(value is not None for value in counts.values()) else None
+            cancelled = holder.get("cancel_event")
+            reason = "cancelled" if cancelled is not None and cancelled.is_set() else holder["_speed_reason"]
+            journal.emit("request.speed", "Скорость завершённого запроса", "info",
+                         turn_id=holder.get("turn_id"), request_id=getattr(parsed, "request_id", None),
+                         conversation=journal.tag(getattr(parsed, "conversation_key", None)),
+                         reason=reason, duration_ms=duration, output_tokens=output,
+                         tokens_per_second=journal.request_speed(output, duration))
+
+    async def _run_request(self, parsed, out: queue.Queue, holder: dict):
         """Run a turn; retry on another account after a confirmed low balance or an hourly limit.
 
         The retry happens only while nothing was sent to the client. A low balance must be
@@ -1039,12 +1064,23 @@ class TurnRunner:
         search_spec = getattr(parsed, "web_search", None)
         searcher = web_search.provider(self.cfg) if search_spec else None
         search_uses = search_steps = 0
-        turn_started = time.time()
+        turn_started = time.monotonic()
+        output_attempts = {}
+        request_attempts = holder.setdefault("_speed_attempts", {})
         outcome = {"reason": None, "error": None, "first": False}
         trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None),
                  "conversation": journal.tag(getattr(parsed, "conversation_key", None))}
 
         def log(kind, message, level="info", **fields):
+            # Usage and credits can repeat one attempt's cumulative token snapshot. Keep that snapshot, not their sum.
+            if kind == "upstream.usage_start":
+                output_attempts.setdefault(fields["attempt"], None)
+                request_attempts.setdefault((turn_id, fields["attempt"]), None)
+            elif kind == "upstream.usage":
+                count = credits.token_counter((fields.get("usage_snapshot") or {}).get("output_tokens"))
+                if count is not None:
+                    output_attempts[fields["attempt"]] = count
+                    request_attempts[(turn_id, fields["attempt"])] = count
             journal.emit(kind, message, level, **trace, **fields)
 
         try:
@@ -1242,11 +1278,11 @@ class TurnRunner:
                 counted = getattr(self.pool, "inflight", None)
                 load = ({} if counted is None else dict(zip(("inflight_account", "inflight_total"),
                                                            counted(getattr(acquired, "backend", None)))))
-                log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
+                log("session.acquire", "Сессия получена за %d мс" % round((time.monotonic() - turn_started) * 1000),
                     "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
                     isolated=bool(isolated), mode=self.cfg.get("session_mode"),
                     context_scope="text" if persistent_text else None,
-                    wait_ms=round((time.time() - turn_started) * 1000), **load)
+                    wait_ms=round((time.monotonic() - turn_started) * 1000), **load)
                 native_target, native_context = None, None
                 if native_tools:
                     prompt, native_target, native_context = await self._native_prompt(
@@ -1779,7 +1815,7 @@ class TurnRunner:
             outcome["error"] = apierr.internal(str(exc))
             out.put({"type": "error", "error": outcome["error"]})
         finally:
-            duration = round((time.time() - turn_started) * 1000)
+            duration = round((time.monotonic() - turn_started) * 1000)
             err = outcome["error"]
             if err is not None:
                 log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]), "error",
@@ -1787,9 +1823,18 @@ class TurnRunner:
                 reason = "error"
             else:
                 reason = outcome["reason"] or holder.get("reason") or "stop"
+            holder["_speed_reason"] = reason
+            # Explicit account-quota refusals are free; retain their latency, but count no generated tokens.
+            if err is not None and apierr.is_account_quota(err):
+                number = next(reversed(output_attempts), None)
+                if number is not None and output_attempts[number] is None:
+                    request_attempts[(turn_id, number)] = 0
+            output_tokens = (sum(output_attempts.values()) if output_attempts
+                             and all(value is not None for value in output_attempts.values()) else None)
             log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
                 "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout", "length") else "success",
                 reason=reason, duration_ms=duration, exec_steps=exec_steps,
+                output_tokens=output_tokens, tokens_per_second=None,
                 retries=empty_retries + tool_retries,
                 **({"web_searches": search_uses} if search_uses else {}))
             out.put(None)

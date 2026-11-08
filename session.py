@@ -22,6 +22,7 @@ import websockets
 import apierr
 import conversation_state
 import journal
+import console_log
 import models as model_catalog
 from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled, priority as account_priority
 from auth import upstream_headers
@@ -729,7 +730,7 @@ class RelaySession:
                         poller.cancel()
                     raise apierr.upstream_error(str(event)[:300])
                 elif os.environ.get("DEBUG_EVENTS"):
-                    print("dbg-unknown:", json.dumps(event, ensure_ascii=False)[:400], flush=True)
+                    console_log.write("dbg-unknown: " + json.dumps(event, ensure_ascii=False)[:400])
         finally:
             if receive_task is not None:
                 receive_task.cancel()

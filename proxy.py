@@ -493,6 +493,7 @@ def make_handler(runtime: Runtime):
             self.request_id = uuid.uuid4().hex[:12]
             context_token = client_context.bind({"request_id": self.request_id})
             self._started = time.time()
+            self._request_started_monotonic = time.monotonic() - max(0.0, getattr(self, "_slot_wait", 0.0) or 0.0)
             # Keep-alive reuses the handler: a stale status from the previous
             # request (e.g. a 404 probe) must not leak into this log line.
             self._status = 0
@@ -992,7 +993,8 @@ def make_handler(runtime: Runtime):
                     raise unavailable
 
             events = queue.Queue()
-            holder = {"reason": "stop", "session": None, "cancel_event": threading.Event()}
+            holder = {"reason": "stop", "session": None, "cancel_event": threading.Event(),
+                      "_request_started_monotonic": self._request_started_monotonic}
             self._holder = holder
             self._model_called = True
             fut = runtime.submit_turn(parsed, events, holder)
@@ -1521,7 +1523,7 @@ def main(argv=None):
         r.start()  # no-op for accounts the dispatcher schedules
     balance = startup_balance(runtime)
     for line in banner_lines(cfg, balance, warnings):
-        print(line)
+        console_log.write(line)
 
     stop_requested = threading.Event()
 
@@ -1529,7 +1531,7 @@ def main(argv=None):
         if stop_requested.is_set():
             return
         stop_requested.set()
-        print("\nshutting down…")
+        console_log.write("shutting down…")
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1539,7 +1541,7 @@ def main(argv=None):
             pass
 
     def _thread_crash(args):
-        print("thread crash:", args.exc_type.__name__, args.exc_value, flush=True)
+        console_log.write("thread crash: %s %s" % (args.exc_type.__name__, args.exc_value))
 
     threading.excepthook = _thread_crash
 
@@ -1551,7 +1553,7 @@ def main(argv=None):
             except Exception as exc:  # never lose the listener on a stray error
                 if stop_requested.is_set():
                     break
-                print("serve_forever crashed:", exc, flush=True)
+                console_log.write("serve_forever crashed: %s" % exc)
                 time.sleep(0.5)
     finally:
         try:

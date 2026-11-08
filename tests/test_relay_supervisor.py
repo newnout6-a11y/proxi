@@ -11,6 +11,7 @@ itself runs, and a .cmd stub stands in for python. No relay is ever started.
 """
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -19,6 +20,7 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run_relay.ps1"
+STAMP = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}\] ")
 
 pytestmark = pytest.mark.skipif(os.name != "nt" or not shutil.which("powershell.exe"),
                                 reason="needs Windows PowerShell")
@@ -76,7 +78,9 @@ try {
 @{ code = $code; delays = @($script:delays) } | ConvertTo-Json -Compress
 """ % (fast_exit_seconds, max_fast_exits), STUB=python or str(stub), CONFIG=str(config_path), LOG=str(log), **env)
     starts = (tmp_path / "starts.txt").read_text().split() if (tmp_path / "starts.txt").exists() else []
-    lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    stamped = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    assert all(STAMP.match(line) for line in stamped)
+    lines = [STAMP.sub("", line) for line in stamped]
     return result["code"], result["delays"], len(starts), lines
 
 
@@ -173,15 +177,26 @@ def test_relay_log_starts_again_past_twenty_mib_while_a_viewer_holds_it_open(tmp
     with open(log, encoding="utf-8") as viewer:
         assert viewer.readline() == "old line\n"
         powershell(tmp_path, "Write-RelayLog $env:LOG 'new line'; '{}'", LOG=str(log))
-    assert log.read_bytes() == b"new line\r\n"
+    assert STAMP.sub("", log.read_text(encoding="utf-8")) == "new line\n"
     assert (tmp_path / "relay.log.1").stat().st_size == 20 * MIB
     assert sorted(path.name for path in tmp_path.glob("relay.log*")) == ["relay.log", "relay.log.1"]
 
 
 def test_only_the_newest_old_relay_logs_are_kept(tmp_path):
     log = tmp_path / "relay.log"
-    powershell(tmp_path, "1..12 | ForEach-Object { Write-RelayLog $env:LOG (('line {0:d2} ' -f $_) + ('x' * 20)) "
-                         "-MaxBytes 64 -Keep 2 }; '{}'", LOG=str(log))
+    powershell(tmp_path, "$limit = ((Format-RelayLogLine ('line 00 ' + ('x' * 20))).Length + 2) * 3 - 1; "
+                         "1..12 | ForEach-Object { Write-RelayLog $env:LOG (('line {0:d2} ' -f $_) + ('x' * 20)) "
+                         "-MaxBytes $limit -Keep 2 }; '{}'", LOG=str(log))
     files = {path.name: path.read_text(encoding="utf-8").split() for path in tmp_path.glob("relay.log*")}
     numbers = {name: [int(word) for word in words if word.isdigit()] for name, words in files.items()}
     assert numbers == {"relay.log.2": [4, 5, 6], "relay.log.1": [7, 8, 9], "relay.log": [10, 11, 12]}
+
+
+def test_supervisor_keeps_python_event_time_and_stamps_its_own_multiline_messages(tmp_path):
+    log = tmp_path / "relay.log"
+    powershell(tmp_path, "Write-RelayLog $env:LOG '[2026-11-08 13:14:15.123 +03:00] original'; "
+                         "Write-RelayLog $env:LOG \"first`nsecond\"; '{}'", LOG=str(log))
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "[2026-11-08 13:14:15.123 +03:00] original"
+    assert all(STAMP.match(line) for line in lines)
+    assert [STAMP.sub("", line) for line in lines] == ["original", "first", "second"]

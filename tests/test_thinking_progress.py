@@ -128,7 +128,7 @@ def test_runner_measures_from_live_status_instead_of_buffer_flush(tmp_path, monk
     backend, pool, runner = setup(tmp_path, transport="direct", cache_keepwarm_seconds=0)
     clock = [0.0]
     logs = []
-    monkeypatch.setattr(orchestrator, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(orchestrator, "time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
     monkeypatch.setattr(journal, "emit", lambda kind, message, level="info", **fields: logs.append((kind, fields)))
 
     async def script(*args, **kwargs):

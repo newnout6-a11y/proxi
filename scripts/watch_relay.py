@@ -71,7 +71,8 @@ def main():
         else:
             for line in lines(args.path, tail=args.lines, follow=not args.no_follow):
                 # Older Windows PowerShell appended UTF-16 lines to the same file.
-                console_log.write(line.replace("\x00", "").rstrip("\r\n"))
+                # Retain the event's timestamp, and leave legacy lines undated: viewer time is not event time.
+                console_log.write(line.replace("\x00", "").rstrip("\r\n"), with_time=False)
     except KeyboardInterrupt:
         pass
 

@@ -6,6 +6,7 @@ import collections
 import copy
 import datetime
 import fnmatch
+import console_log
 
 from apierr import ApiError, bad_request, not_found, service_unavailable
 
@@ -947,10 +948,10 @@ def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade,
         entry, _ = resolve(base_name, None, strict=strict, default_model=default_model)
         levels = entry.get("reasoning_effort_levels") or []
         if not levels or not entry.get("reasoning", True):
-            print("[effort] %s -> None (reasoning not supported) for %s" % (extracted_effort, entry["id"]), flush=True)
+            console_log.write("[effort] %s -> None (reasoning not supported) for %s" % (extracted_effort, entry["id"]))
             return entry, None
         clamped = nearest_effort(levels, extracted_effort)
-        print("[effort] %s -> %s for %s" % (extracted_effort, clamped, entry["id"]), flush=True)
+        console_log.write("[effort] %s -> %s for %s" % (extracted_effort, clamped, entry["id"]))
         return entry, clamped
 
 

@@ -6,6 +6,7 @@ import sys
 import threading
 
 import journal
+from console_clock import timestamp
 
 # Terminal theme colors, by meaning; no fixed background or truecolor dependency.
 PALETTE = {"read": "36", "write": "33", "alert": "1;91", "success": "32",
@@ -16,6 +17,7 @@ WRITE_JUMP = 8_192
 _LOCK = threading.Lock()
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _FIELDS = re.compile(r"\b(in|out|read|write|credits|balance|limit|spent)=([^\s]+)")
+_TIMESTAMP = re.compile(r"^(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}\] )")
 
 
 def number(value, *, signed=False):
@@ -67,8 +69,12 @@ def render(line, *, color=None):
     enabled = color_enabled() if color is None else color
     if not enabled:
         return line
+    # The log viewer renders already-stamped lines; the prefix must not hide request/error classification.
+    stamp = _TIMESTAMP.match(line)
+    prefix = stamp[1] if stamp else ""
+    line = line[len(prefix):]
     if line.startswith("[err]") or " EXC " in line:
-        return _paint(line, "alert", True)
+        return prefix + _paint(line, "alert", True)
     write_alert = "[WRITE SPIKE" in line or "[WRITE HIGH" in line
     input_alert = "[INPUT HIGH]" in line
 
@@ -94,16 +100,22 @@ def render(line, *, color=None):
         status = int(match[2])
         role = "alert" if status >= 400 or status == 0 else "success"
         line = match[1] + _paint(match[2], role, True) + match[3]
-    return line
+    return prefix + line
 
 
-def write(line):
+def write(line, *, file=None, with_time=True):
     """Best effort, as the journal is: a console that cannot be written (the supervisor that read the relay's stdout was
     killed without /T, and the pipe is gone) used to raise OSError out of request handling, so every completion and every
     error ended with no response at all, and the journal lost the event too."""
     with _LOCK:
         try:
-            print(render(line), flush=True)
+            # New messages always get actual event time, even if upstream payload text looks like an old timestamp.
+            # Only the explicit replay path (with_time=False) preserves original lines without adding a new date.
+            stamp = timestamp() if with_time else ""
+            # Mask whole literal secrets before splitting: a configured secret can itself contain a line break.
+            cleaned = str(journal.scrub(str(line)))
+            for part in cleaned.splitlines() or [""]:
+                print(stamp + render(part, color=color_enabled(file)), file=file, flush=True)
         except (OSError, ValueError):
             pass
 

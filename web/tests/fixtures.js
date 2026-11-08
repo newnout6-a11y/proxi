@@ -206,7 +206,7 @@ export function metricsFor(windowSec) {
       keepwarm_credits: Number(sum('keepwarm_credits').toFixed(4)), keepwarm_pings: buckets.filter((b) => b.keepwarm_credits > 0).length,
       keepwarm_unknown: 0, credits_unknown: 0, credits_complete: true, credits_in_progress: 0,
       input_tokens: input, cache_hit_ratio: read / (read + write + input), latency_p50: 3500, latency_p95: 7000,
-      ttft_p50: 2100, ttft_p95: 4000,
+      ttft_p50: 2100, ttft_p95: 4000, tokens_per_second: 42.5, speed_samples: Math.round(12 * scale),
     },
     models: { 'claude-opus-5-5': Math.round(9 * scale), 'gpt-5.5': Math.round(3 * scale) },
     // The journal reaches back past the window: covered_from <= now - window is what "complete" means

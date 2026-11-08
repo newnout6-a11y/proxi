@@ -70,7 +70,7 @@ export function buildTraces(events) {
     let trace = map.get(event.turn_id);
     if (!trace) {
       trace = { id: event.turn_id, started: event.ts, ended: null, status: 'running', restored: false, model: null, effort: null,
-        task: null, askedEffort: null,
+        task: null, askedEffort: null, outputTokens: null, tokensPerSecond: null, speedDuration: null, speedReason: null,
         transport: null, dialect: null, ttft: null, duration: null, credits: null, creditsSum: null, creditsComplete: false,
         phase: 'wait', phaseStarted: event.ts, waitStarted: event.ts, waitMs: 0, firstSignal: null,
         thinkingStarted: null, thinking: 0, textStarted: null, textMs: 0, toolOpen: new Map(), toolSpans: [], args: 0,
@@ -113,6 +113,13 @@ export function buildTraces(events) {
       // silent at this moment as possibly billed, for good (what arrives later does not undo or repeat it)
       const last = trace.costAttempts.get(trace.costAttempt);
       if (data.reason === 'cancelled' && last) last.observed = true;
+    }
+    if (event.kind === 'request.speed') {
+      // One final measurement covers all account failovers; turn.end only times this account's timeline.
+      trace.outputTokens = data.output_tokens ?? null;
+      trace.tokensPerSecond = data.tokens_per_second ?? null;
+      trace.speedDuration = data.duration_ms ?? null;
+      trace.speedReason = data.reason ?? null;
     }
     if (event.kind === 'upstream.first_token') {
       signal(trace, event.ts);
@@ -193,6 +200,16 @@ export function buildTraces(events) {
     const cost = costOf(trace, status);
     return { ...trace, status, credits: cost.credits, creditsComplete: cost.complete };
   }).reverse();
+}
+
+/** Completed request throughput, not decoding speed: includes waiting, thinking, retries and relay commands. */
+export function speedOf(trace) {
+  const rate = trace.tokensPerSecond;
+  return ['stop', 'tool_calls', 'length'].includes(trace.status)
+    && Number.isInteger(trace.outputTokens) && trace.outputTokens >= 0
+    && ['stop', 'tool_calls', 'length'].includes(trace.speedReason)
+    && typeof trace.speedDuration === 'number' && Number.isFinite(trace.speedDuration) && trace.speedDuration > 0
+    && typeof rate === 'number' && Number.isFinite(rate) && rate >= 0 ? rate : null;
 }
 
 /**

@@ -10,6 +10,12 @@ param(
     [int]$MaxFastExits = 8
 )
 
+function Format-RelayLogLine([string]$Line) {
+    # Python supplies its event time; supervisor messages (or startup errors before Python logging) need one too.
+    if ($Line -match '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}\] ') { return $Line }
+    return ('[{0}] {1}' -f [DateTimeOffset]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff zzz'), $Line)
+}
+
 function Write-RelayLog([string]$Path, [string]$Line, [long]$MaxBytes = 20MB, [int]$Keep = 3) {
     # Bounded like the journal: past $MaxBytes the log becomes relay.log.1 (relay.log.2 .. $Keep are older ones) and
     # starts again. It is copied and emptied in place rather than renamed: watch_relay.py holds the file open, which
@@ -30,7 +36,9 @@ function Write-RelayLog([string]$Path, [string]$Line, [long]$MaxBytes = 20MB, [i
     } catch {
         # A rotation that fails (an old file held open, a full disk) leaves the log growing; no line is lost.
     }
-    [IO.File]::AppendAllText($Path, "$Line`r`n", [Text.UTF8Encoding]::new($false))
+    foreach ($part in ($Line -split "\r?\n")) {
+        [IO.File]::AppendAllText($Path, "$(Format-RelayLogLine $part)`r`n", [Text.UTF8Encoding]::new($false))
+    }
 }
 
 function Get-RestartDelay([int]$FastExits) {
@@ -74,7 +82,7 @@ function Invoke-Supervisor {
             $text = "supervisor: port $port is already in use (another relay, a second supervisor or another " +
                     "program listens on it); the relay was not started and the supervisor stops"
             Write-RelayLog $LogPath "$text $(Get-Date -Format o)"
-            Write-Warning $text
+            Write-Warning (Format-RelayLogLine $text)
             return 1
         }
         $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -90,7 +98,7 @@ function Invoke-Supervisor {
             $text = "supervisor: the relay exited within $FastExitSeconds s of its start $fastExits times in a row " +
                     "(exit code $code); the supervisor stops, the lines above say why"
             Write-RelayLog $LogPath "$text $(Get-Date -Format o)"
-            Write-Warning $text
+            Write-Warning (Format-RelayLogLine $text)
             return 1
         }
         $delay = Get-RestartDelay $fastExits
