@@ -196,7 +196,10 @@ def test_concurrent_mixed_clients_keep_routes_credentials_and_accounting_separat
     status, raw = mixed.call('/v1/balance')
     assert status == 200, raw
     balance = json.loads(raw)
-    assert balance['unknown_accounts'] == 1 and balance['partial'] is True
+    # Retool's figures cover Retool's account; Minara's credits are a total of their own (unknown here).
+    assert balance['unknown_accounts'] == 0 and balance['accounts_total'] == 1
+    assert balance['minara'] == {'available': None, 'unit': 'minara_credits', 'usd': None,
+                                 'accounts_total': 1, 'unknown_accounts': 1}
     remote = next(item for item in balance['accounts'] if item.get('upstream') == 'minara')
     # The balance is supported (GET /auth/me) and unknown here: tests never reach api.minara.ai.
     assert remote['available'] is None and remote['balance_supported'] is True

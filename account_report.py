@@ -2,6 +2,7 @@
 import concurrent.futures
 
 import console_log
+from minara_catalog import CREDITS_PER_USD
 from accounts import UNNAMED, account_tag, enabled
 from session import SessionPool
 
@@ -105,7 +106,22 @@ def aggregate_balance(infos):
     `unknown_accounts` counts the accounts left out; `partial` is true when the sums cover only part of
     the pool (an unknown balance, or a known balance without a monthly allocation), so a lower total is
     never mistaken for the whole pool.
-    """
+
+    Only Retool credits are summed here. Minara counts its own credits (220 per US dollar): they go in `minara`, a total
+    of their own, and never into Retool's figures."""
+    minara = [info for info in infos if info.get("unit") == "minara_credits"]
+    infos = [info for info in infos if info.get("unit") != "minara_credits"]
+    report = _aggregate(infos)
+    if minara:
+        known_minara = [info for info in minara if known(info.get("available")) is not None]
+        credits = round(sum(known(info["available"]) for info in known_minara), 4) if known_minara else None
+        report["minara"] = {"available": credits, "unit": "minara_credits",
+                            "usd": round(credits / CREDITS_PER_USD, 4) if credits is not None else None,
+                            "accounts_total": len(minara), "unknown_accounts": len(minara) - len(known_minara)}
+    return report
+
+
+def _aggregate(infos):
     with_balance = [info for info in infos if known(info.get("available")) is not None]
     allocation = [value for value in (known(info.get("monthly_allocation")) for info in with_balance)
                   if value is not None]

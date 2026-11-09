@@ -332,3 +332,44 @@ def test_a_config_from_the_unified_routing_still_loads_with_a_warning(measured):
     routes = minara_catalog.build([record])
     assert list(routes) == ['minara/claude-opus-5-5']  # never the Retool name
     assert routes['minara/claude-opus-5-5']['reasoning_effort_levels'] == ['high']
+
+
+def test_minara_credits_never_join_retool_balance_totals():
+    import account_report
+    retool = {'available': 100.0, 'monthly_allocation': 120.0, 'unit': 'credits'}
+    minara_a = {'available': 193.4, 'monthly_allocation': 500.0, 'unit': 'minara_credits', 'balance_supported': True}
+    minara_b = {'available': None, 'unit': 'minara_credits', 'balance_supported': True}
+    report = account_report.aggregate_balance([retool, minara_a, minara_b])
+    assert report['available'] == 100.0 and report['monthly_allocation'] == 120.0
+    assert report['accounts_total'] == 1 and not report['partial']
+    assert report['minara'] == {'available': 193.4, 'unit': 'minara_credits', 'usd': round(193.4 / 220, 4),
+                                'accounts_total': 2, 'unknown_accounts': 1}
+    only = account_report.aggregate_balance([minara_a])
+    assert only['available'] is None and only['minara']['available'] == 193.4
+
+
+def test_banner_shows_minara_credits_apart_from_retool():
+    import proxy
+    cfg = {'host': '127.0.0.1', 'port': 8787, 'relay_api_key': 'k' * 40, 'model': 'claude-opus-5-5',
+           'reasoning_effort': 'auto', 'session_mode': 'per_conversation', 'workspace_root': '.',
+           'exec_policy': 'off', 'max_exec_turns': 0}
+    lines = proxy.banner_lines(cfg, {'available': 100.0, 'monthly_allocation': 120.0, 'accounts': [{}],
+                                     'minara': {'available': 409.5, 'usd': 1.8614, 'accounts_total': 2,
+                                                'unknown_accounts': 0}})
+    assert any(line.startswith(' balance:       100.0 / 120.0') for line in lines)
+    assert ' minara:        409.5 credits (~$1.8614) on 2 accounts' in lines
+    alone = proxy.banner_lines(cfg, {'available': None, 'accounts': [{'balance_supported': True}],
+                                     'minara': {'available': 12.0, 'usd': 0.0545, 'accounts_total': 1,
+                                                'unknown_accounts': 0}})
+    assert not any('DEGRADED' in line for line in alone)
+
+
+def test_client_catalogs_list_the_minara_models_of_the_relay_config(tmp_path, measured):
+    from scripts import probe_client_settings
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps({'accounts': [{'label': 'M', 'upstream': 'minara', 'bearer_token': 'synthetic'}],
+                                'model': 'minara/claude-opus-5-5'}), encoding='utf-8')
+    ids = {entry['id'] for entry in probe_client_settings.routable_entries(str(path))}
+    assert {'minara/claude-opus-5-5', 'minara/gpt-6.1-sol'} <= ids and 'minara/minimax-m3' not in ids
+    opus = next(entry for entry in probe_client_settings.routable_entries(str(path)) if entry['id'] == 'minara/claude-opus-5-5')
+    assert opus['context'] == models._BY_ID['claude-opus-5-5']['context']  # the model's own window, from the audit

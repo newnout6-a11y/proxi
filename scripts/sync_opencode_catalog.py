@@ -41,6 +41,8 @@ COMPACTION_AGENT = 'compaction'
 # tier, in the order OpenCode itself prefers for small_model (Haiku, Flash, nano).
 SMALL_MODELS = ('claude-haiku-4-5-20251001', 'gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview',
                 'gemini-3.5-flash', 'gemini-2.5-flash', 'gpt-5-nano', 'gpt-5-mini', 'zai-org/GLM-5.3-Flash')
+UNKNOWN_CONTEXT = 128000
+UNKNOWN_OUTPUT = 32000
 MASK = '***'
 # Mappings whose values are credentials; a list under `env` holds NAME=value items instead.
 SECRET_CONTAINERS = ('headers', 'environment', 'env', 'cookies')
@@ -129,7 +131,10 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
         item = copy.deepcopy(old_models.get(name))
         item = item if isinstance(item, dict) else {}
         levels = entry.get('reasoning_effort_levels') or []
-        item.update(name=entry['label'], limit={'context': entry['context'], 'output': entry['max_output']},
+        # OpenCode needs numbers here; a Minara model whose limits nobody measured gets a floor every model of
+        # Minara's current catalog exceeds (OpenCode compacts a little early rather than overflowing).
+        limit = {'context': entry['context'] or UNKNOWN_CONTEXT, 'output': entry['max_output'] or UNKNOWN_OUTPUT}
+        item.update(name=entry['label'], limit=limit,
                     tool_call=bool(entry.get('tools')), attachment=bool(entry.get('vision')),
                     reasoning=bool(entry.get('reasoning')))
         # Retool credits have no verified USD conversion here. Do not publish

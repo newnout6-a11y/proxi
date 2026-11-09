@@ -352,9 +352,18 @@ def build_minara_catalog(configs):
     Every Minara account serves the models minara_models.json publishes, or exactly its own minara_models list
     (minara_catalog). The routes are minara/<name>; no Retool model is ever among them."""
     try:
-        return minara_routes.build(configs)
+        routes = minara_routes.build(configs)
     except ValueError as exc:
         raise service_unavailable(str(exc)) from None
+    for entry in routes.values():
+        # The window and output ceiling are the model's own: the relay's audited catalog has them for the models Retool
+        # serves too (minara/claude-opus-5-5 is claude-opus-5-5). The others stay unknown.
+        same = _BY_ID.get(_canonical(entry['id'][len('minara/'):]))
+        if same is not None:
+            for key in ('context', 'max_output'):
+                if entry.get(key) is None and same.get(key) is not None:
+                    entry[key] = same[key]
+    return routes
 
 
 def configure_minara(configs):

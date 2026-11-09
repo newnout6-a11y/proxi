@@ -1501,8 +1501,14 @@ def banner_lines(cfg, balance, warnings=()):
         lines.append(line)
     elif balance.get("accounts") and all(item.get("balance_supported") is False for item in balance["accounts"]):
         lines.append(" balance:       unavailable (provider does not expose balance; configured routing only)")
-    else:
+    elif not balance.get("minara"):
         lines.append(" upstream:      DEGRADED " + str(balance.get("error")))
+    minara = balance.get("minara")
+    if minara:
+        known = minara.get("available")
+        lines.append(" minara:        " + ("unknown" if known is None else "%s credits (~$%s)" % (known, minara.get("usd")))
+                     + " on %d account%s" % (minara["accounts_total"], "" if minara["accounts_total"] == 1 else "s")
+                     + ("  (%d unknown)" % minara["unknown_accounts"] if minara.get("unknown_accounts") else ""))
     lines += [" WARNING:       " + text for text in warnings]
     lines.append("=" * 64)
     return lines

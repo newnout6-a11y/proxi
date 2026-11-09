@@ -312,8 +312,11 @@ def routable_entries(relay_config):
     if not isinstance(saved, dict):
         raise ValueError("relay configuration %s must contain a JSON object" % relay_config)
     cfg = {**RELAY_DEFAULTS, **saved}
-    backends = [SimpleNamespace(cfg=account) for account in load_accounts(relay_config)]
-    return [entry for entry in models.catalog() if models.catalog_routable(entry, cfg, backends)]
+    accounts = load_accounts(relay_config)
+    backends = [SimpleNamespace(cfg=account) for account in accounts]
+    # Minara models come from the accounts of this file (minara_models.json and their lists), as the relay builds them.
+    cfg['_minara_models'] = models.build_minara_catalog(accounts)
+    return [entry for entry in models.catalog(cfg) if models.catalog_routable(entry, cfg, backends)]
 
 
 def desktop_cli(app_data):
