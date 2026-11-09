@@ -15,6 +15,7 @@ import time
 from apierr import service_unavailable
 import auth
 import console_log
+import minara_catalog
 import models
 import web_search
 
@@ -550,7 +551,11 @@ def _whole_number(value):
     return None
 
 
-def _check_upstream(record, name):
+# Fields of the unified Retool/Minara routing removed on 2026-11-09: a config written then still loads.
+_LEGACY_MINARA_FIELDS = ('public_id', 'verbosity_levels')
+
+
+def _check_upstream(record, name, warnings=None):
     kind = record.get('upstream', 'retool')
     if kind not in ('retool', 'minara'):
         raise service_unavailable(f"{name}: upstream must be retool or minara")
@@ -580,8 +585,12 @@ def _check_upstream(record, name):
         raise service_unavailable(f"{name}: Minara needs a bearer_token or populated bearer_token_env")
     record['bearer_token'] = token
     entries = record.get('minara_models')
-    if not isinstance(entries, list) or not entries:
-        raise service_unavailable(f"{name}: minara_models must be a nonempty list")
+    if entries is None or entries == []:
+        # No list: the account serves every model minara_models.json publishes (minara_catalog).
+        record.pop('minara_models', None)
+        return
+    if not isinstance(entries, list):
+        raise service_unavailable(f"{name}: minara_models must be a list of model IDs (or be left out)")
     seen = set()
     for item in entries:
         descriptor = {'id': item} if isinstance(item, str) else item
@@ -590,10 +599,17 @@ def _check_upstream(record, name):
         ident = descriptor.get('id')
         if not isinstance(ident, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:-]{0,199}', ident) or ident in seen:
             raise service_unavailable(f"{name}: Minara model IDs must be unique nonempty identifiers")
+        if minara_catalog.upstream_of(ident) is None:
+            raise service_unavailable(f"{name}: unknown Minara model '{ident}' (use an ID of Minara's /v1/models, "
+                                      "such as anthropic/claude-opus-5.5, or a published minara/... name)")
         seen.add(ident)
-        public = descriptor.get('public_id')
-        if public is not None and (not isinstance(public, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:-]{0,199}', public)):
-            raise service_unavailable(f"{name}: invalid public_id")
+        legacy = [key for key in _LEGACY_MINARA_FIELDS if key in descriptor]
+        if legacy and warnings is not None:
+            warnings.append(f"{name}: model {ident}: {', '.join(legacy)} no longer used (Minara models are minara/... "
+                            "names of their own, never Retool's); remove the field")
+        unknown = set(descriptor) - {'id', *minara_catalog.OVERRIDABLE, *_LEGACY_MINARA_FIELDS}
+        if unknown:
+            raise service_unavailable(f"{name}: model {ident} has unknown fields: {', '.join(sorted(unknown))}")
         for key in ('provider', 'label'):
             if key in descriptor and (not isinstance(descriptor[key], str) or not descriptor[key].strip()
                     or len(descriptor[key]) > 200 or any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF
@@ -605,9 +621,6 @@ def _check_upstream(record, name):
         for key in ('context', 'max_output'):
             if descriptor.get(key) is not None and (type(descriptor[key]) is not int or descriptor[key] < 1):
                 raise service_unavailable(f"{name}: model {key} must be positive integer")
-        verbosity = descriptor.get('verbosity_levels', [])
-        if not isinstance(verbosity, list) or any(v not in ('low', 'medium', 'high') for v in verbosity):
-            raise service_unavailable(f"{name}: invalid model verbosity_levels")
         levels = descriptor.get('reasoning_effort_levels', [])
         if not isinstance(levels, list) or any(not isinstance(v, str) or v not in models.EFFORT_ORDER for v in levels):
             raise service_unavailable(f"{name}: invalid model reasoning_effort_levels")
@@ -792,7 +805,7 @@ def _load(path):
         for i, acc in enumerate(accounts):
             if not isinstance(acc, dict):
                 raise service_unavailable(f"account #{i} must be an object")
-            _check_upstream(acc, f"account #{i}")
+            _check_upstream(acc, f"account #{i}", warnings)
             acc_missing = ([] if acc.get("upstream") == "minara" else
                            [k for k in ("cookie", "xsrf", "base", "page_uuid") if not acc.get(k)])
             if acc_missing:
@@ -814,7 +827,7 @@ def _load(path):
         for i, acc in enumerate(accounts):
             warnings.extend(_provider_access_warnings(cfg, acc, f"account #{i}"))
     else:
-        _check_upstream(cfg, "the account")
+        _check_upstream(cfg, "the account", warnings)
         _check_pool_fields(cfg, "the account")
         warnings.extend(_provider_access_warnings(cfg, cfg, "the account"))
 

@@ -604,7 +604,9 @@ class Admin:
                 "error": self._safe(str(error))[:200] if error else None,
             })
             if backend.cfg.get("upstream") == "minara":
-                accounts[-1].update(upstream="minara", balance_supported=False, renewal_supported=False)
+                # Credits from GET /auth/me (220 per US dollar); a Bearer token has no renewal.
+                accounts[-1].update(upstream="minara", balance_supported=True, balance_unit="minara_credits",
+                                    renewal_supported=False)
                 accounts[-1].update({key: per_account[key] for key in (
                     "attempts", "provider_cost", "provider_cost_currency", "provider_cost_complete")
                     if key in per_account})

@@ -156,6 +156,17 @@ class CacheMonitor:
             amount(written, tokens=True), amount(usage.get("creditsUsed")), output_note, marker)
 
 
+def route_line(request_id, *, upstream, account, model, upstream_model, effort=None, child=False):
+    """The serving route after acquisition, never a speculative candidate."""
+    def field(value):
+        text = str(value) if value is not None else '?'
+        return ''.join(char if char.isprintable() else '?' for char in text)[:200]
+    provider = 'Minara' if upstream == 'minara' else 'Retool' if upstream == 'retool' else field(upstream)
+    return '[%s] [route] provider=%s account=%s model=%s upstream_model=%s effort=%s kind=%s' % (
+        field(request_id), provider, field(account), field(model), field(upstream_model),
+        field(effort) if effort is not None else 'auto', 'subagent' if child else 'conversation')
+
+
 def balance_line(request_id, snapshot, spent=None, account=None):
     state = ("UNAVAILABLE" if number(snapshot.get("available"), signed=True) is None else
              "UNREPORTED USAGE" if snapshot.get("unreported_usage") else

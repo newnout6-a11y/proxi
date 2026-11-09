@@ -38,7 +38,7 @@ import prompt_stabilizer
 import tool_search_policy
 import tool_union
 import validate
-from accounts import UNNAMED, AccountDispatcher, UnmeteredAccount, account_tag
+from accounts import UNNAMED, AccountDispatcher, MinaraAccount, account_tag
 from credits import CreditsManager
 from orchestrator import TurnRunner, acquire_plan, client_origin, journal_changes
 from session import Backend, SessionPool
@@ -125,7 +125,7 @@ class Runtime:
         managers = {}
         for backend in backends:
             if backend.cfg.get("upstream") == "minara":
-                managers[backend] = UnmeteredAccount()
+                managers[backend] = MinaraAccount(backend.cfg, backend=backend)
                 continue
             if not hasattr(backend, "refresher"):
                 continue
@@ -1246,11 +1246,6 @@ def make_handler(runtime: Runtime):
                     parsed.verbosity = verbosity
                 else:
                     warnings.append("generation.verbosity %s not applied: %s has no such level" % (verbosity, parsed.model))
-
-            if parsed.entry.get('upstream') == 'unified':
-                requirements = dict(parsed.entry.get('_requirements', {}))
-                requirements.update(effort=parsed.effort, verbosity=parsed.verbosity)
-                parsed.entry = dict(parsed.entry, _requirements=requirements)
 
         def _journal_skipped_edits(self, changes):
             """One prompt.edit_skipped per kind of edit the rewrite had to leave out of this request."""

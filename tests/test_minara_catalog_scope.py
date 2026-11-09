@@ -85,7 +85,7 @@ def test_unrelated_successful_and_failed_load_cannot_change_live_catalog(tmp_pat
             loaded(tmp_path, 'bad', ['openai/bad'], reasoning_effort='bogus')
         assert call('/v1/chat/completions', request('minara/openai/a'))[0] == 200
         ids = [row['id'] for row in call('/v1/models')[1]['data']]
-        assert ids == ['minara/openai/a']
+        assert ids == ['minara/a']  # published without the vendor prefix; minara/openai/a stays an alias
         assert call('/v1/chat/completions', request('minara/openai/b'))[0] == 404
         assert models.default_model_warning(cfg) is None
         assert models.parse_model_name('minara/openai/a@profile', cfg).profile == 'profile'
@@ -102,12 +102,12 @@ def test_two_live_runtimes_keep_same_id_capabilities_and_catalogs_isolated(tmp_p
         assert statuses == [200] * 4 + [422] * 4
         for call, own, other in ((a, 'a', 'b'), (b, 'b', 'a')):
             ids = [row['id'] for row in call('/v1/models')[1]['data']]
-            assert set(ids) == {'minara/openai/shared', 'minara/openai/' + own}
-            assert 'minara/openai/' + other not in ids
+            assert set(ids) == {'minara/shared', 'minara/' + own}
+            assert 'minara/' + other not in ids
             codex = call('/codex/models')[1]['models']
             assert {row['slug'] for row in codex} == set(ids)
             admin_catalog = call('/admin/api/models')[1]['data']
-            own_row = next(row for row in admin_catalog if row['id'] == 'minara/openai/shared')
+            own_row = next(row for row in admin_catalog if row['id'] == 'minara/shared')
             assert own_row['tools'] is (own == 'a')
 
 def test_minara_client_catalog_labels_name_the_actual_upstream():

@@ -173,6 +173,17 @@ def upstream_shapes_unknown(monkeypatch):
     monkeypatch.setattr(direct, "_PRUNING", {"refused": False})
 
 
+@pytest.fixture(autouse=True)
+def minara_balance_offline(monkeypatch):
+    """A Minara account reads its credits from GET /auth/me on api.minara.ai: no test reaches the real host. A test
+    that wants a balance sets backend._minara_get (url, **kwargs) -> response, as _minara_post fakes the POST."""
+    import accounts
+
+    def offline(*args, **kwargs):
+        raise ConnectionError("tests do not reach api.minara.ai")
+    monkeypatch.setattr(accounts, "_minara_network_get", offline)
+
+
 class FakeCredits:
     def __init__(self):
         self.used = []

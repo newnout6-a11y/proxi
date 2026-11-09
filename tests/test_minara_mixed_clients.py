@@ -198,7 +198,8 @@ def test_concurrent_mixed_clients_keep_routes_credentials_and_accounting_separat
     balance = json.loads(raw)
     assert balance['unknown_accounts'] == 1 and balance['partial'] is True
     remote = next(item for item in balance['accounts'] if item.get('upstream') == 'minara')
-    assert remote['available'] is None and remote['balance_supported'] is False
+    # The balance is supported (GET /auth/me) and unknown here: tests never reach api.minara.ai.
+    assert remote['available'] is None and remote['balance_supported'] is True
 
 
 @pytest.mark.parametrize('dialect', ['chat', 'responses', 'messages'])

@@ -33,6 +33,9 @@ def _tool_name(tool):
     return (tool["function"] if isinstance(tool.get("function"), dict) else tool).get("name")
 
 
+tool_name = _tool_name
+
+
 def requirement(model, tools, choice):
     """The Requirement of a request that forces a tool call on a route that cannot be told to; None for any other.
 

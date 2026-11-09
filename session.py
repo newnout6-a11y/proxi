@@ -451,7 +451,6 @@ class RelaySession:
 
     async def stream(self, prompt, model_provider, tool_names=None):
         """Keep one request's cancellation sticky across all local tool turns."""
-        conversation_state.provider_binding(self)
         self._loop = asyncio.get_running_loop()
         if self._drain_task is not None:
             try:
@@ -1028,28 +1027,7 @@ class SessionPool:
         if meta is None:
             return None, None, None
         backend = next((item for item in self.backends if cfg_identity(item.cfg) == meta.account), None)
-        refusal = self._state_refusal(backend, model_entry, exclude)
-        if refusal is None and getattr(meta, 'binding', None) and not self._binding_matches(meta.binding, backend, model_entry):
-            refusal = 'route_changed'
-        if refusal is None and getattr(meta, 'binding', None) is None and backend.cfg.get('upstream') == 'minara':
-            refusal = 'route_changed'  # Legacy files contain Retool opaque state, never Minara state.
-        return meta, backend, refusal
-
-    @staticmethod
-    def _binding_matches(binding, backend, model_entry):
-        if backend is None:
-            return False
-        cfg = backend.cfg
-        if binding.get('upstream') != cfg.get('upstream', 'retool') or binding.get('base') != str(cfg.get('base') or '').rstrip('/'):
-            return False
-        if model_entry is None:
-            return True
-        try:
-            route = model_catalog.route_for(model_entry, cfg)
-        except apierr.ApiError:
-            return False
-        return (binding.get('model') == route.get('id', '') and
-                binding.get('upstream_model') == route.get('upstream_model', route.get('id', '')))
+        return meta, backend, self._state_refusal(backend, model_entry, exclude)
 
     def _stored_affinity(self, conversation_key, model_entry, exclude, session_key=None):
         """The account a conversation stored before a restart belonged to, while it can still serve this request.
@@ -1133,14 +1111,9 @@ class SessionPool:
         backend = next((item for item in self.backends if cfg_identity(item.cfg) == loaded.header["account"]), None)
         if self._state_refusal(backend, model_entry, exclude) is not None:
             return None
-        binding = loaded.header.get('binding')
-        if binding and not self._binding_matches(binding, backend, model_entry):
-            return None
-        if binding is None and backend.cfg.get('upstream') == 'minara':
-            return None
         return conversation_state.StoredSession(backend, loaded.state.branches)
 
-    async def _restore_state(self, key, session, model_entry=None):
+    async def _restore_state(self, key, session):
         """Give a session that is about to be registered for a stored conversation its signed history and cache marks back.
 
         (meta, loaded) when it did, for the caller to report once the session is registered. Nothing is registered
@@ -1165,12 +1138,6 @@ class SessionPool:
                 if not any(key_id == meta.key_id for key_id, _ in self._state_skipped):
                     self._state_skipped.add((meta.key_id, "account_changed"))
                     store.skip(meta, "account_changed")
-                return None
-            if getattr(meta, 'binding', None) and not self._binding_matches(meta.binding, session.backend, model_entry):
-                store.skip(meta, 'route_changed')
-                return None
-            if getattr(meta, 'binding', None) is None and session.backend.cfg.get('upstream') == 'minara':
-                store.skip(meta, 'route_changed')
                 return None
             gate = self._restoring[key] = asyncio.Event()
             reading = self._reading(key, meta)
@@ -1363,19 +1330,6 @@ class SessionPool:
                 counts[session.backend] += 2
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % len(self.backends)
-        kinds = {b.cfg.get('upstream', 'retool') for b in candidates}
-        if len(kinds) > 1:
-            # Operator priority still wins; equal-priority vendors share new work
-            # fairly even when one vendor has many more configured accounts.
-            best_priority = min(account_priority(b) for b in candidates)
-            candidates = [b for b in candidates if account_priority(b) == best_priority]
-            vendors = list(dict.fromkeys(b.cfg.get('upstream', 'retool') for b in self.backends if b in candidates))
-            vendor_idx = getattr(self, '_vendor_rr_index', 0)
-            self._vendor_rr_index = vendor_idx + 1
-            loads = {kind: sum(counts[b] for b in self.backends if b.cfg.get('upstream', 'retool') == kind)
-                     for kind in vendors}
-            chosen = min(vendors, key=lambda kind: (loads[kind], (vendors.index(kind) - vendor_idx) % len(vendors)))
-            candidates = [b for b in candidates if b.cfg.get('upstream', 'retool') == chosen]
         # Operator priority first (lower wins), then the least loaded, then round-robin.
         return min(candidates, key=lambda b: (account_priority(b), counts[b],
                                               (self.backends.index(b) - idx) % len(self.backends)))
@@ -1400,11 +1354,6 @@ class SessionPool:
         read back from disk (restored): a refusal that names the blocks forgets them (conversation_state.refuse) and the next
         request is sent unsigned, as every move was before."""
         if not self.cfg.get("account_move_keeps_history", False):
-            return 0
-        old_cfg, new_cfg = old.backend.cfg, new.backend.cfg
-        if old_cfg.get('upstream', 'retool') != 'retool' or new_cfg.get('upstream', 'retool') != 'retool':
-            return 0  # Signed Retool blocks and cache markers never cross vendors.
-        if getattr(old, '_bound_route', None) != getattr(new, '_bound_route', None) and getattr(new, '_bound_route', None):
             return 0
         try:
             state = conversation_state.capture(key, old)
@@ -1599,16 +1548,6 @@ class SessionPool:
             session = None
         if session is None or not (self._usable(session.backend, exclude) and self._routable(session.backend, model_entry)):
             return None
-        binding = conversation_state.provider_binding(session)
-        if binding and not self._binding_matches(binding, session.backend, model_entry):
-            # A different public model has a different native scope; expose the
-            # prior branch for diagnostic comparison only. acquire() still
-            # creates fresh transport state and History.resume cannot match it.
-            # The SAME public model with a changed upstream mapping is unsafe
-            # even to present as a continuation candidate.
-            changed_model = model_entry is not None and binding.get('model') != model_entry.get('id')
-            if not changed_model or not self._binding_matches(binding, session.backend, None):
-                return None
         return session
 
     async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None, context_scope=None,
@@ -1684,11 +1623,12 @@ class SessionPool:
                                else affinity_backend or self._next_backend(model_entry, exclude))
                     self._check_route(backend, model_entry)
                     session = RelaySession(backend, await self._new_thread_id(backend))
-                    parent_binding = conversation_state.provider_binding(parent) if parent is not None else None
-                    if (parent is not None and parent.backend is backend and
-                            (not parent_binding or self._binding_matches(parent_binding, backend, model_entry))):
-                        # Immutable snapshots only belong to this conversation/account.
-                        session._native_history = parent._native_history
+                    if parent is not None:
+                        if parent.backend is backend:
+                            # Immutable snapshots are shared only by branches of
+                            # this same conversation/account. Child replies must
+                            # remain available after its temporary lease closes.
+                            session._native_history = parent._native_history
                         if getattr(parent, "_cached_head", None):
                             session._cached_head = parent._cached_head
                         if getattr(parent, "_registered_tools", None):
@@ -1707,25 +1647,28 @@ class SessionPool:
                     await lock.acquire()
                     locked = True
                     session = self._conversations.get(key)
-                    binding = conversation_state.provider_binding(session) if session is not None else None
-                    route_changed = bool(binding and not self._binding_matches(binding, session.backend, model_entry))
-                    if session is not None and (route_changed or not self._keeps(session.backend, model_entry, exclude)):
+                    if session is not None and not self._keeps(session.backend, model_entry, exclude):
                         # The account ran out, was signed out or has no route for this
                         # model: move the conversation.
                         # Resolve the replacement first, so a 402/503 keeps the old state;
                         # a lone fallback account is the same backend and is kept as is.
                         replacement = affinity_backend or self._next_backend(model_entry, exclude)
-                        if replacement is not session.backend or route_changed:
+                        if replacement is not session.backend:
                             self._check_route(replacement, model_entry)
                             old = session
                             session = RelaySession(replacement, await self._new_thread_id(replacement))
-                            carried = 0 if route_changed else self._carry_history(key, old, session)
+                            carried = self._carry_history(key, old, session)
                             # The children that run against this conversation pin it wherever it lives: their releases
                             # find the new session by key (_touch_cache_parents), and it is not evicted while one of
                             # them still works for it.
                             for name in ("_cache_dependents", "_cache_dependent_records", "_cache_children"):
                                 if hasattr(old, name):
                                     setattr(session, name, getattr(old, name))
+                            if (old.backend.cfg.get("upstream") == "minara" == replacement.cfg.get("upstream")
+                                    and getattr(old, "_minara_reasoning", None)):
+                                # Minara's accounts share one cache: the next request reads the old account's prefix only if
+                                # its replies carry the same reasoning_details (minara._attach_reasoning).
+                                session._minara_reasoning = old._minara_reasoning
                             self._conversations[key] = session
                             await old.aclose()
                             # Unless account_move_keeps_history took the signed branches along, the new account's first request
@@ -1743,7 +1686,7 @@ class SessionPool:
                         session = RelaySession(backend, await self._new_thread_id(backend))
                         # Before it is registered: whoever looks for this conversation meanwhile waits at the gate
                         # or starts cold without touching its file, and a cancelled request leaves nothing behind.
-                        restored = await self._restore_state(key, session, model_entry)
+                        restored = await self._restore_state(key, session)
                         self._conversations[key] = session
                         journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),

@@ -17,6 +17,7 @@ import time
 import apierr
 import console_log
 import journal
+from minara_catalog import CREDITS_PER_USD
 from io_workers import DaemonIOExecutor
 
 DEAD_AFTER = 3            # consecutive auth failures before an account leaves the pool
@@ -186,12 +187,125 @@ class UnmeteredAccount:
         pass  # Upstream monetary cost must never be debited as Retool credits.
 
 
+def _minara_network_get(url, **kwargs):
+    from curl_cffi import requests
+    return requests.get(url, **kwargs)
+
+
+class MinaraAccount(UnmeteredAccount):
+    """A Minara account's credits, read from GET /auth/me (creditBalanceBreakdown: plan + extra).
+
+    Minara debits a reply's usage.cost at 220 credits per US dollar as soon as it ends, and lets the balance go below zero
+    (a turn is charged after it ran); at zero or below it answers 402. Between server reads the reported costs are taken
+    off the last balance, so an account near its end leaves the pool before its next reply would overdraw it."""
+    supports_balance = True
+    CACHE_SECONDS = 20.0
+
+    def __init__(self, cfg, fetch=None, backend=None):
+        super().__init__()
+        self.cfg = cfg
+        self._fetch = fetch
+        self.backend = backend
+        self._balance = None
+        self._fetched = float("-inf")
+        self._spent_since = 0.0
+        # The balance at which Minara last answered 402: whether its bonus ("extra") credits pay for API calls is not
+        # known (an account at plan -102 and extra 63 was refused), so a refusal holds until the balance grows.
+        self._refused_at = None
+
+    def note_refusal(self):
+        """Minara answered 402: the account takes nothing until a later read shows more credits than now."""
+        with self._lock:
+            total = (self._balance or {}).get("available")
+            self._refused_at = (total - self._spent_since) if total is not None else float("inf")
+
+    def _origin(self):
+        base = str(self.cfg.get("base") or "https://api.minara.ai/v1").rstrip("/")
+        return base[:-3] if base.endswith("/v1") else base
+
+    def _read(self):
+        if self._fetch is not None:
+            return self._fetch()
+        # config._check_upstream resolves bearer_token_env into bearer_token in memory.
+        token = self.cfg.get("bearer_token") or ""
+        get = getattr(self.backend, "_minara_get", None) or _minara_network_get
+        response = get(self._origin() + "/auth/me", impersonate="chrome131", timeout=30, allow_redirects=False,
+                       headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+        if response.status_code in (401, 403):
+            raise apierr.upstream_auth_failed("Minara rejected the account token")
+        if response.status_code != 200:
+            raise apierr.upstream_error("Minara balance HTTP %s" % response.status_code)
+        return response.json()
+
+    def get_balance(self, force_refresh=False):
+        with self._lock:
+            fresh = time.monotonic() - self._fetched < self.CACHE_SECONDS
+            if self._balance is not None and fresh and not force_refresh:
+                return dict(self._balance)
+        try:
+            data = self._read()
+            parts = data.get("creditBalanceBreakdown") or {}
+            plan, extra = float(parts.get("plan")), float(parts.get("extra", 0) or 0)
+            if not (math.isfinite(plan) and math.isfinite(extra)):
+                raise ValueError("balance is not a number")
+            total = (data.get("creditBalance") or {}).get("total")
+            reward = (data.get("creditBalance") or {}).get("reward")
+            capacity = sum(float(value) for value in (total, reward) if value is not None) or None
+        except apierr.ApiError as error:
+            return self._failed(error.code)
+        except Exception as error:  # noqa: BLE001 - a balance read must never fail a turn
+            return self._failed(type(error).__name__)
+        with self._lock:
+            available = plan + extra
+            if self._refused_at is not None:
+                if available > self._refused_at + 1 and self._refused_at != float("inf"):
+                    self._refused_at = None  # topped up since the refusal
+                else:
+                    available = min(available, 0.0)
+            self._balance = {"available": round(available, 4), "plan": round(plan, 4), "extra": round(extra, 4),
+                             "monthly_allocation": capacity, "unit": "minara_credits", "balance_supported": True,
+                             "usd": round(available / CREDITS_PER_USD, 4), "session_used": None,
+                             "refused": self._refused_at is not None,
+                             "stale": False, "unreported_usage": False}
+            self._fetched = time.monotonic()
+            self._spent_since = 0.0
+            self.last_fetched_at = time.time()
+            self.last_error = None
+            return dict(self._balance)
+
+    def _failed(self, reason):
+        with self._lock:
+            self.last_error = reason
+            snapshot = dict(self._balance) if self._balance else {
+                "available": None, "unit": "minara_credits", "balance_supported": True, "session_used": None,
+                "unreported_usage": True}
+            snapshot.update(error=reason, stale=self._balance is not None)
+            return snapshot
+
+    def balance_snapshot(self):
+        """The last server balance less the costs reported since: no network."""
+        with self._lock:
+            if self._balance is None:
+                return {"available": None, "unit": "minara_credits", "balance_supported": True}
+            snapshot = dict(self._balance)
+            snapshot["available"] = round(snapshot["available"] - self._spent_since, 4)
+            return snapshot
+
+    def _account(self, row, sign=1):
+        super()._account(row, sign)
+        cost = row.get("provider_cost")
+        if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
+            self._spent_since += sign * cost * CREDITS_PER_USD
+
+
 class AccountDispatcher:
     def __init__(self, backends, cfg, managers, *, clock=time.monotonic, rng=None):
         self.backends = list(backends)
         self.managers = dict(managers)
         self.interval = float(cfg.get("session_refresh_interval", 900) or 0)
         self.threshold = float(cfg.get("min_account_balance", 20))
+        # Minara credits are another unit (220 per US dollar): a turn on a long Claude context costs 5-50 of them.
+        self.minara_threshold = float(cfg.get("minara_min_credits", 15))
         self.balance_interval = float(cfg.get("account_balance_interval", 300) or 0)
         self.rate_limit_cooldown = min(max(float(cfg.get("account_rate_limit_cooldown") or RATE_LIMIT_COOLDOWN),
                                            1.0), RATE_LIMIT_MAX)
@@ -218,6 +332,12 @@ class AccountDispatcher:
             refresher = getattr(backend, "refresher", None)
             if refresher is not None:
                 refresher.keepalive_owner = self
+
+    def threshold_of(self, backend):
+        """The balance below which this account takes no new turn, in its own unit."""
+        if (getattr(backend, "cfg", None) or {}).get("upstream") == "minara":
+            return self.minara_threshold
+        return self.threshold
 
     # -- lifecycle -----------------------------------------------------------
     def alive(self):
@@ -294,7 +414,7 @@ class AccountDispatcher:
                 if snapshot and "exhausted" not in state["reasons"] and now - state["last_forced"] >= FORCED_CHECK_GAP:
                     # A local debit crossed the threshold: confirm with the server now.
                     local = console_log.number(snapshot().get("available"), signed=True)
-                    if local is not None and (local <= 0 or local < self.threshold):
+                    if local is not None and (local <= 0 or local < self.threshold_of(backend)):
                         state["next_balance"] = min(state["next_balance"], now)
                         state["last_forced"] = now
                 if (getattr(backend, "refresher", None) is not None
@@ -360,10 +480,12 @@ class AccountDispatcher:
         elif reason["reason"] == "rate_limited":
             return  # mark_rate_limited says it itself, with the time the account comes back
         elif reason["reason"] == "exhausted":
-            text = "[account] %s исключён: баланс %s < %s" % (
-                label, console_log.amount(reason.get("available"), signed=True), console_log.amount(self.threshold))
+            threshold = self.threshold_of(backend)
+            unit = " кредитов Minara" if (getattr(backend, "cfg", None) or {}).get("upstream") == "minara" else ""
+            text = "[account] %s исключён: баланс %s < %s%s" % (
+                label, console_log.amount(reason.get("available"), signed=True), console_log.amount(threshold), unit)
             journal.emit("account.exhausted", text, "warn", account=tag, available=reason.get("available"),
-                         threshold=self.threshold)
+                         threshold=threshold)
         else:
             text = "[account] %s исключён: сессия не продлевается, нужен новый вход" % label
             journal.emit("account.auth_dead", text, "error", account=tag, error=reason.get("error"))
@@ -519,9 +641,9 @@ class AccountDispatcher:
             if fresh:
                 state["available"] = available
                 # A balance of 0 buys nothing whatever the threshold (min_account_balance 0 left such an account usable).
-                if available <= 0 or available < self.threshold:
+                if available <= 0 or available < self.threshold_of(backend):
                     changed = self._set_reason(backend, "exhausted",
-                                               {"available": available, "threshold": self.threshold})
+                                               {"available": available, "threshold": self.threshold_of(backend)})
                 else:
                     changed = self._set_reason(backend, "exhausted", None)
             exhausted = "exhausted" in state["reasons"]

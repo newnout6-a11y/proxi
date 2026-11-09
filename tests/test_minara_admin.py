@@ -37,7 +37,7 @@ def test_bearer_accounts_share_an_api_origin_not_an_identity(pool, monkeypatch):
 
 
 @pytest.mark.parametrize("changes", [
-    {"cookie": "must-not-be-accepted"}, {"minara_models": []},
+    {"cookie": "must-not-be-accepted"}, {"minara_models": {"id": "openai/x"}},
     {"base": "http://api.minara.ai/v1"}, {"bearer_token_env": "bad\nname"},
     {"label": "x" * 41},
 ])

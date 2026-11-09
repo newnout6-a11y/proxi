@@ -150,7 +150,8 @@ def test_actual_http_provider_cost_and_truthful_account_turns(http_usage, dialec
         body['max_tokens'] = 64
     status, raw = call(route, body)
     assert status == 200 and '"provider_cost": 0.125' in raw, raw
-    assert '"provider_cost_currency": null' in raw
+    # Minara's usage.cost is US dollars (220 of its credits per 1.0, measured on 2026-11-09).
+    assert '"provider_cost_currency": "USD"' in raw
     status, raw = call('/v1/usage')
     usage = json.loads(raw)
     assert usage['turns'] == 1 and usage['session_used'] is None

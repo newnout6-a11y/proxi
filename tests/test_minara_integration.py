@@ -80,7 +80,8 @@ def test_env_token_not_written_to_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('value', [dict(base='http://unsafe/v1'), dict(base='https://user:pass@host/v1'),
-                                  dict(bearer_token='bad\ntoken'), dict(minara_models=[]),
+                                  dict(bearer_token='bad\ntoken'), dict(minara_models={'id': 'x'}),
+                                  dict(minara_models=['unknown-without-vendor']),
                                   dict(minara_models=[{'id': 'x', 'tools': 'true'}])])
 def test_invalid_provider_config_rejected(value):
     record = minara()
@@ -150,6 +151,13 @@ def test_real_relay_routes_all_dialects_to_minara(tmp_path, monkeypatch, path, b
         conversation_state=False, project_context=False, exec_policy='off',
         cache_keepwarm_seconds=0, journal_path=str(tmp_path / 'journal.jsonl')))
     runtime = proxy.Runtime(cfg)
+    balance_reads = []
+
+    def auth_me(url, **kwargs):
+        balance_reads.append((url, kwargs['headers']['Authorization']))
+        return types.SimpleNamespace(status_code=200, json=lambda: {
+            'creditBalanceBreakdown': {'plan': '120.5', 'extra': '200'}, 'creditBalance': {'total': '300', 'reward': '200'}})
+    runtime.backend._minara_get = auth_me
     server = proxy.BoundedServer(('127.0.0.1', 0), proxy.make_handler(runtime), threading.BoundedSemaphore(4))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -166,7 +174,9 @@ def test_real_relay_routes_all_dialects_to_minara(tmp_path, monkeypatch, path, b
         response = conn.getresponse()
         health = json.loads(response.read())
         assert response.status == 200, health
-        assert health['balance_known'] is False
+        # Minara's credits come from GET /auth/me with the account's own Bearer (plan + extra).
+        assert health['balance_known'] is True
+        assert balance_reads and balance_reads[-1] == ('https://api.minara.ai/auth/me', 'Bearer synthetic-test-bearer')
     finally:
         conn.close()
         server.shutdown()
@@ -229,7 +239,7 @@ def test_retool_environment_cannot_redirect_minara_bearer(tmp_path, monkeypatch)
 @pytest.mark.parametrize('choice', ['auto', 'required'])
 def test_disabled_tool_capability_rejected_across_dialects(dialect, choice):
     import validate
-    models.configure_minara([{'upstream': 'minara', 'minara_models': ['openai/no-tools']}])
+    models.configure_minara([{'upstream': 'minara', 'minara_models': [{'id': 'openai/no-tools', 'tools': False}]}])
     cfg = dict(config.DEFAULTS, model='minara/openai/no-tools')
     schema = {'type': 'object', 'properties': {}}
     if dialect == 'chat':
@@ -255,7 +265,8 @@ def test_colon_model_id_catalog_request_roundtrip(tmp_path, monkeypatch):
     cfg, _ = load(tmp_path, monkeypatch, value)
     import validate
     parsed = validate.parse_chat({'model': cfg['model'], 'messages': [{'role': 'user', 'content': 'hi'}]}, cfg)
-    assert parsed.model == cfg['model'] and parsed.entry['upstream_model'] == 'openai/test:high'
+    # minara/<vendor>/<model> is the older spelling of the published minara/<model>.
+    assert parsed.model == 'minara/test:high' and parsed.entry['upstream_model'] == 'openai/test:high'
     assert models.resolve(cfg['model'] + '#high', cfg=cfg)[1] == 'high'
     assert models.parse_model_name(cfg['model'] + '@profile#high', cfg=cfg).profile == 'profile'
 

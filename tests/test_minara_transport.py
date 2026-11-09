@@ -62,7 +62,8 @@ def test_reasoning_is_not_duplicated_and_tool_fragments_are_cumulative():
     events = parser.feed(chunk({'tool_calls': [{'index': 1, 'function': {'arguments': '1}'}}]}, 'tool_calls'))
     assert events[-1]['arguments'] == '{"a":1}'
     assert parser.feed(chunk(finish='tool_calls', usage={'prompt_tokens': 4, 'completion_tokens': 2, 'cost': 0.01})) == [
-        {'type': 'usage', 'usage': {'input_tokens': 4, 'output_tokens': 2, 'provider_cost': 0.01}}]
+        {'type': 'usage', 'usage': {'input_tokens': 4, 'output_tokens': 2, 'provider_cost': 0.01,
+                                    'provider_cost_currency': 'USD'}}]
     assert parser.feed('[DONE]') == [{'type': 'tool_call', 'id': 'c', 'name': 'echo', 'arguments': '{"a":1}'}, {'type': 'end', 'reason': 'tool_calls'}]
 
 
@@ -75,7 +76,7 @@ def test_parser_refuses_invalid_and_incomplete_stream(data):
 def test_usage_unknown_not_zero_and_bad_counts_filtered():
     assert minara.normalize_usage({}) == {}
     assert minara.normalize_usage({'prompt_tokens': True, 'completion_tokens': -1, 'cost': float('inf')}) == {}
-    assert minara.normalize_usage({'cost': 0, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 3}}) == {'provider_cost': 0, 'cache_read': 0, 'reasoning_tokens': 3}
+    assert minara.normalize_usage({'cost': 0, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 3}}) == {'provider_cost': 0, 'provider_cost_currency': 'USD', 'cache_read': 0, 'reasoning_tokens': 3}
 
 
 class Response:
@@ -122,7 +123,7 @@ async def test_transport_truncation_is_error_not_stop():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('status,code', [(401,'upstream_auth_error'), (403,'upstream_auth_error'), (429,'rate_limit_error'), (402,'insufficient_credits'), (500,'upstream_error'), (302,'upstream_error')])
+@pytest.mark.parametrize('status,code', [(401,'upstream_auth_error'), (403,'upstream_auth_error'), (429,'rate_limit_error'), (402,'insufficient_credits'), (500,'service_unavailable'), (302,'upstream_error')])
 async def test_http_error_does_not_leak_body_or_retry(status, code):
     response = Response([])
     response.status_code = status
@@ -131,6 +132,9 @@ async def test_http_error_does_not_leak_body_or_retry(status, code):
     assert raised.value.code == code
     assert 'secret' not in raised.value.message
     assert response.closed
+    if status == 500:
+        # An empty 500 is one of Minara's channel windows: unbilled, retried shortly, then a 503 with Retry-After.
+        assert raised.value.retry_after == minara.CHANNEL_RETRY_AFTER
 
 
 @pytest.mark.asyncio
