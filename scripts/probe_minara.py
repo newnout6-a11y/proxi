@@ -249,16 +249,27 @@ def probe_thinking(client, model):
 
 
 def probe_effort(client, model):
+    """Each level streamed, at most 3,000 tokens: Cloudflare in front of Minara cuts a non-streamed answer after 100 s
+    with a 502 that is still billed (Grok 4.7 at high, xhigh and max on 2026-11-09, part of 123 credits)."""
     ladder = {}
     for level in EFFORTS:
-        body = {"model": model, "max_tokens": 6000, "reasoning_effort": level,
-                "messages": [{"role": "user", "content": EFFORT_TASK}]}
-        response, text = client.chat(body)
+        body = {"model": model, "max_tokens": 3000, "reasoning_effort": level, "stream": True,
+                "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": EFFORT_TASK}]}
+        response, text = client.chat(body, stream=True)
         if response.status_code != 200:
             ladder[level] = {"accepted": False, "status": response.status_code, "detail": (text or "")[:160]}
             continue
-        data = json.loads(text)
-        usage = data.get("usage") or {}
+        usage, buffer = {}, b""
+        for piece in response.iter_content():
+            buffer += piece
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
+                    try:
+                        usage = json.loads(line[5:]).get("usage") or usage
+                    except ValueError:
+                        pass
         tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
         if tokens is None:
             tokens = ((usage.get("billing_usage") or {}).get("gemini_usage_metadata") or {}).get("thoughtsTokenCount")
@@ -299,15 +310,22 @@ def ladder_reasons(ladder):
     return any(((ladder.get(level) or {}).get("reasoning_tokens") or 0) > 0 for level in EFFORTS)
 
 
-def generate(results, listing):
-    """Build minara_models.json from the listing and the saved measurements."""
+def generate(results, listing, published=None):
+    """Build minara_models.json from the listing, the saved measurements and OpenRouter's published limits.
+
+    `published` is OpenRouter's public /api/v1/models (id -> entry): the window, the output ceiling and whether the
+    model takes reasoning. Minara routes most models through OpenRouter, and its other backends were checked to take
+    the same window (WINDOW_CHECKS)."""
+    published = published or {}
     entries = []
     groups = {}
+    vendor_ladders = {}
     for upstream in EFFORT_REPRESENTATIVES:
         effort = (results.get(upstream) or {}).get("effort") or {}
         if effort.get("status") == "ok":
             tools = (results.get(upstream) or {}).get("tools") or {}
             groups[(upstream.split("/")[0], backend_of(tools), _family(upstream))] = upstream
+            vendor_ladders.setdefault(upstream.split("/")[0], []).append(upstream)
     seen = set()
     for item in listing:
         upstream = item["id"]
@@ -339,12 +357,23 @@ def generate(results, listing):
             rep = ((results.get(group) or {}).get("effort") or {}) if group else None
             effort_source = ("family:" + group) if rep else None
         levels, effect = ladder_levels(rep["ladder"]) if rep else ([], "unmeasured")
+        if rep is None and vendor_ladders.get(upstream.split("/")[0]):
+            # No ladder of its own nor of its family: the levels every measured model of the vendor took (Minara and
+            # OpenRouter read reasoning_effort the same way for all of a vendor's models; GPT-6.1-sol refused none and
+            # minimal, so GPT models get low..max).
+            names = vendor_ladders[upstream.split("/")[0]]
+            sets = [ladder_levels(results[name]["effort"]["ladder"])[0] for name in names]
+            levels = [level for level in EFFORTS if all(level in taken for taken in sets)]
+            effort_source, effect = "vendor:" + ",".join(names), "inherited"
         own = (measured.get("effort") or {}).get("ladder") or {}
-        # A short question can be answered without thinking (Sonnet 5.5 did): the ladder's harder one shows that it reasons.
+        info = published.get(upstream) or {}
+        # A short question can be answered without thinking (Sonnet 5.5 did, Claude 4.x think only when asked): the
+        # ladder's harder question and OpenRouter's parameters show that the model reasons.
         reasoning = (thinking.get("thinking") not in (None, "none") or bool(thinking.get("reasoning_tokens"))
-                     or ladder_reasons(own))
+                     or ladder_reasons(own) or "reasoning" in (info.get("supported_parameters") or []))
         if not reasoning:
             levels = []
+        context, output = _limits(info)
         name = public_id(upstream)
         if name in seen:
             raise SystemExit("duplicate public id " + name)
@@ -356,6 +385,9 @@ def generate(results, listing):
             "vision": vision.get("vision") if vision.get("status") == "ok" else None,
             "reasoning": reasoning, "thinking": thinking.get("thinking"), "thinking_signature": bool(thinking.get("signature")),
             "reasoning_effort_levels": levels, "effort_source": effort_source, "effort_effect": effect,
+            "context": context, "max_output": output,
+            "limits_source": ("openrouter /api/v1/models" if context else None),
+            "limits_checked": WINDOW_CHECKS.get(upstream),
             "cache": "explicit" if upstream.startswith("anthropic/") else "automatic",
             "pricing": item.get("pricing"),
             "measured_from": source if source != upstream else None,
@@ -369,11 +401,44 @@ def generate(results, listing):
             "credits_per_usd": CREDITS_PER_USD, "models": entries}
 
 
+# Minara's own backends checked against the published window (2026-11-09, prompts of about 943k tokens).
+WINDOW_CHECKS = {
+    "deepseek/deepseek-v4-flash": "943,533 tokens answered; 1,107,041 refused: maximum 1,048,576 (2026-11-09)",
+    "z-ai/glm-5.3-flash": "943,351 tokens answered (2026-11-09)",
+}
+# OpenRouter lists a provider's whole budget as max_completion_tokens where it states no output ceiling (943,718 of a
+# 1,048,576 window). No model writes more than this in one reply; Minara cuts a larger max_tokens silently.
+OUTPUT_CEILING = 128000
+
+
+def _limits(info):
+    """(context window, output ceiling) of an OpenRouter model entry, or (None, None)."""
+    top = info.get("top_provider") or {}
+    context = top.get("context_length") or info.get("context_length")
+    output = top.get("max_completion_tokens")
+    context = int(context) if isinstance(context, (int, float)) and context > 0 else None
+    output = int(output) if isinstance(output, (int, float)) and output > 0 else None
+    if output is not None:
+        output = min(output, OUTPUT_CEILING)
+    elif context is not None:
+        output = min(OUTPUT_CEILING, context // 4)
+    return context, output
+
+
+def fetch_published():
+    """OpenRouter's public model list: no key, no cost."""
+    from curl_cffi import requests
+    response = requests.get("https://openrouter.ai/api/v1/models", impersonate="chrome131", timeout=60)
+    response.raise_for_status()
+    return {item["id"]: item for item in response.json().get("data", []) if isinstance(item, dict) and item.get("id")}
+
+
 def _family(upstream):
     name = upstream.split("/", 1)[1]
-    for prefix in ("claude-opus-5.5", "claude-sonnet-5.5", "claude-haiku-5.5", "gpt-6", "gpt-5.6", "gpt-5", "gemini",
-                   "grok", "glm", "deepseek", "kimi", "claude-opus-4", "claude-sonnet-4", "claude-opus-5", "claude-sonnet-5",
-                   "claude-fable", "claude-haiku-4", "o3", "gpt-4", "gpt-3", "gpt-oss", "minimax"):
+    prefixes = ("claude-opus-5.5", "claude-sonnet-5.5", "claude-haiku-5.5", "gpt-6.1", "gpt-6", "gpt-5.6", "gpt-5",
+                "gemini", "grok", "glm", "deepseek", "kimi", "claude-opus-4", "claude-sonnet-4", "claude-opus-5",
+                "claude-sonnet-5", "claude-fable", "claude-haiku-4", "o3", "gpt-4", "gpt-3", "gpt-oss", "minimax")
+    for prefix in sorted(prefixes, key=len, reverse=True):  # gpt-6.1-sol is gpt-6.1 before it is gpt-6
         if name.startswith(prefix):
             return prefix
     return name
@@ -409,6 +474,8 @@ def main():
     parser.add_argument("--checks", nargs="*", default=["tools", "vision", "thinking", "effort"])
     parser.add_argument("--refresh", action="store_true", help="re-measure checks that already have a result")
     parser.add_argument("--regenerate", action="store_true", help="only rebuild minara_models.json")
+    parser.add_argument("--limits", action="store_true",
+                        help="with --regenerate: fetch OpenRouter's published windows again (free, no key)")
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
     results_path = pathlib.Path(args.results)
@@ -471,7 +538,14 @@ def main():
         end = client.credits()
         print("credits after: %.2f, spent %.2f (%.4f USD)" % (end, start - end, (start - end) / CREDITS_PER_USD))
     listing = json.loads(listing_path.read_text(encoding="utf-8"))
-    catalog = generate(results, listing)
+    published_path = results_path.with_name("minara-probe-openrouter.json")
+    if not args.regenerate or args.limits:
+        try:
+            published_path.write_text(json.dumps(fetch_published(), ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 - limits stay as the last snapshot had them
+            print("OpenRouter model list unavailable (%s): keeping the last snapshot" % type(exc).__name__)
+    published = json.loads(published_path.read_text(encoding="utf-8")) if published_path.exists() else {}
+    catalog = generate(results, listing, published)
     CATALOG_FILE.write_text(json.dumps(catalog, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     counts = {}
     for entry in catalog["models"]:

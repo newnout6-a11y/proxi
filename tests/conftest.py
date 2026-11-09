@@ -174,6 +174,14 @@ def upstream_shapes_unknown(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def keepwarm_takes_test_sized_prefixes(monkeypatch):
+    """Test conversations stand for real ones with a few hundred tokens: keepwarm warms them as it would a real prefix.
+    The test of the 1,024-token minimum (direct.MIN_CACHED_PREFIX) sets it itself."""
+    import direct
+    monkeypatch.setattr(direct, "MIN_CACHED_PREFIX", 0)
+
+
+@pytest.fixture(autouse=True)
 def minara_balance_offline(monkeypatch):
     """A Minara account reads its credits from GET /auth/me on api.minara.ai: no test reaches the real host. A test
     that wants a balance sets backend._minara_get (url, **kwargs) -> response, as _minara_post fakes the POST."""

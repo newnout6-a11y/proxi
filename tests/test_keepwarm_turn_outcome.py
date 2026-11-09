@@ -365,3 +365,27 @@ def test_an_upstream_error_turn_is_not_warmed_either(tmp_path, monkeypatch):
     events, main = asyncio.run(scenario())
     assert events[-1]["type"] == "error" and main._turn_outcome == "error" and main._warm_body is None
     assert pings == [] and [(s["reason"], s["turn_outcome"]) for s in stops(mark)] == [("last_turn_failed", "error")]
+
+
+@pytest.mark.parametrize("prefix,starts", [(618, False), (1023, False), (1024, True), (0, True)])
+def test_a_prefix_too_small_to_be_cached_gets_no_keepwarm(monkeypatch, prefix, starts):
+    """OpenCode's title requests (618 tokens each, a conversation of their own) were pinged until their idle limit,
+    though no provider caches a prefix under 1,024 tokens. An unknown size (0) still gets its cycle."""
+    monkeypatch.setattr(direct, "MIN_CACHED_PREFIX", 1024)  # conftest lowers it for test-sized prefixes
+    monkeypatch.setattr(direct, "_ping", lambda *_args: pytest.fail("no ping is due within this test"))
+
+    async def scenario():
+        target = SimpleNamespace(_cancelled=False, _busy=False, _turn_started_at=0, _turn_seq=1, _turn_body=None,
+                                 _warm_body=dict(BODY_A), _warm_at=time.time() - 1, _last_request_at=time.time(),
+                                 _warm_failures=0, _keepwarm_cost=0.0, thread_id="t", _last_prefix_tokens=prefix)
+        direct._ensure_keepwarm(target, {"cache_keepwarm_seconds": 240, "cache_keepwarm_idle": 900})
+        task = getattr(target, "_warm_task", None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return task is not None
+
+    assert asyncio.run(scenario()) is starts
+    if not starts:
+        assert direct._warm_refused(SimpleNamespace(_last_prefix_tokens=prefix), True) == (
+            "too_small", {"prefix_tokens": prefix})

@@ -1445,7 +1445,7 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   `cache_keepwarm_idle`.
   Остановка пишется в журнал событием `cache.keepwarm_stop`: `reason` (`idle_limit`,
   `subagent_done`, `account_unavailable`, `evicted`, `failures`, `last_turn_failed`,
-  `cache_expired`, `cache_rewritten`, `compacted`; `closed` — сессию закрыли
+  `cache_expired`, `cache_rewritten`, `compacted`, `too_small`; `closed` — сессию закрыли
   после уже отправленных пингов), `pings` и `idle_pings` цикла, `credits` — списанное этими
   пингами (известная часть), `idle_seconds` с последнего настоящего запроса, применённый
   `limit`, `subagent`, `account` и названия диалога. У `account_unavailable` есть
@@ -1458,6 +1458,8 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   как вход), `read_tokens`, `prefix_tokens`, `ping_credits` —
   цена перезаписавшего пинга — и `touch_age_seconds`. `compacted` — клиент сжал историю
   диалога: тело запроса сжатия не греется, а прежний префикс больше не продолжится.
+  `too_small` — префикс меньше 1024 токенов (есть `prefix_tokens`): провайдер такой не кэширует,
+  греть нечего; так было с запросами заголовков OpenCode на его `small_model`, по 618 токенов.
   `cache_rewritten`, `last_turn_failed` и `compacted` держатся на сессии: новый цикл
   прогрева, в том числе по запросу дочернего диалога, начинается только после следующего
   удачного хода этого диалога. Событие `cache.keepwarm` каждого

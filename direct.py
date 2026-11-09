@@ -1539,6 +1539,8 @@ PROMPT_CACHE_TTL = 300.0
 # a ping may start at most TTL - margin after the last confirmed touch of the entry.
 PROMPT_CACHE_MARGIN = 20.0
 PING_DEADLINE = PROMPT_CACHE_TTL - PROMPT_CACHE_MARGIN
+# The smallest prefix a provider caches (Anthropic's Opus and Sonnet, OpenAI): a shorter one is never kept warm.
+MIN_CACHED_PREFIX = 1024
 # No setting may schedule a ping later than this: a few seconds of tick before the deadline.
 PING_LATEST = PING_DEADLINE - 5.0
 # A failed ping is retried this long after the failure (doubled for every further one), and only if the retry
@@ -1567,6 +1569,7 @@ _STOP_TEXT = {
     "cache_expired": "Прогрев остановлен: кэш префикса уже истёк, пинг оплатил бы его полную перезапись",
     "cache_rewritten": "Прогрев остановлен: пинг перезаписал префикс вместо чтения из кэша",
     "compacted": "Прогрев остановлен: клиент сжал историю диалога и больше не продолжит прежний префикс",
+    "too_small": "Прогрев не нужен: префикс меньше 1024 токенов, провайдер его не кэширует",
 }
 
 
@@ -2318,6 +2321,11 @@ def _warm_refused(session, busy):
     blocked = getattr(session, "_warm_blocked", None)
     if blocked == "cache_rewritten":
         return blocked, {}
+    prefix = int(getattr(session, "_last_prefix_tokens", 0) or 0)
+    if 0 < prefix < MIN_CACHED_PREFIX:
+        # Nothing of it is cached: a ping would read nothing. OpenCode's title requests (618 tokens, one conversation
+        # each, on its small_model) were pinged every few minutes until their idle limit (2026-11-09).
+        return "too_small", {"prefix_tokens": prefix}
     if busy:
         return None
     outcome = getattr(session, "_turn_outcome", None)

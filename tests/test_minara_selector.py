@@ -373,3 +373,37 @@ def test_client_catalogs_list_the_minara_models_of_the_relay_config(tmp_path, me
     assert {'minara/claude-opus-5-5', 'minara/gpt-6.1-sol'} <= ids and 'minara/minimax-m3' not in ids
     opus = next(entry for entry in probe_client_settings.routable_entries(str(path)) if entry['id'] == 'minara/claude-opus-5-5')
     assert opus['context'] == models._BY_ID['claude-opus-5-5']['context']  # the model's own window, from the audit
+
+
+def test_the_generator_fills_limits_reasoning_and_inherited_effort():
+    from scripts import probe_minara as probe
+    ladder = {level: {'accepted': True, 'reasoning_tokens': tokens} for level, tokens in
+              zip(probe.EFFORTS, (0, 10, 20, 30, 40, 50, 60))}
+    gpt_ladder = dict(ladder, none={'accepted': False, 'status': 400, 'detail': 'does not support reasoning effort "none"'},
+                      minimal={'accepted': False, 'status': 400, 'detail': 'does not support reasoning effort "minimal"'})
+    ok = {'status': 'ok', 'tools': True, 'id': 'gen-1', 'served': None}
+    results = {
+        'anthropic/claude-opus-5.5': {'tools': dict(ok), 'thinking': {'status': 'ok', 'thinking': 'stream'},
+                                      'effort': {'status': 'ok', 'ladder': ladder}},
+        'anthropic/claude-fable-5.1': {'tools': dict(ok), 'thinking': {'status': 'ok', 'thinking': 'none', 'reasoning_tokens': 0}},
+        'openai/gpt-6.1-sol': {'tools': dict(ok, id='resp_1'), 'thinking': {'status': 'ok', 'thinking': 'end'},
+                               'effort': {'status': 'ok', 'ladder': gpt_ladder}},
+        'openai/gpt-6.1-sol-pro': {'tools': dict(ok), 'thinking': {'status': 'ok', 'thinking': 'stream'}},
+        'x-ai/grok-4.7': {'tools': dict(ok), 'thinking': {'status': 'ok', 'thinking': 'end'}},
+    }
+    listing = [{'id': name, 'supported_endpoint_types': ['openai']} for name in results]
+    published = {
+        'anthropic/claude-fable-5.1': {'context_length': 1000000, 'supported_parameters': ['tools', 'reasoning'],
+                                       'top_provider': {'context_length': 1000000, 'max_completion_tokens': 128000}},
+        'x-ai/grok-4.7': {'context_length': 500000, 'top_provider': {'context_length': 500000, 'max_completion_tokens': 450000}},
+    }
+    models_ = {entry['upstream_model']: entry for entry in probe.generate(results, listing, published)['models']}
+    fable = models_['anthropic/claude-fable-5.1']
+    # Claude 4.x/Fable think only when asked: OpenRouter's parameters say it reasons, the vendor's ladder gives the levels.
+    assert fable['reasoning'] and fable['reasoning_effort_levels'] == list(probe.EFFORTS)
+    assert fable['effort_source'].startswith('vendor:') and (fable['context'], fable['max_output']) == (1000000, 128000)
+    # A pro tier of GPT-6.1 takes the GPT-6.1 line's ladder (no none/minimal), not GPT-6's.
+    assert models_['openai/gpt-6.1-sol-pro']['reasoning_effort_levels'] == ['low', 'medium', 'high', 'xhigh', 'max']
+    # OpenRouter's whole-budget "max_completion_tokens" (450k of a 500k window) is capped at a real reply size.
+    assert models_['x-ai/grok-4.7']['max_output'] == probe.OUTPUT_CEILING and models_['x-ai/grok-4.7']['context'] == 500000
+    assert probe._family('openai/gpt-6.1-terra') == 'gpt-6.1' and probe._family('openai/gpt-6-luna') == 'gpt-6'
