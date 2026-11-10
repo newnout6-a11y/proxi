@@ -9,6 +9,7 @@
 |---|---|
 | [client-setup.md](client-setup.md) | Настройка клиентов под relay: Codex, Claude Code, Claude Desktop, OpenCode, DeepSeek Harness |
 | [minara.md](minara.md) | Отдельный набор моделей Minara `minara/…`: аккаунты, замер каталога, кэш, мышление, баланс |
+| [minara-questions.md](minara-questions.md) | Minara: вопросы владельцу, решения по ним и что из них сделано (9–10 ноября 2026) |
 | [prompt-control.md](prompt-control.md) | Управление системным промптом через `prompts.json`: профили, правила, правки истории и tools |
 | [prompt-control-plan.md](prompt-control-plan.md) | План работ по управлению промптом (5 ноября 2026) |
 | [direct-transport.md](direct-transport.md) | Прямой транспорт Retool и кэш контекста: устройство и замеры |

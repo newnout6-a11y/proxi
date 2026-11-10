@@ -1780,16 +1780,16 @@ relay с этим делает. 429 приходит до начала гене�
 | Слой | Модули |
 |---|---|
 | HTTP и входящие запросы | `proxy.py` (сервер, маршруты, лимиты, слоты), `auth.py` (ключ relay, заголовки upstream), `validate.py` (строгий разбор трёх диалектов), `apierr.py` (ошибки в форме OpenAI/Anthropic), `sse.py`, `io_workers.py` |
-| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `upstream_attempts.py`, `upstream_diagnostics.py` |
+| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `minara.py` (транспорт Minara: чат и `/v1/messages`), `upstream_attempts.py`, `upstream_diagnostics.py` |
 | История между ходами и перезапусками | `native_history.py`, `conversation_state.py`, `conversation_infer.py`, `compaction_tools.py`, `summary_guard.py` |
 | Ответ клиенту | `adapters.py` (Chat, Responses, Messages), `structured.py`, `forced_choice.py`, `generation.py`, `web_search.py` |
 | Клиенты и системный промпт | `client_context.py`, `context.py`, `prompt_policy.py` (профили и правила `prompts.json`), `prompt_body.py` (правки истории и tools), `prompt_stabilizer.py`, `tool_names.py`, `tool_union.py`, `tool_search_policy.py` |
-| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей) |
-| Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
+| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей), `minara_accounts.py` (токены Minara и их срок), `minara_catalog.py` (опубликованные модели Minara), `minara_refresh.py` (каталог Minara обновляется сам), `minara_probe.py` (замеры моделей Minara) |
+| Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `console_clock.py` (время в строках консоли), `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
 
 Путь запроса: proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
 (контекст, exec-цикл) -> session.py (диалоги, ретраи, отмена) -> direct.py
-(direct-транспорт, prompt caching) -> adapters.py (три диалекта) + sse.py.
+(direct-транспорт, prompt caching) или, для моделей `minara/…`, minara.py -> adapters.py (три диалекта) + sse.py.
 Реверс-инжиниринг протокола — PROTOCOL.md. Локальные capture/probe-артефакты
 исключены из Git: они могут содержать credentials. Удаление файлов из текущей
 ветки не удаляет ранее опубликованные секреты из истории; их следует отозвать.
