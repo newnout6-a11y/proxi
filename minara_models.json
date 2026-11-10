@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-11-10T18:09:34+00:00",
+ "generated_at": "2026-11-10T19:37:51+00:00",
  "source": "https://api.minara.ai/v1/models",
  "credits_per_usd": 220,
  "models": [
@@ -103,6 +103,9 @@
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
+    "low",
+    "medium",
+    "high",
     "xhigh",
     "max"
    ],
@@ -183,6 +186,10 @@
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
     "max"
    ],
    "effort_source": "study",
@@ -350,6 +357,10 @@
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
     "max"
    ],
    "effort_source": "study",
@@ -986,6 +997,10 @@
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
     "max"
    ],
    "effort_source": "study",
@@ -1344,6 +1359,10 @@
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
     "max"
    ],
    "effort_source": "study",

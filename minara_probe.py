@@ -687,6 +687,15 @@ def generate(results, listing, published=None, study=None):
         cache_probe = measured.get("cache") or {}
         if cache_probe.get("status") == "ok" and cache_probe.get("caches") is False and status == "ok":
             status = "uncached"  # a head written with marks was not read back: every turn would pay the whole prompt
+        native = native_levels(upstream)
+        if reasoning and native:
+            # Claude's own levels are offered whatever the study says (the owner, 2026-11-10: Fable 5.2 showed max alone):
+            # on the study's question low..high reason alike, on long agent work they differ (tool calls, care, length),
+            # and the Messages API takes every one. Only a level sent as itself: one the channels send as another (Opus
+            # 4.7's max on a chat path without cache) is not offered as if it were there.
+            mapped = effort_map or {}
+            extra = [level for level in native if mapped.get(level, level) == level]
+            levels = [level for level in EFFORTS if level in set(levels) | set(extra)]
         name = public_id(upstream)
         if name in seen:
             raise SystemExit("duplicate public id " + name)
@@ -718,6 +727,20 @@ def generate(results, listing, published=None, study=None):
     entries.sort(key=lambda e: (e["provider"], e["id"]))
     return {"generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             "source": BASE + "/v1/models", "credits_per_usd": CREDITS_PER_USD, "models": entries}
+
+
+def native_levels(upstream):
+    """The effort levels a Claude model takes natively (Anthropic's Messages API), or () for one without effort: the five
+    from low to max on Fable, the 5.x models and Opus 4.7 and 4.8; no xhigh on Claude 4.6; none on older ones."""
+    name = upstream.split("/", 1)[-1].replace(".", "-")
+    if not upstream.startswith("anthropic/"):
+        return ()
+    if (name.startswith("claude-fable-") or re.fullmatch(r"claude-(opus|sonnet|haiku)-5(-5)?", name)
+            or name in ("claude-opus-4-7", "claude-opus-4-8")):
+        return ("low", "medium", "high", "xhigh", "max")
+    if name in ("claude-opus-4-6", "claude-sonnet-4-6"):
+        return ("low", "medium", "high", "max")
+    return ()
 
 
 def messages_offer(upstream):
