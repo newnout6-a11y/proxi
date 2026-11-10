@@ -4,20 +4,26 @@ Streams every request (Cloudflare cuts a non-streamed reply after 100 s and stil
 times on one effort-sensitive question, spreads the models over the pool's fullest accounts (read from the relay's
 config.json, never printed) and saves after every request, so a stopped run continues where it ended.
 
-  python scripts/study_minara_effort.py [--budget-usd 8] [--only model ...] [--config path]
+  python scripts/study_minara_effort.py [--budget-usd 8] [--only model ...] [--hard] [--samples N]
 
-The result (%TEMP%/minara-effort-study.json) is read by scripts/probe_minara.py --regenerate, which turns it into the
-levels and effort maps of minara_models.json (effort_tiers). Measured on 2026-11-09: about $10 for all 50 models.
+The result (%TEMP%/minara-effort-study.json, with --hard %TEMP%/minara-effort-study-hard.json) is read by
+scripts/probe_minara.py --regenerate, which turns it into the levels and effort maps of minara_models.json
+(effort_tiers). The hard question is minara_probe's, the one the relay itself asks a model Minara adds later.
+Measured on 2026-11-09/10: about $10 for all 50 models on the first question, $14 on the hard one.
 """
 import argparse
 import concurrent.futures as cf
 import json
 import os
 import pathlib
+import sys
 import threading
 import time
 
 from curl_cffi import requests
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import minara_probe  # noqa: E402
 
 BASE = "https://api.minara.ai"
 CONFIG = pathlib.Path(__file__).resolve().parents[1] / "config.json"
@@ -49,12 +55,21 @@ MODELS = {
     "openai/gpt-6.1-sol-pro": 10, "openai/gpt-6.1-terra-pro": 5,
     "x-ai/grok-4.20-multi-agent": 2.5, "x-ai/grok-4.3": 2.5, "x-ai/grok-4.5": 6, "x-ai/grok-4.6": 6, "x-ai/grok-build-0.1": 2,
     "z-ai/glm-5.3-flashx": 1.25, "z-ai/glm-5.3-flashx-legal": 1.25,
+    # released 2026-11-10
+    "anthropic/claude-fable-5.2": 40,
 }
 MAX_TOKENS = 4000
+# --hard: a question that makes the strong models think long enough for working levels to separate (the one above takes
+# GPT-6 and Gemini 4 Argon 50-400 reasoning tokens at every level). Divisibility by 11 splits it into two 3-digit sums.
+HARD_QUESTION, HARD_ANSWER = minara_probe.HARD_QUESTION, minara_probe.HARD_ANSWER
+HARD_OUT = pathlib.Path(os.environ["TEMP"]) / "minara-effort-study-hard.json"
+# Measured on chat they answer from a channel without cache; the relay sends them through /v1/messages, whose levels
+# come from the Messages API (minara_probe.messages_offer), so their chat study says nothing about it.
+HARD_SKIP = {"anthropic/claude-fable-5", "anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6"}
 
 
-def pool_tokens(config=CONFIG):
-    saved = json.loads(pathlib.Path(config).read_text(encoding="utf-8-sig"))
+def pool_tokens():
+    saved = json.loads(CONFIG.read_text(encoding="utf-8-sig"))
     tokens = [a["bearer_token"] for a in saved["accounts"] if a.get("upstream") == "minara" and a.get("bearer_token")]
     rich = []
     for token in tokens:
@@ -94,25 +109,31 @@ def one(token, model, level):
                 continue
             return {"status": r.status_code, "detail": text}
         usage, text, reasoning_chars, buf = {}, "", 0, b""
-        for piece in r.iter_content():
-            buf += piece
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
-                    continue
-                try:
-                    item = json.loads(line[5:])
-                except ValueError:
-                    continue
-                usage = item.get("usage") or usage
-                for choice in item.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    for key in ("reasoning", "reasoning_content"):
-                        if isinstance(delta.get(key), str):
-                            reasoning_chars += len(delta[key])
-                    if isinstance(delta.get("content"), str):
-                        text += delta["content"]
+        try:
+            for piece in r.iter_content():
+                buf += piece
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                        continue
+                    try:
+                        item = json.loads(line[5:])
+                    except ValueError:
+                        continue
+                    usage = item.get("usage") or usage
+                    for choice in item.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        for key in ("reasoning", "reasoning_content"):
+                            if isinstance(delta.get(key), str):
+                                reasoning_chars += len(delta[key])
+                        if isinstance(delta.get("content"), str):
+                            text += delta["content"]
+        except Exception as exc:  # noqa: BLE001 - a stream cut mid-way (curl 92): the sample is taken again
+            if attempt < 3:
+                time.sleep(15 * (attempt + 1))
+                continue
+            return {"status": "stream_error", "detail": type(exc).__name__}
         tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
         if tokens is None:
             tokens = ((usage.get("billing_usage") or {}).get("gemini_usage_metadata") or {}).get("thoughtsTokenCount")
@@ -126,19 +147,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--budget-usd", type=float, default=8.0)
     parser.add_argument("--only", nargs="*")
-    parser.add_argument("--config", default=str(CONFIG), help="the relay config whose Minara accounts pay for the study")
+    parser.add_argument("--hard", action="store_true", help="the harder question, 2 samples, into %%TEMP%%/minara-effort-study-hard.json")
+    parser.add_argument("--samples", type=int, default=0, help="samples per level (default 2 with --hard, 2-3 without)")
     args = parser.parse_args()
+    global QUESTION, ANSWER, OUT, MAX_TOKENS
+    if args.hard:
+        QUESTION, ANSWER, OUT, MAX_TOKENS = HARD_QUESTION, HARD_ANSWER, HARD_OUT, 12000
     results = json.loads(OUT.read_text(encoding="utf-8")) if OUT.exists() else {}
     lock = threading.Lock()
     spent = [0.0]
-    tokens = pool_tokens(args.config)
-    models = [m for m in MODELS if not args.only or m in args.only]
+    tokens = pool_tokens()
+    models = [m for m in MODELS if (not args.only or m in args.only) and not (args.hard and m in HARD_SKIP)]
     print("answer", ANSWER, "| rich accounts", len(tokens), "| models", len(models), flush=True)
 
     def study(index_model):
         index, model = index_model
         token = tokens[index % len(tokens)]
-        samples = 3 if MODELS[model] <= 10 else 2
+        samples = args.samples or (2 if args.hard else 3 if MODELS[model] <= 10 else 2)
         for level in LEVELS:
             key = "default" if level is None else level
             for sample in range(samples):

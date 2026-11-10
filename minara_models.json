@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-11-10",
+ "generated_at": "2026-11-10T18:09:34+00:00",
  "source": "https://api.minara.ai/v1/models",
  "credits_per_usd": 220,
  "models": [
@@ -8,7 +8,7 @@
    "upstream_model": "anthropic/claude-fable-5",
    "label": "Claude Fable 5 (Minara)",
    "provider": "anthropic",
-   "status": "uncached",
+   "status": "ok",
    "backend": "openrouter",
    "tools": true,
    "forced_tool_choice": false,
@@ -16,9 +16,15 @@
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": true,
-   "reasoning_effort_levels": [],
-   "effort_source": "study",
-   "effort_effect": "studied",
+   "reasoning_effort_levels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "effort_source": "messages:documented",
+   "effort_effect": "messages",
    "effort_map": {
     "none": "none",
     "minimal": "minimal",
@@ -57,6 +63,16 @@
     "xhigh": "anthropic",
     "max": "anthropic"
    },
+   "messages_levels": [
+    "default",
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -136,6 +152,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -157,19 +174,18 @@
    "upstream_model": "anthropic/claude-fable-5.2",
    "label": "Claude Fable 5.2 (Minara)",
    "provider": "anthropic",
-   "status": "unmeasured",
-   "backend": null,
-   "tools": null,
+   "status": "ok",
+   "backend": "openrouter",
+   "tools": true,
    "forced_tool_choice": false,
-   "vision": null,
+   "vision": true,
    "reasoning": true,
-   "thinking": null,
+   "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "xhigh",
     "max"
    ],
-   "effort_source": "study:anthropic/claude-fable-5.1",
+   "effort_source": "study",
    "effort_effect": "studied",
    "effort_map": {
     "none": "none",
@@ -185,36 +201,37 @@
     "groups": [
      {
       "levels": [
-       "low",
-       "high",
        "minimal",
+       "low",
+       "medium",
        "none",
-       "medium"
+       "high"
       ],
-      "median_reasoning_tokens": 420.0
+      "median_reasoning_tokens": 272
      },
      {
       "levels": [
        "xhigh"
       ],
-      "median_reasoning_tokens": 700.5
+      "median_reasoning_tokens": 376
      },
      {
       "levels": [
        "max"
       ],
-      "median_reasoning_tokens": 1223.5
+      "median_reasoning_tokens": 508
      }
     ],
     "broken": [],
     "off": [],
     "refused": [],
-    "default_reasoning_tokens": 520.5,
+    "default_reasoning_tokens": 297,
     "question": "hard"
    },
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -229,7 +246,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": null
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/claude-haiku-4-5",
@@ -302,6 +319,7 @@
    "default_effort": null,
    "natural_effort": "none",
    "channels": null,
+   "messages_levels": null,
    "context": 200000,
    "max_output": 64000,
    "limits_source": "openrouter /api/v1/models",
@@ -380,6 +398,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -464,6 +483,7 @@
    "default_effort": null,
    "natural_effort": "none",
    "channels": null,
+   "messages_levels": null,
    "context": 200000,
    "max_output": 32000,
    "limits_source": "openrouter /api/v1/models",
@@ -551,6 +571,7 @@
    "default_effort": null,
    "natural_effort": "none",
    "channels": null,
+   "messages_levels": null,
    "context": 200000,
    "max_output": 64000,
    "limits_source": "openrouter /api/v1/models",
@@ -572,7 +593,7 @@
    "upstream_model": "anthropic/claude-opus-4.6",
    "label": "Claude Opus 4.6 (Minara)",
    "provider": "anthropic",
-   "status": "uncached",
+   "status": "ok",
    "backend": "openrouter",
    "tools": true,
    "forced_tool_choice": false,
@@ -581,18 +602,22 @@
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "high"
+    "none",
+    "low",
+    "medium",
+    "high",
+    "max"
    ],
-   "effort_source": "study",
-   "effort_effect": "studied",
+   "effort_source": "messages:documented",
+   "effort_effect": "messages",
    "effort_map": {
     "none": "none",
     "minimal": "minimal",
     "low": "low",
     "medium": "medium",
     "high": "high",
-    "xhigh": "high",
-    "max": "high"
+    "xhigh": "xhigh",
+    "max": "max"
    },
    "effort_control": "mapped",
    "effort_study": {
@@ -632,6 +657,16 @@
     "xhigh": "bedrock",
     "max": "bedrock"
    },
+   "messages_levels": [
+    "default",
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -662,20 +697,23 @@
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
+    "none",
     "low",
     "medium",
-    "high"
+    "high",
+    "xhigh",
+    "max"
    ],
    "effort_source": "study",
-   "effort_effect": "channels",
+   "effort_effect": "channels+messages",
    "effort_map": {
-    "none": "low",
-    "minimal": "low",
+    "none": "none",
+    "minimal": "minimal",
     "low": "low",
     "medium": "medium",
     "high": "high",
-    "xhigh": "high",
-    "max": "high"
+    "xhigh": "xhigh",
+    "max": "max"
    },
    "effort_control": "mapped",
    "effort_study": {
@@ -720,6 +758,13 @@
     "xhigh": "bedrock",
     "max": "bedrock"
    },
+   "messages_levels": [
+    "default",
+    "none",
+    "minimal",
+    "xhigh",
+    "max"
+   ],
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -750,20 +795,23 @@
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
+    "none",
     "low",
     "medium",
-    "high"
+    "high",
+    "xhigh",
+    "max"
    ],
    "effort_source": "study",
-   "effort_effect": "channels",
+   "effort_effect": "channels+messages",
    "effort_map": {
-    "none": "low",
-    "minimal": "low",
+    "none": "none",
+    "minimal": "minimal",
     "low": "low",
     "medium": "medium",
     "high": "high",
-    "xhigh": "high",
-    "max": "high"
+    "xhigh": "xhigh",
+    "max": "max"
    },
    "effort_control": "mapped",
    "effort_study": {
@@ -803,6 +851,13 @@
     "xhigh": "bedrock",
     "max": "bedrock"
    },
+   "messages_levels": [
+    "default",
+    "none",
+    "minimal",
+    "xhigh",
+    "max"
+   ],
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -833,20 +888,23 @@
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
+    "none",
     "low",
     "medium",
-    "high"
+    "high",
+    "xhigh",
+    "max"
    ],
    "effort_source": "study",
-   "effort_effect": "channels",
+   "effort_effect": "channels+messages",
    "effort_map": {
-    "none": "low",
-    "minimal": "low",
+    "none": "none",
+    "minimal": "minimal",
     "low": "low",
     "medium": "medium",
     "high": "high",
-    "xhigh": "high",
-    "max": "high"
+    "xhigh": "xhigh",
+    "max": "max"
    },
    "effort_control": "mapped",
    "effort_study": {
@@ -891,6 +949,13 @@
     "xhigh": "bedrock",
     "max": "bedrock"
    },
+   "messages_levels": [
+    "default",
+    "none",
+    "minimal",
+    "xhigh",
+    "max"
+   ],
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -964,6 +1029,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1051,6 +1117,7 @@
    "default_effort": null,
    "natural_effort": "none",
    "channels": null,
+   "messages_levels": null,
    "context": 1000000,
    "max_output": 64000,
    "limits_source": "openrouter /api/v1/models",
@@ -1075,7 +1142,7 @@
    "upstream_model": "anthropic/claude-sonnet-4.6",
    "label": "Claude Sonnet 4.6 (Minara)",
    "provider": "anthropic",
-   "status": "uncached",
+   "status": "ok",
    "backend": "openrouter",
    "tools": true,
    "forced_tool_choice": false,
@@ -1084,18 +1151,22 @@
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
-    "high"
+    "none",
+    "low",
+    "medium",
+    "high",
+    "max"
    ],
-   "effort_source": "study",
-   "effort_effect": "studied",
+   "effort_source": "messages:documented",
+   "effort_effect": "messages",
    "effort_map": {
     "none": "none",
     "minimal": "minimal",
     "low": "low",
     "medium": "medium",
     "high": "high",
-    "xhigh": "high",
-    "max": "high"
+    "xhigh": "xhigh",
+    "max": "max"
    },
    "effort_control": "mapped",
    "effort_study": {
@@ -1135,6 +1206,16 @@
     "xhigh": "bedrock",
     "max": "bedrock"
    },
+   "messages_levels": [
+    "default",
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1165,20 +1246,23 @@
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
+    "none",
     "low",
     "medium",
-    "high"
+    "high",
+    "xhigh",
+    "max"
    ],
    "effort_source": "study",
-   "effort_effect": "channels",
+   "effort_effect": "channels+messages",
    "effort_map": {
-    "none": "low",
-    "minimal": "low",
+    "none": "none",
+    "minimal": "minimal",
     "low": "low",
     "medium": "medium",
     "high": "high",
-    "xhigh": "high",
-    "max": "high"
+    "xhigh": "xhigh",
+    "max": "max"
    },
    "effort_control": "mapped",
    "effort_study": {
@@ -1223,6 +1307,13 @@
     "xhigh": "bedrock",
     "max": "bedrock"
    },
+   "messages_levels": [
+    "default",
+    "none",
+    "minimal",
+    "xhigh",
+    "max"
+   ],
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1296,6 +1387,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1475,6 +1567,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048575,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1560,6 +1653,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1632,6 +1726,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048575,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1716,6 +1811,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1024000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1788,6 +1884,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1867,6 +1964,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1949,6 +2047,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2021,6 +2120,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -2108,6 +2208,7 @@
    "default_effort": null,
    "natural_effort": "none",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -2179,6 +2280,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -2250,6 +2352,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -2316,6 +2419,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -2382,6 +2486,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2420,6 +2525,7 @@
    "default_effort": null,
    "natural_effort": null,
    "channels": null,
+   "messages_levels": null,
    "context": 196608,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2458,6 +2564,7 @@
    "default_effort": null,
    "natural_effort": null,
    "channels": null,
+   "messages_levels": null,
    "context": 524288,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2529,6 +2636,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 262144,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2590,6 +2698,7 @@
    "default_effort": null,
    "natural_effort": "none",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3239,6 +3348,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3327,6 +3437,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3405,6 +3516,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3479,6 +3591,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3560,6 +3673,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3641,6 +3755,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3722,6 +3837,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3809,6 +3925,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3890,6 +4007,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3977,6 +4095,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4139,6 +4258,7 @@
    "default_effort": null,
    "natural_effort": "none",
    "channels": null,
+   "messages_levels": null,
    "context": 2000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4212,6 +4332,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 2000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4296,6 +4417,7 @@
    "default_effort": null,
    "natural_effort": "low",
    "channels": null,
+   "messages_levels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4375,6 +4497,7 @@
    "default_effort": null,
    "natural_effort": "high",
    "channels": null,
+   "messages_levels": null,
    "context": 500000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4454,6 +4577,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 500000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4539,6 +4663,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 500000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4618,6 +4743,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 256000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4867,6 +4993,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -4953,7 +5080,8 @@
    "default_effort": null,
    "natural_effort": "xhigh",
    "channels": null,
-   "context": 1048575,
+   "messages_levels": null,
+   "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
    "limits_checked": "943,351 tokens answered (2026-11-09)",
@@ -5033,6 +5161,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -5113,6 +5242,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -5197,6 +5327,7 @@
    "default_effort": null,
    "natural_effort": "medium",
    "channels": null,
+   "messages_levels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",

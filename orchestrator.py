@@ -841,7 +841,7 @@ class TurnRunner:
                 snapshot['provider_cost_estimated'] = True
             else:
                 snapshot.pop('provider_cost_estimated', None)
-        for key in ('cache_write_reported', 'upstream_cost'):
+        for key in ('cache_write_reported', 'upstream_cost', 'channel', 'channel_path', 'provider'):
             if key in (event.get('usage') or {}):
                 snapshot[key] = (event.get('usage') or {})[key]
         return snapshot, delta
@@ -1225,6 +1225,9 @@ class TurnRunner:
                     model_provider["pricing"] = parsed.entry["pricing"]  # prices the replies Minara reports no cost for
                 if parsed.entry.get("forced_tool_choice") is False:
                     model_provider["refuses_forced_tool_choice"] = True
+                if parsed.entry.get("messages_levels"):
+                    # The levels the chat path sends to a channel without cache: they go through /v1/messages (minara).
+                    model_provider["messages_levels"] = list(parsed.entry["messages_levels"])
             effort = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"),
                                                     self.cfg.get("claude_xhigh_effort", "high"))
             # The effort of the request is the client's, then the profile's when the profile sets one (proxy applied it
@@ -1636,10 +1639,28 @@ class TurnRunner:
                                             and breakdown['prompt_tokens'] >= 2048):
                                         # The marks were sent, and the answer came from a channel that has no cache at all
                                         # (Minara's Bedrock or Anthropic path: no cache write field): the whole prompt is
-                                        # billed each turn. Said, so the model's channel rule can be measured again.
+                                        # billed each turn. The level moves to /v1/messages, where those channels cache.
                                         log('cache.uncached_channel', 'Minara ответила с канала без кэша: промпт %d '
                                             'токенов оплачен полностью' % breakdown['prompt_tokens'], 'warn',
                                             model=parsed.model, effort=getattr(parsed, 'effort', None),
+                                            sent_effort=model_provider.get('reasoningEffort'),
+                                            channel=usage.get('channel'), path=usage.get('channel_path'),
+                                            prompt_tokens=breakdown['prompt_tokens'], attempt=journal_attempt)
+                                        if parsed.entry.get('upstream') == 'minara' and usage.get('channel_path') == 'chat':
+                                            import minara
+                                            minara.switch_to_messages(
+                                                parsed.entry.get('upstream_model'), model_provider.get('reasoningEffort'),
+                                                reason='chat channel %s' % (usage.get('channel') or 'unknown'))
+                                    elif (usage.get('channel_path') == 'messages' and not delta.get('cache_read')
+                                            and not delta.get('cache_write')
+                                            and (getattr(parsed, 'entry', None) or {}).get('cache') == 'explicit'
+                                            and breakdown['prompt_tokens'] >= 8192):
+                                        # /v1/messages answered a marked prompt above every model's smallest cacheable
+                                        # size without reading or writing it: a channel there that drops the marks too.
+                                        log('cache.uncached_channel', 'Minara /v1/messages ответила без кэша: промпт %d '
+                                            'токенов оплачен полностью' % breakdown['prompt_tokens'], 'warn',
+                                            model=parsed.model, sent_effort=model_provider.get('reasoningEffort'),
+                                            channel=usage.get('channel'), path='messages',
                                             prompt_tokens=breakdown['prompt_tokens'], attempt=journal_attempt)
                                     if session is not None and breakdown['prompt_tokens'] > 0:
                                         # Only counts tell the size of the prefix. The empty usage of an attempt whose

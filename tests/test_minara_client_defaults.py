@@ -262,7 +262,7 @@ def types_module():
     return types
 
 
-def test_gpt_requests_carry_a_cache_key_per_conversation_and_claude_requests_none():
+def test_gpt_requests_carry_a_cache_key_per_conversation_and_claude_requests_one_per_head():
     session = types_module().SimpleNamespace(_native_allow_cold_replay=True, _native_conversation_key=('codex', 'c-1'),
                                              _native_client_messages=[{'role': 'user', 'content': [{'type': 'text',
                                                                                                     'text': 'hi'}]}])
@@ -273,8 +273,12 @@ def test_gpt_requests_carry_a_cache_key_per_conversation_and_claude_requests_non
     other = types_module().SimpleNamespace(**dict(vars(session), _native_conversation_key=('codex', 'c-2')))
     assert minara.build_body({}, {'model': 'openai/gpt-6.1-sol'}, 'head', '', None, None, 100,
                              session=other)['prompt_cache_key'] != gpt['prompt_cache_key']
+    # Claude: the key of its head, the same for every conversation that shares it (OpenRouter keeps them on the provider
+    # that holds the head's cache), and never the GPT key of the conversation.
     claude = minara.build_body({}, {'model': 'anthropic/claude-opus-5.5'}, 'head', '', None, None, 100, session=session)
-    assert 'prompt_cache_key' not in claude
+    claude_other = minara.build_body({}, {'model': 'anthropic/claude-opus-5.5'}, 'head', '', None, None, 100, session=other)
+    assert claude['prompt_cache_key'].startswith('proxi-') and claude['prompt_cache_key'] == claude_other['prompt_cache_key']
+    assert claude['prompt_cache_key'] != gpt['prompt_cache_key']
 
 
 def test_a_dump_stays_valid_json_with_its_secrets_masked():

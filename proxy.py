@@ -29,6 +29,7 @@ import conversation_infer
 import conversation_state
 import forced_choice
 import generation
+import minara_refresh
 import models as model_catalog
 import sse
 import models
@@ -136,6 +137,8 @@ class Runtime:
             self.backend.cfg.get("base", cfg.get("base")),
             lambda: auth.upstream_headers(self.backend.cfg), getattr(self.backend, "refresher", None))
         self.accounts = AccountDispatcher(list(managers), cfg, managers)
+        # Minara's new models, prices and gone models, taken by the relay itself (minara_refresh); started with the pool.
+        self.catalog = minara_refresh.CatalogRefresher(cfg, self.accounts)
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.runner.accounts = self.accounts
         self.prompts = prompt_policy.PromptStore(cfg)
@@ -1536,6 +1539,7 @@ def main(argv=None):
 
     backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
     runtime.accounts.start()
+    runtime.catalog.start()
     refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
     for r in refreshers:
         r.start()  # no-op for accounts the dispatcher schedules
@@ -1582,6 +1586,7 @@ def main(argv=None):
             refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
             for r in refreshers:
                 r.stop()
+            runtime.catalog.stop()
             runtime.accounts.stop()
 
 

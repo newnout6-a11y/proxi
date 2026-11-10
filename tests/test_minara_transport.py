@@ -63,7 +63,7 @@ def test_reasoning_is_not_duplicated_and_tool_fragments_are_cumulative():
     assert events[-1]['arguments'] == '{"a":1}'
     assert parser.feed(chunk(finish='tool_calls', usage={'prompt_tokens': 4, 'completion_tokens': 2, 'cost': 0.01})) == [
         {'type': 'usage', 'usage': {'input_tokens': 4, 'output_tokens': 2, 'provider_cost': 0.01,
-                                    'provider_cost_currency': 'USD'}}]
+                                    'provider_cost_currency': 'USD', 'channel_path': 'chat'}}]
     assert parser.feed('[DONE]') == [{'type': 'tool_call', 'id': 'c', 'name': 'echo', 'arguments': '{"a":1}'}, {'type': 'end', 'reason': 'tool_calls'}]
 
 

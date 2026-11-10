@@ -297,6 +297,17 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         # a hash, so nothing of the client's identifiers goes upstream.
         body["prompt_cache_key"] = "proxi-" + hashlib.sha256(
             json.dumps(conversation, default=str).encode("utf-8")).hexdigest()[:32]
+    elif model.startswith("anthropic/"):
+        # OpenRouter spreads some Claude models over providers with caches of their own (Fable 5.2: Anthropic, Google
+        # Vertex, Azure): without a key a follow-up read the head in 3 of 5 requests and each new provider wrote it again
+        # (12.8 credits a 5.8k head), with one all 6 went to one provider and every follow-up read it (2026-11-10). The key
+        # is the head's (model, instructions, tools), not the conversation's: a client's conversations and subagents share
+        # their head, so they share the provider that holds it too, and a level change keeps it.
+        head_part = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
+        seed = [model, head_part, body.get("tools")] if head_part else [model, conversation]
+        if head_part or conversation:
+            body["prompt_cache_key"] = "proxi-" + hashlib.sha256(json.dumps(
+                seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass")).hexdigest()[:32]
     return body
 
 
@@ -520,6 +531,8 @@ class EventParser:
         # reasoning_details by index, as upstream streams them: text/summary/data pieces, then the signature.
         self.details = {}
         self.signed = False
+        self.reply_id = ""  # the first chunk's id: the channel that answered (channel_of)
+        self.provider = None  # OpenRouter's provider behind it (Anthropic, Google, Azure, ...): each has its own cache
 
     def reasoning_details(self):
         """The reasoning_details of the reply, assembled (the signature the client gets comes from them)."""
@@ -600,8 +613,18 @@ class EventParser:
         if failed:
             raise apierr.upstream_error("Minara's upstream failed: " + failed)
         events = []
+        if not self.reply_id and isinstance(item.get("id"), str):
+            self.reply_id = item["id"]
+        if self.provider is None and isinstance(item.get("provider"), str) and len(item["provider"]) <= 80:
+            self.provider = item["provider"]
         if isinstance(item.get("usage"), dict):
-            events.append({"type": "usage", "usage": normalize_usage(item["usage"], self.pricing)})
+            usage = normalize_usage(item["usage"], self.pricing)
+            usage["channel_path"] = "chat"
+            if self.reply_id:
+                usage["channel"] = channel_of(self.reply_id)
+            if self.provider:
+                usage["provider"] = self.provider
+            events.append({"type": "usage", "usage": usage})
         choices = item.get("choices", [])
         if not isinstance(choices, list):
             raise apierr.upstream_error("Minara returned invalid choices")
@@ -852,6 +875,386 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     raise apierr.ApiError(502, "upstream_tool_choice_ignored", "upstream did not honor the required client tool choice")
 
 
+def channel_of(ident):
+    """The channel behind a Minara reply id: gen- OpenRouter, msg_bdrk_ Bedrock, any other msg_ Anthropic's own API."""
+    ident = str(ident or "")
+    if ident.startswith("gen-"):
+        return "openrouter"
+    if ident.startswith("msg_bdrk"):
+        return "bedrock"
+    if ident.startswith("msg_"):
+        return "anthropic"
+    return "other" if ident else None
+
+
+# ----- Claude through Minara's /v1/messages ------------------------------------------------------------------------------
+# Minara's chat path sends some Claude models and levels to Bedrock or Anthropic's API without the cache marks (Sonnet 4.6,
+# Opus 4.6 and Fable 5 at every level; Opus 4.7, 4.8, 5 and Sonnet 5 at none, minimal, xhigh and max): the whole prompt is
+# billed every turn. Its /v1/messages reaches the same channels with the marks, and they cache there (measured
+# 2026-11-10: the second request read the 8-13k-token head on all seven, a tool loop continued without its thinking
+# blocks on all of them). Such levels go that way: minara_models.json lists them per model (messages_levels), and a chat
+# reply that comes from a channel without cache moves its level there at once (switch_to_messages).
+ANTHROPIC_VERSION = "2023-06-01"
+MESSAGES_MAX_TOKENS = 32000
+SWITCHED = {}  # upstream id -> levels moved to /v1/messages while the relay runs (switch_to_messages)
+_SWITCH_LOCK = threading.Lock()
+_switch_listeners = []
+
+
+def _claude_name(upstream):
+    return str(upstream or "").split("/", 1)[-1].replace(".", "-")
+
+
+def messages_supported(upstream):
+    """True for the Claude models whose /v1/messages request the relay knows how to write."""
+    name = _claude_name(upstream)
+    return str(upstream or "").startswith("anthropic/") and bool(
+        name.startswith("claude-fable-") or re.fullmatch(r"claude-(opus|sonnet|haiku)-5-5", name)
+        or name in ("claude-opus-5", "claude-sonnet-5") or re.fullmatch(r"claude-(opus|sonnet)-4-[678]", name))
+
+
+def messages_reasoning(upstream, level):
+    """(output_config.effort, thinking) of a /v1/messages request at `level` (None, "default": the model's own default).
+
+    The Messages API thinks on Claude 4.x only when asked (Opus 4.8 and 4.7 run without thinking when it is left out); Fable,
+    Opus 5 and Sonnet 5 think by default, and Fable and the 5.5 models refuse "disabled". Claude 4.6 knows no xhigh (it
+    goes up, as the chat path's nearest level does). The reasoning is asked as summaries: the default on Claude 4.7 and
+    later is an empty thinking block."""
+    name = _claude_name(upstream)
+    on_by_default = (name.startswith("claude-fable-") or bool(re.fullmatch(r"claude-(opus|sonnet|haiku)-5-5", name))
+                     or name in ("claude-opus-5", "claude-sonnet-5"))
+    can_disable = not (name.startswith("claude-fable-") or re.fullmatch(r"claude-(opus|sonnet|haiku)-5-5", name))
+    summarized = {"type": "adaptive", "display": "summarized"}
+    if level in (None, "", "default", "auto"):
+        return None, (summarized if on_by_default else None)
+    if level == "none" and can_disable:
+        return None, {"type": "disabled"}
+    effort = {"none": "low", "minimal": "low"}.get(level, level)
+    if effort == "xhigh" and name in ("claude-opus-4-6", "claude-sonnet-4-6"):
+        effort = "max"
+    return effort, summarized
+
+
+def messages_levels(model_provider, upstream):
+    """The levels of one route that go through /v1/messages: the catalog's, and the ones moved there while running."""
+    levels = set(model_provider.get("messages_levels") or ())
+    with _SWITCH_LOCK:
+        levels |= SWITCHED.get(upstream, set())
+    return levels
+
+
+def use_messages(model_provider, body):
+    """True when this chat body should go through /v1/messages instead (its model and level lose the cache on chat)."""
+    upstream = body.get("model")
+    if not messages_supported(upstream):
+        return False
+    return (body.get("reasoning_effort") or "default") in messages_levels(model_provider, upstream)
+
+
+def on_switch(listener):
+    """Call listener(upstream, level, switched) whenever a level moves to /v1/messages or back (persistence)."""
+    _switch_listeners.append(listener)
+
+
+def switch_to_messages(upstream, level, switched=True, reason=None):
+    """Move one model's level to /v1/messages (or, `switched` False, back to chat); False when nothing changed."""
+    level = level or "default"
+    if switched and not messages_supported(upstream):
+        return False
+    with _SWITCH_LOCK:
+        current = SWITCHED.setdefault(upstream, set())
+        if (level in current) == switched:
+            return False
+        (current.add if switched else current.discard)(level)
+        if not current:
+            SWITCHED.pop(upstream, None)
+    if switched:
+        journal.emit("cache.route_switched", "Minara отправила уровень %s модели %s на канал без кэша: дальше этот уровень "
+                     "идёт через /v1/messages, где кэш работает" % (level, upstream), "warn", model=upstream,
+                     effort=level, upstream="minara", path="messages", reason=reason)
+    else:
+        journal.emit("cache.route_switched", "Уровень %s модели %s снова идёт через чат: /v1/messages его не принял (%s)"
+                     % (level, upstream, reason or "ошибка"), "warn", model=upstream, effort=level, upstream="minara",
+                     path="chat", reason=reason)
+    for listener in list(_switch_listeners):
+        try:
+            listener(upstream, level, switched)
+        except Exception:  # noqa: BLE001 - persistence is best effort; the switch holds in memory
+            pass
+    return True
+
+
+def _anthropic_parts(content):
+    """Anthropic content blocks for a chat message's content (text and images; cache marks kept)."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    blocks = []
+    for part in content if isinstance(content, list) else []:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        block = None
+        if kind == "text" and part.get("text"):
+            block = {"type": "text", "text": part["text"]}
+        elif kind == "image_url":
+            url = str((part.get("image_url") or {}).get("url") or "")
+            match = re.match(r"data:([\w.+/-]+);base64,(.*)", url, re.DOTALL)
+            if match:
+                block = {"type": "image", "source": {"type": "base64", "media_type": match.group(1),
+                                                     "data": match.group(2)}}
+            elif url.startswith(("https://", "http://")):
+                block = {"type": "image", "source": {"type": "url", "url": url}}
+        if block is None:
+            continue
+        if part.get("cache_control"):
+            block["cache_control"] = copy.deepcopy(part["cache_control"])
+        blocks.append(block)
+    return blocks
+
+
+def _tool_input(arguments):
+    try:
+        value = json.loads(arguments) if isinstance(arguments, str) and arguments.strip() else {}
+    except ValueError:
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def messages_body(body):
+    """The /v1/messages request for a chat body of build_body: the same history, tools, marks and level.
+
+    Thinking blocks are not sent back, as on the chat path: Minara's /v1/messages continued a tool loop without them on all
+    seven models and read the cache all the same (2026-11-10)."""
+    system, turns = [], []
+
+    def add(role, blocks):
+        if not blocks:
+            return
+        if turns and turns[-1]["role"] == role:
+            merged = turns[-1]["content"] + blocks
+            # A user turn starts with its tool results (Anthropic refuses text before them).
+            turns[-1]["content"] = ([b for b in merged if b.get("type") == "tool_result"]
+                                    + [b for b in merged if b.get("type") != "tool_result"])
+        else:
+            turns.append({"role": role, "content": list(blocks)})
+
+    for message in body.get("messages") or []:
+        role = message.get("role")
+        if role == "system":
+            if not turns:
+                system.extend(_anthropic_parts(message.get("content")))
+            else:  # a later instruction: Claude Code's own wrapper, in a user turn
+                add("user", [{"type": "text", "text": "<system-reminder>\n%s\n</system-reminder>" % "\n".join(
+                    part.get("text", "") for part in _anthropic_parts(message.get("content")) if part["type"] == "text")}])
+        elif role == "tool":
+            parts = _anthropic_parts(message.get("content"))
+            result = {"type": "tool_result", "tool_use_id": message.get("tool_call_id"), "content": parts or ""}
+            add("user", [result])
+        elif role == "assistant":
+            blocks = [part for part in _anthropic_parts(message.get("content")) if part["type"] == "text"]
+            for part in blocks:
+                part.pop("cache_control", None)
+            for call in message.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                blocks.append({"type": "tool_use", "id": call.get("id"), "name": fn.get("name"),
+                               "input": _tool_input(fn.get("arguments"))})
+            add("assistant", blocks)
+        else:
+            add("user", _anthropic_parts(message.get("content")) or [{"type": "text", "text": "(empty)"}])
+    upstream = body.get("model")
+    result = {"model": upstream, "max_tokens": body.get("max_tokens") or MESSAGES_MAX_TOKENS, "messages": turns,
+              "stream": True}
+    if system:
+        result["system"] = system
+    tools = []
+    for tool in body.get("tools") or []:
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        declared = {"name": fn.get("name"), "input_schema": copy.deepcopy(
+            fn.get("parameters") or {"type": "object", "properties": {}})}
+        if fn.get("description"):
+            declared["description"] = fn["description"]
+        if fn.get("strict") is True:
+            declared["strict"] = True
+        tools.append(declared)
+    if tools:
+        result["tools"] = tools
+    choice = body.get("tool_choice")
+    if tools and choice is not None:
+        if choice in ("auto", "none"):
+            result["tool_choice"] = {"type": choice}
+        elif choice == "required":
+            result["tool_choice"] = {"type": "any"}
+        elif isinstance(choice, dict) and (choice.get("function") or {}).get("name"):
+            result["tool_choice"] = {"type": "tool", "name": choice["function"]["name"]}
+    effort, thinking = messages_reasoning(upstream, body.get("reasoning_effort"))
+    if effort:
+        result["output_config"] = {"effort": effort}
+    if thinking:
+        result["thinking"] = thinking
+    return result
+
+
+def normalize_messages_usage(value, pricing=None, channel=None):
+    """The relay's usage counters for an Anthropic usage block (its input_tokens already leave the cache out)."""
+    result = {}
+    for source, target in (("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"),
+                           ("cache_read_input_tokens", "cache_read"), ("cache_creation_input_tokens", "cache_write")):
+        number = _count(value.get(source))
+        if number is not None:
+            result[target] = number
+    result["cache_write_reported"] = "cache_creation_input_tokens" in value
+    result["channel_path"] = "messages"
+    if channel:
+        result["channel"] = channel
+    estimate = estimated_cost(pricing, result) if pricing is not None and "input_tokens" in result else None
+    if estimate is not None:
+        result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
+    return result
+
+
+_STOP_REASONS = {"end_turn": "stop", "stop_sequence": "stop", "pause_turn": "stop", "max_tokens": "length",
+                 "model_context_window_exceeded": "length", "tool_use": "tool_calls", "refusal": "content_filter"}
+
+
+class MessagesParser:
+    """EventParser's events for Anthropic's stream (message_start ... message_stop) from Minara's /v1/messages."""
+
+    def __init__(self, max_bytes=MAX_EVENT_BYTES, pricing=None):
+        self.pricing = pricing
+        self.max_bytes = max_bytes
+        self.calls = {}
+        self.blocks = {}
+        self.finish = None
+        self.done = False
+        self.thinking = False
+        self.signed = False
+        self.text = ""
+        self.reply_id = ""
+        self.usage = {}
+
+    def reasoning_details(self):
+        return []
+
+    def reply_key(self):
+        calls = [self.calls[index] for index in sorted(self.calls)]
+        if calls:
+            return ("calls",) + tuple(call["id"] for call in calls)
+        if self.text.strip():
+            return ("text", hashlib.sha256(self.text.encode("utf-8")).hexdigest())
+        return None
+
+    def _usage_event(self):
+        return {"type": "usage", "usage": normalize_messages_usage(self.usage, self.pricing, channel_of(self.reply_id))}
+
+    def feed(self, data):
+        if data == "[DONE]":
+            return []  # not Anthropic's, but a proxy may add it after message_stop
+        if self.done:
+            raise apierr.upstream_error("Minara sent data after message_stop")
+        try:
+            item = _bounded_json(data)
+        except (ValueError, RecursionError):
+            raise apierr.upstream_error("Minara returned malformed SSE JSON") from None
+        if not isinstance(item, dict):
+            raise apierr.upstream_error("Minara returned a stream error")
+        kind = item.get("type")
+        events = []
+        if kind == "error":
+            error = item.get("error") if isinstance(item.get("error"), dict) else {}
+            raise apierr.upstream_error("Minara returned a stream error" + (
+                ": " + _upstream_message(json.dumps({"error": error})) if error.get("message") else ""))
+        if kind == "message_start":
+            message = item.get("message") if isinstance(item.get("message"), dict) else {}
+            self.reply_id = str(message.get("id") or "")
+            if isinstance(message.get("usage"), dict):
+                self.usage.update(message["usage"])
+        elif kind == "content_block_start":
+            index, block = item.get("index"), item.get("content_block")
+            if type(index) is not int or not 0 <= index < 256 or not isinstance(block, dict):
+                raise apierr.upstream_error("Minara returned an invalid content block")
+            self.blocks[index] = {"type": block.get("type"), "signature": ""}
+            if block.get("type") == "tool_use":
+                if not isinstance(block.get("id"), str) or not isinstance(block.get("name"), str):
+                    raise apierr.upstream_error("Minara returned an incomplete tool call")
+                start = block.get("input")
+                self.calls[index] = {"id": block["id"], "name": block["name"],
+                                     "arguments": json.dumps(start) if isinstance(start, dict) and start else ""}
+                events.append({"type": "tool_call", **self.calls[index], "partial": True})
+            elif block.get("type") == "thinking":
+                if not self.thinking:
+                    events.append({"type": "thinking_start"})
+                    self.thinking = True
+                if isinstance(block.get("thinking"), str) and block["thinking"]:
+                    events.append({"type": "thinking", "delta": block["thinking"]})
+            elif block.get("type") == "text" and isinstance(block.get("text"), str) and block["text"]:
+                self.text += block["text"]
+                events.append({"type": "text", "delta": block["text"]})
+        elif kind == "content_block_delta":
+            index, delta = item.get("index"), item.get("delta")
+            if index not in self.blocks or not isinstance(delta, dict):
+                raise apierr.upstream_error("Minara returned a delta of no block")
+            dtype = delta.get("type")
+            if dtype == "text_delta" and isinstance(delta.get("text"), str):
+                self.text += delta["text"]
+                events.append({"type": "text", "delta": delta["text"]})
+            elif dtype == "thinking_delta" and isinstance(delta.get("thinking"), str) and delta["thinking"]:
+                if not self.thinking:
+                    events.append({"type": "thinking_start"})
+                    self.thinking = True
+                events.append({"type": "thinking", "delta": delta["thinking"]})
+            elif dtype == "signature_delta" and isinstance(delta.get("signature"), str):
+                self.blocks[index]["signature"] += delta["signature"]
+                if len(self.blocks[index]["signature"]) > self.max_bytes:
+                    raise apierr.upstream_error("Minara reasoning exceeds the size limit")
+            elif dtype == "input_json_delta" and index in self.calls:
+                piece = delta.get("partial_json")
+                if not isinstance(piece, str):
+                    raise apierr.upstream_error("Minara returned an invalid tool fragment")
+                self.calls[index]["arguments"] += piece
+                if len(self.calls[index]["arguments"].encode("utf-8")) > self.max_bytes:
+                    raise apierr.upstream_error("Minara tool call exceeds the size limit")
+                events.append({"type": "tool_call", **self.calls[index], "partial": True})
+        elif kind == "content_block_stop":
+            block = self.blocks.get(item.get("index")) or {}
+            if block.get("type") == "thinking" and block.get("signature") and not self.signed:
+                self.signed = True  # one signed block per reply, as the chat path gives
+                events.append({"type": "thinking_signature", "signature": block["signature"]})
+        elif kind == "message_delta":
+            delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+            stop = delta.get("stop_reason")
+            if stop is not None:
+                if stop not in _STOP_REASONS:
+                    raise apierr.upstream_error("Minara returned an unknown stop reason")
+                self.finish = _STOP_REASONS[stop]
+            if isinstance(item.get("usage"), dict):
+                self.usage.update({key: value for key, value in item["usage"].items() if value is not None})
+            events.append(self._usage_event())
+        elif kind == "message_stop":
+            if self.finish is None:
+                raise apierr.upstream_error("Minara stream ended without a stop reason")
+            for index in sorted(self.calls):
+                call = self.calls[index]
+                event = {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": call["arguments"] or "{}"}
+                try:
+                    def invalid_number(value):
+                        raise ValueError("nonfinite argument")
+
+                    def finite_float(value):
+                        number = float(value)
+                        return number if math.isfinite(number) else invalid_number(value)
+                    parsed = _bounded_json(event["arguments"], parse_constant=invalid_number, parse_float=finite_float)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("tool arguments must be an object")
+                except (ValueError, RecursionError):
+                    event["invalid"] = True
+                events.append(event)
+            self.done = True
+            events.append({"type": "end", "reason": self.finish})
+        return events
+
+
 def _read_timeout(cfg, deadline):
     """(connect, read) for curl_cffi, whose low-speed window on a stream is their sum."""
     connect = float(cfg.get("upstream_timeout", 120))
@@ -923,6 +1326,11 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     # text_only: the request as the client's own text, no tools and no canonical history (the summary guard's last try).
     body = build_body(cfg, model_provider, head, prompt, None if text_only else tools, None if text_only else tool_choice,
                       max_tokens, chunks, None if text_only else session, instruction, mark_tail=not side)
+    # The path: chat, or /v1/messages for a Claude level that the chat path sends to a channel without cache. A level the
+    # relay moved there itself (not measured) goes back to chat when /v1/messages refuses it.
+    level = body.get("reasoning_effort") or "default"
+    route = {"messages": use_messages(model_provider, body)}
+    route["measured"] = route["messages"] and level in set(model_provider.get("messages_levels") or ())
     # Requests that go at once with one Claude head nobody has cached yet (Claude Code starts several subagents in one
     # message): the first writes it, the others wait for its answer to begin and then read it, as on Retool
     # (direct._claim_head). Minara's cache is shared by all its accounts; an entry is there once its response began.
@@ -1002,10 +1410,18 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 request_sent()
                 put({"type": "request_sent"})
             delays = list(cfg.get("minara_channel_retry_delays", (3, 8)))  # numbers: config.load checked them
+            base = cfg.get("base", BASE).rstrip("/")
             while True:
-                response = post(cfg.get("base", BASE).rstrip("/") + "/chat/completions",
-                                headers={"Authorization": "Bearer " + token, "Content-Type": "application/json", "Accept": "text/event-stream"},
-                                json=body, impersonate="chrome131", stream=True, allow_redirects=False,
+                if route["messages"]:
+                    url, payload = base + "/messages", messages_body(body)
+                    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                               "Accept": "text/event-stream", "anthropic-version": ANTHROPIC_VERSION}
+                else:
+                    url, payload = base + "/chat/completions", body
+                    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                               "Accept": "text/event-stream"}
+                response = post(url, headers=headers, json=payload, impersonate="chrome131", stream=True,
+                                allow_redirects=False,
                                 # (connect, read): curl_cffi makes a lone number on a stream its low-speed window too,
                                 # and cut a reply silent for 120 s (a model that reasons before it writes anything: Opus
                                 # at max took up to 292 s to its first event on Retool). curl adds the two: silence is
@@ -1018,6 +1434,19 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 if response.status_code == 200:
                     break
                 text = _error_body(response)
+                if (route["messages"] and not route["measured"] and response.status_code in (400, 404, 422)
+                        and not _channel_trouble(response.status_code, text)):
+                    # A level the relay moved to /v1/messages by itself, refused there before anything was generated:
+                    # back to chat for good, and this request asks chat now.
+                    switch_to_messages(body.get("model"), level, switched=False,
+                                       reason="HTTP %s: %s" % (response.status_code, _upstream_message(text, 160)))
+                    route["messages"] = False
+                    holder["response"] = None
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    continue
                 error = _http_error(response.status_code, response.headers, text)
                 if response.status_code == 402:
                     refused = getattr(getattr(getattr(session, "backend", None), "credits", None), "note_refusal", None)
@@ -1061,7 +1490,7 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     session._direct_reply = None
     session._active_direct_abort = abort
     thread = threading.Thread(target=worker, name="minara-stream", daemon=True)
-    parser = EventParser(pricing=model_provider.get("pricing"))
+    parser = None  # made with the first data: the worker has settled the path by then
     try:
         yield {"type": "usage_start"}
         if head_role == "follow":
@@ -1097,7 +1526,7 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 await asyncio.sleep(0.01)
                 continue
             if item is None:
-                if not parser.done:
+                if parser is None or not parser.done:
                     raise apierr.upstream_error("Minara stream ended before DONE")
                 return
             if isinstance(item, dict) and item.get("type") == "request_sent":
@@ -1105,6 +1534,8 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 continue
             if isinstance(item, Exception):
                 raise item
+            if parser is None:
+                parser = (MessagesParser if route["messages"] else EventParser)(pricing=model_provider.get("pricing"))
             if head_gate is not None and not head_marked:
                 head_marked = True
                 direct._head_started(head_gate, head_key)  # the answer began: the head is in the cache now

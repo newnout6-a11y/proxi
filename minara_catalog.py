@@ -9,28 +9,84 @@ are not. An account without minara_models serves every published model; an accou
 Minara models are never Retool models: only a Minara account serves them, and no Retool model is ever sent to Minara.
 """
 import copy
+import datetime
 import json
 import pathlib
 
 FILE = pathlib.Path(__file__).with_name('minara_models.json')
+# What the relay measured by itself after this file was made (minara_refresh): a model Minara added, a new price, a model
+# gone. It lives beside config.json (not in git); an entry there wins over this file's when it is newer than the file.
+AUTO_NAME = 'minara_models.auto.json'
 PUBLISHED = frozenset({'ok'})
 # What an account descriptor may override; anything else in it is an error (config._check_upstream).
 OVERRIDABLE = ('label', 'provider', 'context', 'max_output', 'tools', 'image', 'reasoning', 'reasoning_effort_levels',
                'forced_tool_choice')
 
 
-def load(path=FILE):
-    """(upstream id -> measured entry, credits per USD); an absent or unreadable file measures nothing."""
+def _read(path):
     try:
         data = json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
     except (OSError, ValueError):
-        return {}, 220.0
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load(path=FILE):
+    """(upstream id -> measured entry, credits per USD); an absent or unreadable file measures nothing."""
+    data = _read(path)
     measured = {entry['upstream_model']: entry for entry in data.get('models', [])
                 if isinstance(entry, dict) and isinstance(entry.get('upstream_model'), str)}
     return measured, float(data.get('credits_per_usd') or 220)
 
 
+def when(value):
+    """The moment an ISO date or timestamp names (a bare date is its midnight, UTC), or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=datetime.timezone.utc)
+
+
 MEASURED, CREDITS_PER_USD = load()
+SHIPPED = dict(MEASURED)  # this file's entries, whatever an overlay put over them
+GENERATED_AT = _read(FILE).get('generated_at')
+
+
+def overlay_wins(entry, shipped=None, generated_at=None):
+    """True when an entry the relay measured by itself replaces the shipped one: none shipped, or it is newer than the
+    shipped file (a later measurement by hand, deployed with a newer file, wins again)."""
+    generated_at = GENERATED_AT if generated_at is None else generated_at
+    if shipped is None:
+        return True
+    moment, base = when(entry.get('refreshed_at')), when(generated_at)
+    return moment is not None and (base is None or moment > base)
+
+
+def apply_overlay(path):
+    """Put the entries of an overlay file (minara_refresh writes it) over the measured catalog, in place; their ids.
+
+    An entry wins over the shipped one only when newer than the shipped file; an unreadable overlay changes nothing."""
+    data = _read(path) if path else {}
+    changed = []
+    for upstream, entry in (data.get('models') or {}).items():
+        if not isinstance(entry, dict) or entry.get('upstream_model') != upstream:
+            continue
+        if overlay_wins(entry, SHIPPED.get(upstream)):
+            if MEASURED.get(upstream) != entry:
+                MEASURED[upstream] = entry
+                changed.append(upstream)
+        elif upstream in SHIPPED and MEASURED.get(upstream) is not SHIPPED[upstream]:
+            MEASURED[upstream] = SHIPPED[upstream]
+            changed.append(upstream)
+    return changed
+
+
+def overlay_path(config_path):
+    """Where the overlay of the relay whose config.json is `config_path` lives."""
+    return pathlib.Path(config_path).resolve().with_name(AUTO_NAME) if config_path else None
 
 
 def public_id(upstream):
@@ -108,6 +164,8 @@ def route(upstream, descriptor=None, measured=None):
         'default_reasoning_effort': found.get('default_effort') if reasoning and effort_map else None,
         # The level that reasons like the model's own default, for a client that must name one (Codex's default level).
         'natural_reasoning_effort': found.get('natural_effort') if reasoning and effort_map else None,
+        # The levels that go through Minara's /v1/messages: the chat path sends them to a channel without cache.
+        'messages_levels': list(found.get('messages_levels') or []) or None,
         'metadata_source': 'minara_models.json' if found else 'operator-configured',
         'metadata_status': ('measured ' + str(found.get('checked_at'))) if found.get('checked_at') else 'unverified',
     }

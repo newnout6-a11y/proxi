@@ -55,3 +55,7 @@ probes/chunks/
 
 # A state folder for `python proxy.py --state-dir state` (journal, command log, conversations, upstream-400 dumps)
 /state/
+
+# What the relay measured of Minara by itself (minara_refresh), beside config.json
+/minara_models.auto.json
+.minara-catalog-*.tmp
