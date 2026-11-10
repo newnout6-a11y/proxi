@@ -193,6 +193,7 @@ class _FailoverOut:
         self.out = out
         self.error = None
         self.started = False
+        self.sent = False  # a request left (Minara's request_sent): from then on only an unbilled refusal moves it
 
     def put(self, event):
         if event is None:
@@ -200,7 +201,11 @@ class _FailoverOut:
         if event.get("type") == "error":
             self.error = event["error"]
             return
-        if event.get("type") not in ("credits", "usage", "usage_start"):
+        # request_sent says that a request left (the Minara transport sends it before each POST, for the ledger): no
+        # output yet. Counted as output, it made every failed Minara turn final, a 402 included (audit, 2026-11-10).
+        if event.get("type") == "request_sent":
+            self.sent = True
+        elif event.get("type") not in ("credits", "usage", "usage_start"):
             self.started = True
         self.out.put(event)
 
@@ -216,6 +221,11 @@ async def _off_loop(fn, *args):
     if io_executor is None:
         return await asyncio.to_thread(fn, *args)
     return await loop.run_in_executor(io_executor, contextvars.copy_context().run, fn, *args)
+
+
+def _minara_refusal(error):
+    """A Minara answer that takes the account out of the pool by itself: 402 (no credits) or 401/403 (the token)."""
+    return getattr(error, "status", 0) == 402 or getattr(error, "code", None) == "upstream_auth_error"
 
 
 def _may_be_balance_related(error):
@@ -487,6 +497,26 @@ class TurnRunner:
         if len(history) > 8:
             del history[0]
 
+    def _minara_dialog_effort(self, parsed, session):
+        """The effort a Minara dialog's turns went with, for its compaction, or None to keep the client's own.
+
+        Minara keeps no signed branch: the effort is what the dialog's last turn sent (recorded on its session). It is kept
+        when the compaction asks for no level or a lower one (the relay never lowers an effort to save a cache): a request
+        on another level may miss the dialog's cache (Opus 4.7 at high did not read what low had written, 2026-11-10)."""
+        if session is None or not getattr(session, "_minara_effort_set", False):
+            return None
+        if getattr(session, "_minara_effort_model", None) != parsed.model:
+            return None  # another model's level is no level of this one (its map may send it as another)
+        dialog = getattr(session, "_minara_effort", None)
+        wanted = model_catalog.effective_effort(parsed.entry, parsed.effort, self.cfg.get("reasoning_effort"),
+                                                self.cfg.get("claude_xhigh_effort", "high"))
+        order = model_catalog.EFFORT_ORDER
+        if dialog is None or dialog == wanted or dialog not in order:
+            return None
+        if wanted is None or (wanted in order and order.index(dialog) >= order.index(wanted)):
+            return dialog
+        return None
+
     def _dialog_effort(self, parsed, head, choice, exclude):
         """(the effort of the dialog, why the history restarts anyway) for a compaction.
 
@@ -512,6 +542,8 @@ class TurnRunner:
         if not client or not key or peek is None:
             return None, None
         session = peek(key, model_entry=parsed.entry, exclude=exclude, **acquire_plan(self.cfg, parsed).kwargs)
+        if parsed.entry.get("upstream") == "minara":
+            return self._minara_dialog_effort(parsed, session), None
         history = getattr(session, "_native_history", None)
         if history is None or not history.branches:
             return None, {"reason": "no_branch"}
@@ -804,6 +836,14 @@ class TurnRunner:
             snapshot['provider_cost'] = cost
             currency = (event.get('usage') or {}).get('provider_cost_currency')
             snapshot['provider_cost_currency'] = currency if isinstance(currency, str) and currency else None
+            # A cost the relay worked out from the catalog price, not one upstream reported (minara.normalize_usage).
+            if (event.get('usage') or {}).get('provider_cost_estimated'):
+                snapshot['provider_cost_estimated'] = True
+            else:
+                snapshot.pop('provider_cost_estimated', None)
+        for key in ('cache_write_reported', 'upstream_cost'):
+            if key in (event.get('usage') or {}):
+                snapshot[key] = (event.get('usage') or {})[key]
         return snapshot, delta
 
     @staticmethod
@@ -986,8 +1026,12 @@ class TurnRunner:
                                  "info", account=account_tag(awaiting[0]), request_id=getattr(parsed, "request_id", None),
                                  seconds=awaiting[1])
                 awaiting = None
+            # A request that left may have been billed: it moves to another account only when upstream refused it before
+            # generating anything (minara._http_error marks such answers unbilled: 402, 401/403, 429, no channel). A cut
+            # stream or an error inside a 200 went to every account in turn, each attempt billed.
             retryable = (error is not None and not relay.started and not cancelled.is_set()
-                         and accounts is not None and holder["_attempt_budget"].remaining > 0)
+                         and accounts is not None and holder["_attempt_budget"].remaining > 0
+                         and (not relay.sent or getattr(error, "unbilled", False)))
             exhausted = False
             rate_limited = False
             try:
@@ -1022,9 +1066,20 @@ class TurnRunner:
                     # The pool refused before any upstream call: confirm the excluded
                     # balances once, so a top-up is used without waiting for the timer.
                     rechecked = True
-                    if await _off_loop(accounts.recheck_exhausted):
+                    if await _off_loop(accounts.recheck_exhausted, getattr(parsed, "entry", None)):
                         continue
-                if (retryable and backend is not None and backend not in exclude
+                minara_refusal = (retryable and backend is not None and backend not in exclude
+                                  and (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
+                                  and _minara_refusal(error) and hasattr(accounts, "mark_minara_refusal"))
+                if minara_refusal and error.code == "upstream_auth_error" and hasattr(accounts, "confirm_minara_token"):
+                    # A 401/403 may be about the request (a WAF rule, a moderation flag), the same on every account: the
+                    # account is out only when /auth/me refuses its token too, or one request emptied the pool.
+                    exhausted = await _off_loop(accounts.confirm_minara_token, backend)
+                elif minara_refusal:
+                    # 402: Minara said it in so many words; the one check_balance_now would make may be held back by
+                    # FORCED_CHECK_GAP.
+                    exhausted = accounts.mark_minara_refusal(backend, error)
+                elif (retryable and backend is not None and backend not in exclude
                         and _may_be_balance_related(error)):
                     # With no account left, the next acquire raises a clear 402.
                     exhausted = await _off_loop(accounts.check_balance_now, backend)
@@ -1043,11 +1098,14 @@ class TurnRunner:
                 continue
             if exhausted:
                 exclude.append(backend)
-                journal.emit("account.failover", "Баланс аккаунта закончился — запрос повторён на другом",
+                rejected = error.code == "upstream_auth_error"
+                journal.emit("account.failover", "Токен аккаунта отклонён — запрос повторён на другом" if rejected else
+                             "Баланс аккаунта закончился — запрос повторён на другом",
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code)
-                console_log.write("[%s] [account] %s: баланс закончился, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
+                console_log.write("[%s] [account] %s: %s, повтор на другом аккаунте" % (
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED),
+                    "токен отклонён" if rejected else "баланс закончился"))
                 holder["reason"] = "stop"
                 continue
             if error is not None:
@@ -1294,6 +1352,12 @@ class TurnRunner:
                 log("route.bound", "Выбран фактический маршрут %s" % actual_upstream,
                     upstream=actual_upstream, model=parsed.model, upstream_model=model_provider.get("model"),
                     effective_effort=model_provider.get("reasoningEffort"), child=bool(parent_key))
+                if actual_upstream == "minara" and getattr(parsed, "client_task", "") not in client_context.SIDE_TASKS:
+                    # What the dialog's turns go with: its compaction keeps it (_minara_dialog_effort).
+                    target = acquired.session if isinstance(acquired, SessionLease) else acquired
+                    target._minara_effort = model_provider.get("reasoningEffort")
+                    target._minara_effort_model = parsed.model
+                    target._minara_effort_set = True
                 # How many turns the pool has in flight, on this account and in all, this one included: the load this turn met.
                 counted = getattr(self.pool, "inflight", None)
                 load = ({} if counted is None else dict(zip(("inflight_account", "inflight_total"),
@@ -1407,6 +1471,10 @@ class TurnRunner:
                     usage_started = False
                     provider_recorder = getattr(account_credits, "record_provider_usage", None)
                     provider_attempt = "%s:%d" % (turn_id, journal_attempt)
+                    # The ledger row of the request being sent: a transport that asks again inside one attempt (Minara's
+                    # forced choice asked in words) starts a new usage_start, and each request keeps its own row. With one
+                    # id for both, the second request's cost replaced the first's (4.4 credits debited for 92.4 spent).
+                    attempt_cell = {"id": provider_attempt}
                     sent_attempt = threading.Event()
                     accounting_finished = threading.Event()
                     accounting_lock = threading.Lock()
@@ -1416,10 +1484,10 @@ class TurnRunner:
                         if id(account_credits) not in managers_seen:
                             account_credits.start_provider_turn()
                             managers_seen.add(id(account_credits))
-                        def request_sent(recorder=provider_recorder, attempt=provider_attempt, turn=turn_id,
+                        def request_sent(recorder=provider_recorder, cell=attempt_cell, turn=turn_id,
                                          sent=sent_attempt, lock=accounting_lock, finished=accounting_finished):
                             with lock:
-                                recorder(attempt, turn, {}, final=finished.is_set())
+                                recorder(cell["id"], turn, {}, final=finished.is_set())
                                 sent.set()
                         provider_target._provider_request_sent = request_sent
                     try:
@@ -1481,6 +1549,11 @@ class TurnRunner:
                                             journal_attempt += 1
                                             holder['_journal_attempt'] = journal_attempt
                                             log('upstream.usage_start', 'Начат учёт попытки upstream', 'debug', attempt=journal_attempt)
+                                            if provider_recorder:
+                                                with accounting_lock:
+                                                    if sent_attempt.is_set():
+                                                        account_credits.finish_provider_attempt(attempt_cell["id"], turn_id)
+                                                    attempt_cell["id"] = "%s:%d" % (turn_id, journal_attempt)
                                         usage_started = True
                                         think_started = None
                                         holder['_attempt_usage'] = {}
@@ -1538,14 +1611,36 @@ class TurnRunner:
                                 elif event['type'] == 'usage':
                                     usage, delta = self._usage_update(holder, event)
                                     if provider_recorder and sent_attempt.is_set():
-                                        provider_recorder(provider_attempt, turn_id, usage)
+                                        provider_recorder(attempt_cell["id"], turn_id, usage)
                                     breakdown = credits.cost_breakdown(usage, parsed.model)
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
-                                    log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
-                                                          'Токены получены; стоимость upstream не сообщена'),
-                                        'info' if known else 'warn', credits=None, attempt=journal_attempt,
-                                        credits_reported=bool(known), **delta,
-                                        **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                    provider_cost = usage.get('provider_cost')
+                                    if not known and provider_cost is not None:
+                                        # Minara reports a cost in USD (or the relay estimated one from the catalog): the
+                                        # turn is priced, only not in Retool credits. It was a warning on every turn.
+                                        log('upstream.usage', 'Токены получены; стоимость %s %.6f%s' % (
+                                                usage.get('provider_cost_currency') or 'USD', provider_cost,
+                                                ' (оценка по прайсу)' if usage.get('provider_cost_estimated') else ''),
+                                            'info', credits=None, attempt=journal_attempt, credits_reported=False,
+                                            provider_cost=provider_cost,
+                                            provider_cost_estimated=bool(usage.get('provider_cost_estimated')), **delta,
+                                            **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                    else:
+                                        log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
+                                                              'Токены получены; стоимость upstream не сообщена'),
+                                            'info' if known else 'warn', credits=None, attempt=journal_attempt,
+                                            credits_reported=bool(known), **delta,
+                                            **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                    if (usage.get('cache_write_reported') is False and not delta.get('cache_read')
+                                            and (getattr(parsed, 'entry', None) or {}).get('cache') == 'explicit'
+                                            and breakdown['prompt_tokens'] >= 2048):
+                                        # The marks were sent, and the answer came from a channel that has no cache at all
+                                        # (Minara's Bedrock or Anthropic path: no cache write field): the whole prompt is
+                                        # billed each turn. Said, so the model's channel rule can be measured again.
+                                        log('cache.uncached_channel', 'Minara ответила с канала без кэша: промпт %d '
+                                            'токенов оплачен полностью' % breakdown['prompt_tokens'], 'warn',
+                                            model=parsed.model, effort=getattr(parsed, 'effort', None),
+                                            prompt_tokens=breakdown['prompt_tokens'], attempt=journal_attempt)
                                     if session is not None and breakdown['prompt_tokens'] > 0:
                                         # Only counts tell the size of the prefix. The empty usage of an attempt whose
                                         # price is unknown (a timeout or a cut stream on a 200) has none: written as 0,
@@ -1596,7 +1691,7 @@ class TurnRunner:
                             with accounting_lock:
                                 accounting_finished.set()
                                 if sent_attempt.is_set():
-                                    account_credits.finish_provider_attempt(provider_attempt, turn_id)
+                                    account_credits.finish_provider_attempt(attempt_cell["id"], turn_id)
                         if provider_recorder:
                             provider_target._provider_request_sent = None
                     holder.setdefault("reason", "stop")

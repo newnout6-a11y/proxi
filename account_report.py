@@ -48,6 +48,18 @@ def collect(runtime, *, force_refresh=False):
     def fetch(row):
         backend, manager = row
         snapshot = getattr(manager, "balance_snapshot", None)
+        if not force_refresh and snapshot is not None and getattr(manager, "keeps_local_debit", False):
+            # A Minara account: the dispatcher reads it on its interval and on demand, and the snapshot takes off what was
+            # spent since. /health and the admin's polls (every 8 s) read /auth/me of all 51 accounts every 20 s before.
+            # One that was never read yet (the first minute after a start) is read once, so the page shows its credits.
+            info = dict(snapshot())
+            if info.get("available") is not None or getattr(manager, "last_error", None):
+                info.setdefault("available", None)
+                if getattr(manager, "last_error", None):
+                    # the last read failed: what the snapshot holds is old, and /health says so as before
+                    info["error"] = manager.last_error
+                    info["stale"] = True
+                return info
         if not enabled(backend) and snapshot is not None:
             # A switched-off account stays off the network (a stale cache would refetch and may
             # renew the session); only an explicit admin balance check reaches Retool.

@@ -213,14 +213,14 @@ def upstream_auth_failed(detail: str = "") -> ApiError:
     return ApiError(502, "upstream_auth_error", f"Retool rejected the session (cookies/xsrf expired?){(': ' + detail) if detail else ''}")
 
 
-def insufficient_credits(threshold, balances=()) -> ApiError:
+def insufficient_credits(threshold, balances=(), provider="Retool") -> ApiError:
     """Every account able to serve the model is below the configured reserve."""
     known = ", ".join("%s: %s" % (account, "?" if value is None else round(value, 2))
                       for account, value in balances)
     return ApiError(402, "insufficient_credits",
-                    "Баланс Retool закончился: на всех аккаунтах меньше %s кредитов%s. "
+                    "Баланс %s закончился: на всех аккаунтах меньше %s кредитов%s. "
                     "Пополните баланс или добавьте аккаунт в config.json."
-                    % (round(threshold, 2), " (%s)" % known if known else ""))
+                    % (provider, round(threshold, 2), " (%s)" % known if known else ""))
 
 
 def upstream_error(message: str) -> ApiError:

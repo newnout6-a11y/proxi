@@ -8,6 +8,9 @@ or what they can do. Each check is one small paid request on the account whose b
   thinking  one streaming request: where the reasoning arrives (reasoning / reasoning_content / reasoning_details),
             whether it streams before the answer, signatures, reasoning tokens
   effort    none..max on one representative of each family and backend; the others inherit that ladder
+  channels  no level and each of the seven, on every Claude model Minara also serves on its Anthropic endpoint: which
+            channel answers. Minara sends such a chat request to OpenRouter, which caches with the cache_control marks,
+            or to Bedrock or Anthropic's own API, which it reaches without them (the whole prompt billed every turn)
 
 Usage (PowerShell):
   python scripts/probe_minara.py --token-file <file with one or more Minara bearer tokens> [--budget 150] [--only id ...]
@@ -22,6 +25,7 @@ import base64
 import concurrent.futures as cf
 import datetime
 import json
+import math
 import os
 import pathlib
 import struct
@@ -42,6 +46,12 @@ TOOLS = [{"type": "function", "function": {"name": "get_weather", "description":
 THINK_TASK = "What is 17 * 23? Think it through briefly, then reply with the number only."
 EFFORT_TASK = ("How many 6-digit positive integers have strictly increasing digits (left to right) and a digit sum "
                "divisible by 3? Reply with the number only.")
+CHANNEL_TASK = "What is 23 * 47? Reply with the number only."
+# The channels of /v1/chat/completions where the relay's cache_control marks work (measured 2026-11-10). A chat request
+# that Minara sends to Bedrock (msg_bdrk_...) or to Anthropic's own API (msg_011C...) reports cache_creation_input_tokens
+# 0 on every repeat: the marks are dropped on the way and the whole prompt is billed each turn.
+CACHING_CHANNELS = frozenset({"openrouter"})
+CHANNEL_LEVELS = ("default",) + EFFORTS  # "default": no reasoning_effort at all
 # One representative per family and backend; the effort ladder of every other model of the group is inherited.
 EFFORT_REPRESENTATIVES = (
     "anthropic/claude-opus-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-4.6",
@@ -185,7 +195,11 @@ def probe_vision(client, model):
     data = json.loads(text)
     answer = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     low = answer.lower()
-    return {"status": "ok", "vision": "yellow" in low and "green" in low, "answer": answer[:60],
+    # The image reached the model when it names colours of it: GPT-6 Luna called the dark yellow half green ("green,
+    # green"), saw it, and was published blind (its images refused with 422). A model that cannot see says so or names none.
+    colours = ("yellow", "green", "gold", "olive", "amber", "lime", "mustard", "khaki", "orange")
+    blind = any(words in low for words in ("can't see", "cannot see", "no image", "unable to", "don't see", "not able"))
+    return {"status": "ok", "vision": not blind and any(colour in low for colour in colours), "answer": answer[:60],
             "prompt_tokens": (data.get("usage") or {}).get("prompt_tokens")}
 
 
@@ -277,6 +291,73 @@ def probe_effort(client, model):
     return {"status": "ok", "ladder": ladder}
 
 
+def channel_of(ident):
+    """The channel behind a reply id: gen- OpenRouter, msg_bdrk_ Bedrock, any other msg_ Anthropic's own API."""
+    ident = str(ident or "")
+    if ident.startswith("gen-"):
+        return "openrouter"
+    if ident.startswith("msg_bdrk"):
+        return "bedrock"
+    if ident.startswith("msg_"):
+        return "anthropic"
+    return backend_of({"id": ident}) or "unknown"
+
+
+def probe_channels(client, model):
+    """Which channel answers no level and each of the seven, at the max_tokens an agent sends (32,000).
+
+    Minara chooses it from the level and, for Sonnet 4.6 and Opus 4.6, from max_tokens as well (OpenRouter only up to
+    about 2,000 tokens), so a small max_tokens would say nothing about an agent's requests (measured 2026-11-10). One
+    tiny streamed request per level; a level whose request fails stays unknown."""
+    channels = {}
+    for level in CHANNEL_LEVELS:
+        body = {"model": model, "max_tokens": 32000, "stream": True, "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": CHANNEL_TASK}]}
+        if level != "default":
+            body["reasoning_effort"] = level
+        response, _ = client.chat(body, stream=True)
+        if response.status_code != 200:
+            continue
+        for line in b"".join(response.iter_content()).split(b"\n"):
+            line = line.strip()
+            if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                continue
+            try:
+                ident = json.loads(line[5:]).get("id")
+            except ValueError:
+                continue
+            if ident:
+                channels[level] = channel_of(ident)
+                break
+    # Only a full measure is used: a level whose request failed is unknown, and a channel rule built on a gap lowered
+    # or raised levels that were never measured (review of 2026-11-10).
+    return {"status": "ok" if len(channels) == len(CHANNEL_LEVELS) else "partial" if channels else "failed",
+            "channels": channels}
+
+
+def cached_levels(channels):
+    """(offered levels, the level sent for each of the seven, the level sent when none is asked) of a model whose levels
+    Minara sends to channels that do not all cache, or None when no level reaches a caching channel.
+
+    Every level goes as the nearest one that lands on OpenRouter (none and minimal as the lowest, xhigh and max as the
+    highest), and no level at all goes as high when the model's own default lands on a channel that drops the marks:
+    Opus 4.7 at Default, none, xhigh or max wrote nothing to the cache in any of 4 repeats, at low, medium and high it
+    read the whole prefix. Reasoning cannot be switched off on OpenRouter for these models, so none means low."""
+    rank = EFFORTS.index
+    cached = [level for level in EFFORTS if channels.get(level) in CACHING_CHANNELS]
+    if not cached:
+        return None
+    uncached = {level for level in EFFORTS if level in channels and channels[level] not in CACHING_CHANNELS}
+
+    def nearest(level):
+        # ties go up: the level is never sent as one that reasons less than the one between
+        return min(cached, key=lambda other: (abs(rank(other) - rank(level)), rank(other) < rank(level)))
+    mapping = {level: nearest(level) if level in uncached else level for level in EFFORTS}
+    known = "default" in channels and channels["default"] not in CACHING_CHANNELS
+    default = ("high" if "high" in cached else max(cached, key=rank)) if known else None
+    return [level for level in EFFORTS if level not in uncached], mapping, default
+
+
 def backend_of(probe):
     ident = str(probe.get("id") or "")
     if ident.startswith("gen-"):
@@ -288,6 +369,165 @@ def backend_of(probe):
     if ident[:3].isdigit():
         return "volcengine-ark"
     return "other" if ident else None
+
+
+TIER_STEP = 1.3  # a level reasons differently from its neighbour when their samples do not overlap and this ratio holds
+BROKEN_STEP = 2.0  # a level is sent as another only when a lower one reasons this many times more (or it reasons not at all)
+NAMES = ("low", "medium", "high", "max")  # the usual names a group of levels is called by
+
+
+def _median(values):
+    values = sorted(values)
+    n = len(values)
+    return None if not n else values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2
+
+
+def _apart(upper, lower, step=None):
+    """True when the samples of `upper` lie wholly above those of `lower` and its median is `step` (TIER_STEP) times
+    theirs."""
+    step = TIER_STEP if step is None else step
+    return bool(upper) and bool(lower) and min(upper) > max(lower) and _median(upper) >= step * max(_median(lower), 1)
+
+
+def effort_tiers(study):
+    """What the seven reasoning_effort levels really do on one model, from its effort study
+    ({"default" | level: [rows with status and reasoning_tokens]}); None until the default and every level are measured.
+
+    Returns "levels" (what a client is offered), "map" (the level sent upstream for each of the seven) and "control".
+    A level that works is sent as asked: one question of medium difficulty shows when levels are broken, not that two
+    working levels stay equal on a hard task. Only broken levels are sent as another:
+    - a level Minara refuses in words goes as the nearest level that works;
+    - a level above medium that reasons clearly less than a lower one (Opus 4.8 and Sonnet 4.6 at xhigh and max: no
+      reasoning at all) goes as the strongest group below it (its member nearest below the level), or as nothing when the
+      default reasons more than that group;
+    - when reasoning can be switched off and the model reasons by default, "none" is offered and sends a level that
+      really switches it off (Sonnet 5.5's own "none" still reasons, its "minimal" does not).
+    The offered list holds one level per group of levels that reason alike (walking them by median, a level starts a
+    new group when its samples lie wholly above those of the group's first level and its median is TIER_STEP times
+    theirs, so noise never splits a group and a slow climb cannot chain far-apart levels into one), named in the order
+    of their reasoning, without the group that reasons as the default does (Default is that choice). An empty list
+    means no level does anything the default does not; the levels a client sends anyway still go upstream."""
+    samples, refused = {}, set()
+    for level in ("default",) + EFFORTS:
+        rows = study.get(level) or []
+        values = [row["reasoning_tokens"] for row in rows
+                  if row.get("status") == 200 and isinstance(row.get("reasoning_tokens"), (int, float))]
+        if values:
+            samples[level] = values
+        elif any(row.get("status") == 400 and "reasoning effort" in str(row.get("detail", "")).lower() for row in rows):
+            refused.add(level)
+    measured = [level for level in EFFORTS if level in samples]
+    if "default" not in samples or len(measured) + len(refused) < len(EFFORTS):
+        return None
+    default = samples["default"]
+    default_thinks = any(default)
+    off = [level for level in measured if not any(samples[level])]
+    groups = []
+    for level in sorted((level for level in measured if level not in off), key=lambda level: _median(samples[level])):
+        # compared with the group's first (weakest) member, so a slow climb cannot chain far-apart levels together
+        if groups and not _apart(samples[level], samples[groups[-1][0]]):
+            groups[-1].append(level)
+        else:
+            groups.append([level])
+    pooled = [[value for level in group for value in samples[level]] for group in groups]
+    strength = [_median(values) for values in pooled]
+    group_of = {level: index for index, group in enumerate(groups) for level in group}
+    rank = EFFORTS.index
+
+    broken = {}  # level above medium that reasons clearly less than a lower one -> the strongest lower group
+    for level in measured:
+        # "none" never speaks for a level above it: where it reasons the most (GLM-5.3 Prime: Minara ignores it there),
+        # max was judged broken and sent as none, which would switch reasoning off the day Minara honours it.
+        lower = [group_of[other] for other in measured
+                 if rank(other) < rank(level) and other in group_of and other != "none"]
+        best = max(lower, key=lambda index: strength[index], default=None)
+        # Broken: no reasoning at all, or at most half the lower group's. Two samples a level are noisy: a gap of 1.3x
+        # (Gemini 3.7 Flash at max, 988 and 981 tokens against about 1,100) is no reason to send another level.
+        if rank(level) > rank("medium") and best is not None and (
+                level in off or _apart(pooled[best], samples[level], BROKEN_STEP)):
+            broken[level] = best
+    working = [level for level in measured if level not in broken]
+    used = sorted({group_of[level] for level in working if level in group_of}, key=lambda index: strength[index])
+    names, previous = {}, -1
+    for position, index in enumerate(used):
+        members = sorted((level for level in groups[index] if level in working), key=rank)
+        pool = [level for level in members if level in NAMES] or members
+        if position == len(used) - 1:
+            choice = max(pool, key=rank)
+        else:
+            choice = next((level for level in pool if rank(level) > previous), max(pool, key=rank))
+        names[index] = choice
+        previous = max(previous, rank(choice))
+    like_default = {index for index in used
+                    if default_thinks and not _apart(default, pooled[index]) and not _apart(pooled[index], default)}
+    # The level "none" is sent as must switch reasoning off for real: one at or below medium (xhigh or max that reason
+    # not at all are broken levels, which "none" must not rely on staying broken).
+    calm = [level for level in off if level not in broken]
+    offer_none = bool(calm) and default_thinks
+    offered = list(dict.fromkeys(names[index] for index in used if index not in like_default and names[index] != "none"))
+    offered.sort(key=rank)
+    off_sent = ("none" if "none" in calm else min(calm, key=rank)) if calm else None
+
+    def replacement(level):
+        """What a broken level is sent as: nothing when the default reasons more than any lower group (Kimi K2.6), else
+        the strongest lower group's member nearest below it, so the reply never costs more than the level asked for."""
+        best = broken[level]
+        if default_thinks and (_apart(default, pooled[best]) or best in like_default):
+            return None  # the default reasons at least as much: send nothing
+        members = [other for other in groups[best] if other in working]
+        below = [other for other in members if rank(other) <= rank(level)]
+        return max(below, key=rank) if below else min(members, key=rank)
+
+    mapping = {}
+    for level in EFFORTS:
+        if level in broken:
+            mapping[level] = replacement(level)
+        elif level in refused:
+            near = min(working, key=lambda other: (abs(rank(other) - rank(level)), rank(other) > rank(level)))
+            mapping[level] = near
+        else:
+            mapping[level] = level
+    if offer_none:
+        mapping["none"] = off_sent  # the offered "none" switches reasoning off, whatever the level "none" itself does
+    natural = _natural(default, default_thinks, groups, pooled, like_default, working, off_sent)
+    return {"levels": (["none"] if offer_none else []) + offered, "map": mapping, "control": "mapped", "natural": natural,
+            "default_reasoning_tokens": _median(default), "broken": sorted(broken, key=rank), "refused": sorted(refused),
+            "off": off, "groups": [{"levels": group, "median_reasoning_tokens": strength[i]} for i, group in enumerate(groups)]}
+
+
+def _natural(default, default_thinks, groups, pooled, like_default, working, off_sent):
+    """The level that reasons as the model does when no level is sent: what a client that must name a level (Codex) sends
+    by default. A model that does not reason by default gets the level that switches reasoning off; one that does, the
+    member nearest to medium of the group that reasons like it, or of the group nearest to it when none does."""
+    rank = EFFORTS.index
+    if not default_thinks:
+        return off_sent or "medium"
+    candidates = sorted(like_default) or sorted(
+        range(len(groups)), key=lambda index: abs(math.log(max(_median(pooled[index]), 1) / max(_median(default), 1))))[:1]
+    # Never an extreme for a model that reasons by default: "none" would rely on Minara ignoring it (GLM-5.3 FlashX), and
+    # max would make Codex run at its most (and offer Ultra). Then medium, a level every route takes.
+    members = [level for index in candidates for level in groups[index]
+               if level in working and level not in ("none", "max")]
+    if not members:
+        return "medium"
+    return min(members, key=lambda level: (abs(rank(level) - rank("medium")), rank(level)))
+
+
+# Studied model that speaks for an unstudied one: its own family's, else the vendor's flagship.
+STUDY_FLAGSHIP = {"anthropic": "anthropic/claude-opus-5.5", "openai": "openai/gpt-6.1-sol", "google": "google/gemini-4-argon",
+                  "x-ai": "x-ai/grok-4.7", "deepseek": "deepseek/deepseek-v4-pro", "z-ai": "z-ai/glm-5.3-prime",
+                  "moonshotai": "moonshotai/kimi-k3"}
+
+
+def _study_for(upstream, studies):
+    if upstream in studies:
+        return upstream, "study"
+    vendor, family = upstream.split("/")[0], _family(upstream)
+    same = [name for name in studies if name.split("/")[0] == vendor and _family(name) == family]
+    if same:
+        return same[0], "study:" + same[0]
+    flagship = STUDY_FLAGSHIP.get(vendor)
+    return (flagship, "study:" + flagship) if flagship in studies else (None, None)
 
 
 def ladder_levels(ladder):
@@ -310,13 +550,18 @@ def ladder_reasons(ladder):
     return any(((ladder.get(level) or {}).get("reasoning_tokens") or 0) > 0 for level in EFFORTS)
 
 
-def generate(results, listing, published=None):
+def generate(results, listing, published=None, study=None):
     """Build minara_models.json from the listing, the saved measurements and OpenRouter's published limits.
 
     `published` is OpenRouter's public /api/v1/models (id -> entry): the window, the output ceiling and whether the
     model takes reasoning. Minara routes most models through OpenRouter, and its other backends were checked to take
     the same window (WINDOW_CHECKS)."""
     published = published or {}
+    studies = {}
+    for name, rows in (study or {}).items():
+        tiers = effort_tiers(rows)
+        if tiers:
+            studies[name] = dict(tiers, question=rows.get("_question", "easy"))
     entries = []
     groups = {}
     vendor_ladders = {}
@@ -374,6 +619,30 @@ def generate(results, listing, published=None):
         if not reasoning:
             levels = []
         context, output = _limits(info)
+        effort_map, effort_control, effort_detail, natural = None, None, None, None
+        studied, study_source = _study_for(upstream, studies)
+        if studied is not None and reasoning:
+            tiers = studies[studied]
+            levels, effort_map, effort_control = tiers["levels"], tiers["map"], tiers["control"]
+            effort_source, effect = study_source, "studied"
+            effort_detail = {key: tiers[key] for key in ("groups", "broken", "off", "refused", "default_reasoning_tokens")}
+            effort_detail["question"] = tiers.get("question", "easy")
+            natural = tiers.get("natural")
+        channel_probe = measured.get("channels") or {}
+        # A partial measure still gives what it measured (cached_levels leaves unknown levels as asked); only a full one
+        # can say a model never caches.
+        complete = channel_probe.get("status") == "ok"
+        channels = channel_probe.get("channels") if channel_probe.get("status") in ("ok", "partial") else None
+        default_effort = None
+        if channels:
+            routed = cached_levels(channels)
+            if routed is None and complete and channels.get("default") not in CACHING_CHANNELS:
+                status = "uncached" if status == "ok" else status
+            elif routed is not None and reasoning:
+                # The study's levels are the reasoning of the channel each level reached; the channel decides the cost.
+                levels, effort_map, default_effort = routed
+                effort_control, effect = "mapped", "channels"
+                natural = default_effort or natural
         name = public_id(upstream)
         if name in seen:
             raise SystemExit("duplicate public id " + name)
@@ -381,10 +650,15 @@ def generate(results, listing, published=None):
         entry = {
             "id": name, "upstream_model": upstream, "label": _label(upstream), "provider": upstream.split("/")[0],
             "status": status, "backend": backend, "tools": tools.get("tools") if tools.get("status") == "ok" else None,
-            "forced_tool_choice": not _mandatory_reasoning(upstream),
+            # Anthropic refuses a forced tool choice whenever thinking is on: always on the 5.5 family and Fable 5.1, at
+            # any level on the others (OpenRouter turns reasoning_effort into a thinking budget). The relay asks for the
+            # call in words on every Claude route, as for Retool's (forced_choice).
+            "forced_tool_choice": not upstream.startswith("anthropic/"),
             "vision": vision.get("vision") if vision.get("status") == "ok" else None,
             "reasoning": reasoning, "thinking": thinking.get("thinking"), "thinking_signature": bool(thinking.get("signature")),
             "reasoning_effort_levels": levels, "effort_source": effort_source, "effort_effect": effect,
+            "effort_map": effort_map, "effort_control": effort_control, "effort_study": effort_detail,
+            "default_effort": default_effort, "natural_effort": natural if reasoning else None, "channels": channels,
             "context": context, "max_output": output,
             "limits_source": ("openrouter /api/v1/models" if context else None),
             "limits_checked": WINDOW_CHECKS.get(upstream),
@@ -444,12 +718,6 @@ def _family(upstream):
     return name
 
 
-def _mandatory_reasoning(upstream):
-    # Measured on 2026-11-09: Opus 5.5 rejects tool_choice "required" and a named tool ("not supported for this model")
-    # because its reasoning cannot be disabled. The 5.5 family shares adaptive, mandatory reasoning.
-    return upstream in ("anthropic/claude-opus-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-haiku-5.5")
-
-
 def _substituted(upstream, served):
     """True when upstream answered with another model: glm-5.3 served as glm-5-3-flash-260828. A date or version suffix
     (deepseek-v4-pro-260425, glm-5-2-260617) is the same model."""
@@ -465,13 +733,28 @@ def _label(upstream):
     return name.replace("-", " ").replace("claude ", "Claude ").replace("gpt ", "GPT-").title().replace("Gpt", "GPT") + " (Minara)"
 
 
+def merged_study(easy_path, hard_path):
+    """The effort study per model: the harder question's rows where every level was measured on it, else the first one's.
+
+    The first question (digit sum 19 below 10,000) takes GPT-6 and Gemini 4 Argon 50-400 reasoning tokens at every level,
+    too little for working levels to separate; the harder one (digit sum 27 and divisible by 11 below 1,000,000) makes
+    them think long enough. Each model's rows say which question they answer ("_question")."""
+    easy = json.loads(easy_path.read_text(encoding="utf-8")) if easy_path.exists() else {}
+    hard = json.loads(hard_path.read_text(encoding="utf-8")) if hard_path.exists() else {}
+    study = {name: dict(rows, _question="easy") for name, rows in easy.items()}
+    for name, rows in hard.items():
+        if effort_tiers(rows) is not None:
+            study[name] = dict(rows, _question="hard")
+    return study
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--token-file", help="file with Minara bearer tokens, one per line (the richest one is used)")
     parser.add_argument("--results", default=os.path.join(tempfile.gettempdir(), "minara-probe-results.json"))
     parser.add_argument("--budget", type=float, default=150, help="stop starting new checks after this many credits")
     parser.add_argument("--only", nargs="*", help="upstream model ids to check")
-    parser.add_argument("--checks", nargs="*", default=["tools", "vision", "thinking", "effort"])
+    parser.add_argument("--checks", nargs="*", default=["tools", "vision", "thinking", "effort", "channels"])
     parser.add_argument("--refresh", action="store_true", help="re-measure checks that already have a result")
     parser.add_argument("--regenerate", action="store_true", help="only rebuild minara_models.json")
     parser.add_argument("--limits", action="store_true",
@@ -509,11 +792,14 @@ def main():
             for check in args.checks:
                 if check == "effort" and upstream not in EFFORT_REPRESENTATIVES:
                     continue
+                if check == "channels" and "anthropic" not in (item.get("supported_endpoint_types") or []):
+                    continue
                 if not args.refresh and ((results.get(upstream) or {}).get(check) or {}).get("status") == "ok":
                     continue
                 jobs.append((upstream, check))
         print("checks to run:", len(jobs), flush=True)
-        probes = {"tools": probe_tools, "vision": probe_vision, "thinking": probe_thinking, "effort": probe_effort}
+        probes = {"tools": probe_tools, "vision": probe_vision, "thinking": probe_thinking, "effort": probe_effort,
+                  "channels": probe_channels}
 
         def run(job):
             upstream, check = job
@@ -545,7 +831,9 @@ def main():
         except Exception as exc:  # noqa: BLE001 - limits stay as the last snapshot had them
             print("OpenRouter model list unavailable (%s): keeping the last snapshot" % type(exc).__name__)
     published = json.loads(published_path.read_text(encoding="utf-8")) if published_path.exists() else {}
-    catalog = generate(results, listing, published)
+    study = merged_study(results_path.with_name("minara-effort-study.json"),
+                         results_path.with_name("minara-effort-study-hard.json"))
+    catalog = generate(results, listing, published, study)
     CATALOG_FILE.write_text(json.dumps(catalog, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     counts = {}
     for entry in catalog["models"]:

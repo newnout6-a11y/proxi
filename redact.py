@@ -1,5 +1,7 @@
 """Secret redaction for logs, injected context and command output."""
+import collections
 import re
+import threading
 
 MASK = "[redacted]"
 
@@ -47,14 +49,39 @@ def _may_hold_a_secret(text: str) -> bool:
     return bool(_LITERALS.search(text)) or ((":" in text or "=" in text) and bool(_KEYWORDS.search(text)))
 
 
+_COOKIES = collections.OrderedDict()  # the cookie values a pattern was built for -> the pattern or None
+_COOKIE_PATTERNS = 8  # the journal's whole list and the lists of a few accounts: one entry thrashed between them
+_COOKIES_LOCK = threading.Lock()
+
+
+def _cookie_pattern(values):
+    """One pattern for every cookie value of at least 12 characters, built again only when the values change.
+
+    The loop it replaces ran str.replace for every value on every string: with 76 accounts (51 Minara tokens of about
+    1 KB) that was 82 million calls for the 20,000 events restored at startup, 19 s before the relay listened."""
+    key = values if isinstance(values, tuple) else tuple(values)
+    with _COOKIES_LOCK:
+        if key in _COOKIES:
+            _COOKIES.move_to_end(key)
+            return _COOKIES[key]
+    found = sorted({value for value in key if isinstance(value, str) and len(value) >= 12}, key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(value) for value in found)) if found else None
+    with _COOKIES_LOCK:
+        _COOKIES[key] = pattern
+        while len(_COOKIES) > _COOKIE_PATTERNS:
+            _COOKIES.popitem(last=False)
+    return pattern
+
+
 def redact(text: str, *, cookie_values=()) -> str:
     """Mask known secret shapes plus any literal cookie value we hold."""
     if not text:
         return text
     out = text
-    for value in cookie_values:
-        if value and len(value) >= 12:
-            out = out.replace(value, MASK)
+    if cookie_values:
+        pattern = _cookie_pattern(cookie_values)
+        if pattern is not None and len(out) >= 12:
+            out = pattern.sub(MASK, out)
     if not _may_hold_a_secret(out):
         return out
     for pattern, replacement in _PATTERNS:

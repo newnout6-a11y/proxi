@@ -894,3 +894,23 @@ def test_show_unrouted_models_decides_whether_unconfigured_providers_are_listed(
     report, rows = preview(capsys, tmp_path, '--config-library', path.parent,
                            relay=relay_config(tmp_path, show_unrouted_models=True, **only_openai))
     assert {row['name'] for row in rows} == claude_ids()
+
+
+def test_minara_claude_routes_are_listed_after_retool_and_checked_against_anthropics_catalog(monkeypatch):
+    import minara_catalog
+    measured = {'anthropic/claude-opus-5.5': {
+        'id': 'minara/claude-opus-5-5', 'upstream_model': 'anthropic/claude-opus-5.5', 'provider': 'anthropic',
+        'label': 'Claude Opus 5.5 (Minara)', 'status': 'ok', 'tools': True, 'vision': True, 'reasoning': True,
+        'reasoning_effort_levels': ['high', 'max'], 'effort_control': 'mapped', 'effort_map': {'low': 'high', 'max': 'max'}},
+        'openai/gpt-6.1-sol': {'id': 'minara/gpt-6.1-sol', 'upstream_model': 'openai/gpt-6.1-sol', 'provider': 'openai',
+                               'status': 'ok', 'reasoning': True, 'reasoning_effort_levels': []}}
+    monkeypatch.setattr(minara_catalog, 'MEASURED', measured)
+    routes = minara_catalog.build([{'upstream': 'minara', 'bearer_token': 'synthetic'}])
+    retool = models._BY_ID['claude-opus-5-5']
+    entries = [retool, *routes.values()]
+    assert [entry['id'] for entry in sync.claude_routes(entries)] == ['claude-opus-5-5', 'minara/claude-opus-5-5']
+    assert sync._base_id(routes['minara/claude-opus-5-5']) == 'claude-opus-5-5'  # Desktop's own catalog name
+    rows = build_catalog(entries, [{'name': 'claude-opus-5-5'}], desktop={'claude-opus-5-5': ['low', 'medium', 'high', 'max']})
+    assert [row['name'] for row in rows] == ['claude-opus-5-5', 'minara/claude-opus-5-5']
+    minara_row = rows[1]
+    assert minara_row['labelOverride'] == 'Claude Opus 5.5 (Minara)' and not minara_row['isFamilyDefault']

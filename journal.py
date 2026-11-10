@@ -568,6 +568,7 @@ class Journal:
             budget -= used
         lines = [line for found in reversed(parts) for line in found]
         restored = []
+        secrets = self._secrets()  # the same for every line: built once (it was 15 s of a 19 s start with 76 accounts)
         for line in lines:
             try:
                 event = json.loads(line)
@@ -577,7 +578,7 @@ class Journal:
                 continue
             # Re-clean with the CURRENT patterns and secrets: events written by
             # older code (or before a redact fixup) must not serve raw.
-            event = self._clean(event, self._secrets())
+            event = self._clean(event, secrets)
             event["restored"] = True
             restored.append(event)
         with self._cond:
@@ -665,6 +666,10 @@ class Journal:
             cleaned = {}
             for key, item in list(value.items())[:64]:
                 # Keys are user-adjacent data too: a secret can sit in a key.
+                if isinstance(item, float) and "cost" in str(key) and math.isfinite(item):
+                    # A cost keeps its digits: rounded to 5 decimals, $0.000224 read 0.00022 and a cheap turn 0.0.
+                    cleaned[self._clean(str(key), secrets, depth + 1)] = round(item, 10)
+                    continue
                 cleaned[self._clean(str(key), secrets, depth + 1)] = self._clean(item, secrets, depth + 1)
             return cleaned
         if isinstance(value, (list, tuple, set)):
@@ -971,6 +976,48 @@ JOURNAL = Journal()
 def scrub(value):
     """Apply the journal's configured secret redaction to console diagnostics."""
     return JOURNAL._clean(value, JOURNAL._secrets())
+
+
+_SECRET_NAME = re.compile(r"(?i)api[_-]?key|secret|password|passwd|token|authorization|cookie|credential")
+MASK = "[redacted]"
+
+
+def redact_json(payload):
+    """A JSON body with every string in it masked like redact_whole, as valid JSON; text that is not JSON as text.
+
+    Masked value by value: redact()'s shapes ("key=value", "Bearer ...") run over the serialized body broke its quoting,
+    and a dump that is no longer JSON cannot be bisected."""
+    try:
+        value = json.loads(payload)
+    except (ValueError, RecursionError):
+        return redact_whole(payload)
+
+    def walk(item):
+        if isinstance(item, str):
+            return redact_whole(item)
+        if isinstance(item, list):
+            return [walk(part) for part in item]
+        if isinstance(item, dict):
+            # A member named like a secret ("password", "api_key", "token") is masked whole: string by string, its value
+            # alone matched no pattern ({"password": "hunter2"} in a tool call's arguments went to disk in clear).
+            return {walk(key) if isinstance(key, str) else key:
+                    MASK if isinstance(key, str) and isinstance(part, str) and part and _SECRET_NAME.search(key)
+                    else walk(part) for key, part in item.items()}
+        return item
+    try:
+        return json.dumps(walk(value), ensure_ascii=False)
+    except (ValueError, RecursionError):
+        return redact_whole(payload)  # nesting too deep for the walk: masked as text, as before
+
+
+def redact_whole(text):
+    """A text with every secret the journal knows masked, whole: no cut at 4,000 characters (a dump is for bisection)."""
+    if not isinstance(text, str) or not text:
+        return text
+    secrets = JOURNAL._secrets()
+    text = redact(text, cookie_values=(JOURNAL._cfg or {}).get("cookie_values", ()))
+    pattern = getattr(secrets, "pattern", None)
+    return pattern.sub("[redacted]", text) if pattern is not None else text
 
 
 def emit(kind, message="", level="info", **fields):

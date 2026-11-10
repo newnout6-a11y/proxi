@@ -3,7 +3,6 @@
 No automatic generation retries: a disconnected request may already have been billed.
 """
 import asyncio
-import collections
 import contextlib
 import copy
 import hashlib
@@ -11,17 +10,22 @@ import json
 import math
 import os
 import queue
+import re
 import threading
 import time
 
 import apierr
+import client_context
 import forced_choice
 import journal
+import redact
 
 BASE = "https://api.minara.ai/v1"
+BILLING_PREFIX = "x-anthropic-billing-header:"
+HEAD_WARM = 3300.0  # seconds a Claude head used by a request stays readable without a leader: under the marks' hour
+SILENCE_LIMIT = 600.0  # seconds a reply may send nothing (a model that reasons before it writes) before curl cuts it  # Claude Code's attribution line (prompt_policy.BILLING_PREFIX)
 MAX_EVENT_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 128
-REASONING_KEPT = 256  # assistant replies per conversation whose reasoning_details are kept for the next request
 
 
 def _bounded_json(text, **kwargs):
@@ -113,7 +117,13 @@ def _message(message):
     value = message.get("content")
     if role == "tool" and isinstance(value, dict):
         result = value.get("toolResult", "")
-        if not isinstance(result, str):
+        if (isinstance(result, list) and result
+                and all(isinstance(block, dict) and block.get("type") == "text" for block in result)):
+            # Text blocks (MCP results, Claude Code's Agent and ToolSearch results): their text, as a model reads them
+            # natively. json.dumps showed it the escaped blocks ('[{"type": "text", "text": "line \"one\"\n..."}]'): exact
+            # text lost for edits, and every result paid for the wrapper and the escapes (audit, 2026-11-10).
+            result = "\n".join(block.get("text") or "" for block in result)
+        elif not isinstance(result, str):
             result = json.dumps(result, ensure_ascii=False)
         return {"role": "tool", "tool_call_id": value.get("toolCallId"), "content": result}
     result = {"role": role, "content": _content(value)}
@@ -162,46 +172,6 @@ def _messages(history):
         yield {'role': 'user', 'content': images}
 
 
-def _reasoning_key(message):
-    """What identifies one assistant reply across requests: its tool call IDs, else a hash of its text."""
-    calls = tuple(call.get("id") for call in message.get("tool_calls") or [] if isinstance(call, dict))
-    if calls:
-        return ("calls",) + calls
-    text = message.get("content")
-    if isinstance(text, list):
-        text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-    if not isinstance(text, str) or not text.strip():
-        return None
-    return ("text", hashlib.sha256(text.encode("utf-8")).hexdigest())
-
-
-def _attach_reasoning(messages, session):
-    """Give each assistant reply back the reasoning_details upstream sent with it (OpenRouter's signed thinking of Claude,
-    the encrypted reasoning of GPT). Upstream continues a reply that carries them with its reasoning context; one without
-    them is also accepted (measured 2026-11-09), so a reply the relay no longer remembers simply goes without."""
-    store = getattr(session, "_minara_reasoning", None)
-    if not store:
-        return
-    for message in messages:
-        if message.get("role") == "assistant":
-            details = store.get(_reasoning_key(message))
-            if details:
-                message["reasoning_details"] = copy.deepcopy(details)
-
-
-def _remember_reasoning(session, key, details):
-    if session is None or key is None or not details:
-        return
-    store = getattr(session, "_minara_reasoning", None)
-    if not isinstance(store, collections.OrderedDict):
-        store = collections.OrderedDict()
-        session._minara_reasoning = store
-    store[key] = details
-    store.move_to_end(key)
-    while len(store) > REASONING_KEPT:
-        store.popitem(last=False)
-
-
 def _mark(message, ttl):
     """Put a cache breakpoint on the last part of a message; False when the message has nothing to carry one."""
     content = message.get("content")
@@ -219,7 +189,7 @@ def _mark(message, ttl):
     return True
 
 
-def _cache_marks(messages, ttl):
+def _cache_marks(messages, ttl, mark_tail=True):
     """Anthropic caches only up to explicit breakpoints (measured on Minara: none, no cache; a top-level mark is ignored).
 
     At most four: the system head (with the tools, which come before it), the last message, and the end of the turn
@@ -232,24 +202,32 @@ def _cache_marks(messages, ttl):
     last_user = [i for i, message in enumerate(messages) if message.get("role") in ("user", "tool")]
     wanted = []
     if last_user:
-        wanted.append(last_user[-1])
+        if mark_tail:
+            wanted.append(last_user[-1])
+        elif len(last_user) > 1:
+            # A side request (a client's compaction, a one-shot job) is never continued: its own last message, the
+            # instruction, would be written for an hour and never read (2,053 and 2,142 tokens of two Claude Code
+            # compactions, 2026-11-10). The message before it, the end of the dialog's own history (a mid-turn
+            # compaction's latest tool results), is marked instead: everything up to there is read.
+            wanted.append(last_user[-2])
         # The end of the previous turn: the last user/tool message before the latest assistant reply.
         latest_assistant = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=None)
         if latest_assistant is not None:
             before = [i for i in last_user if i < latest_assistant]
             if before:
                 wanted.append(before[-1])
+    lowest = 1 if messages and messages[0].get("role") == "system" else 0  # no head: the first message can carry one
     for index in wanted:
         if marks >= 4:
             break
-        for candidate in range(index, 0, -1):
+        for candidate in range(index, lowest - 1, -1):
             if _mark(messages[candidate], ttl):
                 marks += 1
                 break
 
 
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None,
-               instruction=None):
+               instruction=None, mark_tail=True):
     """Translate canonical client history, not signed Retool replies, to OpenAI roles.
 
     `instruction` is a relay-only user turn after the last message (the forced tool choice asked in words): it gets no
@@ -257,6 +235,14 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     model = model_provider.get("upstream_model") or model_provider.get("model", "")
     if model.startswith("minara/"):
         model = model[len("minara/"):]
+    first, separator, rest = (head or "").partition("\n")
+    if first.startswith(BILLING_PREFIX) and separator:
+        # Claude Code's attribution line (x-anthropic-billing-header: cc_version=...; cch=<per-conversation>;) goes
+        # nowhere on Minara. Glued to the instructions, it made Minara drop the whole system prompt: 25 prompt tokens, the
+        # model knew none of the rules (Opus 5.5 and 4.7, 2026-11-10), so Claude Code ran without its system prompt on
+        # minara/claude-*. Without it the instructions arrive, and every conversation of a client has the same head: its
+        # fingerprint no longer splits the cache, so subagents read the head one of them wrote.
+        head = rest
     messages = [{"role": "system", "content": head}] if head else []
     canonical = getattr(session, "_native_client_messages", None)
     if canonical is not None and getattr(session, "_native_allow_cold_replay", True):
@@ -269,10 +255,15 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
                 messages.append({"role": "user", "content": _content(part) if isinstance(part, list) else str(part)})
     elif prompt:
         messages.append({"role": "user", "content": prompt})
-    _attach_reasoning(messages, session)
+    # No reasoning_details go back with the replies: Minara does not pass them on. Sent or not, the prompt has the same
+    # tokens and reads the same cache, in a tool loop as after it, on Opus 5.5, Opus 4.7, Sonnet 5.5, GPT-6.1-sol,
+    # Gemini 4 Argon and 3.6 Flash, Grok 4.7, Kimi K3, DeepSeek V4 Pro and GLM-5.3 Prime (measured 2026-11-10), and every
+    # one of them continues a tool call without them. Kept, they cost memory and a larger body on every request.
     if model.startswith("anthropic/") and cfg.get("direct_cache", True):
         ttl = cfg.get("minara_cache_ttl", "1h")
-        _cache_marks(messages, ttl if ttl in ("1h", "5m") else None)
+        # An hour costs Minara's accounts nothing more than five minutes (it bills every write at its list price), and a
+        # subagent that waits on a long command still reads its own history when it comes back.
+        _cache_marks(messages, ttl if ttl in ("1h", "5m") else None, mark_tail)
     if instruction:
         messages.append({"role": "user", "content": instruction})
     body = {"model": model, "messages": messages, "stream": True, "stream_options": {"include_usage": True}}
@@ -282,7 +273,11 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         declared = []
         for tool in tools:
             if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
-                declared.append(copy.deepcopy(tool))
+                # Only the standard fields: the relay marks a Codex custom tool inside its function (x-client-type,
+                # x-format with the whole grammar), which no upstream should see.
+                fn = {key: copy.deepcopy(value) for key, value in tool["function"].items()
+                      if key in ("name", "description", "parameters", "strict")}
+                declared.append({"type": "function", "function": fn})
             else:
                 fn = {key: copy.deepcopy(tool[key]) for key in ("name", "description", "parameters", "strict") if key in tool}
                 if "parameters" not in fn:
@@ -295,6 +290,13 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     effort = model_provider.get("reasoningEffort") or model_provider.get("reasoning_effort") or model_provider.get("effort")
     if effort and effort != "auto":
         body["reasoning_effort"] = effort
+    conversation = getattr(session, "_native_conversation_key", None) if session is not None else None
+    if model.startswith("openai/") and conversation:
+        # OpenAI routes a request with a cache key to where the same key's prefix is: through Minara, GPT-6.1 Sol read
+        # its cached prefix in 6 of 7 follow-ups with one and 1 of 7 without (2026-11-10). One key per conversation;
+        # a hash, so nothing of the client's identifiers goes upstream.
+        body["prompt_cache_key"] = "proxi-" + hashlib.sha256(
+            json.dumps(conversation, default=str).encode("utf-8")).hexdigest()[:32]
     return body
 
 
@@ -348,6 +350,11 @@ def normalize_usage(value, pricing=None):
         number = _count(details.get(source)) if isinstance(details, dict) else None
         if number is not None:
             result[target] = number
+    details = value.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        # OpenRouter always reports cache_write_tokens (0 when nothing was written); Minara's Bedrock and Anthropic paths
+        # leave the field out: their answer never caches (measured 2026-11-10). The orchestrator says so in the journal.
+        result["cache_write_reported"] = "cache_write_tokens" in details
     # OpenAI prompt_tokens includes cached tokens; relay input_tokens excludes
     # them. Adapters and journal add the canonical read/write counters back.
     if 'input_tokens' in result:
@@ -359,26 +366,36 @@ def normalize_usage(value, pricing=None):
             result.pop('cache_read', None)
             result.pop('cache_write', None)
     cost = value.get("cost")
-    if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
-        result["provider_cost"] = cost  # NOT Retool credits.
+    reported = cost if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0 else None
+    # Minara debits its own price list (its /v1/models pricing), 220 credits per dollar of it, not the cost upstream
+    # reports: a cache write is billed at its cache_write price (1.25x input) whether its TTL is 5 minutes or an hour,
+    # Sonnet 5.5's reads at $0.2/M. OpenRouter's usage.cost bills an hour-long write at 2x input: an Opus 5.5 write of
+    # 17,139 tokens reported 30.19 credits and was debited 18.88, the list price; balances over whole runs matched the list
+    # to 0.0002 credits (end-to-end runs of 2026-11-10). So the list prices every reply it can read; what upstream reported
+    # stays as upstream_cost, for diagnosis.
+    estimate = estimated_cost(pricing, result) if pricing is not None and 'input_tokens' in result else None
+    if estimate is not None:
+        result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
+        if reported is not None:
+            result["upstream_cost"] = reported
+    elif reported is not None and not (reported == 0 and result.get("output_tokens")):
+        result["provider_cost"] = reported  # NOT Retool credits.
         currency = value.get("currency")
         if isinstance(currency, str) and 1 <= len(currency) <= 16 and currency.isascii() and currency.isalpha():
             result["provider_cost_currency"] = currency.upper()
         else:
-            # Minara's usage.cost is US dollars at the prices of its /v1/models (Opus 4.5 at 5/25 per million, as
-            # Anthropic's own): 220 of its credits went per 1.0 of it (measured on 2026-11-09).
             result["provider_cost_currency"] = "USD"
-    elif pricing is not None and 'input_tokens' in result:
-        estimate = estimated_cost(pricing, result)
-        if estimate is not None:
-            # GPT-6.x, Gemini, GLM and DeepSeek report no cost: the catalog price of the tokens, marked as an estimate.
-            result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
     return result
 
 
 def estimated_cost(pricing, usage):
-    """USD for one reply at a flat catalog price (per million tokens); None for tiered or per-request pricing."""
-    if not isinstance(pricing, dict) or pricing.get("billing_mode") or pricing.get("quota_type") not in (0, None):
+    """USD for one reply at the catalog price (per million tokens): flat, or Minara's tiered expression; None when the
+    price cannot be read (per-request pricing, an expression this reader does not know)."""
+    if not isinstance(pricing, dict) or pricing.get("quota_type") not in (0, None):
+        return None
+    if pricing.get("billing_mode") == "tiered_expr":
+        return _tiered_cost(pricing, usage)
+    if pricing.get("billing_mode"):
         return None
     try:
         rates = {key: float(pricing[key]) for key in ("prompt", "completion")}
@@ -389,6 +406,106 @@ def estimated_cost(pricing, usage):
     total = (usage.get("input_tokens", 0) * rates["prompt"] + usage.get("output_tokens", 0) * rates["completion"]
              + usage.get("cache_read", 0) * read + usage.get("cache_write", 0) * write) / 1e6
     return round(total, 10) if math.isfinite(total) and total >= 0 else None
+
+
+def _tiered_cost(pricing, usage):
+    """Minara's (new-api's) tiered price: an expression over p (uncached input), c (output), cr (cache read), cc and cc1h
+    (cache written for 5 minutes or an hour) and len (the whole prompt), in USD per million tokens, e.g.
+    "len > 272000 ? (p * 4 + c * 15 + cr * 0.2 + cc * 5) : (p * 2 + c * 10 + cr * 0.1 + cc * 2.5)" (GPT-6.1 Sol). Read
+    by a small parser, never eval(); with writes at cc it matched Minara's debits."""
+    expression = pricing.get("billing_expr")
+    if not isinstance(expression, str) or len(expression) > 2000:
+        return None
+    written = usage.get("cache_write", 0)
+    # Minara bills every write at the cc term, an hour-long one too (Haiku 5.5's 1h writes were debited at cc's $0.125/M,
+    # not cc1h's $0.2/M): cc1h stays 0.
+    names = {"p": usage.get("input_tokens", 0), "c": usage.get("output_tokens", 0), "cr": usage.get("cache_read", 0),
+             "cc": written, "cc1h": 0}
+    names["len"] = names["p"] + names["cr"] + written
+    try:
+        value = _Expression(expression, names).value()
+        ratio = float(pricing.get("group_ratio") or 1)
+    except (ValueError, TypeError, ZeroDivisionError, RecursionError):
+        return None
+    total = value * ratio / 1e6
+    return round(total, 10) if math.isfinite(total) and total >= 0 else None
+
+
+class _Expression:
+    """ternary := comparison ["?" ternary ":" ternary]; comparison := sum [(">"|"<"|">="|"<="|"=="|"!=") sum];
+    sum := product (("+"|"-") product)*; product := unary (("*"|"/") unary)*; unary := ["-"] atom;
+    atom := number | name | "(" ternary ")". Anything else is a ValueError."""
+
+    def __init__(self, text, names):
+        self.tokens = re.findall(r"\d+(?:\.\d+)?|[A-Za-z_]\w*|>=|<=|==|!=|[-+*/()?:<>]|\S", text)
+        self.names = names
+        self.at = 0
+
+    def value(self):
+        result = self._ternary()
+        if self.at != len(self.tokens):
+            raise ValueError("unexpected " + self.tokens[self.at])
+        return float(result)
+
+    def _peek(self):
+        return self.tokens[self.at] if self.at < len(self.tokens) else None
+
+    def _take(self, expected=None):
+        token = self._peek()
+        if token is None or (expected is not None and token != expected):
+            raise ValueError("expected %s" % (expected or "a value"))
+        self.at += 1
+        return token
+
+    def _ternary(self):
+        condition = self._comparison()
+        if self._peek() != "?":
+            return condition
+        self._take("?")
+        yes = self._ternary()
+        self._take(":")
+        no = self._ternary()
+        return yes if condition else no
+
+    def _comparison(self):
+        left = self._sum()
+        operator = self._peek()
+        if operator in (">", "<", ">=", "<=", "==", "!="):
+            self._take()
+            right = self._sum()
+            return {">": left > right, "<": left < right, ">=": left >= right, "<=": left <= right,
+                    "==": left == right, "!=": left != right}[operator]
+        return left
+
+    def _sum(self):
+        total = self._product()
+        while self._peek() in ("+", "-"):
+            total = total + self._product() if self._take() == "+" else total - self._product()
+        return total
+
+    def _product(self):
+        total = self._unary()
+        while self._peek() in ("*", "/"):
+            total = total * self._unary() if self._take() == "*" else total / self._unary()
+        return total
+
+    def _unary(self):
+        if self._peek() == "-":
+            self._take()
+            return -self._unary()
+        return self._atom()
+
+    def _atom(self):
+        token = self._take()
+        if token == "(":
+            result = self._ternary()
+            self._take(")")
+            return result
+        if token[0].isdigit():
+            return float(token)
+        if token in self.names:
+            return float(self.names[token])
+        raise ValueError("unknown name " + token)
 
 
 class EventParser:
@@ -405,7 +522,7 @@ class EventParser:
         self.signed = False
 
     def reasoning_details(self):
-        """The reasoning_details of the reply, assembled, for the next request to send back (_attach_reasoning)."""
+        """The reasoning_details of the reply, assembled (the signature the client gets comes from them)."""
         result = []
         for index in sorted(self.details):
             item = {key: value for key, value in self.details[index].items() if value not in (None, "")}
@@ -414,7 +531,7 @@ class EventParser:
         return result
 
     def reply_key(self):
-        """The key the reply is known by when the client sends it back (_reasoning_key)."""
+        """The key the reply is known by when the client sends it back: its tool call ids, else a hash of its text."""
         calls = [self.calls[index] for index in sorted(self.calls)]
         if calls:
             return ("calls",) + tuple(call["id"] for call in calls)
@@ -573,7 +690,10 @@ def _upstream_failure(item):
 # Minara's own routing failures: the model is in /v1/models, but no channel serves it right now (measured 2026-11-09:
 # windows of minutes in which a model or every OpenRouter model answers 500/503 like this, unbilled).
 _CHANNEL_MARKS = (b"channel_selection", b"channel_unavailable", b"no_enabled_channel", b"available channel",
-                  b"Unknown or unsupported model")
+                  b"Unknown or unsupported model",
+                  # OpenRouter's provider down: Opus 4.7 answered every request so for ten minutes, the same requests were
+                  # answered before and after (2026-11-10 01:05-01:15)
+                  b"The request could not be processed")
 CHANNEL_RETRY_AFTER = 30
 
 
@@ -584,8 +704,20 @@ def _channel_trouble(status, text):
 
 
 def _http_error(status, headers, text=b""):
+    """The error a Minara answer of `status` becomes, marked as upstream's (the journal logged them as the relay's)."""
+    error = _status_error(status, headers, text)
+    error.upstream_status = status
+    error.unbilled = True  # answered instead of a stream: nothing was generated, so another account may take it
+    return error
+
+
+def _status_error(status, headers, text=b""):
     if status in (401, 403):
-        return apierr.upstream_auth_failed("Minara rejected upstream authentication")
+        # The code is the one every account path knows (auth_dead, failover); the words are Minara's, not Retool's.
+        error = apierr.ApiError(502, "upstream_auth_error", "Minara rejected the account's token (HTTP %s): it expired or "
+                                "was revoked; the request moves to another account, the account needs a new token" % status)
+        error.upstream_status = status
+        return error
     if status == 429:
         return apierr.too_many_requests("Minara rate limit", apierr.retry_after_seconds(headers.get("retry-after")) or 2)
     if status == 402:
@@ -594,17 +726,66 @@ def _http_error(status, headers, text=b""):
         error = apierr.service_unavailable("Minara has no working channel for this model right now; retry later")
         error.retry_after = CHANNEL_RETRY_AFTER
         return error
-    if status in (400, 404, 422):
-        return apierr.bad_request("Minara rejected the upstream request (HTTP %s)" % status)
+    if status in (400, 404, 413, 422):
+        # Minara's own words go to the client: Claude Code compacts on "prompt is too long", and a bare "HTTP 400" told
+        # nobody what to change (audit, 2026-11-10). Cut, on one line, and redacted like everything the relay prints.
+        detail = _upstream_message(text)
+        error = apierr.bad_request("Minara rejected the upstream request (HTTP %s)%s" % (
+            status, ": " + detail if detail else ""))
+        if status == 413:
+            error.status = 413
+        return error
     return apierr.upstream_error("Minara upstream HTTP %s" % status)
+
+
+def _innermost(message):
+    """OpenRouter's provider error inside Minara's ("Provider returned error ({"raw":"{\"type\":\"error\",...
+    \"message\":\"Could not process image\"...")): the innermost message, which says what to change; the
+    message as it is when there is none."""
+    found = message
+    for _ in range(3):
+        start, end = found.find("{"), found.rfind("}")
+        if start < 0 or end <= start:
+            break
+        try:
+            data = json.loads(found[start:end + 1])
+        except (ValueError, RecursionError):
+            break
+        inner = None
+        if isinstance(data, dict):
+            error = data.get("error")
+            inner = (error.get("message") if isinstance(error, dict) else None) or data.get("message") or data.get("raw")
+        if not isinstance(inner, str) or not inner.strip():
+            break
+        found = inner
+    return " ".join(found.split()) if found is not message else message
+
+
+def _upstream_message(text, limit=400):
+    """The message of an upstream error body (its error.message, else the start of the text), or ""."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    message = ""
+    try:
+        data = json.loads(text)
+        error = data.get("error") if isinstance(data, dict) else None
+        message = error.get("message") if isinstance(error, dict) else error if isinstance(error, str) else ""
+        message = message or (data.get("message") if isinstance(data, dict) else "") or ""
+    except (ValueError, AttributeError, RecursionError):
+        message = text if "<html" not in text[:200].lower() else ""
+    message = _innermost(" ".join(str(message).split()))
+    if len(message) > limit:
+        message = message[:limit - 1] + "…"
+    return redact.redact(message) if message else ""
 
 
 def _forced_requirement(model_provider, tools, tool_choice):
     """The call a request forces on a route that refuses tool_choice required/named, or None.
 
-    Opus, Sonnet and Haiku 5.5 answer 400 "tool_choice: type tool and any are not supported for this model" through
-    Minara: their reasoning cannot be switched off (measured 2026-11-09). The relay asks for the call in words, as for
-    Retool's Claude routes (forced_choice)."""
+    Anthropic refuses tool_choice any/tool whenever thinking is on: Opus, Sonnet and Haiku 5.5 answer 400 "tool_choice:
+    type tool and any are not supported for this model" through Minara (measured 2026-11-09), and every other Claude model
+    does once a level turns thinking on. The relay asks for the call in words on every Claude route (minara_models.json
+    forced_tool_choice false), as for Retool's Claude routes (forced_choice)."""
     if not tools or not model_provider.get("refuses_forced_tool_choice"):
         return None
     names = frozenset(name for name in map(forced_choice.tool_name, tools) if name)
@@ -621,6 +802,16 @@ def _forced_requirement(model_provider, tools, tool_choice):
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens, chunks=None):
     required = _forced_requirement(model_provider, tools, tool_choice)
+    context = client_context.current()
+    if (required is None and tools and context.get("client_task") == client_context.COMPACTION
+            and context.get("compaction_tools") == "restored"):
+        # The compaction of a Codex chat, whose tools the relay declared again to read the chat's cache: Codex cannot take
+        # a call in reply to it (the summary becomes "(no summary available)"), so a reply with one is not passed on.
+        async with contextlib.aclosing(_summary_events(cfg, session, model_provider, prompt, head, tools, tool_choice,
+                                                       max_tokens, chunks)) as events:
+            async for event in events:
+                yield event
+        return
     if required is None:
         async with contextlib.aclosing(_stream(cfg, session, model_provider, prompt, head, tools, tool_choice,
                                                max_tokens, chunks)) as events:
@@ -642,7 +833,16 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                     yield ready
         if end is None:
             return
-        if gate.complied or end.get("reason") == "cancelled":
+        reason = end.get("reason")
+        # A refusal, or a cap spent on reasoning alone, repeats for the same body: both end the turn as they would under a
+        # native choice (the orchestrator takes both as final), with what the attempt showed but never a call it held
+        # (under a named choice that could hand the client a call to another tool). Asking again only paid twice.
+        terminal = reason == "content_filter" or (reason == "length" and not gate.text and not gate.called)
+        if gate.complied or reason == "cancelled" or terminal:
+            if terminal and not gate.complied:
+                for held in gate.held:
+                    if held.get("type") != "tool_call":
+                        yield held
             yield end
             return
         journal.emit("turn.forced_choice_missed",
@@ -652,9 +852,86 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     raise apierr.ApiError(502, "upstream_tool_choice_ignored", "upstream did not honor the required client tool choice")
 
 
+def _read_timeout(cfg, deadline):
+    """(connect, read) for curl_cffi, whose low-speed window on a stream is their sum."""
+    connect = float(cfg.get("upstream_timeout", 120))
+    silence = max(1.0, min(SILENCE_LIMIT, deadline - time.monotonic()))
+    return connect, max(1.0, silence - connect)
+
+
+def _head_key(body):
+    """What a Claude body shares with every request of its kind: the model, the tools and the system message with its
+    cache mark; None when there is no such head, or one too small to be cached (direct.HEAD_MIN_CHARS)."""
+    import direct
+    messages = body.get("messages") or []
+    first = messages[0] if messages and isinstance(messages[0], dict) else None
+    if not str(body.get("model", "")).startswith("anthropic/") or first is None or first.get("role") != "system":
+        return None
+    content = first.get("content")
+    parts = content if isinstance(content, list) else []
+    if not any(isinstance(part, dict) and part.get("cache_control") for part in parts):
+        return None
+    tools = body.get("tools")
+    size = sum(len(part.get("text") or "") for part in parts if isinstance(part, dict))
+    size += len(json.dumps(tools, ensure_ascii=False, default=str)) if tools else 0
+    if size < direct.HEAD_MIN_CHARS:
+        return None
+    # The effort is part of it: a request on another level may not read the entry (Opus 4.7 at high did not read what
+    # low had written, 2026-11-10), so it must not wait for that leader.
+    payload = json.dumps(["minara", body.get("model"), body.get("reasoning_effort"), tools, first], sort_keys=True,
+                         ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+async def _summary_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens, chunks):
+    """iter_events for a Codex compaction whose tools the relay declared again: the reply is text, or it is asked again
+    (direct._summary_stream on Retool). An attempt that calls a tool is dropped (its cost still counts) and asked once
+    more with an instruction after the last message; a second call sends the request as Codex made it, with no tools."""
+    import summary_guard
+    for attempt in range(1, summary_guard.TRIES_WITH_TOOLS + 2):
+        fallback = attempt > summary_guard.TRIES_WITH_TOOLS
+        gate = summary_guard.Gate()
+        end = None
+        instruction = summary_guard.INSTRUCTION if attempt == 2 else None
+        async with contextlib.aclosing(_stream(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
+                                               chunks, instruction, text_only=fallback)) as events:
+            async for event in events:
+                if event.get("type") == "end":
+                    end = event
+                    continue
+                for ready in gate.feed(event):
+                    yield ready
+        if end is None:
+            return
+        if not gate.called or end.get("reason") == "cancelled" or fallback:
+            for ready in gate.release():
+                yield ready
+            yield end
+            return
+        journal.emit("turn.compaction_tool_call",
+                     "Модель вызвала инструмент вместо сводки сжатия: ответ отброшен, %s" % (
+                         "запрос повторён с просьбой ответить текстом" if attempt < summary_guard.TRIES_WITH_TOOLS else
+                         "запрос идёт без инструментов, как его прислал Codex"),
+                     "warn", model=model_provider.get("model"), called=gate.called, wrote_text=gate.text,
+                     attempt=attempt, tools_kept=attempt < summary_guard.TRIES_WITH_TOOLS, upstream="minara")
+
+
 async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens, chunks=None,
-                  instruction=None):
-    body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session, instruction)
+                  instruction=None, text_only=False):
+    import direct
+    side = client_context.current().get("client_task") in client_context.SIDE_TASKS
+    # text_only: the request as the client's own text, no tools and no canonical history (the summary guard's last try).
+    body = build_body(cfg, model_provider, head, prompt, None if text_only else tools, None if text_only else tool_choice,
+                      max_tokens, chunks, None if text_only else session, instruction, mark_tail=not side)
+    # Requests that go at once with one Claude head nobody has cached yet (Claude Code starts several subagents in one
+    # message): the first writes it, the others wait for its answer to begin and then read it, as on Retool
+    # (direct._claim_head). Minara's cache is shared by all its accounts; an entry is there once its response began.
+    head_key = _head_key(body) if cfg.get("direct_cache", True) else None
+    # Its cache lasts an hour: a head used within the last 55 minutes is read, no request waits for a leader.
+    warm = HEAD_WARM if cfg.get("minara_cache_ttl", "1h") == "1h" else None  # 5-minute marks: Retool's window
+    head_role, head_gate = (direct._claim_head(head_key, time.monotonic(), id(session), warm=warm)
+                            if head_key else (None, None))
+    head_marked = False
     token = token_of(cfg)
     if not isinstance(token, str) or not token.strip():
         raise apierr.service_unavailable("Minara Bearer token is missing")
@@ -724,12 +1001,17 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
             if request_sent is not None:
                 request_sent()
                 put({"type": "request_sent"})
-            delays = [float(value) for value in cfg.get("minara_channel_retry_delays", (3, 8))]
+            delays = list(cfg.get("minara_channel_retry_delays", (3, 8)))  # numbers: config.load checked them
             while True:
                 response = post(cfg.get("base", BASE).rstrip("/") + "/chat/completions",
                                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json", "Accept": "text/event-stream"},
                                 json=body, impersonate="chrome131", stream=True, allow_redirects=False,
-                                timeout=cfg.get("upstream_timeout", 120))
+                                # (connect, read): curl_cffi makes a lone number on a stream its low-speed window too,
+                                # and cut a reply silent for 120 s (a model that reasons before it writes anything: Opus
+                                # at max took up to 292 s to its first event on Retool). curl adds the two: silence is
+                                # allowed for SILENCE_LIMIT, never past the turn's deadline, so a cancelled silent request
+                                # gives its worker slot back within that.
+                                timeout=_read_timeout(cfg, deadline))
                 holder["response"] = response
                 if stopped.is_set():
                     return
@@ -744,6 +1026,10 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 if not (delays and _channel_trouble(response.status_code, text)
                         and time.monotonic() + delays[0] < deadline):
                     raise error
+                # Said, so a slow answer can be told from Minara's own retries (one took 17 s on an image).
+                journal.emit("upstream.channel_retry", "Minara: нет рабочего канала (HTTP %s), повтор через %g с" % (
+                    response.status_code, delays[0]), "info", upstream="minara", status=response.status_code,
+                    delay=delays[0], model=body.get("model"))
                 # Minara's channel failures are answered before anything is generated or billed: ask again shortly.
                 holder["response"] = None
                 try:
@@ -764,7 +1050,7 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
         except Exception as exc:
             # curl exceptions may contain credential-bearing URLs/headers; never forward them.
             timed_out = isinstance(exc, TimeoutError) or (
-                "CurlTimeout" in locals() and isinstance(exc, CurlTimeout))
+                "CurlTimeout" in locals() and isinstance(exc, CurlTimeout)) or getattr(exc, "code", None) == 28
             put(apierr.upstream_timeout("Minara upstream request timed out") if timed_out else
                 apierr.upstream_error("Minara connection or stream read failed"))
         finally:
@@ -778,6 +1064,12 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     parser = EventParser(pricing=model_provider.get("pricing"))
     try:
         yield {"type": "usage_start"}
+        if head_role == "follow":
+            waiting_since = time.monotonic()
+            outcome = await direct._wait_for_head(head_gate)
+            journal.emit("cache.head_wait", "Запрос ждал начала ответа соседнего запроса с той же головой: голова "
+                         "читается из кэша, а не пишется второй раз", "info", outcome=outcome, model=body.get("model"),
+                         upstream="minara", waited_ms=round((time.monotonic() - waiting_since) * 1000))
         while not slots.acquire(blocking=False):
             if stopped.is_set() or getattr(session, '_cancelled', False):
                 yield {"type": "end", "reason": "cancelled"}
@@ -813,13 +1105,18 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 continue
             if isinstance(item, Exception):
                 raise item
+            if head_gate is not None and not head_marked:
+                head_marked = True
+                direct._head_started(head_gate, head_key)  # the answer began: the head is in the cache now
             for event in parser.feed(item):
                 yield event
             if parser.done:
-                _remember_reasoning(session, parser.reply_key(), parser.reasoning_details())
-            if parser.done:
                 return
     finally:
+        if head_role == "lead" and not head_marked:
+            # The leader ended without an answer: nobody waits for it, the next request leads. A follower never releases
+            # its leader's gate (the others would stop waiting and write the head themselves).
+            direct._head_released(head_key, head_gate)
         abort()
         if admitted and not started:
             slots.release()

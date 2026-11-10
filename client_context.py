@@ -121,6 +121,7 @@ LEGACY_COMPACTION_INSTRUCTIONS = (
 # How many of the user messages that end a conversation are read for the instruction: it is the last one, or the one before
 # a reminder.
 _TRAILING_USER_MESSAGES = 3
+_REMINDER_PREFIX = "<system-reminder>"  # native_history.reminder: how a late system message becomes a user turn
 # Request headers a recorded request keeps for a preview: client identity and affinity, never a credential.
 # prompt_client reads x-codex-* (and the originator); conversation_affinity reads the session ids Codex 0.164 sends.
 _RECORDED_HEADERS = frozenset({"user-agent", "originator", "x-session-affinity", "x-session-id",
@@ -221,6 +222,21 @@ def _first_text(content):
     return ""
 
 
+def _last_user_blocks(parsed):
+    """The text blocks of the last user message that is not a reminder (native messages only), in order."""
+    for message in reversed(getattr(parsed, "native_messages", None) or ()):
+        if message.get("role") != "user":
+            return []
+        content = message.get("content")
+        blocks = ([content] if isinstance(content, str) else
+                  [block["text"] for block in content or () if isinstance(block, dict) and block.get("type") == "text"
+                   and isinstance(block.get("text"), str)])
+        if blocks and all(block.lstrip().startswith(_REMINDER_PREFIX) for block in blocks):
+            continue
+        return blocks
+    return []
+
+
 def _trailing_user_texts(parsed):
     """What the user messages that end the conversation open with, the last one first.
 
@@ -258,7 +274,16 @@ def client_task(parsed, identity=None):
             or info.get("codex_task") == COMPACTION or (info.get("client") == "opencode" and agent == COMPACTION)):
         return COMPACTION
     texts = [text.lstrip() for text in _trailing_user_texts(parsed)]
+    # A system message the client puts after its instruction (Claude Code 2.1.310 ends a /compact with a <total_tokens>
+    # reminder) reaches here as a user message wrapped as a reminder: the instruction is the message before it. Missed,
+    # the compaction lost its side-request handling and the dialog's effort (end-to-end run of 2026-11-10).
+    while texts and texts[0].startswith(_REMINDER_PREFIX):
+        texts = texts[1:]
     if texts and texts[0].startswith(COMPACTION_INSTRUCTIONS):
+        return COMPACTION
+    # Claude Code 2.1.310 adds its /compact instruction as one more text block of the last user message, after the
+    # user's own text: the message opens with the question, the instruction comes second (final check of 2026-11-10).
+    if any(block.lstrip().startswith(COMPACTION_INSTRUCTIONS) for block in _last_user_blocks(parsed)[1:]):
         return COMPACTION
     if len(texts) > 1 and texts[0].startswith(COMPACTION_NUDGE) and texts[1].startswith(COMPACTION_INSTRUCTIONS):
         return COMPACTION

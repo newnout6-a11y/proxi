@@ -168,6 +168,11 @@ DEFAULTS = {
     "cache_keepwarm_turn_offset": 200,
     # Accounts below this confirmed balance leave the routing pool.
     "min_account_balance": 20,
+    # Minara: how long the relay's cache marks keep a Claude prefix ("1h" or "5m"); the balance below which an account
+    # takes no new turn (credits; 0 = until Minara refuses); the waits before asking again when Minara has no channel.
+    "minara_cache_ttl": "1h",
+    "minara_min_credits": 0,
+    "minara_channel_retry_delays": [3, 8],
     "account_balance_interval": 300,
     "account_refresh_parallel": 3,
     # Pause after Retool's hourly managed-key limit; a limit right after the return adds 5 minutes
@@ -721,6 +726,16 @@ def _load(path):
         raise service_unavailable("min_account_balance must be a number")
     if not math.isfinite(cfg["min_account_balance"]) or cfg["min_account_balance"] < 0:
         raise service_unavailable("min_account_balance must be a finite non-negative number")
+    # A typo here failed silently (a ttl of "60m" became a 5-minute cache) or every Minara turn (a bad delay list).
+    if cfg.get("minara_cache_ttl") not in ("1h", "5m"):
+        raise service_unavailable('minara_cache_ttl must be "1h" or "5m"')
+    credits_floor = cfg.get("minara_min_credits")
+    if type(credits_floor) not in (int, float) or not math.isfinite(credits_floor) or credits_floor < 0:
+        raise service_unavailable("minara_min_credits must be a finite non-negative number")
+    delays = cfg.get("minara_channel_retry_delays")
+    if (not isinstance(delays, list) or len(delays) > 5
+            or any(type(item) not in (int, float) or not 0 <= item <= 60 for item in delays)):
+        raise service_unavailable("minara_channel_retry_delays must be a list of at most 5 waits of 0-60 seconds")
     if cfg["account_balance_interval"] < 0 or cfg["account_refresh_parallel"] < 1:
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
     if not 1 <= cfg["account_rate_limit_cooldown"] <= 3600:

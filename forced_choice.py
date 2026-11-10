@@ -23,7 +23,10 @@ Requirement = collections.namedtuple("Requirement", "named names")
 
 _UNKNOWN_ARGUMENT = "If a required argument is unknown, use a plausible value instead of asking."
 # Events that describe the attempt or its billing, not its content: never held back.
-PASSING = frozenset({"usage_start", "usage", "credits", "thinking_status", "thinking_heartbeat", "error"})
+# request_sent carries no content and says a request left: held back, a billed attempt cut before the call looked unsent
+# and moved to another account (final check of 2026-11-10), and the client's cost record went to the wrong attempt.
+PASSING = frozenset({"usage_start", "usage", "credits", "thinking_status", "thinking_heartbeat", "error",
+                     "request_sent"})
 
 
 def _tool_name(tool):
@@ -36,11 +39,16 @@ def _tool_name(tool):
 tool_name = _tool_name
 
 
-def requirement(model, tools, choice):
+def requirement(model, tools, choice, entry=None):
     """The Requirement of a request that forces a tool call on a route that cannot be told to; None for any other.
 
-    `tools` are the declarations in either shape, `choice` the client's normalised tool_choice."""
-    if not tools or not models.refuses_forced_tool_choice(model):
+    `tools` are the declarations in either shape, `choice` the client's normalised tool_choice. A Minara route says it in
+    its entry (forced_tool_choice false: every Claude route), which the Retool rule does not know."""
+    if entry is not None and entry.get("upstream") == "minara":
+        refuses = entry.get("forced_tool_choice") is False
+    else:
+        refuses = models.refuses_forced_tool_choice(model)
+    if not tools or not refuses:
         return None
     names = frozenset(name for name in map(_tool_name, tools) if name)
     if choice == "required":

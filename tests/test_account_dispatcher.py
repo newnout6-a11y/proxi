@@ -292,7 +292,7 @@ def test_top_up_is_adopted_before_answering_402(tmp_path, monkeypatch):
         yield {"type": "text", "delta": "ok"}
         yield {"type": "end", "reason": "stop"}
 
-    def recheck():
+    def recheck(entry=None):  # the request's model entry: only accounts of its provider are read
         account.unavailable = None
         return True
 

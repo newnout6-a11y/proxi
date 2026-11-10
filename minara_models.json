@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-11-09",
+ "generated_at": "2026-11-10",
  "source": "https://api.minara.ai/v1/models",
  "credits_per_usd": 220,
  "models": [
@@ -8,25 +8,55 @@
    "upstream_model": "anthropic/claude-fable-5",
    "label": "Claude Fable 5 (Minara)",
    "provider": "anthropic",
-   "status": "ok",
+   "status": "uncached",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": true,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [],
+    "broken": [],
+    "off": [
+     "none",
+     "minimal",
+     "low",
+     "medium",
+     "high",
+     "xhigh",
+     "max"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "easy"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": {
+    "default": "anthropic",
+    "none": "anthropic",
+    "minimal": "anthropic",
+    "low": "anthropic",
+    "medium": "anthropic",
+    "high": "anthropic",
+    "xhigh": "anthropic",
+    "max": "anthropic"
+   },
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -41,7 +71,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/claude-fable-5-1",
@@ -51,22 +81,61 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
     "xhigh",
     "max"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "high",
+       "minimal",
+       "none",
+       "medium"
+      ],
+      "median_reasoning_tokens": 420.0
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 700.5
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1223.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 520.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -84,6 +153,85 @@
    "checked_at": "2026-11-09"
   },
   {
+   "id": "minara/claude-fable-5-2",
+   "upstream_model": "anthropic/claude-fable-5.2",
+   "label": "Claude Fable 5.2 (Minara)",
+   "provider": "anthropic",
+   "status": "unmeasured",
+   "backend": null,
+   "tools": null,
+   "forced_tool_choice": false,
+   "vision": null,
+   "reasoning": true,
+   "thinking": null,
+   "thinking_signature": false,
+   "reasoning_effort_levels": [
+    "xhigh",
+    "max"
+   ],
+   "effort_source": "study:anthropic/claude-fable-5.1",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "high",
+       "minimal",
+       "none",
+       "medium"
+      ],
+      "median_reasoning_tokens": 420.0
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 700.5
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1223.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 520.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
+   "context": 1000000,
+   "max_output": 128000,
+   "limits_source": "openrouter /api/v1/models",
+   "limits_checked": null,
+   "cache": "explicit",
+   "pricing": {
+    "quota_type": 0,
+    "prompt": 8,
+    "completion": 40,
+    "cache_read": 0.2,
+    "cache_write": 10,
+    "request": null
+   },
+   "measured_from": null,
+   "checked_at": null
+  },
+  {
    "id": "minara/claude-haiku-4-5",
    "upstream_model": "anthropic/claude-haiku-4.5",
    "label": "Claude Haiku 4.5 (Minara)",
@@ -91,22 +239,69 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
     "minimal",
     "low",
     "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal"
+      ],
+      "median_reasoning_tokens": 895.5
+     },
+     {
+      "levels": [
+       "low"
+      ],
+      "median_reasoning_tokens": 1863.0
+     },
+     {
+      "levels": [
+       "medium",
+       "high"
+      ],
+      "median_reasoning_tokens": 6541.0
+     },
+     {
+      "levels": [
+       "max",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 8610.0
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": null,
    "context": 200000,
    "max_output": 64000,
    "limits_source": "openrouter /api/v1/models",
@@ -137,16 +332,54 @@
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "minimal",
+       "none",
+       "medium"
+      ],
+      "median_reasoning_tokens": 584.0
+     },
+     {
+      "levels": [
+       "high",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 709.5
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1555.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 679.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -174,22 +407,63 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
-    "medium",
     "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "medium",
+       "xhigh",
+       "minimal"
+      ],
+      "median_reasoning_tokens": 600.0
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 836.0
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1271.0
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "easy"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": null,
    "context": 200000,
    "max_output": 32000,
    "limits_source": "openrouter /api/v1/models",
@@ -214,22 +488,69 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
     "minimal",
     "low",
     "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal"
+      ],
+      "median_reasoning_tokens": 856.0
+     },
+     {
+      "levels": [
+       "low"
+      ],
+      "median_reasoning_tokens": 1602.5
+     },
+     {
+      "levels": [
+       "medium"
+      ],
+      "median_reasoning_tokens": 3651.0
+     },
+     {
+      "levels": [
+       "high",
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 6201.5
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": null,
    "context": 200000,
    "max_output": 64000,
    "limits_source": "openrouter /api/v1/models",
@@ -251,25 +572,66 @@
    "upstream_model": "anthropic/claude-opus-4.6",
    "label": "Claude Opus 4.6 (Minara)",
    "provider": "anthropic",
-   "status": "ok",
+   "status": "uncached",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
+    "high"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 399.5
+     }
+    ],
+    "broken": [
+     "xhigh",
+     "max"
+    ],
+    "off": [
+     "none",
+     "minimal",
+     "low",
+     "medium",
+     "xhigh",
+     "max"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "easy"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": {
+    "default": "bedrock",
+    "none": "bedrock",
+    "minimal": "bedrock",
+    "low": "bedrock",
+    "medium": "bedrock",
+    "high": "bedrock",
+    "xhigh": "bedrock",
+    "max": "bedrock"
+   },
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -284,7 +646,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/claude-opus-4-7",
@@ -294,22 +656,70 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
     "medium",
-    "high",
-    "xhigh",
-    "max"
+    "high"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "channels",
+   "effort_map": {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "medium"
+      ],
+      "median_reasoning_tokens": 521.0
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 753.0
+     }
+    ],
+    "broken": [
+     "xhigh",
+     "max"
+    ],
+    "off": [
+     "none",
+     "minimal",
+     "xhigh",
+     "max"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": "high",
+   "natural_effort": "high",
+   "channels": {
+    "default": "bedrock",
+    "none": "bedrock",
+    "minimal": "bedrock",
+    "low": "openrouter",
+    "medium": "openrouter",
+    "high": "openrouter",
+    "xhigh": "bedrock",
+    "max": "bedrock"
+   },
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -324,7 +734,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/claude-opus-4-8",
@@ -334,22 +744,65 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
     "medium",
-    "high",
-    "xhigh",
-    "max"
+    "high"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "channels",
+   "effort_map": {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "medium",
+       "high"
+      ],
+      "median_reasoning_tokens": 1366.5
+     }
+    ],
+    "broken": [
+     "xhigh",
+     "max"
+    ],
+    "off": [
+     "none",
+     "minimal",
+     "xhigh",
+     "max"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": "high",
+   "natural_effort": "high",
+   "channels": {
+    "default": "bedrock",
+    "none": "bedrock",
+    "minimal": "bedrock",
+    "low": "openrouter",
+    "medium": "openrouter",
+    "high": "openrouter",
+    "xhigh": "bedrock",
+    "max": "bedrock"
+   },
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -364,7 +817,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/claude-opus-5",
@@ -374,22 +827,70 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
     "medium",
-    "high",
-    "xhigh",
-    "max"
+    "high"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "channels",
+   "effort_map": {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "medium"
+      ],
+      "median_reasoning_tokens": 524.5
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 794.5
+     }
+    ],
+    "broken": [
+     "xhigh",
+     "max"
+    ],
+    "off": [
+     "none",
+     "minimal",
+     "xhigh",
+     "max"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": "high",
+   "natural_effort": "high",
+   "channels": {
+    "default": "bedrock",
+    "none": "bedrock",
+    "minimal": "bedrock",
+    "low": "openrouter",
+    "medium": "openrouter",
+    "high": "openrouter",
+    "xhigh": "bedrock",
+    "max": "bedrock"
+   },
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -404,7 +905,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/claude-opus-5-5",
@@ -420,16 +921,49 @@
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "low",
+       "medium",
+       "none",
+       "high",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 304.5
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1108.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 306.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -454,22 +988,69 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
     "minimal",
     "low",
     "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal"
+      ],
+      "median_reasoning_tokens": 1043.5
+     },
+     {
+      "levels": [
+       "low"
+      ],
+      "median_reasoning_tokens": 1565.0
+     },
+     {
+      "levels": [
+       "medium"
+      ],
+      "median_reasoning_tokens": 3701.0
+     },
+     {
+      "levels": [
+       "xhigh",
+       "high",
+       "max"
+      ],
+      "median_reasoning_tokens": 5769.0
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": null,
    "context": 1000000,
    "max_output": 64000,
    "limits_source": "openrouter /api/v1/models",
@@ -494,25 +1075,66 @@
    "upstream_model": "anthropic/claude-sonnet-4.6",
    "label": "Claude Sonnet 4.6 (Minara)",
    "provider": "anthropic",
-   "status": "ok",
+   "status": "uncached",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
+    "high"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 404.0
+     }
+    ],
+    "broken": [
+     "xhigh",
+     "max"
+    ],
+    "off": [
+     "none",
+     "minimal",
+     "low",
+     "medium",
+     "xhigh",
+     "max"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "easy"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": {
+    "default": "bedrock",
+    "none": "bedrock",
+    "minimal": "bedrock",
+    "low": "bedrock",
+    "medium": "bedrock",
+    "high": "bedrock",
+    "xhigh": "bedrock",
+    "max": "bedrock"
+   },
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -527,7 +1149,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/claude-sonnet-5",
@@ -537,22 +1159,70 @@
    "status": "ok",
    "backend": "openrouter",
    "tools": true,
-   "forced_tool_choice": true,
+   "forced_tool_choice": false,
    "vision": true,
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": true,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
     "medium",
-    "high",
-    "xhigh",
-    "max"
+    "high"
    ],
-   "effort_source": "vendor:anthropic/claude-opus-5.5,anthropic/claude-sonnet-5.5,anthropic/claude-haiku-5.5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "channels",
+   "effort_map": {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "medium",
+       "low"
+      ],
+      "median_reasoning_tokens": 831.5
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 1188.5
+     }
+    ],
+    "broken": [
+     "xhigh",
+     "max"
+    ],
+    "off": [
+     "none",
+     "minimal",
+     "xhigh",
+     "max"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": "high",
+   "natural_effort": "high",
+   "channels": {
+    "default": "bedrock",
+    "none": "bedrock",
+    "minimal": "bedrock",
+    "low": "openrouter",
+    "medium": "openrouter",
+    "high": "openrouter",
+    "xhigh": "bedrock",
+    "max": "bedrock"
+   },
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -567,7 +1237,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/claude-sonnet-5-5",
@@ -583,16 +1253,49 @@
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "medium",
+       "low",
+       "minimal",
+       "none",
+       "high",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 321.5
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1091.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 363.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -728,16 +1431,50 @@
    "thinking": "stream",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
+    "none"
    ],
-   "effort_source": "family:deepseek/deepseek-v4-pro",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "high",
+       "medium"
+      ],
+      "median_reasoning_tokens": 2886.5
+     },
+     {
+      "levels": [
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 4543.0
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none",
+     "minimal"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 4036.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048575,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -770,15 +1507,59 @@
    "thinking_signature": false,
    "reasoning_effort_levels": [
     "none",
-    "minimal",
     "low",
-    "medium",
     "high",
-    "xhigh",
-    "max"
+    "xhigh"
    ],
-   "effort_source": "family:deepseek/deepseek-v4-pro",
-   "effort_effect": "measured",
+   "effort_source": "study:deepseek/deepseek-v4-pro",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "medium",
+       "max"
+      ],
+      "median_reasoning_tokens": 2783.0
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 3887.5
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 16201.0
+     }
+    ],
+    "broken": [
+     "max"
+    ],
+    "off": [
+     "none",
+     "minimal"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 1412.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -809,17 +1590,48 @@
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "vendor:deepseek/deepseek-v4-pro,deepseek/deepseek-v3.2",
-   "effort_effect": "inherited",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "none",
+       "max",
+       "xhigh",
+       "minimal",
+       "medium",
+       "low"
+      ],
+      "median_reasoning_tokens": 1436.5
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 2230.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 1943.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048575,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -851,15 +1663,59 @@
    "thinking_signature": false,
    "reasoning_effort_levels": [
     "none",
-    "minimal",
     "low",
-    "medium",
     "high",
-    "xhigh",
-    "max"
+    "xhigh"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "medium",
+       "max"
+      ],
+      "median_reasoning_tokens": 2783.0
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 3887.5
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 16201.0
+     }
+    ],
+    "broken": [
+     "max"
+    ],
+    "off": [
+     "none",
+     "minimal"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 1412.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1024000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -890,17 +1746,48 @@
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "vendor:deepseek/deepseek-v4-pro,deepseek/deepseek-v3.2",
-   "effort_effect": "inherited",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "none",
+       "low",
+       "medium"
+      ],
+      "median_reasoning_tokens": 982.5
+     },
+     {
+      "levels": [
+       "high",
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 3243.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 2438.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -931,16 +1818,55 @@
    "thinking": "end",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
+    "none"
    ],
-   "effort_source": "family:deepseek/deepseek-v4-pro",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "low"
+      ],
+      "median_reasoning_tokens": 1046.0
+     },
+     {
+      "levels": [
+       "max",
+       "high",
+       "medium"
+      ],
+      "median_reasoning_tokens": 1457.0
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 2193.0
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 1205.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -973,15 +1899,56 @@
    "thinking_signature": false,
    "reasoning_effort_levels": [
     "none",
-    "minimal",
     "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "family:deepseek/deepseek-v4-pro",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low"
+      ],
+      "median_reasoning_tokens": 769.0
+     },
+     {
+      "levels": [
+       "minimal",
+       "high",
+       "xhigh",
+       "medium"
+      ],
+      "median_reasoning_tokens": 1128.5
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1795.5
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 1043.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1012,17 +1979,48 @@
    "reasoning": true,
    "thinking": "hidden",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "none",
+       "max",
+       "xhigh",
+       "minimal",
+       "medium"
+      ],
+      "median_reasoning_tokens": 2325.0
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 2888.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 2238.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -1053,16 +2051,63 @@
    "thinking": "hidden",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
     "medium",
     "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "vendor:google/gemini-3.5-flash",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low"
+      ],
+      "median_reasoning_tokens": 1600.5
+     },
+     {
+      "levels": [
+       "medium"
+      ],
+      "median_reasoning_tokens": 3724.5
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 5246.0
+     },
+     {
+      "levels": [
+       "xhigh",
+       "high"
+      ],
+      "median_reasoning_tokens": 9824.0
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none",
+     "minimal"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -1092,17 +2137,48 @@
    "reasoning": true,
    "thinking": "hidden",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "family:google/gemini-3.5-flash",
-   "effort_effect": "measured",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "xhigh",
+       "medium",
+       "high",
+       "minimal",
+       "low"
+      ],
+      "median_reasoning_tokens": 2296.5
+     },
+     {
+      "levels": [
+       "none",
+       "max"
+      ],
+      "median_reasoning_tokens": 2799.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 2652.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -1132,17 +2208,48 @@
    "reasoning": true,
    "thinking": "hidden",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "family:google/gemini-3.5-flash",
-   "effort_effect": "measured",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "medium",
+       "max",
+       "high",
+       "none",
+       "low",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 1105.5
+     },
+     {
+      "levels": [
+       "minimal"
+      ],
+      "median_reasoning_tokens": 1287.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 1278.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -1172,17 +2279,43 @@
    "reasoning": true,
    "thinking": "hidden",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "family:google/gemini-3.5-flash",
-   "effort_effect": "measured",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "medium",
+       "high",
+       "max",
+       "minimal",
+       "xhigh",
+       "low",
+       "none"
+      ],
+      "median_reasoning_tokens": 1422.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 1834.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 65536,
    "limits_source": "openrouter /api/v1/models",
@@ -1212,17 +2345,43 @@
    "reasoning": true,
    "thinking": "hidden",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "family:google/gemini-3.5-flash",
-   "effort_effect": "measured",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "medium",
+       "high",
+       "none",
+       "minimal",
+       "max",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 550.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 531.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1255,6 +2414,12 @@
    "reasoning_effort_levels": [],
    "effort_source": null,
    "effort_effect": "unmeasured",
+   "effort_map": null,
+   "effort_control": null,
+   "effort_study": null,
+   "default_effort": null,
+   "natural_effort": null,
+   "channels": null,
    "context": 196608,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1287,6 +2452,12 @@
    "reasoning_effort_levels": [],
    "effort_source": null,
    "effort_effect": "unmeasured",
+   "effort_map": null,
+   "effort_control": null,
+   "effort_study": null,
+   "default_effort": null,
+   "natural_effort": null,
+   "channels": null,
    "context": 524288,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1316,17 +2487,48 @@
    "reasoning": true,
    "thinking": "stream",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "medium",
+       "high",
+       "low"
+      ],
+      "median_reasoning_tokens": 9419.5
+     },
+     {
+      "levels": [
+       "minimal",
+       "max",
+       "none",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 12000.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 12000.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 262144,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1356,17 +2558,38 @@
    "reasoning": true,
    "thinking": "none",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "vendor:moonshotai/kimi-k2.6",
-   "effort_effect": "inherited",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [],
+    "broken": [],
+    "off": [
+     "none",
+     "minimal",
+     "low",
+     "medium",
+     "high",
+     "xhigh",
+     "max"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0,
+    "question": "easy"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -1973,16 +3196,49 @@
    "thinking": "hidden",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "family:openai/gpt-6-luna",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "minimal",
+       "medium",
+       "none",
+       "high"
+      ],
+      "median_reasoning_tokens": 116.5
+     },
+     {
+      "levels": [
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 180.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 118.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2016,14 +3272,61 @@
    "thinking": "stream",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "low",
-    "medium",
     "high",
     "xhigh",
     "max"
    ],
-   "effort_source": "vendor:openai/gpt-6.1-sol,openai/gpt-6-luna,openai/gpt-5.5,openai/gpt-5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "low",
+       "none",
+       "medium"
+      ],
+      "median_reasoning_tokens": 244.0
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 358.0
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 491.0
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 656.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 253.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2049,21 +3352,59 @@
    "backend": "openai-responses",
    "tools": true,
    "forced_tool_choice": true,
-   "vision": false,
+   "vision": true,
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study:openai/gpt-6-sol-pro",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "low",
+       "medium"
+      ],
+      "median_reasoning_tokens": 314.0
+     },
+     {
+      "levels": [
+       "none",
+       "high",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 497.0
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 939.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 395.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2081,7 +3422,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/gpt-6-luna-pro",
@@ -2092,19 +3433,52 @@
    "backend": "openrouter",
    "tools": true,
    "forced_tool_choice": true,
-   "vision": false,
+   "vision": true,
    "reasoning": true,
    "thinking": "stream",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "vendor:openai/gpt-6.1-sol,openai/gpt-6-luna,openai/gpt-5.5,openai/gpt-5",
-   "effort_effect": "inherited",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "none"
+      ],
+      "median_reasoning_tokens": 797.5
+     },
+     {
+      "levels": [
+       "low",
+       "xhigh",
+       "medium",
+       "high",
+       "max"
+      ],
+      "median_reasoning_tokens": 1030.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 881.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2122,7 +3496,7 @@
     "request": null
    },
    "measured_from": null,
-   "checked_at": "2026-11-09"
+   "checked_at": "2026-11-10"
   },
   {
    "id": "minara/gpt-6-sol",
@@ -2138,16 +3512,54 @@
    "thinking": "end",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "family:openai/gpt-6-luna",
-   "effort_effect": "measured",
+   "effort_source": "study:openai/gpt-6-sol-pro",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "low",
+       "medium"
+      ],
+      "median_reasoning_tokens": 314.0
+     },
+     {
+      "levels": [
+       "none",
+       "high",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 497.0
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 939.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 395.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2181,14 +3593,54 @@
    "thinking": "hidden",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "vendor:openai/gpt-6.1-sol,openai/gpt-6-luna,openai/gpt-5.5,openai/gpt-5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "low",
+       "medium"
+      ],
+      "median_reasoning_tokens": 314.0
+     },
+     {
+      "levels": [
+       "none",
+       "high",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 497.0
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 939.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 395.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2222,14 +3674,54 @@
    "thinking": "end",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "minimal",
+       "medium",
+       "none"
+      ],
+      "median_reasoning_tokens": 116.5
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 156.5
+     },
+     {
+      "levels": [
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 216.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 123.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2263,14 +3755,60 @@
    "thinking": "stream",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "low",
-    "medium",
-    "high",
     "xhigh",
     "max"
    ],
-   "effort_source": "vendor:openai/gpt-6.1-sol,openai/gpt-6-luna,openai/gpt-5.5,openai/gpt-5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "none",
+       "low",
+       "medium"
+      ],
+      "median_reasoning_tokens": 255.0
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 360.5
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 491.0
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 715.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 290.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2304,14 +3842,54 @@
    "thinking": "none",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "family:openai/gpt-6.1-sol",
-   "effort_effect": "measured",
+   "effort_source": "study:openai/gpt-6.1-sol",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "minimal",
+       "medium",
+       "none"
+      ],
+      "median_reasoning_tokens": 116.5
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 156.5
+     },
+     {
+      "levels": [
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 216.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 123.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2345,14 +3923,60 @@
    "thinking": null,
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "low",
-    "medium",
-    "high",
     "xhigh",
     "max"
    ],
-   "effort_source": "vendor:openai/gpt-6.1-sol,openai/gpt-6-luna,openai/gpt-5.5,openai/gpt-5",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "minimal",
+       "none"
+      ],
+      "median_reasoning_tokens": 289.5
+     },
+     {
+      "levels": [
+       "medium",
+       "high"
+      ],
+      "median_reasoning_tokens": 407.5
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 466.5
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 948.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 347.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1050000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2476,16 +4100,45 @@
    "thinking": "stream",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "vendor:x-ai/grok-4.7",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "high",
+       "low",
+       "medium",
+       "minimal",
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 3378.0
+     }
+    ],
+    "broken": [],
+    "off": [
+     "none"
+    ],
+    "refused": [],
+    "default_reasoning_tokens": 0.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "none",
+   "channels": null,
    "context": 2000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2516,16 +4169,49 @@
    "thinking": "hidden",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "family:x-ai/grok-4.7",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "none",
+       "medium",
+       "minimal"
+      ],
+      "median_reasoning_tokens": 11321
+     },
+     {
+      "levels": [
+       "high",
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 46935.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 10230.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 2000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2556,16 +4242,60 @@
    "thinking": "stream",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
     "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "vendor:x-ai/grok-4.7",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "none"
+      ],
+      "median_reasoning_tokens": 979.0
+     },
+     {
+      "levels": [
+       "low"
+      ],
+      "median_reasoning_tokens": 1275.5
+     },
+     {
+      "levels": [
+       "high",
+       "medium"
+      ],
+      "median_reasoning_tokens": 2519.0
+     },
+     {
+      "levels": [
+       "max",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 4110
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 1198.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "low",
+   "channels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2596,16 +4326,55 @@
    "thinking": "end",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
+    "medium"
    ],
-   "effort_source": "vendor:x-ai/grok-4.7",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "low"
+      ],
+      "median_reasoning_tokens": 944.0
+     },
+     {
+      "levels": [
+       "medium",
+       "max"
+      ],
+      "median_reasoning_tokens": 2470.0
+     },
+     {
+      "levels": [
+       "high",
+       "xhigh",
+       "none"
+      ],
+      "median_reasoning_tokens": 4483.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 3674.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "high",
+   "channels": null,
    "context": 500000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2636,16 +4405,55 @@
    "thinking": "stream",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
+    "xhigh"
    ],
-   "effort_source": "vendor:x-ai/grok-4.7",
-   "effort_effect": "inherited",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "minimal"
+      ],
+      "median_reasoning_tokens": 827.5
+     },
+     {
+      "levels": [
+       "max",
+       "none",
+       "high",
+       "medium"
+      ],
+      "median_reasoning_tokens": 4305.0
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 7907.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 5248.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 500000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2676,16 +4484,61 @@
    "thinking": "end",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
-    "medium",
     "high",
-    "xhigh",
-    "max"
+    "xhigh"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "low"
+      ],
+      "median_reasoning_tokens": 4287.5
+     },
+     {
+      "levels": [
+       "max",
+       "medium",
+       "none"
+      ],
+      "median_reasoning_tokens": 13247.0
+     },
+     {
+      "levels": [
+       "high"
+      ],
+      "median_reasoning_tokens": 16155
+     },
+     {
+      "levels": [
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 22685.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 11650.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 500000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2718,17 +4571,53 @@
    "reasoning": true,
    "thinking": "end",
    "thinking_signature": false,
-   "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
-   ],
-   "effort_source": "family:x-ai/grok-4.7",
-   "effort_effect": "measured",
+   "reasoning_effort_levels": [],
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "xhigh"
+      ],
+      "median_reasoning_tokens": 3891.5
+     },
+     {
+      "levels": [
+       "none",
+       "high",
+       "max",
+       "low"
+      ],
+      "median_reasoning_tokens": 6181
+     },
+     {
+      "levels": [
+       "medium"
+      ],
+      "median_reasoning_tokens": 7128
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 5733.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 256000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2924,16 +4813,60 @@
    "thinking": "stream",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
     "medium",
-    "high",
-    "xhigh",
-    "max"
+    "high"
    ],
-   "effort_source": "family:z-ai/glm-5.2",
-   "effort_effect": "measured",
+   "effort_source": "study:z-ai/glm-5.3-prime",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "high"
+      ],
+      "median_reasoning_tokens": 521.0
+     },
+     {
+      "levels": [
+       "medium",
+       "xhigh",
+       "low"
+      ],
+      "median_reasoning_tokens": 611.0
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1612.0
+     },
+     {
+      "levels": [
+       "none"
+      ],
+      "median_reasoning_tokens": 2619.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 1665.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -2965,16 +4898,61 @@
    "thinking": "stream",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
     "minimal",
     "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
+    "medium"
    ],
-   "effort_source": "family:z-ai/glm-5.2",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "high",
+       "none"
+      ],
+      "median_reasoning_tokens": 411.5
+     },
+     {
+      "levels": [
+       "minimal"
+      ],
+      "median_reasoning_tokens": 573.0
+     },
+     {
+      "levels": [
+       "medium"
+      ],
+      "median_reasoning_tokens": 815.5
+     },
+     {
+      "levels": [
+       "xhigh",
+       "max"
+      ],
+      "median_reasoning_tokens": 1447.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 1984.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "xhigh",
+   "channels": null,
    "context": 1048575,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3006,16 +4984,55 @@
    "thinking": "end",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max"
+    "medium"
    ],
-   "effort_source": "family:z-ai/glm-5.3-prime",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "low",
+       "minimal"
+      ],
+      "median_reasoning_tokens": 368.5
+     },
+     {
+      "levels": [
+       "xhigh",
+       "medium",
+       "high"
+      ],
+      "median_reasoning_tokens": 501.0
+     },
+     {
+      "levels": [
+       "none",
+       "max"
+      ],
+      "median_reasoning_tokens": 1726.0
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 1218.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3046,16 +5063,56 @@
    "thinking": "end",
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
     "low",
     "medium",
-    "high",
-    "xhigh",
     "max"
    ],
-   "effort_source": "family:z-ai/glm-5.3-prime",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "medium",
+       "high",
+       "minimal"
+      ],
+      "median_reasoning_tokens": 427.5
+     },
+     {
+      "levels": [
+       "xhigh",
+       "low"
+      ],
+      "median_reasoning_tokens": 653.5
+     },
+     {
+      "levels": [
+       "max",
+       "none"
+      ],
+      "median_reasoning_tokens": 1544
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 2022.0,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1048576,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",
@@ -3086,16 +5143,60 @@
    "thinking": null,
    "thinking_signature": false,
    "reasoning_effort_levels": [
-    "none",
-    "minimal",
-    "low",
     "medium",
-    "high",
-    "xhigh",
-    "max"
+    "high"
    ],
-   "effort_source": "measured",
-   "effort_effect": "measured",
+   "effort_source": "study",
+   "effort_effect": "studied",
+   "effort_map": {
+    "none": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "effort_control": "mapped",
+   "effort_study": {
+    "groups": [
+     {
+      "levels": [
+       "minimal",
+       "high"
+      ],
+      "median_reasoning_tokens": 521.0
+     },
+     {
+      "levels": [
+       "medium",
+       "xhigh",
+       "low"
+      ],
+      "median_reasoning_tokens": 611.0
+     },
+     {
+      "levels": [
+       "max"
+      ],
+      "median_reasoning_tokens": 1612.0
+     },
+     {
+      "levels": [
+       "none"
+      ],
+      "median_reasoning_tokens": 2619.5
+     }
+    ],
+    "broken": [],
+    "off": [],
+    "refused": [],
+    "default_reasoning_tokens": 1665.5,
+    "question": "hard"
+   },
+   "default_effort": null,
+   "natural_effort": "medium",
+   "channels": null,
    "context": 1000000,
    "max_output": 128000,
    "limits_source": "openrouter /api/v1/models",

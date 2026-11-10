@@ -40,7 +40,9 @@ COMPACTION_AGENT = 'compaction'
 # Retool credits have no verified USD price here, so "cheap" means the small/fast
 # tier, in the order OpenCode itself prefers for small_model (Haiku, Flash, nano).
 SMALL_MODELS = ('claude-haiku-4-5-20251001', 'gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview',
-                'gemini-3.5-flash', 'gemini-2.5-flash', 'gpt-5-nano', 'gpt-5-mini', 'zai-org/GLM-5.3-Flash')
+                'gemini-3.5-flash', 'gemini-2.5-flash', 'gpt-5-nano', 'gpt-5-mini', 'zai-org/GLM-5.3-Flash',
+                # a relay with Minara accounts only: cheap Minara models that cache
+                'minara/claude-haiku-5-5', 'minara/deepseek-v4.1-flash', 'minara/glm-5.3-flash')
 UNKNOWN_CONTEXT = 128000
 UNKNOWN_OUTPUT = 32000
 MASK = '***'
@@ -144,6 +146,12 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
         item['variants'] = {level: {'name': level.title(), 'reasoningEffort': level,
                             'settings': {'reasoningEffort': level}, 'body': {'reasoningEffort': level}}
                             for level in levels}
+        # OpenCode 1.19 adds its own low/medium/high to a reasoning model; every relay route takes those levels, so they
+        # stay. They are not switched off with {"disabled": true}: OpenCode Desktop 2.2.5 sends "disabled" as a request
+        # parameter instead of hiding the variant (audit f7b2ca6).
+        # OpenCode takes image input from modalities alone (attachment does not enable it): without them no relay model
+        # took a pasted image, the model answered that it "doesn't support image input".
+        item['modalities'] = {'input': ['text', 'image'] if entry.get('vision') else ['text'], 'output': ['text']}
         options = item.get('options')
         if not isinstance(options, dict):
             options = item['options'] = {}
@@ -158,8 +166,10 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
         for key in ('settings', 'body'):
             if item.get(key) == {}:
                 del item[key]
-        if levels:
+        if levels and selected is not None:
             options['reasoningEffort'] = selected
+        elif levels:
+            pass  # no default: OpenCode sends no level and the model reasons its own way (a null is refused by OpenCode)
         elif not entry.get('reasoning'):
             options['reasoningEffort'] = 'none'  # a route that ignores effort never needs a client default
         new_models[name] = item
@@ -169,6 +179,10 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
     provider.pop('blacklist', None)
     provider['whitelist'] = list(new_models)
     fallback = default_model if default_model in new_models else next(iter(new_models))
+    # The references are read against the Minara routes being published: without them every "minara/..." reference was
+    # an unknown model, and the sync moved each agent the user had put on Minara back to Retool.
+    names = {'_minara_models': {entry['id']: entry for entry in entries
+                                if entry.get('upstream') == 'minara' and 'virtual' not in entry}}
     small = next((name for name in SMALL_MODELS if name in new_models), None)
 
     def update_reference(container, key, replacement):
@@ -181,11 +195,13 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
             return None
         raw, _, variant = item[len(PROVIDER) + 1:].partition('#')
         try:
-            name = models.canonical_name(raw)
+            name = models.canonical_name(raw, names)
         except ApiError:
             name = None
         if name in new_models:
-            suffix = '#' + variant if variant in new_models[name]['variants'] else ''
+            published = new_models[name]['variants'].get(variant)
+            # a variant switched off (OpenCode's own built-in levels the model does not offer) is no variant to keep
+            suffix = '#' + variant if isinstance(published, dict) and not published.get('disabled') else ''
             container[key] = PROVIDER + '/' + name + suffix
             return None
         if replacement:

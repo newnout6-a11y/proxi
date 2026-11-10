@@ -1303,6 +1303,7 @@ HEAD_STALE = 30.0
 _HEAD_GATES_MAX = 2048
 _HEAD_GATES = {}
 _HEAD_GATES_LOCK = threading.Lock()
+DUMP_INLINE_BYTES = 256 * 1024  # a rejected body larger than this is masked and written on a thread of its own
 
 
 class _HeadGate:
@@ -1348,13 +1349,13 @@ def _head_key(body):
     return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def _claim_head(key, now, owner=None):
+def _claim_head(key, now, owner=None, warm=None):
     """("cached", gate) when the head was used within HEAD_WARM, ("follow", gate) when another request is writing it now,
     ("lead", gate) when this request is the one that writes it. `owner` is the session: a retry of a turn on the session
     that leads (the only requests a session sends at once) leads again instead of waiting for itself."""
     with _HEAD_GATES_LOCK:
         gate = _HEAD_GATES.get(key)
-        if gate is not None and gate.started and now - gate.used_at <= HEAD_WARM:
+        if gate is not None and gate.started and now - gate.used_at <= (HEAD_WARM if warm is None else warm):
             return "cached", gate
         if (gate is not None and not gate.started and not gate.released and now - gate.opened_at <= HEAD_STALE
                 and (owner is None or gate.owner != owner)):
@@ -2376,8 +2377,17 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
                 return known
             request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
             stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
-            (folder / ("%s-body.json" % stamp)).write_bytes(payload)
-            (folder / ("%s-error.txt" % stamp)).write_text(detail, encoding="utf-8")
+            # The secrets the journal masks are masked here too (a token a tool result showed went in whole); the
+            # sha256 above is the original body's, for dedup.
+            def write(body=folder / ("%s-body.json" % stamp), error=folder / ("%s-error.txt" % stamp)):
+                # a lone surrogate (a client's "\ud83d") must not lose the dump: written as its escape
+                body.write_bytes(journal.redact_json(payload.decode("utf-8", "replace")).encode("utf-8", "backslashreplace"))
+                error.write_text(journal.redact_whole(str(detail)), encoding="utf-8", errors="backslashreplace")
+            if len(payload) < DUMP_INLINE_BYTES:
+                write()
+            else:
+                # Masking a large body takes seconds of regular expressions that hold the interpreter: not on the loop.
+                threading.Thread(target=write, name="dump-redact", daemon=True).start()
             metadata = {**client_context.current(), "request_id": request_id,
                         "upstream_status": status, "diagnostic_id": stamp,
                         "body_sha256": digest}

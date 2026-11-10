@@ -60,6 +60,7 @@ def clocked(prompt_relay):
 @pytest.mark.parametrize("path,key", [("/v1/models", "id"), ("/codex/models", "slug")])
 def test_a_catalog_follows_the_prompts_file_without_any_completion(clocked, tmp_path, path, key):
     relay, clock = clocked
+    before = journal.JOURNAL.last_seq  # only this test's events: others of the run may report prompt errors of their own
     file = tmp_path / "prompts.json"
     assert virtual(relay, path, key) == []
     file.write_text(json.dumps(document("mine")), encoding="utf-8")
@@ -76,7 +77,7 @@ def test_a_catalog_follows_the_prompts_file_without_any_completion(clocked, tmp_
     assert virtual(relay, path, key) == [MODEL + "@other"]
     clock.advance()
     assert virtual(relay, path, key) == []
-    assert not [event for event in journal.JOURNAL.query(limit=5000) if event["kind"] == "prompt.runtime_error"]
+    assert not [event for event in journal.JOURNAL.query(since=before, limit=5000) if event["kind"] == "prompt.runtime_error"]
 
 
 def test_the_codex_catalog_carries_the_base_text_of_a_file_that_appeared_after_the_start(clocked, tmp_path):

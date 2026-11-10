@@ -6,6 +6,7 @@ import collections
 import copy
 import datetime
 import fnmatch
+import re
 import console_log
 import minara_catalog as minara_routes
 
@@ -577,6 +578,12 @@ def default_model_warning(cfg, backends=None):
     return "default model '%s' is not published (%s); requests without 'model' are refused" % (entry['id'], reason)
 
 
+def _version_of(ident):
+    """The version numbers of a Claude id (claude-opus-5-5 -> (5, 5), claude-haiku-4-5-20251001 -> (4, 5)), for order."""
+    numbers = re.findall(r"(?<![0-9])([0-9]{1,2})(?![0-9])", ident.removeprefix('minara/'))
+    return tuple(int(number) for number in numbers[:2])
+
+
 def desktop_metadata(entry, entries):
     """Additional Anthropic Desktop discovery fields; IDs stay canonical.
 
@@ -591,12 +598,19 @@ def desktop_metadata(entry, entries):
         if limit >= 1000000:
             result['supports_1m'] = True
     if entry['provider'] == 'anthropic':
-        family = entry['id'].removeprefix('claude-').split('-', 1)[0]
+        # A Minara Claude (minara/claude-opus-5-5) is of the same family as Retool's. The family has one default, its first
+        # row: Retool's where the relay has both, Minara's in a Minara-only relay.
+        family = entry['id'].removeprefix('minara/').removeprefix('claude-').split('-', 1)[0]
         if family not in {'opus', 'sonnet', 'haiku', 'fable', 'mythos'}:  # Desktop's documented tier enum
             return result
         result['anthropic_family_tier'] = family
-        first = next(item['id'] for item in entries
-                     if item['provider'] == 'anthropic' and item['id'].startswith('claude-' + family + '-'))
+        family_rows = [item for item in entries if item['provider'] == 'anthropic'
+                       and item['id'].removeprefix('minara/').startswith('claude-' + family + '-')]
+        retool_rows = [item for item in family_rows if item.get('upstream') != 'minara']
+        # Retool's catalog is in order, newest first; Minara's is sorted by name, oldest first (Opus 4.1 at $15/$75 was
+        # the family default of a Minara-only relay): there the newest version leads.
+        first = (retool_rows[0]['id'] if retool_rows else
+                 max((item['id'] for item in family_rows), key=_version_of, default=entry['id']))
         result['is_family_default'] = entry['id'] == first
     return result
 
@@ -693,6 +707,13 @@ def codex_catalog(entries=None, snapshot=None):
         overrides = _codex_overrides(snapshot, model)
         efforts = entry.get('reasoning_effort_levels', [])
         default = entry.get('default_reasoning_effort')
+        natural = default or entry.get('natural_reasoning_effort')
+        if entry.get('upstream') == 'minara' and natural in EFFORT_ORDER:
+            # Codex always sends its default level: for a Minara model it is the level that reasons as the model does with
+            # none sent (the effort study's "natural" one), listed beside the levels that do something else. Offered
+            # alone, the lists' first level was the default: max for Opus 5.5 and GPT-6.1 Sol, none for Sonnet 5.5.
+            efforts = sorted(set(efforts) | {natural}, key=EFFORT_ORDER.index)
+            default = natural
         if default not in efforts:
             default = 'medium' if 'medium' in efforts else (efforts[0] if efforts else None)
         levels = [{'effort': effort, 'description': effort.title() + ' reasoning effort'} for effort in efforts]
@@ -751,6 +772,10 @@ def substitute_for(name):
     `name` is the base of the client's name (no @profile, no effort suffix). Only a model of an unsupported route has a
     substitute (SUBSTITUTES): a model some account can serve is never replaced."""
     named = _canonical(name)
+    if named.lower().startswith('minara/'):
+        # A Minara model is served by Minara or refused: "minara/" is no vendor prefix to strip (minara/gpt-6-luna went to
+        # Retool's gpt-6.1-terra as Retool's gpt-6-luna would).
+        return None
     if '/' in named and named not in _BY_ID:
         named = _canonical(named.split('/', 1)[1])  # a provider prefix ("openai/gpt-6-luna") is read as resolve() reads it
     served = SUBSTITUTES.get(named)
@@ -945,8 +970,16 @@ def ignored_effort_controls(data, entry):
 
 def effective_effort(entry, effort=None, configured=None, xhigh_as=None):
     """A global default is a preference; explicit client controls were validated by resolve."""
+    if (effort is None and entry.get("upstream") == "minara" and entry.get("reasoning", True)
+            and (not configured or str(configured).lower() == "auto")):
+        # "auto" is the model's own default on Minara: nothing is sent. Sending medium switched thinking on for models
+        # that do not think unless asked (Claude 4.x, Opus 4.5 at default: 0 reasoning tokens in the effort study).
+        # A model whose own default lands on a channel that drops the cache marks names the level to send instead.
+        return entry.get("default_reasoning_effort")
     if effort is not None or not configured or not entry.get("reasoning", True):
         return effort
+    if entry.get("reasoning_effort_control") == "mapped" and isinstance(configured, str):
+        return (entry.get("effort_map") or {}).get(configured.lower())
     configured = configured.lower() if isinstance(configured, str) else configured
     if configured != "auto" and configured not in EFFORT_ORDER:
         raise bad_request("invalid configured reasoning effort", param="reasoning_effort")
@@ -1017,7 +1050,7 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
     """
     entry, level = _resolve_requested(model, effort, strict=strict, default_model=default_model,
                                       allow_downgrade=allow_downgrade, xhigh_as=xhigh_as, cfg=cfg)
-    served = substitute_for(entry['id'])
+    served = None if entry.get('upstream') == 'minara' else substitute_for(entry['id'])
     if served:
         entry = _BY_ID[served]
         levels = entry.get('reasoning_effort_levels') or []
@@ -1060,8 +1093,11 @@ def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
     if not name:
         raise bad_request("'model' is required", param='model')
     entry = minara_entry(name, cfg) or _BY_ID.get(name)
-    if entry is None and name.startswith("minara/"):
-        raise not_found(f"unknown Minara model '{name}'; see GET /v1/models (no Minara account serves it)")
+    if entry is None and name.lower().startswith("minara/"):
+        # "Minara/gpt-6.1-sol" is no vendor prefix either: it is refused, never resolved to Retool's gpt-6.1-sol.
+        entry = minara_entry("minara/" + name[len("minara/"):], cfg)
+        if entry is None:
+            raise not_found(f"unknown Minara model '{name}'; see GET /v1/models (no Minara account serves it)")
     if entry is None and '/' in name:
         stripped = _canonical(name.split('/', 1)[1])
         if stripped in _BY_ID:
@@ -1075,6 +1111,14 @@ def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
     if effort is not None:
         if not entry.get('reasoning', True) and isinstance(effort, str) and effort.lower() == 'none':
             return entry, None  # An explicit disabled control is harmless; never forward it.
+        if entry.get('reasoning_effort_control') == 'mapped':
+            # A Minara model whose levels the effort study grouped into tiers: every level is accepted and sent as the
+            # level of its tier (None: nothing is sent), so a client that sends one level to every model never fails.
+            level = effort.lower() if isinstance(effort, str) else None
+            if level in EFFORT_ORDER:
+                return entry, (entry.get('effort_map') or {}).get(level)
+            raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
+                              param='reasoning_effort')
         if entry.get('reasoning_effort_control') == 'passthrough':
             # A Minara model that reasons, whose levels were not measured: the level goes to upstream as asked.
             if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:

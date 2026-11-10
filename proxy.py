@@ -567,7 +567,9 @@ def make_handler(runtime: Runtime):
                     self._json(200, self._with_prompts(lambda snapshot: model_catalog.codex_catalog(entries, snapshot)))
                 elif route == "balance":
                     report = self._balance_report()
-                    self._json(200 if report["available"] is not None else 503, report)
+                    # A relay of Minara accounts only has no Retool total: its Minara credits are an answer too.
+                    known = report["available"] is not None or (report.get("minara") or {}).get("available") is not None
+                    self._json(200 if known else 503, report)
                 elif route == "usage":
                     self._json(200, self._usage_report())
                 elif route == "health":
@@ -947,16 +949,20 @@ def make_handler(runtime: Runtime):
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"),
                                                        cfg.get("claude_xhigh_effort", "high"))
+            # No level sent is "default" (the model's own), never "none": that is a level of its own on Minara (Opus
+            # 4.7 sends it as low), and the console printed the same word for both.
             self._effort_str = effective_effort or (
                 "provider" if parsed.entry.get("reasoning") and
-                parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
+                parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored")
+                else "default" if parsed.entry.get("reasoning") and parsed.effort is None else "none")
 
             compatibility_headers = {}
             if substituted:
                 compatibility_headers['x-proxi-model-substituted'] = '%s=%s' % (parsed.requested_model, substituted)
             if parsed.structured_output:
                 compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
-            if forced_choice.requirement(parsed.model, parsed.tools, parsed.tool_choice) is not None:
+            if forced_choice.requirement(parsed.model, parsed.tools, parsed.tool_choice,
+                                         getattr(parsed, "entry", None)) is not None:
                 compatibility_headers['x-proxi-tool-choice'] = 'emulated'
             if 'thinking.display' in parsed.declared_ignored:
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
@@ -970,7 +976,7 @@ def make_handler(runtime: Runtime):
                 compatibility_headers['x-proxi-system-messages'] = 'inline-as-user-text'
                 journal.emit('request.compatibility',
                              'Системные сообщения внутри диалога переданы user-текстом на своих местах: '
-                             'Retool не принимает несколько system, head и подписи не меняются.', 'debug',
+                             'upstream не принимает несколько system, head и подписи не меняются.', 'debug',
                              request_id=self.request_id, control='mid_conversation_system',
                              handling='inline_user_text')
             if self._client_trace:
@@ -1273,7 +1279,7 @@ def make_handler(runtime: Runtime):
                 # TurnRunner confirms excluded balances once before it answers 402, so a top-up does not
                 # wait for the timer; a stream is refused only after the same confirmation.
                 recheck = getattr(runtime.accounts, "recheck_exhausted", None)
-                if recheck is not None and recheck():
+                if recheck is not None and recheck(entry):
                     error = runtime.pool.unavailable_error(entry, **scope)
             return error
 

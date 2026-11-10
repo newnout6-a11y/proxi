@@ -76,7 +76,7 @@ def test_parser_refuses_invalid_and_incomplete_stream(data):
 def test_usage_unknown_not_zero_and_bad_counts_filtered():
     assert minara.normalize_usage({}) == {}
     assert minara.normalize_usage({'prompt_tokens': True, 'completion_tokens': -1, 'cost': float('inf')}) == {}
-    assert minara.normalize_usage({'cost': 0, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 3}}) == {'provider_cost': 0, 'provider_cost_currency': 'USD', 'cache_read': 0, 'reasoning_tokens': 3}
+    assert minara.normalize_usage({'cost': 0, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 3}}) == {'provider_cost': 0, 'provider_cost_currency': 'USD', 'cache_read': 0, 'reasoning_tokens': 3, 'cache_write_reported': False}
 
 
 class Response:
@@ -261,8 +261,8 @@ def test_cached_prompt_normalization_preserves_total_in_all_dialects(read, write
 
 
 def test_cache_without_total_remains_unknown_and_inconsistent_details_do_not_inflate_total():
-    assert minara.normalize_usage({'prompt_tokens_details': {'cached_tokens': 8}}) == {'cache_read': 8}
-    assert minara.normalize_usage({'prompt_tokens': 5, 'prompt_tokens_details': {'cached_tokens': 8}}) == {'input_tokens': 5}
+    assert minara.normalize_usage({'prompt_tokens_details': {'cached_tokens': 8}}) == {'cache_read': 8, 'cache_write_reported': False}
+    assert minara.normalize_usage({'prompt_tokens': 5, 'prompt_tokens_details': {'cached_tokens': 8}}) == {'input_tokens': 5, 'cache_write_reported': False}
 
 
 @pytest.mark.parametrize('raw', ['[]', 'null', '123', '{"x":NaN}', '{"x":Infinity}', '{"x":1e400}'])

@@ -278,6 +278,14 @@ class _SocketReader:
             pass
 
 
+def _without_attribution(head):
+    """A head without Claude Code's attribution line: its fingerprint changes with every conversation and after a
+    compaction, and neither Anthropic (it consumes the line) nor Minara (the relay leaves it out) caches it, so a change
+    of it alone moves no cached prefix (cache.head_changed fired after every Claude Code compaction)."""
+    first, separator, rest = head.partition("\n")
+    return rest if separator and first.startswith("x-anthropic-billing-header:") else head
+
+
 class RelaySession:
     """One WebSocket turn stream bound to a single Retool thread."""
 
@@ -317,7 +325,7 @@ class RelaySession:
         """Direct transport: cacheable head, chunked history and native client tools."""
         prior = self._direct or {}
         if head:
-            if self._cached_head and self._cached_head != head:
+            if self._cached_head and _without_attribution(self._cached_head) != _without_attribution(head):
                 # Head churn invalidates the cached prefix, so every history
                 # breakpoint misses and the whole prompt is written again.
                 journal.emit("cache.head_changed", "Head изменился — кэш префикса будет перезаписан", "info",
@@ -1223,11 +1231,15 @@ class SessionPool:
             # The hourly limit clears by itself: say when, instead of a 402/503 that implies a manual fix.
             wait = min(max(0.0, r.get("until_at", 0.0) - time.time()) for r in limited)
             return apierr.accounts_rate_limited(wait, len(limited), len(backends))
+        minara = all((getattr(b, "cfg", None) or {}).get("upstream") == "minara" for b in backends)
         exhausted = [(account_tag(b, UNNAMED), r.get("available"))
                      for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
         if exhausted:
             threshold = next(r.get("threshold") for r in reasons if r.get("reason") == "exhausted")
-            return apierr.insufficient_credits(threshold or 0, exhausted)
+            return apierr.insufficient_credits(threshold or 0, exhausted, "Minara" if minara else "Retool")
+        if minara:
+            return apierr.service_unavailable("no usable Minara account: their tokens expired or were rejected; "
+                                              "add new tokens (admin, Accounts) and restart the relay")
         return apierr.service_unavailable("no usable account: Retool sessions need a new sign-in")
 
     def _on_shared_session(self, isolated=False, context_scope=None):
@@ -1281,8 +1293,11 @@ class SessionPool:
             return "reserve", spare
         # A signed-out account is still better than no account: its 401 makes the
         # refresher re-read config.json, so a fresh sign-in is adopted at once.
+        # A Bearer token (Minara) has no refresher and never changes before a restart: an expired or rejected one would
+        # only be sent to be refused, once per dead account per request.
         signed_out = [backend for backend in routable if backend not in exclude and account_enabled(backend)
-                      and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"]
+                      and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"
+                      and (getattr(backend, "cfg", None) or {}).get("upstream") != "minara"]
         if signed_out:
             return "signed_out", signed_out
         raise self._unusable_error(routable)
@@ -1664,11 +1679,6 @@ class SessionPool:
                             for name in ("_cache_dependents", "_cache_dependent_records", "_cache_children"):
                                 if hasattr(old, name):
                                     setattr(session, name, getattr(old, name))
-                            if (old.backend.cfg.get("upstream") == "minara" == replacement.cfg.get("upstream")
-                                    and getattr(old, "_minara_reasoning", None)):
-                                # Minara's accounts share one cache: the next request reads the old account's prefix only if
-                                # its replies carry the same reasoning_details (minara._attach_reasoning).
-                                session._minara_reasoning = old._minara_reasoning
                             self._conversations[key] = session
                             await old.aclose()
                             # Unless account_move_keeps_history took the signed branches along, the new account's first request
@@ -1688,7 +1698,8 @@ class SessionPool:
                         # or starts cold without touching its file, and a cancelled request leaves nothing behind.
                         restored = await self._restore_state(key, session)
                         self._conversations[key] = session
-                        journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
+                        journal.emit("session.create", "Новый диалог — новый тред %s" % (
+                                         "Minara" if backend.cfg.get("upstream") == "minara" else "Retool"), "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),
                                      account=account_tag(backend), pool=len(self._conversations))
                         self._report_restored(restored)

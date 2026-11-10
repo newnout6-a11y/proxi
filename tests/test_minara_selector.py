@@ -133,7 +133,7 @@ def stream_chunks(*deltas, finish='stop', usage=None):
     return lines
 
 
-def test_reasoning_details_are_shown_once_signed_and_sent_back_with_the_reply():
+def test_reasoning_details_are_shown_once_and_signed_and_never_sent_back():
     parser = minara.EventParser()
     events = []
     for data in stream_chunks(
@@ -152,13 +152,12 @@ def test_reasoning_details_are_shown_once_signed_and_sent_back_with_the_reply():
         {'role': 'user', 'content': [{'type': 'text', 'text': 'go'}]},
         {'role': 'assistant', 'content': [{'type': 'tool_call', 'toolCallId': 'call_9', 'toolName': 'read', 'toolInput': {'path': 'b'}}]},
         {'role': 'tool', 'content': {'toolCallId': 'call_9', 'toolResult': 'ok'}}])
-    minara._remember_reasoning(session, parser.reply_key(), parser.reasoning_details())
     body = minara.build_body({}, {'model': 'anthropic/claude-opus-5.5'}, '', '', None, None, 100, session=session)
     reply = next(m for m in body['messages'] if m['role'] == 'assistant')
-    assert reply['reasoning_details'][0]['signature'] == 'SIG=='
+    assert 'reasoning_details' not in reply  # Minara does not pass them on (measured on ten models, 2026-11-10)
 
 
-def test_encrypted_reasoning_is_kept_for_continuation_but_never_shown():
+def test_encrypted_reasoning_is_never_shown():
     parser = minara.EventParser()
     events = []
     for data in stream_chunks({'reasoning_details': [{'type': 'reasoning.encrypted', 'data': 'gAAA', 'index': 0, 'format': 'openai-responses-v1'}]},
@@ -175,16 +174,36 @@ def test_an_error_inside_a_200_chunk_is_an_upstream_error():
         parser.feed(json.dumps({'base_resp': {'status_code': 2049, 'status_msg': 'invalid api key'}, 'usage': {'prompt_tokens': 3}}))
 
 
-def test_flat_prices_estimate_the_cost_minara_does_not_report_and_tiered_ones_stay_unknown():
+def test_flat_and_tiered_prices_estimate_the_cost_minara_does_not_report():
     flat = {'quota_type': 0, 'prompt': 4, 'completion': 20, 'cache_read': 0.2, 'cache_write': 5}
     usage = minara.normalize_usage({'prompt_tokens': 1100, 'completion_tokens': 50,
                                     'prompt_tokens_details': {'cached_tokens': 1000}}, flat)
     assert usage['provider_cost'] == pytest.approx((100 * 4 + 50 * 20 + 1000 * 0.2) / 1e6)
     assert usage['provider_cost_estimated'] is True and usage['provider_cost_currency'] == 'USD'
-    tiered = {'quota_type': 0, 'billing_mode': 'tiered_expr', 'billing_expr': 'p * 2'}
-    assert 'provider_cost' not in minara.normalize_usage({'prompt_tokens': 10, 'completion_tokens': 1}, tiered)
+    # GPT-6.1 Sol's tiered price: the tier is chosen by the whole prompt (len)
+    gpt = {'quota_type': 0, 'billing_mode': 'tiered_expr', 'billing_expr':
+           'len > 272000 ? (p * 4 + c * 15 + cr * 0.2 + cc * 5) : (p * 2 + c * 10 + cr * 0.1 + cc * 2.5)'}
+    small = minara.normalize_usage({'prompt_tokens': 1100, 'completion_tokens': 50,
+                                    'prompt_tokens_details': {'cached_tokens': 1000}}, gpt)
+    assert small['provider_cost'] == pytest.approx((100 * 2 + 50 * 10 + 1000 * 0.1) / 1e6) and small['provider_cost_estimated']
+    large = minara.normalize_usage({'prompt_tokens': 300000, 'completion_tokens': 50}, gpt)
+    assert large['provider_cost'] == pytest.approx((300000 * 4 + 50 * 15) / 1e6)
+    # Haiku 5.5: Minara bills every write at cc, an hour-long one too (its debits matched cc, not cc1h)
+    haiku = {'quota_type': 0, 'billing_mode': 'tiered_expr', 'billing_expr': 'len > 100000 ? (p * 0.5 + c * 2.5 + cr * 0.05 '
+             '+ cc * 0.625 + cc1h * 1) : (p * 0.1 + c * 0.5 + cr * 0.01 + cc * 0.125 + cc1h * 0.2)', 'group_ratio': 1}
+    assert minara.estimated_cost(haiku, {'input_tokens': 4, 'output_tokens': 97, 'cache_write': 10459}) == 0.001356275
+    for bad in ('__import__(1)', 'p * ', 'q * 2', '(' * 600 + 'p' + ')' * 600):
+        assert minara.estimated_cost({'quota_type': 0, 'billing_mode': 'tiered_expr', 'billing_expr': bad},
+                                     {'input_tokens': 1}) is None
+    # Minara debits its list, not the cost upstream reports: the list prices the reply, the report is kept for diagnosis
     reported = minara.normalize_usage({'prompt_tokens': 10, 'completion_tokens': 1, 'cost': 0.5}, flat)
-    assert reported['provider_cost'] == 0.5 and 'provider_cost_estimated' not in reported
+    assert reported['provider_cost'] == pytest.approx((10 * 4 + 1 * 20) / 1e6) and reported['upstream_cost'] == 0.5
+    # without a readable list the reported cost is what there is
+    unlisted = minara.normalize_usage({'prompt_tokens': 10, 'completion_tokens': 1, 'cost': 0.5}, None)
+    assert unlisted['provider_cost'] == 0.5 and 'provider_cost_estimated' not in unlisted
+    # a reported 0 for a reply that wrote tokens is a cost nobody reported: estimated
+    zero = minara.normalize_usage({'prompt_tokens': 10, 'completion_tokens': 5, 'cost': 0}, flat)
+    assert zero['provider_cost'] == pytest.approx((10 * 4 + 5 * 20) / 1e6) and zero['provider_cost_estimated']
 
 
 class Response:

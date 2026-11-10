@@ -62,11 +62,15 @@ def upstream_of(ident, measured=None):
     return ident if '/' in ident else None
 
 
-def _effort_control(entry):
-    if not entry['reasoning']:
-        # Clients send one effort to every model (OpenCode, Claude Desktop): a model that does not reason takes it and
-        # nothing is forwarded, as for Retool's accepted-ignored routes.
+def _effort_control(entry, studied=None):
+    if not entry['reasoning'] or studied == 'accepted-ignored':
+        # Clients send one effort to every model (OpenCode, Claude Desktop): a model that does not reason, or whose levels
+        # the effort study found to change nothing, takes it and nothing is forwarded, as for Retool's accepted-ignored routes.
         return 'accepted-ignored'
+    if entry.get('effort_map'):
+        # Every level is accepted and sent as the study's map says: as asked, or, for a broken level, as one that works.
+        # The offered list may be empty (no level does more than the default); a level sent anyway still goes upstream.
+        return 'mapped'
     return 'selectable' if entry['reasoning_effort_levels'] else 'passthrough'
 
 
@@ -77,8 +81,12 @@ def route(upstream, descriptor=None, measured=None):
     value = dict(descriptor or {})
     tools = value.get('tools', found.get('tools'))
     vision = value.get('image', found.get('vision'))
-    reasoning = value.get('reasoning', found.get('reasoning', False))
+    # A model nobody measured (an excluded one an account lists, or one not in the file) may well reason: its levels go
+    # upstream as asked (passthrough) instead of being dropped as for a model known not to reason.
+    reasoning = value.get('reasoning', found['reasoning'] if 'reasoning' in found else True)
     levels = list(value.get('reasoning_effort_levels', found.get('reasoning_effort_levels') or []))
+    # An account that lists its own levels takes them as they are: the study's map no longer describes them.
+    effort_map = None if 'reasoning_effort_levels' in value else found.get('effort_map')
     entry = {
         'id': public_id(upstream) if not found else found['id'],
         'upstream': 'minara', 'upstream_model': upstream,
@@ -88,17 +96,25 @@ def route(upstream, descriptor=None, measured=None):
         # An unmeasured capability is not refused: the request goes and upstream answers it.
         'tools': True if tools is None else bool(tools), 'vision': True if vision is None else bool(vision),
         'reasoning': bool(reasoning), 'reasoning_effort_levels': levels if reasoning else [],
-        'forced_tool_choice': bool(value.get('forced_tool_choice', found.get('forced_tool_choice', True))),
+        'effort_map': copy.deepcopy(effort_map) if reasoning and effort_map else None,
+        # Unmeasured, a Claude route asks for a forced call in words: Anthropic refuses tool_choice any/tool with thinking.
+        'forced_tool_choice': bool(value.get('forced_tool_choice', found.get(
+            'forced_tool_choice', not upstream.startswith('anthropic/')))),
         'thinking': found.get('thinking'), 'thinking_signature': bool(found.get('thinking_signature')),
         'cache': found.get('cache') or ('explicit' if upstream.startswith('anthropic/') else 'automatic'),
         'pricing': copy.deepcopy(found.get('pricing')), 'backend': found.get('backend'),
-        'default_reasoning_effort': None,
+        # The level sent when the client asks for none, where the model's own default lands on a channel that drops the
+        # cache marks (scripts/probe_minara.py cached_levels); None sends nothing, the model's own default.
+        'default_reasoning_effort': found.get('default_effort') if reasoning and effort_map else None,
+        # The level that reasons like the model's own default, for a client that must name one (Codex's default level).
+        'natural_reasoning_effort': found.get('natural_effort') if reasoning and effort_map else None,
         'metadata_source': 'minara_models.json' if found else 'operator-configured',
-        'metadata_status': ('measured ' + str(found.get('checked_at'))) if found else 'unverified',
+        'metadata_status': ('measured ' + str(found.get('checked_at'))) if found.get('checked_at') else 'unverified',
     }
     if found.get('served_as'):
         entry['served_as'] = found['served_as']
-    entry['reasoning_effort_control'] = _effort_control(entry)
+    entry['reasoning_effort_control'] = _effort_control(
+        entry, None if 'reasoning_effort_levels' in value else found.get('effort_control'))
     return entry
 
 
