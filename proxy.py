@@ -567,6 +567,10 @@ def make_handler(runtime: Runtime):
                     self._models()
                 elif route == "codex_models":
                     entries = [entry for entry in model_catalog.catalog(cfg) if self._model_routable(entry)]
+                    if cfg.get("codex_catalog_gpt_only"):
+                        # Codex's picker offers GPT models only, Retool's and Minara's (the owner's choice, 2026-11-10):
+                        # Codex is OpenAI's client, and the Claude, GLM and Gemini routes have clients of their own.
+                        entries = [entry for entry in entries if entry.get("provider") == "openai"]
                     self._json(200, self._with_prompts(lambda snapshot: model_catalog.codex_catalog(entries, snapshot)))
                 elif route == "balance":
                     report = self._balance_report()

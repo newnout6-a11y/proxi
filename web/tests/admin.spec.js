@@ -899,6 +899,18 @@ test('a balance known for only some of the accounts says how many are missing, a
   await expect(page.locator('.forecast')).toContainText('по известным балансам хватит примерно на');
 });
 
+test('the summary shows Minara credits and dollars on their own line, the big figure is Retool', async ({ page }) => {
+  const minara = { available: 14980.84, usd: 68.0947, unit: 'minara_credits', accounts_total: 44, unknown_accounts: 0 };
+  await mockAdmin(page, { overviewPatch: { balance: { ...PARTIAL_BALANCE, minara } } });
+  await login(page);
+  await expect(page.locator('.instrument-head .instrument-label')).toContainText('Retool · 2 аккаунта');
+  const line = page.locator('.minara-balance');
+  await expect(line).toContainText('Minara · 44 аккаунта');
+  await expect(line).toContainText('14 980,84');
+  await expect(line).toContainText('$68,09');
+  await expect(line.locator('.tag')).toHaveCount(0);
+});
+
 test('a balance with a known total but a missing monthly limit says so, and its forecast needs no qualifier', async ({ page }) => {
   await mockAdmin(page, { overviewPatch: { balance: { ...PARTIAL_BALANCE, unknown_accounts: 0 } } });
   await login(page);

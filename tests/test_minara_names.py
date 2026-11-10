@@ -77,3 +77,10 @@ def test_claude_desktop_takes_a_minara_default_and_gives_minara_claude_its_famil
     assert models.desktop_metadata(models._BY_ID['claude-opus-5-5'], entries)['is_family_default'] is True
     alone = models.desktop_metadata(routes['_minara_models']['minara/claude-opus-5-5'], entries[1:])
     assert alone['is_family_default'] is True  # a Minara-only relay: its own row is the family's default
+
+
+def test_claude_codes_1m_marker_names_the_same_model(routes):
+    """A Desktop row with supports1m (or ANTHROPIC_MODEL=...[1m]) is the same model: the marker never reaches a route."""
+    assert models.parse_model_name('minara/claude-opus-5-5[1m]', routes).base == 'minara/claude-opus-5-5'
+    assert models.resolve_tolerant('minara/claude-opus-5-5[1m]', cfg=routes)[0]['id'] == 'minara/claude-opus-5-5'
+    assert models.parse_model_name('claude-opus-5-5[1M]').base == 'claude-opus-5-5'

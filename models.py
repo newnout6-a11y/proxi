@@ -827,6 +827,10 @@ def parse_model_name(name, cfg=None):
     style id) is one unknown model, which strict_models refuses and strict_models: false passes on as it is.
     """
     original = (name or '').strip()
+    if original.lower().endswith('[1m]'):
+        # Claude Code's 1M-context marker (minara/claude-fable-5-2[1m], a Desktop row with supports1m): it takes the marker
+        # off before an API request, and a client that passes the picker's name on still means the same model.
+        original = original[:-len('[1m]')].rstrip()
     if minara_entry(original, cfg) is not None:
         return ModelName(original, None, None)
     if '#' in original or '@' in original:

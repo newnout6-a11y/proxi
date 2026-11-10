@@ -166,3 +166,17 @@ def test_shared_mode_without_backends_uses_the_first_account_record_like_the_poo
     glm = models.resolve('zai-org/GLM-5.3')[0]
     assert not models.catalog_routable(glm, cfg)
     assert models.catalog_routable(glm, dict(cfg, session_mode='per_conversation'))
+
+
+def test_codex_lists_only_gpt_models_when_the_owner_asks(multi):
+    """codex_catalog_gpt_only: Codex's picker gets the GPT routes (Retool's and Minara's), never Claude, GLM or Gemini."""
+    runtime = multi.runner_.runtime
+    status, body, _ = multi.call('/codex/models')
+    assert status == 200 and any(not row['slug'].startswith('gpt-') for row in body['models'])
+    runtime.cfg['codex_catalog_gpt_only'] = True
+    try:
+        status, body, _ = multi.call('/codex/models')
+        slugs = [row['slug'] for row in body['models']]
+        assert status == 200 and slugs and all(slug.removeprefix('minara/').startswith('gpt-') for slug in slugs), slugs
+    finally:
+        runtime.cfg.pop('codex_catalog_gpt_only', None)

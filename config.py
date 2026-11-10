@@ -109,6 +109,9 @@ DEFAULTS = {
     # (client_task "background"), about 5 credits each on gpt-6.1-terra. False answers them with a 400 before anything is
     # spent, so Codex makes no memories until they are switched on again; a switch in the admin, applied at once.
     "codex_memory_jobs": True,
+    # true: /codex/models lists GPT models only (Retool's and Minara's), so Codex's picker shows no Claude, GLM or Gemini
+    # route (the owner's config sets it, 2026-11-10).
+    "codex_catalog_gpt_only": False,
     # Codex's compaction goes out with no tools, so it shared nothing with the chat's cached prefix and wrote the whole history again
     # (31,943 tokens, 1.65 credits where the chat's last request wrote 9,807; about 31 credits at 330k tokens). True declares the chat's
     # tools again (compaction_tools), so the summary reads the chat's cache; False serves the request as Codex sent it. A switch in
@@ -765,6 +768,8 @@ def _load(path):
         raise service_unavailable("compaction_keep_effort must be a boolean")
     if type(cfg["codex_memory_jobs"]) is not bool:
         raise service_unavailable("codex_memory_jobs must be a boolean")
+    if type(cfg["codex_catalog_gpt_only"]) is not bool:
+        raise service_unavailable("codex_catalog_gpt_only must be a boolean")
     if type(cfg["codex_compaction_cache"]) is not bool:
         raise service_unavailable("codex_compaction_cache must be a boolean")
     if type(cfg["infer_conversations"]) is not bool:

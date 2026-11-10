@@ -441,7 +441,16 @@ Claude Code, блок `env` в `settings.json`:
 
 `ANTHROPIC_DEFAULT_HAIKU_MODEL` — модель фоновых запросов Claude Code (заголовки,
 проверки). Без неё они идут на Haiku Retool; в relay только с аккаунтами Minara задайте её
-обязательно. Для обратного варианта поменяйте значения местами. Без
+обязательно. Для обратного варианта поменяйте значения местами.
+
+**Окно 1M в Claude Code.** Модель, которую Claude Code не знает (`minara/claude-fable-5-2`
+вышла позже его версии), он считает моделью на 200k и сжимает историю, как только диалог
+дорастает до них. Допишите к имени `[1m]`: `"ANTHROPIC_MODEL": "minara/claude-fable-5-2[1m]"`.
+Claude Code снимает метку перед запросом, а relay принимает имя и с ней. В Claude Desktop то же
+делает строка `inferenceModels` с полями `"behavesAs": "claude-fable-5-2"` (уровни effort и
+лимиты этой модели из каталога Desktop), `"supports1m": true` (вариант на 1M, при
+`modelPrefer1mContext` — единственный), `"anthropicFamilyTier": "fable"` и `"maxEffort": "max"`.
+Без них Desktop не показывает у модели выбор effort. Действует после перезапуска Desktop. Без
 `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` встроенные Explore и Plan остаются на модели основного
 агента, а `model:` в определениях агентов важнее переменной. Форки и skills с
 `model: inherit` всегда идут на модели основного агента. Проверить можно через `/tasks`:
@@ -453,7 +462,12 @@ Claude Code, блок `env` в `settings.json`:
 `modalities`: без них OpenCode 1.19 не отправлял картинку ни одной модели relay.
 
 Codex видит модели Minara в `/codex/models`; уровень по умолчанию — «естественный»
-(см. «Мышление и effort»).
+(см. «Мышление и effort»). С `"codex_catalog_gpt_only": true` в `config.json` этот список
+содержит только GPT (Retool и Minara): Claude, GLM и Gemini в выборе Codex не появляются.
+Если в `config.toml` Codex задан `model_catalog_json`, Codex берёт список из этого файла, а не
+у relay: файл надо пересобрать, когда меняется каталог. Память Codex можно поставить на модель
+Minara: в разделе `[memories]` задайте `extract_model` и `consolidation_model`
+(`"minara/gpt-6-luna-pro"`), а в relay включите «Память Codex» (`codex_memory_jobs`).
 
 В консоли relay каждая привязка маршрута видна строкой
 `[route] provider=Minara|Retool account=… model=… upstream_model=… kind=conversation|subagent`.

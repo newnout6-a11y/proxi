@@ -172,6 +172,9 @@ nav { display: grid; gap: var(--space-6); }
 .scale-legend { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--space-2); font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); }
 .forecast { font-size: var(--text-sm); color: var(--ink-2); }
 .forecast b { color: var(--accent-text); font-weight: 500; }
+.minara-balance { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2) var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--line); }
+.minara-figure { font-size: var(--text-lg, 1.125rem); color: var(--ink-2); }
+.minara-figure b { color: var(--ink); font-weight: 500; }
 .instrument-foot { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-6); padding-top: var(--space-3); border-top: 1px solid var(--line); font-size: var(--text-sm); color: var(--muted); }
 .instrument-foot b { color: var(--ink); font-weight: 500; }
 
