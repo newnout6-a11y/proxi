@@ -206,3 +206,27 @@ def test_viewer_follows_truncation(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_relay.time, "sleep", lambda _: path.write_text("new\n", encoding="utf-8"))
     assert next(iterator) == "new\n"
     iterator.close()
+
+
+def test_a_costly_write_is_a_marker_in_the_same_cache_line():
+    # The shape stays exactly `[cache] in= read= write= credits= out=`, as every other cache line: the warning is one
+    # more marker at the end, like [WRITE HIGH], not a line of its own.
+    usage = {"inputTokens": 4, "promptTokensReadFromCache": 90_342,
+             "promptTokensWrittenToCache": 484_380, "outputTokens": 2014}
+    line = console_log.CacheMonitor().line("req", usage, credits=1065.64, write_cost=1065.64)
+    assert line.startswith("[req] [cache] in=4 read=90,342 write=484,380 credits=1,065.6400 out=2,014")
+    assert "[WRITE COSTLY 1,065.6400]" in line
+    assert "\x1b[1;91m[WRITE COSTLY 1,065.6400]\x1b[0m" in console_log.render(line, color=True)
+
+
+def test_a_cheap_write_gets_no_costly_marker():
+    usage = {"inputTokens": 4, "promptTokensWrittenToCache": 9_738, "outputTokens": 266}
+    line = console_log.CacheMonitor().line("req", usage, credits=11.2, write_cost=11.2)
+    assert "WRITE COSTLY" not in line
+
+
+def test_minara_credits_replace_the_retool_figure_in_the_line():
+    # A Minara turn has no creditsUsed: its price comes as Minara's own credits, which is what the line must show.
+    usage = {"inputTokens": 4, "promptTokensWrittenToCache": 94_361, "outputTokens": 186}
+    line = console_log.CacheMonitor().line("req", usage, credits=207.5942)
+    assert "credits=207.5942 out=186" in line

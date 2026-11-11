@@ -1637,23 +1637,35 @@ class TurnRunner:
                                             'info' if known else 'warn', credits=None, attempt=journal_attempt,
                                             credits_reported=bool(known), minara_credits=minara_credits, **delta,
                                             **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
-                                    # A cache write is the one line item that can cost more than a whole account at once:
-                                    # 484,380 tokens at Fable 5.2's $10/M is 1065 Minara credits, more than a fresh
-                                    # account's 300-credit plan, and one such turn took an account from +500 to -875.
-                                    # Only a warning: the reply is already paid for and stopping it changes nothing.
+                                    # The same `[cache]` line Retool's path prints, in the same shape — in= read= write=
+                                    # credits= out= — for a Minara turn, which had none at all and whose cost was
+                                    # therefore invisible. Only for minara/*: direct.py's _drain prints it for Retool,
+                                    # and printing it here too would show every Retool turn twice. `credits` is
+                                    # Minara's own currency (220 per dollar), never Retool's.
+                                    minara_turn = str(parsed.model).startswith('minara/')
                                     write_cost = credits.write_cost(
                                         delta, parsed.model, (getattr(parsed, 'entry', None) or {}).get('pricing'))
+                                    monitor = getattr(session, '_console_cache_monitor', None) if session is not None else None
+                                    if minara_turn:
+                                        if session is not None and monitor is None:
+                                            # The Retool path makes this monitor in _drain; a Minara turn never goes
+                                            # there, and without it the `[cache]` line was missing for every turn.
+                                            monitor = session._console_cache_monitor = console_log.CacheMonitor()
+                                        if monitor is not None:
+                                            console_log.write(monitor.line(
+                                                getattr(parsed, 'request_id', None) or 'req', delta,
+                                                scope=(parsed.model, getattr(parsed, 'conversation_key', None)),
+                                                credits=minara_credits, write_cost=write_cost)
+                                                + (" " + client_context.label() if client_context.label() else ""))
                                     if write_cost is not None and write_cost >= credits.WRITE_WARN:
-                                        unit = 'кредитов Minara' if str(parsed.model).startswith('minara/') else 'кредитов'
-                                        text = '[%s] [cache.write_expensive] Дорогая запись кэша: %s токенов = %s %s' % (
-                                            getattr(parsed, 'request_id', None) or 'req',
-                                            console_log.amount(delta.get('cache_write'), tokens=True),
-                                            console_log.amount(write_cost), unit)
-                                        log('cache.write_expensive', text, 'warn',
+                                        # A warning only: by the time the usage arrives the turn is paid for. The
+                                        # console shows it as a [WRITE COSTLY …] marker inside the [cache] line.
+                                        log('cache.write_expensive', 'Дорогая запись кэша: %s токенов = %s %s' % (
+                                                console_log.amount(delta.get('cache_write'), tokens=True),
+                                                console_log.amount(write_cost),
+                                                'кредитов Minara' if minara_turn else 'кредитов'), 'warn',
                                             model=parsed.model, cache_write=delta.get('cache_write'),
-                                            write_cost=write_cost, attempt=journal_attempt,
-                                            minara_credits=minara_credits)
-                                        console_log.write(text)
+                                            write_cost=write_cost, attempt=journal_attempt)
                                     if (usage.get('cache_write_reported') is False and not delta.get('cache_read')
                                             and (getattr(parsed, 'entry', None) or {}).get('cache') == 'explicit'
                                             and breakdown['prompt_tokens'] >= 2048):

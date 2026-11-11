@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 
+import credits
 import journal
 from console_clock import timestamp
 
@@ -14,6 +15,9 @@ PALETTE = {"read": "36", "write": "33", "alert": "1;91", "success": "32",
 LARGE_WRITE = 50_000
 LARGE_INPUT = 50_000
 WRITE_JUMP = 8_192
+# A single cache write worth this much is called out in the same `[cache]` line as its own marker; the journal event
+# (cache.write_expensive) uses the same figure, so the one constant lives in credits.py.
+WRITE_WARN = credits.WRITE_WARN
 _LOCK = threading.Lock()
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _FIELDS = re.compile(r"\b(in|out|read|write|credits|balance|limit|spent)=([^\s]+)")
@@ -75,9 +79,6 @@ def render(line, *, color=None):
     line = line[len(prefix):]
     if line.startswith("[err]") or " EXC " in line:
         return prefix + _paint(line, "alert", True)
-    if "[cache.write_expensive]" in line:
-        # A single cache write worth more than a fresh account's whole plan: the whole line, not one field, goes red.
-        return prefix + _paint(line, "alert", True)
     write_alert = "[WRITE SPIKE" in line or "[WRITE HIGH" in line
     input_alert = "[INPUT HIGH]" in line
 
@@ -94,7 +95,7 @@ def render(line, *, color=None):
         return _paint(match[0], role, True)
 
     line = _FIELDS.sub(field, line)
-    line = re.sub(r"\[(?:WRITE (?:SPIKE|HIGH)|INPUT HIGH)[^\]]*\]",
+    line = re.sub(r"\[(?:WRITE (?:SPIKE|HIGH|COSTLY)|INPUT HIGH)[^\]]*\]",
                   lambda m: _paint(m[0], "alert", True), line)
     line = re.sub(r"\b(?:MODEL|EFFORT):\s*\S+", lambda m: _paint(m[0], "model", True), line)
     line = re.sub(r"^\[([^\]]+)\]", lambda m: _paint(m[0], "request", True), line)
@@ -131,7 +132,7 @@ class CacheMonitor:
         self.previous_write = None
         self.last_write = None
 
-    def line(self, request_id, usage, *, scope=None, sample_id=None):
+    def line(self, request_id, usage, *, scope=None, sample_id=None, credits=None, write_cost=None):
         if scope != self.scope:
             self.scope = scope
             self.request = self.previous_write = self.last_write = None
@@ -152,11 +153,15 @@ class CacheMonitor:
         uncached = number(usage.get("inputTokens"))
         if uncached is not None and uncached >= LARGE_INPUT:
             marker += " [INPUT HIGH]"
+        if write_cost is not None and write_cost >= WRITE_WARN:
+            # One write worth this much can cost more than a whole account's plan (Minara credits, or Retool's own).
+            marker += " [WRITE COSTLY %s]" % amount(write_cost)
         output = number(usage.get("outputTokens"))
         output_note = " out=%s" % amount(output, tokens=True) if output is not None else ""
+        spent = number(usage.get("creditsUsed")) if credits is None else number(credits)
         return "[%s] [cache] in=%s read=%s write=%s credits=%s%s%s" % (
             request_id, amount(usage.get("inputTokens"), tokens=True), amount(read, tokens=True),
-            amount(written, tokens=True), amount(usage.get("creditsUsed")), output_note, marker)
+            amount(written, tokens=True), amount(spent), output_note, marker)
 
 
 def route_line(request_id, *, upstream, account, model, upstream_model, effort=None, child=False):

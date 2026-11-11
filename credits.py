@@ -8,9 +8,10 @@ import urllib.request
 
 CACHE_TTL = 30.0
 HISTORY_MAX = 200
-# A cache write that alone costs this much is called out (credits.warning in the journal, red on the console): one turn
-# of 484,380 written tokens at Fable 5.2's $10/M is 1065 Minara credits, and took an account from +500 to -875 at once.
-# A warning only: the turn is billed by the time the usage arrives, so refusing it here would change nothing.
+# A cache write worth this much alone is called out (a `[WRITE COSTLY …]` marker in the `[cache]` line and a
+# cache.write_expensive event): one turn of 484,380 written tokens at Fable 5.2's $10/M is 1065 Minara credits, more than
+# a fresh account's 300-credit plan, and it took an account from +500 to -875 at once. A warning only: the turn is
+# billed by the time its usage arrives, so refusing it here would change nothing.
 WRITE_WARN = 300.0
 # The turn ids a manager remembers to count each billed attempt once. Every id is new (a uuid per attempt, per keepwarm
 # ping), so a repeat can only come from the same attempt reported twice, moments apart: a few thousand cover that, where
