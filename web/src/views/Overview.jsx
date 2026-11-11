@@ -271,6 +271,11 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
         <section className="panel stats" aria-label="Показатели за окно">
           <Stat label="Потрачено за окно" value={totals.credits_complete === false ? totals.credits > 0 ? `≥ ${fmtFixed(totals.credits, 2)}` : '—' : fmtFixed(totals.credits, 2)}
             note={spendNote(totals, busy, span)} />
+          {isNum(totals.minara_credits) && (
+            <Stat label="Minara за окно" value={fmtFixed(totals.minara_credits, 2)}
+              note={`кредитов · $${fmtFixed(totals.minara_credits / 220, 2)}`}
+              title="Расход на моделях minara/* за окно. Minara считает свои кредиты (220 за доллар) отдельной валютой: они не входят в расход кредитов Retool выше." />
+          )}
           <Stat label="Запросы" value={fmtInt(totals.requests)}
             note={totals.errors ? `${fmtInt(totals.errors)} ${plural(totals.errors, ['ошибка', 'ошибки', 'ошибок'])}` : 'без ошибок'}
             tone={totals.errors ? 'neg' : undefined} />

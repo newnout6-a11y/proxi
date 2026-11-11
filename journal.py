@@ -218,13 +218,16 @@ class _Fine:
     """Numeric counters of one FINE-second interval: everything a chart bucket shows."""
     __slots__ = ("requests", "errors", "latency_sum", "latency_n", "ttft_sum", "ttft_n", "credits", "keepwarm",
                  "keepwarm_pings", "keepwarm_unknown", "cache_read", "cache_write", "input", "output",
-                 "turns", "tools", "commands", "unknown", "speed_output", "speed_duration", "speed_samples")
+                 "turns", "tools", "commands", "unknown", "speed_output", "speed_duration", "speed_samples",
+                 "minara_credits")
 
     def __init__(self):
         self.requests = self.errors = self.latency_n = self.ttft_n = 0
         self.keepwarm_pings = self.keepwarm_unknown = self.cache_read = self.cache_write = 0
         self.input = self.output = self.turns = self.tools = self.commands = self.unknown = 0
         self.latency_sum = self.ttft_sum = self.credits = self.keepwarm = 0.0
+        # Minara's own credits (220 per US dollar) never enter `credits`, which is Retool's currency only.
+        self.minara_credits = 0.0
         self.speed_output = self.speed_duration = self.speed_samples = 0
 
 
@@ -281,8 +284,8 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
     It takes no lock and reads no live state, so it may take as long as it likes without holding emit() back.
     """
     rows = [{"t": int(start + index * bucket), "requests": 0, "errors": 0, "latency": None, "ttft": None,
-             "credits": 0.0, "keepwarm_credits": 0.0, "cache_read": 0, "cache_write": 0, "input": 0,
-             "output": 0, "turns": 0, "tools": 0, "commands": 0, "credits_unknown": 0}
+             "credits": 0.0, "keepwarm_credits": 0.0, "minara_credits": 0.0, "cache_read": 0, "cache_write": 0,
+             "input": 0, "output": 0, "turns": 0, "tools": 0, "commands": 0, "credits_unknown": 0}
             for index in range(count)]
     latency = [[0.0, 0] for _ in range(count)]
     ttft = [[0.0, 0] for _ in range(count)]
@@ -303,6 +306,7 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
         row["commands"] += slot.commands
         row["credits"] += slot.credits
         row["keepwarm_credits"] += slot.keepwarm
+        row["minara_credits"] += slot.minara_credits
         row["credits_unknown"] += slot.unknown
         pings += slot.keepwarm_pings
         pings_unknown += slot.keepwarm_unknown
@@ -324,11 +328,13 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
     # Totals come from the unrounded rows: summing per-bucket roundings drifts by up to 5e-5 per bucket.
     credits_sum = sum(row["credits"] for row in rows)
     keepwarm_sum = sum(row["keepwarm_credits"] for row in rows)
+    minara_sum = sum(row["minara_credits"] for row in rows)
     for row, (latency_sum, latency_n), (ttft_sum, ttft_n) in zip(rows, latency, ttft):
         row["latency"] = round(latency_sum / latency_n) if latency_n else None
         row["ttft"] = round(ttft_sum / ttft_n) if ttft_n else None
         row["credits"] = round(row["credits"], 4)
         row["keepwarm_credits"] = round(row["keepwarm_credits"], 4)
+        row["minara_credits"] = round(row["minara_credits"], 4)
         row["credits_unknown"] = max(0, row["credits_unknown"])
         row["credits_complete"] = row["credits_unknown"] == 0
 
@@ -347,6 +353,7 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
               "tools": total("tools"), "commands": total("commands"),
               "credits": round(credits_sum, 4), "cache_read": cached,
               "keepwarm_credits": round(keepwarm_sum, 4),
+              "minara_credits": round(minara_sum, 4),
               "keepwarm_pings": pings, "keepwarm_unknown": pings_unknown,
               "credits_complete": unknown == 0, "credits_unknown": unknown,
               "credits_in_progress": in_progress,
@@ -490,6 +497,11 @@ class _Rollup:
             attempt, change = self.turn(key, ts, restored).usage(_attempt_number(data), price, index)
             if price is not None:
                 fine.credits += price
+            # A Minara turn is priced in USD, never in Retool credits: its own credits go in a counter of their own, so
+            # the two currencies are never added together (account_report.aggregate_balance keeps them apart too).
+            minara = _price(data.get("minara_credits"))
+            if minara is not None:
+                fine.minara_credits += minara
             if change:
                 self._shift_unknown(now, attempt.where, change)
             fine.cache_read += _whole(data.get("cache_read"))

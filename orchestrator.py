@@ -1618,22 +1618,42 @@ class TurnRunner:
                                     breakdown = credits.cost_breakdown(usage, parsed.model)
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
                                     provider_cost = usage.get('provider_cost')
+                                    minara_credits = credits.minara_credits(usage)
                                     if not known and provider_cost is not None:
                                         # Minara reports a cost in USD (or the relay estimated one from the catalog): the
                                         # turn is priced, only not in Retool credits. It was a warning on every turn.
-                                        log('upstream.usage', 'Токены получены; стоимость %s %.6f%s' % (
+                                        log('upstream.usage', 'Токены получены; стоимость %s %.6f%s%s' % (
                                                 usage.get('provider_cost_currency') or 'USD', provider_cost,
-                                                ' (оценка по прайсу)' if usage.get('provider_cost_estimated') else ''),
+                                                ' (оценка по прайсу)' if usage.get('provider_cost_estimated') else '',
+                                                ' = %s кредитов Minara' % minara_credits
+                                                if minara_credits is not None else ''),
                                             'info', credits=None, attempt=journal_attempt, credits_reported=False,
-                                            provider_cost=provider_cost,
+                                            provider_cost=provider_cost, minara_credits=minara_credits,
                                             provider_cost_estimated=bool(usage.get('provider_cost_estimated')), **delta,
                                             **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
                                     else:
                                         log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
                                                               'Токены получены; стоимость upstream не сообщена'),
                                             'info' if known else 'warn', credits=None, attempt=journal_attempt,
-                                            credits_reported=bool(known), **delta,
+                                            credits_reported=bool(known), minara_credits=minara_credits, **delta,
                                             **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                    # A cache write is the one line item that can cost more than a whole account at once:
+                                    # 484,380 tokens at Fable 5.2's $10/M is 1065 Minara credits, more than a fresh
+                                    # account's 300-credit plan, and one such turn took an account from +500 to -875.
+                                    # Only a warning: the reply is already paid for and stopping it changes nothing.
+                                    write_cost = credits.write_cost(
+                                        delta, parsed.model, (getattr(parsed, 'entry', None) or {}).get('pricing'))
+                                    if write_cost is not None and write_cost >= credits.WRITE_WARN:
+                                        unit = 'кредитов Minara' if str(parsed.model).startswith('minara/') else 'кредитов'
+                                        text = '[%s] [cache.write_expensive] Дорогая запись кэша: %s токенов = %s %s' % (
+                                            getattr(parsed, 'request_id', None) or 'req',
+                                            console_log.amount(delta.get('cache_write'), tokens=True),
+                                            console_log.amount(write_cost), unit)
+                                        log('cache.write_expensive', text, 'warn',
+                                            model=parsed.model, cache_write=delta.get('cache_write'),
+                                            write_cost=write_cost, attempt=journal_attempt,
+                                            minara_credits=minara_credits)
+                                        console_log.write(text)
                                     if (usage.get('cache_write_reported') is False and not delta.get('cache_read')
                                             and (getattr(parsed, 'entry', None) or {}).get('cache') == 'explicit'
                                             and breakdown['prompt_tokens'] >= 2048):

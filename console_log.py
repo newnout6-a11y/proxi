@@ -75,6 +75,9 @@ def render(line, *, color=None):
     line = line[len(prefix):]
     if line.startswith("[err]") or " EXC " in line:
         return prefix + _paint(line, "alert", True)
+    if "[cache.write_expensive]" in line:
+        # A single cache write worth more than a fresh account's whole plan: the whole line, not one field, goes red.
+        return prefix + _paint(line, "alert", True)
     write_alert = "[WRITE SPIKE" in line or "[WRITE HIGH" in line
     input_alert = "[INPUT HIGH]" in line
 
