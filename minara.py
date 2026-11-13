@@ -208,7 +208,8 @@ def _cache_marks(messages, ttl, mark_tail=True):
             # A side request (a client's compaction, a one-shot job) is never continued: its own last message, the
             # instruction, would be written for an hour and never read (2,053 and 2,142 tokens of two Claude Code
             # compactions, 2026-11-10). The message before it, the end of the dialog's own history (a mid-turn
-            # compaction's latest tool results), is marked instead: everything up to there is read.
+            # compaction's latest tool results), is marked instead: everything up to there is read. Not on /v1/messages,
+            # where a reply that writes nothing costs the whole prompt at the input price (_stream marks the tail there).
             wanted.append(last_user[-2])
         # The end of the previous turn: the last user/tool message before the latest assistant reply.
         latest_assistant = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=None)
@@ -1036,11 +1037,41 @@ def _tool_input(arguments):
     return value if isinstance(value, dict) else {}
 
 
+# Minara's /v1/messages passes a request on in chat form, and a tool result loses its cache mark on the way (Fable 5.2 at
+# max through OpenRouter, 2026-11-13): a mark on the tool_result block, or on the tool_use it answers, is dropped, and one on
+# a text part inside its content reaches the model as text, because a content list arrives as its JSON (a result of 1,313
+# characters was 1,546 prompt tokens as a list of one text part and 1,173 as a string). Only a text block of the user turn
+# carries a mark there. A turn that ended in tool results therefore wrote nothing to the cache, and Minara bills a reply that
+# writes nothing at the input price for its whole prompt, the part it read from the cache included: 15 of 36 turns of one
+# Claude Desktop session (6,972 of 9,876 credits), and in a probe 20.5 credits for a turn that, written, costs 2.4. The mark
+# that became text also made the same tool result 25 tokens longer while it was marked than after, so the next request
+# could not read what this one wrote and wrote it again (36,864 tokens, then the same span less 25).
+# So a tool result goes as its text, and each run of tool results in a user turn is closed by this block, which carries the
+# turn's mark. It closes every such run, marked or not, so a turn reads the same in every request. In the probe each request
+# then wrote its tail (input 4) and the next one read all of it.
+TOOL_RESULTS_END = "<system-reminder>\nEnd of tool results.\n</system-reminder>"
+
+
+def _close_tool_results(turn):
+    """Put TOOL_RESULTS_END after the tool results of a user turn (messages_body puts them first) and move their mark to it."""
+    blocks = turn["content"]
+    count = sum(1 for block in blocks if block.get("type") == "tool_result")
+    if turn["role"] != "user" or not count:
+        return
+    end = {"type": "text", "text": TOOL_RESULTS_END}
+    for block in blocks[:count]:
+        mark = block.pop("cache_control", None)
+        if mark:
+            end["cache_control"] = mark
+    blocks.insert(count, end)
+
+
 def messages_body(body):
     """The /v1/messages request for a chat body of build_body: the same history, tools, marks and level.
 
     Thinking blocks are not sent back, as on the chat path: Minara's /v1/messages continued a tool loop without them on all
-    seven models and read the cache all the same (2026-11-10)."""
+    seven models and read the cache all the same (2026-11-10). A tool result goes as its text, and its mark goes onto the
+    block that closes the tool results of its turn (TOOL_RESULTS_END)."""
     system, turns = [], []
 
     def add(role, blocks):
@@ -1064,7 +1095,13 @@ def messages_body(body):
                     part.get("text", "") for part in _anthropic_parts(message.get("content")) if part["type"] == "text")}])
         elif role == "tool":
             parts = _anthropic_parts(message.get("content"))
-            result = {"type": "tool_result", "tool_use_id": message.get("tool_call_id"), "content": parts or ""}
+            marks = [part.pop("cache_control") for part in parts if "cache_control" in part]
+            # Text alone goes as one string, what the model reads natively; a content list would reach it as its JSON.
+            content = ("\n".join(part["text"] for part in parts) if all(part["type"] == "text" for part in parts)
+                       else parts)
+            result = {"type": "tool_result", "tool_use_id": message.get("tool_call_id"), "content": content}
+            if marks:
+                result["cache_control"] = marks[-1]  # _close_tool_results moves it to the text that closes the turn
             add("user", [result])
         elif role == "assistant":
             blocks = [part for part in _anthropic_parts(message.get("content")) if part["type"] == "text"]
@@ -1077,6 +1114,8 @@ def messages_body(body):
             add("assistant", blocks)
         else:
             add("user", _anthropic_parts(message.get("content")) or [{"type": "text", "text": "(empty)"}])
+    for turn in turns:
+        _close_tool_results(turn)
     upstream = body.get("model")
     result = {"model": upstream, "max_tokens": body.get("max_tokens") or MESSAGES_MAX_TOKENS, "messages": turns,
               "stream": True}
@@ -1347,6 +1386,13 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     # relay moved there itself (not measured) goes back to chat when /v1/messages refuses it.
     level = body.get("reasoning_effort") or "default"
     route = {"messages": use_messages(model_provider, body)}
+    if side and route["messages"]:
+        # A side request marks no tail of its own, so on /v1/messages it read the dialog's cache and wrote nothing, and
+        # Minara bills such a reply at the input price for its whole prompt (TOOL_RESULTS_END). There it writes its tail:
+        # the instruction at the write price instead of the whole conversation at the input price.
+        body = build_body(cfg, model_provider, head, prompt, None if text_only else tools,
+                          None if text_only else tool_choice, max_tokens, chunks, None if text_only else session,
+                          instruction)
     route["measured"] = route["messages"] and level in set(model_provider.get("messages_levels") or ())
     # Requests that go at once with one Claude head nobody has cached yet (Claude Code starts several subagents in one
     # message): the first writes it, the others wait for its answer to begin and then read it, as on Retool

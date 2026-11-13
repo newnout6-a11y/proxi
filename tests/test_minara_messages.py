@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import apierr
+import client_context
 import minara
 
 
@@ -58,10 +59,13 @@ def test_a_chat_body_becomes_the_same_request_in_anthropic_shape():
         {"type": "text", "text": "checking"},
         {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}},
         {"type": "tool_use", "id": "call_2", "name": "get_time", "input": {}}]}
-    # Both results and the text after them in one user turn, the results first; the mark stays where build_body put it.
+    # Both results and the text after them in one user turn, the results first, each as its text; the block that closes
+    # the results carries the mark build_body put on the last one (Minara drops a mark on or inside a tool_result).
     kinds = [block["type"] for block in results["content"]]
-    assert kinds == ["tool_result", "tool_result", "text"]
-    assert results["content"][1]["content"] == [{"type": "text", "text": "noon", "cache_control": MARK}]
+    assert kinds == ["tool_result", "tool_result", "text", "text"]
+    assert results["content"][1] == {"type": "tool_result", "tool_use_id": "call_2", "content": "noon"}
+    assert results["content"][2] == {"type": "text", "text": minara.TOOL_RESULTS_END, "cache_control": MARK}
+    assert results["content"][3] == {"type": "text", "text": "Use the answer."}
     assert body["tools"][0] == {"name": "get_weather", "description": "Weather",
                                 "input_schema": {"type": "object", "properties": {}}}
     assert body["tools"][1]["strict"] is True and body["tool_choice"] == {"type": "auto"}
@@ -302,3 +306,133 @@ def test_a_reply_of_minaras_own_anthropic_channel_names_anthropic_as_its_provide
     assert (usage["channel"], usage["provider"]) == ("anthropic", "Anthropic")
     # OpenRouter behind /v1/messages names no provider: none is made up
     assert "provider" not in minara.normalize_messages_usage({"input_tokens": 4}, channel="openrouter")
+
+
+FABLE = {"model": "minara/claude-fable-5-2", "upstream_model": "anthropic/claude-fable-5.2", "reasoningEffort": "max"}
+WEATHER = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}}]
+REMINDER = "<system-reminder>\nThe user hasn't heard from you in a while.\n</system-reminder>"
+
+
+def tool_loop(rounds, reminders=()):
+    """A canonical history of a tool loop: a question, then `rounds` calls each answered by a result; a reminder after the
+    results of the rounds in `reminders` (Claude Code adds one to the user turn that carries the results)."""
+    history = [{"role": "user", "content": [{"type": "text", "text": "What is the weather in every city?"}]}]
+    for n in range(rounds):
+        history.append({"role": "assistant", "content": [{"type": "tool_call", "toolCallId": "call_%d" % n,
+                                                          "toolName": "get_weather", "toolInput": {"city": "c%d" % n}}]})
+        history.append({"role": "tool", "content": {"toolCallId": "call_%d" % n, "toolResult": 'c%d: "18 C"\nsunny' % n}})
+        if n in reminders:
+            history.append({"role": "user", "content": [{"type": "text", "text": REMINDER}]})
+    return history
+
+
+def loop_request(history):
+    session = SimpleNamespace(_native_client_messages=history, _native_allow_cold_replay=True,
+                              _native_conversation_key=None)
+    return minara.messages_body(minara.build_body({}, FABLE, "HEAD " * 600, "", WEATHER, "auto", 1000, session=session))
+
+
+def marks_in(payload):
+    """Every cache mark of an Anthropic request: ("system", index) or (turn, block, type), and "inside" for a part of a
+    tool_result's content."""
+    found = [("system", index) for index, block in enumerate(payload.get("system") or []) if "cache_control" in block]
+    for turn_index, turn in enumerate(payload["messages"]):
+        for block_index, block in enumerate(turn["content"]):
+            if "cache_control" in block:
+                found.append((turn_index, block_index, block["type"]))
+            if isinstance(block.get("content"), list):
+                found.extend((turn_index, block_index, "inside") for part in block["content"] if "cache_control" in part)
+    return found
+
+
+def read_by_the_model(payload):
+    """The blocks of a request in order, as the model reads them: without the marks."""
+    blocks = [json.dumps({k: v for k, v in block.items() if k != "cache_control"}) for block in payload["system"]]
+    for turn in payload["messages"]:
+        blocks.extend(json.dumps([turn["role"], {k: v for k, v in block.items() if k != "cache_control"}])
+                      for block in turn["content"])
+    return blocks
+
+
+def test_a_tool_result_goes_as_its_text_and_the_block_closing_its_turn_carries_the_mark():
+    """Minara's /v1/messages drops a mark on a tool_result or a tool_use, and one inside a tool_result's content reaches the
+    model as text: a turn that ended in tool results wrote nothing to the cache, and Minara billed its whole prompt at the
+    input price (Fable 5.2, 2026-11-13). A text block after the results carries the mark there (each such request then
+    wrote its tail and the next one read it)."""
+    payload = loop_request(tool_loop(2))
+    last = payload["messages"][-1]
+    assert last == {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": 'c1: "18 C"\nsunny'},
+        {"type": "text", "text": minara.TOOL_RESULTS_END, "cache_control": MARK}]}
+    # The head, the tail and the end of the turn before: never on a tool_result, inside one or on a tool_use.
+    assert marks_in(payload) == [("system", 0), (2, 1, "text"), (4, 1, "text")]
+    assert "cache_control" not in json.dumps([turn for turn in payload["messages"] if turn["role"] == "assistant"])
+
+
+def test_a_tool_turn_reads_the_same_in_every_request_marked_or_not():
+    """A mark inside a tool result was text the model read: the same result was 25 tokens longer while it was the tail or
+    the end of the turn before than after, so the next request could not read what this one wrote and wrote it again
+    (36,864 tokens, then the same span less 25). Each request must read as the one before it did, up to its end."""
+    requests = [loop_request(tool_loop(rounds, reminders={1})) for rounds in (1, 2, 3, 4)]
+    for earlier, later in zip(requests, requests[1:]):
+        before = read_by_the_model(earlier)
+        assert read_by_the_model(later)[:len(before)] == before
+    for payload in requests:
+        assert all(where[0] == "system" or where[2] == "text" for where in marks_in(payload))
+        assert len(marks_in(payload)) <= 4
+        assert "cache_control" not in json.dumps([block for turn in payload["messages"] for block in turn["content"]
+                                                  if block["type"] == "tool_result"])
+    # Every run of tool results is closed, marked or not, so that a turn reads the same wherever the marks are.
+    closing = [turn["content"] for turn in requests[-1]["messages"] if turn["content"][0]["type"] == "tool_result"]
+    assert len(closing) == 4 and all(blocks[1]["text"] == minara.TOOL_RESULTS_END for blocks in closing)
+
+
+def test_results_before_a_reminder_are_closed_before_it_and_the_reminder_keeps_the_mark():
+    payload = loop_request(tool_loop(2, reminders={1}))
+    assert [block["type"] for block in payload["messages"][-1]["content"]] == ["tool_result", "text", "text"]
+    assert payload["messages"][-1]["content"][1] == {"type": "text", "text": minara.TOOL_RESULTS_END}
+    assert payload["messages"][-1]["content"][2] == {"type": "text", "text": REMINDER, "cache_control": MARK}
+
+
+def test_two_marked_tool_results_of_one_turn_leave_one_mark_on_the_block_that_closes_it():
+    body = chat_body("max", model="anthropic/claude-fable-5.2")
+    body["messages"][3]["content"] = [{"type": "text", "text": "18 C", "cache_control": MARK}]
+    del body["messages"][-1]  # the turn ends with its results
+    payload = minara.messages_body(body)
+    results = payload["messages"][-1]["content"]
+    assert [block.get("content") for block in results[:2]] == ["18 C", "noon"]
+    assert results[2] == {"type": "text", "text": minara.TOOL_RESULTS_END, "cache_control": MARK}
+    assert marks_in(payload) == [("system", 0), (2, 2, "text")]
+
+
+def test_a_tool_result_with_an_image_keeps_its_list_and_its_mark_closes_the_turn():
+    # build_body never makes one (an image of a tool result goes to a user message after the results), but a list with an
+    # image stays a list; its mark goes where every tool result's goes, and nothing of it is left inside.
+    body = chat_body("max", model="anthropic/claude-fable-5.2")
+    body["messages"][4]["content"] = [{"type": "text", "text": "noon", "cache_control": MARK},
+                                      {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]
+    del body["messages"][-1]
+    results = minara.messages_body(body)["messages"][-1]["content"]
+    assert results[1]["content"] == [{"type": "text", "text": "noon"}, {"type": "image", "source": {
+        "type": "base64", "media_type": "image/png", "data": "QUJD"}}]
+    assert "cache_control" not in results[1] and results[2]["cache_control"] == MARK
+
+
+def test_a_side_request_writes_its_tail_on_v1_messages_and_keeps_the_side_rule_on_chat():
+    """A compaction marks no tail of its own: on /v1/messages it then wrote nothing, and Minara bills such a reply at the
+    input price for its whole prompt. There its tail is written; on chat the side rule stands."""
+    posts = []
+
+    def post(url, **kwargs):
+        posts.append((url, kwargs["json"]))
+        return Response(200, anthropic_stream() if url.endswith("/messages") else chat_stream())
+    token = client_context.bind({"client": "codex", "client_task": client_context.COMPACTION})
+    try:
+        run({"model": "anthropic/claude-opus-4.7", "reasoningEffort": "max", "messages_levels": ["max"]}, post)
+        run({"model": "anthropic/claude-opus-4.7", "reasoningEffort": "high"}, post)
+    finally:
+        client_context._CURRENT.reset(token)
+    (messages_url, messages_payload), (chat_url, chat_payload) = posts
+    assert messages_url.endswith("/v1/messages") and chat_url.endswith("/chat/completions")
+    assert messages_payload["messages"][-1]["content"][-1] == {"type": "text", "text": "Hello", "cache_control": MARK}
+    assert "cache_control" not in json.dumps(chat_payload["messages"][1:])
