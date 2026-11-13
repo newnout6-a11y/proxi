@@ -278,6 +278,30 @@ test('the reported flag alone never creates a price but keeps an earlier one', (
   assert.equal(kept.unknown, 0);
 });
 
+// A Minara reply comes with Minara's own credits (minara_credits) and credits: null. Until 2026-11-13 such a turn was
+// "нет данных" here and one more "без цены" in the metrics, though its price was in the event.
+const MINARA = (n, minara) => USAGE(n, null, { credits_reported: false, minara_credits: minara });
+
+test('a Minara turn is priced in Minara credits, kept apart from Retool credits', () => {
+  const cost = costOf(turnOf([START(1), MINARA(1, 71.0893), END()]));
+  assert.deepEqual(cost, { credits: null, minara: 71.0893, unknown: 0, running: false, complete: true });
+  // A failover inside Minara: both attempts priced, summed in Minara credits only
+  const two = costOf(turnOf([START(1), MINARA(1, 2.5), START(2), MINARA(2, 3.25), END()]));
+  assert.equal(two.minara, 5.75);
+  assert.equal(two.credits, null);
+  assert.equal(two.complete, true);
+});
+
+test('a Minara attempt without a readable price is still a gap, and a later priced one is a lower bound', () => {
+  const cost = costOf(turnOf([START(1), USAGE(1, null, MARKER), START(2), MINARA(2, 4), END()]));
+  assert.equal(cost.unknown, 1);
+  assert.equal(cost.minara, 4);
+  assert.equal(cost.complete, false);
+  // An invalid Minara figure prices nothing
+  assert.equal(costOf(turnOf([START(1), MINARA(1, -1), END()])).unknown, 1);
+  assert.equal(costOf(turnOf([START(1), MINARA(1, NaN), END()])).minara, undefined);
+});
+
 test('a turn whose end the relay never recorded is not complete and has no final price', () => {
   // The relay turns a silent attempt into a missing price only on a cancelled end, so a lost turn is no gap by itself
   assert.deepEqual(costOf(turnOf([]), 'interrupted'), { credits: null, unknown: 0, running: false, complete: false });

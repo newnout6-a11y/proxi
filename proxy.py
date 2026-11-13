@@ -471,7 +471,10 @@ def make_handler(runtime: Runtime):
                 snapshot = getattr(manager, "balance_snapshot", None)
                 if snapshot:
                     tag = account_tag(backend, UNNAMED) if backend is not None and len(runtime.accounts.backends) > 1 else None
-                    console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used, account=tag))
+                    # A Minara account's balance is in Minara credits: so is what this request spent there.
+                    minara = (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
+                    spent = getattr(self, "_minara_used", None) if minara else self._credits_used
+                    console_log.write(console_log.balance_line(self.request_id, snapshot(), spent, account=tag))
             # Admin polling and live streams would drown the journal in its own traffic.
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
                 return
@@ -513,6 +516,7 @@ def make_handler(runtime: Runtime):
             self._model = "-"
             self._effort_str = ""
             self._credits_used = None
+            self._minara_used = None  # Minara credits of a Minara request (never added to Retool's _credits_used)
             self._model_called = False
             self._holder = None
             self._error_code = None
@@ -1334,6 +1338,12 @@ def make_handler(runtime: Runtime):
                 cost = console_log.number(event.get("value"))
                 if cost is not None:
                     self._credits_used = (self._credits_used or 0.0) + cost
+            elif event.get("type") == "usage":
+                # A Minara reply's share in Minara's own credits (the orchestrator puts each event's share on it): the
+                # [balance] line under a Minara turn said spent=? every time, next to a balance in the same credits.
+                cost = console_log.number(event.get("minara_credits"))
+                if cost is not None:
+                    self._minara_used = (self._minara_used or 0.0) + cost
 
         def _trace_relay_event(self, event):
             trace = self._client_trace

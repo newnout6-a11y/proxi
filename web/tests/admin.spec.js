@@ -446,6 +446,11 @@ test('turn rows price a turn by the relay rules: nothing for a refused attempt, 
     eventAt('t-cancelled', -250, 'turn.begin', { model: 'model-cancelled' }),
     eventAt('t-cancelled', -250, 'upstream.usage_start', { attempt: 1 }),
     eventAt('t-cancelled', -247, 'turn.end', { reason: 'cancelled', duration_ms: 3000 }),
+    // A Minara reply: priced by Minara's list in its own credits, credits (Retool's) null; it was "нет данных" until 2026-11-13
+    eventAt('t-minara', -200, 'turn.begin', { model: 'minara/model-minara' }),
+    eventAt('t-minara', -200, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-minara', -197, 'upstream.usage', { credits: null, minara_credits: 71.0893, attempt: 1, credits_reported: false }),
+    eventAt('t-minara', -196, 'turn.end', { reason: 'stop', duration_ms: 4000 }),
     // Still running: one attempt priced, the next not yet; and one that has reported nothing
     eventAt('t-running', -20, 'turn.begin', { model: 'model-running' }),
     eventAt('t-running', -20, 'upstream.usage_start', { attempt: 1 }),
@@ -461,6 +466,9 @@ test('turn rows price a turn by the relay rules: nothing for a refused attempt, 
   await expect(cost('model-refused')).toHaveText('0,00');
   await expect(cost('model-unpriced')).toContainText('нет данных');
   await expect(cost('model-cancelled')).toContainText('нет данных');
+  await expect(cost('model-minara')).toContainText('71,09');
+  await expect(cost('model-minara')).toContainText('кредитов Minara');
+  await expect(cost('model-minara')).not.toContainText('нет данных');
   await expect(cost('model-running')).toContainText('≥ 0,50');
   await expect(cost('model-running')).toContainText('ход идёт');
   await expect(cost('model-waiting')).toContainText('ход идёт');

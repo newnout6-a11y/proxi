@@ -308,6 +308,37 @@ def test_trace_prices_ignore_invalid_values_and_sum_attempts():
     assert traces["t"]["credits"] == pytest.approx(.3) and traces["t"]["credits_complete"] is True
 
 
+# A Minara reply is journaled with credits=None and its price in minara_credits (Minara's own credits, 220 per dollar of
+# its list). Until 2026-11-13 the journal took only `credits`: every Minara turn was a turn without a price in the trace
+# list and one more "без цены" in the metrics, so the window's spend was never complete while a Minara turn was in it.
+def minara_usage(turn, attempt, minara):
+    return usage(turn, attempt, None, credits_reported=False, minara_credits=minara)
+
+
+def test_a_minara_priced_attempt_is_known_and_its_credits_stay_apart():
+    feed = Feed()
+    totals = feed.play([begin("m"), start("m", 1), minara_usage("m", 1, 71.0893), end("m"),
+                        begin("r"), start("r", 1), usage("r", 1, .25), end("r")])
+    assert totals["credits_unknown"] == 0 and totals["credits_complete"] is True
+    assert totals["credits"] == pytest.approx(.25) and totals["minara_credits"] == pytest.approx(71.0893)
+    traces = {trace["turn_id"]: trace for trace in feed.log.turns()}
+    assert traces["m"]["minara_credits"] == pytest.approx(71.0893) and traces["m"]["credits_complete"] is True
+    assert traces["m"]["credits"] == 0.0 and traces["m"]["credits_unknown"] == 0  # no Retool credit in it
+    assert traces["r"]["minara_credits"] is None and traces["r"]["credits"] == pytest.approx(.25)
+
+
+def test_a_minara_attempt_without_a_price_is_still_unknown():
+    feed = Feed()
+    totals = feed.play([begin("m"), start("m", 1), usage("m", 1, **MARKER), start("m", 2), minara_usage("m", 2, 3.5),
+                        end("m")])
+    assert totals["credits_unknown"] == 1 and totals["minara_credits"] == pytest.approx(3.5)
+    trace = feed.log.turns()[0]
+    assert (trace["minara_credits"], trace["credits_unknown"], trace["credits_complete"]) == (3.5, 1, False)
+    for invalid in (-1, float("nan"), True, "3"):
+        feed = Feed()
+        assert feed.play([begin("m"), start("m", 1), minara_usage("m", 1, invalid), end("m")])["credits_unknown"] == 1
+
+
 def test_a_cancelled_silent_attempt_is_unknown_in_the_trace_too():
     traces = traces_of([begin("cut"), start("cut", 1), end("cut", "cancelled"),
                         begin("early"), end("early", "cancelled")])

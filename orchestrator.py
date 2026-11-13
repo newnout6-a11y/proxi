@@ -827,6 +827,27 @@ class TurnRunner:
             log("prompt.runtime_error", "Не удалось записать план промпта", "error", stage="record")
 
     @staticmethod
+    def _unpriced(parsed, usage):
+        """What the journal says of an attempt's usage that came without a price, and why: (message, extra fields).
+
+        An attempt cut before any usage (a stream that ended without its end, a 503 after the request left) has no
+        tokens at all: "tokens received" said of it, 104 times in a day and a half of the live journal, read as if
+        Retool had kept a price back. A Minara turn is priced by the catalog: when it cannot be, the reason is named."""
+        counted = any(credits.token_counter(usage.get(key)) is not None for key in (
+            'input_tokens', 'output_tokens', 'cache_read', 'cache_write'))
+        if not counted:
+            return 'Попытка оборвалась до отчёта о расходе: стоимость неизвестна', {}
+        if str(getattr(parsed, 'model', '')).startswith('minara/'):
+            try:
+                import minara
+                reason = minara.price_problem((getattr(parsed, 'entry', None) or {}).get('pricing'))
+            except Exception:  # noqa: BLE001 - what the journal says must never fail the turn it describes
+                reason = None
+            reason = reason or 'Minara не сообщила цену'
+            return 'Токены получены; цену по прайсу Minara не посчитать: %s' % reason, {'price_problem': reason}
+        return 'Токены получены; стоимость upstream не сообщена', {}
+
+    @staticmethod
     def _usage_update(holder, event):
         """Keep the attempt snapshot; journal additive deltas exactly once."""
         snapshot = holder.setdefault('_attempt_usage', {})
@@ -1600,6 +1621,7 @@ class TurnRunner:
                                         think_started = None
                                         holder['_attempt_usage'] = {}
                                         holder['_attempt_credited'] = False
+                                        holder['_attempt_minara'] = None
                                     out.put(event)
                                 elif (event["type"] == "tool_call" and searcher is not None and direct_mode
                                       and event.get("name") == search_spec["name"]):
@@ -1658,6 +1680,14 @@ class TurnRunner:
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
                                     provider_cost = usage.get('provider_cost')
                                     minara_credits = credits.minara_credits(usage)
+                                    # The attempt's Minara credits so far, against what earlier usage of the same attempt
+                                    # already said: the journal and the console's spent= add each event's share once.
+                                    minara_spent = None
+                                    if minara_credits is not None:
+                                        before = holder.get('_attempt_minara') or 0.0
+                                        minara_spent = round(max(0.0, minara_credits - before), 4)
+                                        holder['_attempt_minara'] = minara_credits
+                                        event = dict(event, minara_credits=minara_spent)
                                     if not known and provider_cost is not None:
                                         # Minara reports a cost in USD (or the relay estimated one from the catalog): the
                                         # turn is priced, only not in Retool credits. It was a warning on every turn.
@@ -1667,15 +1697,17 @@ class TurnRunner:
                                                 ' = %s кредитов Minara' % minara_credits
                                                 if minara_credits is not None else ''),
                                             'info', credits=None, attempt=journal_attempt, credits_reported=False,
-                                            provider_cost=provider_cost, minara_credits=minara_credits,
+                                            provider_cost=provider_cost, minara_credits=minara_spent,
                                             provider_cost_estimated=bool(usage.get('provider_cost_estimated')), **delta,
                                             **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
                                     else:
-                                        log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
-                                                              'Токены получены; стоимость upstream не сообщена'),
+                                        text, unpriced = (('Токены обновлены; стоимость уже сообщена', {}) if known
+                                                          else self._unpriced(parsed, usage))
+                                        log('upstream.usage', text,
                                             'info' if known else 'warn', credits=None, attempt=journal_attempt,
-                                            credits_reported=bool(known), minara_credits=minara_credits, **delta,
-                                            **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                            credits_reported=bool(known), minara_credits=minara_spent, **delta,
+                                            **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage),
+                                            **unpriced)
                                     # The same `[cache]` line Retool's path prints, in the same shape — in= read= write=
                                     # credits= out= — for a Minara turn, which had none at all and whose cost was
                                     # therefore invisible. Only for minara/*: direct.py's _drain prints it for Retool,
