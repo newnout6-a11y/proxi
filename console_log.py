@@ -9,9 +9,10 @@ import credits
 import journal
 from console_clock import timestamp
 
-# Terminal theme colors, by meaning; no fixed background or truecolor dependency.
+# Terminal theme colors, by meaning; no fixed background or truecolor dependency. "route" (who answered a Minara reply:
+# its channel and provider) is the 256-color orange, apart from the yellow of a cache write.
 PALETTE = {"read": "36", "write": "33", "alert": "1;91", "success": "32",
-           "request": "34", "model": "92", "balance": "32", "muted": "90"}
+           "request": "34", "model": "92", "balance": "32", "muted": "90", "route": "38;5;208"}
 LARGE_WRITE = 50_000
 LARGE_INPUT = 50_000
 WRITE_JUMP = 8_192
@@ -20,7 +21,7 @@ WRITE_JUMP = 8_192
 WRITE_WARN = credits.WRITE_WARN
 _LOCK = threading.Lock()
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-_FIELDS = re.compile(r"\b(in|out|read|write|credits|balance|limit|spent)=([^\s]+)")
+_FIELDS = re.compile(r"\b(in|out|read|write|credits|balance|limit|spent|channel|path|provider)=([^\s]+)")
 _TIMESTAMP = re.compile(r"^(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}\] )")
 
 
@@ -87,7 +88,7 @@ def render(line, *, color=None):
         role = {"read": "read", "write": "alert" if write_alert else "write",
                 "in": "alert" if input_alert else "muted",
                 "credits": "alert" if input_alert else "model",
-                "balance": "balance", "spent": "model"}.get(key, "muted")
+                "balance": "balance", "spent": "model", "channel": "route", "provider": "route"}.get(key, "muted")
         if match[2] == "?":
             role = "muted"
         elif key == "balance" and match[2].startswith("-"):
@@ -132,7 +133,15 @@ class CacheMonitor:
         self.previous_write = None
         self.last_write = None
 
-    def line(self, request_id, usage, *, scope=None, sample_id=None, credits=None, write_cost=None):
+    def line(self, request_id, usage, *, scope=None, sample_id=None, credits=None, write_cost=None, channel=None,
+             path=None, provider=None):
+        """The `[cache]` line of one upstream attempt. `usage` is Retool's metadata (inputTokens, ...) or the relay's own
+        counters (input_tokens, cache_read, ...), as a Minara reply has them: the line is the same for both. `channel`,
+        `path` and `provider` name who answered a Minara reply (its channel, chat or /v1/messages, and OpenRouter's
+        provider behind it): a reply's cache and its thinking depend on them."""
+        def count(camel, snake):
+            return usage.get(camel) if usage.get(camel) is not None else usage.get(snake)
+
         if scope != self.scope:
             self.scope = scope
             self.request = self.previous_write = self.last_write = None
@@ -140,8 +149,8 @@ class CacheMonitor:
         if sample_id != self.request:
             self.previous_write = self.last_write
             self.request = sample_id
-        read = number(usage.get("promptTokensReadFromCache"))
-        written = number(usage.get("promptTokensWrittenToCache"))
+        read = number(count("promptTokensReadFromCache", "cache_read"))
+        written = number(count("promptTokensWrittenToCache", "cache_write"))
         marker = ""
         if written is not None:
             previous = self.previous_write
@@ -150,18 +159,21 @@ class CacheMonitor:
             elif written >= LARGE_WRITE:
                 marker = " [WRITE HIGH]"
             self.last_write = written
-        uncached = number(usage.get("inputTokens"))
+        uncached = number(count("inputTokens", "input_tokens"))
         if uncached is not None and uncached >= LARGE_INPUT:
             marker += " [INPUT HIGH]"
         if write_cost is not None and write_cost >= WRITE_WARN:
             # One write worth this much can cost more than a whole account's plan (Minara credits, or Retool's own).
             marker += " [WRITE COSTLY %s]" % amount(write_cost)
-        output = number(usage.get("outputTokens"))
+        output = number(count("outputTokens", "output_tokens"))
         output_note = " out=%s" % amount(output, tokens=True) if output is not None else ""
         spent = number(usage.get("creditsUsed")) if credits is None else number(credits)
-        return "[%s] [cache] in=%s read=%s write=%s credits=%s%s%s" % (
-            request_id, amount(usage.get("inputTokens"), tokens=True), amount(read, tokens=True),
-            amount(written, tokens=True), amount(spent), output_note, marker)
+        via = "".join(" %s=%s" % (key, "".join(ch for ch in value if ch.isprintable() and not ch.isspace())[:40])
+                      for key, value in (("channel", channel), ("path", path), ("provider", provider))
+                      if isinstance(value, str) and value)
+        return "[%s] [cache] in=%s read=%s write=%s credits=%s%s%s%s" % (
+            request_id, amount(uncached, tokens=True), amount(read, tokens=True),
+            amount(written, tokens=True), amount(spent), output_note, via, marker)
 
 
 def route_line(request_id, *, upstream, account, model, upstream_model, effort=None, child=False):

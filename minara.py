@@ -622,8 +622,10 @@ class EventParser:
             usage["channel_path"] = "chat"
             if self.reply_id:
                 usage["channel"] = channel_of(self.reply_id)
-            if self.provider:
-                usage["provider"] = self.provider
+            # OpenRouter's provider when it names one, else the provider the channel itself is (Anthropic, Bedrock).
+            provider = provider_of(usage.get("channel"), self.provider)
+            if provider:
+                usage["provider"] = provider
             events.append({"type": "usage", "usage": usage})
         choices = item.get("choices", [])
         if not isinstance(choices, list):
@@ -887,6 +889,18 @@ def channel_of(ident):
     return "other" if ident else None
 
 
+# Minara's own Anthropic and Bedrock channels are the provider themselves; OpenRouter names its own (Anthropic, Google,
+# Azure, ...) on the chat path only, and nothing names the one behind its /v1/messages replies.
+_CHANNEL_PROVIDER = {"anthropic": "Anthropic", "bedrock": "Amazon Bedrock"}
+
+
+def provider_of(channel, reported=None):
+    """Who served a Minara reply: the provider OpenRouter reported, else the one its channel is; None when unknown."""
+    if isinstance(reported, str) and reported:
+        return reported
+    return _CHANNEL_PROVIDER.get(channel)
+
+
 # ----- Claude through Minara's /v1/messages ------------------------------------------------------------------------------
 # Minara's chat path sends some Claude models and levels to Bedrock or Anthropic's API without the cache marks (Sonnet 4.6,
 # Opus 4.6 and Fable 5 at every level; Opus 4.7, 4.8, 5 and Sonnet 5 at none, minimal, xhigh and max): the whole prompt is
@@ -1108,6 +1122,9 @@ def normalize_messages_usage(value, pricing=None, channel=None):
     result["channel_path"] = "messages"
     if channel:
         result["channel"] = channel
+        provider = provider_of(channel)  # nothing in an Anthropic-shaped reply names OpenRouter's provider
+        if provider:
+            result["provider"] = provider
     estimate = estimated_cost(pricing, result) if pricing is not None and "input_tokens" in result else None
     if estimate is not None:
         result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)

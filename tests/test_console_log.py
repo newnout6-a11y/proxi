@@ -230,3 +230,23 @@ def test_minara_credits_replace_the_retool_figure_in_the_line():
     usage = {"inputTokens": 4, "promptTokensWrittenToCache": 94_361, "outputTokens": 186}
     line = console_log.CacheMonitor().line("req", usage, credits=207.5942)
     assert "credits=207.5942 out=186" in line
+
+
+def test_a_minara_reply_prints_its_own_counters_and_who_answered_it():
+    # A Minara reply carries the relay's own counters (input_tokens, cache_read, ...), not Retool's metadata: read by
+    # Retool's names alone, every field of its line came out as "?".
+    usage = {"input_tokens": 908, "cache_read": 88_947, "cache_write": 603_627, "output_tokens": 355}
+    line = console_log.CacheMonitor().line("req", usage, credits=1327.98, channel="openrouter", path="messages",
+                                           provider="Google")
+    assert line.startswith("[req] [cache] in=908 read=88,947 write=603,627 credits=1,327.9800 out=355 "
+                           "channel=openrouter path=messages provider=Google")
+    colored = console_log.render(line, color=True)
+    # Who answered stands out: orange (256-color), apart from the yellow of a cache write.
+    assert "\x1b[38;5;208mchannel=openrouter\x1b[0m" in colored and "\x1b[38;5;208mprovider=Google\x1b[0m" in colored
+
+
+def test_a_retool_line_keeps_its_shape_without_a_channel():
+    line = console_log.CacheMonitor().line("req", {"inputTokens": 2, "promptTokensReadFromCache": 243_487,
+                                                   "promptTokensWrittenToCache": 1_758, "creditsUsed": 1.2919,
+                                                   "outputTokens": 355})
+    assert line == "[req] [cache] in=2 read=243,487 write=1,758 credits=1.2919 out=355"

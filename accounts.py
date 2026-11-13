@@ -417,6 +417,48 @@ class AccountDispatcher:
             if refresher is not None:
                 refresher.keepalive_owner = self
 
+    def add_account(self, backend, manager):
+        """Take one account into the live routing pool, its state built exactly as __init__ builds the rest.
+
+        Its first check is due at once (a balance read, or the expiry its token names), so a wrong sign-in or an empty
+        account shows on the status page within seconds instead of after a restart."""
+        with self._lock:
+            if backend in self.state:
+                return
+            now = self.clock()
+            self.state[backend] = {"next_refresh": now, "next_balance": now, "auth_failures": 0,
+                                   "soft_failures": 0, "running": set(), "reasons": {},
+                                   "last_forced": float("-inf"), "forced": None, "available": None,
+                                   "expiry_warned": None}
+            backend.unavailable = None
+            if manager is not None:
+                self.managers[backend] = manager
+                backend.credits = manager
+            refresher = getattr(backend, "refresher", None)
+            if refresher is not None:
+                refresher.keepalive_owner = self
+            # A new list: reports read it without the lock (account_report.account_managers).
+            self.backends = [*self.backends, backend]
+
+    def check_soon(self, backend):
+        """Judge this account again now: its token's expiry at once, its balance at the next tick (the regular check, so
+        the admin's request does not wait for Minara). For an account that has just got a new token."""
+        self.check_expiry([backend])
+        with self._lock:
+            state = self.state.get(backend)
+            if state is not None:
+                state["next_balance"] = min(state["next_balance"], self.clock())
+
+    def remove_account(self, backend):
+        """Take one account out of routing; True when it was there. Nothing of its state is read afterwards."""
+        with self._lock:
+            if backend not in self.state:
+                return False
+            self.backends = [item for item in self.backends if item is not backend]
+            self.state.pop(backend, None)
+            self.managers.pop(backend, None)
+        return True
+
     def threshold_of(self, backend):
         """The balance below which this account takes no new turn, in its own unit."""
         if (getattr(backend, "cfg", None) or {}).get("upstream") == "minara":
@@ -471,7 +513,10 @@ class AccountDispatcher:
 
     def _unclaim(self, backend, kind):
         with self._lock:
-            self.state[backend]["running"].discard(kind)
+            state = self.state.get(backend)
+            if state is not None:
+                state["running"].discard(kind)
+            # Always given back, also for an account removed meanwhile: a slot lost here was lost for every account.
             self._busy = max(0, self._busy - 1)
 
     # -- scheduling ----------------------------------------------------------
@@ -529,14 +574,14 @@ class AccountDispatcher:
                 self.check_balance(backend)
         except Exception as exc:  # noqa: BLE001 - one account must not stop the others
             with self._lock:
-                key = "next_refresh" if kind == "refresh" else "next_balance"
-                self.state[backend][key] = self.clock() + 60.0
-            journal.emit("account.dispatcher", "Проверка аккаунта не удалась: %s" % type(exc).__name__, "warn",
-                         account=account_tag(backend), job=kind)
+                state = self.state.get(backend)
+                if state is not None:
+                    state["next_refresh" if kind == "refresh" else "next_balance"] = self.clock() + 60.0
+            if state is not None:  # an account removed while its check ran has nothing left to report
+                journal.emit("account.dispatcher", "Проверка аккаунта не удалась: %s" % type(exc).__name__, "warn",
+                             account=account_tag(backend), job=kind)
         finally:
-            with self._lock:
-                self.state[backend]["running"].discard(kind)
-                self._busy = max(0, self._busy - 1)
+            self._unclaim(backend, kind)
 
     # -- state ---------------------------------------------------------------
     def _set_reason(self, backend, reason, details):

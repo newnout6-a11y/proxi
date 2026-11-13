@@ -127,7 +127,7 @@ function TokenReport({ report }) {
   return (
     <section className="token-report" aria-label="Результат по токенам" role="status">
       <p className="token-report-head">
-        Добавлено {fmtInt(report.added)}{renewed ? `, обновлено ${fmtInt(renewed)}` : ''} из {fmtInt(report.results.length)}{report.added || renewed ? ', подключатся после перезапуска' : ''}
+        Добавлено {fmtInt(report.added)}{renewed ? `, обновлено ${fmtInt(renewed)}` : ''} из {fmtInt(report.results.length)}{report.added || renewed ? (report.restart_required ? ', подключатся после перезапуска' : ', уже в пуле') : ''}
       </p>
       {skipped.length > 0 && (
         <ol className="token-report-list">
@@ -221,7 +221,7 @@ function AddForm({ onCancel, onSubmit, busy, report }) {
       {minara && report && <TokenReport report={report} />}
       <p className="muted small">
         {minara ? `Токен — JWT из веб-приложения Minara, живёт 30 дней; за ${WARN_DAYS} дня до конца relay предупредит в журнале. Токены сохраняются в config.json, у переменной окружения — только её имя. 220 кредитов — 1 USD.`
-          : 'Cookie и xsrf сохраняются только в config.json рядом с relay. Ресурсы нужны, если у аккаунта другой адрес Retool.'} {minara ? 'Изменения подключатся' : 'Аккаунт подключится'} после перезапуска.
+          : 'Cookie и xsrf сохраняются только в config.json рядом с relay. Ресурсы нужны, если у аккаунта другой адрес Retool.'} {minara ? 'Новые аккаунты и токены вступают в силу сразу' : 'Аккаунт сразу попадает в пул'}, перезапуск не нужен.
       </p>
       <div className="form-actions">
         <Button onClick={onCancel}>Отмена</Button>
@@ -280,9 +280,9 @@ export default function Accounts({ apiKey, onUnauthorized }) {
   const remove = (account) => () => {
     if (!window.confirm(`Удалить аккаунт ${account.label || account.account} из config.json? Его учётные данные будут стёрты`)) return;
     run(account.account, 'Не удалено', () => api(apiKey, `accounts/${account.account}`, { method: 'DELETE', body: {} }),
-      (result) => (result?.pending === 'removed'
+      (result) => (result?.restart_required
         ? { tone: 'warn', title: 'Аккаунт удалён', text: 'Исчезнет из пула после перезапуска relay' }
-        : { tone: 'success', title: 'Аккаунт удалён', text: 'Он ещё не был подключён, перезапуск не нужен' }));
+        : { tone: 'success', title: 'Аккаунт удалён', text: 'Убран из пула, перезапуск не нужен' }));
   };
   const add = (form, { tokens = [], models } = {}) => {
     const minara = form.upstream === 'minara';
@@ -296,10 +296,12 @@ export default function Accounts({ apiKey, onUnauthorized }) {
       : bulk ? { upstream: 'minara', base, bearer_tokens: tokens.map((item) => item.token), ...(label ? { label } : {}), ...(models ? { minara_models: models } : {}) }
         : { upstream: 'minara', base, label, bearer_token_env: form.bearer_token_env.trim(), ...(models ? { minara_models: models } : {}) };
     setReport(null);
+    // The relay takes a new account (and a renewed token) in at once; restart_required says when it could not
+    const when = (result) => (result?.restart_required ? 'Подключится после перезапуска relay' : 'Уже в пуле, перезапуск не нужен');
     return run('_new', 'Не добавлено', () => api(apiKey, 'accounts', { method: 'POST', body }), (result) => {
       if (!bulk) {
         setAdding(false);
-        return { tone: 'success', title: 'Аккаунт добавлен', text: 'Подключится после перезапуска relay' };
+        return { tone: 'success', title: 'Аккаунт добавлен', text: when(result) };
       }
       if (!result?.skipped) {
         setAdding(false);
@@ -309,11 +311,11 @@ export default function Accounts({ apiKey, onUnauthorized }) {
         return { tone: 'success', title: added
           ? `Добавлено: ${accounts(added)} Minara${renewed ? `, токен обновлён у ${fmtInt(renewed)}` : ''}`
           : `Токен обновлён у ${accounts(renewed)} Minara`,
-        text: 'Подключатся после перезапуска relay' };
+        text: result?.restart_required ? 'Подключатся после перезапуска relay' : 'Уже в пуле, перезапуск не нужен' };
       }
       // Something was skipped: the form stays open with what happened to each line
       setReport({ results: result.results || [], added: result.added || 0, renewed: result.renewed || 0,
-        lines: tokens.map((item) => item.line) });
+        restart_required: !!result.restart_required, lines: tokens.map((item) => item.line) });
       return null;
     });
   };

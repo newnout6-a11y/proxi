@@ -442,3 +442,33 @@ def test_a_conversation_stays_on_its_degraded_account_when_no_account_is_better(
         await pool.release(lease)
 
     asyncio.run(scenario())
+
+
+def test_an_account_added_while_running_is_checked_at_once():
+    first = Account("a0")
+    value, clock = dispatcher([first], {first: FakeManager(100.0)})
+    clock.now += 120  # the first account's check is behind
+    value.due()
+    late = Account("late")
+    manager = FakeManager(55.0)
+    value.add_account(late, manager)
+    assert late in value.backends and late.credits is manager and late.unavailable is None
+    assert (late, "refresh") in value.due()  # due at once, not after the start's spread
+
+
+def test_a_check_that_runs_while_its_account_is_removed_gives_its_slot_back():
+    # The dispatcher has `account_refresh_parallel` slots for all accounts: a slot a removed account kept was lost for
+    # every account, and three such removals stopped every balance check and renewal of the relay.
+    gone = Account("gone")
+    value, _ = dispatcher([gone], account_refresh_parallel=1)
+
+    class RemovedDuringRead:
+        def get_balance(self, force_refresh=False):
+            value.remove_account(gone)
+            raise ConnectionError("read failed")
+
+    value.managers[gone] = RemovedDuringRead()
+    value._busy = 1  # as due() leaves it for the claimed job
+    value.state[gone]["running"].add("balance")
+    value._run(gone, "balance")
+    assert value._busy == 0 and gone not in value.state and gone not in value.backends

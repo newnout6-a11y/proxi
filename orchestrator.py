@@ -1652,10 +1652,15 @@ class TurnRunner:
                                             # there, and without it the `[cache]` line was missing for every turn.
                                             monitor = session._console_cache_monitor = console_log.CacheMonitor()
                                         if monitor is not None:
+                                            # The attempt's counters, as the relay keeps them (input_tokens, cache_read,
+                                            # ...), and who answered it: Minara's channel, the path and the provider
+                                            # (minara.provider_of). A Minara line always names both ("?" when unknown).
                                             console_log.write(monitor.line(
-                                                getattr(parsed, 'request_id', None) or 'req', delta,
+                                                getattr(parsed, 'request_id', None) or 'req', usage,
                                                 scope=(parsed.model, getattr(parsed, 'conversation_key', None)),
-                                                credits=minara_credits, write_cost=write_cost)
+                                                credits=minara_credits, write_cost=write_cost,
+                                                channel=usage.get('channel') or '?', path=usage.get('channel_path'),
+                                                provider=usage.get('provider') or '?')
                                                 + (" " + client_context.label() if client_context.label() else ""))
                                     if write_cost is not None and write_cost >= credits.WRITE_WARN:
                                         # A warning only: by the time the usage arrives the turn is paid for. The

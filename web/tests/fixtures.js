@@ -261,15 +261,18 @@ function bulkMinara(state, body) {
     if (token.includes('.expired.')) return { token: position, status: 'expired', expires_at: NOW - 86400 };
     number += 1;
     const label = body.label ? (body.bearer_tokens.length === 1 ? body.label : `${body.label} ${number}`) : `Minara ${number}`;
+    // The relay takes new accounts into the running pool; state.restartRequired is a relay that could not (they wait)
+    const waits = !!state.restartRequired;
     const added = { ...poolAccount(`m-new-${number}`, label, 0), upstream: 'minara', balance_unit: 'minara_credits',
-      balance_supported: false, renewal_supported: false, expires_at: NOW + 30 * 86400, available: null, monthly_allocation: null,
-      used_month: null, reset_date: null, last_renewed_at: null, last_balance_at: null, pending: 'added', state: 'pending', routable: false };
+      balance_supported: !waits, renewal_supported: false, expires_at: NOW + 30 * 86400, available: null, monthly_allocation: null,
+      used_month: null, reset_date: null, last_renewed_at: null, last_balance_at: null,
+      ...(waits ? { pending: 'added', state: 'pending', routable: false } : {}) };
     state.pool.push(added);
     seen.set(token, { position, account: added.account, label, expires_at: added.expires_at });
     return { token: position, status: 'added', account: added.account, label, expires_at: added.expires_at };
   });
   const added = results.filter((item) => item.status === 'added').length;
-  return { results, added, skipped: results.length - added, restart_required: added > 0 };
+  return { results, added, skipped: results.length - added, restart_required: !!state.restartRequired && added > 0 };
 }
 
 // Mirrors models.replaces_xhigh: a Claude route whose levels the client can pick has no xhigh, and the relay serves it at another level.
@@ -352,10 +355,12 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
       const body = request.postDataJSON();
       state.accountRequests.push({ method, path, body, headers });
       if (Array.isArray(body.bearer_tokens)) return reply(200, bulkMinara(state, body));
+      const waits = !!state.restartRequired;
       const added = { ...poolAccount('acc-new', body.label || '', 0), available: null, monthly_allocation: null, used_month: null,
-        reset_date: null, last_renewed_at: null, last_balance_at: null, pending: 'added', state: 'pending', routable: false };
+        reset_date: null, last_renewed_at: null, last_balance_at: null,
+        ...(waits ? { pending: 'added', state: 'pending', routable: false } : {}) };
       state.pool.push(added);
-      return reply(200, { account: added, restart_required: true });
+      return reply(200, { account: added, restart_required: waits });
     }
     const accountMatch = path.match(/^\/admin\/api\/accounts\/([^/]+)(?:\/(balance|renew))?$/);
     if (accountMatch) {
@@ -370,7 +375,11 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
         return reply(200, { ok: true, error: null, account });
       }
       if (!action && method === 'PATCH') { Object.assign(account, request.postDataJSON()); return reply(200, { account }); }
-      if (!action && method === 'DELETE') { account.pending = 'removed'; return reply(200, { ok: true, pending: 'removed', restart_required: true }); }
+      if (!action && method === 'DELETE') {
+        if (state.restartRequired) { account.pending = 'removed'; return reply(200, { ok: true, pending: 'removed', restart_required: true }); }
+        state.pool.splice(state.pool.indexOf(account), 1);
+        return reply(200, { ok: true, pending: null, restart_required: false });
+      }
       return reply(405, { error: { message: 'Method not allowed' } });
     }
     if (path === '/admin/api/settings' && method === 'GET') return reply(200, settingsResponse(state.settings, state.effective, schema));

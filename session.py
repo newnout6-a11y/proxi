@@ -963,6 +963,57 @@ class SessionPool:
         self._store = store
         self._reads.clear()
 
+    def add_account(self, record):
+        """Take one account record into the live pool, built exactly as __init__ builds the rest; returns its backend.
+
+        The account serves requests from the next one on: nothing has to be restarted. `record` joins cfg["accounts"],
+        the list the journal masks every account's secrets from and the Minara routes are built from
+        (CatalogRefresher.install); it is the account's `_account_ref`, so `_apply_live` (enabled, priority, label) reaches
+        it too. The list is extended, never replaced: replaced, the other accounts' cookies were no longer masked."""
+        configs = self.cfg.get("accounts")
+        if not isinstance(configs, list):
+            # One account without accounts[]: the file has just become a pool of it and this one (admin._append_records).
+            # The list holds that first account too, as a copy without "accounts" (never the root cfg, which holds the list).
+            configs = self.cfg["accounts"] = [{key: value for key, value in self.backend.cfg.items() if key != "accounts"}]
+        if record.get("upstream") == "minara" and not record.get("bearer_token"):
+            # config.load resolves bearer_token_env into the record's bearer_token in memory; a record taken from the admin
+            # request has only the variable's name, and every request and balance read of the account would answer 401.
+            import config  # local: session's imports stay those it starts with
+            config.validate_minara_account(record)
+        base = self.backends[0] if self.backends else self.backend
+        custom_post = getattr(base, "_http_post", None)
+        if custom_post == getattr(base, "_default_post", None):
+            custom_post = None
+        custom_ws = getattr(base, "_ws_connect", None)
+        if custom_ws == getattr(websockets, "connect", None):
+            custom_ws = None
+        acc_cfg = model_catalog.account_config(self.cfg, record)
+        acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
+        acc_cfg["_account_ref"] = record
+        acc_cfg["_disk_auth"] = (record.get("cookie"), record.get("xsrf"))
+        backend = Backend(acc_cfg, http_post=custom_post, ws_connect=custom_ws)
+        configs.append(record)
+        # A new list, not an append: a request choosing an account on the event loop keeps reading the list it started with.
+        self.backends = [*self.backends, backend]
+        return backend
+
+    def remove_account(self, backend):
+        """Take one account out of the live pool; True when it was there.
+
+        A conversation running on it keeps its session until that closes; the account takes nothing new. The caller has
+        switched it off first (so it is no candidate of a request choosing right now) and removes its record from the file."""
+        if backend not in self.backends:
+            return False
+        self.backends = [item for item in self.backends if item is not backend]
+        record = backend.cfg.get("_account_ref")
+        configs = self.cfg.get("accounts")
+        if isinstance(configs, list):
+            for item in [item for item in configs if item is record or item is backend.cfg]:
+                configs.remove(item)
+        if self.backend is backend and self.backends:
+            self.backend = self.backends[0]
+        return True
+
     def _persist(self, key, urgent=False):
         """Queue the stored copy of a conversation whose history, cache marks or account moved since the last one.
 

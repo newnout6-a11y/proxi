@@ -940,9 +940,52 @@ class Admin:
         if record.get("upstream") == "minara":
             self._mask_tokens([os.environ.get(record.get("bearer_token_env") or "") or record.get("bearer_token")])
         tag = self._record_tag(record)
-        journal.emit("admin.account", "Добавлен аккаунт %s, подключится после перезапуска" % tag, "success",
-                     account=tag, label=record.get("label", ""))
-        return self._account_response(tag, restart_required=True)
+        live = self._adopt(record)
+        journal.emit("admin.account", "Добавлен аккаунт %s%s" % (
+            tag, ", подключён в пул" if live else ", подключится после перезапуска"), "success",
+            account=tag, label=record.get("label", ""), live=live)
+        return self._account_response(tag, restart_required=not live)
+
+    def _adopt(self, record):
+        """Take a record just written to config.json into the running relay; False when this relay cannot.
+
+        A new account used to need a restart: it was on disk and listed as pending while the pool served without it. Here
+        its backend, balance manager and dispatcher state are built as a start builds them (SessionPool.add_account,
+        Runtime.account_manager, AccountDispatcher.add_account), so it takes requests from the next one on; the Minara
+        routes are rebuilt too, as a Minara account may serve models no other account did."""
+        runtime = self.runtime
+        pool = getattr(runtime, "pool", None)
+        dispatcher = getattr(runtime, "accounts", None)
+        if pool is None or dispatcher is None or not hasattr(pool, "add_account"):
+            return False
+        backend = None
+        try:
+            backend = pool.add_account(record)
+            make = getattr(runtime, "account_manager", None)
+            dispatcher.add_account(backend, make(backend) if make is not None else None)
+            self._routes_changed()
+        except Exception as exc:  # noqa: BLE001 - the account is saved; a restart still takes it
+            if backend is not None:
+                # Half taken in: out again, so that no request goes to an account the dispatcher does not watch.
+                with contextlib.suppress(Exception):
+                    dispatcher.remove_account(backend)
+                with contextlib.suppress(Exception):
+                    pool.remove_account(backend)
+            journal.emit("admin.account", "Аккаунт сохранён, но не подключён в пул (%s: %s); подключится после "
+                         "перезапуска" % (type(exc).__name__, self._safe(str(exc))[:200]), "warn",
+                         error=type(exc).__name__)
+            return False
+        return True
+
+    def _routes_changed(self):
+        """The Minara routes and the catalog refresher's accounts after the pool changed. CatalogRefresher.install rebuilds
+        the routes in place from cfg["accounts"] (every account's cfg holds the same dict), as its own refresh does."""
+        catalog = getattr(self.runtime, "catalog", None)
+        if catalog is None:
+            return
+        catalog.install()
+        catalog.backends = [item for item in self.runtime.pool.backends
+                            if (getattr(item, "cfg", None) or {}).get("upstream") == "minara"]
 
     def _add_minara_accounts(self, data):
         """Minara accounts from several Bearer tokens at once (minara_accounts.plan decides): each token is judged on its
@@ -961,13 +1004,32 @@ class Admin:
             if records or renewed:
                 self._write(path, saved)
         self._mask_tokens([record["bearer_token"] for record in records] + renewed)
+        adopted = [record for record in records if self._adopt(record)]
+        renewed_live = sum(1 for result in results
+                           if result.get("status") == "renewed" and self._renew_token(result["of"]))
         skipped = len(results) - len(records) - len(renewed)
+        later = len(records) - len(adopted) + len(renewed) - renewed_live
         if records or renewed:
-            journal.emit("admin.account", "Аккаунты Minara: добавлено %d, токен обновлён у %d; подключатся после "
-                         "перезапуска" % (len(records), len(renewed)), "success",
-                         accounts=[self._record_tag(record) for record in records], renewed=len(renewed), skipped=skipped)
+            journal.emit("admin.account", "Аккаунты Minara: добавлено %d, токен обновлён у %d%s" % (
+                len(records), len(renewed), "; %d подключатся после перезапуска" % later if later else ", всё уже в пуле"),
+                "success", accounts=[self._record_tag(record) for record in records], renewed=len(renewed),
+                skipped=skipped, live=len(adopted) + renewed_live)
         return self._safe({"results": [self._token_result(result) for result in results], "added": len(records),
-                           "renewed": len(renewed), "skipped": skipped, "restart_required": bool(records or renewed)})
+                           "renewed": len(renewed), "skipped": skipped, "restart_required": later > 0})
+
+    def _renew_token(self, record):
+        """Give the running account of `record` the new token just stored for it; False when it is not running here.
+
+        Every request and balance read takes the token from the account's cfg, so the next one already sends this one,
+        and an account that was out for its expired or refused token is judged again at once (check_soon)."""
+        backend = next((item for item in self._live_backends() if self._same_account(record, item.cfg)), None)
+        if backend is None:
+            return False
+        self._apply_live(backend, {"bearer_token": record["bearer_token"]})
+        dispatcher = getattr(self.runtime, "accounts", None)
+        if dispatcher is not None and hasattr(dispatcher, "check_soon"):
+            dispatcher.check_soon(backend)
+        return True
 
     def _token_result(self, result):
         """One token's outcome as the form reports it: its position, the account it became or already is, never the token."""
@@ -1044,9 +1106,28 @@ class Admin:
             self._write(path, saved)
             if backend is not None:
                 self._apply_live(backend, {"enabled": False})
-        journal.emit("admin.account", "Аккаунт %s удалён из config.json" % tag, "warn", account=tag)
-        return {"ok": True, "pending": "removed" if backend is not None else None,
-                "restart_required": backend is not None}
+        adopted = self._drop(backend)
+        journal.emit("admin.account", "Аккаунт %s удалён из config.json%s" % (
+            tag, ", снят с пула" if adopted else ""), "warn", account=tag, live=adopted)
+        return {"ok": True, "pending": "removed" if backend is not None and not adopted else None,
+                "restart_required": backend is not None and not adopted}
+
+    def _drop(self, backend):
+        """Take an account whose record was just removed from config.json out of the running relay; False when this
+        relay cannot (it then stays in the pool switched off until a restart: the record is already gone from the file)."""
+        runtime = self.runtime
+        if backend is None or not hasattr(getattr(runtime, "pool", None), "remove_account"):
+            return False
+        try:
+            runtime.pool.remove_account(backend)
+            if getattr(runtime, "accounts", None) is not None:
+                runtime.accounts.remove_account(backend)
+            self._routes_changed()  # a Minara account may have been the only one to serve a model
+            return True
+        except Exception as exc:  # noqa: BLE001 - the record is gone from the file; a restart finishes it
+            journal.emit("admin.account", "Аккаунт снят из config.json, но не из пула: %s" % type(exc).__name__,
+                         "warn", error=type(exc).__name__)
+            return False
 
     def _scrub_root(self, saved, record, remaining):
         """The root mirrored the removed account: drop its identity and session there (a

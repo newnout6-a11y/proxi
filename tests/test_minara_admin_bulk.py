@@ -46,7 +46,7 @@ def test_several_tokens_become_numbered_accounts_and_each_is_reported(pool):
     before = journal.JOURNAL.last_seq
     status, body = post(pool, bulk(*tokens))
     assert status == 200, body
-    assert body["added"] == 3 and body["skipped"] == 3 and body["restart_required"] is True
+    assert body["added"] == 3 and body["skipped"] == 3 and body["restart_required"] is False
     results = body["results"]
     assert [item["status"] for item in results] == ["added", "added", "invalid", "duplicate", "expired", "added"]
     assert [item["token"] for item in results] == [1, 2, 3, 4, 5, 6]
@@ -70,11 +70,13 @@ def test_several_tokens_become_numbered_accounts_and_each_is_reported(pool):
     assert config.load(str(pool.path))["accounts"][4]["bearer_token"] == tokens[5]
 
     listing = pool.call(ADD)[1]
-    added = [item for item in listing["accounts"] if item["pending"] == "added"]
-    assert [(item["label"], item["expires_at"], item["balance_unit"]) for item in added] == [
-        ("Minara 1", soon(30), "minara_credits"), ("Minara 2", soon(29), "minara_credits"),
-        ("Minara 3", soon(2), "minara_credits")]
-    assert listing["restart_required"] is True
+    # In the pool at once: listed as loaded accounts (pending None), with the expiry each token names.
+    added = [item for item in listing["accounts"] if item["label"] in ("Minara 1", "Minara 2", "Minara 3")]
+    assert [(item["label"], item["pending"], item["expires_at"], item["balance_unit"]) for item in added] == [
+        ("Minara 1", None, soon(30), "minara_credits"), ("Minara 2", None, soon(29), "minara_credits"),
+        ("Minara 3", None, soon(2), "minara_credits")]
+    assert listing["restart_required"] is False
+    assert len(pool.runtime.pool.backends) == 5 and len(pool.runtime.accounts.backends) == 5
     assert_no_token(listing, tokens)
     events = [event for event in journal.JOURNAL.query(since=before) if event["kind"] == "admin.account"]
     assert len(events) == 1 and events[0]["data"]["accounts"] == [item["account"] for item in results if item["status"] == "added"]
@@ -105,7 +107,10 @@ def test_a_newer_token_of_a_stored_user_renews_that_account(pool):
     stored, fresh = jwt("user-1", exp=soon(2)), jwt("user-1", exp=soon(30))
     assert post(pool, bulk(stored, label="Мой"))[0] == 200
     status, body = post(pool, bulk(fresh))
-    assert status == 200 and body["added"] == 0 and body["renewed"] == 1 and body["restart_required"] is True
+    # The running account sends the new token from its next request: nothing waits for a restart.
+    assert status == 200 and body["added"] == 0 and body["renewed"] == 1 and body["restart_required"] is False
+    live = next(backend for backend in pool.runtime.pool.backends if backend.cfg.get("label") == "Мой")
+    assert live.cfg["bearer_token"] == fresh and live.credits.expires_at() == soon(30)
     assert [(item["status"], item["label"]) for item in body["results"]] == [("renewed", "Мой")]
     assert body["results"][0]["was_expires_at"] == soon(2) and body["results"][0]["expires_at"] == soon(30)
     assert fresh not in json.dumps(body)
@@ -142,7 +147,7 @@ def test_the_single_account_shape_still_needs_no_model_list(pool, monkeypatch):
     monkeypatch.setenv("MINARA_BULK_TEST_TOKEN", token)
     status, body = post(pool, {"upstream": "minara", "bearer_token_env": "MINARA_BULK_TEST_TOKEN",
                                    "minara_models": [], "label": ""})
-    assert status == 200 and body["account"]["pending"] == "added"
+    assert status == 200 and body["account"]["pending"] is None and body["restart_required"] is False
     record = pool.saved()["accounts"][-1]
     assert "minara_models" not in record and "bearer_token" not in record
     assert body["account"]["expires_at"] == soon(9) and body["account"]["balance_unit"] == "minara_credits"

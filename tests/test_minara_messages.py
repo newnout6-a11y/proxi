@@ -284,3 +284,21 @@ def test_a_chat_usage_names_openrouters_provider():
     events = parser.feed(json.dumps({"id": "gen-abc", "provider": "Azure", "choices": [],
                                      "usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
     assert events[0]["usage"]["provider"] == "Azure"
+
+
+@pytest.mark.parametrize("channel, reported, provider", [
+    ("openrouter", "Azure", "Azure"),  # OpenRouter names its provider on the chat path
+    ("openrouter", None, None),  # ... and nothing names it behind /v1/messages
+    ("anthropic", None, "Anthropic"),  # Minara's own channel is the provider itself
+    ("bedrock", None, "Amazon Bedrock"),
+    ("other", None, None), (None, None, None),
+])
+def test_the_provider_of_a_reply_is_the_reported_one_else_its_channel(channel, reported, provider):
+    assert minara.provider_of(channel, reported) == provider
+
+
+def test_a_reply_of_minaras_own_anthropic_channel_names_anthropic_as_its_provider():
+    usage = minara.normalize_messages_usage({"input_tokens": 4, "cache_read_input_tokens": 690_000}, channel="anthropic")
+    assert (usage["channel"], usage["provider"]) == ("anthropic", "Anthropic")
+    # OpenRouter behind /v1/messages names no provider: none is made up
+    assert "provider" not in minara.normalize_messages_usage({"input_tokens": 4}, channel="openrouter")

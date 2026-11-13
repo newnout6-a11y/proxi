@@ -25,7 +25,9 @@ def test_add_bearer_account_keeps_env_reference_without_resolving_to_disk(pool, 
     assert "bearer_token" not in saved
     assert token not in json.dumps(body)
     assert body["account"]["renewal_supported"] is False
-    assert body["account"]["balance_supported"] is False
+    # In the pool at once: its credits are read like any running Minara account's (no longer "after a restart").
+    assert body["account"]["pending"] is None and body["account"]["balance_supported"] is True
+    assert body["restart_required"] is False
 
 
 def test_bearer_accounts_share_an_api_origin_not_an_identity(pool, monkeypatch):

@@ -125,14 +125,9 @@ class Runtime:
         backends = getattr(self.pool, "backends", None) or [self.backend]
         managers = {}
         for backend in backends:
-            if backend.cfg.get("upstream") == "minara":
-                managers[backend] = MinaraAccount(backend.cfg, backend=backend)
-                continue
-            if not hasattr(backend, "refresher"):
-                continue
-            managers[backend] = CreditsManager(
-                backend.cfg.get("base", cfg.get("base")),
-                (lambda b=backend: auth.upstream_headers(b.cfg)), backend.refresher)
+            manager = self.account_manager(backend)
+            if manager is not None:
+                managers[backend] = manager
         self.credits = managers.get(self.backend) or CreditsManager(
             self.backend.cfg.get("base", cfg.get("base")),
             lambda: auth.upstream_headers(self.backend.cfg), getattr(self.backend, "refresher", None))
@@ -170,6 +165,16 @@ class Runtime:
         self.stabilizer = prompt_stabilizer.Stabilizer(
             cfg, os.path.join(folder, prompt_stabilizer.FILE_NAME) if folder else None)
         self.prompts.stabilizer = self.stabilizer  # the admin's preview shows the client's system as it is held
+
+    def account_manager(self, backend):
+        """The balance of one account: Minara's credits, Retool's credits, or None for an account without one. The same
+        for the accounts of the start and for one the admin adds while the relay runs (admin._adopt)."""
+        if backend.cfg.get("upstream") == "minara":
+            return MinaraAccount(backend.cfg, backend=backend)
+        if not hasattr(backend, "refresher"):
+            return None
+        return CreditsManager(backend.cfg.get("base", self.cfg.get("base")),
+                              (lambda b=backend: auth.upstream_headers(b.cfg)), backend.refresher)
 
     def submit(self, coroutine):
         with self._lifecycle_lock:
