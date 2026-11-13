@@ -489,6 +489,7 @@ class Admin:
         self.prompts_lock = threading.Lock()
         self.schema = _schema(self.cfg)
         self._tokens_cache = None  # (config.json's path, mtime, size) -> the Bearer tokens saved in it
+        self._secrets_cache = None  # (the accounts' credentials) -> _account_secrets
         self._mask_cache = None  # (the credentials) -> _Masks
 
     def _saved_tokens(self):
@@ -513,23 +514,38 @@ class Admin:
         return self._tokens_cache[1]
 
     def _account_secrets(self):
-        """Credentials of every account; short values are skipped so they cannot mangle ordinary text."""
+        """Credentials of every account; short values are skipped so they cannot mangle ordinary text.
+
+        Built again only when an account's credentials or the saved tokens change: gathering them took ~0.1 s with 501
+        accounts, three times for each switch of an account."""
+        backends = list(getattr(self.runtime.accounts, "backends", None) or [])
+        tokens = self._saved_tokens()
+        fingerprint = (tokens, tuple(
+            (id(backend),) + tuple((getattr(backend, "cfg", None) or {}).get(key) for key in (
+                "cookie", "xsrf", "bearer_token", "bearer_token_env", "account_id", "page_uuid", "thread_id", "base"))
+            + (tuple((getattr(backend, "cfg", None) or {}).get("cookie_values") or ()),)
+            for backend in backends))
+        cached = self._secrets_cache
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
         # Pending accounts are saved before they are loaded into the routing pool.
         # Their credentials must protect free-text responses too, including after
         # restarting the old runtime with the same configuration file.
-        secrets = list(self._saved_tokens())
-        for backend in getattr(self.runtime.accounts, "backends", None) or []:
+        secrets = list(tokens)
+        for backend in backends:
             cfg = getattr(backend, "cfg", None) or {}
             secrets += [cfg.get("cookie"), cfg.get("xsrf"), cfg.get("bearer_token"),
                         os.environ.get(cfg.get("bearer_token_env") or "")]
             secrets += [part.partition("=")[2].strip() for part in str(cfg.get("cookie") or "").split(";")]
             secrets += cfg.get("cookie_values") or []
         secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= SECRET_CHARS]
-        for backend in getattr(self.runtime.accounts, "backends", None) or []:
+        for backend in backends:
             cfg = getattr(backend, "cfg", None) or {}
             secrets += [str(cfg[key]) for key in ("account_id", "page_uuid", "thread_id", "base")
                         if cfg.get(key) and len(str(cfg[key])) >= 5]
-        return sorted(set(secrets), key=len, reverse=True)
+        result = sorted(set(secrets), key=len, reverse=True)
+        self._secrets_cache = (fingerprint, result)
+        return result
 
     def _masks(self):
         """What _safe masks an answer with: redact()'s cookie pattern and one pattern of every credential, a prefix tree
@@ -862,9 +878,9 @@ class Admin:
 
     def _other_enabled(self, saved, backend):
         """Loaded, still configured and enabled accounts other than `backend`."""
-        records = self._records(saved)
+        saved_holds = self._account_index(self._records(saved))
         return [other for other in self._live_backends() if other is not backend and account_enabled(other)
-                and any(self._same_account(record, other.cfg) for record in records)]
+                and saved_holds(other.cfg)]
 
     @staticmethod
     def _write(path, saved):
@@ -897,7 +913,7 @@ class Admin:
         if account["pending"] == "removed":
             raise apierr.conflict("The account is removed from config.json and leaves after a restart")
         backend = account.get("_backend")
-        with self._transaction() as (path, saved):
+        with self._transaction(refreshers=()) as (path, saved):
             record = self._saved_record(saved, account)
             if changes.get("enabled") is False and backend is not None and account_enabled(backend):
                 if not self._other_enabled(saved, backend):
@@ -1166,7 +1182,8 @@ class Admin:
         if account["pending"] == "removed":
             raise apierr.conflict("The account is already removed and leaves after a restart")
         backend = account.get("_backend")
-        with self._transaction() as (path, saved):
+        # Only this account's renewal can write the record being removed (or the root it shares with the file).
+        with self._transaction(refreshers=(getattr(backend, "refresher", None),)) as (path, saved):
             record = self._saved_record(saved, account)
             if not isinstance(saved.get("accounts"), list) or len(self._records(saved)) <= 1:
                 raise apierr.conflict("The last account cannot be removed")
@@ -1285,8 +1302,12 @@ class Admin:
             raise apierr.bad_request("session_mode is controlled by RELAY_SESSION_MODE", param="session_mode")
 
     @contextlib.contextmanager
-    def _transaction(self):
-        """Read/merge/write of config.json, serialized with renewal's cookie rotation."""
+    def _transaction(self, refreshers=None):
+        """Read/merge/write of config.json, serialized with renewal's cookie rotation.
+
+        `refreshers` are the renewals to wait for: every account's (None) for a change of credentials, none for a switch,
+        a priority or a label, which no renewal touches (persist_auth merges its own cookie under storage_lock alone).
+        Each switch waited for every renewal in flight, seconds each after a start: 0.4 to 7.3 s a switch on 2026-11-13."""
         path = self.cfg.get("_config_path")
         if not path:
             raise apierr.service_unavailable("Relay settings have no writable configuration file")
@@ -1296,9 +1317,10 @@ class Admin:
             # for its HTTP round trip, so an admin write may wait for one to finish (up to
             # upstream_timeout); storage_lock alone would keep the file consistent, the
             # refresher locks keep a renewal from reading the file mid-transaction.
-            backends = getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]
-            for refresher_lock in {id(r._lock): r._lock for r in
-                                   (getattr(b, "refresher", None) for b in backends) if r}.values():
+            if refreshers is None:
+                backends = getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]
+                refreshers = [getattr(b, "refresher", None) for b in backends]
+            for refresher_lock in {id(r._lock): r._lock for r in refreshers if r}.values():
                 locks.enter_context(refresher_lock)
             try:
                 locks.enter_context(config.storage_lock(path))

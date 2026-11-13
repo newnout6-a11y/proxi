@@ -3,6 +3,7 @@ and how routing and the dispatcher honour those controls."""
 import asyncio
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -564,3 +565,34 @@ def test_a_minara_account_added_to_a_retool_pool_brings_its_models(pool):
     assert pool.runtime.cfg["_minara_models"] is routes and "minara/claude-opus-5-5" in routes
     added = pool.runtime.pool.backends[-1]
     assert added.cfg["upstream"] == "minara" and added in pool.runtime.catalog.backends
+
+
+def test_a_switch_does_not_wait_for_a_renewal_in_flight_and_a_slow_answer_is_journaled(pool, monkeypatch):
+    # A renewal holds its account's refresher lock for its HTTP round trip: every switch of an account waited for every
+    # renewal in flight, 0.4 to 7.3 s a switch right after a start (2026-11-13). A switch, a priority or a label touches
+    # nothing a renewal writes (persist_auth merges its own cookie under storage_lock), so it waits for none.
+    renewing = pool.backends[1].refresher._lock
+    assert renewing.acquire(timeout=5)
+    try:
+        started = time.monotonic()
+        status, body = pool.call("/admin/api/accounts/" + pool.tags[0], {"enabled": False}, method="PATCH")
+        assert status == 200 and body["account"]["enabled"] is False and time.monotonic() - started < 5
+    finally:
+        renewing.release()
+    assert pool.saved()["accounts"][0]["enabled"] is False
+    # An admin answer that took a second or more is journaled with its time; a quick poll is not.
+    before = journal.JOURNAL.last_seq
+    pool.call("/admin/api/accounts")
+    deadline = time.monotonic() + 2
+    time.sleep(0.2)
+    assert not [e for e in journal.JOURNAL.query(since=before) if e["kind"] == "http.request"
+                and e["data"].get("path") == "/admin/api/accounts"]
+    monkeypatch.setattr(proxy, "SLOW_ADMIN_MS", 0)
+    pool.call("/admin/api/accounts")
+    while True:
+        slow = [e for e in journal.JOURNAL.query(since=before) if e["kind"] == "http.request"
+                and e["data"].get("path") == "/admin/api/accounts"]
+        if slow or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    assert slow and slow[0]["level"] == "warn" and " за " in slow[0]["message"]

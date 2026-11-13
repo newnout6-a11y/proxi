@@ -478,11 +478,18 @@ def make_handler(runtime: Runtime):
                     minara = (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
                     spent = getattr(self, "_minara_used", None) if minara else self._credits_used
                     console_log.write(console_log.balance_line(self.request_id, snapshot(), spent, account=tag))
-            # Admin polling and live streams would drown the journal in its own traffic.
-            if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
+            # Admin polling and live streams would drown the journal in its own traffic. A slow answer is journaled all the
+            # same (the live journal stream excepted, which lasts by design): a page that took seconds to open left no
+            # trace anywhere but the console (2026-11-13).
+            slow_admin = took >= SLOW_ADMIN_MS and self.path.split("?", 1)[0] != "/admin/api/events/stream"
+            if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400 and not slow_admin:
                 return
-            level = "error" if status >= 500 or status == 0 else "warn" if status >= 400 else "success"
-            journal.emit("http.request", "%s %s → %s" % (self.command, self.path, status or "—"), level,
+            level = ("error" if status >= 500 or status == 0 else "warn" if status >= 400
+                     or (route == "admin" and slow_admin) else "success")
+            message = "%s %s → %s" % (self.command, self.path, status or "—")
+            if route == "admin" and slow_admin:
+                message += " за %.1f с" % (took / 1000)
+            journal.emit("http.request", message, level,
                          request_id=self.request_id, method=self.command, path=self.path, route=route,
                          status=status, duration_ms=round(took), slot_wait_ms=round(slot_wait * 1000),
                          model=None if model == "-" else model,
@@ -1416,6 +1423,8 @@ def make_handler(runtime: Runtime):
 MAX_CONNECTIONS = 512
 # A request that waited this long for a slot says so in the console line of its reply.
 SLOT_WAIT_NOTE = 0.5
+# An admin answer that took this long (ms) is journaled, though the admin's quick polls are not.
+SLOW_ADMIN_MS = 1000
 
 
 class BoundedServer(ThreadingHTTPServer):

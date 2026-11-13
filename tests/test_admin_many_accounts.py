@@ -70,7 +70,7 @@ def test_the_accounts_page_gathers_the_credentials_once(monkeypatch):
     real = admin.Admin._account_secrets
     monkeypatch.setattr(admin.Admin, "_account_secrets", lambda self: calls.append(1) or real(self))
     page = admin.Admin.__new__(admin.Admin)
-    page.cfg, page._tokens_cache, page._mask_cache = {"cookie_values": ["x" * 20]}, None, None
+    page.cfg, page._tokens_cache, page._secrets_cache, page._mask_cache = {"cookie_values": ["x" * 20]}, None, None, None
     page.runtime = SimpleNamespace(accounts=SimpleNamespace(backends=[]))
     entries = [{"info": {"error": "boom %d %s" % (n, "x" * 20)}, "backend": SimpleNamespace(cfg={"account_id": str(n)}),
                 "state": "active", "routable": True, "reserve": False, "available": 1.0, "auth_failures": 0}
