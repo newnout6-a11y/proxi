@@ -39,7 +39,7 @@ import prompt_stabilizer
 import tool_search_policy
 import tool_union
 import validate
-from accounts import UNNAMED, AccountDispatcher, MinaraAccount, account_tag
+from accounts import UNNAMED, AccountDispatcher, MinaraAccount, account_tag, enabled
 from credits import CreditsManager
 from orchestrator import TurnRunner, acquire_plan, client_origin, journal_changes
 from session import Backend, SessionPool
@@ -1503,6 +1503,29 @@ def startup_balance(runtime):
     return account_report.balance_report(account_report.collect(runtime, force_refresh=True))
 
 
+def startup_round(runtime):
+    """The first balance round of a start, while the relay already serves: every enabled account's balance at once
+    (AccountDispatcher.check_all, which also takes the empty ones out of the pool), then the banner's balance lines.
+
+    The start used to read every balance for the banner before it served at all: with 483 accounts that was a minute
+    after the journal's restore, the console full of "[account] ... исключён" lines and no request answered, while the
+    dispatcher read the same balances again three at a time (2026-11-13). Returns the balance report, None when the round
+    failed (the dispatcher's regular checks go on)."""
+    started = time.monotonic()
+    try:
+        check = getattr(runtime.accounts, "check_all", None)
+        checked = check() if check is not None else 0
+        # The balances were just read: the report takes them from the managers' caches, not from the network again.
+        balance = account_report.balance_report(account_report.collect(runtime))
+    except Exception as exc:  # noqa: BLE001 - the relay serves whatever the round could not read
+        console_log.write("[startup] balance round failed: %s" % type(exc).__name__)
+        return None
+    for line in balance_lines(balance):
+        console_log.write("[startup]" + line)
+    console_log.write("[startup] balances of %d accounts read in %.0f s" % (checked, time.monotonic() - started))
+    return balance
+
+
 def startup_warnings(runtime):
     """Conditions that make requests fail later without any other hint, in banner order."""
     backends = getattr(runtime.accounts, "backends", None)
@@ -1519,6 +1542,17 @@ def banner_lines(cfg, balance, warnings=()):
               " model default: " + cfg["model"] + " | effort: " + cfg["reasoning_effort"],
               " session mode:  " + cfg["session_mode"] + " | workspace: " + cfg["workspace_root"],
               " exec policy:   " + cfg["exec_policy"] + " | max turns: " + str(cfg["max_exec_turns"])]
+    lines += balance_lines(balance)
+    lines += [" WARNING:       " + text for text in warnings]
+    lines.append("=" * 64)
+    return lines
+
+
+def balance_lines(balance):
+    """The banner's balance lines; `pending` (a text) while the start's balance round still runs (startup_round)."""
+    if balance.get("pending"):
+        return [" balance:       " + str(balance["pending"])]
+    lines = []
     if balance.get("available") is not None:
         allocation = balance.get("monthly_allocation")
         line = (" balance:       " + str(balance["available"]) + " / " + ("?" if allocation is None else str(allocation)))
@@ -1537,8 +1571,6 @@ def banner_lines(cfg, balance, warnings=()):
         lines.append(" minara:        " + ("unknown" if known is None else "%s credits (~$%s)" % (known, minara.get("usd")))
                      + " on %d account%s" % (minara["accounts_total"], "" if minara["accounts_total"] == 1 else "s")
                      + ("  (%d unknown)" % minara["unknown_accounts"] if minara.get("unknown_accounts") else ""))
-    lines += [" WARNING:       " + text for text in warnings]
-    lines.append("=" * 64)
     return lines
 
 
@@ -1562,9 +1594,14 @@ def main(argv=None):
     refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
     for r in refreshers:
         r.start()  # no-op for accounts the dispatcher schedules
-    balance = startup_balance(runtime)
-    for line in banner_lines(cfg, balance, warnings):
+    # The relay serves at once: the balances are read in the background, and their lines follow the banner.
+    reading = sum(1 for backend in backends if enabled(backend))
+    pending = {"pending": "reading %d account%s in the background; the relay already serves" % (
+        reading, "" if reading == 1 else "s")}
+    for line in banner_lines(cfg, pending, warnings):
         console_log.write(line)
+    first_round = threading.Thread(target=startup_round, args=(runtime,), name="startup-balances", daemon=True)
+    first_round.start()
 
     stop_requested = threading.Event()
 
@@ -1607,6 +1644,7 @@ def main(argv=None):
                 r.stop()
             runtime.catalog.stop()
             runtime.accounts.stop()
+            first_round.join(timeout=2.0)  # stopped, the dispatcher ends the round between two accounts
 
 
 if __name__ == "__main__":

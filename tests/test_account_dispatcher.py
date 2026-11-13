@@ -472,3 +472,79 @@ def test_a_check_that_runs_while_its_account_is_removed_gives_its_slot_back():
     value.state[gone]["running"].add("balance")
     value._run(gone, "balance")
     assert value._busy == 0 and gone not in value.state and gone not in value.backends
+
+
+class SlowManager(FakeManager):
+    """A balance read that takes a while, counting how many run at once."""
+
+    def __init__(self, available, gauge):
+        super().__init__(available)
+        self.gauge = gauge
+
+    def get_balance(self, force_refresh=False):
+        import threading
+        import time
+        with self.gauge["lock"]:
+            self.gauge["now"] += 1
+            self.gauge["most"] = max(self.gauge["most"], self.gauge["now"])
+        time.sleep(0.02)
+        with self.gauge["lock"]:
+            self.gauge["now"] -= 1
+        return super().get_balance(force_refresh)
+
+
+def test_the_first_round_of_a_start_reads_every_enabled_balance_at_once_and_takes_the_empty_ones_out():
+    # 483 accounts at three a time took three minutes after a start to leave the pool, while the start waited a minute
+    # more for the banner's own read of every balance (2026-11-13): the first round reads them all, 16 at a time.
+    import threading
+    gauge = {"lock": threading.Lock(), "now": 0, "most": 0}
+    accounts = [Account("a%d" % i) for i in range(40)]
+    accounts[3].cfg["enabled"] = False
+    managers = {account: SlowManager(0.0 if i % 4 == 0 else 500.0, gauge) for i, account in enumerate(accounts)}
+    value, _clock = dispatcher(accounts, managers)
+    assert value.check_all(parallel=8) == 39  # the switched-off account stays off the network
+    assert managers[accounts[3]].fetches == 0 and all(managers[a].fetches == 1 for a in accounts if a is not accounts[3])
+    assert 1 < gauge["most"] <= 8
+    out = [i for i, account in enumerate(accounts) if account.unavailable]
+    assert out == [i for i in range(0, 40, 4)] and accounts[4].unavailable["reason"] == "exhausted"
+    # Every claim is given back: the regular loop finds the accounts again when they are due.
+    assert all(not value.state[account]["running"] for account in accounts)
+
+
+def test_an_account_checked_in_the_first_round_is_not_checked_by_the_loop_at_the_same_time():
+    import threading
+    import time
+    release = threading.Event()
+
+    class Held(FakeManager):
+        def get_balance(self, force_refresh=False):
+            release.wait(5)
+            return super().get_balance(force_refresh)
+
+    accounts = [Account("a%d" % i) for i in range(3)]
+    for account in accounts:
+        del account.refresher  # a Bearer account: no renewal job, only balances
+    managers = {account: Held(500.0) for account in accounts}
+    value, clock = dispatcher(accounts, managers)
+    clock.now += 120.0  # every first check is due
+    worker = threading.Thread(target=value.check_all)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not all(value.state[account]["running"] for account in accounts):
+            assert time.monotonic() < deadline
+        assert value.due() == []  # claimed by the round
+    finally:
+        release.set()
+        worker.join(5)
+    assert all(managers[account].fetches == 1 for account in accounts)
+    assert value.due() == []  # just read: the next reads are an interval away
+
+
+def test_a_stopped_dispatcher_ends_the_first_round_between_two_accounts():
+    accounts = [Account("a%d" % i) for i in range(5)]
+    managers = {account: FakeManager(500.0) for account in accounts}
+    value, _clock = dispatcher(accounts, managers)
+    value._stop.set()
+    assert value.check_all() == 5 and all(managers[account].fetches == 0 for account in accounts)
+    assert all(not value.state[account]["running"] for account in accounts)

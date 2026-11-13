@@ -75,3 +75,38 @@ def test_rotation_failure_does_not_kill_the_journal(tmp_path, monkeypatch, capsy
     monkeypatch.setattr(os, "replace", real_replace)
     event = instance.emit("probe", "after-failure")
     assert event is not None and event["seq"] == 6, "journal must survive failed rotations"
+
+
+def test_restore_with_many_accounts_masks_their_secrets_and_builds_the_cookie_pattern_once(tmp_path, monkeypatch):
+    # 501 accounts (1,027 cookie values and Minara tokens) made the restore at startup clean a million strings one by one,
+    # each against an alternation of every secret: 90 s before the relay listened (2026-11-13). The same strings are now
+    # cleaned once per restore, the cookie pattern is looked up once per event, and the secrets are still masked.
+    import secrets as random_secrets
+
+    import redact
+    tokens = ["eyJ" + random_secrets.token_urlsafe(700) for _ in range(400)]
+    cookies = ["c%03d%s" % (n, random_secrets.token_hex(20)) for n in range(600)]
+    cfg = {"cookie_values": cookies + tokens,
+           "accounts": [{"cookie": "session=" + value, "thread_id": "thread-%04d-abcdef" % n} for n, value in
+                        enumerate(cookies[:78])]}
+    path = tmp_path / "journal.jsonl"
+    lines = []
+    for seq in range(1, 2001):
+        message = "turn %d" % (seq % 7)
+        if seq == 1500:
+            message = "pasted " + tokens[123] + " and " + cookies[456] + " and thread-0042-abcdef"
+        lines.append(json.dumps({"seq": seq, "ts": float(seq), "kind": "upstream.usage", "category": "upstream",
+                                 "level": "info", "message": message, "turn_id": "t%d" % (seq % 50),
+                                 "data": {"client": "claude-desktop", "account": "a%d" % (seq % 9), "credits": 0.5}}))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    built = []
+    real = redact._cookie_pattern
+    monkeypatch.setattr(redact, "_cookie_pattern", lambda values: built.append(1) or real(values))
+    instance = Journal()
+    instance.configure(cfg, str(path), load=True)
+    assert len(built) <= 2  # once for the restore (and for an event emitted alongside it), not once per string
+    events = {event["seq"]: event for event in instance.query(limit=5000)}
+    assert len(events) == 2000 and events[1499]["message"] == "turn 1" and events[1499]["data"]["credits"] == 0.5
+    leaked = events[1500]["message"]
+    assert tokens[123] not in leaked and cookies[456] not in leaked and "thread-0042-abcdef" not in leaked
+    assert leaked.startswith("pasted ") and leaked.count("[redacted]") == 3

@@ -24,6 +24,7 @@ import time
 
 import client_context
 import console_clock
+import redact as redact_module
 from redact import redact
 
 LEVELS = ("debug", "info", "success", "warn", "error")
@@ -39,6 +40,10 @@ KEEP_FILES = 5
 # What a restart reads back of the files, newest first: the ring buffer takes the last CAPACITY events and the
 # metrics window the last day, so reading all the kept files would only slow the start down.
 RESTORE_BYTES = 20 * 1024 * 1024
+# The restore remembers what each string of up to _MEMO_CHARS became, for up to _MEMO_SIZE strings: keys, kinds, ids and
+# names repeat in every event, so most of the restore's strings are cleaned once.
+_MEMO_CHARS = 256
+_MEMO_SIZE = 200_000
 _TOP_LEVEL = ("turn_id", "request_id", "conversation")
 # Rollups: numeric counters per FINE seconds (the smallest chart bucket), distributions per
 # COARSE seconds (window-wide figures only), both kept for the longest window plus a margin.
@@ -541,8 +546,10 @@ class _Rollup:
 
 
 class _Secrets(list):
-    """The values to mask, and `pattern`, which finds any of them in a text (None when there are none)."""
+    """The values to mask, `pattern`, which finds any of them in a text (None when there are none), and `cookies`, the
+    pattern redact() masks the cookie values with (False: not built, redact() looks it up)."""
     pattern = None
+    cookies = False
 
 
 class Journal:
@@ -596,6 +603,10 @@ class Journal:
         lines = [line for found in reversed(parts) for line in found]
         restored = []
         secrets = self._secrets()  # the same for every line: built once (it was 15 s of a 19 s start with 76 accounts)
+        # The same short strings come back in every event (keys, kinds, levels, ids, model and client names): each is
+        # cleaned once per restore. With 501 accounts the restore cleaned 1,052,225 strings one by one: 90 s before the
+        # relay listened (2026-11-13), most of it in the secret patterns (now a prefix tree, redact.literal_pattern).
+        memo = {}
         for line in lines:
             try:
                 event = json.loads(line)
@@ -605,7 +616,7 @@ class Journal:
                 continue
             # Re-clean with the CURRENT patterns and secrets: events written by
             # older code (or before a redact fixup) must not serve raw.
-            event = self._clean(event, secrets)
+            event = self._clean(event, secrets, memo=memo)
             event["restored"] = True
             restored.append(event)
         with self._cond:
@@ -660,52 +671,66 @@ class Journal:
         values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))
         found = _Secrets(value for value in values if isinstance(value, str) and len(value) >= 4)
         found.pattern = self._pattern_of(found)
+        # redact() masks the cookie values with a pattern of its own: looked up once per event here, not for every string
+        # of it (a tuple of 1,027 values hashed a million times was 10 s of the restore at startup).
+        found.cookies = redact_module.cookie_pattern(cfg.get("cookie_values") or ())
         return found
 
     def _pattern_of(self, secrets):
         """The pattern that finds any of `secrets` in a text, or None when there are none.
 
         The accounts are the same from one event to the next, so it is built again only when a secret changes (an account
-        added, a cookie rotated): the key is compared with the one it was built for, string by string, identity first."""
+        added, a cookie rotated): the key is compared with the one it was built for, string by string, identity first.
+        A prefix tree of them (redact.literal_pattern): the plain alternation was 55 s of a 97 s start with 501 accounts."""
         key = tuple(secrets)
         cached, pattern = self._pattern
         if cached == key:
             return pattern
-        pattern = re.compile("|".join(re.escape(secret) for secret in sorted(set(key), key=len, reverse=True))) if key else None
+        pattern = redact_module.literal_pattern(key) if key else None
         self._pattern = (key, pattern)
         return pattern
 
-    def _clean(self, value, secrets, depth=0):
+    def _clean(self, value, secrets, depth=0, memo=None):
+        """`memo` (the restore at startup) keeps what each short string became: the same secrets clean it the same way."""
         if depth > 6:
             return "…"
         if isinstance(value, str):
+            remember = memo is not None and len(value) <= _MEMO_CHARS
+            if remember:
+                cached = memo.get(value)
+                if cached is not None:
+                    return cached
             # A lone UTF-16 surrogate (a client's "\ud83d") cannot be written as UTF-8: the event never reached journal.jsonl,
             # and the admin event list and live stream broke on it. It is kept as its escape.
             text = value if value.isascii() else value.encode("utf-8", "backslashreplace").decode("utf-8")
-            text = redact(text, cookie_values=(self._cfg or {}).get("cookie_values", ()))
+            cookies = getattr(secrets, "cookies", False)  # False: a plain list, the pattern is looked up by redact()
+            text = redact(text, cookie_values=(self._cfg or {}).get("cookie_values", ()), cookie_pattern=cookies)
             # Each secret is replaced in turn, as before; a text that holds none of them (nearly every one) skips the loop.
             pattern = getattr(secrets, "pattern", False)  # False: a plain list, whose secrets are all tried
             if pattern is False or (pattern is not None and pattern.search(text)):
                 for secret in secrets:
                     text = text.replace(secret, "[redacted]")
-            return text if len(text) <= 4000 else text[:4000] + "…[+%d]" % (len(text) - 4000)
+            text = text if len(text) <= 4000 else text[:4000] + "…[+%d]" % (len(text) - 4000)
+            if remember and len(memo) < _MEMO_SIZE:
+                memo[value] = text
+            return text
         if isinstance(value, dict):
             cleaned = {}
             for key, item in list(value.items())[:64]:
                 # Keys are user-adjacent data too: a secret can sit in a key.
                 if isinstance(item, float) and "cost" in str(key) and math.isfinite(item):
                     # A cost keeps its digits: rounded to 5 decimals, $0.000224 read 0.00022 and a cheap turn 0.0.
-                    cleaned[self._clean(str(key), secrets, depth + 1)] = round(item, 10)
+                    cleaned[self._clean(str(key), secrets, depth + 1, memo)] = round(item, 10)
                     continue
-                cleaned[self._clean(str(key), secrets, depth + 1)] = self._clean(item, secrets, depth + 1)
+                cleaned[self._clean(str(key), secrets, depth + 1, memo)] = self._clean(item, secrets, depth + 1, memo)
             return cleaned
         if isinstance(value, (list, tuple, set)):
-            return [self._clean(item, secrets, depth + 1) for item in list(value)[:64]]
+            return [self._clean(item, secrets, depth + 1, memo) for item in list(value)[:64]]
         if value is None or isinstance(value, (bool, int)):
             return value
         if isinstance(value, float):
             return round(value, 5) if value == value and value not in (float("inf"), float("-inf")) else None
-        return self._clean(str(value), secrets, depth + 1)
+        return self._clean(str(value), secrets, depth + 1, memo)
 
     # -- recording ---------------------------------------------------------
     def emit(self, kind, message="", level="info", **fields):

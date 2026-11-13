@@ -1,5 +1,7 @@
 """Secret redaction for logs, injected context and command output."""
 import collections
+import itertools
+import os
 import re
 import threading
 
@@ -54,6 +56,40 @@ _COOKIE_PATTERNS = 8  # the journal's whole list and the lists of a few accounts
 _COOKIES_LOCK = threading.Lock()
 
 
+def literal_pattern(values):
+    """One pattern that finds any of `values` (literal strings, the longest where several start at the same place), or
+    None for none: what `"|".join` of them, longest first, finds, laid out as a tree of their common prefixes.
+
+    The plain alternation tried every value at every character of a text. With 501 accounts (1,027 cookie values and
+    Minara tokens of about 1 KB, 1,259 secrets in the journal's list) the journal's restore at startup spent 90 s in it,
+    before the relay listened (2026-11-13); the tree tries only the values that share what was read so far: 28 times
+    faster on the same journal strings, with the same replacements."""
+    found = sorted({value for value in values if isinstance(value, str) and value})
+    if not found:
+        return None
+    try:
+        return re.compile(_prefix_tree(found))
+    except (RecursionError, re.error):  # a pathological set (thousands of nested prefixes): the plain alternation
+        return re.compile("|".join(re.escape(value) for value in sorted(found, key=len, reverse=True)))
+
+
+def _prefix_tree(values):
+    """The pattern of sorted, distinct `values`: a branch per first character, each branch's common prefix taken whole,
+    so a 1 KB token is one literal and the recursion goes only as deep as the values part. A value that ends where longer
+    ones go on makes the rest optional and greedy: the longest value that matches is the one replaced."""
+    ends = values[0] == ""  # sorted: an empty rest comes first
+    rest = values[1:] if ends else values
+    if not rest:
+        return ""
+    branches = []
+    for char, group in itertools.groupby(rest, key=lambda value: value[0]):
+        tails = [value[1:] for value in group]
+        common = os.path.commonprefix(tails)
+        branches.append(re.escape(char + common) + _prefix_tree([tail[len(common):] for tail in tails]))
+    body = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
+    return "(?:" + body + ")?" if ends else body
+
+
 def _cookie_pattern(values):
     """One pattern for every cookie value of at least 12 characters, built again only when the values change.
 
@@ -64,8 +100,7 @@ def _cookie_pattern(values):
         if key in _COOKIES:
             _COOKIES.move_to_end(key)
             return _COOKIES[key]
-    found = sorted({value for value in key if isinstance(value, str) and len(value) >= 12}, key=len, reverse=True)
-    pattern = re.compile("|".join(re.escape(value) for value in found)) if found else None
+    pattern = literal_pattern(value for value in key if isinstance(value, str) and len(value) >= 12)
     with _COOKIES_LOCK:
         _COOKIES[key] = pattern
         while len(_COOKIES) > _COOKIE_PATTERNS:
@@ -73,15 +108,21 @@ def _cookie_pattern(values):
     return pattern
 
 
-def redact(text: str, *, cookie_values=()) -> str:
-    """Mask known secret shapes plus any literal cookie value we hold."""
+def cookie_pattern(values):
+    """The pattern redact() masks `values` with: built once by a caller that masks many texts with the same values (the
+    journal, once per event), where redact(cookie_values=...) looks it up again for every text."""
+    return _cookie_pattern(values) if values else None
+
+
+def redact(text: str, *, cookie_values=(), cookie_pattern=False) -> str:
+    """Mask known secret shapes plus any literal cookie value we hold. `cookie_pattern`, when given (None included), is
+    cookie_pattern(cookie_values) built by the caller."""
     if not text:
         return text
     out = text
-    if cookie_values:
-        pattern = _cookie_pattern(cookie_values)
-        if pattern is not None and len(out) >= 12:
-            out = pattern.sub(MASK, out)
+    pattern = (_cookie_pattern(cookie_values) if cookie_values else None) if cookie_pattern is False else cookie_pattern
+    if pattern is not None and len(out) >= 12:
+        out = pattern.sub(MASK, out)
     if not _may_hold_a_secret(out):
         return out
     for pattern, replacement in _PATTERNS:

@@ -137,6 +137,61 @@ def test_main_writes_the_warning_to_the_journal_and_the_banner(tmp_path, monkeyp
     assert " WARNING:       default model 'claude-fable-5' is not published" in capsys.readouterr().out
 
 
+
+def test_main_serves_before_the_balances_are_read_and_prints_them_after(tmp_path, monkeypatch, capsys):
+    """With 483 accounts the start read every balance for the banner before it served: a minute with no request
+    answered, the console full of exclusions (2026-11-13). The banner says the balances are being read, the relay serves,
+    and the balance lines follow once the start's round (AccountDispatcher.check_all) is done."""
+    import signal
+    import threading
+    monkeypatch.setattr(journal, 'JOURNAL', journal.Journal())
+    monkeypatch.setattr(threading, 'excepthook', threading.excepthook)
+    cfg = runtime_config(tmp_path)
+    cfg.update(relay_api_key='fixture-relay-key-' + 'x' * 20)
+    runtime = proxy.Runtime(cfg)
+    monkeypatch.setattr(runtime.accounts, 'start', lambda: None)
+    reading, release = threading.Event(), threading.Event()
+
+    def check_all():
+        reading.set()
+        assert release.wait(5)
+        return 1
+    monkeypatch.setattr(runtime.accounts, 'check_all', check_all)
+    monkeypatch.setattr(runtime.credits, 'get_balance', lambda **_kw: {'available': 100})
+    handlers, stopped, seen = {}, threading.Event(), {}
+
+    class Server:
+        def __init__(self, *_args):
+            pass
+
+        def serve_forever(self):
+            # Serving while the round still reads: the banner is out, the balance is not.
+            assert reading.wait(2)
+            seen['before'] = capsys.readouterr().out
+            release.set()
+            handlers[signal.SIGINT](signal.SIGINT, None)
+            assert stopped.wait(2)
+
+        def shutdown(self):
+            stopped.set()
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(proxy, 'Runtime', lambda _cfg: runtime)
+    monkeypatch.setattr(proxy, 'BoundedServer', Server)
+    monkeypatch.setattr(proxy, 'startup_config', lambda _argv: cfg)
+    monkeypatch.setattr(proxy.signal, 'signal', lambda sig, handler: handlers.__setitem__(sig, handler))
+    try:
+        proxy.main([])
+    finally:
+        runtime.close()
+    assert ' balance:       reading 1 account in the background; the relay already serves' in seen['before']
+    assert '[startup]' not in seen['before']
+    after = capsys.readouterr().out
+    assert '[startup] balance:       100' in after and '[startup] balances of 1 accounts read in' in after
+
+
 # -- 63 and the /health session: counts and sessions that exist --------------------------------------
 def test_health_counts_the_published_models_not_the_whole_registry(multi):
     status, health, _ = multi.call('/health', key=None)

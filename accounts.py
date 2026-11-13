@@ -31,6 +31,7 @@ FORCED_CHECK_GAP = 15.0   # at most one on-demand balance fetch per account per 
 TOKEN_RECHECK = 120.0     # seconds between balance reads of a Minara account whose token was rejected: a brief
                           # 401 of Minara's own took every account out for ten minutes
 STARTUP_SPREAD = 2.0      # seconds between accounts' first checks
+STARTUP_PARALLEL = 16     # balances read at a time in the first round of a start (check_all)
 NETWORK_PAUSE_MAX = 300.0
 AUTH_RETRY_MAX = 600.0
 PRIORITY_MAX = 99
@@ -1008,6 +1009,52 @@ class AccountDispatcher:
             with self._lock:
                 state["forced"] = None
             pending.set()
+
+    def check_all(self, parallel=None):
+        """Read every enabled account's balance now, `parallel` at a time (STARTUP_PARALLEL), and judge each one as the
+        regular check does: the first round of a start. Returns how many accounts it checked.
+
+        The regular round reads `account_refresh_parallel` (3) accounts at a time and spreads the first reads over a
+        minute: with 483 accounts the empty ones (most of the Minara pool) left the pool one by one for three minutes after
+        a start, and the start itself waited a minute more for the banner's own read of every balance (2026-11-13). An
+        account claimed here is left alone by the dispatcher's loop until its check is done; the relay stopping ends the
+        round between two accounts."""
+        claimed = []
+        with self._lock:
+            for backend in self.backends:
+                state = self.state.get(backend)
+                manager = self.managers.get(backend)
+                if (state is None or state["running"] or not enabled(backend) or manager is None
+                        or not getattr(manager, "supports_balance", True)):
+                    continue
+                state["running"].add("balance")
+                claimed.append(backend)
+
+        def check(backend):
+            try:
+                if not self._stop.is_set():
+                    self.check_balance(backend)
+            except Exception as exc:  # noqa: BLE001 - one account must not stop the others
+                with self._lock:
+                    state = self.state.get(backend)
+                    if state is not None:
+                        state["next_balance"] = self.clock() + 60.0
+                journal.emit("account.dispatcher", "Проверка аккаунта не удалась: %s" % type(exc).__name__, "warn",
+                             account=account_tag(backend), job="balance")
+            finally:
+                with self._lock:
+                    state = self.state.get(backend)
+                    if state is not None:
+                        state["running"].discard("balance")
+
+        if claimed:
+            workers = DaemonIOExecutor(min(max(1, int(parallel or STARTUP_PARALLEL)), len(claimed)),
+                                       thread_name_prefix="account-start")
+            try:
+                list(workers.map(check, claimed))
+            finally:
+                workers.shutdown(wait=False)
+        return len(claimed)
 
     def status(self):
         with self._lock:
