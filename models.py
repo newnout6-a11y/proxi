@@ -341,6 +341,33 @@ def add_discovered(found):
     return changed
 
 
+def add_levels(verified):
+    """Effort levels Retool's own registry documents for a model and a probe question saw its route take (retool_refresh),
+    in place: each joins the model's reasoning_effort_levels, in EFFORT_ORDER, audited entries included. A route whose
+    effort is accepted and ignored (GLM, Haiku) and a Minara entry never change. Returns the ids changed."""
+    changed = []
+    for name, added in (verified or {}).items():
+        entry = _BY_ID.get(name)
+        if (entry is None or entry.get('upstream') == 'minara' or entry.get('route_status') != 'verified'
+                or entry.get('reasoning_effort_control') == 'accepted-ignored'):
+            continue
+        known = list(entry.get('reasoning_effort_levels') or ())
+        extra = [level for level in added or () if level in EFFORT_ORDER and level not in known]
+        if not extra:
+            continue
+        levels = [level for level in EFFORT_ORDER if level in known or level in extra]
+        # A new entry rather than an edit, as add_discovered does: a request already holding the old one keeps it.
+        updated = dict(entry, reasoning_effort_levels=levels, reasoning=True, reasoning_effort_control='selectable',
+                       reasoning_effort_added=[level for level in levels if level not in known
+                                               or level in (entry.get('reasoning_effort_added') or ())])
+        if updated.get('default_reasoning_effort') not in levels:
+            updated['default_reasoning_effort'] = _recommended_effort(name, levels)
+        CATALOG[CATALOG.index(entry)] = updated
+        _BY_ID[name] = updated
+        changed.append(name)
+    return changed
+
+
 def _is_claude_route(model):
     """A catalog id of the Anthropic provider; a name the catalog lacks (strict_models off) counts when it says claude."""
     entry = _BY_ID.get(model)

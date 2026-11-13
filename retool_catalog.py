@@ -40,10 +40,15 @@ def read(path):
 
 
 def apply_overlay(path):
-    """Publish the overlay's models (retool_refresh writes them) into models.CATALOG, in place; the ids added or changed.
-    An audited entry of the same id wins; an unreadable overlay changes nothing."""
-    entries = [entry for entry in (read(path).get("models") or {}).values() if isinstance(entry, dict)]
-    return models.add_discovered(entries)
+    """Publish the overlay's models (retool_refresh writes them) into models.CATALOG, in place, and give every model the
+    effort levels a probe saw its route take (state "levels"); the ids added or changed. An audited entry of the same id
+    wins over a published one; an unreadable overlay changes nothing."""
+    state = read(path)
+    entries = [entry for entry in (state.get("models") or {}).values() if isinstance(entry, dict)]
+    changed = models.add_discovered(entries)
+    verified = {ident: record.get("verified") for ident, record in (state.get("levels") or {}).items()
+                if isinstance(record, dict) and record.get("verified")}
+    return changed + [ident for ident in models.add_levels(verified) if ident not in changed]
 
 
 def _unescape(literal):

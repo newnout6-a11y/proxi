@@ -100,7 +100,11 @@ def refresher(tmp_path, frontend, answers, **cfg):
     settings = dict({"_retool_catalog_file": str(tmp_path / retool_catalog.AUTO_NAME)}, **cfg)
     asked = []
 
-    def prober(backend, entry):
+    def prober(backend, entry, effort=None):
+        if effort is not None:  # a level of a model the relay routes (CatalogRefresher._relevel)
+            asked.append((entry["id"], effort))
+            return dict({"ok": True, "accepted": True, "http": 200, "error": None, "credits": 0.004, "thinking": 1,
+                         "seconds": 0.5}, **answers.get((entry["id"], effort), {}))
         asked.append(entry["id"])
         return dict({"http": 200, "error": None, "credits": 0.0125, "thinking": 0, "seconds": 1.0},
                     **answers.get(entry["id"], {"ok": True}))
@@ -170,6 +174,61 @@ def test_probes_per_look_are_bounded(tmp_path):
     assert len(asked) == 3 and sum(reason.startswith("waits for the next look") for reason in summary["skipped"].values()) == 6
 
 
+def with_levels():
+    """The registry as Retool might change it: Opus 5.5 gains xhigh, GPT-6 Sol lists the xhigh its route refuses, GLM
+    lists levels its route takes and ignores."""
+    document = registry()
+    document["anthropic"]["models"]["claude-opus-5-5"]["capabilities"]["reasoningEffortLevels"] = [
+        "low", "medium", "high", "xhigh", "max"]
+    document["openAI"]["models"]["gpt-6-sol"] = {"id": "gpt-6-sol", "capabilities": {
+        "textGeneration": True, "reasoningEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"]}}
+    document["retoolFast"] = {"models": {"zai-org/GLM-5.3": {"id": "zai-org/GLM-5.3", "capabilities": {
+        "textGeneration": True, "reasoningEffortLevels": ["none", "high", "max"]}}}}
+    return document
+
+
+def test_a_level_retool_adds_is_asked_once_and_offered_without_a_restart(tmp_path):
+    gpt_levels = list(models._BY_ID["gpt-6-sol"]["reasoning_effort_levels"])
+    assert models._BY_ID["zai-org/GLM-5.3"]["reasoning_effort_control"] == "accepted-ignored"
+    value, asked = refresher(tmp_path, Frontend(with_levels()), {"gpt-7-mini": {"ok": False, "http": 404}})
+    before = journal.JOURNAL.last_seq
+    summary = value.run_once()
+    # Only the level the relay lacks and has no reason to doubt is asked: GPT's xhigh is refused (422), GLM ignores effort.
+    assert [item for item in asked if isinstance(item, tuple)] == [("claude-opus-5-5", "xhigh")]
+    assert summary["leveled"] == [["claude-opus-5-5", "xhigh"]] and summary["refused_levels"] == []
+    opus = models._BY_ID["claude-opus-5-5"]
+    assert opus["reasoning_effort_levels"] == ["low", "medium", "high", "xhigh", "max"]
+    assert not models.replaces_xhigh(opus)  # xhigh is now sent as itself, not as the claude_xhigh_effort setting
+    assert models._BY_ID["gpt-6-sol"]["reasoning_effort_levels"] == gpt_levels
+    assert models._BY_ID["zai-org/GLM-5.3"]["reasoning_effort_levels"] == []
+    added = [event for event in journal.JOURNAL.query(since=before, limit=100) if event["kind"] == "catalog.retool_level_added"]
+    assert len(added) == 1 and added[0]["data"]["effort"] == "xhigh"
+    path = tmp_path / retool_catalog.AUTO_NAME
+    assert retool_catalog.read(path)["levels"]["claude-opus-5-5"]["verified"] == ["xhigh"]
+    # The next look asks nothing: the level is offered.
+    asked.clear()
+    value.run_once()
+    assert [item for item in asked if isinstance(item, tuple)] == []
+    # A start gives it back from the overlay.
+    opus["reasoning_effort_levels"] = ["low", "medium", "high", "max"]
+    assert "claude-opus-5-5" in retool_catalog.apply_overlay(path)
+    assert models._BY_ID["claude-opus-5-5"]["reasoning_effort_levels"] == ["low", "medium", "high", "xhigh", "max"]
+
+
+def test_a_level_the_route_refuses_is_asked_again_after_its_day(tmp_path):
+    value, asked = refresher(tmp_path, Frontend(with_levels()), {
+        ("claude-opus-5-5", "xhigh"): {"ok": False, "accepted": False, "http": 422, "error": "invalid reasoning effort"}})
+    summary = value.run_once()
+    assert summary["leveled"] == [] and summary["refused_levels"] == [["claude-opus-5-5", "xhigh", "invalid reasoning effort"]]
+    assert "xhigh" not in models._BY_ID["claude-opus-5-5"]["reasoning_effort_levels"]
+    assert models.replaces_xhigh(models._BY_ID["claude-opus-5-5"])
+    mark = retool_catalog.read(tmp_path / retool_catalog.AUTO_NAME)["levels"]["claude-opus-5-5"]["refused"]["xhigh"]
+    assert (mark["failures"], mark["http"]) == (1, 422) and mark["retry_after"] > summary["at"]
+    asked.clear()
+    again = value.run_once()
+    assert asked == [] and again["skipped"]["claude-opus-5-5 at xhigh"].startswith("asked again after")
+
+
 class Stream:
     def __init__(self, lines, status=200):
         self.lines, self.status = [json.dumps(line).encode() + b"\n" for line in lines], status
@@ -210,6 +269,35 @@ def test_a_probe_reads_the_relays_own_route(monkeypatch):
     monkeypatch.setattr(retool_refresh.urllib.request, "urlopen", refused)
     result = retool_refresh.probe(account, entry)
     assert result["ok"] is False and result["http"] == 404 and "no" in result["error"]
+
+
+def test_a_level_probe_asks_at_that_level_and_stops_at_the_first_event(monkeypatch):
+    seen = {"read": 0}
+
+    class Counting(Stream):
+        def __iter__(self):
+            for line in self.lines:
+                seen["read"] += 1
+                yield line
+
+    def answer(request, timeout):
+        seen["body"] = json.loads(request.data)
+        return Counting([{"event": "content_block_delta", "type": "thinking", "partialThinking": "hm"},
+                         {"event": "content_block_delta", "type": "text", "partialText": "never read"},
+                         {"event": "end_of_stream"}])
+    monkeypatch.setattr(retool_refresh.urllib.request, "urlopen", answer)
+    monkeypatch.setattr(retool_refresh.auth, "upstream_headers", lambda cfg: {"cookie": "c"})
+    account = Account()
+    entry = {"id": "claude-opus-5-5", "provider": "anthropic", "reasoning_effort_levels": ["low", "high"]}
+    result = retool_refresh.probe(account, entry, effort="xhigh")
+    assert seen["body"]["reasoningEffort"] == "xhigh" and seen["read"] == 1
+    assert (result["ok"], result["accepted"], result["error"], result["thinking"]) == (True, True, None, 1)
+
+    def refused(request, timeout):
+        raise retool_refresh.urllib.error.HTTPError(request.full_url, 422, "u", {}, io.BytesIO(b'{"message":"effort"}'))
+    monkeypatch.setattr(retool_refresh.urllib.request, "urlopen", refused)
+    result = retool_refresh.probe(account, entry, effort="xhigh")
+    assert (result["ok"], result["accepted"], result["http"]) == (False, False, 422) and "effort" in result["error"]
 
 
 def test_a_published_model_reaches_the_client_lists_sync(tmp_path):

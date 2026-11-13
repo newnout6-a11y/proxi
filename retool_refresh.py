@@ -12,8 +12,11 @@ off), first three minutes after the start, the relay:
   most `retool_catalog_probes` a look (10 by default; one question costs a few hundredths of a credit). A model that
   answers is published with the registry's limits and levels, at once and without a restart (/v1/models, /codex/models
   and the routes see it); one that does not is asked again on a later look, at most MAX_ATTEMPTS times a day;
-- says what it found: catalog.retool_model_added, catalog.retool_model_failed and catalog.retool_refresh in the journal,
-  a [catalog] line on the console.
+- compares the effort levels the registry documents for each model it routes with the ones it offers: a new level is
+  asked one question at that level (closed at the model's first event) and offered as soon as the route takes it, the
+  audited models included; a level the route refuses is asked again after a day, three, then a week;
+- says what it found: catalog.retool_model_added, catalog.retool_model_failed, catalog.retool_level_added,
+  catalog.retool_level_refused and catalog.retool_refresh in the journal, a [catalog] line on the console.
 
 What it learns goes to retool_models.auto.json beside config.json (retool_catalog.apply_overlay puts it into the catalog
 at every start). The client files (OpenCode, Claude Desktop) list a new model after their sync script, as for Minara.
@@ -68,23 +71,30 @@ def fetch(url, limit, timeout=30.0):
     return data.decode("utf-8", "replace")
 
 
-def probe(backend, entry, timeout=90.0):
+def probe(backend, entry, timeout=90.0, effort=None):
     """Ask `entry`'s model one short question through `backend` (a Retool account) on the relay's own route: a dict with
     `ok` (it answered with the expected word), `http`, `error`, `credits` (what Retool reported), `thinking` (thinking
-    events seen) and `seconds`. A model that only thinks within the output limit counts as not answering."""
+    events seen), `accepted` (the model began to answer) and `seconds`. A model that only thinks within the output limit
+    counts as not answering.
+
+    With `effort` the question is asked at that level and only whether the route takes it counts: the stream is closed
+    at the model's first thinking or text event (`ok` = `accepted`), so a level that thinks at length costs little."""
     cfg = backend.cfg
     nonce = uuid.uuid4().hex[:8].upper()
     word = "READY-" + nonce
     head = "You are answering a one-line availability check. Reply with exactly the word %s and nothing else." % word
     provider = {"model": entry["id"], "providerResourceName": models.provider_resource(cfg, entry)}
-    if "low" in (entry.get("reasoning_effort_levels") or ()):
+    if effort is not None:
+        provider["reasoningEffort"] = effort
+    elif "low" in (entry.get("reasoning_effort_levels") or ()):
         provider["reasoningEffort"] = "low"  # a small answer: thinking at length would eat the output limit
     body = direct.build_body(cfg, provider, head, "Reply now with the word.", [], None, 2048)
     headers = auth.upstream_headers(cfg)
     headers["content-type"] = "application/json"
     request = urllib.request.Request(str(cfg["base"]).rstrip("/") + direct.ROUTE,
                                      data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
-    row = {"ok": False, "http": None, "error": None, "credits": None, "thinking": 0, "seconds": None}
+    row = {"ok": False, "http": None, "error": None, "credits": None, "thinking": 0, "accepted": False,
+           "seconds": None}
     text, ended, started = [], False, time.monotonic()
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -103,8 +113,10 @@ def probe(backend, entry, timeout=90.0):
                 block = str(event.get("type") or "")
                 if kind == "content_block_delta" and block == "text":
                     text.append(str(event.get("partialText") or ""))
+                    row["accepted"] = row["accepted"] or not row["error"]
                 elif kind == "content_block_delta" and block == "thinking":
                     row["thinking"] += 1
+                    row["accepted"] = row["accepted"] or not row["error"]
                 elif kind == "metadata" and isinstance(event.get("usage"), dict):
                     used = console_log.number(event["usage"].get("creditsUsed"))
                     row["credits"] = used if used is not None else row["credits"]
@@ -113,6 +125,8 @@ def probe(backend, entry, timeout=90.0):
                 elif kind == "end_of_stream" or block == "end_of_stream":
                     ended = True
                     break
+                if effort is not None and row["accepted"]:
+                    break  # the route took the level: the model is answering at it
     except urllib.error.HTTPError as error:
         row["http"] = error.code
         row["error"] = error.read(2000).decode("utf-8", "replace")[:300]
@@ -120,10 +134,18 @@ def probe(backend, entry, timeout=90.0):
     except (OSError, ValueError) as error:
         row["error"] = type(error).__name__
     row["seconds"] = round(time.monotonic() - started, 2)
+    row["accepted"] = bool(row["accepted"] and row["http"] == 200)
     answer = "".join(text).strip()
-    row["ok"] = row["http"] == 200 and ended and not row["error"] and word in answer
-    if not row["ok"] and not row["error"]:
-        row["error"] = "no answer" if not answer else "unexpected answer: %s" % answer[:80]
+    if effort is not None:
+        row["ok"] = row["accepted"]
+        if row["ok"]:
+            row["error"] = None
+        elif not row["error"]:
+            row["error"] = "no answer"
+    else:
+        row["ok"] = row["http"] == 200 and ended and not row["error"] and word in answer
+        if not row["ok"] and not row["error"]:
+            row["error"] = "no answer" if not answer else "unexpected answer: %s" % answer[:80]
     # Never a credential in what is kept or said: the answer of an error page may quote the request.
     row["error"] = journal.scrub(row["error"]) if row["error"] else None
     return row
@@ -212,10 +234,32 @@ class CatalogRefresher:
         summary.setdefault("error", "no enabled Retool account")
         return None
 
+    def _accounts(self, provider):
+        """The live accounts with a resource of `provider`; none for Google while every account has only the managed
+        placeholder (managed Google is no route: models.route_block_reason)."""
+        key = models.PROVIDER_RESOURCE_KEY.get(provider)
+        accounts = [b for b in self._live() if key and b.cfg.get(key)]
+        if provider == "google" and accounts and all(b.cfg.get(key) == "__managed__" for b in accounts):
+            return []
+        return accounts
+
+    def _spent(self, summary, backend, result):
+        credits = result.get("credits")
+        if credits:
+            summary["spent_credits"] = round(summary["spent_credits"] + credits, 5)
+            manager = getattr(backend, "credits", None)
+            if manager is not None and hasattr(manager, "record_turn"):
+                manager.record_turn("retool-catalog-%s" % uuid.uuid4().hex, credits)
+
+    def _retry_after(self, failures):
+        wait = RETRY_DAYS[min(failures, len(RETRY_DAYS)) - 1]
+        return (datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(days=wait)).isoformat(timespec="seconds")
+
     def run_once(self):
         """One look at Retool's registry; a summary of what changed (also kept as self.last)."""
         summary = {"at": _now(), "entry_script": None, "registry": 0, "new": [], "added": [], "failed": [],
-                   "skipped": {}, "spent_credits": 0.0}
+                   "leveled": [], "refused_levels": [], "skipped": {}, "spent_credits": 0.0}
         state = retool_catalog.read(self.path)
         found = self._registry(state, summary)
         if found is None:
@@ -229,11 +273,7 @@ class CatalogRefresher:
         budget = self.probes
         for ident, model in sorted(retool_catalog.new_models(found, published).items()):
             summary["new"].append(ident)
-            key = models.PROVIDER_RESOURCE_KEY.get(model["provider"])
-            accounts = [b for b in self._live() if key and b.cfg.get(key)]
-            if model["provider"] == "google" and accounts and all(
-                    b.cfg.get(key) == "__managed__" for b in accounts):
-                accounts = []  # managed Google is no route (models.route_block_reason)
+            accounts = self._accounts(model["provider"])
             if not accounts:
                 summary["skipped"][ident] = "no account has a %s resource" % model["provider"]
                 continue
@@ -253,22 +293,20 @@ class CatalogRefresher:
             record.update(last=summary["at"], account=account_tag(backend),
                           result={key: result.get(key) for key in ("ok", "http", "error", "credits", "thinking",
                                                                    "seconds")})
-            credits = result.get("credits")
-            if credits:
-                summary["spent_credits"] = round(summary["spent_credits"] + credits, 5)
-                manager = getattr(backend, "credits", None)
-                if manager is not None and hasattr(manager, "record_turn"):
-                    manager.record_turn("retool-catalog-%s" % uuid.uuid4().hex, credits)
+            self._spent(summary, backend, result)
             if result.get("ok"):
                 published[ident] = dict(entry, published_at=summary["at"], thinking=bool(result.get("thinking")))
                 records.pop(ident, None)
                 summary["added"].append(ident)
             else:
                 record["failures"] = int(record.get("failures") or 0) + 1
-                wait = RETRY_DAYS[min(record["failures"], len(RETRY_DAYS)) - 1]
-                record["retry_after"] = (datetime.datetime.now(datetime.timezone.utc)
-                                         + datetime.timedelta(days=wait)).isoformat(timespec="seconds")
+                record["retry_after"] = self._retry_after(record["failures"])
                 summary["failed"].append([ident, result.get("error") or "HTTP %s" % result.get("http")])
+        if self.path:
+            # The models just published are in the catalog before their levels are compared.
+            retool_catalog.write(self.path, state)
+            retool_catalog.apply_overlay(self.path)
+        self._relevel(found, state, summary, budget)
         state["refreshed_at"] = summary["at"]
         if self.path:
             retool_catalog.write(self.path, state)
@@ -276,6 +314,62 @@ class CatalogRefresher:
         self._report(summary)
         self.last = summary
         return summary
+
+    def _relevel(self, found, state, summary, budget):
+        """The effort levels Retool's registry documents for a model the relay routes and the relay does not offer yet:
+        each is asked one question at that level (probe with `effort`), within the look's probe budget. A level the route
+        takes is offered at once (state "levels", models.add_levels); one it refuses is asked again after a day, three,
+        then a week, as it may be switched on later. Levels the route is known to refuse (GPT's xhigh: HTTP 422,
+        2026-11-03) and routes whose effort is accepted and ignored (GLM, Haiku) are not asked; a level the registry no
+        longer lists stays, as the route took it."""
+        levels_state = state.setdefault("levels", {})
+        for ident, model in sorted(found.items()):
+            entry = models._BY_ID.get(ident)
+            if (entry is None or entry.get("route_status") != "verified"
+                    or entry.get("reasoning_effort_control") == "accepted-ignored"):
+                continue
+            provider = entry.get("provider")
+            record = levels_state.get(ident) or {}
+            offered = set(entry.get("reasoning_effort_levels") or ()) | set(record.get("verified") or ())
+            refused_known = models._DISCOVERED_REFUSED_LEVELS.get(provider, ())
+            candidates = [level for level in model.get("reasoning_effort_levels") or ()
+                          if level in models.EFFORT_ORDER and level not in offered and level not in refused_known]
+            if not candidates:
+                continue
+            accounts = self._accounts(provider)
+            if not accounts:
+                summary["skipped"]["%s levels" % ident] = "no account has a %s resource" % provider
+                continue
+            for level in candidates:
+                label = "%s at %s" % (ident, level)
+                mark = (record.get("refused") or {}).get(level) or {}
+                if mark.get("retry_after") and mark["retry_after"] > summary["at"]:
+                    summary["skipped"][label] = "asked again after %s" % mark["retry_after"]
+                    continue
+                if budget <= 0:
+                    summary["skipped"][label] = "waits for the next look (retool_catalog_probes)"
+                    continue
+                if self._stop.is_set():
+                    return budget
+                budget -= 1
+                backend = accounts[0]
+                result = self._probe(backend, entry, effort=level)
+                self._spent(summary, backend, result)
+                record = levels_state.setdefault(ident, {})
+                if result.get("ok"):
+                    record["verified"] = [step for step in models.EFFORT_ORDER
+                                          if step in (record.get("verified") or ()) or step == level]
+                    (record.get("refused") or {}).pop(level, None)
+                    record["checked_at"] = summary["at"]
+                    summary["leveled"].append([ident, level])
+                else:
+                    failures = int(mark.get("failures") or 0) + 1
+                    reason = result.get("error") or "HTTP %s" % result.get("http")
+                    record.setdefault("refused", {})[level] = {
+                        "failures": failures, "http": result.get("http"), "error": reason, "last": summary["at"],
+                        "account": account_tag(backend), "retry_after": self._retry_after(failures)}
+                    summary["refused_levels"].append([ident, level, reason])
+        return budget
 
     def _report(self, summary):
         for ident in summary["added"]:
@@ -286,14 +380,25 @@ class CatalogRefresher:
             journal.emit("catalog.retool_model_failed", "Retool: модель %s не ответила на проверку (%s)" % (ident, reason),
                          "warn", upstream="retool", model=ident, reason=reason)
             console_log.write("[catalog] Retool: модель %s не ответила на проверку (%s)" % (ident, reason))
+        for ident, level in summary.get("leveled", ()):
+            journal.emit("catalog.retool_level_added", "Retool: у %s новый уровень effort %s из реестра Retool, маршрут "
+                         "его принял" % (ident, level), "success", upstream="retool", model=ident, effort=level,
+                         levels=(models._BY_ID.get(ident) or {}).get("reasoning_effort_levels"))
+            console_log.write("[catalog] Retool: у %s новый уровень effort %s" % (ident, level))
+        for ident, level, reason in summary.get("refused_levels", ()):
+            journal.emit("catalog.retool_level_refused", "Retool: уровень effort %s у %s есть в реестре, но маршрут его не "
+                         "принял (%s)" % (level, ident, reason), "info", upstream="retool", model=ident, effort=level,
+                         reason=reason)
         if summary.get("error"):
             journal.emit("catalog.retool_refresh_failed", "Каталог Retool не прочитан: %s" % summary["error"], "warn",
                          upstream="retool", error=summary["error"])
             return
         skipped = "; ".join("%s: %s" % item for item in summary["skipped"].items())
         journal.emit("catalog.retool_refresh", "Каталог Retool проверен: %d моделей в реестре, новых %d, опубликовано %d, "
-                     "не ответили %d, отложено %d%s; проверки стоили %.4f кредита" % (
+                     "не ответили %d, новых уровней effort %d, отложено %d%s; проверки стоили %.4f кредита" % (
                          summary["registry"], len(summary["new"]), len(summary["added"]), len(summary["failed"]),
-                         len(summary["skipped"]), " (%s)" % skipped if skipped else "", summary["spent_credits"]),
-                     "info", upstream="retool", **{key: summary[key] for key in (
-                         "entry_script", "registry", "new", "added", "failed", "skipped", "spent_credits")})
+                         len(summary.get("leveled", ())), len(summary["skipped"]), " (%s)" % skipped if skipped else "",
+                         summary["spent_credits"]),
+                     "info", upstream="retool", **{key: summary.get(key) for key in (
+                         "entry_script", "registry", "new", "added", "failed", "leveled", "refused_levels", "skipped",
+                         "spent_credits")})
