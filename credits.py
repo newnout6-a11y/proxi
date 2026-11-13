@@ -111,22 +111,27 @@ def write_cost(usage, model=None, pricing=None):
     A cache write is the one line item that can cost more than a whole account: a 484,380-token write at Fable 5.2's
     $10/M is 1065 Minara credits ($4.84), more than the 300-credit plan of a fresh account. Minara's own price list
     (`pricing`, USD per million tokens) is what it debits, so the share is read from there rather than guessed from the
-    dollar total, which mixes input, output and reads together."""
+    dollar total, which mixes input, output and reads together. A price expression gives the write's share at the tier the
+    whole prompt falls in (minara.write_cost): without it a model priced by one (Sonnet 4.5, GPT-6) never got the warning."""
     if not isinstance(usage, dict) or not isinstance(pricing, dict):
         return None
     tokens = usage.get("cache_write")
     if type(tokens) not in (int, float) or not math.isfinite(tokens) or tokens <= 0:
         return None
+    if isinstance(model, str) and model.startswith("minara/"):
+        import minara_catalog
+        try:
+            import minara
+            usd = minara.write_cost(pricing, usage)
+        except Exception:  # noqa: BLE001 - a warning's figure must never fail the turn it is about
+            return None
+        return None if usd is None else round(usd * minara_catalog.CREDITS_PER_USD, 2)
     try:
         usd_per_million = float(pricing.get("cache_write", pricing["prompt"]) or 0)
     except (KeyError, TypeError, ValueError):
         return None
     if not math.isfinite(usd_per_million) or usd_per_million <= 0:
         return None
-    usd = tokens * usd_per_million / 1e6
-    if isinstance(model, str) and model.startswith("minara/"):
-        import minara_catalog
-        return round(usd * minara_catalog.CREDITS_PER_USD, 2)
     # Retool bills its own fitted rate for a write (credits per token), not Minara's dollar price list.
     return round(tokens * rates(model)["cache_write"], 5)
 

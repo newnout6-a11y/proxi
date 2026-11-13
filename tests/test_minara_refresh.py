@@ -271,3 +271,64 @@ def test_messages_levels_come_from_the_channels_on_chat_and_on_messages():
     without = dict(results["anthropic/claude-sonnet-4.6"], messages={"status": "failed", "levels": {}})
     alone = minara_probe.generate({"anthropic/claude-sonnet-4.6": without}, listing[1:], {})["models"][0]
     assert alone["status"] == "uncached" and alone["messages_levels"] is None
+
+
+# Gemini 4 Carbon's price as Minara lists it (2026-11-13): an expression whose `ai` is audio input (new-api's billing
+# expression). The relay's reader did not know `ai`, so Carbon and Hydrogen waited unmeasured, named nowhere but in a
+# count of "отложено", and their turns would have had no price.
+CARBON = {"quota_type": 0, "billing_mode": "tiered_expr", "group_ratio": 1, "prompt": None, "completion": None,
+          "cache_read": None, "cache_write": None, "request": None,
+          "billing_expr": "p * 2 + c * 10 + cr * 0.1 + cc * 0.1875 + ai * 2"}
+
+
+def test_a_new_model_priced_by_an_expression_with_audio_input_is_measured(tmp_path, monkeypatch):
+    cfg = relay_cfg(tmp_path)
+    monkeypatch.setattr(minara_probe, "measure_model", measured_ok)
+    item = {"id": "google/gemini-test-carbon", "pricing": CARBON, "supported_endpoint_types": ["openai"]}
+    summary = refresher(cfg, FakeClient(listing_of([item]))).run_once()
+    assert summary["added"] == ["google/gemini-test-carbon"] and summary["skipped"] == []
+    assert summary["unpriced"] == {}  # every published model of the shipped catalog has a price the relay reads
+
+
+def test_a_model_whose_price_cannot_be_read_is_not_measured_and_says_why(tmp_path, monkeypatch, capsys):
+    cfg = relay_cfg(tmp_path)
+    monkeypatch.setattr(minara_probe, "measure_model", lambda *a, **k: pytest.fail("an unpriced model was measured"))
+    unreadable = dict(CARBON, billing_expr="p * 2 + c * 10 + vid * 3")
+    item = {"id": "google/gemini-test-video", "pricing": unreadable, "supported_endpoint_types": ["openai"]}
+    before = journal.JOURNAL.last_seq
+    summary = refresher(cfg, FakeClient(listing_of([item]))).run_once()
+    assert summary["skipped"] == ["google/gemini-test-video"] and summary["price_unreadable"] == summary["skipped"]
+    assert summary["skipped_reasons"]["google/gemini-test-video"].endswith("неизвестная переменная vid")
+    record = json.loads((tmp_path / minara_catalog.AUTO_NAME).read_text(encoding="utf-8"))["measurements"][
+        "google/gemini-test-video"]
+    assert record["attempts"] == 0 and record["skipped"]["price_unreadable"] is True and "vid" in record["skipped"]["reason"]
+    events = journal.JOURNAL.query(since=before, limit=500)
+    said = [event for event in events if event["kind"] == "catalog.model_skipped"]
+    assert len(said) == 1 and said[0]["level"] == "warn" and "google/gemini-test-video" in said[0]["message"]
+    assert "google/gemini-test-video" in [event for event in events if event["kind"] == "catalog.refresh"][-1]["message"]
+    assert "[catalog] Minara: новая модель google/gemini-test-video не измерена" in capsys.readouterr().out
+
+
+def test_a_model_over_the_budget_waits_with_its_reason_as_information(tmp_path, monkeypatch):
+    cfg = relay_cfg(tmp_path, minara_catalog_budget=1)
+    monkeypatch.setattr(minara_probe, "measure_model", lambda *a, **k: pytest.fail("measured over the budget"))
+    item = {"id": "google/gemini-test-carbon", "pricing": CARBON, "supported_endpoint_types": ["openai"]}
+    before = journal.JOURNAL.last_seq
+    summary = refresher(cfg, FakeClient(listing_of([item]))).run_once()
+    assert summary["skipped"] == ["google/gemini-test-carbon"] and summary["price_unreadable"] == []
+    assert "бюджете" in summary["skipped_reasons"]["google/gemini-test-carbon"]
+    said = [event for event in journal.JOURNAL.query(since=before, limit=500) if event["kind"] == "catalog.model_skipped"]
+    assert len(said) == 1 and said[0]["level"] == "info"
+
+
+def test_a_published_model_repriced_into_a_price_the_relay_cannot_read_is_a_warning(tmp_path):
+    cfg = relay_cfg(tmp_path)
+    upstream = next(name for name, entry in minara_catalog.MEASURED.items() if entry.get("status") == "ok")
+    items = [dict(item, pricing=dict(CARBON, billing_expr="p * 2 + c * 10 + zz * 1")) if item["id"] == upstream else item
+             for item in listing_of()]
+    before = journal.JOURNAL.last_seq
+    summary = refresher(cfg, FakeClient(items)).run_once()
+    assert upstream in summary["repriced"] and summary["unpriced"][upstream].endswith("неизвестная переменная zz")
+    warned = [event for event in journal.JOURNAL.query(since=before, limit=500)
+              if event["kind"] == "catalog.price_unreadable"]
+    assert len(warned) == 1 and warned[0]["level"] == "warn" and warned[0]["data"]["upstream_model"] == upstream

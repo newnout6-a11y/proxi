@@ -193,7 +193,7 @@ class CatalogRefresher:
         """One look at Minara's list; a summary of what changed (also kept as self.last)."""
         backend, client = self._account()
         summary = {"at": _now(), "listed": 0, "added": [], "repriced": [], "gone": [], "failed": [], "skipped": [],
-                   "spent_credits": 0.0}
+                   "skipped_reasons": {}, "price_unreadable": [], "unpriced": {}, "spent_credits": 0.0}
         if client is None:
             summary["error"] = "no_account"
             self.last = summary
@@ -225,6 +225,10 @@ class CatalogRefresher:
             if _pricing_key(entry.get("pricing")) != _pricing_key(item["pricing"]):
                 overlay[upstream] = dict(entry, pricing=copy.deepcopy(item["pricing"]), refreshed_at=now)
                 summary["repriced"].append(upstream)
+            # A published model whose price the relay cannot read has every turn unpriced: said on each look, never quietly.
+            problem = minara.price_problem(item["pricing"]) if entry.get("status") == "ok" else None
+            if problem:
+                summary["unpriced"][upstream] = problem
         missing = state.setdefault("missing", {})
         if complete:
             for upstream, entry in list(measured.items()):
@@ -277,11 +281,23 @@ class CatalogRefresher:
                 continue
             checks = minara_probe.checks_for(item)
             # The checks' cost is known from the price list; the study's is not (300 to 27,000 tokens a request on its
-            # question): it gets what is left and stops after its first request when it would not fit.
-            estimate = minara_probe.measure_estimate(item.get("pricing"), [c for c in checks if c != "study"])
+            # question): it gets what is left and stops after its first request when it would not fit. A price the relay
+            # cannot read leaves the model unmeasured (its turns would have no price), and says why: Gemini 4 Hydrogen
+            # and Carbon waited unseen on 2026-11-13 for the `ai` (audio input) of their expressions.
+            problem = minara.price_problem(item.get("pricing"))
+            estimate = None if problem else minara_probe.measure_estimate(
+                item.get("pricing"), [c for c in checks if c != "study"])
             if estimate is None or estimate > budget:
+                reason = problem or ("замер стоит около %.0f кредитов, а в бюджете этой проверки осталось %.0f" % (
+                    estimate, budget) if estimate is not None else "стоимость замера не посчитать")
+                unreadable = bool(problem or estimate is None)
+                record["skipped"] = {"at": now, "reason": reason, "price_unreadable": unreadable}
                 summary["skipped"].append(upstream)
+                summary["skipped_reasons"][upstream] = reason
+                if unreadable:
+                    summary["price_unreadable"].append(upstream)
                 continue
+            record.pop("skipped", None)
             try:
                 before = client.credits()
             except Exception:  # noqa: BLE001
@@ -345,9 +361,25 @@ class CatalogRefresher:
         for upstream in summary["repriced"]:
             journal.emit("catalog.model_repriced", "Minara: новая цена %s" % upstream, "info", upstream="minara",
                          upstream_model=upstream)
+        for upstream, reason in summary.get("unpriced", {}).items():
+            name = minara_catalog.public_id(upstream)
+            journal.emit("catalog.price_unreadable", "Minara: цену %s релей не читает (%s): ходы этой модели идут без "
+                         "цены" % (name, reason), "warn", upstream="minara", model=name, upstream_model=upstream,
+                         reason=reason)
+            console_log.write("[catalog] Minara: цену %s релей не читает (%s): ходы этой модели идут без цены" % (
+                name, reason))
+        for upstream, reason in summary.get("skipped_reasons", {}).items():
+            # A price the relay cannot read waits for a fix of the relay; a measurement over the budget, for the next look.
+            journal.emit("catalog.model_skipped", "Minara: новая модель %s не измерена: %s" % (upstream, reason),
+                         "warn" if upstream in summary.get("price_unreadable", ()) else "info", upstream="minara",
+                         upstream_model=upstream, reason=reason)
+            console_log.write("[catalog] Minara: новая модель %s не измерена: %s" % (upstream, reason))
+        skipped = "; ".join("%s: %s" % item for item in summary.get("skipped_reasons", {}).items())
         journal.emit("catalog.refresh", "Каталог Minara проверен: %d моделей; новых %d, новых цен %d, снято %d, "
-                     "не прошли %d, отложено %d; замеры стоили %.2f кредита" % (
+                     "не прошли %d, отложено %d%s; замеры стоили %.2f кредита" % (
                          summary["listed"], len(summary["added"]), len(summary["repriced"]), len(summary["gone"]),
-                         len(summary["failed"]), len(summary["skipped"]), summary["spent_credits"]),
+                         len(summary["failed"]), len(summary["skipped"]), " (%s)" % skipped if skipped else "",
+                         summary["spent_credits"]),
                      "info", upstream="minara", **{key: summary[key] for key in (
-                         "listed", "added", "repriced", "gone", "failed", "skipped", "spent_credits")})
+                         "listed", "added", "repriced", "gone", "failed", "skipped", "skipped_reasons", "unpriced",
+                         "spent_credits")})
