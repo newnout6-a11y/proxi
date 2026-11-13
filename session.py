@@ -1064,6 +1064,16 @@ class SessionPool:
             return False
         return kind != "ready" and backend in candidates
 
+    def _move_reason(self, backend, model_entry):
+        """Why a conversation leaves this account (account.migrate): why the account is out of the pool, its Retool plan
+        that refused the model (plan_refused), no route to the model, or else a failover of this very request."""
+        reason = (getattr(backend, "unavailable", None) or {}).get("reason")
+        if reason:
+            return reason
+        if self._plan_hold(backend, model_entry) is not None:
+            return "plan_refused"
+        return "failover" if self._routable(backend, model_entry) else "no_route"
+
     def _state_refusal(self, backend, model_entry, exclude):
         """Why a stored conversation cannot return to its account now (a name for the journal), else None."""
         if backend is None:
@@ -1230,11 +1240,43 @@ class SessionPool:
             pass
 
     @staticmethod
+    def _plan_hold(backend, model_entry):
+        """The hold AccountDispatcher.mark_plan_refusal keeps on this account for this model ({until_at, pause}), or None."""
+        holds = getattr(backend, "refused_models", None)
+        if not isinstance(holds, dict) or not holds or model_entry is None:
+            return None
+        return holds.get(model_entry.get("id"))
+
+    @staticmethod
+    def _plan_reason(holds):
+        """What a request is told about the accounts whose Retool plan refused its model: one text for all of them (the 404
+        names it once), with how many there are and when the relay tries the first of them again."""
+        first = min(hold.get("until_at") or 0 for hold in holds)
+        return ('the Retool plan of %d account%s does not include it (HTTP 402 "This model is not available for your '
+                'plan."); the relay tries again at %s' % (len(holds), "" if len(holds) == 1 else "s",
+                                                          time.strftime("%H:%M", time.localtime(first))))
+
+    @staticmethod
+    def _refusals(model_entry, backends, configured=True):
+        """models.refusal_reasons over these accounts, with an account whose Retool plan refused the model a short while ago
+        (_plan_hold) refusing it too: a settled fact until the hold ends, like a route fact. [None, ...] without a model."""
+        backends = list(backends)
+        if model_entry is None:
+            return [None] * len(backends)
+        reasons = model_catalog.refusal_reasons(model_entry, [backend.cfg for backend in backends], configured)
+        holds = [SessionPool._plan_hold(backend, model_entry) for backend in backends]
+        if not any(holds):
+            return reasons
+        text = SessionPool._plan_reason([hold for hold in holds if hold])
+        return [reason or (text if hold else None) for reason, hold in zip(reasons, holds)]
+
+    @staticmethod
     def _route_refusal(backend, model_entry):
-        """Why this account can never serve the model (a settled fact, unlike its health), or None."""
+        """Why this account cannot serve the model (a settled fact, unlike its health), or None: its configuration, or a
+        Retool plan that refused the model a short while ago."""
         if model_entry is None:
             return None
-        return model_catalog.refusal_reasons(model_entry, [backend.cfg])[0]
+        return SessionPool._refusals(model_entry, [backend])[0]
 
     @staticmethod
     def _check_route(backend, model_entry):
@@ -1315,8 +1357,7 @@ class SessionPool:
         """
         if model_entry is None:
             return None
-        configs = [backend.cfg for backend in self._serving(isolated, context_scope)]
-        refusals = model_catalog.refusal_reasons(model_entry, configs, self._pool_configured())
+        refusals = self._refusals(model_entry, self._serving(isolated, context_scope), self._pool_configured())
         return model_catalog.model_unavailable(model_entry, refusals) if refusals and all(refusals) else None
 
     def _candidates(self, backends, model_entry, exclude=(), configured=True):
@@ -1325,14 +1366,14 @@ class SessionPool:
         kind is "ready" (usable accounts), "reserve" (every one is below min_account_balance: the richest serves)
         or "signed_out" (a session that needs a new sign-in is still tried). Reads state only: nothing is
         reserved, awaited or counted. `configured` is refusal_reasons': acquire() always judges the resource.
+        An account whose Retool plan refused the model a short while ago refuses it like a route fact (_refusals).
         """
-        reasons = (model_catalog.refusal_reasons(model_entry, [backend.cfg for backend in backends], configured)
-                   if model_entry is not None else [None] * len(backends))
+        reasons = self._refusals(model_entry, backends, configured)
         routable = [backend for backend, reason in zip(backends, reasons) if not reason]
         refusals = [reason for reason in reasons if reason]
         if refusals and not routable:
             # Every account refuses this model by configuration (unsupported, retired, gated, no
-            # resource): a settled 4xx that names the reason, never a retryable 503.
+            # resource) or by its plan: a settled 4xx that names the reason, never a retryable 503.
             raise model_catalog.model_unavailable(model_entry, refusals)
         if not any(account_enabled(b) for b in routable) and any(account_enabled(b) for b in backends):
             raise apierr.service_unavailable("no enabled account has a route for the requested model")
@@ -1355,8 +1396,7 @@ class SessionPool:
 
     def _check_shared(self, model_entry, exclude=(), configured=True):
         """What the shared session needs of its one account; acquire()'s error when it cannot serve."""
-        reasons = (model_catalog.refusal_reasons(model_entry, [self.backend.cfg], configured)
-                   if model_entry is not None else [None])
+        reasons = self._refusals(model_entry, [self.backend], configured)
         if reasons[0]:
             raise model_catalog.model_unavailable(model_entry, reasons)
         if not account_enabled(self.backend):
@@ -1737,9 +1777,7 @@ class SessionPool:
                             journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
                                          conversation=journal.tag(key),
                                          from_account=account_tag(old.backend), to_account=account_tag(replacement),
-                                         reason=(getattr(old.backend, "unavailable", None) or {}).get(
-                                             "reason", "failover" if self._routable(old.backend, model_entry)
-                                             else "no_route"),
+                                         reason=self._move_reason(old.backend, model_entry),
                                          **({"carried_branches": carried} if carried else {}))
                     if session is None:
                         backend = affinity_backend or self._next_backend(model_entry, exclude)
