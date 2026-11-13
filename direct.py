@@ -3109,4 +3109,9 @@ def _api_error(status, detail, headers=None):
         # The hourly managed-key quota is spent: the orchestrator parks this account and moves the turn.
         error.account_quota = True
         error.retry_after = apierr.retry_after_seconds((headers or {}).get("retry-after"))
+    elif status == 402 and apierr.is_not_in_plan(detail):
+        # The account's plan does not include the model. The client still gets the 502 it got before if the turn cannot
+        # move; the orchestrator holds this account back from this model only and moves the turn
+        # (AccountDispatcher.mark_plan_refusal).
+        error.plan_refusal = True
     return error

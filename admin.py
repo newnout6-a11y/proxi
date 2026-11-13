@@ -619,6 +619,10 @@ class Admin:
                     if key in per_account})
             if entry.get("rate_limited_until"):
                 accounts[-1]["rate_limited_until"] = entry["rate_limited_until"]
+            refused = getattr(backend, "refused_models", None)
+            if isinstance(refused, dict) and refused:
+                # Models this account's Retool plan refused (402), each with the moment it is asked again; it serves the rest.
+                accounts[-1]["refused_models"] = {model: hold.get("until_at") for model, hold in refused.items()}
         return accounts
 
     def _session(self):

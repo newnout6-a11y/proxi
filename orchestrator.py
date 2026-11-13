@@ -228,6 +228,11 @@ def _minara_refusal(error):
     return getattr(error, "status", 0) == 402 or getattr(error, "code", None) == "upstream_auth_error"
 
 
+def _model_id(parsed):
+    """The catalog id of the model a request runs on: what the pool and an account's plan refusals are keyed by."""
+    return (getattr(parsed, "entry", None) or {}).get("id") or getattr(parsed, "model", None)
+
+
 def _may_be_balance_related(error):
     """Rate limits, timeouts and client errors never justify a balance fetch."""
     status = getattr(error, "status", 0) or 0
@@ -994,6 +999,9 @@ class TurnRunner:
         once, even when the turn is already streaming and cannot be retried. Other failures
         (empty turns, 5xx) are returned as before. With account_rate_limit_wait set, a conversation
         with a warm prefix first waits once on the limited account and asks it again (_limit_pause).
+        A Retool plan that does not include the model (402) holds the account back from that model
+        alone, also when the turn cannot move, and the turn moves like after an hourly limit; once
+        no account can take the model, the client gets the pool's settled 404 (_pool_refusal).
         """
         exclude = []
         rechecked = False
@@ -1033,7 +1041,7 @@ class TurnRunner:
                          and accounts is not None and holder["_attempt_budget"].remaining > 0
                          and (not relay.sent or getattr(error, "unbilled", False)))
             exhausted = False
-            rate_limited = False
+            rate_limited = plan_refused = False
             try:
                 if error is not None and backend is not None and apierr.is_account_quota(error):
                     pause = (self._limit_pause(error, getattr(lease, "session", lease))
@@ -1061,6 +1069,13 @@ class TurnRunner:
                                                    request_id=getattr(parsed, "request_id", None),
                                                    sent_at=holder["_attempt_budget"].sent_at)
                     rate_limited = retryable and backend not in exclude
+                if error is not None and backend is not None and apierr.is_plan_refusal(error):
+                    # Retool's 402 "This model is not available for your plan.": nothing was generated or billed. The
+                    # account is held back from this model alone (never from the others), whether or not this turn can
+                    # still move, and the turn moves while the client has seen nothing. No balance is read for it.
+                    if hasattr(accounts, "mark_plan_refusal"):
+                        accounts.mark_plan_refusal(backend, _model_id(parsed), request_id=getattr(parsed, "request_id", None))
+                    plan_refused = retryable and backend not in exclude
                 if (retryable and backend is None and error.code == "insufficient_credits"
                         and not rechecked and hasattr(accounts, "recheck_exhausted")):
                     # The pool refused before any upstream call: confirm the excluded
@@ -1080,7 +1095,7 @@ class TurnRunner:
                     # FORCED_CHECK_GAP.
                     exhausted = accounts.mark_minara_refusal(backend, error)
                 elif (retryable and backend is not None and backend not in exclude
-                        and _may_be_balance_related(error)):
+                        and not apierr.is_plan_refusal(error) and _may_be_balance_related(error)):
                     # With no account left, the next acquire raises a clear 402.
                     exhausted = await _off_loop(accounts.check_balance_now, backend)
             except BaseException:
@@ -1096,6 +1111,15 @@ class TurnRunner:
                     getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
                 holder["reason"] = "stop"
                 continue
+            if plan_refused:
+                exclude.append(backend)
+                journal.emit("account.failover", "Модель не входит в тариф аккаунта Retool — запрос повторён на другом аккаунте",
+                             "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
+                             error=error.code, reason="plan_refused", model=_model_id(parsed))
+                console_log.write("[%s] [account] %s: %s не входит в тариф Retool, повтор на другом аккаунте" % (
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), _model_id(parsed)))
+                holder["reason"] = "stop"
+                continue
             if exhausted:
                 exclude.append(backend)
                 rejected = error.code == "upstream_auth_error"
@@ -1108,10 +1132,25 @@ class TurnRunner:
                     "токен отклонён" if rejected else "баланс закончился"))
                 holder["reason"] = "stop"
                 continue
+            if error is not None and apierr.is_plan_refusal(error):
+                # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
+                # the client gets the settled 404 that names the cause rather than a 502 it would only send again.
+                error = self._pool_refusal(parsed, exclude) or error
             if error is not None:
                 out.put({"type": "error", "error": error})
             out.put(None)
             return
+
+    def _pool_refusal(self, parsed, exclude):
+        """The settled 404 the pool gives this request now, when no account can serve its model, else None (reads state only)."""
+        check = getattr(self.pool, "unavailable_error", None)
+        if check is None:
+            return None
+        try:
+            error = check(parsed.entry, exclude=tuple(exclude), **acquire_plan(self.cfg, parsed).kwargs)
+        except Exception:  # noqa: BLE001 - a better error is only a nicety: the refusal itself is still the answer
+            return None
+        return error if isinstance(error, apierr.ApiError) and error.status == 404 else None
 
     async def _run_once(self, parsed, out, holder, exclude=()):
         turn_id = str(uuid.uuid4())
@@ -2046,8 +2085,8 @@ class TurnRunner:
             else:
                 reason = outcome["reason"] or holder.get("reason") or "stop"
             holder["_speed_reason"] = reason
-            # Explicit account-quota refusals are free; retain their latency, but count no generated tokens.
-            if err is not None and apierr.is_account_quota(err):
+            # Explicit account-quota and plan refusals are free; retain their latency, but count no generated tokens.
+            if err is not None and (apierr.is_account_quota(err) or apierr.is_plan_refusal(err)):
                 number = next(reversed(output_attempts), None)
                 if number is not None and output_attempts[number] is None:
                     request_attempts[(turn_id, number)] = 0
