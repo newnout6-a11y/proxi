@@ -18,7 +18,7 @@ import direct
 import journal
 import models
 import upstream_attempts
-from accounts import PLAN_REFUSAL_HOLD, AccountDispatcher
+from accounts import PLAN_REFUSAL_FIRST, PLAN_REFUSAL_HOLD, AccountDispatcher
 from session import Backend as PoolBackend, SessionPool
 from test_account_dispatcher import Account, Clock, dispatcher
 from test_account_rate_limit import CHAT, _events, _headers, _stream, retool, serve_ok, served, tag, turn  # noqa: F401
@@ -90,15 +90,13 @@ def test_the_transport_never_asks_the_refusing_account_again(tmp_path, monkeypat
     assert len(posts) == 1 and caught.value.upstream_status == 402 and apierr.is_plan_refusal(caught.value)
 
 
-# -- the hold: one account, one model, one hour ----------------------------------------------------------------------------
+# -- the hold: one account, one model; five minutes, an hour when it repeats -----------------------------------------------
 def test_a_refusal_holds_the_account_back_from_that_model_alone(capsys):
     account = Account("a")
     value, _ = dispatcher([account])
     before = journal.JOURNAL.last_seq
-    started = time.time()
     until = value.mark_plan_refusal(account, OPUS, request_id="req-1")
-    assert started + PLAN_REFUSAL_HOLD <= until <= time.time() + PLAN_REFUSAL_HOLD and PLAN_REFUSAL_HOLD == 3600
-    assert account.refused_models == {OPUS: {"until_at": until, "pause": PLAN_REFUSAL_HOLD}}
+    assert set(account.refused_models) == {OPUS} and account.refused_models[OPUS]["until_at"] == until
     # The account stays in the pool for every other model.
     assert account.unavailable is None and value.status()[0]["state"] == "active"
     held = _events("account.model_refused", before)
@@ -108,6 +106,56 @@ def test_a_refusal_holds_the_account_back_from_that_model_alone(capsys):
     line = capsys.readouterr().out
     assert "исключён для %s" % OPUS in line and "тариф Retool" in line
     assert time.strftime("%H:%M:%S", time.localtime(until)) in line
+
+
+def hold_of(value, account, model):
+    """(pause, repeated) of the hold a refusal starts, as the pool and the journal see it."""
+    before = journal.JOURNAL.last_seq
+    value.mark_plan_refusal(account, model)
+    return account.refused_models[model]["pause"], _events("account.model_refused", before)[-1]["data"]["repeated"]
+
+
+def test_the_first_refusal_of_a_pair_holds_it_for_five_minutes(capsys):
+    account = Account("a")
+    value, _ = dispatcher([account])
+    started = time.time()
+    assert hold_of(value, account, OPUS) == (PLAN_REFUSAL_FIRST, False) and PLAN_REFUSAL_FIRST == 300
+    assert started + 300 <= account.refused_models[OPUS]["until_at"] <= time.time() + 300
+    line = capsys.readouterr().out
+    assert "(пауза 5 мин)" in line and "повторный" not in line
+
+
+def test_a_refusal_right_after_a_release_holds_the_pair_for_an_hour_and_so_does_each_one_after_it(capsys):
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0)
+    value.mark_plan_refusal(account, OPUS)
+    clock.now += PLAN_REFUSAL_FIRST
+    value._tick()
+    assert account.refused_models == {}  # released: the next request of the model asks the account again ...
+    clock.now += 10
+    assert hold_of(value, account, OPUS) == (PLAN_REFUSAL_HOLD, True) and PLAN_REFUSAL_HOLD == 3600  # ... refused again
+    assert "(пауза 60 мин, повторный отказ подряд)" in capsys.readouterr().out
+    # The ladder is the pair's own: another model of the same account starts from the short hold.
+    assert hold_of(value, account, SONNET) == (PLAN_REFUSAL_FIRST, False)
+    # Within the hour after the long hold ended it is long again, also when the scheduler has not released it yet.
+    clock.now += PLAN_REFUSAL_HOLD + PLAN_REFUSAL_HOLD - 1
+    assert hold_of(value, account, OPUS) == (PLAN_REFUSAL_HOLD, True)
+
+
+def test_a_refusal_long_after_a_release_starts_from_the_short_hold_again():
+    account = Account("a")
+    value, clock = dispatcher([account], session_refresh_interval=0)
+    value.mark_plan_refusal(account, OPUS)
+    clock.now += PLAN_REFUSAL_FIRST
+    value._tick()
+    assert set(value.state[account]["plan_released"]) == {OPUS}  # when the hold ended is kept for the ladder ...
+    clock.now += PLAN_REFUSAL_HOLD
+    value._tick()
+    assert set(value.state[account]["plan_released"]) == {OPUS}  # ... while a refusal still counts as repeated ...
+    clock.now += 1
+    value._tick()
+    assert value.state[account]["plan_released"] == {}  # ... and no longer
+    assert hold_of(value, account, OPUS) == (PLAN_REFUSAL_FIRST, False)
 
 
 def test_turns_that_fail_together_share_one_hold_and_another_model_gets_its_own():
@@ -127,17 +175,17 @@ def test_the_hold_ends_by_itself_and_another_refusal_holds_the_account_again():
     value, clock = dispatcher([account], session_refresh_interval=0)
     before = journal.JOURNAL.last_seq
     value.mark_plan_refusal(account, OPUS)
-    clock.now += 600
+    clock.now += 100
     value.mark_plan_refusal(account, SONNET)
-    clock.now += PLAN_REFUSAL_HOLD - 600 - 1
+    clock.now += PLAN_REFUSAL_FIRST - 100 - 1
     value._tick()
     assert set(account.refused_models) == {OPUS, SONNET}
     clock.now += 2
     value._tick()
-    assert set(account.refused_models) == {SONNET}  # each model's hour is its own
+    assert set(account.refused_models) == {SONNET}  # each pair's hold is its own
     retried = _events("account.model_retry", before)
     assert [(event["data"]["account"], event["data"]["model"]) for event in retried] == [(value._tag(account), OPUS)]
-    clock.now += 600
+    clock.now += 100
     value._tick()
     assert account.refused_models == {}
     value.mark_plan_refusal(account, OPUS)
@@ -148,7 +196,7 @@ def test_the_hold_ends_by_itself_and_another_refusal_holds_the_account_again():
 def test_the_real_scheduler_thread_ends_a_hold_by_itself():
     account = Account("a")
     value = AccountDispatcher([account], {"session_refresh_interval": 0, "min_account_balance": 20}, {})
-    value.plan_refusal_hold = 1.0
+    value.plan_refusal_first = 1.0
     value.start()
     try:
         value.mark_plan_refusal(account, OPUS)
@@ -349,17 +397,19 @@ def test_after_the_hold_the_account_is_asked_again_and_a_new_refusal_holds_it_ag
 
     async def scenario():
         await run(retool.runner, turn("conv-1"))
-        retool.clock.now += PLAN_REFUSAL_HOLD + 1
+        first = retool.a.refused_models[OPUS]["pause"]
+        retool.clock.now += first + 1
         assert retool.dispatcher.release_plan_refusals() and retool.a.refused_models == {}
         await run(retool.runner, turn("conv-2"))
-        held_again = set(retool.a.refused_models)
+        again = retool.a.refused_models[OPUS]["pause"]
         retool.script["acc-a"] = serve_ok  # the plan includes the model now
-        retool.clock.now += PLAN_REFUSAL_HOLD + 1
+        retool.clock.now += again + 1
         retool.dispatcher.release_plan_refusals()
         await run(retool.runner, turn("conv-3"))
-        return held_again
+        return first, again
 
-    assert asyncio.run(scenario()) == {OPUS}
+    # Five minutes, then an hour: the account refused again within the hour after its first hold ended.
+    assert asyncio.run(scenario()) == (PLAN_REFUSAL_FIRST, PLAN_REFUSAL_HOLD)
     assert retool.posts == ["acc-a", "acc-b", "acc-a", "acc-b", "acc-a"]
     assert retool.pool._conversations["conv-3"].backend is retool.a
     # The conversations that moved stay where their cache is.

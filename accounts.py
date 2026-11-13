@@ -8,8 +8,10 @@ balance is below `min_account_balance`, leaves the routing pool until a later
 check succeeds. An account that spent Retool's hourly managed-key quota is parked
 for `account_rate_limit_cooldown` seconds and returns by itself. A Minara account
 whose Bearer token has expired leaves the pool without a request to Minara. An
-account whose Retool plan refused a model is held back from that model alone for
-an hour (`refused_models` on the backend) and keeps serving every other one.
+account whose Retool plan refused a model is held back from that model alone
+(`refused_models` on the backend) and keeps serving every other one: for five
+minutes, and for an hour when the refusal comes within an hour after the last
+hold of that pair ended.
 """
 import math
 import collections
@@ -38,7 +40,8 @@ RATE_LIMIT_MAX = 3600.0      # the limit is a sliding hour: parking an account l
 RATE_LIMIT_STEP = 300.0      # a limit right after the return adds five minutes to the pause ...
 RATE_LIMIT_CEILING = 1200.0  # ... up to twenty minutes, or the cooldown itself when that is longer
 EXPIRY_WARN_EVERY = 86400.0  # a token about to expire is announced at most once a day per account
-PLAN_REFUSAL_HOLD = 3600.0   # an account whose Retool plan refused a model is not asked for that model again for an hour
+PLAN_REFUSAL_FIRST = 300.0   # the first refusal of a model by an account's Retool plan holds that pair for five minutes,
+PLAN_REFUSAL_HOLD = 3600.0   # one within an hour after the pair's last hold ended holds it for an hour
 
 
 def _local_time(epoch):
@@ -394,6 +397,7 @@ class AccountDispatcher:
         self.balance_interval = float(cfg.get("account_balance_interval", 300) or 0)
         self.rate_limit_cooldown = min(max(float(cfg.get("account_rate_limit_cooldown") or RATE_LIMIT_COOLDOWN),
                                            1.0), RATE_LIMIT_MAX)
+        self.plan_refusal_first = PLAN_REFUSAL_FIRST
         self.plan_refusal_hold = PLAN_REFUSAL_HOLD
         self.parallel = max(1, int(cfg.get("account_refresh_parallel", 3) or 1))
         self.clock = clock
@@ -413,7 +417,7 @@ class AccountDispatcher:
             self.state[backend] = {"next_refresh": now + offset, "next_balance": now + offset + 1.0,
                                    "auth_failures": 0, "soft_failures": 0, "running": set(), "reasons": {},
                                    "last_forced": float("-inf"), "forced": None, "available": None,
-                                   "expiry_warned": None, "plan_refusals": {}}
+                                   "expiry_warned": None, "plan_refusals": {}, "plan_released": {}}
             backend.unavailable = None
             backend.refused_models = {}
             if self.managers.get(backend) is not None:
@@ -434,7 +438,7 @@ class AccountDispatcher:
             self.state[backend] = {"next_refresh": now, "next_balance": now, "auth_failures": 0,
                                    "soft_failures": 0, "running": set(), "reasons": {},
                                    "last_forced": float("-inf"), "forced": None, "available": None,
-                                   "expiry_warned": None, "plan_refusals": {}}
+                                   "expiry_warned": None, "plan_refusals": {}, "plan_released": {}}
             backend.unavailable = None
             backend.refused_models = {}
             if manager is not None:
@@ -815,8 +819,11 @@ class AccountDispatcher:
         the pool for anything else. The pool reads the holds from `backend.refused_models` (SessionPool._plan_hold): a
         conversation of this model bound to the account moves at its next request, and when every account that serves the
         model is held, the request gets the pool's settled 404. Turns that fail together share one hold and one journal
-        line. The hold ends by itself after `plan_refusal_hold` seconds (release_plan_refusals, every tick): the next
-        request of the model asks the account again, and another refusal holds it again. Nothing of it outlives a restart.
+        line. The hold ends by itself (release_plan_refusals, every tick): the next request of the model asks the account
+        again. Its length is a ladder of two steps: `plan_refusal_first` for a pair (account, model), and
+        `plan_refusal_hold` for a refusal that comes within that long a time after the pair's last hold ended, and for each
+        one after it. A fault of Retool's that refuses every account for a few minutes so holds the pool for five minutes,
+        not an hour. Nothing of it outlives a restart.
         """
         if not isinstance(model, str) or not model:
             return None
@@ -825,33 +832,45 @@ class AccountDispatcher:
             state = self.state.get(backend)  # read under the lock: the admin may remove the account meanwhile
             if state is None:
                 return None
-            holds = state["plan_refusals"]
+            holds, ended_at = state["plan_refusals"], state["plan_released"]
             hold = holds.get(model)
             if hold is not None and now < hold["until"]:
                 return hold["until_at"]
-            pause = self.plan_refusal_hold
+            # When the pair's last hold ended: one the scheduler has not released yet still ended at its own deadline.
+            ended = hold["until"] if hold is not None else ended_at.get(model)
+            repeated = ended is not None and now - ended <= self.plan_refusal_hold
+            pause = self.plan_refusal_hold if repeated else self.plan_refusal_first
             until_at = time.time() + pause
-            holds[model] = {"until": now + pause, "until_at": until_at, "pause": pause}
+            ended_at.pop(model, None)
+            holds[model] = {"until": now + pause, "until_at": until_at, "pause": pause, "repeated": repeated}
             self._publish_plan_refusals(backend)
-        text = "[account] %s исключён для %s: модель не входит в тариф Retool (402) до %s (пауза %s)" % (
-            self._tag(backend), model, time.strftime("%H:%M:%S", time.localtime(until_at)), apierr.wait_text(pause))
+        text = "[account] %s исключён для %s: модель не входит в тариф Retool (402) до %s (пауза %s%s)" % (
+            self._tag(backend), model, time.strftime("%H:%M:%S", time.localtime(until_at)), apierr.wait_text(pause),
+            ", повторный отказ подряд" if repeated else "")
         journal.emit("account.model_refused", text, "warn", account=account_tag(backend), model=model,
-                     until=round(until_at, 3), retry_in=pause, **({"request_id": request_id} if request_id else {}))
+                     until=round(until_at, 3), retry_in=pause, repeated=repeated,
+                     **({"request_id": request_id} if request_id else {}))
         console_log.write(text)
         return until_at
 
     def release_plan_refusals(self, now=None):
         """End the holds whose time is over, so that the next request of the model asks the account again; the scheduler
-        calls this every tick. True when a hold ended."""
+        calls this every tick. True when a hold ended.
+
+        When a hold ended stays in memory (`plan_released`, one entry per pair) for as long as a refusal then counts as a
+        repeated one (mark_plan_refusal), and no longer."""
         now = self.clock() if now is None else now
         released = []
         with self._lock:
             for backend in self.backends:
-                holds = self.state[backend]["plan_refusals"]
+                state = self.state[backend]
+                holds, ended_at = state["plan_refusals"], state["plan_released"]
                 ended = [model for model, hold in holds.items() if now >= hold["until"]]
                 for model in ended:
-                    del holds[model]
+                    ended_at[model] = holds.pop(model)["until"]
                     released.append((backend, model))
+                for model in [model for model, at in ended_at.items() if now - at > self.plan_refusal_hold]:
+                    del ended_at[model]
                 if ended:
                     self._publish_plan_refusals(backend)
         for backend, model in released:
