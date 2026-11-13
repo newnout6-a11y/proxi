@@ -17,6 +17,7 @@ import auth
 import console_log
 import minara_catalog
 import models
+import retool_catalog
 import web_search
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -180,6 +181,11 @@ DEFAULTS = {
     # 0 = never), and the most credits one such look may spend on measuring (minara_refresh).
     "minara_catalog_refresh_hours": 6,
     "minara_catalog_budget": 300,
+    # Retool: how often the relay reads Retool's own model registry (its frontend) and publishes a chat model it adds
+    # once the model answered a short question (hours; 0 = never), and how many new models one look may ask
+    # (retool_refresh).
+    "retool_catalog_refresh_hours": 6,
+    "retool_catalog_probes": 10,
     "account_balance_interval": 300,
     "account_refresh_parallel": 3,
     # Pause after Retool's hourly managed-key limit; a limit right after the return adds 5 minutes
@@ -679,6 +685,9 @@ def _load(path):
     # over the catalog before the accounts' model lists are checked against it.
     cfg["_minara_catalog_file"] = os.fspath(minara_catalog.overlay_path(cfg["_config_path"]))
     minara_catalog.apply_overlay(cfg["_minara_catalog_file"])
+    # The Retool models the relay published from Retool's own registry (retool_refresh), likewise.
+    cfg["_retool_catalog_file"] = os.fspath(retool_catalog.overlay_path(cfg["_config_path"]))
+    retool_catalog.apply_overlay(cfg["_retool_catalog_file"])
     cfg["prompts_file"] = _prompts_path(cfg.get("prompts_file"), cfg["_config_path"])
     cfg["_persist_auth"] = not (os.environ.get("RETOOL_COOKIE") or os.environ.get("RETOOL_XSRF"))
     # The tenant the file itself names, before RETOOL_BASE overrides it in memory: the file's record is matched against
@@ -747,7 +756,8 @@ def _load(path):
     if (not isinstance(delays, list) or len(delays) > 5
             or any(type(item) not in (int, float) or not 0 <= item <= 60 for item in delays)):
         raise service_unavailable("minara_channel_retry_delays must be a list of at most 5 waits of 0-60 seconds")
-    for key, top in (("minara_catalog_refresh_hours", 168), ("minara_catalog_budget", 5000)):
+    for key, top in (("minara_catalog_refresh_hours", 168), ("minara_catalog_budget", 5000),
+                     ("retool_catalog_refresh_hours", 168), ("retool_catalog_probes", 50)):
         value = cfg.get(key)
         if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= top:
             raise service_unavailable("%s must be a number from 0 to %d" % (key, top))

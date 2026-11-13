@@ -293,6 +293,53 @@ _ROUTE_INPUT_TOKENS = {
 for _name, _limit in _ROUTE_INPUT_TOKENS.items():
     _BY_ID[_name]['route_input_tokens'] = _limit
 
+# The copilot route refused xhigh for every GPT that lists it (HTTP 422, live 2026-11-03): a model the catalog refresh
+# finds publishes the registry's levels the route accepts.
+_DISCOVERED_REFUSED_LEVELS = {'openai': {'xhigh'}}
+_CLAUDE_VERSION = re.compile(r'^(claude-[a-z]+-)(\d+)-(\d+)$')
+
+
+def add_discovered(found):
+    """Publish Retool models the catalog refresh found in Retool's own model registry and saw answer (retool_refresh),
+    in place: each one becomes a CATALOG entry with the fields an audited entry has, and its route is verified by that
+    answer. An audited entry of the same id always wins. Returns the ids added or changed."""
+    changed = []
+    for raw in found:
+        name, provider = raw.get('id'), raw.get('provider')
+        if not isinstance(name, str) or not name or provider not in EFFORTS_BY_PROVIDER:
+            continue
+        known = _BY_ID.get(name)
+        if known is not None and not known.get('discovered'):
+            continue
+        levels = [level for level in raw.get('reasoning_effort_levels') or ()
+                  if level in EFFORTS_BY_PROVIDER[provider] and level not in _DISCOVERED_REFUSED_LEVELS.get(provider, ())]
+        checked = str(raw.get('checked_at') or _today().isoformat())
+        entry = {'id': name, 'label': str(raw.get('label') or name), 'provider': provider,
+                 'context': int(raw.get('context') or 0) or None, 'max_output': int(raw.get('max_output') or 0) or None,
+                 'reasoning': bool(levels or raw.get('reasoning')), 'tools': bool(raw.get('tools', True)),
+                 'vision': bool(raw.get('vision')), 'verbosity_levels': [], 'reasoning_effort_levels': levels,
+                 'default_reasoning_effort': _recommended_effort(name, levels),
+                 'reasoning_effort_control': 'selectable' if levels else 'provider-managed',
+                 'metadata_checked_at': checked, 'metadata_source': [str(raw.get('source') or '')],
+                 'metadata_status': 'discovered',
+                 'metadata_notes': ("Found in Retool's own model registry (its frontend) by the relay's catalog refresh: "
+                                    "limits and levels are the registry's, not separately audited."),
+                 'route_checked_at': checked, 'route_status': 'verified',
+                 'route_reason': 'A probe question was answered on the Retool route (catalog refresh, %s).' % checked,
+                 'discovered': True}
+        if known == entry:
+            continue
+        if known is None:
+            CATALOG.append(entry)
+        else:
+            CATALOG[CATALOG.index(known)] = entry
+        _BY_ID[name] = entry
+        version = _CLAUDE_VERSION.match(name)
+        if version and '%s%s.%s' % version.groups() not in ALIASES:
+            ALIASES['%s%s.%s' % version.groups()] = name  # claude-fable-5.2 as well as claude-fable-5-2
+        changed.append(name)
+    return changed
+
 
 def _is_claude_route(model):
     """A catalog id of the Anthropic provider; a name the catalog lacks (strict_models off) counts when it says claude."""

@@ -30,6 +30,7 @@ import conversation_state
 import forced_choice
 import generation
 import minara_refresh
+import retool_refresh
 import models as model_catalog
 import sse
 import models
@@ -134,6 +135,8 @@ class Runtime:
         self.accounts = AccountDispatcher(list(managers), cfg, managers)
         # Minara's new models, prices and gone models, taken by the relay itself (minara_refresh); started with the pool.
         self.catalog = minara_refresh.CatalogRefresher(cfg, self.accounts)
+        # Retool's new models, from Retool's own registry (retool_refresh); started with the pool too.
+        self.retool_catalog = retool_refresh.CatalogRefresher(cfg, self.accounts)
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.runner.accounts = self.accounts
         self.prompts = prompt_policy.PromptStore(cfg)
@@ -1591,6 +1594,7 @@ def main(argv=None):
     backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
     runtime.accounts.start()
     runtime.catalog.start()
+    runtime.retool_catalog.start()
     refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
     for r in refreshers:
         r.start()  # no-op for accounts the dispatcher schedules
@@ -1643,6 +1647,7 @@ def main(argv=None):
             for r in refreshers:
                 r.stop()
             runtime.catalog.stop()
+            runtime.retool_catalog.stop()
             runtime.accounts.stop()
             first_round.join(timeout=2.0)  # stopped, the dispatcher ends the round between two accounts
 
