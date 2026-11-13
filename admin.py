@@ -25,6 +25,7 @@ import native_history
 import prompt_policy
 from accounts import UNNAMED, account_tag, cfg_tag, enabled as account_enabled, priority as account_priority
 from minara_catalog import CREDITS_PER_USD
+import redact as redact_module
 from redact import redact
 import sse
 import structured
@@ -43,6 +44,19 @@ LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "a
                  "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs", "codex_compaction_cache"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
+# A credential the admin masks in its answers is at least this long (an account's id, page or thread at least 5). Retool's
+# cookies carry values such as "1", a two-letter locale or a four-digit number: masked, every "1" of an answer became
+# "[redacted]", account 00b1023f came back as 00b[redacted]023f and switching it off or deleting it answered 404 "not
+# found"; HTTP 401 read "40[redacted]" (2026-11-13). Real cookie values and tokens are far longer.
+SECRET_CHARS = 8
+
+
+class _Masks:
+    """What _safe masks with: `pattern` finds any credential (None: there is none), `cookies` is redact()'s pattern."""
+    __slots__ = ("pattern", "cookies")
+
+    def __init__(self, pattern, cookies):
+        self.pattern, self.cookies = pattern, cookies
 POOL_FIELDS = {"enabled", "priority", "label"}
 NEW_ACCOUNT_REQUIRED = ("base", "page_uuid", "cookie", "xsrf")
 NEW_ACCOUNT_OPTIONAL = ("label", "provider_resource_name", "openai_provider_resource_name")
@@ -474,47 +488,78 @@ class Admin:
         # Saving the prompts document: read the revision it replaces, save, journal what changed, as one step.
         self.prompts_lock = threading.Lock()
         self.schema = _schema(self.cfg)
+        self._tokens_cache = None  # (config.json's path, mtime, size) -> the Bearer tokens saved in it
+        self._mask_cache = None  # (the credentials) -> _Masks
 
-    def _account_secrets(self):
-        """Credentials of every account; short values are skipped so they cannot mangle ordinary text."""
-        secrets = []
-        # Pending accounts are saved before they are loaded into the routing pool.
-        # Their credentials must protect free-text responses too, including after
-        # restarting the old runtime with the same configuration file.
+    def _saved_tokens(self):
+        """The Bearer tokens of the accounts saved in config.json, pending ones included, read again only when the file
+        changes: it was read and parsed (492 KB with 501 accounts) for every string _safe masked."""
+        path = self.cfg.get("_config_path")
+        try:
+            stat = os.stat(path) if path else None
+        except OSError:
+            stat = None
+        key = (path, stat.st_mtime_ns, stat.st_size) if stat is not None else None
+        cached = self._tokens_cache
+        if key is not None and cached is not None and cached[0] == key:
+            return cached[1]
+        tokens = []
         for record in self._records(self._saved()):
             token = (os.environ.get(record.get("bearer_token_env") or "")
                      or record.get("bearer_token"))
             if isinstance(token, str) and token:
-                secrets.append(token)
+                tokens.append(token)
+        self._tokens_cache = (key, tuple(tokens))
+        return self._tokens_cache[1]
+
+    def _account_secrets(self):
+        """Credentials of every account; short values are skipped so they cannot mangle ordinary text."""
+        # Pending accounts are saved before they are loaded into the routing pool.
+        # Their credentials must protect free-text responses too, including after
+        # restarting the old runtime with the same configuration file.
+        secrets = list(self._saved_tokens())
         for backend in getattr(self.runtime.accounts, "backends", None) or []:
             cfg = getattr(backend, "cfg", None) or {}
             secrets += [cfg.get("cookie"), cfg.get("xsrf"), cfg.get("bearer_token"),
                         os.environ.get(cfg.get("bearer_token_env") or "")]
             secrets += [part.partition("=")[2].strip() for part in str(cfg.get("cookie") or "").split(";")]
             secrets += cfg.get("cookie_values") or []
-        secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= 8]
+        secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= SECRET_CHARS]
         for backend in getattr(self.runtime.accounts, "backends", None) or []:
             cfg = getattr(backend, "cfg", None) or {}
             secrets += [str(cfg[key]) for key in ("account_id", "page_uuid", "thread_id", "base")
                         if cfg.get(key) and len(str(cfg[key])) >= 5]
         return sorted(set(secrets), key=len, reverse=True)
 
-    def _safe(self, value, secrets=None):
-        # Collected once per response, not once per string in it.
-        if secrets is None:
-            secrets = [self.cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf")]
-            secrets += self.cfg.get("cookie_values", [])
-            secrets += self._account_secrets()
-            secrets = [secret for secret in secrets if secret]
+    def _masks(self):
+        """What _safe masks an answer with: redact()'s cookie pattern and one pattern of every credential, a prefix tree
+        (redact.literal_pattern), built again only when a credential changes. Taken once per answer: the accounts page
+        gathered every credential again for each account with an error and replaced ~2,000 of them one by one in every
+        string, 35 s for 501 accounts (2026-11-13)."""
+        secrets = [self.cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf")]
+        secrets += self.cfg.get("cookie_values") or []
+        secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= SECRET_CHARS]
+        secrets += self._account_secrets()
+        key = tuple(sorted(set(secrets)))
+        cached = self._mask_cache
+        if cached is None or cached[0] != key:
+            cached = self._mask_cache = (key, _Masks(redact_module.literal_pattern(key),
+                                                     redact_module.cookie_pattern(self.cfg.get("cookie_values") or ())))
+        return cached[1]
+
+    def _safe(self, value, masks=None):
+        """`value` with every credential masked; `masks` (from _masks) is passed down, never gathered per string."""
+        if masks is None:
+            masks = self._masks()
         if isinstance(value, str):
-            value = redact(value, cookie_values=self.cfg.get("cookie_values", []))
-            for secret in secrets:
-                value = value.replace(secret, "[redacted]")
+            value = redact(value, cookie_values=self.cfg.get("cookie_values", []), cookie_pattern=masks.cookies)
+            if masks.pattern is not None:
+                value = masks.pattern.sub("[redacted]", value)
             return value
         if isinstance(value, dict):
-            return {key: self._safe(item, secrets) for key, item in value.items()}
+            return {key: self._safe(item, masks) for key, item in value.items()}
         if isinstance(value, list):
-            return [self._safe(item, secrets) for item in value]
+            return [self._safe(item, masks) for item in value]
         return value
 
     def _saved(self):
@@ -590,6 +635,7 @@ class Admin:
 
     def _accounts(self, entries, usage):
         accounts = []
+        masks = self._masks()  # once for the page, not once per account with an error
         for entry, per_account in zip(entries, usage["accounts"]):
             info, backend = entry["info"], entry["backend"]
             error = info.get("error") or info.get("stale_error")
@@ -603,7 +649,7 @@ class Admin:
                 "session_used": per_account.get("session_used", 0.0), "turns": per_account.get("turns", 0),
                 "auth_failures": entry["auth_failures"],
                 "last_renewed_at": getattr(getattr(backend, "refresher", None), "last_success_at", None),
-                "error": self._safe(str(error))[:200] if error else None,
+                "error": self._safe(str(error), masks)[:200] if error else None,
             })
             if backend.cfg.get("upstream") == "minara":
                 # Credits from GET /auth/me (220 per US dollar); a Bearer token has no renewal, it expires (JWT exp).
@@ -709,6 +755,33 @@ class Admin:
     def _record_tag(record):
         return cfg_tag(record, UNNAMED)
 
+    @staticmethod
+    def _account_index(items):
+        """`holds(other)`: whether _same_account(item, other) holds for any of `items` (configs or records), answered by
+        lookups. The accounts page compared every loaded account with every saved one, and back: 2 x 251,001 calls
+        for 501 accounts on every load of the page and on every switch, rename or delete."""
+        ids, keys, keys_without_id = set(), set(), set()
+
+        def key_of(item):
+            return item.get("upstream", "retool"), str(item.get("base") or "").rstrip("/"), item.get("page_uuid")
+
+        for item in items:
+            if item.get("account_id"):
+                ids.add(item["account_id"])
+            if item.get("upstream") == "minara":
+                continue  # Bearer accounts require their assigned ID; a shared API base is not an identity.
+            keys.add(key_of(item))
+            if not item.get("account_id"):
+                keys_without_id.add(key_of(item))
+
+        def holds(other):
+            if other.get("account_id"):
+                # Two IDs decide alone; an item without one is matched by its base and page.
+                return other["account_id"] in ids or (
+                    other.get("upstream") != "minara" and key_of(other) in keys_without_id)
+            return other.get("upstream") != "minara" and key_of(other) in keys
+        return holds
+
     def _live_backends(self):
         return getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]
 
@@ -721,18 +794,18 @@ class Admin:
         records = self._records(saved) if saved is not None else None
         # Without accounts[] the file's root and the one loaded account are the same account: nothing to match, nothing added.
         single = saved is not None and not isinstance(saved.get("accounts"), list)
+        saved_holds = self._account_index(records or [])
         pool = []
         for entry, item in zip(entries, self._accounts(entries, usage)):
             backend = entry["backend"]
-            removed = (records is not None and not single
-                       and not any(self._same_account(r, backend.cfg) for r in records))
+            removed = records is not None and not single and not saved_holds(backend.cfg)
             pool.append({**item, "label": backend.cfg.get("label") or "", "enabled": account_enabled(backend),
                          "priority": account_priority(backend),
                          "last_balance_at": getattr(entry["manager"], "last_fetched_at", None),
                          "pending": "removed" if removed else None, "_backend": backend})
-        loaded = [entry["backend"].cfg for entry in entries]
+        loaded_holds = self._account_index([entry["backend"].cfg for entry in entries])
         for record in [] if single else records or []:
-            if any(self._same_account(record, cfg) for cfg in loaded):
+            if loaded_holds(record):
                 continue
             pool.append({
                 "account": self._record_tag(record), "label": record.get("label") or "",

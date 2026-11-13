@@ -482,7 +482,6 @@ class SlowManager(FakeManager):
         self.gauge = gauge
 
     def get_balance(self, force_refresh=False):
-        import threading
         import time
         with self.gauge["lock"]:
             self.gauge["now"] += 1

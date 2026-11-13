@@ -44,6 +44,13 @@ RESTORE_BYTES = 20 * 1024 * 1024
 # names repeat in every event, so most of the restore's strings are cleaned once.
 _MEMO_CHARS = 256
 _MEMO_SIZE = 200_000
+# A cookie value is masked from this length on. Retool's cookies carry values such as "1", a locale or a four-digit number:
+# masked, they cut ordinary text (a date, a count, an account's tag) wherever they occurred. Real ones are far longer.
+COOKIE_SECRET_CHARS = 8
+
+
+def _cookie_secrets(values):
+    return [value for value in values or () if isinstance(value, str) and len(value) >= COOKIE_SECRET_CHARS]
 _TOP_LEVEL = ("turn_id", "request_id", "conversation")
 # Rollups: numeric counters per FINE seconds (the smallest chart bucket), distributions per
 # COARSE seconds (window-wide figures only), both kept for the longest window plus a margin.
@@ -661,11 +668,11 @@ class Journal:
     def _secrets(self):
         cfg = self._cfg or {}
         values = [cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf", "thread_id", "page_uuid")]
-        values += list(cfg.get("cookie_values") or [])
+        values += _cookie_secrets(cfg.get("cookie_values"))
         for account in cfg.get("accounts") or []:
             if isinstance(account, dict):
                 values += [account.get(key) for key in ("cookie", "xsrf", "thread_id", "page_uuid")]
-                values += list(account.get("cookie_values") or [])
+                values += _cookie_secrets(account.get("cookie_values"))
         # The search provider's key lives in the environment, never in the config, and it still turned up in the journal:
         # a client's tool call that set it (a shell command) was journaled with its arguments (v3 run of 2026-11-07).
         values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))

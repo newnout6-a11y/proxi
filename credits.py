@@ -265,6 +265,20 @@ class CreditsManager:
                         unreported_usage=self._unreported_usage,
                         estimated=self._balance_estimated)
 
+    def recent_balance(self, max_age):
+        """What get_balance() answers from its cache, for a balance read less than `max_age` seconds ago, else None: no
+        network. The dispatcher reads every account each account_balance_interval and the turns' debits are taken off
+        in between, so /health and the admin's polls (every 8 s) need no read of their own: they read all 60 Retool
+        balances every 30 s before, four seconds of every page with 78 accounts (2026-11-13)."""
+        with self._lock:
+            if not self._balance or self._balance.get("available") is None:
+                return None
+            if time.monotonic() - self._cached_at >= max_age:
+                return None
+            return dict(self._balance, stale=bool(self.last_error or self._unreported_usage or self._refresh_raced),
+                        unreported_usage=self._unreported_usage,
+                        **({"stale_error": self.last_error} if self.last_error else {}))
+
     def usage(self):
         with self._lock:
             total = sum(item["credits"] for item in self._history)

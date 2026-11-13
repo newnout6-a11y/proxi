@@ -107,6 +107,23 @@ def test_overview_never_exposes_account_secrets(multi):
     assert len(accounts[1]["error"]) <= 200
 
 
+
+def test_short_cookie_values_never_mangle_the_answer_and_long_ones_stay_masked(multi):
+    # Retool's cookies carry values such as "1", a locale or a four-digit number. Masked, every "1" of an answer became
+    # "[redacted]": account 00b1023f came back as 00b[redacted]023f, so switching it off or deleting it answered 404
+    # "not found", and HTTP 401 read "40[redacted]" (2026-11-13).
+    cfg = multi.runner_.runtime.cfg
+    long_value = "cookie-long-value-0123456789"
+    cfg["cookie_values"] = list(cfg.get("cookie_values") or []) + ["1", "en", "2026", "light", long_value]
+    multi.managers_[0].balance["stale_error"] = "HTTP Error 401: Unauthorized at 2026-12-01 en light " + long_value
+    body = overview(multi)
+    assert [item["account"] for item in body["accounts"]] == multi.tags  # the tags are the ones the pool knows
+    error = body["accounts"][0]["error"]
+    assert error.startswith("HTTP Error 401: Unauthorized at 2026-12-01 en light ") and long_value not in error
+    assert error.endswith("[redacted]") and "[redacted]" not in json.dumps(body["accounts"][1])
+    status, accounts, _ = multi.call("/admin/api/accounts")
+    assert status == 200 and [item["account"] for item in accounts["accounts"]][:2] == multi.tags
+
 def test_single_account_overview_has_the_same_contract(admin_relay):
     status, body, _ = admin_relay.request("/admin/api/overview")
     assert status == 200
