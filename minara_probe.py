@@ -644,6 +644,15 @@ def generate(results, listing, published=None, study=None):
             effort_detail = {key: tiers[key] for key in ("groups", "broken", "off", "refused", "default_reasoning_tokens")}
             effort_detail["question"] = tiers.get("question", "easy")
             natural = tiers.get("natural")
+        documented = (provider_levels(info, set((effort_detail or {}).get("broken") or ())
+                                      | set((effort_detail or {}).get("refused") or ()))
+                      if reasoning and provider_levels_apply(upstream, backend) else None)
+        if documented is not None:
+            # The levels the provider documents for the model, never the study's tiers alone (provider_levels); the study
+            # still says which of them are broken. Claude keeps its own levels below (native_levels, channels).
+            levels, effort_map, provider_default = documented
+            effort_control, effort_source = "mapped", "openrouter"
+            natural = provider_default or natural
         channel_probe = measured.get("channels") or {}
         # A partial measure still gives what it measured (cached_levels leaves unknown levels as asked); only a full one
         # can say a model never caches.
@@ -783,6 +792,47 @@ def fetch_published():
     response = requests.get("https://openrouter.ai/api/v1/models", impersonate="chrome131", timeout=60)
     response.raise_for_status()
     return {item["id"]: item for item in response.json().get("data", []) if isinstance(item, dict) and item.get("id")}
+
+
+def provider_levels(info, broken=()):
+    """The effort levels a model documents in OpenRouter's public list (its `reasoning`: supported_efforts, default_effort,
+    mandatory) as (levels to offer, map of the seven levels to the level sent, the model's default level), or None when
+    the list names no level. `broken` are levels the effort study saw refused or broken: never offered, sent as the
+    nearest one that works.
+
+    The effort study tells levels apart by their reasoning on one hard question, and two samples a level do not separate
+    levels that differ by a third: Gemini 4 Hydrogen reasoned ~1,100 tokens at low, ~1,450 at medium and high and ~9,000
+    at xhigh and max, and was offered max alone, as were GPT-6.1 Sol and others (2026-11-13). The provider's own list
+    says what the model takes; a level it does not take is sent as the nearest one it does (max as xhigh, none as low
+    for a model whose reasoning cannot be switched off), the lower of two as near."""
+    reasoning = (info or {}).get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None
+    supported = reasoning.get("supported_efforts")
+    levels = [level for level in EFFORTS if isinstance(supported, list) and level in supported and level not in broken]
+    if not levels:
+        return None
+    effort_map = {}
+    for level in EFFORTS:
+        if level in levels:
+            effort_map[level] = level
+            continue
+        rank = EFFORTS.index(level)
+        effort_map[level] = min(levels, key=lambda other: (abs(EFFORTS.index(other) - rank), EFFORTS.index(other)))
+    default = reasoning.get("default_effort")
+    return levels, effort_map, default if default in levels else None
+
+
+def provider_levels_apply(upstream, backend):
+    """Whether the provider's documented levels describe the channel Minara answers `upstream` on: OpenRouter's own
+    (the list is OpenRouter's), OpenAI's Responses and Google's API (the model's own levels, which OpenRouter mirrors),
+    not Volcengine Ark (DeepSeek, GLM Flash), whose handling of reasoning_effort only the study knows. Never Claude,
+    which keeps its own levels (native_levels)."""
+    vendor = upstream.split("/", 1)[0]
+    if vendor == "anthropic":
+        return False
+    return backend in ("openrouter", "openai-responses") or (
+        backend in ("other", None) and vendor in ("google", "openai", "x-ai"))
 
 
 def _family(upstream):

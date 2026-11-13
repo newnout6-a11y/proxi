@@ -332,3 +332,66 @@ def test_a_published_model_repriced_into_a_price_the_relay_cannot_read_is_a_warn
     warned = [event for event in journal.JOURNAL.query(since=before, limit=500)
               if event["kind"] == "catalog.price_unreadable"]
     assert len(warned) == 1 and warned[0]["level"] == "warn" and warned[0]["data"]["upstream_model"] == upstream
+
+
+# The provider's own list of a model's effort levels (OpenRouter's public /api/v1/models, its `reasoning` field). The effort
+# study's two samples a level offered Gemini 4 Hydrogen and GPT-6.1 Sol max alone (2026-11-13), though Hydrogen reasoned
+# ~1,100 tokens at low, ~1,450 at medium and high and ~9,000 at xhigh: the provider's list says what the model takes.
+HYDROGEN_INFO = {"reasoning": {"mandatory": True, "supported_efforts": ["xhigh", "high", "medium", "low"],
+                               "default_effort": "medium"}}
+
+
+def test_the_provider_list_gives_the_levels_and_the_nearest_for_the_others():
+    levels, effort_map, default = minara_probe.provider_levels(HYDROGEN_INFO)
+    assert levels == ["low", "medium", "high", "xhigh"] and default == "medium"
+    assert effort_map == {"none": "low", "minimal": "low", "low": "low", "medium": "medium", "high": "high",
+                          "xhigh": "xhigh", "max": "xhigh"}
+    # A level the study saw broken is never offered, and goes as the nearest one that works (the lower of two as near).
+    levels, effort_map, _ = minara_probe.provider_levels(HYDROGEN_INFO, broken={"high"})
+    assert levels == ["low", "medium", "xhigh"] and effort_map["high"] == "medium"
+    assert minara_probe.provider_levels({}) is None and minara_probe.provider_levels({"reasoning": {}}) is None
+
+
+def test_generated_entries_take_the_provider_levels_except_claude():
+    listing = [{"id": "google/gemini-test", "supported_endpoint_types": ["openai"]},
+               {"id": "anthropic/claude-fable-5.9", "supported_endpoint_types": ["openai"]}]
+    results = {name: {"tools": {"status": "ok", "tools": True, "id": "gen-1"},
+                      "thinking": {"status": "ok", "thinking": "hidden", "reasoning_tokens": 80}} for name in
+               ("google/gemini-test", "anthropic/claude-fable-5.9")}
+    published = {"google/gemini-test": HYDROGEN_INFO,
+                 "anthropic/claude-fable-5.9": {"reasoning": {"supported_efforts": ["high"], "default_effort": "high"}}}
+    entries = {entry["upstream_model"]: entry for entry in minara_probe.generate(results, listing, published)["models"]}
+    gemini, fable = entries["google/gemini-test"], entries["anthropic/claude-fable-5.9"]
+    assert gemini["reasoning_effort_levels"] == ["low", "medium", "high", "xhigh"] and gemini["effort_source"] == "openrouter"
+    assert gemini["effort_map"]["max"] == "xhigh" and gemini["natural_effort"] == "medium"
+    assert fable["reasoning_effort_levels"] == list(minara_probe.native_levels("anthropic/claude-fable-5.9"))
+
+
+def test_a_published_model_takes_the_provider_levels_on_a_look_without_a_measurement(tmp_path, monkeypatch):
+    cfg = relay_cfg(tmp_path)
+    monkeypatch.setattr(minara_probe, "measure_model", lambda *a, **k: pytest.fail("no measurement is needed"))
+    upstream = "google/gemini-4-argon"
+    assert minara_catalog.MEASURED[upstream]["status"] == "ok"
+    claude = next(name for name, entry in minara_catalog.MEASURED.items()
+                  if name.startswith("anthropic/") and entry.get("status") == "ok" and entry.get("reasoning"))
+    claude_levels = list(minara_catalog.MEASURED[claude].get("reasoning_effort_levels") or [])
+    published = {upstream: {"reasoning": {"mandatory": True, "supported_efforts": ["high", "medium", "low"],
+                                          "default_effort": "medium"}},
+                 claude: {"reasoning": {"supported_efforts": ["low"], "default_effort": "low"}}}
+    backend = SimpleNamespace(cfg=dict(cfg["accounts"][0], enabled=True, base="https://api.minara.ai/v1"),
+                              unavailable=None, credits=SimpleNamespace(balance_snapshot=lambda: {"available": 500.0},
+                                                                        get_balance=lambda force_refresh=False: {}))
+    client = FakeClient(listing_of())
+    value = minara_refresh.CatalogRefresher(cfg, backends=[backend], client_factory=lambda token: client,
+                                            published=published)
+    before = journal.JOURNAL.last_seq
+    summary = value.run_once()
+    assert summary["releveled"] == [upstream]
+    entry = minara_catalog.MEASURED[upstream]
+    assert entry["reasoning_effort_levels"] == ["low", "medium", "high"] and entry["effort_source"] == "openrouter"
+    assert minara_catalog.MEASURED[claude].get("reasoning_effort_levels") == claude_levels  # Claude keeps its own
+    route, sent = models.resolve("minara/gemini-4-argon", "max", cfg=cfg)
+    assert sent == "high" and route["reasoning_effort_levels"] == ["low", "medium", "high"]
+    assert any(event["kind"] == "catalog.model_releveled" for event in journal.JOURNAL.query(since=before, limit=200))
+    # The next look finds the levels in place: nothing to do.
+    assert value.run_once()["releveled"] == []

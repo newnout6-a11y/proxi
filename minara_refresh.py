@@ -93,7 +93,8 @@ class CatalogRefresher:
         self._thread = None
         self._file_lock = threading.Lock()
         self._factory = client_factory or (lambda token: minara_probe.Client(token, wait=self._stop.wait))
-        self._published = published  # OpenRouter's public list (windows, output ceilings); fetched when None
+        self._published = published  # OpenRouter's public list (windows, output ceilings, levels); fetched when None
+        self._published_given = published  # a list given (tests) is the one every look reads
         self.last = None
         self.next_at = None
         for upstream, levels in (self._read().get("switched") or {}).items():
@@ -192,7 +193,8 @@ class CatalogRefresher:
     def run_once(self):
         """One look at Minara's list; a summary of what changed (also kept as self.last)."""
         backend, client = self._account()
-        summary = {"at": _now(), "listed": 0, "added": [], "repriced": [], "gone": [], "failed": [], "skipped": [],
+        summary = {"at": _now(), "listed": 0, "added": [], "repriced": [], "releveled": [], "gone": [], "failed": [],
+                   "skipped": [],
                    "skipped_reasons": {}, "price_unreadable": [], "unpriced": {}, "spent_credits": 0.0}
         if client is None:
             summary["error"] = "no_account"
@@ -230,6 +232,7 @@ class CatalogRefresher:
             if problem:
                 summary["unpriced"][upstream] = problem
         missing = state.setdefault("missing", {})
+        self._relevel(listed, measured, overlay, summary, now)
         if complete:
             for upstream, entry in list(measured.items()):
                 if upstream in listed:
@@ -319,6 +322,44 @@ class CatalogRefresher:
             else:
                 summary["failed"].append([upstream, fresh["status"]])
 
+    def _published_now(self):
+        """OpenRouter's public list, read again on each look (a model's levels can change); the last one read, or the one
+        given to the constructor (tests), when it cannot be read."""
+        if self._published_given is not None:
+            return self._published_given
+        try:
+            self._published = minara_probe.fetch_published()
+        except Exception:  # noqa: BLE001 - the last list read stands; the look goes on
+            pass
+        return self._published or {}
+
+    def _relevel(self, listed, measured, overlay, summary, now):
+        """A published model takes the effort levels its provider documents (minara_probe.provider_levels), at once and
+        with no measurement: the effort study's two samples a level offered Gemini 4 Hydrogen and GPT-6.1 Sol max alone,
+        though their low, medium and high differ (2026-11-13). Claude keeps its own levels; a level the study saw broken
+        or refused is never offered."""
+        published = None
+        for upstream in sorted(listed):
+            entry = overlay.get(upstream) or measured.get(upstream)
+            if (not entry or entry.get("status") != "ok" or not entry.get("reasoning")
+                    or not minara_probe.provider_levels_apply(upstream, entry.get("backend"))):
+                continue
+            if published is None:
+                published = self._published_now()
+            study = entry.get("effort_study") or {}
+            documented = minara_probe.provider_levels(published.get(upstream),
+                                                      set(study.get("broken") or ()) | set(study.get("refused") or ()))
+            if documented is None:
+                continue
+            levels, effort_map, default = documented
+            natural = default or entry.get("natural_effort")
+            if (entry.get("reasoning_effort_levels"), entry.get("effort_map"), entry.get("natural_effort"),
+                    entry.get("effort_control")) == (levels, effort_map, natural, "mapped"):
+                continue
+            overlay[upstream] = dict(entry, reasoning_effort_levels=levels, effort_map=effort_map, effort_control="mapped",
+                                     natural_effort=natural, effort_source="openrouter", refreshed_at=now)
+            summary["releveled"].append(upstream)
+
     def entry(self, upstream, item, results, study):
         """The catalog entry the measurements make (minara_probe.generate), with its family's levels when unstudied."""
         published = self._published
@@ -358,6 +399,12 @@ class CatalogRefresher:
             journal.emit("catalog.model_gone", "Minara больше не перечисляет %s: модель снята с публикации" % name, "warn",
                          upstream="minara", model=name, upstream_model=upstream)
             console_log.write("[catalog] Minara: %s is gone from Minara's list, unpublished" % name)
+        for upstream in summary["releveled"]:
+            name = minara_catalog.public_id(upstream)
+            entry = minara_catalog.MEASURED.get(upstream) or {}
+            journal.emit("catalog.model_releveled", "Minara: уровни effort %s по данным провайдера: %s" % (
+                name, ", ".join(entry.get("reasoning_effort_levels") or ()) or "нет"), "info", upstream="minara",
+                model=name, upstream_model=upstream, levels=entry.get("reasoning_effort_levels"))
         for upstream in summary["repriced"]:
             journal.emit("catalog.model_repriced", "Minara: новая цена %s" % upstream, "info", upstream="minara",
                          upstream_model=upstream)
@@ -375,11 +422,12 @@ class CatalogRefresher:
                          upstream_model=upstream, reason=reason)
             console_log.write("[catalog] Minara: новая модель %s не измерена: %s" % (upstream, reason))
         skipped = "; ".join("%s: %s" % item for item in summary.get("skipped_reasons", {}).items())
-        journal.emit("catalog.refresh", "Каталог Minara проверен: %d моделей; новых %d, новых цен %d, снято %d, "
-                     "не прошли %d, отложено %d%s; замеры стоили %.2f кредита" % (
-                         summary["listed"], len(summary["added"]), len(summary["repriced"]), len(summary["gone"]),
+        journal.emit("catalog.refresh", "Каталог Minara проверен: %d моделей; новых %d, новых цен %d, новых уровней %d, "
+                     "снято %d, не прошли %d, отложено %d%s; замеры стоили %.2f кредита" % (
+                         summary["listed"], len(summary["added"]), len(summary["repriced"]),
+                         len(summary.get("releveled", ())), len(summary["gone"]),
                          len(summary["failed"]), len(summary["skipped"]), " (%s)" % skipped if skipped else "",
                          summary["spent_credits"]),
-                     "info", upstream="minara", **{key: summary[key] for key in (
-                         "listed", "added", "repriced", "gone", "failed", "skipped", "skipped_reasons", "unpriced",
-                         "spent_credits")})
+                     "info", upstream="minara", **{key: summary.get(key) for key in (
+                         "listed", "added", "repriced", "releveled", "gone", "failed", "skipped", "skipped_reasons",
+                         "unpriced", "spent_credits")})
