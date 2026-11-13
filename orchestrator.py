@@ -1699,6 +1699,22 @@ class TurnRunner:
                                             model=parsed.model, sent_effort=model_provider.get('reasoningEffort'),
                                             channel=usage.get('channel'), path='messages',
                                             prompt_tokens=breakdown['prompt_tokens'], attempt=journal_attempt)
+                                    if (minara_turn and (getattr(parsed, 'entry', None) or {}).get('cache') == 'explicit'
+                                            and self.cfg.get('direct_cache', True) and usage.get('cache_write_reported')
+                                            and not usage.get('cache_write') and usage.get('cache_read')
+                                            and (delta.get('input_tokens') or 0) >= credits.TAIL_UNWRITTEN_INPUT):
+                                        # The reply carried marks and read the cache, but wrote nothing: Minara then bills
+                                        # the whole prompt at the input price, the part it read included (a turn that ended
+                                        # in tool results did so until minara.TOOL_RESULTS_END; a retry whose prompt is all
+                                        # cached still can). A warning only: the turn is paid for.
+                                        log('cache.tail_unwritten', console_log.tail_unwritten_text(
+                                                delta.get('input_tokens'), minara_credits), 'warn',
+                                            model=parsed.model, path=usage.get('channel_path'), channel=usage.get('channel'),
+                                            input_tokens=delta.get('input_tokens'), cache_read=usage.get('cache_read'),
+                                            minara_credits=minara_credits, attempt=journal_attempt)
+                                        console_log.write(console_log.tail_unwritten_line(
+                                            getattr(parsed, 'request_id', None) or 'req', delta.get('input_tokens'),
+                                            minara_credits) + (" " + client_context.label() if client_context.label() else ""))
                                     if session is not None and breakdown['prompt_tokens'] > 0:
                                         # Only counts tell the size of the prefix. The empty usage of an attempt whose
                                         # price is unknown (a timeout or a cut stream on a 200) has none: written as 0,

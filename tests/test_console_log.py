@@ -225,6 +225,17 @@ def test_a_cheap_write_gets_no_costly_marker():
     assert "WRITE COSTLY" not in line
 
 
+def test_a_minara_reply_that_wrote_nothing_gets_a_red_line_of_its_own():
+    # Minara bills such a reply at the input price for its whole prompt, the part it read included; the [cache] line shows
+    # only a large in=, so the line under it says why, in red like an error line.
+    line = console_log.tail_unwritten_line("req", 106_167, 195.2441)
+    assert line == ("[req] [cache.tail_unwritten] Minara ничего не записала в кэш: 106,167 токенов промпта оплачены по "
+                    "цене входа (195.2441 кредитов Minara)")
+    assert console_log.render(line, color=True) == "\x1b[1;91m%s\x1b[0m" % line
+    assert console_log.tail_unwritten_text(30_443) == ("Minara ничего не записала в кэш: 30,443 токенов промпта оплачены по "
+                                                       "цене входа")  # no price known: no figure made up
+
+
 def test_minara_credits_replace_the_retool_figure_in_the_line():
     # A Minara turn has no creditsUsed: its price comes as Minara's own credits, which is what the line must show.
     usage = {"inputTokens": 4, "promptTokensWrittenToCache": 94_361, "outputTokens": 186}

@@ -78,7 +78,7 @@ def render(line, *, color=None):
     stamp = _TIMESTAMP.match(line)
     prefix = stamp[1] if stamp else ""
     line = line[len(prefix):]
-    if line.startswith("[err]") or " EXC " in line:
+    if line.startswith("[err]") or " EXC " in line or "[cache.tail_unwritten]" in line:
         return prefix + _paint(line, "alert", True)
     write_alert = "[WRITE SPIKE" in line or "[WRITE HIGH" in line
     input_alert = "[INPUT HIGH]" in line
@@ -174,6 +174,19 @@ class CacheMonitor:
         return "[%s] [cache] in=%s read=%s write=%s credits=%s%s%s%s" % (
             request_id, amount(uncached, tokens=True), amount(read, tokens=True),
             amount(written, tokens=True), amount(spent), output_note, via, marker)
+
+
+def tail_unwritten_text(input_tokens, credits=None):
+    """What cache.tail_unwritten says: a Minara Claude reply carried marks, read the cache and wrote nothing, and Minara
+    billed its prompt at the input price."""
+    spent = " (%s кредитов Minara)" % amount(credits) if number(credits) is not None else ""
+    return "Minara ничего не записала в кэш: %s токенов промпта оплачены по цене входа%s" % (
+        amount(input_tokens, tokens=True), spent)
+
+
+def tail_unwritten_line(request_id, input_tokens, credits=None):
+    """The line under such a reply's `[cache]` line: red and whole, like an error line."""
+    return "[%s] [cache.tail_unwritten] %s" % (request_id, tail_unwritten_text(input_tokens, credits))
 
 
 def route_line(request_id, *, upstream, account, model, upstream_model, effort=None, child=False):

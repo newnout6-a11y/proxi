@@ -12,6 +12,7 @@ import pytest
 import accounts
 import apierr
 import config
+import console_log
 import journal
 import models
 import orchestrator
@@ -231,6 +232,34 @@ def test_the_balance_of_a_minara_only_relay_is_an_answer(relay):
     status, body = relay.get('/v1/balance')
     assert status == 200, body
     assert body['available'] is None and body['minara']['available'] == 400  # 2 accounts x 200 credits
+
+
+def test_a_marked_claude_reply_that_read_the_cache_and_wrote_nothing_is_said(relay, monkeypatch):
+    """Minara bills a reply that writes nothing to the cache at the input price for its whole prompt, the part it read
+    included (15 of 36 turns of one Fable 5.2 session, 2026-11-13): such a reply is a warning in the journal and a line
+    on the console. A reply that wrote its tail is not."""
+    relay.state.refusal = None
+    lines = []
+    monkeypatch.setattr(console_log, 'write', lambda line, **kwargs: lines.append(line))
+    answers = [{'prompt_tokens': 120_000, 'completion_tokens': 2,
+                'prompt_tokens_details': {'cached_tokens': 89_557, 'cache_write_tokens': 0}},
+               {'prompt_tokens': 120_000, 'completion_tokens': 2,
+                'prompt_tokens_details': {'cached_tokens': 89_557, 'cache_write_tokens': 30_439}}]
+
+    def post(url, **kwargs):
+        data = {'choices': [{'index': 0, 'delta': {'content': 'OK'}, 'finish_reason': 'stop'}], 'usage': answers.pop(0)}
+        return Response(200, ('data: ' + json.dumps(data) + '\n\ndata: [DONE]\n\n').encode())
+    for backend in relay.runtime.accounts.backends:
+        backend._minara_post = post
+    models.minara_entry(MODEL, relay.runtime.cfg)['cache'] = 'explicit'  # as a Claude route
+    before = journal.JOURNAL.last_seq
+    assert relay.ask('conv-unwritten')[0] == 200 and relay.ask('conv-written')[0] == 200
+    said = [event for event in journal.JOURNAL.query(since=before, limit=500) if event['kind'] == 'cache.tail_unwritten']
+    assert len(said) == 1 and said[0]['level'] == 'warn'
+    assert said[0]['data']['input_tokens'] == 30_443 and said[0]['data']['cache_read'] == 89_557
+    assert said[0]['message'].endswith('Minara ничего не записала в кэш: 30,443 токенов промпта оплачены по цене входа')
+    shown = [line for line in lines if '[cache.tail_unwritten]' in line]
+    assert len(shown) == 1 and '30,443' in shown[0]
 
 
 def test_each_request_of_a_forced_choice_asked_in_words_keeps_its_own_cost(relay):

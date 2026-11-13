@@ -13,6 +13,11 @@ HISTORY_MAX = 200
 # a fresh account's 300-credit plan, and it took an account from +500 to -875 at once. A warning only: the turn is
 # billed by the time its usage arrives, so refusing it here would change nothing.
 WRITE_WARN = 300.0
+# A Minara Claude reply that carried cache marks, read the cache, wrote nothing and came back with at least this many input
+# tokens is called out (cache.tail_unwritten, and a red line under its `[cache]` line): Minara bills a reply that writes
+# nothing at the input price for its whole prompt, the part it read from the cache included. 15 of 36 turns of one Fable
+# 5.2 session were such replies, 6,972 of its 9,876 credits (2026-11-13; minara.TOOL_RESULTS_END). A warning only.
+TAIL_UNWRITTEN_INPUT = 8192
 # The turn ids a manager remembers to count each billed attempt once. Every id is new (a uuid per attempt, per keepwarm
 # ping), so a repeat can only come from the same attempt reported twice, moments apart: a few thousand cover that, where
 # the set kept every id of the process's life (about 120 bytes each, some 2,000 a day).
