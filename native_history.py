@@ -390,12 +390,10 @@ class History:
 
     def resume(self, scope, client, defaults=None):
         for snapshot in reversed(self.branches):
-            offset = len(snapshot.client)
-            if (scope != snapshot.scope or len(client) <= offset + 1
-                    or not same_json(client[:offset], snapshot.client)
-                    or not same_echo(client[offset], snapshot.echo, defaults)):
+            at = _echo_index(snapshot.client, client) if scope == snapshot.scope else None
+            if at is None or len(client) <= at + 1 or not same_echo(client[at], snapshot.echo, defaults):
                 continue
-            tail = client[offset + 1:]
+            tail = client[at + 1:]
             calls = [b["toolCallId"] for b in snapshot.assistant if b["type"] == "tool_call"]
             results = [m["content"]["toolCallId"] for m in tail[:len(calls)] if m["role"] == "tool"]
             if (len(results) != len(calls) or len(set(results)) != len(results) or set(results) != set(calls)
@@ -431,6 +429,51 @@ class History:
 
 
 _MISSING = object()
+
+
+def transient(message):
+    """True for a user message of nothing but <system-reminder> text: what a client adds to one request without keeping it."""
+    content = message.get("content") if isinstance(message, dict) and message.get("role") == "user" else None
+    if not isinstance(content, list) or not content:
+        return False
+    for block in content:
+        text = block.get("text") if isinstance(block, dict) and block.get("type") == "text" else None
+        if not isinstance(text, str) or not (text.strip().startswith(_REMINDER_OPEN)
+                                             and text.strip().endswith(_REMINDER_CLOSE)):
+            return False
+    return True
+
+
+def _echo_index(kept, client):
+    """Where the client's echo of a kept reply stands in its next request, or None when the request does not extend it.
+
+    The request extends the kept one when it holds all of its messages, with one exception: a reminder the client added
+    to the kept request only, in the user messages that close it. OpenCode's goal plugin adds "<system-reminder>A goal
+    is active for this session...</system-reminder>" to every request without keeping it (at the end, or just before a
+    trailing user message), so in the next request the reminder is gone and the reply stands where it was. Every step
+    of such a conversation went cold: 89 requests in a row on 2026-11-06 (9b839275847f, ffb84e3c975b, 0aff4f28a7eb),
+    cache reads stuck at the 11.5k tokens of the system prompt, up to 122k tokens written and 4 to 18 credits a step,
+    the first token after 60 to 180 s. The reminder stays in what upstream gets, where the model saw it when it made the
+    signed reply, so that reply is continued in its own context and the cached prefix is read as it was written."""
+    if same_json(client[:len(kept)], kept):
+        return len(kept)
+    start = len(kept)
+    while start and isinstance(kept[start - 1], dict) and kept[start - 1].get("role") == "user":
+        start -= 1
+    if not same_json(client[:start], kept[:start]):
+        return None
+    at = start
+    for message in kept[start:]:
+        if at < len(client) and same_json(client[at], message):
+            at += 1
+        elif not transient(message):
+            return None
+    return at
+
+
+def dropped(snapshot, client, messages):
+    """How many reminders of the kept request the client left out of this one (resume() keeps them upstream)."""
+    return len(snapshot.client) - (len(client) - (len(messages) - len(snapshot.messages) - 1) - 1)
 
 
 def _complete_turns(messages, seen):
