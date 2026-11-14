@@ -26,6 +26,7 @@
 .p-notice .link-button { color: inherit; }
 .p-notice .head-actions { margin-top: var(--space-1); }
 .p-notice code { background: transparent; padding: 0; color: inherit; }
+.p-no-file { margin-bottom: var(--space-4); }
 
 /* --- page ------------------------------------------------------------------------------------------------ */
 .prompts .page-meta { max-width: 48rem; }

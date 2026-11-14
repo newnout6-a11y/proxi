@@ -1022,7 +1022,7 @@ async def _keepwarm(session, cfg):
                 session._warm_failures = 0
                 retry_at = 0.0
                 prefix_tokens = int(getattr(session, "_last_prefix_tokens", 0) or 0)
-                estimate = prefix_tokens * credits.RATE_CACHE_READ
+                estimate = prefix_tokens * credits.rates(body.get("model"))["cache_read"]
                 if actual is None:
                     session._keepwarm_estimated_cost = round(
                         getattr(session, "_keepwarm_estimated_cost", 0.0) + estimate, 4)

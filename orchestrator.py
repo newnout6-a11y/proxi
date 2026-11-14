@@ -1219,13 +1219,13 @@ class TurnRunner:
                                             | {"tool_type": definition.get("x-client-type", "function")})
                                 elif event['type'] == 'usage':
                                     usage, delta = self._usage_update(holder, event)
-                                    breakdown = credits.cost_breakdown(usage)
+                                    breakdown = credits.cost_breakdown(usage, parsed.model)
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
                                     log('upstream.usage', ('Токены обновлены; стоимость уже сообщена' if known else
                                                           'Токены получены; стоимость upstream не сообщена'),
                                         'info' if known else 'warn', credits=None, attempt=journal_attempt,
                                         credits_reported=bool(known), **delta,
-                                        **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
+                                        **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
                                     if session is not None:
                                         acquired._last_prefix_tokens = breakdown['prompt_tokens']
                                     out.put(event)
@@ -1239,13 +1239,13 @@ class TurnRunner:
                                         event["value"])
                                     holder['_attempt_credited'] = True
                                     usage, delta = self._usage_update(holder, event)
-                                    breakdown = credits.cost_breakdown(usage)
+                                    breakdown = credits.cost_breakdown(usage, parsed.model)
                                     hit = breakdown["cache_hit_ratio"]
                                     log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
                                         event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
                                         "%d%%" % round(hit * 100) if hit is not None else "—"),
                                         "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
-                                        **credits.cost_breakdown(delta), usage_snapshot=dict(usage))
+                                        **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
                                     if session is not None:
                                         # Write through the lease: SessionLease only proxies
                                         # reads, so keepwarm (which holds the real session)

@@ -379,7 +379,7 @@ def rewrite(data: dict, dialect: str, profile: dict, snapshot: Snapshot) -> tupl
 
 - Модель агентов — `retool-relay/claude-sonnet-5-5#max`. Работать самостоятельно до конца. Отчёт по-русски.
 - Запрещено:
-  - менять `C:\specialinay_papka` (живой relay, порт 8787);
+  - менять рабочую папку живого relay (порт 8787);
   - трогать чужие worktree и `config.json`;
   - останавливать python и `proxy.py`;
   - слать запросы на `localhost:8787`;

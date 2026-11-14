@@ -92,12 +92,72 @@ test('without a prompts file the screen says the legacy path is in force and sta
   await expect(savebar(page)).toHaveCount(0);
 });
 
-test('legacy mode still previews and lists pins, only the editors wait for a profile', async ({ page }) => {
-  await openPrompts(page, { legacy: true }, 'Правила');
-  await expect(page.getByRole('region', { name: 'Файл промптов не создан' })).toBeVisible();
+test('without a prompts file each editing tab shows its own content: the rules and the texts open their editors', async ({ page }) => {
+  const { prompts } = await openPrompts(page, { legacy: true }, 'Правила');
+  // the start card belongs to the profiles tab alone
+  await expect(page.getByRole('region', { name: 'Файл промптов не создан' })).toHaveCount(0);
+  await expect(page.locator('.p-no-file')).toContainText('сохранятся в новом prompts.json');
+  await expect(page.locator('.rule-list.locked .rule')).not.toHaveCount(0);   // the built-in protected rules are listed
+  await expect(savebar(page)).toHaveCount(0);
+
   await tab(page, 'Тексты').click();
+  await expect(page.getByRole('region', { name: 'Файл промптов не создан' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Тексты relay' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Именованные тексты' })).toBeVisible();
+  await expect(savebar(page)).toHaveCount(0);
+
+  // the link of the note leads to the profiles tab, which keeps the start card
+  await page.locator('.p-no-file').getByRole('button', { name: '«Профили»' }).click();
+  await expect(tab(page, 'Профили')).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('region', { name: 'Файл промптов не создан' })).toBeVisible();
-  await tab(page, 'Пины').click();
+
+  // a first change on the texts tab starts the document, and the save sends it without a profile
+  await tab(page, 'Тексты').click();
+  const named = page.getByRole('region', { name: 'Именованные тексты' });
+  await named.getByLabel('Новый текст: имя').fill('my_rules');
+  await named.getByRole('button', { name: 'Добавить текст' }).click();
+  await expect(savebar(page)).toContainText('1 несохранённых');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  expect(prompts.saves[0].body.base_rev).toBeNull();
+  expect(prompts.saves[0].body.document).toEqual({ version: 1, profiles: {}, rules: [], texts: { my_rules: '' } });
+});
+
+test('the publish masks say which models they publish and warn when they match none', async ({ page }) => {
+  await mockAdmin(page, { rich: true });
+  await mockPrompts(page, {});
+  await login(page);
+  await rail(page, 'Промпты').click();
+  const publish = section(page, 'Публикация как модель');
+  await publish.locator('summary').click();
+  await publish.getByRole('radio', { name: 'Только для моделей по маске' }).check();
+  const masks = publish.getByLabel('Маски моделей: добавить значение');
+  // the default mask lists the routable Claude models of the catalog
+  await expect(publish.locator('.p-publish-list')).toContainText('claude-opus-5-5@mine-first');
+  await expect(publish.locator('.p-publish-list')).not.toContainText('gpt-');
+  // a mask that matches no id: the GLM ids start with their organisation
+  await publish.getByRole('button', { name: 'Убрать значение claude-*' }).click();
+  await masks.fill('glm-*');
+  await masks.press('Enter');
+  await expect(publish.locator('.p-publish-none')).toContainText('не подходят ни к одной модели');
+  await expect(publish.locator('.p-publish-list')).toHaveCount(0);
+  await publish.getByRole('button', { name: 'Убрать значение glm-*' }).click();
+  await masks.fill('*GLM*');
+  await masks.press('Enter');
+  await expect(publish.locator('.p-publish-none')).toHaveCount(0);
+  await expect(publish.locator('.p-publish-list')).toContainText('zai-org/GLM-5.3@mine-first');
+  await expect(publish).toContainText('Клиент выбирает профиль, просто называя такую модель: zai-org/GLM-5.3@mine-first');
+});
+
+test('legacy mode still previews and lists pins; only the profiles tab waits for a first profile', async ({ page }) => {
+  await openPrompts(page, { legacy: true }, 'Правила');
+  await expect(page.getByRole('region', { name: 'Файл промптов не создан' })).toHaveCount(0);
+  await expect(page.locator('.rule-list.locked')).toBeVisible();
+  await tab(page, 'Тексты').click();
+  await expect(page.getByRole('region', { name: 'Тексты relay' })).toBeVisible();
+  await tab(page, 'Профили').click();
+  await expect(page.getByRole('region', { name: 'Файл промптов не создан' })).toBeVisible();
+  await tab(page, 'Закрепления').click();
   await expect(page.locator('.pin-row')).toHaveCount(3);
 });
 
@@ -1401,7 +1461,7 @@ test('with no requests the list says what will appear there', async ({ page }) =
 // --- pins --------------------------------------------------------------------------------------------------------------
 
 test('pinned conversations show their revision against the current one and can be unpinned one by one', async ({ page }) => {
-  const { prompts } = await openPrompts(page, {}, 'Пины');
+  const { prompts } = await openPrompts(page, {}, 'Закрепления');
   const rows = page.locator('.pin-row');
   // a conversation has a pin for each purpose: c-7f2a is listed twice
   await expect(rows).toHaveCount(3);
@@ -1428,7 +1488,7 @@ test('pinned conversations show their revision against the current one and can b
 });
 
 test('applying the revision to every conversation asks first and says it costs a cache write', async ({ page }) => {
-  const { prompts } = await openPrompts(page, {}, 'Пины');
+  const { prompts } = await openPrompts(page, {}, 'Закрепления');
   await page.getByRole('button', { name: 'Применить ко всем' }).click();
   const confirm = page.getByRole('group').filter({ hasText: 'Применить текущую ревизию ко всем диалогам?' });
   // three pins of two conversations: the question counts what the answer takes off, the conversations
@@ -1460,7 +1520,7 @@ test('the question about applying to all counts conversations, one or several, h
     { conversation: 'c-7f2a', purpose: 'client-service', rev: 3, profile: 'passthrough', age_s: 50 },
     { conversation: 'c-7f2a', purpose: 'client-text', rev: 3, profile: null, age_s: 40 },
   ];
-  await tab(page, 'Пины').click();
+  await tab(page, 'Закрепления').click();
   await expect(page.locator('.pin-row')).toHaveCount(3);
   await page.getByRole('button', { name: 'Применить ко всем' }).click();
   await expect(page.getByRole('group').filter({ hasText: 'Применить текущую ревизию ко всем диалогам?' })).toContainText('у 1 диалога,');
@@ -2049,7 +2109,7 @@ test('the first profile form opens on its name, cancelling returns to its button
 });
 
 test('after an unpin, an apply to all or a cancelled question the focus is on a button that stays', async ({ page }) => {
-  await openPrompts(page, {}, 'Пины');
+  await openPrompts(page, {}, 'Закрепления');
   const refresh = page.locator('.p-pins').getByRole('button', { name: 'Обновить' });
   await page.locator('.pin-row').nth(0).getByRole('button', { name: 'Открепить диалог c-7f2a' }).click();
   await expect(page.locator('.pin-row')).toHaveCount(1);
@@ -2111,11 +2171,11 @@ test('the sections follow the WAI-ARIA tabs pattern: arrows, Home and End move t
   await expect(tab(page, 'Правила')).toBeFocused();
   await expect(page).toHaveURL(/#prompts\/rules$/);
   await page.keyboard.press('End');
-  await expect(tab(page, 'Пины')).toBeFocused();
+  await expect(tab(page, 'Закрепления')).toBeFocused();
   await page.keyboard.press('ArrowRight');
   await expect(tab(page, 'Профили')).toBeFocused();
   await page.keyboard.press('ArrowLeft');
-  await expect(tab(page, 'Пины')).toBeFocused();
+  await expect(tab(page, 'Закрепления')).toBeFocused();
   await page.keyboard.press('Home');
   await expect(tab(page, 'Профили')).toBeFocused();
   const wiring = await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].map((item) => {
@@ -2146,7 +2206,7 @@ test('the session ending while the screen is open signs out, as in the other sec
 
 // --- design ----------------------------------------------------------------------------------------------------------
 
-const TABS = ['Профили', 'Правила', 'Тексты', 'Предпросмотр', 'Что увидела модель', 'Пины'];
+const TABS = ['Профили', 'Правила', 'Тексты', 'Предпросмотр', 'Что увидела модель', 'Закрепления'];
 
 // Opens what is folded or hidden on each tab, so the scans see the densest state of the screen.
 async function openEverything(page, name) {
@@ -2162,7 +2222,7 @@ async function openEverything(page, name) {
     while (await change.count()) await change.first().click();
   } else if (name === 'Что увидела модель') {
     await page.getByRole('button', { name: 'Сравнить с другим' }).click();
-  } else if (name === 'Пины') {
+  } else if (name === 'Закрепления') {
     await page.getByRole('button', { name: 'Применить ко всем' }).click();
   }
 }

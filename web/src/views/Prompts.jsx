@@ -5,6 +5,7 @@ import { Button, Tag, useToast } from '../ui.jsx';
 import { Page, ease } from '../motion.jsx';
 import { usePolling } from '../useJournal.js';
 import { fmtInt } from '../format.js';
+import { api } from '../api.js';
 import { failureLead, failureOf, loadPrompts, loadRecent, savePrompts, warningsToShow } from '../prompts/api.js';
 import { ErrorContext, Notice } from '../prompts/controls.jsx';
 import { addProfile, blankDocument, changedPaths, equalJson, errorHits, insertAt, locate, newRule, normalizePath, pathLabel, profilesOf, rulesOf, starterProfile } from '../prompts/draft.js';
@@ -25,10 +26,11 @@ const TABS = [
   { id: 'texts', label: 'Тексты' },
   { id: 'preview', label: 'Предпросмотр' },
   { id: 'seen', label: 'Что увидела модель' },
-  { id: 'pins', label: 'Пины' },
+  { id: 'pins', label: 'Закрепления' },
 ];
-const EDITING = ['profiles', 'rules', 'texts'];
 const NO_SAVE = { rev: null, warnings: [] };
+// What the rules and texts tabs edit while no prompts file exists: the first change makes it the draft.
+const EMPTY_DOCUMENT = blankDocument();
 
 function initialTab() {
   const id = location.hash.replace(/^#prompts\/?/, '');
@@ -44,6 +46,19 @@ function fieldFor(param) {
     if (errorHits(wanted, path) && (!best || path.length > best.path.length)) best = { element, path };
   }
   return best?.element || null;
+}
+
+// The rules and texts tabs while no prompts file exists: they edit an empty document, and the first change starts it.
+function NoFileYet({ what, onProfiles }) {
+  return (
+    <Notice tone="muted" className="p-no-file">
+      <p>
+        Файла промптов пока нет: {what}, которые вы зададите здесь, сохранятся в новом prompts.json. Правило применяет профиль,
+        а профили создаются на вкладке{' '}
+        <button type="button" className="link-button" onClick={onProfiles}>«Профили»</button>
+      </p>
+    </Notice>
+  );
 }
 
 export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
@@ -106,6 +121,18 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
     }
   }, [apiKey, tab, onUnauthorized]);
   usePolling(loadSamples, tab === 'seen' ? 8000 : 60000, [apiKey, tab === 'seen']);
+
+  // The catalog the publish masks of a profile are matched against: the relay publishes <model>@<profile> for routable models
+  const [catalog, setCatalog] = useState(null);
+  const loadCatalog = useCallback(async () => {
+    try {
+      const result = await api(apiKey, 'models');
+      setCatalog((result?.data || []).filter((model) => model.routable).map((model) => model.id));
+    } catch (error) {
+      if (error.status === 401) onUnauthorized();
+    }
+  }, [apiKey, onUnauthorized]);
+  usePolling(loadCatalog, 300000, [apiKey]);
 
   const dirtyPaths = useMemo(() => (base ? changedPaths(base.document, draft) : []), [base, draft]);
   const dirty = dirtyPaths.length;
@@ -275,7 +302,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
             {TABS.map((item) => (
               <div key={item.id} role="tabpanel" id={`prompts-panel-${item.id}`} aria-labelledby={`prompts-tab-${item.id}`} hidden={tab !== item.id}>
                 {tab === item.id && (
-                  EDITING.includes(item.id) && legacyMode ? (
+                  item.id === 'profiles' && legacyMode ? (
                     <LegacyStart legacy={server.legacy} builtin={builtin} path={server.path} invalid={server.errors.length > 0} onCreate={(name, starter) => {
                       setDraft(addProfile(blankDocument(), name, starterProfile(starter)));
                       setSelected(name);
@@ -284,11 +311,17 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
                     }} />
                   ) : item.id === 'profiles' ? (
                     <ProfilesTab apiKey={apiKey} doc={draft} setDoc={setDoc} builtin={builtin} selected={selected} select={setSelected}
-                      onAddRule={addRuleFor} live={live} onUnauthorized={onUnauthorized} />
+                      onAddRule={addRuleFor} live={live} onUnauthorized={onUnauthorized} catalog={catalog} />
                   ) : item.id === 'rules' ? (
-                    <RulesTab doc={draft} setDoc={setDoc} builtin={builtin} profileNames={profileNames} expandIndex={expand} onExpanded={() => setExpand(null)} />
+                    <>
+                      {legacyMode && <NoFileYet what="правила" onProfiles={() => { setTab('profiles'); focusLater(toActiveTab); }} />}
+                      <RulesTab doc={draft ?? EMPTY_DOCUMENT} setDoc={setDoc} builtin={builtin} profileNames={profileNames} expandIndex={expand} onExpanded={() => setExpand(null)} />
+                    </>
                   ) : item.id === 'texts' ? (
-                    <TextsTab doc={draft} setDoc={setDoc} builtin={builtin} />
+                    <>
+                      {legacyMode && <NoFileYet what="тексты" onProfiles={() => { setTab('profiles'); focusLater(toActiveTab); }} />}
+                      <TextsTab doc={draft ?? EMPTY_DOCUMENT} setDoc={setDoc} builtin={builtin} />
+                    </>
                   ) : item.id === 'preview' ? (
                     <PreviewTab apiKey={apiKey} doc={draft} saved={base?.document} dirty={dirty > 0} {...live} onUnauthorized={onUnauthorized} />
                   ) : item.id === 'seen' ? (

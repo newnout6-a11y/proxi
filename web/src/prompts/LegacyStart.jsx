@@ -27,7 +27,7 @@ export default function LegacyStart({ legacy, builtin, path, invalid = false, on
       <p>
         {invalid ? 'Файл есть, но relay его не принял (причины указаны выше), поэтому ' : 'Сейчас '}
         relay работает в прежнем режиме (legacy): system клиента уходит к модели как есть, а роль relay задают настройки
-        «Применение инструкций» и «Инструкции для модели». Профиль с <code>{'"use": "$legacy"'}</code> воспроизводит это поведение
+        «Применение инструкций» и «Инструкции для модели». Правило с <code>{'"use": "$legacy"'}</code> воспроизводит это поведение
       </p>
       <dl className="p-facts">
         <div><dt>Режим ролей</dt><dd className="mono">{mode ? `${MODES[mode] || mode} (${mode})` : '—'}</dd></div>
