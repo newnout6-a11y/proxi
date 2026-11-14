@@ -69,6 +69,8 @@ def test_the_ping_is_the_last_body_plus_one_user_message_that_asks_for_one_word(
     assert ping["messages"][:-1] == body["messages"]
     assert ping["messages"][-1] == {"role": "user", "content": [{"type": "text", "text": direct.KEEPWARM_NUDGE}]}
     assert "single word" in direct.KEEPWARM_NUDGE and "tool" in direct.KEEPWARM_NUDGE
+    # what the model thinks before its OK is paid output: the nudge says it is a check to answer without thinking it over
+    assert "without thinking" in direct.KEEPWARM_NUDGE and "Keep-alive" in direct.KEEPWARM_NUDGE
     assert {key: value for key, value in ping.items() if key not in ("messages", "rit", "maxCompletionTokens")} == {
         key: value for key, value in body.items() if key not in ("messages", "rit", "maxCompletionTokens")}
     assert ping["maxCompletionTokens"] == direct.MIN_OUTPUT_TOKENS
