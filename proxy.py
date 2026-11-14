@@ -199,14 +199,46 @@ ROUTES = {
 }
 
 
+class SlottedRequestHandler(BaseHTTPRequestHandler):
+    """Holds one of the server's max_workers slots for each request, not for its whole connection.
+
+    An idle keep-alive connection waits for its next request without a slot. Claude Desktop starts its sessions by
+    counting the tokens of their tools in a dozen parallel requests and keeps those connections open; while they held the
+    slots, the relay stopped accepting and Windows refused every new connection until the idle ones timed out. A request
+    that finds every slot busy waits for one.
+    """
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        acquire = getattr(self.server, "acquire_slot", None)
+        if acquire is None:
+            return True
+        if not acquire():
+            # The server is stopping: the request goes with its connection, unanswered.
+            self.close_connection = True
+            return False
+        self._holds_slot = True
+        return True
+
+    def handle_one_request(self):
+        self._holds_slot = False
+        try:
+            super().handle_one_request()
+        finally:
+            if self._holds_slot:
+                self._holds_slot = False
+                self.server.release_slot()
+
+
 def make_handler(runtime: Runtime):
     cfg = runtime.cfg
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(SlottedRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "retool-relay/2"
-        # Idle keep-alive reads die after 75s: without this, 32 silent connections
-        # hold every worker slot forever (slowloris on a single-process relay).
+        # Idle keep-alive reads die after 75s. A waiting connection holds no worker slot (SlottedRequestHandler), but
+        # it is a thread and counts against MAX_CONNECTIONS, so silent connections must not pile up forever.
         # SSE heartbeats (10-15s) keep legitimate streams well below it.
         timeout = 75
 
@@ -970,41 +1002,60 @@ def make_handler(runtime: Runtime):
     return Handler
 
 
+# Client connections open at once, idle keep-alive ones included: each is a thread, but only a request in progress holds
+# one of the max_workers slots (SlottedRequestHandler).
+MAX_CONNECTIONS = 512
+
+
 class BoundedServer(ThreadingHTTPServer):
     daemon_threads = True
     # Windows SO_REUSEADDR permits two relay processes to own the same port,
     # making clients randomly hit old code after a restart.
     allow_reuse_address = os.name != "nt"
+    # Connections the system holds until the relay accepts them. Past this queue Windows refuses a connection outright
+    # (ECONNREFUSED), and socketserver's default of 5 turned away a burst of a dozen parallel connections.
+    request_queue_size = 128
 
     def server_bind(self):
         if os.name == "nt":
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
 
-    def __init__(self, address, handler, slots):
+    def __init__(self, address, handler, slots, connections=None):
         super().__init__(address, handler)
-        self.slots = slots
+        self.slots = slots  # requests handled at once (max_workers)
+        self.connections = connections if connections is not None else threading.BoundedSemaphore(MAX_CONNECTIONS)
         self._stopping = threading.Event()
 
     def shutdown(self):
         self._stopping.set()
         super().shutdown()
 
-    def process_request(self, request, client_address):
+    def _take(self, semaphore):
+        """Take `semaphore`, waiting as long as the server runs; False when it stops first."""
         while not self._stopping.is_set():
-            if self.slots.acquire(timeout=0.1):
+            if semaphore.acquire(timeout=0.1):
+                if not self._stopping.is_set():
+                    return True
+                semaphore.release()
                 break
-        else:
-            self.shutdown_request(request)
-            return
-        if self._stopping.is_set():
-            self.slots.release()
+        return False
+
+    def acquire_slot(self):
+        """One of the max_workers slots for a request (SlottedRequestHandler); False when the server is stopping."""
+        return self._take(self.slots)
+
+    def release_slot(self):
+        self.slots.release()
+
+    def process_request(self, request, client_address):
+        if not self._take(self.connections):
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except Exception:
-            self.slots.release()
+            self.connections.release()
             raise
 
     def handle_error(self, request, client_address):
@@ -1019,7 +1070,7 @@ class BoundedServer(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.slots.release()
+            self.connections.release()
 
 
 def startup_config(argv=None):
@@ -1085,7 +1136,8 @@ def main(argv=None):
         journal.emit("relay.warning", text, "warn")
     handler = make_handler(runtime)
     slots = threading.BoundedSemaphore(cfg["max_workers"])
-    server = BoundedServer((cfg["host"], cfg["port"]), handler, slots)
+    connections = threading.BoundedSemaphore(max(MAX_CONNECTIONS, 4 * cfg["max_workers"]))
+    server = BoundedServer((cfg["host"], cfg["port"]), handler, slots, connections)
 
     backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
     runtime.accounts.start()
