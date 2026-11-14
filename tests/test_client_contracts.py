@@ -121,6 +121,18 @@ def test_conflicting_effort_controls_are_not_silently_ignored():
     with pytest.raises(apierr.ApiError) as raised:
         validate.parse_chat(_body("chat", reasoning_effort="low", output_config={"effort": "high"}), CFG)
     assert raised.value.status == 422
+    with pytest.raises(apierr.ApiError):
+        validate.parse_chat(_body("chat", settings={"reasoningEffort": "low"}, body={"reasoningEffort": "high"}), CFG)
+
+
+def test_the_dialects_own_effort_field_wins_over_copied_variant_settings():
+    # OpenCode CLI 1.x's title request (live, 2026-11-06): the title agent's variant on top, another variant's keys
+    # copied beside it. It failed with 422 and no session got a title.
+    body = _body("chat", reasoning_effort="high", name="Low", settings={"reasoningEffort": "low"},
+                 body={"reasoningEffort": "low"})
+    assert validate.parse_chat(body, CFG).requested_effort == "high"
+    only_nested = _body("chat", settings={"reasoningEffort": "low"}, body={"reasoningEffort": "low"})
+    assert validate.parse_chat(only_nested, CFG).requested_effort == "low"
 
 
 @pytest.mark.parametrize("model,effort", [("gpt-5.5", "xhigh"), ("gpt-5.6-sol", "max"),

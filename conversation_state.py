@@ -250,7 +250,7 @@ def resume(session, history, scope, client):
     version, an edit). The request then goes the way it would without the file, with a cold history, and the
     stored copy follows; the branches the running relay recorded itself are never judged here."""
     try:
-        return history.resume(scope, client)
+        return history.resume(scope, client, getattr(session, "_native_tool_defaults", None))
     except Exception as error:  # noqa: BLE001 - only a stored branch may be blamed for it
         if not any(getattr(branch, "restored", False) for branch in history.branches):
             raise
@@ -258,7 +258,7 @@ def resume(session, history, scope, client):
         _drop_branches(session, history, lambda branch: not getattr(branch, "restored", False), "unusable",
                        "Восстановленная ветка не годится для продолжения (%s) и забыта" % type(error).__name__,
                        error=type(error).__name__)
-    return history.resume(scope, client)
+    return history.resume(scope, client, getattr(session, "_native_tool_defaults", None))
 
 
 class StoredSession:

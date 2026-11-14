@@ -63,11 +63,14 @@ COMPACTION = "compaction"
 # read as well: "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools." in 2.1.316 (a community capture,
 # clawdipedia.cc/prompts/context-and-memory/compact; unofficial, the product is closed), and the opening it has had
 # since 2025 without that line, "Your task is to create a detailed summary of the conversation so far".
+# Codex's local compaction (the path of every provider but OpenAI's own) sends the history without tools and ends it with
+# its template, codex-rs/prompts/templates/compact/prompt.md: "You are performing a CONTEXT CHECKPOINT COMPACTION.".
 COMPACTION_INSTRUCTIONS = (
     "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the work.",
     "Update the existing checkpoint in the conversation above into one consolidated summary.",
     "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
     "Your task is to create a detailed summary of the conversation so far",
+    "You are performing a CONTEXT CHECKPOINT COMPACTION.",
 )
 # The reminder OpenCode 2.x adds as a further user message when the reply skipped the summary template.
 COMPACTION_NUDGE = "The previous response did not fill in the required summary template."
@@ -101,8 +104,12 @@ _RECORDED_VALUE_LIMIT = 4096
 SDK_TITLE_PREFIX = "You are naming a coding session so the user can pick it out of a long list of sessions."
 # Claude Code before 2.1.234 asked for the same title in these words.
 LEGACY_TITLE_PREFIX = "Generate a concise, sentence-case title"
+# DeepSeek Harness names a session with its own system prompt (llm-pi-ai session title job). Not recognised, the
+# request took the profile of a GLM rule (39k characters) like a chat: 0.61 credits a title instead of 0.02.
+HARNESS_TITLE_PREFIX = "Create a concise title for an AI coding-assistant session"
 _TITLE_PREFIXES = (SDK_TITLE_PREFIX, LEGACY_TITLE_PREFIX,
-                   "You write short session titles. Reply with only the tagged fields the prompt asks for.")
+                   "You write short session titles. Reply with only the tagged fields the prompt asks for.",
+                   HARNESS_TITLE_PREFIX)
 _ATTRIBUTION = "x-anthropic-billing-header:"
 # One-line identity blocks that Claude Code and the Agent SDK put before their real prompt.
 _IDENTITY = re.compile(r"You are (?:Claude Code|a Claude agent)\b[^\n]*")

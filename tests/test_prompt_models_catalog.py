@@ -60,7 +60,7 @@ def legacy_codex_catalog(entries=None):
             'input_modalities': ['text', 'image'] if entry.get('vision') else ['text'],
             'supports_search_tool': False, 'supports_experimental_context': False,
             'use_responses_lite': False, 'supports_reasoning_effort_updates': False,
-            'node_repl_disabled': True, 'tool_mode': 'direct',
+            'node_repl_disabled': False, 'tool_mode': 'direct',
         })
         if 'max' in efforts:
             result[-1]['multi_agent_version'] = 'v2'

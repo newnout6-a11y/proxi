@@ -193,6 +193,8 @@ class _Base:
         else:
             delta = arguments
         current["arguments"] = arguments
+        # True once upstream has ended the call: its arguments are complete (the orchestrator says so with "done").
+        current["done"] = bool(event.get("done"))
         self._tool_call(self.tool_calls.index(current), current, delta, new=is_new)
 
     def _tool_call(self, index, call, delta, new=False):
@@ -611,9 +613,14 @@ class AnthropicAdapter(_Base):
             self._blocks[block_index]["input"] = json.loads(call["arguments"] or "{}")
         except ValueError:
             pass  # streamed JSON fragments are finalized by a subsequent delta
-        if delta:
+        if delta and block_index in self._open_indices:
             self._emit("content_block_delta", {"type": "content_block_delta", "index": block_index,
                                                "delta": {"type": "input_json_delta", "partial_json": delta}})
+        if call.get("done") and block_index in self._open_indices:
+            # Close the block as soon as upstream ends the call. Claude Code starts a tool when its block stops; held
+            # to the end of the message, every call of a parallel batch waited for the last one to be written.
+            self._emit("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            self._open_indices.discard(block_index)
 
     def _stop_reason(self, reason):
         if reason == "timeout":

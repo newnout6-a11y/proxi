@@ -7,6 +7,7 @@ context is billed once and reused, keeping time-to-first-token flat.
 import asyncio
 import contextlib
 import contextvars
+import decimal
 import hashlib
 import http.client
 import json
@@ -144,9 +145,58 @@ def loop_now():
     return time.time()
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _js_number(value):
+    """A double as JSON.stringify writes it (Number::toString): 3 for 3.0, 1e-7 for 1e-07, null for NaN and inf."""
+    if value != value or value in (float("inf"), float("-inf")):
+        return "null"
+    if value == 0:
+        return "0"
+    negative, digits, exponent = decimal.Decimal(repr(float(value))).normalize().as_tuple()
+    digits = "".join(map(str, digits))
+    k, n = len(digits), len(digits) + exponent
+    if k <= n <= 21:
+        text = digits + "0" * (n - k)
+    elif 0 < n <= 21:
+        text = digits[:n] + "." + digits[n:]
+    elif -6 < n <= 0:
+        text = "0." + "0" * -n + digits
+    else:
+        text = digits[0] + ("." + digits[1:] if k > 1 else "") + "e" + ("+" if n > 0 else "-") + str(abs(n - 1))
+    return ("-" if negative else "") + text
+
+
+def _js_delta(value):
+    """How much longer JSON.stringify(value) is than Python's compact dump of the same value, in UTF-16 units.
+
+    Python writes 3.0, 1e-07 and 1e+16 where JavaScript writes 3, 1e-7 and 10000000000000000, an integer past 2**53 in
+    full where JavaScript keeps a double, inf and nan as Infinity and NaN where JavaScript writes null, and a lone
+    surrogate as itself where JavaScript escapes it (\\udXXX)."""
+    stack, delta = [value], 0
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            stack.extend(item.values())
+            stack.extend(key for key in item if isinstance(key, str))
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+        elif isinstance(item, str):
+            delta += 5 * len(_SURROGATE.findall(item))
+        elif isinstance(item, bool) or item is None:
+            continue
+        elif isinstance(item, float):
+            delta += len(_js_number(item)) - len(json.dumps(item))
+        elif isinstance(item, int) and abs(item) >= 2 ** 53:
+            delta += len(_js_number(float(item))) - len(str(item))
+    return delta
+
+
 def _js_length(value):
     """JSON.stringify(value).length in UTF-16 code units."""
-    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-16-le")) // 2
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2 + _js_delta(value)
 
 
 def _hash32(length):
@@ -236,15 +286,53 @@ def _param_schema(schema, required):
         elif kind == "array":
             node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False)}
         elif kind == "object" or schema.get("properties") or schema.get("additionalProperties"):
+            properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
             node = {"type": "object", "properties": {
-                name: _param_schema(sub, name in (schema.get("required") or []))
-                for name, sub in (schema.get("properties") or {}).items()}}
-    description = " ".join(part for part in (str(schema["description"]) if schema.get("description") else "", note)
-                           if part)
+                name: _param_schema(sub, name in _required_names(schema)) for name, sub in properties.items()}}
+    description = " ".join(part for part in (str(schema["description"]) if schema.get("description") else "", note,
+                                             _limits(schema)) if part)
     if description:
         node["description"] = description
     node["required"] = bool(required)
     return node
+
+
+def _required_names(schema):
+    """The required property names of an object schema; a draft-3 boolean or another odd value counts as none.
+
+    Before, `required: true` or a list of properties raised TypeError while the tools were converted, and the client
+    got a 500 instead of its answer (ultracode audit of the relay, C15)."""
+    names = schema.get("required")
+    return [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
+
+
+_LIMITS = (("minLength", "at least %s character"), ("maxLength", "at most %s character"),
+           ("minimum", ">= %s"), ("maximum", "<= %s"), ("exclusiveMinimum", "> %s"), ("exclusiveMaximum", "< %s"),
+           ("multipleOf", "a multiple of %s"), ("minItems", "at least %s item"), ("maxItems", "at most %s item"))
+
+
+def _limits(schema):
+    """The validation limits of a field, in words for its description; None when it has none.
+
+    Retool's param shape has no place for them, so the model never saw them and broke them, and the client's tool or
+    its MCP server refused the call: a wait above its 60-second maximum, a SendMessage recipient on several lines.
+    Limits written inside allOf (as Claude Code writes its patterns) count as well. The safe-integer bounds a schema
+    library adds to every integer (+-9007199254740991) say nothing and are left out."""
+    parts = []
+    for source in [schema] + [item for item in schema.get("allOf") or [] if isinstance(item, dict)]:
+        for key, words in _LIMITS:
+            value = source.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and abs(value) < 2 ** 53 - 1:
+                number = int(value) if float(value).is_integer() else value
+                parts.append(words % number + ("s" if words.endswith(("character", "item")) and number != 1 else ""))
+        if source.get("uniqueItems") is True:
+            parts.append("no duplicate items")
+        if isinstance(source.get("pattern"), str) and 0 < len(source["pattern"]) <= 160:
+            parts.append("matching the regular expression " + source["pattern"])
+        if isinstance(source.get("format"), str) and source["format"]:
+            parts.append("in %s format" % source["format"])
+    parts = list(dict.fromkeys(parts))
+    return "Limits: %s." % "; ".join(parts) if parts else None
 
 
 def tools_to_retool(tools):
@@ -265,9 +353,9 @@ def tools_to_retool(tools):
         if not isinstance(function, dict) or not function.get("name"):
             continue
         params = {}
-        schema = function.get("parameters") or {}
-        required = set(schema.get("required") or [])
-        properties = schema.get("properties") or {}
+        schema = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
+        required = set(_required_names(schema))
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
         for name in sorted(properties.keys()):
             params[name] = _param_schema(properties[name], name in required)
         converted.append({"name": function["name"],
@@ -294,14 +382,23 @@ def coerce_arguments(raw, params):
         # Infinity that would make the arguments invalid JSON.
         coerced = _coerce_value(value, spec) if isinstance(value, str) else None
         if coerced is not None:
-            data[key] = coerced
+            data[key] = None if coerced is _JSON_NULL else coerced
             changed = True
     return json.dumps(data, ensure_ascii=False) if changed else text
+
+
+# What _coerce_value returns for a string that stands for JSON null (None already means "leave the string").
+_JSON_NULL = object()
 
 
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
     kind = spec.get("type") if isinstance(spec, dict) else None
+    if value == "null" and kind in ("number", "boolean", "array", "object"):
+        # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
+        # writes the string "null" when it means null: the client's tool refused middle="null", active="null" (protocol
+        # test run of 2026-11-06). A field of these types never holds that text.
+        return _JSON_NULL
     if kind == "number":
         try:
             number = float(value) if "." in value else int(value)
@@ -338,7 +435,7 @@ class ArgStream:
         except ValueError:
             return False
         spec = self.params.get(name)
-        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean")
+        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean", "array", "object")
 
     def feed(self, chunk):
         out = []
@@ -366,7 +463,7 @@ class ArgStream:
                     except ValueError:
                         value = None
                     coerced = _coerce_value(value, self.params.get(self.key_name)) if isinstance(value, str) else None
-                    out.append(raw if coerced is None else json.dumps(coerced))
+                    out.append(raw if coerced is None else "null" if coerced is _JSON_NULL else json.dumps(coerced))
                     self.state = "after"
             elif state == "keystr":
                 out.append(char)
@@ -1205,7 +1302,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             journal.emit("native_history.reset", "История или настройки изменились; прежняя подпись не переиспользуется",
                          "warn", reason="prefix_or_settings_mismatch",
                          restored=any(getattr(branch, "restored", False) for branch in history.branches),
-                         why=history.mismatch(scope, client))
+                         why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
         body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
         cold = (native_history.unsigned_tool_transcript(client)
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)

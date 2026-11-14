@@ -35,6 +35,35 @@ def reminder(text):
     return _REMINDER_OPEN + "\n" + text + "\n" + _REMINDER_CLOSE
 
 
+def readable_block(block):
+    """Text for an Anthropic document or search result, which the Retool route has no block for; None for others.
+
+    Claude Code's Read answers a PDF with a document block, and search tools answer with search_result blocks. The
+    model got the first 200 characters of their JSON instead, and the conversation lost its native history for good
+    because the block could not be read natively."""
+    kind = block.get("type") if isinstance(block, dict) else None
+    if kind == "search_result":
+        texts = [part.get("text") for part in block.get("content") or []
+                 if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
+        head = "[search result: %s, %s]" % (block.get("title") or "untitled", block.get("source") or "no source")
+        return "\n".join([head] + texts)
+    if kind != "document":
+        return None
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    title = " %s" % block["title"] if isinstance(block.get("title"), str) and block["title"] else ""
+    if source.get("type") == "text" and isinstance(source.get("data"), str):
+        return "[document%s]\n%s" % (title, source["data"])
+    if source.get("type") == "content":
+        texts = [part.get("text") for part in source.get("content") or []
+                 if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
+        return "\n".join(["[document%s]" % title] + texts)
+    if source.get("type") == "url":
+        return "[document%s at %s: this route does not pass the file to the model]" % (title, source.get("url"))
+    kilobytes = len(source.get("data") or "") * 3 // 4 // 1024 if source.get("type") == "base64" else 0
+    return "[document%s, %s%s: this route does not pass the file to the model]" % (
+        title, source.get("media_type") or source.get("type") or "file", ", %d KB" % kilobytes if kilobytes else "")
+
+
 def client_messages(messages, image_converter, *, lead=None):
     """Canonical client echo for matching, never a source of thinking signatures.
 
@@ -68,15 +97,20 @@ def client_messages(messages, image_converter, *, lead=None):
         blocks = []
         for block in value:
             if isinstance(block, str):
-                blocks.append({"type": "text", "text": block})
+                if block:
+                    blocks.append({"type": "text", "text": block})
             elif block.get("type") in ("text", "input_text", "output_text", "summary_text"):
-                blocks.append({"type": "text", "text": block["text"]})
+                # Upstream refuses an empty text block; the text bridge leaves it out as well.
+                if block["text"]:
+                    blocks.append({"type": "text", "text": block["text"]})
             elif block.get("type") in ("image", "image_url", "input_image") or "imageData" in block:
                 blocks.append(image_converter(block, "native history"))
             elif block.get("type") == "tool_reference" and isinstance(block.get("tool_name"), str) and block["tool_name"]:
                 # Claude Code's ToolSearch answers with references to the tools it loaded. Upstream has no such block,
                 # and the loaded tools are in the request's tool list already, so the result names them.
                 blocks.append({"type": "text", "text": "Tool loaded: " + block["tool_name"]})
+            elif readable_block(block) is not None:
+                blocks.append({"type": "text", "text": readable_block(block)})
             else:
                 raise ValueError("unsupported content")
         return blocks
@@ -139,14 +173,15 @@ def client_messages(messages, image_converter, *, lead=None):
                 pending = []
                 for block in ([{"type": "text", "text": value}] if isinstance(value, str) else value or []):
                     if isinstance(block, dict) and block.get("type") == "tool_result":
-                        if pending:
+                        if pending and content(pending):
                             result.append({"role": "user", "content": content(pending)})
-                            pending = []
+                        pending = []
                         result.append(tool_result(block.get("tool_use_id") or block.get("tool_call_id"),
                                                   block.get("content"), block.get("is_error", False)))
                     else:
                         pending.append(block)
-                if pending:
+                # A user turn of nothing but empty text has nothing to say upstream, which refuses an empty message.
+                if pending and content(pending):
                     result.append({"role": "user", "content": content(pending)})
             else:
                 raise ValueError("unsupported role")
@@ -309,17 +344,17 @@ class History:
         self.branches = []
         self.revision = 0
 
-    def resume(self, scope, client):
+    def resume(self, scope, client, defaults=None):
         for snapshot in reversed(self.branches):
             offset = len(snapshot.client)
             if (scope != snapshot.scope or len(client) <= offset + 1
-                    or client[:offset] != snapshot.client or client[offset] != snapshot.echo):
+                    or client[:offset] != snapshot.client or not same_echo(client[offset], snapshot.echo, defaults)):
                 continue
             tail = client[offset + 1:]
             calls = [b["toolCallId"] for b in snapshot.assistant if b["type"] == "tool_call"]
             results = [m["content"]["toolCallId"] for m in tail[:len(calls)] if m["role"] == "tool"]
             if (len(results) != len(calls) or len(set(results)) != len(results) or set(results) != set(calls)
-                    or any(m["role"] != "user" for m in tail[len(calls):])):
+                    or not _complete_turns(tail[len(calls):], set(calls))):
                 continue
             return snapshot, snapshot.messages + [{"role": "assistant", "content": snapshot.assistant}] + tail
         return None, None
@@ -330,7 +365,7 @@ class History:
         self.branches = self.branches[-8:]
         self.revision += 1
 
-    def mismatch(self, scope, client):
+    def mismatch(self, scope, client, defaults=None):
         """Which check of resume() the newest branch fails for this request, for the journal of a reset.
 
         Names only: a part of the scope, a message index and role, a part of the echo; never text."""
@@ -345,9 +380,86 @@ class History:
         for index, (ours, theirs) in enumerate(zip(client, snapshot.client)):
             if ours != theirs:
                 return "message:%d:%s" % (index, ours.get("role"))
-        if client[offset] != snapshot.echo:
+        if not same_echo(client[offset], snapshot.echo, defaults):
             return "echo:" + _echo_difference(client[offset], snapshot.echo)
         return "tool_results"
+
+
+_MISSING = object()
+
+
+def _complete_turns(messages, seen):
+    """True when what follows a kept reply's tool results is whole turns in the client's own words.
+
+    A reply the relay could not keep (a stream cut by a network error, a reply the user stopped) stays in the client's
+    history as an assistant message of its own, usually with a tool call answered by an error, before the client's next
+    message. Before, any assistant message there sent the next request cold, and the whole cached conversation was
+    written again: 281k and 617k tokens (14 and 31 credits) after a few seconds without internet on 2026-11-06. Such
+    turns now follow the kept reply as they are, unsigned, the way a cold replay sends every turn: text and tool calls,
+    each call answered before the next turn, no call id used twice, and no call left open at the end."""
+    pending = set()
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            call_id = message["content"]["toolCallId"]
+            if call_id not in pending:
+                return False
+            pending.discard(call_id)
+            continue
+        if pending:
+            return False
+        if role == "assistant":
+            for block in message["content"]:
+                if block["type"] not in ("text", "tool_call"):
+                    return False
+                if block["type"] == "tool_call":
+                    if block["toolCallId"] in seen:
+                        return False
+                    seen.add(block["toolCallId"])
+                    pending.add(block["toolCallId"])
+        elif role != "user":
+            return False
+    return not pending and (not messages or messages[-1].get("role") != "assistant")
+
+
+def tool_defaults(tools):
+    """{tool name: {argument: default}} from the client's own tool schemas, for the arguments that declare a default."""
+    found = {}
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        schema = function.get("parameters") if isinstance(function, dict) else None
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if not isinstance(properties, dict):
+            continue
+        values = {name: spec["default"] for name, spec in properties.items() if isinstance(spec, dict) and "default" in spec}
+        if values and function.get("name"):
+            found[function["name"]] = values
+    return found
+
+
+def same_echo(theirs, ours, defaults=None):
+    """True when the client's echo of the kept reply is that reply.
+
+    Claude Code fills the default of an optional argument the model left out before it echoes the call ("replace_all":
+    false of Edit), so an argument that holds its schema default counts as absent on both sides. Before, such an echo
+    failed the check and the next turn went cold, rewriting the whole cached conversation (Claude Desktop test run of
+    2026-11-06: 233k tokens, 30.7 credits for one Edit)."""
+    if theirs == ours:
+        return True
+    if not defaults or not isinstance(theirs, dict) or not isinstance(ours, dict):
+        return False
+
+    def without_defaults(message):
+        blocks = []
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_call" and isinstance(block.get("toolInput"), dict):
+                known = defaults.get(block.get("toolName")) or {}
+                block = dict(block, toolInput={key: value for key, value in block["toolInput"].items()
+                                               if known.get(key, _MISSING) != value})
+            blocks.append(block)
+        return dict(message, content=blocks)
+
+    return without_defaults(theirs) == without_defaults(ours)
 
 
 _SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")
