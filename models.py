@@ -2,7 +2,10 @@
 
 Effort capabilities describe the Retool route rather than the provider-wide union.
 """
+import collections
+import copy
 import datetime
+import fnmatch
 
 from apierr import ApiError, bad_request, not_found, service_unavailable
 
@@ -494,20 +497,96 @@ def desktop_metadata(entry, entries):
     return result
 
 
-def codex_catalog(entries=None):
+_CODEX_INSTRUCTIONS = (
+    "You are a coding assistant working in the user's project. Follow the "
+    "user's instructions and project guidance. Use the tools provided by "
+    "the client to inspect files, make requested changes, and run relevant "
+    "checks. Base reports on observed tool results and state any limitations."
+)
+# Codex ModelInfo flags a prompts document may switch per model (prompt_policy.CODEX_OVERRIDE_KEYS minus the text).
+# They are Codex's own usage guidance for skills, plugins and apps; the relay publishes all three as False.
+_CODEX_USAGE_FLAGS = ('include_skills_usage_instructions', 'include_plugin_usage_instructions',
+                      'include_apps_usage_instructions')
+
+
+def _publishes(setting, model_id):
+    """Whether a profile's publish_as_model (False | True | glob list) lists this catalog model."""
+    if setting is True:
+        return True
+    globs = [setting] if isinstance(setting, str) else setting if isinstance(setting, (list, tuple)) else ()
+    folded = model_id.lower()
+    return any(isinstance(glob, str) and fnmatch.fnmatchcase(folded, glob.lower()) for glob in globs)
+
+
+def virtual_entries(entries, snapshot):
+    """Catalog entries of the virtual models <model>@<profile> a prompts snapshot publishes.
+
+    A profile publishes through publish_as_model: True lists every model of `entries`, a glob list the
+    models whose id matches. Each entry is a copy of its base with the id <model>@<profile>, a label that
+    names the profile and a `virtual` marker ({"base", "profile"}); the base entries are not repeated.
+    Without a snapshot (no prompts file) there is nothing to publish and the catalogs stay as they were.
+    """
+    if snapshot is None:
+        return []
+    bases = [entry for entry in entries if 'virtual' not in entry]
+    published = []
+    for profile in snapshot.profile_names():
+        if not _profile_pattern().fullmatch(profile):
+            continue  # the id would not parse back
+        setting = snapshot.profile(profile).get('publish_as_model')
+        for entry in bases:
+            if _publishes(setting, entry['id']):
+                item = copy.deepcopy(entry)
+                item.update(id=entry['id'] + VIRTUAL_SEPARATOR + profile,
+                            label='%s (profile %s)' % (entry.get('label', entry['id']), profile),
+                            virtual={'base': entry['id'], 'profile': profile})
+                published.append(item)
+    return published
+
+
+def virtual_fields(entry):
+    """The /v1/models fields naming the base model and the profile of a virtual entry; {} for any other."""
+    virtual = entry.get('virtual')
+    return {'base_model': virtual['base'], 'prompt_profile': virtual['profile']} if virtual else {}
+
+
+def _codex_text(snapshot, model):
+    """base_instructions of a model: the document's codex_base, else the relay's own text (an empty one is kept)."""
+    text = snapshot.codex_base(model) if snapshot is not None else None
+    return _CODEX_INSTRUCTIONS if text is None else text
+
+
+def _codex_overrides(snapshot, model):
+    """codex.models overrides of a model; a value of the wrong type is ignored (the document check is prompt_policy's)."""
+    found = snapshot.codex_overrides(model) if snapshot is not None else None
+    found = found if isinstance(found, dict) else {}
+    persistent = found.get('persistent_instructions')
+    return {'persistent_instructions': persistent if isinstance(persistent, str) else '',
+            **{flag: found[flag] if isinstance(found.get(flag), bool) else False for flag in _CODEX_USAGE_FLAGS}}
+
+
+def codex_catalog(entries=None, snapshot=None):
     """Codex-native ModelsResponse with direct client tools for this gateway.
 
     The OpenAI-compatible list is insufficient for Codex to discover a custom
     model's tool mode. Keep this separate so SDK model-list clients are unchanged.
+
+    With `snapshot` (the current prompt_policy.Snapshot) the document steers what Codex is told:
+    codex_base(model) is the model's instruction text, sent both as the legacy base_instructions and as
+    model_messages.instructions_template (Codex 0.164 reads the template and takes base_instructions only
+    when it is absent); codex_overrides(model) sets model_messages.persistent_instructions, which Codex
+    uses only at its "persistent" reasoning effort (an empty string, the default here, turns Codex's own
+    persistent-mode text off), and the include_*_usage_instructions flags that add Codex's own how-to text
+    for skills, plugins and apps. The models the document publishes as <model>@<profile> follow the
+    others as copies of their base (same text and overrides): Codex looks a model up by its exact slug in
+    a provider catalog, so a virtual model needs its own entry. Without a snapshot the catalog is unchanged.
     """
-    instructions = (
-        "You are a coding assistant working in the user's project. Follow the "
-        "user's instructions and project guidance. Use the tools provided by "
-        "the client to inspect files, make requested changes, and run relevant "
-        "checks. Base reports on observed tool results and state any limitations."
-    )
+    listed = list(CATALOG if entries is None else entries)
     result = []
-    for index, entry in enumerate(CATALOG if entries is None else entries):
+    for index, entry in enumerate(listed + virtual_entries(listed, snapshot)):
+        model = entry['virtual']['base'] if 'virtual' in entry else entry['id']
+        instructions = _codex_text(snapshot, model)
+        overrides = _codex_overrides(snapshot, model)
         efforts = entry.get('reasoning_effort_levels', [])
         default = entry.get('default_reasoning_effort')
         if default not in efforts:
@@ -522,9 +601,11 @@ def codex_catalog(entries=None):
             'priority': index, 'additional_speed_tiers': [], 'service_tiers': [],
             'default_service_tier': None, 'availability_nux': None, 'upgrade': None,
             'base_instructions': instructions,
-            'model_messages': {'instructions_template': instructions, 'persistent_instructions': ''},
-            'include_skills_usage_instructions': False, 'include_plugin_usage_instructions': False,
-            'include_apps_usage_instructions': False,
+            'model_messages': {'instructions_template': instructions,
+                               'persistent_instructions': overrides['persistent_instructions']},
+            'include_skills_usage_instructions': overrides['include_skills_usage_instructions'],
+            'include_plugin_usage_instructions': overrides['include_plugin_usage_instructions'],
+            'include_apps_usage_instructions': overrides['include_apps_usage_instructions'],
             'supports_reasoning_summary_parameter': bool(entry.get('reasoning')),
             'default_reasoning_summary': 'detailed' if entry.get('reasoning') else 'none',
             'support_verbosity': bool(entry.get('verbosity_levels')), 'default_verbosity': None,
@@ -551,6 +632,81 @@ def _canonical(name):
 
 EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _EFFORT_RANK = {name: index for index, name in enumerate(EFFORT_ORDER)}
+
+# A client model name may select a prompt profile: <model>@<profile>[#effort | :effort] (plan 4.3 item 7).
+# '@' is reserved for that, so no catalog id and no alias may contain one (tests/test_prompt_models_parse.py).
+VIRTUAL_SEPARATOR = '@'
+# What parse_model_name makes of a name: the base model as the client wrote it (aliases not yet resolved,
+# suffixes cut off), the @profile or None, and the #effort / :effort suffix or None.
+ModelName = collections.namedtuple('ModelName', 'base profile effort')
+
+
+def _profile_pattern():
+    """prompt_policy.PROFILE_NAME, the one rule for profile names (a profile name is also this suffix)."""
+    import prompt_policy  # late: prompt_policy may import this module
+    return prompt_policy.PROFILE_NAME
+
+
+def parse_model_name(name):
+    """Take a client model name apart: <base>[@<profile>][#effort | :effort] -> ModelName(base, profile, effort).
+
+    The effort follows the profile (claude-opus-5-5@mine#high) and is cut as it always was: at the first
+    '#', else the first ':', and only when what follows is a known level; any other tail stays in the name.
+    Whitespace around the parts is ignored. A name without '@' comes out exactly as it did before profiles
+    existed. A malformed profile part, or an effort written before it, is a 400 on param "model".
+    """
+    original = (name or '').strip()
+    shown = original[:100]
+    text, effort = original, None
+    for separator in ('#', ':'):
+        if separator in text:
+            head, tail = text.split(separator, 1)
+            candidate = tail.strip().lower()
+            if candidate in EFFORT_ORDER:
+                effort, text = candidate, head.strip()
+            break
+    base, at, profile = text.partition(VIRTUAL_SEPARATOR)
+    if not at:
+        return ModelName(text, None, effort)
+    base, profile = base.strip(), profile.strip()
+    if VIRTUAL_SEPARATOR in profile:
+        raise bad_request("model '%s' has more than one '@'; write <model>@<profile>[#effort]" % shown, param='model')
+    for separator in ('#', ':'):
+        if separator in profile:
+            tail = profile.split(separator, 1)[1].strip()
+            raise bad_request("model '%s': '%s' after the profile is not a reasoning effort (%s)"
+                              % (shown, tail[:40], ', '.join(EFFORT_ORDER)), param='model')
+    if not base:
+        raise bad_request("model '%s' names no model before '@'" % shown, param='model')
+    if not profile:
+        raise bad_request("model '%s' names no profile after '@'" % shown, param='model')
+    if not _profile_pattern().fullmatch(profile):
+        raise bad_request("model '%s': '%s' is not a profile name; use letters, digits, '.', '_' and '-', starting "
+                          "with a letter or digit, at most 64 characters" % (shown, profile[:40]), param='model')
+    for separator in ('#', ':'):
+        if separator in base:
+            head, tail = base.split(separator, 1)
+            if tail.strip().lower() in EFFORT_ORDER:
+                raise bad_request("model '%s': the effort goes after the profile: %s@%s%s%s"
+                                  % (shown, head.strip(), profile, separator, tail.strip()), param='model')
+            break
+    return ModelName(base, profile, effort)
+
+
+def split_virtual(name):
+    """(base, profile) of <model>@<profile>[#effort]; the profile is None for a plain name, the effort is dropped."""
+    parsed = parse_model_name(name)
+    return parsed.base, parsed.profile
+
+
+def canonical_name(name):
+    """The catalog id of a client model name, its @profile kept: 'claude-opus@mine#high' -> 'claude-opus-5-5@mine'.
+
+    ApiError for an unknown model, as resolve(); the effort suffix is dropped.
+    """
+    parsed = parse_model_name(name)
+    entry = resolve(parsed.base)[0]
+    return entry['id'] + (VIRTUAL_SEPARATOR + parsed.profile if parsed.profile else '')
 
 
 def nearest_effort(levels, requested):
@@ -656,19 +812,13 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
     values, so there is nothing to clamp towards). Models whose route ignores
     effort (reasoning_effort_control "accepted-ignored") take every known level
     and forward none.
+
+    The name may select a prompt profile, <model>@<profile>[#effort]: the profile is not the catalog's
+    business, so it is dropped here (validate keeps it in Parsed.virtual_profile, parse_model_name).
     """
-    raw_name = (model or default_model or "").strip()
-    extracted_effort = effort
-    base_name = raw_name
-    for sep in ("#", ":"):
-        if sep in raw_name:
-            parts = raw_name.split(sep, 1)
-            cand = parts[1].strip().lower()
-            if cand in EFFORT_ORDER:
-                if extracted_effort is None:
-                    extracted_effort = cand
-                base_name = parts[0].strip()
-            break
+    parsed = parse_model_name(model or default_model)
+    extracted_effort = effort if effort is not None else parsed.effort
+    base_name = parsed.base
     try:
         return resolve(base_name, extracted_effort, strict=strict, default_model=default_model)
     except ApiError as error:
@@ -689,17 +839,10 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
 
 
 def resolve(model, effort=None, *, strict=True, default_model=None):
-    raw_name = (model or default_model or '').strip()
-    for sep in ('#', ':'):
-        if sep in raw_name:
-            parts = raw_name.split(sep, 1)
-            cand = parts[1].strip().lower()
-            if cand in EFFORT_ORDER:
-                if effort is None:
-                    effort = cand
-                raw_name = parts[0].strip()
-            break
-    name = _canonical(raw_name)
+    parsed = parse_model_name(model or default_model)
+    if effort is None:
+        effort = parsed.effort
+    name = _canonical(parsed.base)
     if not name:
         raise bad_request("'model' is required", param='model')
     entry = _BY_ID.get(name)

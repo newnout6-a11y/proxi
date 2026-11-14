@@ -29,6 +29,7 @@ import client_context
 import models
 from apierr import ApiError
 from config import DEFAULTS as RELAY_DEFAULTS
+from scripts import sync_virtual_models
 
 records = []
 task_sent = False
@@ -262,6 +263,7 @@ def main(argv=None):
                         "(OpenCode Desktop's newest bundled CLI is detected automatically)")
     parser.add_argument('--relay-config', default=str(Path(__file__).resolve().parents[1] / 'config.json'))
     parser.add_argument('--require-complete-catalog', action='store_true')
+    sync_virtual_models.add_arguments(parser)
     options = parser.parse_args(argv)
     mode = options.mode
     exe = options.executable or default_executable(mode)
@@ -271,6 +273,8 @@ def main(argv=None):
     if mode != "claude" and Path(options.relay_config).is_file():
         try:
             expected = routable_entries(options.relay_config)
+            # The virtual models <model>@<profile> the relay lists are part of the catalog a sync writes.
+            expected = sync_virtual_models.with_virtual_models(expected, options)[0]
         except ValueError as error:
             parser.error(str(error))
     records.clear()

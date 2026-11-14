@@ -10,6 +10,9 @@ and unrelated settings; a file with comments is rewritten only with --allow-refo
 A removed model behind agent.compaction.model is replaced only by a cheap model whose
 window holds the main model's, else the override is dropped; the summary's warnings
 say which.
+The prompt profiles that publish themselves as models (publish_as_model) are listed too, as
+<model>@<profile> with the base model's limits and efforts: see scripts/sync_virtual_models.py;
+--no-virtual-models leaves them out.
 """
 import argparse
 import codecs
@@ -26,6 +29,7 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import models
 from apierr import ApiError
+from scripts import sync_virtual_models
 from scripts.probe_client_settings import catalog_policy, effort_controls, routable_entries
 
 PROVIDER = 'retool-relay'
@@ -172,7 +176,7 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
             return None
         raw, _, variant = item[len(PROVIDER) + 1:].partition('#')
         try:
-            name = models.resolve(raw)[0]['id']
+            name = models.canonical_name(raw)
         except ApiError:
             name = None
         if name in new_models:
@@ -503,6 +507,7 @@ def run(args):
     original = read_file(path, 'OpenCode settings file', ' (use --settings; OpenCode also reads opencode.json)')
     document, style, commented = parse_settings(original, str(path))
     entries = routable_entries(args.relay_config)
+    entries, virtual = sync_virtual_models.with_virtual_models(entries, args)
     warnings = []
     result = update_document(document, entries, warnings=warnings)
     unchanged = result == document
@@ -517,7 +522,8 @@ def run(args):
     print(json.dumps({'models': len(entries), 'written': backup is not None, 'changed': not unchanged,
                       'backup': str(backup) if backup else None, 'preview': args.output,
                       'preview_redacted': bool(args.output) and not args.include_secrets,
-                      'drops_comments': commented and not unchanged, 'warnings': warnings}, ensure_ascii=False))
+                      'drops_comments': commented and not unchanged, 'warnings': warnings, **virtual},
+                     ensure_ascii=False))
     return 0
 
 
@@ -532,6 +538,7 @@ def main(argv=None):
     parser.add_argument('--backup-dir')
     parser.add_argument('--allow-reformat', action='store_true',
                         help='Allow --write to rewrite a file with comments, which are then removed')
+    sync_virtual_models.add_arguments(parser)
     args = parser.parse_args(argv)
     if args.write and not args.backup_dir:
         parser.error('--write requires --backup-dir')
