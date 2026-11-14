@@ -14,6 +14,7 @@ from datetime import datetime
 import uuid
 
 import apierr
+import adapters
 import executor
 import credits
 import journal
@@ -59,10 +60,17 @@ _RESTART_REASONS = {
     "no_branch": "у диалога нет подписанной ветки (первый запрос или нет сохранённого состояния)",
     "history": "сообщения запроса не продолжают ветку диалога (история изменена или заменена)",
     "effort": "effort ветки недопустим для этой модели",
+    "lower": "effort ветки ниже того, на котором пошёл бы запрос: relay не понижает effort ради кэша",
     "scope": "у запроса другие %s, чем у ветки",
 }
 _SCOPE_NAMES = {"conversation": "диалог", "provider": "модель или аккаунт", "head": "system (head)", "tools": "tools",
                 "tool_choice": "tool_choice"}
+
+
+def _below(effort, than):
+    """Whether `effort` is a lower reasoning level than `than` (False when either is not a level)."""
+    levels = model_catalog.EFFORT_ORDER
+    return effort in levels and than in levels and levels.index(effort) < levels.index(than)
 
 
 def _b(text: str) -> int:
@@ -94,6 +102,16 @@ def _trim(text: str, budget: int) -> str:
     if len(raw) <= budget:
         return text
     return raw[:budget].decode("utf-8", "ignore")
+
+
+def _remember_prompt_size(session, parsed, tokens):
+    """What count_tokens scales from: the size of the client's request and the tokens upstream counted for it."""
+    if not tokens:
+        return
+    chars = getattr(parsed, "client_chars", None)
+    if chars is None:
+        chars = adapters.request_chars(parsed)
+    session._count_anchor = (chars, tokens, parsed.model)
 
 
 
@@ -192,6 +210,22 @@ def _may_be_balance_related(error):
     if status == 402 or (status == 429 and code == "insufficient_credits"):
         return True
     return status >= 500 and code != "upstream_timeout"
+
+
+# A conversation moved to another account writes its prefix there again; below this many prompt tokens that costs next
+# to nothing, and waiting for the limited account (account_rate_limit_wait) is only a delay.
+LIMIT_WAIT_MIN_PREFIX = 8000
+
+
+async def _pause(cancelled, seconds):
+    """Wait `seconds` without holding a thread; True when the client went away first."""
+    end = time.monotonic() + seconds
+    while not cancelled.is_set():
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        await asyncio.sleep(min(0.25, left))
+    return True
 
 
 def _can_exec(cfg, steps: int) -> bool:
@@ -441,9 +475,10 @@ class TurnRunner:
     def _dialog_effort(self, parsed, head, choice, exclude):
         """(the effort of the dialog, why the history restarts anyway) for a compaction.
 
-        The first is the effort of the dialog when asking for it makes the signed history of the dialog resume, else None
+        The first is the effort of the dialog when asking for it makes the signed history of the dialog resume and it is
+        not lower than the effort the request would run on (the relay never lowers an effort to save a cache), else None
         to leave the client's own effort alone. The second is None, or, when the request does not continue the dialog's
-        signed history on any effort, what to tell the journal: {"reason": "no_branch" | "history" | "effort"} or
+        signed history on any effort, what to tell the journal: {"reason": "no_branch" | "history" | "effort" | "lower"} or
         {"reason": "scope", "differs": [...]} naming what differs from the newest branch (the parts of native_scope).
 
         A signed branch is made under one reasoning effort and continues only a request that asks for that one: with
@@ -482,16 +517,26 @@ class TurnRunner:
                 provider["providerResourceName"] = resource
             return direct.native_scope(key, provider, head or "", tools, choice)
 
-        refused = False
+        refused = lowered = False
         defaults = native_history.tool_defaults(parsed.tools)
+
+        def continues(scope):
+            # The request continues the branch as a turn of it, or forks from it (History.resume_fork: Desktop's compaction).
+            return (history.resume(scope, client, defaults)[0] is not None
+                    or history.resume_fork(scope, client)[0] is not None)
+
         for effort in dict.fromkeys(direct.scope_effort(branch.scope) for branch in reversed(list(history.branches))):
             if effort is None:
                 continue
-            found, _ = history.resume(scope_of(effort), client, defaults)
-            if found is None:
+            if not continues(scope_of(effort)):
                 continue
             if effort == wanted:
                 return None, None  # the request resumes as it is
+            if _below(effort, wanted):
+                # The relay never lowers an effort to keep a cache: the dialog's is taken only when it is not below the
+                # one the request would run on. The history restarts and is written again, at the effort that was asked.
+                lowered = True
+                continue
             try:
                 _, resolved = model_catalog.resolve_tolerant(
                     parsed.model, effort, strict=self.cfg.get("strict_models", True), default_model=self.cfg.get("model"),
@@ -511,9 +556,9 @@ class TurnRunner:
             differs = []
         if differs:
             return None, {"reason": "scope", "differs": differs}
-        if history.resume(newest.scope, client, defaults)[0] is None:
+        if not continues(newest.scope):
             return None, {"reason": "history"}
-        return None, ({"reason": "effort"} if refused else None)
+        return None, ({"reason": "lower"} if lowered else {"reason": "effort"} if refused else None)
 
     def _check_prompt(self, prompt):
         limit = int(self.cfg.get("max_prompt_bytes", 0) or 0)
@@ -796,6 +841,24 @@ class TurnRunner:
                 return None
         return None
 
+    def _limit_pause(self, error, session):
+        """Seconds to wait on an account at its hourly limit before its conversation moves, or None to move it now.
+
+        Only a conversation with a prefix worth keeping waits (LIMIT_WAIT_MIN_PREFIX): the other account writes the
+        whole prefix again and cannot take the signed history along (field: 79k tokens in 38 s, and 490k tokens, after one
+        429 each). Retool sends no Retry-After for this limit, so a wait is the setting's whole length; when it does
+        send one, the wait is the hint if that fits in the setting, and a longer hint moves the conversation at once."""
+        try:
+            allowed = float(self.cfg.get("account_rate_limit_wait") or 0)
+        except (TypeError, ValueError):
+            return None
+        if allowed <= 0 or int(getattr(session, "_last_prefix_tokens", 0) or 0) < LIMIT_WAIT_MIN_PREFIX:
+            return None
+        hint = getattr(error, "retry_after", None)
+        if hint is None:
+            return allowed
+        return float(hint) if hint <= allowed else None
+
     async def _run_searches(self, searcher, spec, calls, used, cancelled, log):
         """Run the search calls of one step: [(call id, content, text)], content as the client gets it, text as the model reads it.
 
@@ -846,10 +909,12 @@ class TurnRunner:
         confirmed by the dispatcher's fresh balance fetch (the serving account dropped below
         min_account_balance); Retool's hourly managed-key limit parks the serving account at
         once, even when the turn is already streaming and cannot be retried. Other failures
-        (empty turns, 5xx) are returned as before.
+        (empty turns, 5xx) are returned as before. With account_rate_limit_wait set, a conversation
+        with a warm prefix first waits once on the limited account and asks it again (_limit_pause).
         """
         exclude = []
         rechecked = False
+        waited, awaiting = False, None
         cancelled = holder.setdefault("cancel_event", threading.Event())
         max_steps = int(self.cfg.get("max_exec_turns", 0) or 0)
         # Exec steps are bounded only by max_exec_turns; each step (plus the summary
@@ -871,12 +936,36 @@ class TurnRunner:
             lease = holder.get("session")
             backend = getattr(getattr(lease, "session", lease), "backend", None)
             accounts = getattr(self, "accounts", None)
+            if awaiting is not None:
+                if error is None or not apierr.is_account_quota(error):
+                    journal.emit("account.rate_limit_lifted",
+                                 "Часовой лимит Retool снят за %g с ожидания — диалог остался на своём аккаунте" % awaiting[1],
+                                 "info", account=account_tag(awaiting[0]), request_id=getattr(parsed, "request_id", None),
+                                 seconds=awaiting[1])
+                awaiting = None
             retryable = (error is not None and not relay.started and not cancelled.is_set()
                          and accounts is not None and holder["_attempt_budget"].remaining > 0)
             exhausted = False
             rate_limited = False
             try:
                 if error is not None and backend is not None and apierr.is_account_quota(error):
+                    pause = (self._limit_pause(error, getattr(lease, "session", lease))
+                             if retryable and backend not in exclude and not waited
+                             and holder["_attempt_budget"].remaining > 1 else None)
+                    if pause is not None:
+                        # The account is not parked and not excluded: the retry goes to it with the conversation's
+                        # history, and only a second 429 takes the usual way below.
+                        waited, awaiting = True, (backend, pause)
+                        journal.emit("account.rate_limit_wait",
+                                     "Часовой лимит Retool — запрос ждёт %g с тот же аккаунт, чтобы диалог не переезжал" % pause,
+                                     "info", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
+                                     seconds=pause, retry_after=getattr(error, "retry_after", None))
+                        console_log.write("[%s] [account] %s: часовой лимит Retool, ждём %g с и повторяем на нём" % (
+                            getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), pause))
+                        if not await _pause(cancelled, pause):
+                            holder["reason"] = "stop"
+                            continue
+                        retryable = False  # the client went away while the request waited: only the account is told
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):
@@ -1167,6 +1256,7 @@ class TurnRunner:
                     visible_text = ""
                     holder["upstream_started_at"] = time.time()
                     streamed_tool_call = False
+                    dropped_calls = []
                     upstream_completed = False
                     search_calls = {}  # this step's calls of the search tool that upstream has ended, by id, in order
                     stream_prompt = prompt
@@ -1214,6 +1304,9 @@ class TurnRunner:
                             chunks)
                         direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
                                                                  if native_tools else None)
+                        # Which calls the client can receive: a call of another tool is dropped below, and is no part
+                        # of what the turn delivered or of the branch kept for it (direct.iter_events).
+                        direct_target._native_callable_tools = list(tool_names) if native_tools else None
                         direct_target._native_tool_defaults = (native_history.tool_defaults(parsed.tools)
                                                                if native_tools else None)
                         # Relay-only retry instructions live in chunks; a cold
@@ -1305,7 +1398,10 @@ class TurnRunner:
                                         search_calls[event.get("id") or event["name"]] = {
                                             "id": event.get("id") or event["name"], "arguments": event.get("arguments")}
                                 elif event["type"] == "tool_call" and event.get("name") in tool_names:
-                                    if not event.get("partial"):
+                                    # A call whose arguments stop short of valid JSON (the cap, a cut) is not a whole
+                                    # call: it is not reported as one (C5), and the turn ends as cut, not as a tool call.
+                                    complete = not event.get("partial") and not event.get("invalid")
+                                    if complete:
                                         streamed_tool_call = True
                                     definition = tool_definitions[event["name"]]
                                     call_key = event.get("id") or event["name"]
@@ -1314,21 +1410,28 @@ class TurnRunner:
                                         ms = round((tool_started[call_key] - holder["upstream_started_at"]) * 1000)
                                         log("upstream.tool_start", "Модель начала вызов %s через %d мс" % (event["name"], ms),
                                             "debug", name=event["name"], call_id=event.get("id"), ms=ms)
-                                    if not event.get("partial"):
+                                    if complete:
                                         args_ms = round((time.time() - tool_started[call_key]) * 1000)
                                         log("tool.call", "Инструмент клиента: %s (аргументы %d мс)" % (event["name"], args_ms),
                                             "info", name=event["name"], call_id=event.get("id"),
                                             arguments=_preview(event.get("arguments")), streamed=True,
                                             args_ms=args_ms, args_chars=len(event.get("arguments") or ""),
                                             **({"carried": True} if event["name"] in carried_tools else {}))
-                                    out.put({key: value for key, value in event.items() if key != "partial"}
+                                    elif event.get("invalid"):
+                                        log("tool.call_incomplete",
+                                            "Вызов %s оборван: аргументы не дописаны до конца JSON" % event["name"], "warn",
+                                            name=event["name"], call_id=event.get("id"),
+                                            arguments=_preview(event.get("arguments")),
+                                            args_chars=len(event.get("arguments") or ""))
+                                    out.put({key: value for key, value in event.items() if key not in ("partial", "invalid")}
                                             | {"tool_type": definition.get("x-client-type", "function"),
-                                               "done": not event.get("partial")})
+                                               "done": complete})
                                 elif event["type"] == "tool_call":
                                     # A call of a tool the client did not declare (under a forced choice, of another
                                     # tool) has nothing to run it on the client and is not passed on; the journal names
                                     # it instead of losing it without a trace (ultracode audit of the relay, C4).
                                     if not event.get("partial"):
+                                        dropped_calls.append(event.get("name"))
                                         log("tool.call_dropped",
                                             "Вызов инструмента %s не передан клиенту: клиент его не объявлял" % (
                                                 event.get("name"),),
@@ -1345,6 +1448,7 @@ class TurnRunner:
                                         **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
                                     if session is not None:
                                         acquired._last_prefix_tokens = breakdown['prompt_tokens']
+                                        _remember_prompt_size(acquired, parsed, breakdown['prompt_tokens'])
                                     out.put(event)
                                 elif event["type"] == "credits":
                                     # Each upstream attempt (retry, exec follow-up) is billed
@@ -1368,6 +1472,7 @@ class TurnRunner:
                                         # reads, so keepwarm (which holds the real session)
                                         # saw prefix_tokens=0 forever.
                                         acquired._last_prefix_tokens = breakdown["prompt_tokens"]
+                                        _remember_prompt_size(acquired, parsed, breakdown["prompt_tokens"])
                                     out.put(event)
                                 elif event["type"] == "hitl":
                                     out.put(event)
@@ -1387,8 +1492,8 @@ class TurnRunner:
                         self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
                         out.put({"type": "end", "reason": "cancelled"})
                         return
-                    if holder.get("reason") == "timeout":
-                        out.put({"type": "end", "reason": "timeout"})
+                    if holder.get("reason") in ("timeout", "length"):
+                        out.put({"type": "end", "reason": holder["reason"]})
                         return
 
                     if search_calls:
@@ -1488,10 +1593,13 @@ class TurnRunner:
                                   "For this requested task, issue the appropriate client tool call now.")
                         continue
                     if tool_names and (choice == "required" or isinstance(choice, dict)):
-                        # Same error shape as an empty turn: diagnostic_id and attempt count.
+                        # Same error shape as an empty turn: diagnostic_id and attempt count. A reply whose only calls
+                        # were dropped is no empty turn: the model answered, with a call the client cannot receive.
                         raise holder["_attempt_budget"].error(
-                            "upstream_tool_choice_ignored" if final_text.strip() else "upstream_empty_turn",
-                            "upstream did not honor the required client tool choice")
+                            "upstream_tool_choice_ignored" if final_text.strip() or dropped_calls else "upstream_empty_turn",
+                            "upstream did not honor the required client tool choice" + (
+                                " (it called only %s, which this request does not offer)" % ", ".join(
+                                    sorted({str(name)[:60] for name in dropped_calls})[:5]) if dropped_calls else ""))
 
                     # Once the summary turn is requested, nothing is executed any more.
                     can_exec = self._can_exec(exec_steps) and not final_summary and not client_owns_instructions
@@ -1643,7 +1751,7 @@ class TurnRunner:
             else:
                 reason = outcome["reason"] or holder.get("reason") or "stop"
             log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
-                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout") else "success",
+                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout", "length") else "success",
                 reason=reason, duration_ms=duration, exec_steps=exec_steps,
                 retries=empty_retries + tool_retries,
                 **({"web_searches": search_uses} if search_uses else {}))

@@ -56,6 +56,9 @@ TRANSIENT = frozenset({"io_error", "internal"})  # save failures that may pass: 
 
 DEFAULT_TTL = 24 * 3600
 DEFAULT_CONVERSATIONS = 200
+# A state this small holds no history worth keeping (a one-shot job, a test: a few hundred bytes); past the count limit
+# these go before the big ones, whatever their age.
+TINY_STATE_BYTES = 4096
 DEFAULT_FILE_BYTES = 32 * 1024 * 1024
 DEFAULT_TOTAL_BYTES = 512 * 1024 * 1024
 
@@ -682,7 +685,14 @@ class ConversationStore:
             console_log.write("[state] %d stored conversation(s), %d KiB in %s" % (files, total // 1024, self.directory))
 
     def _enforce(self, keep=None):
-        """Remove expired states, then the oldest ones past the limits; never the one just written."""
+        """Remove expired states, then states past the limits; never the one just written.
+
+        Past the count limit the states too small to hold a usable history go first (TINY_STATE_BYTES), the oldest of the
+        rest after them. A flow of one-shot jobs and tests keeps the store at its limit all the time: a4's 2,316 saves
+        (2026-11-06, F3) found 200-201 files each time and dropped the oldest 266 times, always a 343-byte state, and the
+        same saves replayed show every state over 4 KiB (133 of 280 conversations) dropped after 84-95 minutes (median 87)
+        under the oldest-first rule, none under this one. Past the byte limit dropping tiny files frees nothing: the oldest
+        goes, as it always did."""
         now = self._clock()
         victims = []
         with self._lock:
@@ -694,10 +704,13 @@ class ConversationStore:
             alive = [meta for meta in ordered if meta.key_id not in gone]
             total = sum(meta.size for meta in alive)
             while alive and (len(alive) > self.max_conversations or total > self.max_total_bytes):
-                victim = next((meta for meta in alive if meta.key_id != keep), None)
+                by_count = len(alive) > self.max_conversations
+                victim = min((meta for meta in alive if meta.key_id != keep),
+                             key=((lambda meta: (meta.size > TINY_STATE_BYTES, meta.saved_at)) if by_count
+                                  else (lambda meta: meta.saved_at)), default=None)
                 if victim is None:
                     break
-                reason = "limit_conversations" if len(alive) > self.max_conversations else "limit_bytes"
+                reason = "limit_conversations" if by_count else "limit_bytes"
                 alive.remove(victim)
                 total -= victim.size
                 victims.append((victim, reason))

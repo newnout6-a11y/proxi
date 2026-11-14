@@ -23,6 +23,14 @@ from test_review_fixes_pr19 import END, THINKING, response, signature, text
 from test_web_search import OTHER, PAGE, FakeSearch
 from web_search import SearchError
 
+
+def result_text(value):
+    """The text of a tool result as upstream got it: a string, or blocks of text (the newest result carries the cache hint
+    on a block of its own, see native_history.cache_messages)."""
+    if isinstance(value, str):
+        return value
+    return "".join(block.get("text", "") for block in value if isinstance(block, dict))
+
 QUESTION = [{"role": "user", "content": "Perform a web search for the query: printing press"}]
 SERVER = {"type": "web_search_20250305", "name": "web_search"}
 SEARCH_SYSTEM = "You are an assistant for performing a web search tool use"
@@ -147,7 +155,8 @@ def test_the_continuation_is_native_the_signature_the_call_and_the_result_and_a_
     assert assistant["role"] == "assistant" and assistant["content"][0] == {"type": "thinking", "thinking": "", "signature": "sig-one"}
     assert [b["type"] for b in assistant["content"]] == ["thinking", "text", "tool_call"]
     assert assistant["content"][2]["toolName"] == "web_search" and assistant["content"][2]["toolInput"] == {"query": "q"}
-    assert result["role"] == "tool" and result["content"] == {"toolCallId": "s1", "toolResult": PRESS}
+    assert result["role"] == "tool" and result["content"]["toolCallId"] == "s1"
+    assert result_text(result["content"]["toolResult"]) == PRESS
     assert second["rit"] == direct.make_rit(second["messages"], second["tools"])
     assert second["reasoningEffort"] == first["reasoningEffort"]
 
@@ -175,7 +184,7 @@ def test_calls_past_max_uses_get_the_error_result_and_the_model_goes_on(tmp_path
     assert found[0]["content"][0]["type"] == "web_search_result"
     assert found[1]["content"] == {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}
     assert final["usage"]["server_tool_use"] == {"web_search_requests": 1}  # a refused search is not counted
-    assert sent[2]["messages"][-1]["content"]["toolResult"] == "web_search error: max_uses_exceeded"
+    assert result_text(sent[2]["messages"][-1]["content"]["toolResult"]) == "web_search error: max_uses_exceeded"
     assert final["content"][-1]["text"].startswith("The printing press")
 
 
@@ -235,7 +244,7 @@ def test_results_outside_the_allowed_domains_never_reach_the_model(tmp_path, mon
     _, sent, _ = drive(tmp_path, monkeypatch, [asks("q"), answers()], search, [
         lambda _: made.append(search_request(search, tool={"allowed_domains": ["wikipedia.org"]})) or made[-1]])
     assert search.calls[0][1]["allowed_domains"] == ["wikipedia.org"]
-    shown = sent[1]["messages"][-1]["content"]["toolResult"]
+    shown = result_text(sent[1]["messages"][-1]["content"]["toolResult"])
     assert PAGE.url in shown and OTHER.url not in shown
 
 
@@ -243,7 +252,7 @@ def test_a_blocked_domain_is_dropped_too(tmp_path, monkeypatch):
     search, made = FakeSearch(results=[PAGE, OTHER]), []
     _, sent, _ = drive(tmp_path, monkeypatch, [asks("q"), answers()], search, [
         lambda _: made.append(search_request(search, tool={"blocked_domains": ["wikipedia.org"]})) or made[-1]])
-    shown = sent[1]["messages"][-1]["content"]["toolResult"]
+    shown = result_text(sent[1]["messages"][-1]["content"]["toolResult"])
     assert OTHER.url in shown and PAGE.url not in shown
 
 

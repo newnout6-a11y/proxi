@@ -68,8 +68,9 @@ def test_the_second_parse_does_not_download_the_images_again(prompt_relay, tmp_p
         assert status == 200, label
         counts[label] = len(downloads["urls"])
         assert sent_images(relay) >= 1, label  # the picture reaches Retool in every case
-    # the legacy parse asks three times (it renders the text, then builds the native messages); a rewrite adds none
-    assert counts["legacy"] == counts["without body edits"] == counts["with body edits"] > 0
+    # one download per request: the parse renders the text, fingerprints the messages and builds the native ones from
+    # the same bytes, and a rewrite adds none
+    assert counts["legacy"] == counts["without body edits"] == counts["with body edits"] == 1
     assert head_of(relay.posts[-1]).startswith("RULES")  # the last request did go through pass 2
     assert "drop" not in json.dumps(relay.posts[-1]["messages"])
 
@@ -86,26 +87,23 @@ def test_a_link_that_stops_answering_after_the_first_parse_does_not_cost_the_req
     assert head_of(relay.posts[-1]).startswith("RULES") and PNG_B64 in json.dumps(relay.posts[-1])
 
 
-def test_without_a_scope_every_parse_downloads_as_it_always_did(downloads):
+def test_a_parse_without_a_scope_downloads_once_and_the_next_parse_downloads_again(downloads):
     data = copy.deepcopy(BODY)
     validate.parse_chat(data, {"strict_models": True, "model": "claude-opus-5-5"})
-    first = len(downloads["urls"])
+    assert len(downloads["urls"]) == 1  # the parse is a scope of its own
     validate.parse_chat(data, {"strict_models": True, "model": "claude-opus-5-5"})
-    assert first > 0 and len(downloads["urls"]) == 2 * first
+    assert len(downloads["urls"]) == 2
 
 
-def test_a_scope_records_first_and_serves_only_after_reuse_is_switched_on(downloads):
+def test_a_scope_serves_every_parse_made_inside_it_from_the_first_download(downloads):
     cfg = {"strict_models": True, "model": "claude-opus-5-5"}
     fetches = validate.ImageFetches()
     with fetches:
         validate.parse_chat(copy.deepcopy(BODY), cfg)
-        first = len(downloads["urls"])
-        validate.parse_chat(copy.deepcopy(BODY), cfg)  # recording only: the same parse downloads again
-        assert len(downloads["urls"]) == 2 * first
+        assert len(downloads["urls"]) == 1
+        parsed = validate.parse_chat(copy.deepcopy(BODY), cfg)  # a second parse of the request: no download
+        assert len(downloads["urls"]) == 1
         assert set(fetches.found) == {URL}
-        fetches.reuse = True
-        parsed = validate.parse_chat(copy.deepcopy(BODY), cfg)
-        assert len(downloads["urls"]) == 2 * first
     assert parsed.native_messages[-1]["content"][-1] == {"type": "image", "imageData": PNG_B64, "mimeType": "image/png"}
     validate.parse_chat(copy.deepcopy(BODY), cfg)  # the scope is over: downloads again
-    assert len(downloads["urls"]) == 3 * first
+    assert len(downloads["urls"]) == 2

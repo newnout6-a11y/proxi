@@ -406,12 +406,21 @@ def test_the_header_of_a_plugin_names_the_task_when_the_wording_is_unknown(promp
     assert relay.events(mark, "turn.begin")[-1]["data"]["client_task"] == "compaction"
 
 
-def test_each_dialog_keeps_its_own_effort(prompt_relay):
+def test_each_dialog_keeps_its_own_effort_unless_that_would_lower_the_clients(prompt_relay):
+    """Owner's rule, 2026-11-06: the relay never lowers an effort to save cost. A dialog on max is compacted on max for a
+    client that asks for high (a higher effort is no lowering); a dialog on low is not: the client asked for more, and the
+    compaction runs on high, with the history written again. It used to run on low, the lowest the client never asked for."""
     relay = prompt_relay()
     one, other = Chat(relay, effort="max"), Chat(relay, effort="low", headers={**OPENCODE, "x-session-affinity": "ses_other"})
     one.work(), other.work()
     assert one.compact(effort="high")["reasoningEffort"] == "max"
-    assert other.compact(effort="high")["reasoningEffort"] == "low"
+    mark = relay.mark()
+    summary = other.compact(effort="high")
+    assert summary["reasoningEffort"] == "high"
+    assert [event["data"]["reason"] for event in relay.events(mark, "cache.compaction_restart")] == ["lower"]
+    assert count(relay, mark, "cache.effort_kept") == 0
+    begin = relay.events(mark, "turn.begin")[-1]["data"]
+    assert (begin["requested_effort"], begin["effective_effort"], begin["effort_source"]) == ("high", "high", "client")
 
 
 def test_a_model_the_dialog_was_not_on_has_nothing_to_continue(prompt_relay):
@@ -502,6 +511,32 @@ def test_the_dialog_effort_is_asked_only_where_it_makes_the_history_resume(tmp_p
     assert idle.ask(None) == ("max", None)
     idle.runner.cfg["reasoning_effort"] = "max"
     assert idle.ask(None) == (None, None)
+
+
+def test_a_dialog_on_a_lower_effort_is_never_taken_for_a_compaction_that_asks_for_more(tmp_path, monkeypatch):
+    idle = Idle(tmp_path, monkeypatch, effort="low")
+    for asked in ("medium", "high", "max"):
+        assert idle.ask(asked) == (None, {"reason": "lower"}), asked
+    assert idle.ask("low") == (None, None)  # asking for it resumes the history as it is
+    # no effort of the request: what it would run on is the configured default, and the same rule applies to that
+    idle.runner.cfg["reasoning_effort"] = "high"
+    assert idle.ask(None) == (None, {"reason": "lower"})
+    idle.runner.cfg["reasoning_effort"] = "low"
+    assert idle.ask(None) == (None, None)
+
+
+def test_a_dialog_on_a_higher_effort_is_still_taken(tmp_path, monkeypatch):
+    idle = Idle(tmp_path, monkeypatch, effort="high")
+    assert idle.ask("low") == ("high", None) and idle.ask("medium") == ("high", None)
+    assert idle.ask("high") == (None, None)
+    assert idle.ask("max") == (None, {"reason": "lower"})
+
+
+def test_the_levels_are_ranked_by_the_catalog_order():
+    import orchestrator
+    assert orchestrator._below("low", "high") and orchestrator._below("none", "minimal") and orchestrator._below("high", "xhigh")
+    assert not orchestrator._below("high", "high") and not orchestrator._below("max", "low")
+    assert not orchestrator._below("auto", "high") and not orchestrator._below("low", None) and not orchestrator._below(None, "low")
 
 
 REASONS = {

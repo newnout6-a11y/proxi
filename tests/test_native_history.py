@@ -106,7 +106,8 @@ def test_two_tool_round_trips_preserve_signatures_raw_arguments_and_prefix(tmp_p
         # Client tools receive a coerced number; upstream gets its original block.
         assert strip_cache(assistant["content"][1])["toolInput"] == {"path": "a", "limit": "3"}
         assert following["messages"][-1]["role"] == "tool"
-        assert following["messages"][-1]["content"]["toolResult"] == "file contents"
+        # a result carries the newest hint where it arrives (item 16): one text block, hinted
+        assert following["messages"][-1]["content"]["toolResult"] == [{"type": "text", "text": "file contents", "cache": True}]
         assert following["rit"] == direct.make_rit(following["messages"], following["tools"])
         assert following["reasoningEffort"] == previous["reasoningEffort"]
         assert following["openAICacheKey"] == previous["openAICacheKey"]

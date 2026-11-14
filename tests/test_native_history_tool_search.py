@@ -72,7 +72,8 @@ def test_after_tool_search_the_conversation_keeps_its_turns_and_then_its_signatu
     assert len(sent) == 3
     cold, resumed = sent[1]["messages"], sent[2]["messages"]
     assert [m["role"] for m in cold][-2:] == ["assistant", "tool"]
-    assert cold[-1]["content"]["toolResult"] == [{"type": "text", "text": "Tool loaded: WebFetch"}]
+    # the newest hint stands on the result (item 16): one text block, hinted
+    assert cold[-1]["content"]["toolResult"] == [{"type": "text", "text": "Tool loaded: WebFetch", "cache": True}]
     assert "sig-one" not in json.dumps(cold)  # a signature never crosses a changed prefix
     thinking = [b["signature"] for m in resumed if isinstance(m.get("content"), list) for b in m["content"]
                 if isinstance(b, dict) and b.get("type") == "thinking"]

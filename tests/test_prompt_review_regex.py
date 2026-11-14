@@ -310,8 +310,9 @@ def test_the_defaults_are_read_when_a_deadline_is_made(monkeypatch):
     assert pp.REGEX_TIMEOUT == 0.123 and 0 < pp.Deadline().per_operation
 
 
-def test_the_real_limits_are_a_fraction_of_a_second_and_a_few_seconds_at_most():
-    assert 0 < pp.REGEX_TIMEOUT <= 0.5 and pp.REGEX_TIMEOUT <= pp.REGEX_BUDGET <= 2.0
+def test_the_real_limits_are_work_first_and_time_only_a_last_stop_that_a_busy_machine_does_not_reach():
+    # G4.1: 0.25 s per operation and 1 s per call were what a loaded relay reached, so that edits were skipped at random
+    assert pp.REGEX_WORK >= 10 ** 8 and 1.0 <= pp.REGEX_TIMEOUT <= pp.REGEX_BUDGET <= 10.0
 
 
 def test_one_snapshot_serves_many_threads_at_once(tmp_path):

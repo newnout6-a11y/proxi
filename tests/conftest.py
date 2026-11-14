@@ -38,6 +38,16 @@ def pinned_calendar(monkeypatch):
     monkeypatch.setattr(models, "_today", lambda: datetime.date(2026, 11, 5))
 
 
+@pytest.fixture(autouse=True)
+def upstream_shapes_unknown(monkeypatch):
+    """What upstream refuses is learned once per run (direct._TOOL_RESULT_HINTS: a cache hint on a tool result;
+    direct._PRUNING: a history that lost a call): a test starts from not having learned it, whatever an earlier one
+    made upstream refuse."""
+    import direct
+    monkeypatch.setattr(direct, "_TOOL_RESULT_HINTS", {"refused": False})
+    monkeypatch.setattr(direct, "_PRUNING", {"refused": False})
+
+
 class FakeCredits:
     def __init__(self):
         self.used = []

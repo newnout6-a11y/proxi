@@ -17,6 +17,7 @@ import json
 import math
 import operator
 import os
+import re
 import threading
 import time
 
@@ -25,9 +26,17 @@ from redact import redact
 
 LEVELS = ("debug", "info", "success", "warn", "error")
 # A raw event is ~465 bytes of JSONL and ~0.8 KiB of memory. 20000 of them are about
-# one rotated file generation (10 MiB), ~16 MiB of RAM and ~40 minutes at 500 events/min.
+# 9 MiB of file, ~16 MiB of RAM and ~40 minutes at 500 events/min.
 CAPACITY = 20000
-MAX_FILE_BYTES = 10 * 1024 * 1024
+# The live file is rotated at this size and this many rotated files (journal.jsonl.1 is the newest) are kept: at most
+# (KEEP_FILES + 1) * MAX_FILE_BYTES on disk. Under four agents' load a file of 10 MiB lasted 13-15 minutes and one kept
+# generation made the evidence of a test run last about half an hour; config.json's journal_max_file_bytes and
+# journal_keep_files override both.
+MAX_FILE_BYTES = 50 * 1024 * 1024
+KEEP_FILES = 5
+# What a restart reads back of the files, newest first: the ring buffer takes the last CAPACITY events and the
+# metrics window the last day, so reading all the kept files would only slow the start down.
+RESTORE_BYTES = 20 * 1024 * 1024
 _TOP_LEVEL = ("turn_id", "request_id", "conversation")
 # Rollups: numeric counters per FINE seconds (the smallest chart bucket), distributions per
 # COARSE seconds (window-wide figures only), both kept for the longest window plus a margin.
@@ -53,6 +62,36 @@ def tag(value):
     if not value:
         return None
     return hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _rotated(path):
+    """(number, file) of every rotated file of the journal at `path`, newest first: journal.jsonl.1, .2, ..."""
+    folder, name = os.path.split(path)
+    try:
+        names = os.listdir(folder or ".")
+    except OSError:
+        return []
+    found = []
+    for entry in names:
+        number = entry[len(name) + 1:] if entry.startswith(name + ".") else ""
+        if re.fullmatch(r"[1-9][0-9]{0,5}", number):
+            found.append((int(number), os.path.join(folder, entry)))
+    return sorted(found)
+
+
+def _tail_lines(source, limit):
+    """(the last lines of a file within `limit` bytes, how many bytes they take); a first line the limit cuts is left out."""
+    try:
+        with open(source, "rb") as handle:
+            start = max(0, handle.seek(0, os.SEEK_END) - limit)
+            handle.seek(max(0, start - 1))
+            data = handle.read()
+    except OSError:
+        return [], 0
+    if start:
+        # The byte before the start tells whether the first line begins there or is the end of one that was cut.
+        data = data[1:] if data[:1] == b"\n" else data.partition(b"\n")[2]
+    return data.decode("utf-8", "replace").splitlines(), len(data)
 
 
 def _number(value):
@@ -479,15 +518,16 @@ class Journal:
             self._load_tail(path)
 
     def _load_tail(self, path):
-        # The rotated generation (.1) is read too: without it every rotation
-        # would silently drop its events from the restored history.
-        lines = collections.deque()
-        for source in (path + ".1", path):
-            try:
-                with open(source, encoding="utf-8") as handle:
-                    lines.extend(handle)
-            except OSError:
-                continue
+        # The rotated files are read too, newest first until RESTORE_BYTES: without them every rotation would
+        # silently drop its events from the restored history.
+        parts, budget = [], RESTORE_BYTES
+        for source in [path] + [old for _, old in _rotated(path)]:
+            if budget <= 0:
+                break
+            found, used = _tail_lines(source, budget)
+            parts.append(found)
+            budget -= used
+        lines = [line for found in reversed(parts) for line in found]
         restored = []
         for line in lines:
             try:
@@ -532,12 +572,12 @@ class Journal:
                     open(self._path, "w", encoding="utf-8").close()
                 except OSError:
                     pass
-                try:
-                    # _load_tail restores .1 too: a cleared journal must not
-                    # come back after a restart.
-                    os.remove(self._path + ".1")
-                except OSError:
-                    pass
+                # _load_tail restores the rotated files too: a cleared journal must not come back after a restart.
+                for _, old in _rotated(self._path):
+                    try:
+                        os.remove(old)
+                    except OSError:
+                        pass
 
     # -- redaction ---------------------------------------------------------
     def _secrets(self):
@@ -603,6 +643,30 @@ class Journal:
         except Exception:  # noqa: BLE001 - the journal is strictly best effort
             return None
 
+    def _limits(self):
+        """(bytes at which the live file is rotated, rotated files kept): config.json's settings, else the defaults."""
+        cfg = self._cfg or {}
+        size, keep = cfg.get("journal_max_file_bytes"), cfg.get("journal_keep_files")
+        return (size if type(size) is int and size > 0 else MAX_FILE_BYTES,
+                keep if type(keep) is int and keep >= 0 else KEEP_FILES)
+
+    def _rotate(self, keep):
+        """The live file becomes journal.jsonl.1, and every rotated file takes the next number; what would pass `keep` goes.
+
+        The caller holds the file lock. The oldest file is moved (or removed) first, so a rotation that stops halfway
+        (a file another program holds open) has lost nothing: the next one carries on from the numbers it finds."""
+        self._file.close()
+        self._file = None
+        for index, old in reversed(_rotated(self._path)):
+            if index >= keep:
+                os.remove(old)
+            else:
+                os.replace(old, "%s.%d" % (self._path, index + 1))
+        if keep:
+            os.replace(self._path, self._path + ".1")
+        else:
+            open(self._path, "w", encoding="utf-8").close()
+
     def _write(self, event):
         if not self._path:
             return
@@ -613,10 +677,9 @@ class Journal:
                     self._file = open(self._path, "a", encoding="utf-8")
                 self._file.write(line)
                 self._file.flush()
-                if self._file.tell() > MAX_FILE_BYTES and time.time() >= self._rotate_retry_at:
-                    self._file.close()
-                    self._file = None
-                    os.replace(self._path, self._path + ".1")
+                size, keep = self._limits()
+                if self._file.tell() > size and time.time() >= self._rotate_retry_at:
+                    self._rotate(keep)
             except OSError as exc:
                 try:
                     self._file.close()

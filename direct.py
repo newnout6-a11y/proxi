@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import apierr
@@ -31,6 +32,7 @@ import journal
 import client_context
 import console_log
 import native_history
+import models as model_catalog
 from accounts import account_tag, idle_block
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
@@ -78,6 +80,55 @@ async def _pause(seconds, is_cancelled):
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku", 'gpt-4.1',
                 'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2'}
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
+# Whether upstream refused a body that carried a cache hint on the result of a tool; once it did, no body carries one for
+# the rest of the run (see _hints_tool_results and the retry in iter_events).
+_TOOL_RESULT_HINTS = {"refused": False}
+# Whether upstream refused a body whose branch had lost a call (native_history.deliverable) and answered the same request
+# without that branch; once it did, no reply is cut down that way for the rest of the run.
+_PRUNING = {"refused": False}
+
+
+def _provider_of(model):
+    """The provider the catalog gives this model, or None for a model it does not know."""
+    try:
+        return model_catalog.resolve(model, strict=True)[0].get("provider")
+    except apierr.ApiError:
+        return None
+
+
+def _anthropic_route(model):
+    """Whether Anthropic's API serves this model: the route with cache breakpoints and signed thinking blocks."""
+    return _provider_of(model) == "anthropic"
+
+
+def _live_thinking(model):
+    """Whether this model's reasoning text may reach the client while its attempt can still be retried.
+
+    Claude's thinking carries a signature that belongs to one history and must never be shown twice, so all of it waits
+    until the attempt has proved usable. The reasoning of the other routes is display text: shown at once, a retried
+    attempt costs the client a second pass of it and nothing else, while held back it leaves the client waiting for the
+    first word of the answer (a3, GLM: 9.1 s of silence and then the whole reasoning in one burst, upstream having sent
+    it continuously from 1.5 s to 10.6 s). A model the catalog does not know keeps the old behaviour."""
+    provider = _provider_of(model)
+    return provider is not None and provider != "anthropic"
+
+
+def _hints_tool_results(model):
+    """Whether the result of a tool may carry a cache hint in a request for this model.
+
+    Only the Anthropic route has breakpoints (the others cache by themselves), and only until upstream has refused a body
+    that carried one: the shape of that hint was never seen accepted, which is why it can switch itself off."""
+    return not _TOOL_RESULT_HINTS["refused"] and _anthropic_route(model)
+
+
+def _has_tool_result_hint(messages):
+    """Whether a tool result of these upstream messages carries a cache hint."""
+    for message in messages:
+        content = message.get("content")
+        result = content.get("toolResult") if isinstance(content, dict) and message.get("role") == "tool" else None
+        if isinstance(result, list) and any(isinstance(block, dict) and block.get("cache") for block in result):
+            return True
+    return False
 
 
 def _owning_socket(resp):
@@ -244,6 +295,175 @@ def make_rit(messages, tools=None):
 _KNOWN_TYPES = ("string", "number", "integer", "boolean", "null", "array", "object")
 
 
+def _pointer(root, ref):
+    """What a local reference (#/$defs/Name) points at inside `root`; None for one that points elsewhere or nowhere."""
+    if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
+        return None
+    node = root
+    for part in ref.split("/")[1:]:
+        part = urllib.parse.unquote(part).replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node
+
+
+_LIMIT_KEYS = ("pattern", "format", "minLength", "maxLength", "minimum", "maximum", "exclusiveMinimum",
+               "exclusiveMaximum", "multipleOf", "minItems", "maxItems")
+
+
+def _merged(base, extra):
+    """Two schemas that both hold, as one: properties and required add up, an enum narrows, anything else `extra` decides.
+
+    A limit both of them set (two patterns, as Claude Code writes them in allOf) is kept beside the first, in an allOf
+    that only _limits reads, so that the model is told both."""
+    result = dict(base)
+    for key, value in extra.items():
+        if key == "properties" and isinstance(value, dict) and isinstance(result.get("properties"), dict):
+            result["properties"] = {**result["properties"],
+                                    **{name: {"allOf": [result["properties"][name], sub]} if name in result["properties"]
+                                       else sub for name, sub in value.items()}}
+        elif key == "required" and isinstance(value, list) and isinstance(result.get("required"), list):
+            result["required"] = list(dict.fromkeys([*result["required"], *value]))
+        elif key == "enum" and isinstance(value, list) and isinstance(result.get("enum"), list):
+            result["enum"] = [item for item in result["enum"] if item in value]
+        elif key == "allOf" and isinstance(value, list):
+            result["allOf"] = [*(result["allOf"] if isinstance(result.get("allOf"), list) else []), *value]
+        elif key in _LIMIT_KEYS and key in result and result[key] != value:
+            result["allOf"] = [*(result["allOf"] if isinstance(result.get("allOf"), list) else []), {key: value}]
+        else:
+            result[key] = value
+    return result
+
+
+def _deref(schema, root, trail=()):
+    """(the schema with its $ref followed and its allOf merged in, the references expanded to make it).
+
+    Pydantic, zod and the MCP SDKs describe a nested object once, under $defs, and point at it, and give such a field a
+    description with allOf. The Retool shape of those fields was a plain string, and the model wrote "Name: Ada, Age: 36"
+    where the client wanted an object (protocol test run of 2026-11-06; ultracode audit, C6). What a field says itself
+    (its description, its default) wins over what the referenced schema says. A reference that points outside the
+    schema is dropped, and one that points into itself is a plain object from the second step on, so a schema
+    that contains itself ends."""
+    if not isinstance(schema, dict):
+        return schema, trail
+    result, used = {}, trail
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref in trail:
+            result = {"type": "object"}
+        else:
+            found = _pointer(root, ref)
+            if isinstance(found, dict):
+                result, used = _deref(found, root, trail + (ref,))
+    for part in schema["allOf"] if isinstance(schema.get("allOf"), list) else ():
+        part, more = _deref(part, root, trail)
+        if isinstance(part, dict):
+            result = _merged(result, part)
+            used = used + tuple(item for item in more if item not in used)
+    return _merged(result, {key: value for key, value in schema.items() if key not in ("$ref", "allOf")}), used
+
+
+def _is_map(schema):
+    """Whether a schema (its $ref and allOf already followed) is a dictionary with keys of its own: additionalProperties as a
+    schema or true, patternProperties, or an object that names no properties at all. An object that must stay empty
+    (additionalProperties false) and one with properties of its own are not."""
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and properties:
+        return False
+    kind = schema.get("type")
+    kinds = kind if isinstance(kind, list) else [kind]
+    if not all(item in ("object", "null", None) for item in kinds):
+        return False
+    extra = schema.get("additionalProperties")
+    if schema.get("patternProperties") or isinstance(extra, dict) or extra is True:
+        return True
+    return "object" in kinds and extra is not False
+
+
+# What the model reads at the end of the description of a dictionary field that is declared as a string (see _param_schema),
+# and what marks such a field for the code that turns the string back into the dictionary (_marked).
+MAP_NOTE = "This is a map with any keys: pass it as one string that holds a JSON object, for example {\"name\": \"value\"} (or {} when empty)."
+
+
+def _marked(spec):
+    """Whether a Retool param node is a dictionary written as a string (MAP_NOTE ends its description).
+
+    A strict tool's field that may also be null is that string inside "X or null" (_with_null), whose outer node carries
+    the description: it is marked too."""
+    if not isinstance(spec, dict) or MAP_NOTE not in str(spec.get("description") or ""):
+        return False
+    if spec.get("type") == "anyOf":
+        branches = [branch for branch in spec.get("anyOf") or [] if isinstance(branch, dict) and branch.get("type") != "null"]
+        return len(branches) == 1 and branches[0].get("type") == "string"
+    return spec.get("type") == "string"
+
+
+def _has_marked(spec):
+    """Whether a Retool param node is, or holds somewhere inside it, a dictionary written as a string."""
+    if not isinstance(spec, dict):
+        return False
+    if _marked(spec):
+        return True
+    if isinstance(spec.get("properties"), dict) and any(_has_marked(sub) for sub in spec["properties"].values()):
+        return True
+    if _has_marked(spec.get("items")):
+        return True
+    return isinstance(spec.get("anyOf"), list) and any(_has_marked(sub) for sub in spec["anyOf"])
+
+
+def _refuse_constant(name):
+    raise ValueError("%s is not JSON" % name)
+
+
+def _decode_map(text):
+    """The dict a model wrote as a JSON string, an empty dict for an empty string, _JSON_NULL for the text "null"; None when
+    the text is no JSON object (the string then stays as it is, and the client's own check says what is wrong with it)."""
+    text = text.strip()
+    if not text:
+        return {}
+    if text == "null":
+        return _JSON_NULL
+    try:
+        value = json.loads(text, parse_constant=_refuse_constant)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _decode_in(value, spec):
+    """(value with every dictionary written as a string under `spec` turned into the dict, whether anything changed)."""
+    if not isinstance(spec, dict):
+        return value, False
+    if _marked(spec):
+        decoded = _decode_map(value) if isinstance(value, str) else None
+        return (value, False) if decoded is None else (None if decoded is _JSON_NULL else decoded, True)
+    kind = spec.get("type")
+    if kind == "object" and isinstance(value, dict) and isinstance(spec.get("properties"), dict):
+        found, result = False, dict(value)
+        for name, sub in spec["properties"].items():
+            if name in result:
+                result[name], changed = _decode_in(result[name], sub)
+                found = found or changed
+        return (result, True) if found else (value, False)
+    if kind == "array" and isinstance(value, list):
+        found, result = False, []
+        for item in value:
+            item, changed = _decode_in(item, spec.get("items"))
+            result.append(item)
+            found = found or changed
+        return (result, True) if found else (value, False)
+    if kind == "anyOf" and isinstance(spec.get("anyOf"), list):
+        for branch in spec["anyOf"]:
+            result, changed = _decode_in(value, branch)
+            if changed:
+                return result, True
+    return value, False
+
+
 def _allowed_values(schema):
     """The values a schema restricts a field to (enum, const, or an anyOf/oneOf of those); None when it does not."""
     if "const" in schema:
@@ -309,14 +529,14 @@ def _keeps_null(convert):
     covers the properties and items below it; a tool that is not strict keeps the plain type, as its optional field can
     be left out."""
     @functools.wraps(convert)
-    def wrapper(schema, required):
-        node = convert(schema, required)
+    def wrapper(schema, required, *args, **kwargs):
+        node = convert(schema, required, *args, **kwargs)
         return _with_null(schema, node) if _STRICT_TOOL.get() and isinstance(schema, dict) else node
     return wrapper
 
 
 @_keeps_null
-def _param_schema(schema, required):
+def _param_schema(schema, required, root=None, trail=(), maps=False):
     """Convert one JSON-Schema property to Retool's typed param shape.
 
     Retool accepts only literal/string/number/boolean/null/array/object/enum/anyOf (its enum holds strings), so an
@@ -326,14 +546,36 @@ def _param_schema(schema, required):
 
     "X or null" (anyOf/oneOf with a null branch, or a type list with "null") is how Pydantic and many MCP servers write
     an optional field: the field keeps the type of X. Before, it became a plain string, and the model sent "" for the
-    booleans and lists of tavily_search. Another union of types becomes Retool's anyOf.
+    booleans and lists of tavily_search. Another union of types becomes Retool's anyOf, a type list of several types
+    included: "number or string" used to keep the number alone, and the string "007" went to the client as 7.
+
+    `root` is the schema of the whole tool, where a $ref points (see _deref); `trail` the references being expanded.
+
+    `maps` (a strict tool) turns a dictionary with keys of its own (_is_map) into a string that holds a JSON object, and
+    says so in the description (MAP_NOTE): Retool's shape has no map, and a strict tool makes the provider write the
+    empty object for the one it has, so the model could never fill it (gpt-6.1-sol, real schemas of Claude Code, Exa and
+    Codex: `{}`, `null` or a run of blanks in 30 of 30 requests). A string cannot be emptied that way. The code that
+    reads the call gives the client the dict back (coerce_arguments, ArgStream). A tool that is not strict keeps the
+    empty object: asked for keys, the models wrote them into it in 147 of 171 requests on the real schemas (all three
+    dialects, streamed or not); the 24 that did not were a tool the model declined (gpt-6.1-sol, AskUserQuestion) and
+    fields that an older converter wrote as strings (allOf, C6), none an empty map.
     """
     if not isinstance(schema, dict):
         return {"type": "string", "required": bool(required)}
+    if root is None:
+        root = schema
+    schema, trail = _deref(schema, root, trail)
     kind = schema.get("type")
     if isinstance(kind, list):
         kinds = [item for item in kind if item in _KNOWN_TYPES]
-        kind = next((item for item in kinds if item != "null"), kinds[0] if kinds else None)
+        spread = list(dict.fromkeys("number" if item == "integer" else item for item in kinds if item != "null"))
+        if len(spread) > 1 and _allowed_values(schema) is None and not schema.get("anyOf") and not schema.get("oneOf"):
+            rest = {key: value for key, value in schema.items() if key not in ("type", "description")}
+            schema = {"anyOf": [{**rest, "type": item} for item in spread],
+                      **({"description": schema["description"]} if schema.get("description") else {})}
+            kind = None
+        else:
+            kind = next((item for item in kinds if item != "null"), kinds[0] if kinds else None)
     allowed = _allowed_values(schema)
     allowed = [value for value in allowed if value is not None] if allowed is not None else None
     options = schema.get("anyOf") if isinstance(schema.get("anyOf"), list) else schema.get("oneOf")
@@ -343,14 +585,18 @@ def _param_schema(schema, required):
             merged = dict(branches[0])
             if schema.get("description"):
                 merged["description"] = schema["description"]
-            return _param_schema(merged, required)
+            return _param_schema(merged, required, root, trail, maps)
         if branches:
-            node = {"type": "anyOf", "anyOf": [_param_schema(branch, False) for branch in branches]}
+            # A dictionary that is one kind among several stays the object it was: beside a plain string it would be a
+            # second string, and the code that reads the call could not tell which of the two the model meant.
+            node = {"type": "anyOf", "anyOf": [
+                _param_schema(branch, False, root, trail, maps and not _is_map(_deref(branch, root, trail)[0]))
+                for branch in branches]}
             if schema.get("description"):
                 node["description"] = str(schema["description"])
             node["required"] = bool(required)
             return node
-    note = None
+    note, as_text = None, False
     node = {"type": "string"}
     if allowed and all(isinstance(value, str) for value in allowed):
         node = {"type": "enum", "enum": list(dict.fromkeys(allowed))}
@@ -365,13 +611,16 @@ def _param_schema(schema, required):
             node = {"type": "string" if kind == "string" else
                     ("number" if kind in ("number", "integer") else kind)}
         elif kind == "array":
-            node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False)}
+            node = {"type": "array", "items": _param_schema(schema.get("items") or {}, False, root, trail, maps)}
+        elif maps and _is_map(schema):
+            as_text = True
         elif kind == "object" or schema.get("properties") or schema.get("additionalProperties"):
             properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
             node = {"type": "object", "properties": {
-                name: _param_schema(sub, name in _required_names(schema)) for name, sub in properties.items()}}
+                name: _param_schema(sub, name in _required_names(schema), root, trail, maps)
+                for name, sub in properties.items()}}
     description = " ".join(part for part in (str(schema["description"]) if schema.get("description") else "", note,
-                                             _limits(schema)) if part)
+                                             _limits(schema), MAP_NOTE if as_text else "") if part)
     if description:
         node["description"] = description
     node["required"] = bool(required)
@@ -434,13 +683,15 @@ def tools_to_retool(tools):
         if not isinstance(function, dict) or not function.get("name"):
             continue
         params = {}
-        schema = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
+        root = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
+        schema, trail = _deref(root, root)
         required = set(_required_names(schema))
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        maps = bool(function.get("strict"))  # see _param_schema
         token = _STRICT_TOOL.set(function.get("strict") is True)
         try:
             for name in sorted(properties.keys()):
-                params[name] = _param_schema(properties[name], name in required)
+                params[name] = _param_schema(properties[name], name in required, root, trail, maps)
         finally:
             _STRICT_TOOL.reset(token)
         converted.append({"name": function["name"],
@@ -469,6 +720,10 @@ def coerce_arguments(raw, params):
         if coerced is not None:
             data[key] = None if coerced is _JSON_NULL else coerced
             changed = True
+        elif _has_marked(spec):
+            # A dictionary the model wrote as a string inside this array or object.
+            data[key], inside = _decode_in(value, spec)
+            changed = changed or inside
     return json.dumps(data, ensure_ascii=False) if changed else text
 
 
@@ -489,6 +744,8 @@ def _coerced_kind(spec):
 
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
+    if _marked(spec):
+        return _decode_map(value)
     kind = _coerced_kind(spec)
     if value == "null" and kind in ("number", "boolean", "array", "object"):
         # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
@@ -509,15 +766,19 @@ def _coerce_value(value, spec):
 class ArgStream:
     """Stream tool-call JSON as it arrives while keeping coerce_arguments' repairs.
 
-    Only a top-level string value of a number/boolean parameter is held until it
-    closes, then emitted coerced. Everything else (long string bodies, nested
+    Only a top-level string value of a number/boolean parameter (or of a dictionary written as a string) is held
+    until it closes, then emitted coerced. Everything else (long string bodies, nested
     values) passes through at once, so the emitted text is always a prefix of
     the final arguments and clients can render the call while it is generated.
     Anything unexpected switches to verbatim pass-through.
+
+    A tool with a dictionary written as a string inside an array or object cannot be decoded in passing: all of its
+    arguments are held until the call ends and are then given as coerce_arguments makes them.
     """
 
     def __init__(self, params):
         self.params = params or {}
+        self.buffer = [] if any(_has_marked(spec) and not _marked(spec) for spec in self.params.values()) else None
         self.state = "pre"
         self.depth = 0
         self.in_string = False
@@ -531,9 +792,13 @@ class ArgStream:
         except ValueError:
             return False
         spec = self.params.get(name)
-        return isinstance(spec, dict) and _coerced_kind(spec) in ("number", "boolean", "array", "object")
+        return isinstance(spec, dict) and (_coerced_kind(spec) in ("number", "boolean", "array", "object")
+                                           or _marked(spec))
 
     def feed(self, chunk):
+        if self.buffer is not None:
+            self.buffer.append(chunk or "")
+            return ""
         out = []
         for char in chunk or "":
             state = self.state
@@ -559,7 +824,8 @@ class ArgStream:
                     except ValueError:
                         value = None
                     coerced = _coerce_value(value, self.params.get(self.key_name)) if isinstance(value, str) else None
-                    out.append(raw if coerced is None else "null" if coerced is _JSON_NULL else json.dumps(coerced))
+                    out.append(raw if coerced is None else "null" if coerced is _JSON_NULL
+                               else json.dumps(coerced, ensure_ascii=False))
                     self.state = "after"
             elif state == "keystr":
                 out.append(char)
@@ -632,6 +898,9 @@ class ArgStream:
 
     def finish(self):
         """Flush a value left open by a truncated stream verbatim."""
+        if self.buffer is not None:
+            text, self.buffer = "".join(self.buffer), None
+            return coerce_arguments(text, self.params) if text else ""
         if self.held is not None:
             raw, self.held = "".join(self.held), None
             return raw
@@ -720,12 +989,16 @@ def _forced_alone(tools, tool_choice):
     return (kept, "required") if kept else (tools, tool_choice)
 
 
-def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
+def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None,
+               mark_tail=True):
     """Assemble the request body.
 
     The stable head becomes a cached system block and the history is sent as one
     message per chunk, preserving prior turn endpoints as cache breakpoints so
     intermediate multi-tool turns do not discard prefix caches.
+
+    mark_tail=False puts no hint on the last chunk: the request of a client's compaction ends in an instruction that
+    nobody reads again, and a hint there only makes the provider write it at the price of a write.
     """
     messages = []
     tools, tool_choice = _forced_alone(tools, tool_choice)
@@ -776,6 +1049,8 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             # An image-only tail cannot carry cache: selecting its index silently
             # lost the recent history breakpoint and re-billed the whole prefix.
             cacheable_indices = [i for i, part in enumerate(history) if _has_cacheable_text(part)]
+            if not mark_tail and cacheable_indices and cacheable_indices[-1] == len(history) - 1:
+                cacheable_indices.pop()
             cacheable = set(cacheable_indices)
             chosen = {cacheable_indices[-1]} if cacheable_indices else set()
             previous = [i for i in session_ends if i in cacheable]
@@ -813,9 +1088,14 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             should_cache = index in cache_indices
             if isinstance(part, list):
                 blocks = [dict(b) if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in part]
-                if should_cache:
+                for block in blocks:
+                    sep = block.pop("sep", None)  # the newline that joined the blocks of one client message (validate._marked_text_blocks)
+                    if sep:
+                        block["text"] += sep
+                if should_cache and not any(b.get("cache") for b in blocks):
                     # Only text blocks carry the cache flag; an image-only chunk has no
                     # cacheable text and upstream may reject the unknown placement.
+                    # A message whose client marked a block keeps that breakpoint instead.
                     target = next((b for b in reversed(blocks) if b.get("type") == "text"), None)
                     if target is not None:
                         target["cache"] = True
@@ -951,6 +1231,30 @@ def _error_from_event(event):
     return apierr.upstream_error(text)
 
 
+KEEPWARM_NUDGE = "Reply with the single word OK and nothing else. Do not call any tool."
+
+
+def ping_body(body):
+    """The request a keep-alive sends: the last body, then one more user message that asks for a one-word answer.
+
+    A ping used to send the last body again, and Retool's Claude route ignores maxCompletionTokens, so the model wrote
+    the whole reply again: 1,041 pings of one load cost 467 credits where 194 were expected, up to 14.6k output tokens
+    for one (journal of 2026-11-06). An output token costs 50 to 100 times a token read from the cache. The earlier
+    messages keep their cache hints, so the ping still reads the same prefix; the new message carries none, because it
+    is not worth a cache entry and the request has only a few breakpoints to spare. `rit` is the hint of the new list.
+    Measured through the relay (Sonnet 5.5, 13.8k cached tokens): the same body again 715 output tokens and 0.198
+    credits, this body 4 output tokens and 0.057, both reading all 13,752 tokens; Opus 5.5 on high 1505 against 50
+    output tokens, on max about 150-370 (it thinks a little even about this); after a tool result, with tools declared,
+    the model answers OK and calls none. The model and the effort stay the turn's own: the relay does not lower an
+    effort or change a model to make a request cheaper, a ping included."""
+    messages = [*(body.get("messages") or []), {"role": "user", "content": [{"type": "text", "text": KEEPWARM_NUDGE}]}]
+    payload = dict(body)
+    payload["messages"] = messages
+    payload["rit"] = make_rit(messages, payload.get("tools"))
+    payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
+    return payload
+
+
 def _without_inf(value):
     if isinstance(value, dict):
         return {key: _without_inf(item) for key, item in value.items()}
@@ -976,8 +1280,7 @@ def _ping(session, body):
 
     Returns the credits Retool actually billed for the ping (from the usage
     metadata event), or None when the stream ended without reporting them."""
-    payload = dict(body)
-    payload["maxCompletionTokens"] = MIN_OUTPUT_TOKENS
+    payload = ping_body(body)
     # Effort can be part of the provider cache scope. Preserve the exact request
     # settings rather than replacing max with low during a cache refresh.
     headers = session.backend.headers()
@@ -1105,6 +1408,17 @@ def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen):
     answer; every other class is a paid attempt that gave the client nothing."""
     return ("cancelled" if cancelled else "error" if failed else "truncated" if not ended else
             "content" if usable else "thinking_only" if thinking_seen else "empty")
+
+
+def _hit_the_cap(body, flags):
+    """True when the attempt ended on exactly the output cap its request carried and holds no whole tool call.
+
+    GPT and GLM keep the cap and report the tokens they wrote: 60 of 60, 150 of 150, 300 of 300 and 400 of 400 in probes
+    through the relay (2026-11-06). Claude's route ignores it (the same caps of 16, 64 and 300 gave 750 to 980 tokens), so
+    its replies never end on the cap, and a reply that happens to is not taken for a cut here; a whole tool call in the
+    reply says that the end was no cut either."""
+    cap, written = body.get("maxCompletionTokens"), (flags.get("last_usage") or {}).get("outputTokens")
+    return (type(cap) is int and type(written) in (int, float) and written == cap and not flags.get("whole_calls"))
 
 
 def _rewrite_of(usage):
@@ -1412,7 +1726,10 @@ def scope_effort(scope):
 
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
-    """Yield normalised relay events from the direct NDJSON stream."""
+    """Yield normalised relay events from the direct NDJSON stream.
+
+    `session._native_callable_tools` names the tools whose calls reach the client (None: every call does); a call of
+    another tool is dropped by the caller and is not part of what the turn delivered, nor of the branch recorded for it."""
     # A route that refuses a forced choice is sent `auto` (forced_choice): the choice is neither sent nor part of the scope
     # of the branch, which the next request continues whatever it forces.
     required = forced_choice.requirement(model_provider.get("model"), tools, tool_choice)
@@ -1420,25 +1737,52 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         tool_choice = "auto"
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
+    # The summary of a client's compaction is a side request: the client replaces its history by that summary and
+    # never continues this one (see where the branches are recorded below, and what keepwarm does after it).
+    side_request = client_context.current().get("client_task") == client_context.COMPACTION
+    # A hint on the result of a tool is new to upstream: `rebuild` makes the same messages without one, for the retry that
+    # a refusal of it gets (see below). It stays None unless a body carries such a hint.
+    hint_results = _hints_tool_results(model_provider.get("model"))
+    rebuild = None
+
+    def without_result_hints(source):
+        return lambda: native_history.cache_messages(source, cfg.get("direct_cache", True), tools,
+                                                     mark_tail=not side_request)
+
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
     tools, tool_choice = _forced_alone(tools, tool_choice)
     parent, messages = (conversation_state.resume(session, history, scope, client)
                         if history is not None and client is not None else (None, None))
+    forked = False
+    if messages is None and side_request and history is not None and client is not None:
+        # A compaction that forks from the last request (History.resume_fork) continues the prefix that request cached.
+        parent, messages = history.resume_fork(scope, client)
+        forked = messages is not None
+    # A branch that lost a call is a shape upstream was never seen to accept: a refusal that blames the blocks of the
+    # history sends the same request again from the client's own messages (below).
+    pruned_parent = bool(parent is not None and not forked and parent in getattr(history, "pruned", ()))
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
-        body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools)
+        body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools,
+                                                         mark_tail=not side_request, tool_results=hint_results)
+        if _has_tool_result_hint(body["messages"]):
+            rebuild = without_result_hints(messages)
         body["rit"] = make_rit(body["messages"], tools)
-        reminders = native_history.dropped(parent, client, messages)
+        # A fork replays none of the last reply: no block of the parent is in this body.
+        replayed = [] if forked else parent.assistant
+        reminders = 0 if forked else native_history.dropped(parent, client, messages)
         # A turn the client took back (an undo, an edit, a retry) continues the final answer of the turn before it.
-        rewound = parent is not history.branches[-1] and any(parent is p for p in getattr(history, "points", ()))
+        rewound = (not forked and parent is not history.branches[-1]
+                   and any(parent is p for p in getattr(history, "points", ())))
         journal.emit("native_history.resume", "Сохранённые assistant/thinking blocks возвращены upstream", "info",
-                     blocks=len(parent.assistant), messages=len(body["messages"]),
-                     signatures=sum(b["type"] == "thinking" for b in parent.assistant),
+                     blocks=len(replayed), messages=len(body["messages"]),
+                     signatures=sum(b["type"] == "thinking" for b in replayed), fork=forked,
                      **({"reminders_kept": reminders} if reminders else {}), **({"rewound": True} if rewound else {}))
         req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
-        console_log.write("[%s] [history] native continuation restored thinking=%d tool_calls=%d" % (
-            req_id, sum(b["type"] in ("thinking", "redacted_thinking") for b in parent.assistant),
-            sum(b["type"] == "tool_call" for b in parent.assistant)))
+        console_log.write("[%s] [history] native continuation %s thinking=%d tool_calls=%d" % (
+            req_id, "forked from the last request" if forked else "restored",
+            sum(b["type"] in ("thinking", "redacted_thinking") for b in replayed),
+            sum(b["type"] == "tool_call" for b in replayed)))
     else:
         if history is not None and history.branches and client is not None:
             # Never attach an old signature to a rebuilt/edited prefix.
@@ -1448,7 +1792,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                          "warn", reason="prefix_or_settings_mismatch",
                          restored=any(getattr(branch, "restored", False) for branch in history.branches),
                          why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
-        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
+        body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session,
+                          mark_tail=not side_request)
         cold = (native_history.unsigned_tool_transcript(client)
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
         if cold is not None:
@@ -1456,7 +1801,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             # account. Client-visible calls/results are still valid protocol.
             # Rebuild them without trusting any client-supplied thinking blocks.
             initial = body['messages'][:1] if head else []
-            body['messages'] = native_history.cache_messages(initial + cold, cfg.get('direct_cache', True), tools)
+            body['messages'] = native_history.cache_messages(initial + cold, cfg.get('direct_cache', True), tools,
+                                                             mark_tail=not side_request, tool_results=hint_results)
+            if _has_tool_result_hint(body['messages']):
+                rebuild = without_result_hints(initial + cold)
             body['rit'] = make_rit(body['messages'], tools)
             journal.emit('native_history.cold', 'История инструментов восстановлена без старых thinking-подписей',
                          'info', messages=len(cold), signatures=0)
@@ -1473,14 +1821,13 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     session._turn_seq = getattr(session, "_turn_seq", 0) + 1
     turn_seq = session._turn_seq
     session._last_request_at = time.time()
-    # The summary of a client's compaction is a side request: the client replaces its history by that summary and
-    # never continues this one (see where the branches are recorded below, and what keepwarm does after it).
-    side_request = identity.get("client_task") == client_context.COMPACTION
     rejected = False
     # A completed answer that asked for no tool is final: a subagent that gave one is done.
     asked_tool, ended = False, None
+    callable_names = getattr(session, "_native_callable_tools", None)
+    callable_names = None if callable_names is None else frozenset(callable_names)
     # What the turn delivered decides what it may become: only a usable answer is a keepwarm body.
-    wrote_text = thinking_seen = errored = False
+    wrote_text = thinking_seen = errored = began = False
     failure = None
     settled = False
 
@@ -1504,7 +1851,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         session._turn_final = ended == "stop" and not asked_tool and not getattr(session, "_cancelled", False)
         # The consumer may drop the generator right after an error event (a cut stream): that is not a cancel.
         stopped_early = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) and not errored
-        outcome = "truncated" if errored else attempt_outcome(
+        # A reply the cap or a cut cut short is no answer to keep warm, whatever it holds.
+        outcome = "truncated" if errored or ended == "length" else attempt_outcome(
             cancelled=bool(getattr(session, "_cancelled", False)) or ended == "cancelled" or stopped_early,
             failed=failure is not None, ended=ended is not None, usable=wrote_text or asked_tool,
             thinking_seen=thinking_seen)
@@ -1544,10 +1892,12 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 _ensure_keepwarm(session, cfg)
 
     def note(event):
-        nonlocal asked_tool, ended, wrote_text, thinking_seen, errored
+        nonlocal asked_tool, ended, wrote_text, thinking_seen, errored, began
+        # Every attempt announces itself with usage_start before upstream has said anything: not an answer.
+        began = began or event.get("type") != "usage_start"
         kind = event.get("type")
-        if kind == "tool_call" and not event.get("partial"):
-            asked_tool = True
+        if kind == "tool_call" and not event.get("partial") and not event.get("invalid"):
+            asked_tool = asked_tool or callable_names is None or event.get("name") in callable_names
         elif kind == "end":
             ended = event.get("reason")
         elif kind == "text":
@@ -1578,33 +1928,99 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                     note(event)
                     yield event
         except apierr.ApiError as error:
-            # Models absent from the App Builder list (legacy GPT-5, Haiku) live on
-            # the Assist list, which is the same route without the agent marker.
-            if (error.status != 400 or "metadata" not in body
-                    or "not available right now" not in (error.message or "").lower()):
-                raise
-            if len(_ASSIST_ONLY) > 200:
-                # Flush only self-learned names: wiping the proven seeds would make
-                # known assist models pay a 400 + retry cycle all over again.
-                _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
-            _ASSIST_ONLY.add(model_provider.get("model"))
-            print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
-            journal.emit("upstream.assist_retry", "╨Ь╨╛╨┤╨╡╨╗╤М ╤В╨╛╨╗╤М╨║╨╛ ╨▓ ╤Б╨┐╨╕╤Б╨║╨╡ Assist тАФ ╨┐╨╛╨▓╤В╨╛╤А ╨▒╨╡╨╖ ╨╝╨░╤А╨║╨╡╤А╨░", "warn",
-                         model=model_provider.get("model"))
-            body = {key: value for key, value in body.items() if key != "metadata"}
-            if body.get("openAICacheKey"):
-                session._turn_body = body
-            async with contextlib.aclosing(open_stream(body)) as stream:
-                async for event in stream:
-                    note(event)
-                    yield event
+            assist = (error.status == 400 and "metadata" in body
+                      and "not available right now" in (error.message or "").lower())
+            # What may be upstream's refusal of a hint on a tool result: a message that names the cache, or the route
+            # validator's own words, which name nothing ("Invalid request format", an empty body). One that names thinking,
+            # a signature or the blocks of the history is about the signed branch, whose own handling follows, and any
+            # other reason it names (a prompt too long, a tool schema, the content filter) is not the hint's.
+            said = (error.message or "").lower()
+            plausible = "cache" in said or said.strip() in ("", "{}") or "invalid request format" in said
+            about_branch = conversation_state.blocks_refused(error) and "cache" not in said
+            if pruned_parent and not began and not assist and about_branch and error.status in (400, 422):
+                # Upstream refused the history of a branch that had lost a call: forget those branches and ask again from
+                # what the client sent (no signatures, like any first request after a reset). If that is answered the
+                # shape was the cause, and replies are no longer cut down that way for the rest of the run.
+                history.forget_pruned()
+                upstream_status = getattr(error, "upstream_status", None) or error.status
+                answered = False
+                async with contextlib.aclosing(iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice,
+                                                           max_tokens, chunks)) as again:
+                    async for event in again:
+                        if not answered and event.get("type") != "usage_start":
+                            answered = True
+                            _PRUNING["refused"] = True
+                            journal.emit("native_history.prune_refused",
+                                         "Upstream отклонил историю без вызова, которого клиент не получил (HTTP %s): "
+                                         "запрос повторён с нуля, дальше ответы так не режутся" % upstream_status, "warn",
+                                         status=upstream_status, upstream_message=(error.message or "").replace("\n", " ")[:160],
+                                         model=model_provider.get("model"))
+                        yield event
+                return
+            if rebuild is not None and not began and not assist and plausible and not about_branch \
+                    and error.status in (400, 422):
+                # Upstream refused a body that carries a cache hint on the result of a tool, a shape that was never seen
+                # accepted: ask again without those hints, and once that is answered stop sending them (this run).
+                body = {**body, "messages": rebuild()}
+                body["rit"] = make_rit(body["messages"], tools)
+                rebuild = None
+                upstream_status = getattr(error, "upstream_status", None) or error.status
+                if body.get("openAICacheKey"):
+                    session._turn_body = body
+                answered = False
+                async with contextlib.aclosing(open_stream(body)) as stream:
+                    async for event in stream:
+                        if not answered and event.get("type") != "usage_start":
+                            answered = True
+                            _TOOL_RESULT_HINTS["refused"] = True
+                            journal.emit("upstream.tool_result_hint_refused",
+                                         "Upstream отклонил подсказку кэша на результате инструмента (HTTP %s): запрос "
+                                         "повторён без неё, дальше такие подсказки не ставятся" % upstream_status, "warn",
+                                         status=upstream_status, upstream_message=(error.message or "").replace("\n", " ")[:160],
+                                         model=model_provider.get("model"))
+                        note(event)
+                        yield event
+            else:
+                # Models absent from the App Builder list (legacy GPT-5, Haiku) live on
+                # the Assist list, which is the same route without the agent marker.
+                if not assist:
+                    raise
+                if len(_ASSIST_ONLY) > 200:
+                    # Flush only self-learned names: wiping the proven seeds would make
+                    # known assist models pay a 400 + retry cycle all over again.
+                    _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
+                _ASSIST_ONLY.add(model_provider.get("model"))
+                print("[assist] retry without agent marker: %s" % (error.message or "")[:80], flush=True)
+                journal.emit("upstream.assist_retry", "╨Ь╨╛╨┤╨╡╨╗╤М ╤В╨╛╨╗╤М╨║╨╛ ╨▓ ╤Б╨┐╨╕╤Б╨║╨╡ Assist тАФ ╨┐╨╛╨▓╤В╨╛╤А ╨▒╨╡╨╖ ╨╝╨░╤А╨║╨╡╤А╨░", "warn",
+                             model=model_provider.get("model"))
+                body = {key: value for key, value in body.items() if key != "metadata"}
+                if body.get("openAICacheKey"):
+                    session._turn_body = body
+                async with contextlib.aclosing(open_stream(body)) as stream:
+                    async for event in stream:
+                        note(event)
+                        yield event
         reply = getattr(session, "_direct_reply", None)
+        pruned = False
+        if (reply is not None and callable_names is not None and not _PRUNING["refused"]
+                and _anthropic_route(model_provider.get("model"))):
+            # Only on the Anthropic route, where a signature belongs to its thinking block alone: OpenAI wants a reasoning
+            # item followed by the item it was made with, so a call cannot be left out there.
+            kept = native_history.deliverable(reply, callable_names, param_types, coerce_arguments)
+            if kept is not reply:
+                journal.emit("native_history.pruned",
+                             "В ветку не записаны вызовы, которых клиент не получил: %s" % ", ".join(sorted(
+                                 {block["toolName"] for block in reply[0]
+                                  if block["type"] == "tool_call" and block["toolName"] not in callable_names})),
+                             "info", kept=kept is not None)
+                pruned = kept is not None
+            reply = kept
         # Recording a compaction's summary would put a branch nobody extends in place of the parent it resumed
         # (a nudged or repeated compaction, a background one beside the chat, or the chat itself after an abandoned
         # compaction would then start from nothing), so the dialog's branches stay as the chat left them.
         if client is not None and history is not None and reply is not None and not session._cancelled and not side_request:
             blocks, expected = reply
-            history.record(scope, client, body["messages"], blocks, expected, parent)
+            history.record(scope, client, body["messages"], blocks, expected, parent, pruned=pruned)
     except apierr.ApiError as error:
         if error.status in (400, 422) and parent is not None:
             # A branch read back from disk is not replayed again once upstream has refused its blocks: the next
@@ -1926,6 +2342,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     # Client service checks (Auto mode, titles) fail deterministically when empty:
     # re-sending the same body only pays for the same empty answer again.
     service_request = client_context.current().get("request_purpose") in client_context.SERVICE_KINDS
+    live_thinking = _live_thinking(body.get("model"))
     try:
         max_empty_retries = _int_setting(cfg, "upstream_empty_retries", 1)
         empty_retries = 0
@@ -1971,6 +2388,9 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         yield event
                     elif kind in _LIVE_EVENTS or not may_retry:
                         spoke = spoke or kind not in _LIVE_EVENTS
+                        yield event
+                    elif live_thinking and kind in ("thinking", "thinking_start"):
+                        # Reasoning text without a signature: the client may read it while the model is still at it.
                         yield event
                     else:
                         held.append(event)
@@ -2037,10 +2457,16 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 # An empty/no-telemetry attempt can still have been billed. Keep
                 # its unknown price visible when a later retry reports a cost.
                 yield {'type': 'usage', 'usage': {}}
-            if not usable and saw_end:
+            # Where the route keeps the cap, a reply that ends on exactly that many output tokens was cut by it (GPT and
+            # GLM, 5 of 5 probes; Claude's route ignores it and writes on). A whole call in the reply says the end was
+            # no cut. A reasoning model that spends a small cap on reasoning ends so, with nothing to show for it:
+            # asking again pays the same cap for the same nothing (two paid attempts, then a 502).
+            capped = _hit_the_cap(body, flags)
+            cut = bool(flags.get("cut_calls"))
+            if not usable and saw_end and not capped:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if (usable or not saw_end or service_request or not budget.remaining
-                    or empty_retries >= max_empty_retries):
+                    or empty_retries >= max_empty_retries or capped):
                 # This attempt is the final one: whatever it produced is the answer.
                 for pending in held:
                     yield pending
@@ -2064,13 +2490,23 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             yield {"type": "error", "error": budget.attach(apierr.upstream_error(
                 "upstream stream ended without end_of_stream; the response may be incomplete"))}
             return
+        # The reply is cut: by the cap, or inside a tool call. It is told as such (max_tokens, length, incomplete) and
+        # never recorded as a branch to continue, nor taken for a whole answer.
+        truncated = (capped or cut) and not is_cancelled()
         blocks = flags.get("assistant_blocks")
-        if usable and blocks and not is_cancelled():
+        if usable and blocks and not is_cancelled() and not truncated:
             session._direct_reply = (blocks, native_history.echo(blocks, param_types or {}, coerce_arguments))
-        elif usable and "assistant_blocks" in flags and blocks is None and not is_cancelled():
+        elif usable and "assistant_blocks" in flags and blocks is None and not is_cancelled() and not truncated:
             journal.emit("native_history.unavailable", "Ответ upstream нельзя сохранить для нативного продолжения",
                          "warn", reason="unsupported_or_incomplete_blocks")
-        yield {"type": "end", "reason": "stop"}
+        if truncated:
+            journal.emit("upstream.truncated", "Ответ upstream оборван: %s" % (
+                            "вызов инструмента не дописан" if cut else "потрачен весь лимит вывода"), "warn",
+                         model=body.get("model"), thread=journal.tag(getattr(session, "thread_id", None)),
+                         cap=body.get("maxCompletionTokens"), cut_calls=flags.get("cut_calls", 0),
+                         output_tokens=(flags.get("last_usage") or {}).get("outputTokens"),
+                         empty=not usable, effort=body.get("reasoningEffort"))
+        yield {"type": "end", "reason": "length" if truncated else "stop"}
     finally:
         session._active_direct_abort = None
 
@@ -2111,14 +2547,24 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         if call is None:
             return None
         streamed = call["out"] + call["stream"].finish()
-        raw = "".join(call["args"])
-        # The streamed text is already coerced; fall back for non-JSON or empty input.
+        event = {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": streamed}
         try:
             json.loads(streamed)
-            final = streamed
+            flags["whole_calls"] = flags.get("whole_calls", 0) + 1
         except ValueError:
-            final = coerce_arguments(raw, (param_types or {}).get(call["name"]))
-        return {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": final}
+            if "".join(call["args"]).strip():
+                # Arguments that are not JSON at the end: the output stopped inside the call (the cap, a cut). The
+                # text is what the client has seen so far and stays that, so that its deltas always add up: this was
+                # rebuilt from the raw arguments before, which differ from the streamed text wherever a number or a
+                # boolean had been written as a string, and the client got both one after the other (ultracode
+                # audit, C13). The event says the call is not whole and no adapter reports it as finished (C5).
+                event["invalid"] = True
+                flags["cut_calls"] = flags.get("cut_calls", 0) + 1
+            else:
+                # A call without arguments arrives as one empty partialInputs.
+                event["arguments"] = "{}"
+                flags["whole_calls"] = flags.get("whole_calls", 0) + 1
+        return event
     while True:
         if session._cancelled:
             yield {"type": "end", "reason": "cancelled"}

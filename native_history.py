@@ -1,8 +1,11 @@
 """Session-local signed assistant history, bound to the prefix that produced it."""
+import base64
 import copy
 from dataclasses import dataclass
 import json
 import math
+import urllib.parse
+import weakref
 
 import web_search
 INSTRUCTION_ROLES = ("system", "developer")
@@ -37,13 +40,67 @@ def reminder(text):
     return _REMINDER_OPEN + "\n" + text + "\n" + _REMINDER_CLOSE
 
 
+def _withheld(where):
+    """What a note says of a file whose content cannot be given to the model, so that the model neither asks for it again
+    nor goes looking for it.
+
+    The Retool route has no file block, so a PDF never reaches the model (11 of 11 rows in user content, 0 of 8 loops in
+    tool results, in every dialect: a4 F12, 2026-11-06). The model got a stub of about 200 characters, took it for data lost
+    on the way, called the tool that returned the file again (7 of 8 loops, when the history had been turned into a flat
+    transcript) or, when the request had no tools of its own, ran `Get-ChildItem -Recurse` and `dir /s` on the host through
+    the relay's own exec feature (60b91554, 6ed0b785). Asked through the relay with a Read tool and a Bash tool, Sonnet 5.5,
+    Opus 5.5 and GPT-6.1-sol all reached for pdftotext after the old stub (11 of 11 runs); after the wording for a file that
+    came inside the request all three answered in text (9 of 9), and after the wording for a document a tool of the client
+    could try, each tried one command and none read the file again (9 of 9). A file that came inside the request exists
+    nowhere else, so no tool can find it; one that a local Read returned may well be on disk, and a tool of the client may
+    then be tried once."""
+    base = "the content of this file cannot be read through this route and was not given to the model"
+    if where == "inline":
+        return (base + "; it came inside the request and is not on disk, so no tool can find it. Do not look for it: tell "
+                "the user that it could not be read, and ask for its text.")
+    if where == "elsewhere":
+        return base + ". Do not look for it: tell the user that it could not be read, and ask for its text."
+    return (base + ". Do not read it again with this tool. If the file is on disk and another tool can extract its text, use "
+            "that once; otherwise tell the user that it could not be read.")
+
+
+def _readable_file(block):
+    """Text for a Chat `file` part or a Responses `input_file` item: the decoded text of a text file, else a note that the
+    route cannot pass the file. Before, the part became the first 200 characters of its JSON and the conversation lost its
+    native history for good, like the Anthropic document blocks (see readable_block)."""
+    spec = block.get("file") if isinstance(block.get("file"), dict) else block
+    name = spec.get("filename")
+    title = " %s" % name if isinstance(name, str) and name else ""
+    data = spec.get("file_data")
+    if isinstance(data, str) and data.startswith("data:") and "," in data:
+        header, _, payload = data.partition(",")
+        mime = header[5:].split(";")[0] or "file"
+        if mime.startswith("text/") or mime in ("application/json", "application/xml"):
+            try:
+                text = (base64.b64decode("".join(payload.split()), validate=True) if ";base64" in header
+                        else urllib.parse.unquote_to_bytes(payload)).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                text = None
+            if text is not None:
+                return "[file%s, %s]\n%s" % (title, mime, text)
+        kilobytes = len(payload) * 3 // 4 // 1024 if ";base64" in header else len(payload) // 1024
+        return "[file%s, %s%s: %s]" % (title, mime, ", %d KB" % kilobytes if kilobytes else "", _withheld("inline"))
+    if isinstance(spec.get("file_url"), str):
+        return "[file%s at %s: %s]" % (title, spec["file_url"], _withheld("elsewhere"))
+    uploaded = " (uploaded id %s)" % spec["file_id"] if spec.get("file_id") else ""
+    return "[file%s%s: %s]" % (title, uploaded, _withheld("inline" if isinstance(data, str) else "elsewhere"))
+
+
 def readable_block(block):
     """Text for an Anthropic document or search result, which the Retool route has no block for; None for others.
 
     Claude Code's Read answers a PDF with a document block, and search tools answer with search_result blocks. The
     model got the first 200 characters of their JSON instead, and the conversation lost its native history for good
-    because the block could not be read natively."""
+    because the block could not be read natively. A Chat `file` part and a Responses `input_file` item are the same case
+    (_readable_file)."""
     kind = block.get("type") if isinstance(block, dict) else None
+    if kind in ("file", "input_file"):
+        return _readable_file(block)
     if kind == "search_result":
         texts = [part.get("text") for part in block.get("content") or []
                  if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
@@ -60,10 +117,11 @@ def readable_block(block):
                  if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
         return "\n".join(["[document%s]" % title] + texts)
     if source.get("type") == "url":
-        return "[document%s at %s: this route does not pass the file to the model]" % (title, source.get("url"))
+        return "[document%s at %s: %s]" % (title, source.get("url"), _withheld("elsewhere"))
     kilobytes = len(source.get("data") or "") * 3 // 4 // 1024 if source.get("type") == "base64" else 0
-    return "[document%s, %s%s: this route does not pass the file to the model]" % (
-        title, source.get("media_type") or source.get("type") or "file", ", %d KB" % kilobytes if kilobytes else "")
+    return "[document%s, %s%s: %s]" % (
+        title, source.get("media_type") or source.get("type") or "file", ", %d KB" % kilobytes if kilobytes else "",
+        _withheld("document"))
 
 
 def client_messages(messages, image_converter, *, lead=None):
@@ -369,6 +427,25 @@ def echo(blocks, param_types, coerce):
     return canonical_assistant(visible)
 
 
+def deliverable(reply, names, param_types, coerce):
+    """The reply `(blocks, echo)` as the client has it when only the calls of the tools `names` reached it, or None.
+
+    The relay passes on a call only when the client can run it: one of a tool that was not declared, or, under a named
+    choice, of another tool than the named one, is dropped (orchestrator, `tool.call_dropped`). The model made that call
+    all the same, so the reply kept as a branch had a call the client never echoes, and its next request could not
+    continue the branch: history reset and the prefix written again (a5, C4). The branch is the reply without the
+    dropped calls: its thinking blocks, which carry the signatures, stay as they are, and the message the client
+    echoes is the message the branch holds. None when nothing is left that the client received (no text and no call),
+    so that nothing is recorded."""
+    blocks, _ = reply
+    kept = [block for block in blocks if block["type"] != "tool_call" or block["toolName"] in names]
+    if len(kept) == len(blocks):
+        return reply
+    if not any(block["type"] in ("text", "tool_call") for block in kept):
+        return None
+    return kept, echo(kept, param_types, coerce)
+
+
 @dataclass(frozen=True, eq=False)
 class Snapshot:
     scope: str
@@ -395,11 +472,13 @@ class History:
     to the cache again (30 credits at 300k tokens) though the provider still held the prefix it had cached minutes
     before. Points give way to other branches when the live bound is reached.
 
-    `revision` counts the recorded snapshots: the stored copy of a conversation is rewritten when it moves."""
+    `revision` counts the recorded snapshots: the stored copy of a conversation is rewritten when it moves. `pruned`
+    holds the branches that were recorded without a call the model made (deliverable): a shape upstream may refuse."""
     def __init__(self):
         self.branches = []
         self.points = []
         self.revision = 0
+        self.pruned = weakref.WeakSet()
 
     def resume(self, scope, client, defaults=None):
         for snapshot in reversed(self.branches):
@@ -415,7 +494,25 @@ class History:
             return snapshot, snapshot.messages + [{"role": "assistant", "content": snapshot.assistant}] + tail
         return None, None
 
-    def record(self, scope, client, messages, blocks, expected, parent=None):
+    def resume_fork(self, scope, client):
+        """(snapshot, upstream messages) for a request that forks from a recorded one, else (None, None).
+
+        Claude Desktop's compaction sends the messages of its last request WITHOUT the reply to that request (the client
+        files a reply into the next turn it builds) and its instruction after them. resume() wants the echo of that
+        reply and never accepted this shape: the history started again, the whole prefix was written once more although
+        the provider still had it (a4, 2026-11-06: 485k tokens, 51.9 credits for one /compact; emulated at 130k tokens
+        6.61 credits and 9.2 s to the first token against 2.57 and 2.5 s). Here the client's history must be exactly the
+        history the snapshot started from, followed by user messages and nothing else; the upstream messages are the
+        snapshot's own input, the prefix its request cached, plus those. No reply of the snapshot is replayed, so no
+        signature is attached to anything it does not belong to. The caller records nothing for the fork."""
+        for snapshot in reversed(self.branches):
+            offset = len(snapshot.client)
+            if (scope == snapshot.scope and len(client) > offset and same_json(client[:offset], snapshot.client)
+                    and all(message.get("role") == "user" for message in client[offset:])):
+                return snapshot, snapshot.messages + client[offset:]
+        return None, None
+
+    def record(self, scope, client, messages, blocks, expected, parent=None, pruned=False):
         points = [p for p in getattr(self, "points", []) if p is not parent and any(p is s for s in self.branches)]
         if parent is not None and any(parent is s for s in self.branches) and _final_answer(parent):
             points.append(parent)
@@ -424,13 +521,22 @@ class History:
         while len(points) > REWIND_POINTS:
             oldest = points.pop(0)
             self.branches = [s for s in self.branches if s is not oldest]
-        self.branches.append(Snapshot(scope, copy.deepcopy(client), messages, blocks, expected))
+        snapshot = Snapshot(scope, copy.deepcopy(client), messages, blocks, expected)
+        self.branches.append(snapshot)
+        if pruned:
+            self.pruned.add(snapshot)
         while len(self.branches) > LIVE_BRANCHES:
             # Other branches (a fork, a subagent on the same key, the chat beside a compaction) outrank a rewind point.
             victim = next((s for s in self.branches[:-1] if any(s is p for p in points)), self.branches[0])
             self.branches = [s for s in self.branches if s is not victim]
             points = [p for p in points if p is not victim]
         self.points = points
+        self.revision += 1
+
+    def forget_pruned(self):
+        """Drop the branches that were recorded without a call; the next request starts that history again."""
+        self.branches = [s for s in self.branches if s not in self.pruned]
+        self.pruned.clear()
         self.revision += 1
 
     def mismatch(self, scope, client, defaults=None):
@@ -641,12 +747,57 @@ def _echo_difference(ours, theirs):
     return "text"
 
 
-def cache_messages(messages, enabled, tools):
-    """Move only cache hints; signed thinking and the model prefix stay unchanged."""
+class _PlainResult:
+    """A tool result that is plain text, as a place for a cache hint: it becomes a list of one text block when it gets one."""
+
+    def __init__(self, content):
+        self.content = content
+
+    def __setitem__(self, key, value):
+        self.content["toolResult"] = [{"type": "text", "text": self.content["toolResult"], key: value}]
+
+
+def _result_slot(content):
+    """(the place of a tool result that can carry a hint, whether it carried one), or (None, False).
+
+    A result that is a list keeps its hint on a text block: every hint it had is taken off, and the last text block takes
+    a new one. One that is plain text has none, and is turned into a list of one block only when it is given one."""
+    result = content.get("toolResult")
+    if isinstance(result, str):
+        return (_PlainResult(content), False) if result.strip() else (None, False)
+    if not isinstance(result, list):
+        return None, False
+    texts = [block for block in result if isinstance(block, dict) and block.get("type") == "text"
+             and isinstance(block.get("text"), str) and block["text"].strip()]
+    had = False
+    for block in texts:
+        had = bool(block.pop("cache", False)) or had
+    return (texts[-1], had) if texts else (None, False)
+
+
+def cache_messages(messages, enabled, tools, mark_tail=True, tool_results=False):
+    """Move only cache hints; signed thinking and the model prefix stay unchanged.
+
+    mark_tail=False leaves the last message without the newest hint: a compaction's own instruction is read by nobody
+    (the client replaces its history by the summary), so writing it to the cache only costs the premium of a write.
+
+    tool_results=True lets the result of a tool carry a hint (for a route that has breakpoints: Anthropic). A result
+    arrives as plain input, and the next request, whose newest hint stands after it, writes it to the cache: 43,703 tokens
+    of input and then a 43,918-token write (a3, 2026-11-06). With the hint where the result arrives it is written once and
+    the next request reads it. Without the flag a result carries none, and the hints an earlier body put on one are
+    taken off."""
     messages = copy.deepcopy(messages)
-    eligible, previous = [], []
-    for message in messages:
+    eligible, previous, owner = [], [], []
+    for position, message in enumerate(messages):
         value = message.get("content")
+        if isinstance(value, dict):
+            slot, had = _result_slot(value) if message.get("role") == "tool" else (None, False)
+            if slot is not None and tool_results:
+                eligible.append(slot)
+                owner.append(position)
+                if had:
+                    previous.append(len(eligible) - 1)
+            continue
         if not isinstance(value, list):
             continue
         for block in value:
@@ -660,14 +811,23 @@ def cache_messages(messages, enabled, tools):
                 block.pop('cache', None)
                 continue
             eligible.append(block)
+            owner.append(position)
             if block.pop("cache", False):
                 previous.append(len(eligible) - 1)
     if enabled and eligible:
         budget = 3 if tools else 4
-        chosen = {len(eligible) - 1}
-        if previous:
+
+        def allowed(index):
+            return mark_tail or owner[index] != len(messages) - 1
+
+        newest = len(eligible) - 1
+        while newest >= 0 and not allowed(newest):
+            newest -= 1
+        chosen = {newest} if newest >= 0 else set()
+        if previous and allowed(previous[-1]):
             chosen.add(previous[-1])
-        chosen.add(0)
+        if allowed(0):
+            chosen.add(0)
         for index in sorted(chosen)[-budget:]:
             eligible[index]["cache"] = True
     return messages
