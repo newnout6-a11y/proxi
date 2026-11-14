@@ -1173,8 +1173,9 @@ Minara, он запускает `scripts/sync_opencode_catalog.py --write` дл�
 `opencode_settings`, а если она пуста — `~/.config/opencode/opencode.jsonc` (или
 `opencode.json`). Актуальный список не переписывается. Перед каждым изменением прежний файл
 сохраняется в `catalog-backups` рядом с ним. Итог — событие `client.opencode_synced` или
-`client.opencode_sync_failed` в журнале и строка `[catalog] OpenCode: …` в консоли. OpenCode
-читает файл при запуске, поэтому новый список видно после его перезапуска. Раньше список
+`client.opencode_sync_failed` в журнале и строка `[catalog] OpenCode: …` в консоли. Служба
+OpenCode 2.x (`opencode-cli serve --service`) перечитывает файл сама; уже открытое окно OpenCode
+может понадобиться перезагрузить. Раньше список
 обновлялся только ручным запуском скрипта: 14 ноября у Gemini 4 Argon в OpenCode не было ни
 одного уровня effort, хотя relay получил их накануне. Список Claude Desktop по-прежнему правится
 вручную.

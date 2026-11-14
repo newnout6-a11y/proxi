@@ -6,8 +6,8 @@ took from a provider, stayed out of OpenCode until someone ran that script (Gemi
 OpenCode on 2026-11-14, a day after the relay had them). After every look the relay now runs the script with --write,
 as a process of its own (the script reads the relay's config and catalog overlays from disk, apart from the running
 relay), when OpenCode's settings file exists and `opencode_sync` is on. The script writes nothing when the list is
-already current and keeps a backup of every change (catalog-backups beside the settings file); OpenCode reads the
-file when it starts.
+already current and keeps a backup of every change (catalog-backups beside the settings file). OpenCode 2.x's service
+(`opencode-cli serve --service`) reloads the file by itself; a window already open may need a reload.
 """
 import json
 import os
@@ -96,6 +96,6 @@ class OpenCodeSync:
                          "моделей; прежний файл сохранён в %s" % (reason, summary.get("models"), summary.get("backup")),
                          "success", client="opencode", reason=reason, settings=str(path), models=summary.get("models"),
                          backup=summary.get("backup"), warnings=summary.get("warnings") or [])
-            console_log.write("[catalog] OpenCode: список моделей обновлён (%s моделей); OpenCode увидит его после "
-                              "перезапуска" % summary.get("models"))
+            console_log.write("[catalog] OpenCode: список моделей обновлён (%s моделей); открытое окно OpenCode может "
+                              "понадобиться перезагрузить" % summary.get("models"))
         return summary
