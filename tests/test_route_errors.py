@@ -193,7 +193,7 @@ LIVE_LIKE = [acct('a', provider_resource_name=M, openai_provider_resource_name=M
 @pytest.mark.parametrize('dialect,model,fragment', [
     ('chat', 'claude-fable-5', 'provider_access.anthropic'),
     ('anthropic', 'claude-opus-4-20250514', 'Retired by Anthropic on 2026-06-15'),
-    ('responses', 'gpt-6-luna', 'Unavailable on the Retool React route'),
+    ('responses', 'claude-sonnet-4-20250514', 'Retired by Anthropic on 2026-06-15'),
     ('chat', 'gemini-2.5-pro', 'google_provider_resource_name'),
     ('anthropic', 'gpt-5.3-codex', 'Responses is required'),
 ])

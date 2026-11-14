@@ -240,6 +240,11 @@ _UNSUPPORTED_ROUTES = {
                                  'Retool Assist returns provider 404 not_found for this model.'),
     'gpt-6-luna': 'Unavailable on the Retool React route; Assist rejects this model.',
 }
+# A model a client names that no account serves (an unsupported route), and the model the relay serves in its place (the
+# owner's choice). Codex's memory jobs ask for gpt-6-luna by name; Retool refused it (404, request
+# 423d2c23bbc8 of 2026-11-06), so Codex never made a memory. A request for one is served by its substitute and says so in
+# the journal (request.model_substituted); /v1/models and the Codex catalog still list only what is served.
+SUBSTITUTES = {'gpt-6-luna': 'gpt-6.1-terra'}
 _BYOK_ROUTES = {'gpt-6-astra'}
 _RETENTION_ROUTES = {'claude-fable-5'}
 _VERIFIED_ROUTES = {
@@ -640,6 +645,18 @@ def _canonical(name):
     return ALIASES.get(name, name)
 
 
+def substitute_for(name):
+    """The id of the model that serves a client's model name in its place, or None.
+
+    `name` is the base of the client's name (no @profile, no effort suffix). Only a model of an unsupported route has a
+    substitute (SUBSTITUTES): a model some account can serve is never replaced."""
+    named = _canonical(name)
+    if '/' in named and named not in _BY_ID:
+        named = _canonical(named.split('/', 1)[1])  # a provider prefix ("openai/gpt-6-luna") is read as resolve() reads it
+    served = SUBSTITUTES.get(named)
+    return served if served in _BY_ID and named in _UNSUPPORTED_ROUTES else None
+
+
 EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _EFFORT_RANK = {name: index for index, name in enumerate(EFFORT_ORDER)}
 
@@ -846,7 +863,23 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
 
     The name may select a prompt profile, <model>@<profile>[#effort]: the profile is not the catalog's
     business, so it is dropped here (validate keeps it in Parsed.virtual_profile, parse_model_name).
+
+    A model that no account serves but that has a substitute (SUBSTITUTES) comes back as the substitute. Its effort
+    is validated as the model the client asked for, so a level that model rejects is still a 400, and then moved to the
+    nearest level the substitute takes, when it lacks one (gpt-6-luna and gpt-6.1-terra take the same levels).
     """
+    entry, level = _resolve_requested(model, effort, strict=strict, default_model=default_model,
+                                      allow_downgrade=allow_downgrade)
+    served = substitute_for(entry['id'])
+    if served:
+        entry = _BY_ID[served]
+        levels = entry.get('reasoning_effort_levels') or []
+        if level is not None and level not in levels:
+            level = nearest_effort(levels, level) if levels else None
+    return entry, level
+
+
+def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade):
     parsed = parse_model_name(model or default_model)
     extracted_effort = effort if effort is not None else parsed.effort
     base_name = parsed.base
