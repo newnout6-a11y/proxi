@@ -38,6 +38,15 @@ DEFAULTS = {
     "max_workers": 32,
     "max_conversations": 128,
     "conversation_idle_timeout": 900,
+    # Conversations survive a relay restart: after every turn that moved one, its signed history, cache marks and
+    # account are written to a private directory (empty = <state-dir>/conversations) and read back, onto the
+    # same account, when the conversation's next request creates its session.
+    "conversation_state": True,
+    "conversation_state_dir": "",
+    "conversation_state_max_conversations": 200,
+    "conversation_state_ttl": 86400,  # seconds a stored conversation is kept after its last turn
+    "conversation_state_max_file_bytes": 32 * 1024 * 1024,   # one conversation, as stored (compressed)
+    "conversation_state_max_total_bytes": 512 * 1024 * 1024,  # the whole directory
     "rate_limit_rps": 0.0,       # optional local quota; upstream limits still apply
     "rate_limit_burst": 64.0,
     "turn_timeout": 900,
@@ -67,6 +76,10 @@ DEFAULTS = {
     "enable_responses": True,
     "reasoning_effort": "auto",
     "allow_effort_downgrade": False,
+    # A client's compaction (the request that summarizes its history so that the client can replace it) runs on the effort
+    # of the signed branch it resends: another effort restarts that history and the provider's cached messages, and the
+    # whole conversation is written again. False lets the effort the client sends decide, as for any other request.
+    "compaction_keep_effort": True,
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
     "transport": "direct",
     "direct_cache": True,
@@ -451,7 +464,8 @@ def _load(path):
                     "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
                     "account_rate_limit_cooldown",
                     "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
-                    "trace_max_folders"):
+                    "trace_max_folders", "conversation_state_max_conversations", "conversation_state_ttl",
+                    "conversation_state_max_file_bytes", "conversation_state_max_total_bytes"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -471,6 +485,8 @@ def _load(path):
         raise service_unavailable("account_rate_limit_cooldown must be between 1 and 3600 seconds")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
+    if type(cfg["compaction_keep_effort"]) is not bool:
+        raise service_unavailable("compaction_keep_effort must be a boolean")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
                 "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
                 "trace_max_folders"):
@@ -484,6 +500,17 @@ def _load(path):
             raise service_unavailable(f"{key} must be positive")
     if cfg["max_conversations"] < 1 or cfg["conversation_idle_timeout"] < 1:
         raise service_unavailable("max_conversations and conversation_idle_timeout must be positive")
+    if type(cfg["conversation_state"]) is not bool:
+        raise service_unavailable("conversation_state must be a boolean")
+    if not isinstance(cfg["conversation_state_dir"], str):
+        raise service_unavailable("conversation_state_dir must be a string (empty = <state-dir>/conversations)")
+    for key in ("conversation_state_max_conversations", "conversation_state_ttl",
+                "conversation_state_max_file_bytes", "conversation_state_max_total_bytes"):
+        if cfg[key] < 1:
+            raise service_unavailable(f"{key} must be positive (set conversation_state to false to switch it off)")
+    if cfg["conversation_state_max_file_bytes"] > cfg["conversation_state_max_total_bytes"]:
+        raise service_unavailable("conversation_state_max_file_bytes must not exceed "
+                                  "conversation_state_max_total_bytes")
 
     for float_key in ("rate_limit_rps", "rate_limit_burst"):
         try:

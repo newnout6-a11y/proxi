@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from accounts import DEAD_AFTER, idle_block
-from keepwarm_harness import START, backend as warm_backend, drive, session as warm_session
+from keepwarm_harness import DUE, START, backend as warm_backend, drive, session as warm_session
 from test_account_dispatcher import Account, FakeManager, FakeRefresher, dispatcher
 
 STATES = {"disabled": {"enabled": False}, "exhausted": {"unavailable": {"reason": "exhausted", "available": 3.0}},
@@ -26,14 +26,14 @@ def unavailable_backend(state):
 
 @pytest.mark.parametrize("state", sorted(STATES))
 def test_idle_conversation_on_an_unavailable_account_is_never_pinged(monkeypatch, state):
-    target = warm_session(backend=unavailable_backend(state), _warm_at=0)
+    target = warm_session(backend=unavailable_backend(state), _warm_at=DUE)
     clock, pings = drive(monkeypatch, target, seconds=1800)
     assert pings == []
     assert clock.now < START + 5, "the scheduler must stop at once instead of polling until the idle limit"
 
 
 def test_the_same_idle_conversation_is_pinged_while_its_account_is_healthy(monkeypatch):
-    target = warm_session(_warm_at=0)
+    target = warm_session(_warm_at=DUE)
     _, pings = drive(monkeypatch, target, seconds=60)
     assert len(pings) == 1
 
@@ -47,7 +47,7 @@ def test_a_ping_inside_a_running_turn_ignores_the_account_state(monkeypatch, sta
 
 
 def test_an_account_that_becomes_unavailable_mid_cycle_stops_the_next_idle_ping(monkeypatch):
-    target = warm_session(_warm_at=START - 300)
+    target = warm_session(_warm_at=DUE)
     flipped = []
 
     def on_tick(now):
@@ -61,7 +61,7 @@ def test_an_account_that_becomes_unavailable_mid_cycle_stops_the_next_idle_ping(
 
 
 def test_an_account_that_recovers_is_warmed_again(monkeypatch):
-    target = warm_session(backend=unavailable_backend("rate_limited"), _warm_at=START - 300)
+    target = warm_session(backend=unavailable_backend("rate_limited"), _warm_at=DUE)
     clock, pings = drive(monkeypatch, target, seconds=10)
     assert pings == [] and clock.now - START < 2
     target.backend.unavailable = None
@@ -89,7 +89,7 @@ def test_an_exclusion_made_by_the_real_dispatcher_stops_idle_warming_and_its_end
             control.refresh(account)
 
     assert account.unavailable and account.unavailable["reason"] == cause
-    target = warm_session(backend=account, _warm_at=0)
+    target = warm_session(backend=account, _warm_at=DUE)
     clock, pings = drive(monkeypatch, target, seconds=60)
     assert pings == [] and clock.now - START < 2
     recover()

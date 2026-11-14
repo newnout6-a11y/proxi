@@ -342,6 +342,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 .trace-model { display: grid; min-width: 0; }
 .trace-model strong { font-family: var(--mono); font-size: var(--text-sm); font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trace-model small { font-size: var(--text-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trace-model small .trace-task { color: var(--accent-text); }
 .trace-tape { display: grid; gap: 6px; min-width: 0; }
 .trace-phases { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-3); font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); }
 .trace-num { font-family: var(--mono); font-size: var(--text-sm); color: var(--ink-2); text-align: right; white-space: nowrap; }

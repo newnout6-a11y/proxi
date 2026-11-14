@@ -128,9 +128,11 @@ def test_five_failed_pings_stop_the_cycle_and_say_so(monkeypatch):
         raise OSError("synthetic failure")
 
     mark = journal.JOURNAL.last_seq
-    clock, pings = drive(monkeypatch, warm_session(_warm_at=START - 100), {"cache_keepwarm_idle": 86400},
-                         seconds=20000, ping=fail)
-    assert len(pings) == 5 and clock.now - START < 20000
+    # A short interval, so that all five attempts (retries 10, 20, 40 and 80 s apart) fit inside the cache window.
+    clock, pings = drive(monkeypatch, warm_session(_warm_at=START - 10),
+                         {"cache_keepwarm_seconds": 30, "cache_keepwarm_idle": 86400}, seconds=20000, ping=fail)
+    assert len(pings) == 5 and clock.now - START < 200
+    assert pings[-1] - (START - 10) < direct.PING_DEADLINE
     [stop] = stops(mark)
     assert (stop["reason"], stop["failures"], stop["pings"], stop["level"]) == ("failures", 5, 5, "warn")
 

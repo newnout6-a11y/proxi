@@ -109,6 +109,92 @@ is not a relay model and its window is unknown. Either way the summary's `warnin
 name the old reference and what was done. A compaction model you chose that is still
 published is kept as it is, even if its window is smaller: check that yourself.
 
+### Compaction and the effort of its agent
+
+OpenCode 2.x (every tag from v2.0.0 to v2.2.5) compacts by resending the chat's own
+request: the same system prompt, tools and history, and one more user message that asks for
+the summary. That message opens with "You MUST summarize the conversation above…" (a later
+compaction: "Update the existing checkpoint in the conversation above…"), and a reply that
+skipped the template gets one more message that opens "The previous response did not fill in
+the required summary template" (`buildPrompt` and `NUDGE` in
+[`packages/core/src/session/compaction.ts`](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/core/src/session/compaction.ts)).
+OpenCode 1.x runs the summary on its hidden `compaction` agent instead, without tools and with
+that agent's own system prompt, so it shares no cache with the chat. Its user message opens, by
+tag (a sweep of every `v1.*` tag of the repository): "Provide a detailed prompt for continuing
+our conversation above" up to v1.14.18, "When constructing the summary, try to stick to this
+template" in v1.14.19 and v1.14.20, "Create a new anchored summary…" or "Update the anchored
+summary below…" from v1.14.21 to v1.18.16, and "Here is the conversation so far:" from v1.18.17
+to v1.19.5 (older tags word it differently and are not recognised by their text).
+
+When the conversation is larger than the room OpenCode 2.x keeps for the summary
+(`compaction.buffer`), it does not send the chat's own request: it cuts the kept tail off the
+history, or sends the history as one text message without tools (`flattenAndDropOldest`). Such a
+request shares no signed branch with the chat, so it cannot resume whatever the effort; the label
+still shows why it was dear. The experimental `background_compaction` is the same: it asks on the
+history up to the latest reply, without that reply, and a signed branch continues only a request
+that carries the reply it was made with.
+
+The hidden `compaction` agent decides who writes the summary: with no `agents.compaction.model`
+it is the session's model and variant, with one it is that model and the variant after its `#`
+([compaction → model](https://opencode.ai/v2/docs/compaction/#model),
+[agents → model](https://opencode.ai/v2/docs/agents/#model)). A V1 `agent.compaction` with a
+separate `variant` is read the same way: the variant joins the model after `#`
+([migration](https://opencode.ai/v2/docs/migrate-v1/)). So a chat on `max` whose
+`agent.compaction.variant` is `high` compacts on `high`, and that is expensive twice over: on
+Anthropic models the effort is rendered into the prompt, so changing it invalidates the cached
+messages ([prompt caching → what invalidates the cache](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
+[steering thinking → prompt caching](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost)),
+and the relay's signed thinking history belongs to the effort it was made under, so a request on
+another effort starts that history again (`native_history.reset`) and is sent without signatures.
+On 2026-11-05 one compaction of a 540,000-token chat (Sonnet 5.5, OpenCode 2.2.5, chat on
+`max`, compaction agent on `high`) wrote 532,000 tokens, 28 credits, where a turn of the same chat
+wrote about 1,000, 3.5 credits.
+
+The relay now recognises the request by the start of that last message, which is what stays the
+same between releases (the rest of the text is reworded), and runs it on the effort of the
+dialog's signed history, when that history really continues: the same system prompt, tools,
+model and account and the same messages. Only the new tail is then written. The journal keeps
+both efforts: `turn.begin` has `requested_effort` (the client's), `effective_effort` (the dialog's),
+`effort_source: dialog` and `effort_resolution: cache_continuity`, and every event of the request
+has `client_task: "compaction"`. `compaction_keep_effort: false` turns the substitution off; the
+label stays. A compaction with nothing to continue (after a relay restart, on another model, after
+the history was edited) runs on the effort the client sent, and the label shows why it was dear:
+`cache.compaction_restart` names the reason (`no_branch`, `history`, `effort`, or `scope` with
+`differs`: `provider` for a model or account, `head`, `tools`, `tool_choice`).
+
+The summary a compaction gets back is not recorded as a branch of the dialog: the client replaces
+its history by it and does not continue that request. So the branch of the chat stays where it
+was, and a compaction asked again (the reminder after a reply that skipped the template, a second
+`/compact`) or the chat itself after a compaction that was cancelled still resumes from it.
+
+To make OpenCode compact on the chat's own effort in the first place, delete the `compaction` entry
+from `agent` (V1 syntax) or `agents` (V2): with no model of its own the summary runs on the
+session's model and variant
+([compaction → model](https://opencode.ai/v2/docs/compaction/#model)). Taking out only the
+`variant` is not enough: an entry that names a model and no variant runs on that model's own
+options, and for a catalog written by `scripts/sync_opencode_catalog.py` that is the
+`options.reasoningEffort` of the model, `high`. A variant written into the entry stays right only
+for chats on that variant, and a chat on another one pays for the difference unless the relay
+substitutes the effort as above. A different model for the summary, a cheaper one for instance,
+never shares the chat's cache whatever the effort: for a chat on Opus and a `compaction` agent on
+Sonnet every compaction is written in full (the journal says `scope` and `provider`).
+
+```jsonc
+// ~/.config/opencode/opencode.jsonc: no "compaction" key under "agent" (V1) or "agents" (V2)
+{
+  "agent": {
+    "build": { "variant": "high", "model": "retool-relay/claude-opus-5-5" }
+    // "compaction": { "variant": "high", "model": "retool-relay/claude-sonnet-5-5" }  <- remove
+  }
+}
+```
+
+If a later release rewords the instruction, a plugin can name the task instead: OpenCode 2.x's
+`model.request` hook carries `event.kind` (`"compaction"` for the checkpoint summary) and can
+set request headers ([plugins → server](https://opencode.ai/v2/docs/build/plugins/server)), and the
+relay reads `X-Proxi-Task: compaction`. No such plugin ships with the relay and this path was not
+run against a live OpenCode 2.x; the wordings above need none.
+
 The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
 retool-relay/claude-opus-5-5 --variant high`; OpenCode 2.2.5 uses `--model
 retool-relay/claude-opus-5-5#high`. Version 2 rejects `--variant` before sending a
@@ -480,6 +566,21 @@ stay as they are; only the policy changes. Other classes, and requests without t
 header, still get the configured policy. The class appears in the journal entries of
 the request. Without the header only the recognised service kinds (titles, Auto mode
 check, connection probe) are protected.
+
+A `compaction` request (with the `x-claude-code-compaction` header that says what
+triggered it: `auto`, `manual` or `reactive`) is also labelled `client_task: "compaction"` in
+every event of the request. Claude Code's compaction repeats the conversation's system prompt,
+tools and history and ends with the summarization instruction
+([prompt caching](https://code.claude.com/docs/en/prompt-caching#compacting-the-conversation)),
+so it can resume the signed history like OpenCode 2.x's, and the relay runs it on the dialog's
+effort when the effort it carries differs (`compaction_keep_effort`, see
+[Compaction and the effort of its agent](#compaction-and-the-effort-of-its-agent)). With the
+hint headers the request class says it; without `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` the relay
+reads the start of the instruction instead: "CRITICAL: Respond with TEXT ONLY. Do NOT call any
+tools." in 2.1.316 (an unofficial
+[capture of the request](https://clawdipedia.cc/prompts/context-and-memory/compact); the
+product is closed and Anthropic documents the instruction only in prose) and "Your task is to
+create a detailed summary of the conversation so far" in earlier versions.
 
 ## Claude Desktop on Windows
 

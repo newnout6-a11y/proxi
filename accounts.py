@@ -45,14 +45,21 @@ def priority(backend):
 UNNAMED = "account"  # what a report, a console line or a message calls an account that has no identity
 
 
+def cfg_identity(cfg):
+    """The raw identifier that names an account config: `account_id`, else `page_uuid`; None when it has neither.
+
+    The one place that says which field names an account. State that must find its account again after a
+    restart (a stored conversation) keeps this value, never a cookie."""
+    cfg = cfg or {}
+    return cfg.get("account_id") or cfg.get("page_uuid") or None
+
+
 def cfg_tag(cfg, default=None):
-    """Journal label of an account config: a short hash, never the raw ID. The one place that says which
-    field names an account (`account_id`, else `page_uuid`).
+    """Journal label of an account config: a short hash, never the raw ID (see cfg_identity).
 
     `default` is what an account without an identity gets. Journal fields keep None, so that the event names
     no account; anything a person reads (reports, status rows, console lines, messages) passes UNNAMED."""
-    cfg = cfg or {}
-    return journal.tag(cfg.get("account_id") or cfg.get("page_uuid")) or default
+    return journal.tag(cfg_identity(cfg)) or default
 
 
 def account_tag(backend, default=None):

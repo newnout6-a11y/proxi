@@ -290,12 +290,17 @@ class Snapshot:
     messages: list
     assistant: list
     echo: dict
+    # True for a branch that was read back from disk after a restart (conversation_state), not recorded live.
+    restored: bool = False
 
 
 class History:
-    """Bounded live branches; sequential tool turns replace their parent snapshot."""
+    """Bounded live branches; sequential tool turns replace their parent snapshot.
+
+    `revision` counts the recorded snapshots: the stored copy of a conversation is rewritten when it moves."""
     def __init__(self):
         self.branches = []
+        self.revision = 0
 
     def resume(self, scope, client):
         for snapshot in reversed(self.branches):
@@ -316,6 +321,7 @@ class History:
         self.branches = [s for s in self.branches if s is not parent]
         self.branches.append(Snapshot(scope, copy.deepcopy(client), messages, blocks, expected))
         self.branches = self.branches[-8:]
+        self.revision += 1
 
 
 def cache_messages(messages, enabled, tools):

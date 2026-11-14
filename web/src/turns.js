@@ -70,6 +70,7 @@ export function buildTraces(events) {
     let trace = map.get(event.turn_id);
     if (!trace) {
       trace = { id: event.turn_id, started: event.ts, ended: null, status: 'running', restored: false, model: null, effort: null,
+        task: null, askedEffort: null,
         transport: null, dialect: null, ttft: null, duration: null, credits: null, creditsSum: null, creditsComplete: false,
         phase: 'wait', phaseStarted: event.ts, waitStarted: event.ts, waitMs: 0, firstSignal: null,
         thinkingStarted: null, thinking: 0, textStarted: null, textMs: 0, toolOpen: new Map(), toolSpans: [], args: 0,
@@ -94,7 +95,13 @@ export function buildTraces(events) {
     }
     trace.events.push(event);
     trace.last = Math.max(trace.last, event.ts);
-    if (event.kind === 'turn.begin') Object.assign(trace, { model: data.model, effort: data.effort, transport: data.transport, dialect: data.dialect });
+    if (event.kind === 'turn.begin') {
+      Object.assign(trace, { model: data.model, effort: data.effort, transport: data.transport, dialect: data.dialect });
+      // What the request is for (a client compacting its history, the dearest turn when the cache does not continue),
+      // and the effort the client asked for when the relay ran the turn on the dialog's own to keep that cache.
+      trace.task = typeof data.client_task === 'string' ? data.client_task : null;
+      trace.askedEffort = data.effort_resolution === 'cache_continuity' ? data.requested_effort ?? null : null;
+    }
     if (event.kind === 'turn.end') {
       closeText(trace, event.ts);
       closeThinking(trace, event.ts);
@@ -227,6 +234,17 @@ export function staleLimit(turnTimeout) {
  */
 export function statusAt(trace, now = Date.now() / 1000, staleAfter = STALE_AFTER) {
   return trace.status === 'running' && now - trace.last > staleAfter ? 'interrupted' : trace.status;
+}
+
+/** What a turn is for, when the relay recognised a request that is more than a chat turn (the journal's client_task). */
+export const TASK_LABEL = { compaction: 'сжатие' };
+
+/** "effort max", and what the client asked for when the relay ran the turn on the dialog's own effort to keep its cache. */
+export function effortText(trace) {
+  if (!trace.effort) return '';
+  const asked = trace.askedEffort && trace.askedEffort !== trace.effort
+    ? ` (клиент ${trace.askedEffort === 'auto' ? 'по умолчанию' : trace.askedEffort})` : '';
+  return `effort ${trace.effort}${asked}`;
 }
 
 export const PHASES = [

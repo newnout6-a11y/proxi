@@ -5,7 +5,8 @@ import pathlib
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-MODULES = ["adapters", "apierr", "direct", "generation", "journal", "proxy", "session", "sse", "structured"]
+MODULES = ["adapters", "apierr", "conversation_state", "direct", "generation", "journal", "proxy", "session", "sse",
+           "structured"]
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 
 

@@ -34,9 +34,10 @@ from orchestrator import DEFAULT_NATIVE_TOOLS_ROLE
 
 BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
 # The role and its mode are read from the shared cfg by every request (orchestrator._instructions and
-# _client_instructions), so the next request already sends the new head.
+# _client_instructions), so the next request already sends the new head. So is compaction_keep_effort, which
+# TurnRunner._run_once reads when a client's compaction begins.
 LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
-                 "relay_system_prompt", "relay_system_prompt_mode"}
+                 "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 POOL_FIELDS = {"enabled", "priority", "label"}
@@ -129,6 +130,10 @@ def _schema():
          ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"]),
         ("allow_effort_downgrade", "boolean", "Подбирать ближайший effort", "model",
          "Если модель не поддерживает запрошенный уровень мышления, взять ближайший вместо ошибки",
+         None, None, None, None),
+        ("compaction_keep_effort", "boolean", "Сжатие на effort диалога", "model",
+         "Когда клиент сжимает историю, relay берёт effort диалога, если так продолжается его подписанная история: "
+         "смена effort сбрасывает её и кэш сообщений, и весь диалог записывается заново. Применяется сразу",
          None, None, None, None),
         ("show_thinking", "boolean", "Передавать мышление модели", "model",
          "Отдавать клиенту блоки мышления модели, когда Retool их присылает",
