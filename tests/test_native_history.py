@@ -410,10 +410,15 @@ def test_cache_hints_do_not_mutate_signed_blocks_or_overrun_the_budget():
 
 def test_snapshot_storage_replaces_sequential_parents_and_bounds_live_branches():
     history = native_history.History()
+    step = [{"type": "tool_call", "toolCallId": "c", "toolName": "read_file", "toolInput": {}}]
     for _ in range(30):
         parent = history.branches[-1] if history.branches else None
-        history.record("scope", [], [], [], {}, parent)
+        history.record("scope", [], [], step, {}, parent)
         assert len(history.branches) == 1
+    for _ in range(30):
+        # A final answer is kept when the next turn continues it, for a few turns (test_native_history_rewind).
+        history.record("scope", [], [], [], {}, history.branches[-1])
+    assert len(history.branches) == native_history.REWIND_POINTS + 1
     for _ in range(30):
         history.record("scope", [], [], [], {})
     assert len(history.branches) == 8
