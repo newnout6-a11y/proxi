@@ -10,6 +10,7 @@ import time
 import uuid
 
 import journal
+from accounts import cfg_tag
 from redact import redact
 from upstream_attempts import MAX_ATTEMPTS
 
@@ -301,7 +302,7 @@ class AttemptTrace:
             self.budget.last = summary
             self.budget.last_trace = self
         journal.emit("upstream.attempt", "Попытка %d/%d: %s" % (self.step_attempt, MAX_ATTEMPTS, outcome),
-                     "debug" if outcome == "content" else "warn", **summary)
+                     "debug" if outcome == "content" else "warn", account=cfg_tag(self.cfg), **summary)
         return summary
 
     def save(self):

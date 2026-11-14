@@ -6,6 +6,7 @@ import time
 import uuid
 
 import apierr
+import structured
 from credits import token_counter as _token_counter
 
 
@@ -486,8 +487,12 @@ class ResponsesAdapter(_Base):
                 "output_text": self.text,
                 "usage": {"input_tokens": prompt, "output_tokens": completion,
                           "total_tokens": prompt + completion,
-                          "input_token_details": {"cached_tokens": self.cache_read},
-                          "input_tokens_details": {"cached_tokens": self.cache_read},
+                          # openai-python 2.45+ requires cache_write_tokens beside
+                          # cached_tokens; Codex's strict parser reads both too.
+                          "input_token_details": {"cached_tokens": self.cache_read,
+                                                  "cache_write_tokens": self.cache_write},
+                          "input_tokens_details": {"cached_tokens": self.cache_read,
+                                                   "cache_write_tokens": self.cache_write},
                           # The details object is optional, but reasoning_tokens
                           # is required when it exists in strict Responses clients.
                           # Omit unknown details instead of {} or an invented zero.
@@ -626,69 +631,82 @@ class AnthropicAdapter(_Base):
                           **self._price_usage(), "estimated": True}}
 
 
-class ValidatedTitleAdapter:
-    """Buffer the SDK title until its exact JSON contract has been checked.
+_THINKING_EVENTS = ('thinking', 'thinking_start', 'thinking_status', 'thinking_signature')
+
+
+class StructuredOutputAdapter:
+    """Hold the reply back until its JSON contract has been checked.
 
     Usage/cost events still reach the ordinary adapter; no invalid partial text
     reaches the client. This is post-validation, not native structured output.
+    A turn that calls a client tool is no final answer: it is released as it is,
+    and only the reply without tool calls is validated.
     """
-    def __init__(self, parsed, writer=None):
-        self.adapter = AnthropicAdapter(parsed, writer)
+    def __init__(self, adapter, spec, *, tools=False, hint=''):
+        self.adapter = adapter
+        self.spec = spec
+        self.tools = tools
+        self.hint = hint
         self.parts = []
         self.size = 0
+        self.released = False
 
     def begin(self):
         self.adapter.begin()
 
+    def _release(self):
+        self.released = True
+        text = ''.join(self.parts)
+        self.parts.clear()
+        if text:
+            self.adapter.feed({'type': 'text', 'delta': text})
+
     def feed(self, event):
         kind = event.get('type')
-        if kind == 'text':
-            delta = event['delta']
-            self.size += len(delta)
-            if self.size > 256 * 1024:
-                raise apierr.upstream_error('session title exceeds the validation buffer')
-            self.parts.append(delta)
+        if kind in ('usage_start', 'usage', 'credits') or self.released:
+            self.adapter.feed(event)
+        elif kind == 'text':
+            self.size += len(event['delta'])
+            if self.size > structured.MAX_CHARS:
+                raise apierr.invalid_structured_output('structured output exceeds the validation buffer')
+            self.parts.append(event['delta'])
+        elif kind == 'tool_call' and self.tools:
+            self._release()
+            self.adapter.feed(event)
         elif kind in ('tool_call', 'tool_call_delta', 'tool_start', 'hitl', 'exec_start', 'exec_result'):
-            raise apierr.upstream_error('session title unexpectedly requested an action')
-        elif kind in ('usage_start', 'usage', 'credits'):
+            raise apierr.invalid_structured_output('structured output unexpectedly requested an action')
+        elif kind in _THINKING_EVENTS and self.tools:
             self.adapter.feed(event)
 
     def end(self, reason, prompt_text=None):
-        text = ''.join(self.parts)
-        # Assist Haiku returns this exact formatting envelope even when asked
-        # for bare JSON. Remove only a whole-response fence; never extract JSON
-        # from prose or manufacture/repair a title value.
-        fenced = re.fullmatch(r'\s*```(?:json)?[ \t]*\r?\n(.*?)\r?\n```\s*', text, re.DOTALL)
-        if fenced:
-            text = fenced.group(1)
-
-        def unique_object(pairs):
-            obj = dict(pairs)
-            if len(obj) != len(pairs):
-                raise ValueError('duplicate JSON keys')
-            return obj
-
-        try:
-            value = json.loads(text, object_pairs_hook=unique_object)
-            valid = (reason == 'stop' and isinstance(value, dict)
-                     and set(value) == {'title'} and isinstance(value['title'], str))
-        except (ValueError, RecursionError):
-            valid = False
-        if not valid:
-            raise apierr.upstream_error('upstream did not return a complete session title JSON object')
-        self.adapter.feed({'type': 'text', 'delta': text})
+        if reason == 'tool_calls' or self.released:
+            self._release()
+        else:
+            try:
+                if reason != 'stop':
+                    raise ValueError('the reply was cut short (%s)' % reason)
+                text = structured.verify(''.join(self.parts), self.spec)
+            except ValueError as problem:
+                what = 'JSON object' if self.spec['kind'] == 'json_object' else 'JSON Schema'
+                raise apierr.invalid_structured_output(
+                    'upstream reply does not satisfy %s (%s): %s.' % (self.spec['source'], what, problem)
+                    + self.hint)
+            self.adapter.feed({'type': 'text', 'delta': text})
         return self.adapter.end(reason, prompt_text)
 
 
 def for_dialect(dialect, parsed, writer=None):
     if dialect == "anthropic":
-        if getattr(parsed, 'structured_title', False):
-            return ValidatedTitleAdapter(parsed, writer)
-        return AnthropicAdapter(parsed, writer)
-    if dialect == "responses":
-        return ResponsesAdapter(parsed, writer)
-    return ChatAdapter(parsed, writer)
-
+        adapter = AnthropicAdapter(parsed, writer)
+    elif dialect == "responses":
+        adapter = ResponsesAdapter(parsed, writer)
+    else:
+        adapter = ChatAdapter(parsed, writer)
+    spec = getattr(parsed, 'structured_output', None)
+    if spec:
+        return StructuredOutputAdapter(adapter, spec, tools=bool(getattr(parsed, 'tools', None)),
+                                       hint=structured.HINT if dialect == "anthropic" else '')
+    return adapter
 
 def error_payload(dialect, err):
     if dialect == "anthropic":

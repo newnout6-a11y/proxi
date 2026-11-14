@@ -133,6 +133,12 @@ prefix; the following unchanged tool round trip preserves the new prefix again.
 Latest inline effort updates are retained. Conflicting thinking controls and
 unsupported turn-scoped `clear_at` are rejected before inference.
 
+Superseded after the PR review: only leading system messages form the head. Later
+non-empty ones stay in place as `<system-reminder>` user text with
+`x-proxi-system-messages: inline-as-user-text`, so the head, the signed prefix and
+the cache survive them; blank effort records add nothing. Details and live checks:
+[relay-quality-and-prompts.md](relay-quality-and-prompts.md).
+
 Three isolated live gateway checks returned the expected markers for standalone
 custom policy (Chat), unknown-client instructions (Responses), and inline system
 guidance (Messages). All three HTTP 200; reported total 0.02656 credits. The real
@@ -519,8 +525,8 @@ collisions are refused before writing. It approved the exact two previews.
 The following writes completed, preserving an exact backup for each profile:
 
 ```powershell
-uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings C:/Users/Redmi/.dsh/profiles/desktop/cordis.patch.yml --write --backup-dir .agents/backups/harness-catalog-20261105/desktop
-uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings C:/Users/Redmi/.dsh/profiles/web/cordis.patch.yml --write --backup-dir .agents/backups/harness-catalog-20261105/web
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings "$env:USERPROFILE/.dsh/profiles/desktop/cordis.patch.yml" --write --backup-dir .agents/backups/harness-catalog-20261105/desktop
+uv run --python 3.14 --with-requirements requirements.txt --no-project python scripts/sync_harness_catalog.py --settings "$env:USERPROFILE/.dsh/profiles/web/cordis.patch.yml" --write --backup-dir .agents/backups/harness-catalog-20261105/web
 ```
 
 Post-write bytes equal the reviewed previews. Restoring the original Proxi
@@ -594,6 +600,39 @@ other registry value, including auth. Older effort pickers are capped at high
 to avoid route-invalid xhigh; Opus/Sonnet 4.6 keep their four-level max. This
 does not invent missing selectors for new 5.5 model IDs.
 
+> **Correction (2026-11-05, PR #24 review).** Three statements here and in the
+> Claude Desktop row of the client table above are withdrawn:
+>
+> - "Accepts 11 Claude models" and "reconciled to 11 Claude routes": 11 is the
+>   number of the relay's verified `claude-*` routes that the script selected
+>   (`provider` anthropic, `claude-` prefix), not a subset Desktop computed.
+>   Desktop only removes list entries that do not name an Anthropic model (its
+>   log: "is not an Anthropic model and was removed from the list"). Anthropic's
+>   cached catalog (version 4008) lists 9 of the 11 for Code and Cowork:
+>   `claude-opus-4-5-20251101` appears only as a disabled chat model and
+>   `claude-sonnet-4-5-20250929` is absent, so Code has no metadata or effort
+>   selector for them.
+> - "The applied policy": the script read and wrote only
+>   `HKCU\Software\Policies\Claude`. During the review neither that key nor
+>   `HKLM\SOFTWARE\Policies\Claude` existed on this machine. `main.log` reports
+>   `type: 'local'` and `managedKeys: []` for every launch logged since
+>   2026-10-26, and `picker = 3 (inferenceModels)` for those of 2026-11-03,
+>   2026-11-04 and 2026-11-05 02:37: the active list was the applied
+>   `%LOCALAPPDATA%\Claude-3p\configLibrary` file. A backup from 10:34 on
+>   2026-11-05 shows the script replacing a 2-model `HKCU` value, which was gone
+>   afterwards; the last logged launch predates that write.
+> - "Capped at high": that followed the relay's rejection of `xhigh` and hid
+>   `max` on five-level rows even though the relay accepts it. Haiku 4.5 also
+>   received `maxEffort`, although it has no native effort (Claude Code's effort
+>   table does not list it; Anthropic's model page says "Default effort: Not
+>   supported").
+>
+> The script now follows Desktop's source precedence (`HKLM`, `HKCU`, local
+> configLibrary), never writes `HKLM`, never creates a policy, keeps the user's
+> order, labels and default model, filters by Anthropic's catalog when it is
+> readable, and sets `max` when `allow_effort_downgrade` is on. See
+> `client-setup.md`.
+
 Exact installed SDK wrapper **0.3.309** was loaded from ASAR. Its embedded target
 runner **2.1.309** is absent on disk. Live checks explicitly used cached Desktop
 runner **2.1.295**, SHA-256
@@ -638,7 +677,11 @@ No actionable findings remained. Exact command:
 python -B -m pytest -p no:cacheprovider tests/test_desktop_service_protocol.py tests/test_native_history.py tests/test_cold_tool_history.py tests/test_native_context_reuse.py tests/test_prompt_ownership.py tests/test_generation_controls.py tests/test_client_context.py tests/test_models_hardening.py tests/test_model_catalog.py
 ```
 
-Root validation and live reproduction commands:
+Root validation and live reproduction commands. The last one runs a local
+evidence script from the git-ignored `.agents/` directory: that script and the
+`.agents/model-audit-20261104/` tree it writes into are not in the repository, so
+this command records what was run on the author's machine and cannot be
+reproduced from a clone. The first three can be.
 
 ```powershell
 uv run --python 3.14 --with-requirements requirements.txt --no-project python -m pytest -o addopts= -q --tb=short
@@ -658,6 +701,10 @@ zero active requests and still belonged to the known relay process. New PID
 2528 listens on `127.0.0.1:8787`; startup balance was 13,271.0479/15,000.
 Health is good, discovery advertises 27 routes, and Haiku exposes its verified
 `none` level. No unrelated client process was stopped.
+
+The two commands below run local evidence scripts from the git-ignored `.agents/`
+directory. Neither script is in the repository: they record what was run on the
+author's machine and cannot be reproduced from a clone.
 
 `python .agents/production-smoke-20261105.py protocol-smoke-4e2b21d.json`
 passed **all eight actual production requests**: stream/nonstream in each API,

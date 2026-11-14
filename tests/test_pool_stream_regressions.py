@@ -119,7 +119,7 @@ async def test_long_turn_repeatedly_refreshes_inside_the_ttl(monkeypatch, durati
     monkeypatch.setattr(direct, "_ping", ping)
     await direct._keepwarm(session, {"cache_keepwarm_seconds":240,
         "cache_keepwarm_idle":1800, "cache_keepwarm_during_turns":True,
-        "cache_keepwarm_turn_offset":200})
+        "cache_keepwarm_turn_offset":200, "turn_timeout": duration})
     assert calls[0] == pytest.approx(200, abs=0.1)
     assert len(calls) == (3 if duration == 900 else 7)
     assert all(right - left < 241 for left, right in zip(calls, calls[1:]))

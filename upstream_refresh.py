@@ -6,6 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from accounts import cfg_tag
 from auth import merge_set_cookie, upstream_headers
 from config import _account_record, persist_auth, reload_auth, renewal_lock
 import journal
@@ -54,12 +55,15 @@ class Refresher:
             return resp.headers.get_all("set-cookie") or []
 
     def _persist(self):
+        """True when config.json was rewritten; False when it already had this session or saving failed."""
         try:
-            persist_auth(self.cfg)
+            written = bool(persist_auth(self.cfg))
             self.persistence_error = None
+            return written
         except Exception as exc:
             # Keep the working in-memory session; retry persistence next keepalive.
             self.persistence_error = "cannot save renewed session: " + type(exc).__name__
+            return False
 
     def refresh(self, force=False, *, rejected_cookie=None) -> bool:
         return self.refresh_detailed(force, rejected_cookie=rejected_cookie)[0]
@@ -87,7 +91,7 @@ class Refresher:
     def _refresh_locked(self, force=False, *, rejected_cookie=None):
         """Single-flight renewal. A concurrent caller reuses the new credentials."""
         # Multi-account: journal events must say WHICH tenant renewed/failed.
-        account_tag = journal.tag(self.cfg.get("account_id") or self.cfg.get("page_uuid"))
+        account_tag = cfg_tag(self.cfg)
         base = self.cfg.get("base")
         # Hostname only: credentials, paths or queries in the URL stay out of logs.
         tenant = (urllib.parse.urlsplit(base).hostname or "") if isinstance(base, str) else ""
@@ -127,7 +131,9 @@ class Refresher:
                              ok=False, error=self.last_error, forced=force,
                              account=account_tag, tenant=tenant)
                 return False, self.last_failure_kind, self.last_error
+            before = (self.cfg["cookie"], self.cfg["xsrf"])
             merge_set_cookie(self.cfg, headers)
+            rotated = (self.cfg["cookie"], self.cfg["xsrf"]) != before
             if "_account_ref" in self.cfg and isinstance(self.cfg["_account_ref"], dict):
                 self.cfg["_account_ref"]["cookie"] = self.cfg["cookie"]
                 self.cfg["_account_ref"]["xsrf"] = self.cfg["xsrf"]
@@ -139,10 +145,10 @@ class Refresher:
                     record = None
                 if record is not None:
                     record.update(cookie=self.cfg["cookie"], xsrf=self.cfg["xsrf"])
-            self._persist()
+            persisted = self._persist()
             journal.emit("auth.refresh", "Сессия Retool продлена",
                          "warn" if self.persistence_error else "success", ok=True, forced=force,
-                         rotated=bool(headers), persistence_error=self.persistence_error,
+                         rotated=rotated, persisted=persisted, persistence_error=self.persistence_error,
                          account=account_tag, tenant=tenant)
             self.last_error = None
             self.last_failure_kind = None

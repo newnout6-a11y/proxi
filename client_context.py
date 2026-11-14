@@ -25,12 +25,42 @@ _TITLE_TTL = 15
 _MISS_TTL = 30
 SERVICE_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe"})
 CLIENT_TEXT_KINDS = SERVICE_KINDS | {"client-text"}
+# x-claude-code-request-class values whose system prompt is the client's own
+# output contract (summaries, titles, classifiers), never the chat the relay
+# policy is written for. The header needs CLAUDE_CODE_GATEWAY_HINT_HEADERS=1.
+OWN_PROMPT_CLASSES = frozenset({"auxiliary", "compaction"})
 SDK_TITLE_PREFIX = "You are naming a coding session so the user can pick it out of a long list of sessions."
+# Claude Code before 2.1.234 asked for the same title in these words.
+LEGACY_TITLE_PREFIX = "Generate a concise, sentence-case title"
+_TITLE_PREFIXES = (SDK_TITLE_PREFIX, LEGACY_TITLE_PREFIX,
+                   "You write short session titles. Reply with only the tagged fields the prompt asks for.")
+_ATTRIBUTION = "x-anthropic-billing-header:"
+# One-line identity blocks that Claude Code and the Agent SDK put before their real prompt.
+_IDENTITY = re.compile(r"You are (?:Claude Code|a Claude agent)\b[^\n]*")
+
+
+def _after_preamble(system):
+    """System text after the leading attribution and identity lines of Claude clients."""
+    rest = system.lstrip()
+    for _ in range(4):
+        line, _sep, tail = rest.partition("\n")
+        line = line.strip()
+        if not (line.startswith(_ATTRIBUTION) or _IDENTITY.fullmatch(line)):
+            break
+        rest = tail.lstrip()
+    return rest
 
 
 def is_sdk_title_system(system):
-    # Billing and SDK identity blocks can precede the actual service policy.
-    return any(line.startswith(SDK_TITLE_PREFIX) for line in system.splitlines())
+    # The title prompt opens its own block. A later line that only quotes the
+    # wording is ordinary instruction text, not a title request.
+    return _after_preamble(system).startswith(_TITLE_PREFIXES)
+
+
+def keeps_client_prompt(purpose, identity=None):
+    """True when relay prompt policy must leave the client's system prompt alone."""
+    info = current() if identity is None else identity
+    return purpose in SERVICE_KINDS or info.get("request_class") in OWN_PROMPT_CLASSES
 
 
 def request_kind(parsed, identity=None):
@@ -40,8 +70,9 @@ def request_kind(parsed, identity=None):
     system = (getattr(parsed, "system", "") or "").lstrip()
     if re.search(r"(?:^|\n)You are a security monitor for autonomous AI coding agents(?:\.|\n|$)", system):
         return "auto-mode-check"
-    if (system.startswith("You write short session titles. Reply with only the tagged fields the prompt asks for.")
-            or is_sdk_title_system(system)):
+    # The schema is the wording-independent signal: a tool-less request for exactly
+    # {title: string} is a title whatever the client's prompt says today.
+    if is_sdk_title_system(system) or (getattr(parsed, "structured_output", None) or {}).get("title"):
         return "session-title"
     info = current() if identity is None else identity
     if (info.get("client") == "claude-desktop" and not system
@@ -224,8 +255,11 @@ def describe(data, headers, cfg=None):
                               headers.get("x-opencode-session"), data.get("conversation_id"),
                               data.get("session_id")), 160)
     title = clean(unquote(str(headers.get("x-proxi-chat-title", "")))) or clean(metadata.get("chat_title"))
+    # Claude Code names what a request is for; only its fixed vocabulary is kept.
+    request_class = clean(headers.get("x-claude-code-request-class"), 64).lower()
     info = {key: value for key, value in {"client": client, "client_session_id": session_id,
             "chat_title": title, "title_source": "client-header" if title else "",
+            "request_class": request_class if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", request_class) else "",
             "agent": clean(_first(headers.get("x-proxi-agent"), headers.get("x-claude-code-agent-id"),
                                   metadata.get("agent_id"), identity.get("agent_id")), 100),
             "parent_session_id": clean(headers.get("x-proxi-parent-session-id") or

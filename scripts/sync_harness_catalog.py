@@ -1,9 +1,11 @@
 """Sync only an existing Proxi provider in a DeepSeek Harness profile patch.
 
-Preview is read-only. --write requires an explicit same-volume backup directory.
-Other providers, credentials, plugin configuration and the selected model remain
-unchanged. Reasoning models keep the existing default and selectors; a separate
-retool-text provider avoids inheriting that default for non-reasoning models.
+Preview is read-only and masks credentials unless --include-secrets is given.
+--write requires an explicit same-volume backup directory and does nothing when
+the catalog is already current. Other providers, credentials, plugin
+configuration and the selected model remain unchanged. Reasoning models keep the
+existing default and selectors; a separate retool-text provider avoids inheriting
+that default for non-reasoning models.
 """
 import argparse
 import copy
@@ -11,12 +13,12 @@ import datetime
 from io import StringIO
 import json
 from pathlib import Path
+import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import models
-from scripts.audit_models import load_accounts
-from scripts.sync_opencode_catalog import write_backed_up
+from scripts.probe_client_settings import routable_entries
+from scripts.sync_opencode_catalog import MASK, is_secret_key, read_file, write_backed_up, write_preview
 
 
 def _copy(value):
@@ -124,13 +126,48 @@ def _semantic(value):
     return value
 
 
-def encode_document(original, document, result):
-    """Splice only Proxi provider blocks; never reserialize unrelated YAML."""
+def _yaml():
     from ruamel.yaml import YAML
-    source = original.decode('utf-8')
     yaml = YAML()
     yaml.preserve_quotes = True
     yaml.width = 4096
+    return yaml
+
+
+def decode_profile(original, label='profile'):
+    try:
+        return original.decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise ValueError('%s is not valid UTF-8 (byte offset %d); convert it to UTF-8 first'
+                         % (label, error.start)) from None
+
+
+def _problem(error):
+    """Kind and position of a YAML error; its snippet or values could hold credentials, so they are dropped."""
+    mark = getattr(error, 'problem_mark', None) or getattr(error, 'context_mark', None)
+    where = ' at line %d, column %d' % (mark.line + 1, mark.column + 1) if mark else ''
+    syntax = type(error).__name__ in ('ScannerError', 'ParserError')
+    return ((getattr(error, 'problem', None) if syntax else None) or 'invalid YAML') + where
+
+
+def load_profile(text, label):
+    from ruamel.yaml.error import YAMLError
+    try:
+        return _yaml().load(text)
+    except YAMLError as error:
+        raise ValueError('%s is not valid YAML: %s' % (label, _problem(error))) from None
+
+
+def encode_document(original, document, result):
+    """Splice only Proxi provider blocks; never reserialize unrelated YAML."""
+    from ruamel.yaml.error import YAMLError
+    source = decode_profile(original)
+    newline = '\r\n' if '\r\n' in source else '\n'
+    final_newline = source.endswith(('\n', '\r'))
+    if not final_newline:
+        # A last block has no following line start to splice up to; this ending is restored below.
+        source += newline
+    yaml = _yaml()
     root = yaml.compose(source)
     before, after = _provider_parent(document), _provider_parent(result)
     index = next(i for i, plugin in enumerate(document)
@@ -148,7 +185,6 @@ def encode_document(original, document, result):
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
-    newline = '\r\n' if '\r\n' in source else '\n'
 
     def block(provider, indent):
         output = StringIO()
@@ -174,9 +210,76 @@ def encode_document(original, document, result):
     # Apply an insertion at a replacement's end first so its bytes are retained.
     for start, end, replacement in sorted(edits, key=lambda edit: (edit[0], edit[1]), reverse=True):
         source = source[:start] + replacement + source[end:]
-    if _semantic(yaml.load(source)) != _semantic(result):
+    if not final_newline:
+        source = source.removesuffix(newline)
+    try:
+        reloaded = yaml.load(source)
+    except YAMLError as error:
+        raise ValueError('The updated profile is not valid YAML (%s); refusing to write it' % _problem(error)) from None
+    if _semantic(reloaded) != _semantic(result):
         raise ValueError('YAML serialization changed a value; refusing to write the profile')
     return source.encode('utf-8')
+
+
+def mask_profile(encoded):
+    """Profile bytes with credential values replaced by MASK; every other byte is kept."""
+    from ruamel.yaml.error import YAMLError
+    from ruamel.yaml.nodes import MappingNode, ScalarNode, SequenceNode
+    source = decode_profile(encoded)
+    yaml = _yaml()
+    try:
+        root = yaml.compose(source)
+    except YAMLError as error:
+        raise ValueError('The preview is not valid YAML: %s' % _problem(error)) from None
+    secrets, seen = {}, set()
+
+    def visit(node, secret):
+        if (id(node), secret) in seen:
+            return
+        seen.add((id(node), secret))
+        if isinstance(node, MappingNode):
+            for key, value in node.value:
+                name = key.value if isinstance(key, ScalarNode) else ''
+                visit(value, secret or is_secret_key(name, isinstance(value, MappingNode)))
+        elif isinstance(node, SequenceNode):
+            for item in node.value:
+                visit(item, secret)
+        elif secret and isinstance(node, ScalarNode) and node.value:
+            # Numbers, booleans and dates are not credentials; text and custom tags are.
+            if node.tag == 'tag:yaml.org,2002:str' or not node.tag.startswith('tag:yaml.org,2002:'):
+                secrets[id(node)] = node
+    if root is not None:
+        visit(root, False)
+    for node in sorted(secrets.values(), key=lambda item: item.start_mark.index, reverse=True):
+        start, end = node.start_mark.index, node.end_mark.index
+        text = source[start:end]
+        # Keep an anchor (aliases still resolve); drop its tag, which would not fit the masked text.
+        anchors = ''.join(re.findall(r'&\S+\s+', re.match(r'(?:(?:&\S+|!\S*)\s+)*', text).group()))
+        tail = next((ending for ending in ('\r\n', '\n', '\r') if text.endswith(ending)), '')
+        source = source[:start] + anchors + "'" + MASK + "'" + tail + source[end:]
+    try:
+        yaml.compose(source)
+    except YAMLError as error:
+        raise ValueError('Could not mask credentials in the preview safely (%s); rerun with --include-secrets '
+                         'only if the preview may hold them' % _problem(error)) from None
+    return source.encode('utf-8')
+
+
+def run(args):
+    path = Path(args.settings)
+    original = read_file(path, 'Harness profile')
+    document = load_profile(decode_profile(original, str(path)).removeprefix('\ufeff'), str(path))
+    entries = routable_entries(args.relay_config)
+    result = update_document(document, entries)
+    unchanged = _semantic(result) == _semantic(document)
+    encoded = original if unchanged else encode_document(original, document, result)
+    if args.output:
+        write_preview(args.output, encoded if args.include_secrets else mask_profile(encoded))
+    backup = write_backed_up(path, original, encoded, args.backup_dir) if args.write and not unchanged else None
+    print(json.dumps({'settings': str(path), 'models': len(entries), 'written': backup is not None,
+                      'changed': not unchanged, 'backup': str(backup) if backup else None, 'preview': args.output,
+                      'preview_redacted': bool(args.output) and not args.include_secrets}, ensure_ascii=False))
+    return 0
 
 
 def main(argv=None):
@@ -184,29 +287,18 @@ def main(argv=None):
     parser.add_argument('--settings', required=True)
     parser.add_argument('--relay-config', default=str(Path(__file__).resolve().parents[1] / 'config.json'))
     parser.add_argument('--output', help='New private preview file; never overwritten')
+    parser.add_argument('--include-secrets', action='store_true',
+                        help='Keep credentials in the --output preview; they are masked as *** by default')
     parser.add_argument('--write', action='store_true')
     parser.add_argument('--backup-dir')
     args = parser.parse_args(argv)
     if args.write and not args.backup_dir:
         parser.error('--write requires --backup-dir')
-    from ruamel.yaml import YAML
-    yaml = YAML()
-    yaml.preserve_quotes = True
-    yaml.width = 4096
-    path = Path(args.settings)
-    original = path.read_bytes()
-    document = yaml.load(original.decode('utf-8-sig'))
-    accounts = load_accounts(args.relay_config)
-    entries = [entry for entry in models.catalog() if models.catalog_routable(entry, {'accounts': accounts})]
-    result = update_document(document, entries)
-    encoded = encode_document(original, document, result)
-    if args.output:
-        with Path(args.output).open('xb') as preview:
-            preview.write(encoded)
-    backup = write_backed_up(path, original, encoded, args.backup_dir) if args.write else None
-    print(json.dumps({'settings': str(path), 'models': len(entries), 'written': bool(args.write),
-                      'backup': str(backup) if backup else None, 'preview': args.output}, ensure_ascii=False))
-    return 0
+    try:
+        return run(args)
+    except (ValueError, RuntimeError, OSError) as error:
+        print('error: %s' % error, file=sys.stderr)
+        return 1
 
 
 if __name__ == '__main__':

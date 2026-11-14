@@ -90,15 +90,22 @@ CATALOG = [
 
 _BY_ID = {m['id']: m for m in CATALOG}
 
-# Explicit registry capabilities plus the live GPT-6 Sol route probe (2026-11-05).
-# Do not infer verbosity support from a model name or reasoning capability alone.
+# Explicit registry capabilities, confirmed by live Retool route probes on 2026-11-05
+# (one question, reasoningEffort low, verbosity omitted / low / high; answer words):
+#   gpt-5 393/155/680, gpt-5.1 345/305/1242, gpt-5.2 398/315/839, gpt-5.4 413/216/570,
+#   gpt-5.5 550/264/1349, gpt-5.6-sol 229/155/750, gpt-5.6-terra 389/184/935,
+#   gpt-5.6-luna 243/160/831, gpt-6-sol 116/88/141.
+# Claude answers HTTP 200 but ignores the field (claude-sonnet-5-5: 492/470/417), so it stays out.
+# gpt-5.3-codex is unavailable on the route (_UNSUPPORTED_ROUTES) and was not probed: it keeps
+# its registry source. Do not infer verbosity support from a model name or reasoning alone.
 _VERBOSITY_MODELS = {'gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5',
                      'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-sol'}
+_VERBOSITY_LIVE = _VERBOSITY_MODELS - {'gpt-5.3-codex'}
 for _model in CATALOG:
     _model['verbosity_levels'] = ['low', 'medium', 'high'] if _model['id'] in _VERBOSITY_MODELS else []
     if _model['verbosity_levels']:
         _model['verbosity_checked_at'] = '2026-11-05'
-        _model['verbosity_source'] = ('live Retool route' if _model['id'] == 'gpt-6-sol' else
+        _model['verbosity_source'] = ('live Retool route' if _model['id'] in _VERBOSITY_LIVE else
                                       'https://retool-edge.com/assets_vjs/main-DVkrwaG2.js')
 
 # Capabilities are dated independently of local resource availability. Values

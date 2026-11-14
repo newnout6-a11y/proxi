@@ -35,6 +35,31 @@ def priority(backend):
     return value if type(value) is int else 0
 
 
+def cfg_tag(cfg):
+    """Journal label of an account config: a short hash, never the raw ID; None without an identity."""
+    cfg = cfg or {}
+    return journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
+
+
+def account_tag(backend):
+    return cfg_tag(getattr(backend, "cfg", None))
+
+
+def idle_block(backend):
+    """Why background traffic, such as idle cache warmups, must skip this account; None when it may run.
+
+    Any account the operator switched off, or the dispatcher took out of routing (`backend.unavailable`
+    is set, whatever its reason), only serves requests a client actually sends. The reason is passed
+    through, never matched against a list, so a reason added later is covered without a change here."""
+    if not enabled(backend):
+        return "disabled"
+    unavailable = getattr(backend, "unavailable", None)
+    if unavailable is None:
+        return None
+    reason = unavailable.get("reason") if isinstance(unavailable, dict) else None
+    return reason or "unavailable"
+
+
 class AccountDispatcher:
     def __init__(self, backends, cfg, managers, *, clock=time.monotonic, rng=None):
         self.backends = list(backends)
@@ -115,8 +140,7 @@ class AccountDispatcher:
 
     # -- scheduling ----------------------------------------------------------
     def _tag(self, backend):
-        cfg = getattr(backend, "cfg", None) or {}
-        return journal.tag(cfg.get("account_id") or cfg.get("page_uuid")) or "account"
+        return account_tag(backend) or "account"
 
     def _jitter(self, seconds):
         return seconds * self.rng.uniform(0.9, 1.1)

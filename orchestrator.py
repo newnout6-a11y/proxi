@@ -18,7 +18,9 @@ import journal
 import client_context
 import console_log
 import models as model_catalog
-from context import DEFAULT_RELAY_SYSTEM_PROMPT, build_system_instructions
+import structured
+from accounts import account_tag
+from context import build_system_instructions, relay_policy
 from redact import redact
 from session import SessionLease
 from upstream_attempts import MAX_ATTEMPTS, AttemptBudget
@@ -285,7 +287,7 @@ class TurnRunner:
     def _instructions(self, native_tools=False):
         if native_tools:
             if self.cfg.get('relay_system_prompt') is not None:
-                return self.cfg['relay_system_prompt']
+                return relay_policy(self.cfg['relay_system_prompt'])
             return ("[ROLE]\nYou are a coding assistant using the client's tools. "
                     "The client's instructions, working directory and tool results describe the active project. "
                     "Use those tools to inspect, edit and test that project. "
@@ -306,9 +308,7 @@ class TurnRunner:
         mode = self.cfg.get('relay_system_prompt_mode', 'standalone')
         if mode == 'standalone':
             return instructions
-        policy = self.cfg.get('relay_system_prompt')
-        if policy is None:
-            policy = DEFAULT_RELAY_SYSTEM_PROMPT
+        policy = relay_policy(self.cfg.get('relay_system_prompt'))
         if mode == 'replace':
             return policy
         return '\n\n'.join(part for part in (instructions, policy) if part)
@@ -474,24 +474,31 @@ class TurnRunner:
             is_native = bool(native_tools)
             purpose = getattr(parsed, "request_purpose", None) or client_context.request_kind(parsed)
             client_text = purpose in client_context.CLIENT_TEXT_KINDS
-            client_owns_instructions = client_text or bool(parsed.system)
+            output_spec = getattr(parsed, "structured_output", None)
+            # A blank system (an effort-only entry, a lone newline) is no instruction at all.
+            client_system = parsed.system if (parsed.system or "").strip() else ""
+            # A JSON-only reply has no room for the relay's workspace or shell protocol;
+            # a client that supplies tools keeps the relay's native-tools role as before.
+            client_owns_instructions = (client_text or bool(client_system)
+                                        or (bool(output_spec) and not native_tools))
             if client_owns_instructions:
                 # The client owns this job's system prompt and execution policy.
                 # A title/probe/permission check must not acquire relay project or shell instructions.
-                instructions = parsed.system or ""
-                if purpose not in client_context.SERVICE_KINDS:
+                instructions = client_system
+                if not client_context.keeps_client_prompt(purpose):
                     instructions = self._client_instructions(instructions)
             else:
                 instructions = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: self._instructions(native_tools=is_native))
             if cancelled.is_set():
                 raise asyncio.CancelledError()
-            if getattr(parsed, 'structured_title', False):
-                # The route lacks constrained decoding. Supply the fixed service
-                # contract as instructions and validate the complete reply later.
-                instructions += ('\n\n[SESSION TITLE OUTPUT FORMAT]\n'
-                                 'Return only one JSON object with one string field named "title". '
-                                 'Do not wrap it in Markdown fences or add any other text.')
+            if output_spec:
+                # The route lacks constrained decoding. Supply the contract as
+                # instructions; the HTTP adapter validates the complete reply.
+                instructions = "\n\n".join(part for part in (
+                    instructions, structured.instructions(output_spec, tools=bool(native_tools))) if part)
+                log("turn.structured_output", "Структурированный вывод эмулируется проверкой ответа: %s" % output_spec["kind"],
+                    "debug", output_format=output_spec["kind"], source=output_spec["source"])
             reminder = ""
             if native_tools and not direct_mode and getattr(parsed, "tool_choice", "auto") != "none":
                 reminder = self._tool_prompt(parsed)
@@ -502,8 +509,6 @@ class TurnRunner:
                     "<exec_command>command</exec_command> and stop. The relay executes it and returns output. "
                     "Do not answer that you cannot run commands."
                 )
-            if parsed.system and not client_owns_instructions:
-                instructions += "\n\n[CLIENT INSTRUCTIONS]\n" + parsed.system
             if direct_mode:
                 # Direct path keeps the stable instructions (plus tool block) as the
                 # cached system head and sends the raw client tail as the user turn.
@@ -581,6 +586,8 @@ class TurnRunner:
                     session = await self.pool.acquire(key, model_entry=parsed.entry, **scoped, **failover)
                 holder["session"] = session
                 acquired = session.session if isinstance(session, SessionLease) else session
+                # Every later event of this turn, errors included, names the account serving it.
+                trace["account"] = account_tag(getattr(acquired, "backend", None))
                 # Debit the account that actually served the turn.
                 account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
                 acquired._credits_manager = account_credits
@@ -685,6 +692,7 @@ class TurnRunner:
                         "debug", transport="direct" if direct_mode else "agent",
                         prompt_chars=len(stream_prompt or ""), attempt=empty_retries + tool_retries + exec_steps + 1)
                     first_token = False
+                    text_open = False
                     think_started = None
                     tool_started = {}
                     out.put({"type": "usage_start"})
@@ -699,8 +707,13 @@ class TurnRunner:
                                 ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
                                 log("upstream.first_token", "Первый токен через %d мс" % ttft,
                                     "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
+                            if event["type"] in ("thinking_status", "thinking_start", "thinking", "thinking_signature",
+                                                 "tool_call"):
+                                text_open = False
                             if event["type"] == "text":
-                                if not upstream_text:
+                                if not text_open and event["delta"]:
+                                    # Every text segment (text, thinking, text) opens its own answer span.
+                                    text_open = True
                                     ms = round((time.time() - holder["upstream_started_at"]) * 1000)
                                     log("upstream.text_start", "Модель начала писать текст через %d мс" % ms,
                                         "debug", ms=ms)

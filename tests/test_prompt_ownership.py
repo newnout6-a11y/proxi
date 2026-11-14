@@ -1,5 +1,6 @@
 """Explicit API instructions belong to every client, including unknown IDEs."""
 import asyncio
+import copy
 import json
 
 import pytest
@@ -289,3 +290,116 @@ def test_direct_exec_budget_counts_retained_chunks_and_trims_only_new_output(tmp
         assert any('ж' * 100 in part for part in parts)
     assert 'synthetic-command' in json.dumps(bodies[1])
     assert 'truncated to configured prompt byte limit' in json.dumps(bodies[1])
+
+
+@pytest.mark.parametrize('system', ['\n\n', ' ', '\t\n'])
+def test_blank_client_system_never_takes_the_relay_role_away(tmp_path, monkeypatch, system):
+    _, _, runner = setup(tmp_path, transport='direct', project_context=True, exec_policy='allow_all',
+                         cookie_values=[], relay_system_prompt=POLICY)
+    sent = capture_direct(monkeypatch)
+    p = request(FIRST, system='')
+    p.system = system  # what two empty effort entries used to leave behind
+    events = asyncio.run(run(runner, p))
+    assert events[-1] == {'type': 'end', 'reason': 'stop'}
+    heads = [m for m in sent[0][1]['messages'] if m['role'] == 'system']
+    assert heads == [{'role': 'system', 'content': [{'type': 'text', 'text': POLICY, 'cache': True}]}]
+
+
+def test_blank_client_system_keeps_project_and_execution_support_of_an_anonymous_relay_task(tmp_path, monkeypatch):
+    _, _, runner = setup(tmp_path, transport='direct', project_context=True, exec_policy='allowlist',
+                         cookie_values=[], command_timeout=3, command_output_limit=4000, exec_allowlist=[],
+                         context_max_bytes=6000, relay_system_prompt='USER_CONFIGURED_RELAY_SYSTEM')
+    (tmp_path / 'README.md').write_text('SYNTHETIC_PROJECT_CONTEXT', encoding='utf-8')
+    heads = []
+
+    async def stream(session, prompt, provider, tool_names=None):
+        heads.append(session._direct['head'])
+        yield {'type': 'text', 'delta': 'ok'}
+        yield {'type': 'end', 'reason': 'stop'}
+
+    monkeypatch.setattr(RelaySession, 'stream', stream)
+    p = request([{'role': 'user', 'content': 'Run my relay task'}], tools=[], system='')
+    p.system = '\n\n'
+    assert asyncio.run(run(runner, p))[-1] == {'type': 'end', 'reason': 'stop'}
+    for expected in ('SYNTHETIC_PROJECT_CONTEXT', 'LOCAL EXEC REMINDER', 'USER_CONFIGURED_RELAY_SYSTEM'):
+        assert expected in heads[0]
+
+
+@pytest.mark.parametrize('dialect', ['chat', 'responses', 'anthropic'])
+def test_effort_only_entries_leave_the_relay_role_in_place(tmp_path, monkeypatch, dialect):
+    _, _, runner = setup(tmp_path, transport='direct', project_context=True, exec_policy='allow_all',
+                         cookie_values=[], relay_system_prompt=POLICY)
+    sent = capture_direct(monkeypatch)
+    effort = {'role': 'system', 'content': [], 'output_config': {'effort': 'low'}}
+    p = request(FIRST + [effort, copy.deepcopy(effort)], system='', dialect=dialect)
+    assert p.system == '' and p.effort == 'low'
+    assert asyncio.run(run(runner, p))[-1] == {'type': 'end', 'reason': 'stop'}
+    heads = [m for m in sent[0][1]['messages'] if m['role'] == 'system']
+    assert heads == [{'role': 'system', 'content': [{'type': 'text', 'text': POLICY, 'cache': True}]}]
+    # The wire head and its cache key are byte-for-byte those of a request without the records.
+    assert asyncio.run(run(runner, request(FIRST, system='', dialect=dialect)))[-1] == {'type': 'end', 'reason': 'stop'}
+    assert sent[1][1]['messages'][0] == sent[0][1]['messages'][0]
+    assert sent[1][1]['openAICacheKey'] == sent[0][1]['openAICacheKey']
+
+
+def run_heads(tmp_path, monkeypatch, policy, mode, tools, system):
+    tmp_path.mkdir()
+    _, _, runner = setup(tmp_path, transport='direct', project_context=False, exec_policy='off',
+                         cookie_values=[], relay_system_prompt=policy, relay_system_prompt_mode=mode)
+    sent = capture_direct(monkeypatch)
+    asyncio.run(run(runner, request(FIRST, tools=tools, system=system)))
+    return [m for m in sent[0][1]['messages'] if m['role'] == 'system']
+
+
+@pytest.mark.parametrize('blank', ['   ', ' \n\t ', ' \u00a0 '])
+@pytest.mark.parametrize('system', ['', 'CLIENT_SYSTEM'])
+@pytest.mark.parametrize('tools', [[], None], ids=['text-client', 'tool-client'])
+@pytest.mark.parametrize('mode', ['standalone', 'append', 'replace'])
+def test_blank_policy_behaves_exactly_like_the_empty_policy(tmp_path, monkeypatch, mode, tools, system, blank):
+    empty = run_heads(tmp_path / 'empty', monkeypatch, '', mode, tools, system)
+    assert run_heads(tmp_path / 'blank', monkeypatch, blank, mode, tools, system) == empty
+    assert all(block['text'].strip() for message in empty for block in message['content'])
+
+
+def test_blank_policy_is_accepted_by_the_loader_and_means_no_role(tmp_path, monkeypatch):
+    for name in ('RETOOL_BASE', 'RETOOL_COOKIE', 'RETOOL_XSRF', 'RETOOL_PAGE_UUID'):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv('RELAY_API_KEY', 'synthetic-key')
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps({'base': 'https://a.invalid', 'page_uuid': 'page-a', 'ua': 'test',
+                                'cookie': 'accessToken=synthetic; xsrfToken=x', 'xsrf': 'x',
+                                'workspace_root': str(tmp_path), 'relay_system_prompt': ' \n\t '}), encoding='utf-8')
+    loaded = config.load(str(path))
+    # The stored text is kept: the admin compares the file with the running value.
+    assert loaded['relay_system_prompt'] == ' \n\t '
+    assert context.relay_policy(loaded['relay_system_prompt']) == ''
+    assert context.relay_policy('') == '' and context.relay_policy(None) == context.DEFAULT_RELAY_SYSTEM_PROMPT
+    assert context.relay_policy(POLICY) == POLICY
+    assert context.build_system_instructions('', enable_context=False, enable_local_exec=False,
+                                             system_prompt=loaded['relay_system_prompt']) == ''
+
+
+def test_client_instructions_section_is_gone_from_the_prompt_builder():
+    import inspect
+    import orchestrator
+    assert '[CLIENT INSTRUCTIONS]' not in inspect.getsource(orchestrator)
+
+
+def test_replace_mode_is_live_for_ordinary_requests_but_never_for_the_sdk_title_contract(tmp_path, monkeypatch):
+    import validate
+    from test_desktop_service_protocol import CFG, title_body
+    _, _, runner = setup(tmp_path, transport='direct', relay_system_prompt_mode='replace',
+                         relay_system_prompt='UNRELATED RELAY POLICY', cookie_values=[])
+    assert runner.cfg['relay_system_prompt_mode'] == 'replace'
+    heads = []
+
+    async def stream(session, prompt, provider, tool_names=None):
+        heads.append(session._direct['head'])
+        yield {'type': 'text', 'delta': '{"title":"Cache accounting"}'}
+        yield {'type': 'end', 'reason': 'stop'}
+
+    monkeypatch.setattr(RelaySession, 'stream', stream)
+    asyncio.run(run(runner, validate.parse_anthropic(title_body(), CFG)))
+    asyncio.run(run(runner, request(FIRST, tools=[], system='ORDINARY_CLIENT_SYSTEM')))
+    assert client_context.SDK_TITLE_PREFIX in heads[0] and 'UNRELATED RELAY POLICY' not in heads[0]
+    assert heads[1] == 'UNRELATED RELAY POLICY'

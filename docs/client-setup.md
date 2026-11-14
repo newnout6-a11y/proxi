@@ -72,12 +72,43 @@ canonical catalog from the enabled account resources. Preview with `--output`
 first; writing requires `--write --backup-dir`. The current configured pool
 publishes 27 verified routes. Its effort lists, including GPT-6's lack of xhigh,
 come from the dated route checks rather than the native provider's larger list.
+Discovery reads the whole relay config as the relay does, so root options such as
+`show_unrouted_models` apply.
+
+The script reads JSONC (comments and trailing commas, as OpenCode does). When it
+writes, it keeps the file's BOM, line endings, indentation and final-newline
+state. Rewriting removes comments, so a file that has them is refused until you
+delete them or pass `--allow-reformat`; the backup keeps the original. Nothing is
+written and no backup is made when the catalog is already current: the summary
+shows `written: false`. The `--output` preview masks credentials as `***`
+(`apiKey`, header and environment values, other token/secret/password fields);
+`--include-secrets` writes it verbatim.
+
+A reference to a removed relay model is replaced instead of left dangling, in
+`model`, `small_model`, `agent.*.model`, `command.*.model` and the deprecated
+`mode.*.model`. `small_model` and the hidden background agents (`title`, `summary`,
+`compaction`) get the first published model of the small tier (Haiku, Flash, nano,
+mini, GLM Flash), or lose the override when none is published so OpenCode chooses
+its own. Everything else gets the default model (Opus 5.5 when published). A valid
+reference keeps a `#variant` suffix only while that model still publishes it.
+Haiku's window is 200K tokens, smaller than the 1M-token models: if you compact very
+long sessions, set `agent.compaction.model` to a larger-window model yourself; the
+script touches only references to models that no longer exist.
 
 The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
 retool-relay/zai-org/GLM-5.3 --variant high`; OpenCode 2.2.5 uses `--model
 retool-relay/zai-org/GLM-5.3#high`. Version 2 rejects `--variant` before sending a
 model request. Both exact clients passed a real GLM high request through an
 isolated current-source relay; their timings and evidence are in the audit.
+
+`scripts/probe_client_settings.py` runs the installed clients against a local fake
+server with a deliberately invalid key. It finds the newest OpenCode Desktop CLI
+itself (override any client with `--executable`) and removes credential-like
+variables from the child environment. OpenCode gets no model request until its
+resolved configuration shows the fake endpoint, and the probe fails unless the fake
+server received requests, so an ignored endpoint override cannot pass silently; a
+client that ignored it would still carry only the invalid key, which the real relay
+rejects.
 
 ## DeepSeek Harness
 
@@ -101,6 +132,17 @@ keeps other bytes intact, including date headers and plugin source. The active
 provider/model and credentials are preserved. Both installed SDK versions
 passed default, off, high and rejection checks with the exact generated files;
 the SDK bundles and Desktop ASAR were not modified.
+
+The `--output` preview masks credential values (`apiKey`, header and environment
+values, tokens, passwords) as `'***'` and replaces only those values; `apiKeyEnv`
+references stay visible. `--include-secrets` writes the exact bytes. A profile that
+is already current is not rewritten and gets no backup (`written: false`). A last
+provider block without a final newline is spliced correctly and keeps that ending.
+A profile that is not UTF-8 or not valid YAML is reported with its line and column,
+never its content. Catalog discovery uses the whole relay config like the relay.
+One limit remains: a comment written directly after the Proxi block, before the next
+provider, can be dropped or repeated (ruamel attaches it to the block's last key), so
+compare the preview with the profile before `--write`.
 
 ### Historical Harness setup — 0.1.5-rc.2
 
@@ -306,6 +348,27 @@ An explicit `model_reasoning_effort` remains authoritative when set. The built-i
 server-side Responses web search is not implemented; client function tools for
 search use the ordinary tool bridge.
 
+`codex exec --output-schema FILE` sends the schema as Responses `text.format`
+(`json_schema`, `strict: true`). Retool cannot constrain decoding, so the relay
+emulates it: the schema goes into the instructions, tool turns pass through
+unchanged, and only the final reply without tool calls is checked. One outer
+Markdown fence is removed, the JSON is parsed and validated against the common
+subset of the schema (`type`, `properties`, `required`, `additionalProperties`,
+`items`, `enum`, `anyOf`, nullable, local `$ref`; unknown keywords never reject).
+Nothing of that reply reaches Codex before the check passes. An invalid reply ends
+the stream with an SSE `error` event (non-stream: `502 upstream_invalid_output`
+with `x-should-retry: false`) and its credits stay accounted. Codex then decides how
+often to ask again within its own `stream_max_retries`; every retry is a paid
+request. `x-proxi-output-format: validated-json-schema` marks the emulation, and a
+format combined with a required tool call is rejected with 422. This is
+post-validation, not constrained decoding: a live check on 2026-11-05 (`gpt-6-sol`,
+`gpt-5.5`, a `project_name`/`programming_languages` schema) returned valid bare JSON,
+which does not guarantee every model or schema.
+
+Codex also sends `prompt_cache_options` and `client_metadata` with each request. The
+relay does not forward them; it names both, without values, in
+`x-proxi-ignored-parameters` and the `request.compatibility` journal event.
+
 Codex 0.164.0 passed real source reading, patching and testing (two tests), and a
 separate real subagent spawn/wait/result round trip. See `pr-1-review.md` for
 commands, versions and limitations.
@@ -322,27 +385,130 @@ blocks are collapsed by default: `Ctrl+O` expands them;
 `showThinkingSummaries: true` enables summaries. This cannot reveal text that
 Retool has redacted or omitted.
 
+### Structured outputs, titles and side requests
+
+Claude Code sends `output_config.format` (`json_schema`) for session titles, memory
+recall and prompt hooks. Retool cannot constrain decoding, so the relay emulates it:
+the schema goes into the system instructions, the whole reply is buffered, one outer
+Markdown fence is removed, and the JSON is parsed and validated against the schema's
+common subset (`type`, `properties`, `required`, `additionalProperties`, `items`,
+`enum`, `anyOf`, nullable, local `$ref`; unknown keywords never reject). Only a
+valid reply is sent; an invalid one is a `502` with type `api_error` (a stream ends with
+an SSE `error` event, with no content), and its credits stay accounted. The 502 carries
+`x-should-retry: false` so that Claude Code does not repeat the paid request; a stream
+cannot carry that header, and Claude Code's own retries of server errors can repeat it.
+A live check on 2026-11-05 (Haiku 4.5, Sonnet 5.5) returned valid JSON for the title,
+memory recall and hook schemas; Haiku wrapped both replies in a ` ```json ` fence,
+which is removed.
+
+If a model keeps failing the check, set `CLAUDE_CODE_DISABLE_STRUCTURED_OUTPUTS=1`
+(Claude Code 2.1.288 or newer). Claude Code then stops sending `output_config.format`
+and its beta header, and titles, memory recall and hooks rely on the prompt alone.
+`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` also removes the format, together with
+other pre-release fields. A format combined with a required tool call cannot be
+emulated and gets a 422 that names this variable. `x-proxi-output-format` shows the
+emulation (`validated-json-schema`, `validated-session-title`).
+
+A title request is recognised by its schema, exactly `{title: string}` without tools,
+whatever the prompt says (Messages only: the same schema from an OpenAI-style client,
+for example ai-sdk `generateObject`, is an ordinary request). Without a schema (the
+variable above) the start of the prompt block decides, after the
+`x-anthropic-billing-header` and identity lines. Both wordings are known: "You are
+naming a coding session…" (Claude Code 2.1.234 and newer, the Agent SDK) and "Generate
+a concise, sentence-case title…" (older). A system prompt that only quotes the phrase
+further down stays an ordinary request and gets the configured relay policy.
+`output_config.task_budget` is accepted, not enforced, and named in
+`x-proxi-ignored-parameters`. A rejected request now carries the Messages error type
+`invalid_request_error` instead of `unprocessable_entity`.
+
+#### Request classes
+
+Behind a custom base URL Claude Code omits gateway hint headers unless
+`CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set (Claude Code 2.1.273 or newer). It then
+sends `x-claude-code-request-class` with `main`, `subagent`, `workflow`, `compaction`
+or `auxiliary` (titles, classifiers, summaries). For `auxiliary` and `compaction` the
+relay does not apply `relay_system_prompt_mode` `append` or `replace`: those requests
+keep their own system prompt and output format. Sessions, isolation and cache scopes
+stay as they are; only the policy changes. Other classes, and requests without the
+header, still get the configured policy. The class appears in the journal entries of
+the request. Without the header only the recognised service kinds (titles, Auto mode
+check, connection probe) are protected.
+
 ## Claude Desktop on Windows
 
-The installed 4.4212.0.0 Code-mode client reads its gateway policy from
-`HKCU\Software\Policies\Claude`. Its native discovery filters the relay's
-27 routes to 11 currently available Claude models. It does not accept GPT or
-GLM merely because those models speak the same API; do not invent Anthropic
-family tiers for them.
+The installed 4.4212.0.0 client reads its configuration from one source, chosen
+in this order ([sources](https://claude.com/docs/third-party/claude-desktop/configuration-format),
+[MDM](https://claude.com/docs/third-party/claude-desktop/mdm)):
 
-A nonempty `inferenceModels` policy is the authoritative list. Enabling
-discovery alone enriches those rows and does not add missing models. The
-maintainer `scripts/sync_claude_desktop_catalog.py` previews the compatible
-Claude subset and updates only that model-list value with `--write
---backup-dir PATH`. The endpoint, key, authentication scheme, high default and
-all other policies are preserved. The installed policy now contains all 11
-Claude routes instead of only Opus/Sonnet 5.5.
+1. machine policy `HKLM\SOFTWARE\Policies\Claude`; while any value exists there,
+   `HKCU` is ignored entirely;
+2. user policy `HKCU\SOFTWARE\Policies\Claude`;
+3. the local `%LOCALAPPDATA%\Claude-3p\configLibrary\`: `_meta.json` names the
+   applied `<id>.json`, whose `inferenceModels` is a native JSON array.
 
-Native picker levels vary by model: a max cap on older five-level rows would
-offer the route-rejected xhigh. Those rows are capped at high; Opus 4.6 and
-Sonnet 4.6 keep their valid four-level max. Unknown 5.5 rows have no built-in
-effort selector in this installed version; setting their policy does not claim
-the GUI gained one. Their gateway default remains high.
+A policy that sets any key other than the app-behavior keys (updates,
+relaunch/re-check, proxy) makes Desktop ignore the whole local configuration,
+gateway URL and key included. Registry values are `REG_SZ` strings holding JSON.
+On the audited machine neither policy key exists: `main.log` for the launches of
+2026-11-03, 2026-11-04 and 2026-11-05 02:37 reports `type: 'local'`,
+`managedKeys: []` and `picker = 3 (inferenceModels)`, so the list comes from the
+applied configLibrary file.
+
+The maintainer `scripts/sync_claude_desktop_catalog.py` detects that source the
+same way and previews or updates only its `inferenceModels` list. `--source
+auto|hkcu|local` states which source you expect (default `auto`); a mismatch is
+an error, never a silent write to a source Desktop ignores. `--write
+--backup-dir PATH` replaces a configLibrary file atomically (the backup must be
+on the same volume) or updates the existing `HKCU` value in place, after saving
+the old content. A configLibrary backup holds the gateway settings: keep it
+private. Quit Desktop first: it reads its configuration at launch. Every other
+key, the endpoint, the gateway key and the authentication scheme stay untouched.
+The script never writes `HKLM` and never creates a policy: a policy that sets any
+other key would switch Desktop away from its working local configuration, so
+with no policy the local file is the target. It also refuses to add a model list
+where none exists, because a static list replaces model discovery. A missing
+Desktop configuration, invalid JSON or a policy it must not touch end in a plain
+error message, not a traceback.
+
+A nonempty `inferenceModels` list is authoritative: enabling discovery alone
+enriches its rows and does not add missing models. The first row is Desktop's
+default model. The script keeps existing rows in order with every field it does
+not derive (`labelOverride`, `supports1m`, `behavesAs` and so on), appends new
+models at the end and moves the first row only for an explicit `--default-model`;
+a current default that is no longer available is an error, not a silent
+replacement. It owns `isFamilyDefault`, `anthropicFamilyTier` and `maxEffort`,
+and gives new rows the relay's label.
+
+Which models: the relay exposes 27 routes and the script selects the verified
+Claude ones (`provider` anthropic with a `claude-` prefix), currently 11. That is
+the script's own selection, not a subset Desktop computes; Desktop only drops
+list entries that do not name an Anthropic model. GPT and GLM are not accepted
+merely because they speak the same API; do not invent Anthropic family tiers for
+them. When Anthropic's catalog cache is readable (`--desktop-catalog PATH`,
+default `%LOCALAPPDATA%\Claude-3p\model-catalog\published.json`) only models it
+lists for Code or Cowork are included: 9 of the 11 in catalog version 4008.
+`claude-opus-4-5-20251101` appears only as a disabled chat model and
+`claude-sonnet-4-5-20250929` is absent, so Code has no metadata or effort
+selector for them. `--include-unlisted` keeps them. Without a catalog file all 11
+are listed, with a warning.
+
+`maxEffort` hides every level above it, so a cap cannot skip a level. The relay
+rejects `xhigh` unless `allow_effort_downgrade` is true in its configuration:
+
+| Model | Desktop picker | `maxEffort`, downgrade off | downgrade on |
+| --- | --- | --- | --- |
+| Opus 5.5, 5, 4.8, 4.7; Sonnet 5.5, 5 | low, medium, high, xhigh, max | `high` | `max` |
+| Opus 4.6, Sonnet 4.6 | low, medium, high, max | `max` | `max` |
+| Haiku 4.5, Opus 4.5, Sonnet 4.5 | no effort selector | not set | not set |
+
+With the setting off, five-level rows stop at `high`: Desktop does not offer `max`
+even though the relay accepts it, because a `max` cap would also expose `xhigh`.
+With it on, the script sets `max`; the relay serves `xhigh` as `high` and `max` as
+`max`. Haiku 4.5, Opus 4.5 and Sonnet 4.5 have no native effort. Claude Code's
+[effort table](https://code.claude.com/docs/en/model-config#adjust-effort-level)
+says "Models not listed here do not support effort" and Anthropic's Haiku 4.5
+page says "Default effort: Not supported". A readable catalog's effort levels
+take precedence over this table.
 
 The installed ASAR's actual discovery/filter/merge/picker functions and bundled
 Agent SDK were executed without Electron or UI input. Exact SDK wrapper
@@ -367,8 +533,8 @@ has a bounded, buffered post-validation path. A sole JSON Markdown fence may be
 removed; the object must still contain exactly one string `title`, no duplicate
 keys and a complete normal finish. Invalid output becomes an error before any
 title content is emitted. `x-proxi-output-format: validated-session-title`
-identifies this service exception; arbitrary structured-output schemas remain
-unsupported. This is validation/normalization, not native constrained decoding.
+marks this case; other schemas use the same emulation described under Claude Code.
+This is validation/normalization, not native constrained decoding.
 
 ## IDE commands and subagents
 
