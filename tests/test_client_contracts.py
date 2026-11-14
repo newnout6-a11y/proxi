@@ -153,7 +153,8 @@ def test_codex_catalog_advertises_direct_client_tools_and_actual_route_capabilit
     assert native["input_modalities"] == ["text", "image"]
     assert native["supports_reasoning_summary_parameter"] is True
     assert native["default_reasoning_summary"] == "detailed"
-    assert [value["effort"] for value in native["supported_reasoning_levels"]] == entry["reasoning_effort_levels"]
+    assert [value["effort"] for value in native["supported_reasoning_levels"]] == entry["reasoning_effort_levels"] + ["ultra"]
+    assert native["multi_agent_version"] == "v2"  # Ultra delegates only on a model that says v2
     assert native["default_reasoning_level"] in entry["reasoning_effort_levels"]
     assert native["model_messages"]["instructions_template"] == native["base_instructions"]
     assert native["use_responses_lite"] is False
@@ -242,11 +243,12 @@ def test_codex_namespace_tools_keep_the_client_namespace_and_call_identity():
             {"type": "function_call_output", "call_id": "call_agent", "output": "agent-id"},
         ]), CFG)
     definition = parsed.tools[0]["function"]
-    assert definition["name"] == "multi_agent_v1.spawn_agent"
+    # one name upstream accepts (OpenAI: ^[a-zA-Z0-9_-]{1,64}$), the namespace and the client's name kept beside it
+    assert definition["name"] == "multi_agent_v1__spawn_agent"
     assert definition["x-client-name"] == "spawn_agent"
     assert definition["x-namespace"] == "multi_agent_v1"
     assert parsed.tool_choice["function"]["name"] == definition["name"]
-    assert "tool_call multi_agent_v1.spawn_agent id=call_agent" in parsed.prompt
+    assert "tool_call multi_agent_v1__spawn_agent id=call_agent" in parsed.prompt
 
 
 def test_image_input_is_rejected_rather_than_replaced_with_a_text_placeholder():

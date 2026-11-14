@@ -11,6 +11,7 @@ import hashlib
 import http.client
 import json
 import pathlib
+import re
 import socket
 import threading
 import time
@@ -713,12 +714,19 @@ def _bounded_put(loop, queue, item, is_cancelled, max_wait=120.0):
     return True
 
 
+# How providers word a refusal of an input past the model's context window (Retool passes the provider's sentence on).
+_CONTEXT_EXCEEDED = re.compile(r"(?i)exceeds? the context window|context[ _]length[ _]exceeded|maximum context length"
+                               r"|prompt is too long|input is too long for")
+
+
 def _error_from_event(event):
     message = event.get("error")
     if isinstance(message, dict):
         message = message.get("message")
     status = event.get("statusCode")
     text = str(message or "upstream stream error")
+    if status in (400, 413, None) and _CONTEXT_EXCEEDED.search(text):
+        return apierr.context_length_exceeded(text)
     if status in (429, None) and apierr.is_hourly_limit(text):
         # The hourly managed-key quota belongs to the account, not to this one request.
         return apierr.account_rate_limited(text)

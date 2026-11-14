@@ -45,6 +45,8 @@ def test_each_relay_code_has_an_explicit_entry_and_a_code_codex_handles_as_inten
         assert mapped not in CODEX_NO_RETRY, 'Codex has to ask again after a temporary failure'
     elif code == 'insufficient_credits':
         assert mapped == 'insufficient_quota'
+    elif code == 'context_length_exceeded':
+        assert mapped == 'context_length_exceeded' and mapped in CODEX_NO_RETRY  # Codex's own code, no retry
     else:
         assert mapped in CODEX_PRINTS_MESSAGE, 'the failure is final and the user reads why'
 

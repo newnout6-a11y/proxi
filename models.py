@@ -591,12 +591,18 @@ def codex_catalog(entries=None, snapshot=None):
         default = entry.get('default_reasoning_effort')
         if default not in efforts:
             default = 'medium' if 'medium' in efforts else (efforts[0] if efforts else None)
+        levels = [{'effort': effort, 'description': effort.title() + ' reasoning effort'} for effort in efforts]
+        # Codex's Ultra: maximum reasoning plus proactive multi-agent delegation, which Codex runs itself. It sends max
+        # for it (openai/codex df1199f, 7f135e1) and grants the delegation only to a model whose entry says
+        # multi_agent_version v2, so a route that takes max takes Ultra as well.
+        delegation = 'max' in efforts
+        if delegation:
+            levels.append({'effort': 'ultra', 'description': 'Maximum reasoning with automatic task delegation'})
         result.append({
             'slug': entry['id'], 'display_name': entry.get('label', entry['id']),
             'description': 'Retool relay: ' + entry.get('label', entry['id']),
             'default_reasoning_level': default,
-            'supported_reasoning_levels': [{'effort': effort, 'description': effort.title() + ' reasoning effort'}
-                                           for effort in efforts],
+            'supported_reasoning_levels': levels,
             'shell_type': 'unified_exec', 'visibility': 'list', 'supported_in_api': True,
             'priority': index, 'additional_speed_tiers': [], 'service_tiers': [],
             'default_service_tier': None, 'availability_nux': None, 'upgrade': None,
@@ -622,6 +628,8 @@ def codex_catalog(entries=None, snapshot=None):
             'use_responses_lite': False, 'supports_reasoning_effort_updates': False,
             'node_repl_disabled': True, 'tool_mode': 'direct',
         })
+        if delegation:
+            result[-1]['multi_agent_version'] = 'v2'
     return {'models': result}
 
 

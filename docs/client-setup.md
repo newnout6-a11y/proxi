@@ -482,7 +482,10 @@ model_catalog_url = "http://127.0.0.1:8787/codex/models"
 ```
 
 The native catalog supplies each model's recommended effort and valid selector
-levels, plus `exec_command`, freeform `apply_patch`, and namespace tool support.
+levels, plus `exec_command`, freeform `apply_patch`, and namespace tool support. Codex 0.166 sends
+its MCP servers as namespaces (`mcp__blender` holding `look`); upstream such a tool is
+`mcp__blender__look` (OpenAI accepts only `^[a-zA-Z0-9_-]{1,64}$`, a longer name is shortened
+with a hash), and the reply names it to Codex by its namespace and short name again.
 An explicit `model_reasoning_effort` remains authoritative when set. The built-in
 server-side Responses web search is not implemented; client function tools for
 search use the ordinary tool bridge.

@@ -58,7 +58,7 @@ def test_the_hint_names_the_level_that_would_replace_an_unsupported_one():
     assert 'turn reasoning off' not in str(error.value)
 
 
-@pytest.mark.parametrize('value', ['extra', 'ultra', 'LOUD'])
+@pytest.mark.parametrize('value', ['extra', 'huge', 'LOUD'])  # not ultra: Codex's name for max (test_codex_ultra.py)
 def test_no_hint_where_the_setting_cannot_help(value):
     with pytest.raises(apierr.ApiError) as error:
         parse('chat', 'claude-opus-5-5', {'reasoning_effort': value})
