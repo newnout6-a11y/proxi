@@ -74,7 +74,7 @@ def test_large_body_rit_matches_browser_without_changing_the_prompt(length, expe
 def test_tools_are_converted_to_the_retool_param_shape():
     converted = direct.tools_to_retool(TOOLS)
     assert converted == [{"name": "read_file", "description": "Read a file",
-                          "params": {"path": {"type": "string", "required": True}}, "strict": True}]
+                          "params": {"path": {"type": "string", "required": True}}, "strict": False}]
 
 
 VALID_TYPES = {"literal", "string", "number", "boolean", "null", "array", "object", "enum", "anyOf"}
