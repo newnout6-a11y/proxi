@@ -51,7 +51,10 @@ DEFAULTS = {
     # same account, when the conversation's next request creates its session.
     "conversation_state": True,
     "conversation_state_dir": "",
-    "conversation_state_max_conversations": 200,
+    # 200 were too few: the tests of six agents filled them in an hour, and the stored states of the owner's idle chats
+    # (Claude Desktop, Codex Desktop) were dropped 43-55 minutes after their last turn, while the store held 22 MB of
+    # its 512 MiB (journal watch of 2026-11-07). A state is about 110 KB compressed on average.
+    "conversation_state_max_conversations": 1000,
     "conversation_state_ttl": 86400,  # seconds a stored conversation is kept after its last turn
     "conversation_state_max_file_bytes": 32 * 1024 * 1024,   # one conversation, as stored (compressed)
     "conversation_state_max_total_bytes": 512 * 1024 * 1024,  # the whole directory
@@ -109,10 +112,12 @@ DEFAULTS = {
     # it is off by default.
     "stabilize_client_prompts": True,
     "stable_prompt_date": False,
-    # Codex declares its MCP tools late (request 1: 44-46 tools, request 2: 50-60), and each change rewrites the cache.
-    # A client of these families is given the union of the tools it declared before and this request's, per project,
-    # so the list the model sees stops changing; [] switches it off. A tool not declared for tool_union_ttl seconds is dropped.
-    "tool_union_clients": ["codex"],
+    # Codex declares its MCP tools late (request 1: 44-46 tools, request 2: 50-60), and so does Claude Code when an MCP server
+    # connects after its first request (59 -> 90 tools, 107k tokens written); each change rewrites the cache. A client of these
+    # families is given the union of the tools it declared before and this request's, per project (and per kind of agent),
+    # kept in conversation_state_dir between runs, so the list the model sees stops changing; [] switches it off. A tool not
+    # declared for tool_union_ttl seconds is dropped.
+    "tool_union_clients": ["codex", "claude-code"],
     "tool_union_ttl": 6 * 3600,
     # Claude Code (2.1.305 and later) defers its MCP tools behind ToolSearch when the base URL is a gateway, and every tool the
     # model loads changes the tool list, which rewrites the whole cached conversation. "eager" answers a request that carries

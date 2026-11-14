@@ -153,7 +153,8 @@ def test_reasoning_effort_clamping_and_preservation():
     entry_haiku, effort_haiku = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh", allow_downgrade=True)
     assert effort_haiku is None
     entry_opus_high, effort_opus_high = models.resolve_tolerant("claude-opus-5-5", "xhigh", allow_downgrade=True)
-    assert effort_opus_high == "high"
+    assert effort_opus_high == "max"  # never lowered; the relay's claude_xhigh_effort (high by default) maps it to high
+    assert models.resolve_tolerant("claude-opus-5-5", "xhigh", allow_downgrade=True, xhigh_as="high")[1] == "high"
 
     # 4. GLM Flash ignores effort as well.
     entry_glm, effort_glm = models.resolve_tolerant("zai-org/GLM-5.3-Flash", "high", allow_downgrade=True)

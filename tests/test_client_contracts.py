@@ -282,13 +282,16 @@ def test_unknown_tool_choice_is_rejected_before_provider_request():
         validate.parse_responses(_body("responses", tool_choice={"type": "function", "name": "missing"}), CFG)
     assert raised.value.status == 422
 def test_unsupported_effort_is_clamped_to_the_nearest_supported_level():
+    # Never lower while the route has a level above: xhigh -> max. The owner's Claude mapping (claude_xhigh_effort, high by
+    # default), which every request path passes, is what turns it into high.
     entry, effort = models.resolve_tolerant("claude-opus-5-5", "xhigh", allow_downgrade=True)
     assert effort in entry["reasoning_effort_levels"]
-    assert effort == "high"
+    assert effort == "max"
+    assert models.resolve_tolerant("claude-opus-5-5", "xhigh", allow_downgrade=True, xhigh_as="high")[1] == "high"
     entry, effort = models.resolve_tolerant("gpt-5.5", "minimal", allow_downgrade=True)
     assert effort == "low"
     entry, effort = models.resolve_tolerant("gpt-6-sol", "xhigh", allow_downgrade=True)
-    assert effort == "high"
+    assert effort == "max"  # the level above, never the one below (ties used to go down to high)
 
 
 def test_effort_no_provider_defines_is_rejected_not_clamped():

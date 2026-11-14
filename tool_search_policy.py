@@ -85,3 +85,13 @@ class LoopGuard:
             while len(self._seen) > self._max:
                 self._seen.popitem(last=False)
             return allowed
+
+    def forgive(self, key):
+        """The conversation sent a request without tool search: the refusals before it worked, so they no longer count.
+
+        Claude Code asks for tool search again after every compaction (two refusals each), and the count of all refusals
+        of a conversation tripped the guard at the third compaction within ten minutes: the deferred list was served, the
+        tools went 29 -> 15 and the history was written again (23,247 tokens, 9bf6cbebe345, Claude Code test run of
+        2026-11-07). Only refusals in a row, with no request in between that complied, make a loop."""
+        with self._lock:
+            self._seen.pop(key, None)

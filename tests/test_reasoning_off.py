@@ -54,7 +54,7 @@ def test_a_route_that_has_none_honours_it_with_or_without_the_setting(model, dia
 def test_the_hint_names_the_level_that_would_replace_an_unsupported_one():
     with pytest.raises(apierr.ApiError) as error:
         parse('chat', 'claude-opus-5-5', {'reasoning_effort': 'minimal'})
-    assert 'allow_effort_downgrade' in str(error.value) and 'nearest level, low' in str(error.value)
+    assert 'allow_effort_downgrade' in str(error.value) and 'use low instead' in str(error.value)
     assert 'turn reasoning off' not in str(error.value)
 
 

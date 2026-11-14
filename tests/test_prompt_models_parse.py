@@ -186,7 +186,8 @@ def test_an_explicit_effort_beats_the_suffix_and_the_default_model_may_carry_a_p
 
 def test_effort_downgrade_still_works_behind_a_profile(capsys):
     entry, effort = models.resolve_tolerant("claude-opus-5-5@mine#xhigh", allow_downgrade=True)
-    assert (entry["id"], effort) == ("claude-opus-5-5", "high")
+    assert (entry["id"], effort) == ("claude-opus-5-5", "max")  # the level above; claude_xhigh_effort would give high
+    assert models.resolve_tolerant("claude-opus-5-5@mine#xhigh", allow_downgrade=True, xhigh_as="high")[1] == "high"
     refused(lambda: models.resolve_tolerant("claude-opus-5-5@mine#xhigh"), param="reasoning_effort")
     capsys.readouterr()
 

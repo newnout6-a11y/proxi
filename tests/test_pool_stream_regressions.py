@@ -30,11 +30,11 @@ def pool_config(**overrides):
 
 
 @pytest.mark.parametrize("model,requested,effective", [
-    ("claude-opus-5-5", "xhigh", "high"),
+    ("claude-opus-5-5", "xhigh", "max"),   # the level above; claude_xhigh_effort is what maps Claude's xhigh to high
     ("claude-opus-5-5", "max", "max"),
-    ("gpt-6-sol", "xhigh", "high"),
+    ("gpt-6-sol", "xhigh", "max"),         # the level above, never the one below
     ("gpt-6.1-sol", "max", "max"),
-    ("gpt-5.5", "xhigh", "high"),
+    ("gpt-5.5", "xhigh", "high"),          # past the route's top: its top
 ])
 def test_explicit_effort_compatibility_mapping(model, requested, effective):
     entry, got = models.resolve_tolerant(model, requested, allow_downgrade=True)

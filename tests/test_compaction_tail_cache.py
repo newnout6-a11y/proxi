@@ -52,6 +52,18 @@ def test_a_flattened_compaction_has_no_hint_on_the_conversation_it_flattens(prom
     assert flags(body) == ["F", "-"]  # the system prompt is cached, the whole conversation is not written to the cache
 
 
+def test_a_flattened_compaction_sent_as_two_messages_writes_neither(prompt_relay):
+    """OpenCode 2.2.6 sends the flattened dialog and the instruction as two user messages: the dialog was hinted and written
+    (2,281 and 3,075 tokens, v3 run of 2026-11-07, 3d0b8da709e7, 6a61f23eef9b), though the summary replaces it."""
+    relay = prompt_relay()
+    request_ = client_request("chat", [{"role": "user", "content": CONVERSATION},
+                                       {"role": "user", "content": "Summarize the conversation above."}],
+                              system=OC_COMPACT, tools=False, model="claude-sonnet-5-5")
+    status, payload, _ = relay.post("chat", request_, OPENCODE)
+    assert status == 200, payload
+    assert "F" not in "".join(flags(relay.posts[-1])[1:])
+
+
 def test_the_same_request_of_another_purpose_is_cached_at_its_end_as_before(prompt_relay):
     relay = prompt_relay()
     body = flattened("You are a helpful assistant.", relay)
@@ -81,7 +93,8 @@ def test_a_compaction_of_a_history_that_cannot_resume_is_marked_up_to_what_prece
     rows = flags(summary)
     assert rows[0] == "F"
     assert "F" not in rows[-1]
-    assert any("F" in row for row in rows[1:-1])
+    # Nothing of a history the chat had not cached under this prefix is written: the client replaces it by the summary.
+    assert not any("F" in row for row in rows[1:-1])
 
 
 # --- the two builders ----------------------------------------------------------------------------------------------
@@ -95,18 +108,22 @@ def test_build_body_leaves_the_last_chunk_unmarked_when_asked():
     unmarked = direct.build_body(cfg, {"model": "m"}, "head", "", None, None, 100, chunks=CHUNKS, mark_tail=False)
     # the head, then the chunks: the default is what it was, and the instruction is the only chunk that changes
     assert flags(marked) == ["F", "F", "-", "F", "F"]
-    assert flags(unmarked) == ["F", "F", "F", "F", "-"]
+    # A compaction without a hint of the chat to read writes none of the chunks: the summary replaces them.
+    assert flags(unmarked) == ["F", "-", "-", "-", "-"]
     only = direct.build_body(cfg, {"model": "m"}, "head", "", None, None, 100, chunks=["User: one flattened text"],
                              mark_tail=False)
     assert flags(only) == ["F", "-"]
 
 
 def test_build_body_still_hints_a_last_chunk_that_is_not_the_tail():
-    # an image-only last chunk cannot carry a hint: the newest text chunk before it is not the instruction
+    # an image-only last chunk cannot carry a hint: the newest text chunk before it gets it in an ordinary request
     image = [{"type": "image", "imageData": "AAAA", "mimeType": "image/png"}]
     body = direct.build_body({"direct_cache": True}, {"model": "m"}, "head", "", None, None, 100,
-                             chunks=["User: u1", "Assistant: a1", image], mark_tail=False)
+                             chunks=["User: u1", "Assistant: a1", image])
     assert "F" in flags(body)[2]  # the last chunk with text, the assistant's message
+    compaction = direct.build_body({"direct_cache": True}, {"model": "m"}, "head", "", None, None, 100,
+                                   chunks=["User: u1", "Assistant: a1", image], mark_tail=False)
+    assert flags(compaction)[1:] == ["-", "-", "-"]  # a compaction with no hint of the chat to read writes nothing new
 
 
 def native(extra_flag=None):

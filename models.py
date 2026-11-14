@@ -778,10 +778,17 @@ def canonical_name(name):
 
 
 def nearest_effort(levels, requested):
-    """Closest level the route accepts; ties resolve downwards."""
+    """The level a route serves a request for `requested` at, when it lacks that level: never a lower one while it has a
+    higher one. The lowest level above the request, else the route's highest (a model cannot think more than its most).
+
+    Ties used to go downwards, so xhigh on a route with high and max (gpt-6.1-sol, gpt-6.1-terra) was served as high:
+    the effort a client asked for was lowered although the route had a level above it (Codex test run of 2026-11-07,
+    4bc53834, 7c35b682). The owner's rule is that the relay never lowers an effort; a level past the route's top (max on
+    gpt-5.5, whose top is high) is served at that top, the most the model takes."""
     wanted = _EFFORT_RANK.get(str(requested or "").lower(), _EFFORT_RANK["medium"])
-    return min(levels, key=lambda level: (abs(_EFFORT_RANK.get(level, wanted) - wanted),
-                                          _EFFORT_RANK.get(level, wanted)))
+    ranked = sorted(levels, key=lambda level: _EFFORT_RANK.get(level, wanted))
+    above = [level for level in ranked if _EFFORT_RANK.get(level, wanted) >= wanted]
+    return above[0] if above else ranked[-1]
 
 
 def _effort_controls_sent(data):
@@ -885,7 +892,7 @@ def _setting_hint(effort, allowed):
     if level == 'none':
         return ('; this model cannot turn reasoning off (thinking disabled and effort none ask for that). '
                 + enable + 'use its lowest level, %s, instead' % nearest)
-    return '. ' + enable + 'use the nearest level, %s, instead' % nearest
+    return '. ' + enable + 'use %s instead (the lowest level above it, or the top of this model)' % nearest
 
 
 def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False, xhigh_as=None):

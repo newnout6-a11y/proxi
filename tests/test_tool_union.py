@@ -198,10 +198,58 @@ def test_a_sub_agent_and_a_different_originator_keep_their_own_lists(prompt_rela
 
 def test_other_clients_get_exactly_the_tools_they_declare(prompt_relay):
     relay = prompt_relay()
-    claude = {"user-agent": "claude-cli/2.1.310 (external, sdk-cli)", "x-claude-code-session-id": "s1"}
-    send(relay, ["a", "b", "c"], claude)
-    send(relay, ["a", "b"], claude)
+    opencode = {"user-agent": "opencode/1.19.3 ai-sdk/provider-utils/3.0.20 runtime/bun/1.3.5", "x-opencode-session": "s1"}
+    send(relay, ["a", "b", "c"], opencode)
+    send(relay, ["a", "b"], opencode)
     assert names_upstream(relay) == ["a", "b"] and len(relay.runtime.tool_union) == 0
+
+
+def test_a_claude_code_session_that_starts_before_its_mcp_server_declares_the_tools_the_server_will_bring(prompt_relay):
+    """Claude Code starts MCP servers in the background: request 1 of an interactive session can go out without a slow
+    server's tools (59 against 90 in a real session, 107,650 tokens written by request 2). A later session of the project
+    is given the tools its sessions declared before, so nothing changes upstream when the server comes up."""
+    relay = prompt_relay()
+    claude = {"user-agent": "claude-cli/2.1.310 (external, cli)", "x-claude-code-session-id": "s1"}
+    send(relay, ["a", "b", "c"], claude)
+    send(relay, ["a", "b"], dict(claude, **{"x-claude-code-session-id": "s2"}))
+    assert names_upstream(relay) == ["a", "b", "c"]
+
+
+CLAUDE_CODE_SYSTEM = ("You are Claude Code, Anthropic's official CLI for Claude.\n\nYou are an interactive agent.\n\n<env>\n"
+                      " - Primary working directory: C:\\work\\proj\n - Is a git repository: true\n</env>")
+
+
+def claude_code(relay, session, attribution, names, deferred=()):
+    """A Claude Code request as it is sent: Messages, the attribution line first (its version ends in three characters
+    drawn from the session's first message), the environment bullet, and maybe tool search (tools with defer_loading)."""
+    body = client_request("anthropic", [{"role": "user", "content": "inspect ORIGINAL_TASK"}],
+                          system=[{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.310.%s; "
+                                                           "cc_entrypoint=cli;" % attribution},
+                                  {"type": "text", "text": CLAUDE_CODE_SYSTEM}], tools=False)
+    body["tools"] = ([{"name": name, "description": "does " + name, "input_schema": SCHEMA} for name in names]
+                     + [{"name": name, "description": "does " + name, "input_schema": SCHEMA, "defer_loading": True}
+                        for name in deferred])
+    relay.scripts.append([text("ok"), *END])
+    headers = {"user-agent": "claude-cli/2.1.310 (external, cli)", "x-claude-code-session-id": session}
+    status, payload, _ = relay.post("anthropic", body, headers)
+    assert status == 200, payload
+    return names_upstream(relay)
+
+
+def test_claude_code_sessions_of_a_project_share_their_tools_whatever_their_attribution(prompt_relay):
+    relay = prompt_relay()
+    assert claude_code(relay, "s1", "2e4", ["a", "b", "c"]) == ["a", "b", "c"]
+    assert claude_code(relay, "s2", "6cd", ["a", "b"]) == ["a", "b", "c"]
+
+
+def test_a_request_with_tool_search_neither_feeds_the_union_nor_is_given_it(prompt_relay):
+    """Served as it asks (claude_tool_search "native", or after a loop), a request with tool search declares the deferred
+    list: the eager sessions' tools are not added to it, and its ToolSearch and deferred tools reach no other session."""
+    relay = prompt_relay(claude_tool_search="native")
+    claude_code(relay, "s1", "2e4", ["a", "b", "c"])
+    deferred = claude_code(relay, "s2", "6cd", ["a", "ToolSearch"], deferred=["mcp__srv__slow"])
+    assert "b" not in deferred and "c" not in deferred
+    assert claude_code(relay, "s3", "29f", ["a", "b"]) == ["a", "b", "c"]
 
 
 def test_the_union_can_be_switched_off(prompt_relay):

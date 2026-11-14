@@ -103,7 +103,8 @@ def test_without_the_flag_the_hints_an_earlier_body_put_on_a_result_are_taken_of
 def test_a_compaction_leaves_the_last_result_unmarked():
     placed = native_history.cache_messages(dialog(2), True, TOOLS, mark_tail=False, tool_results=True)
     assert ("result", 5) not in hinted(placed)  # the last message is the tail
-    assert hinted(placed) == [("block", 0), ("block", 4)]  # the newest hint stands before it, as it would without results
+    # Nothing the chat did not cache is hinted in a compaction: the client replaces its history by the summary.
+    assert hinted(placed) == [("block", 0)]
 
 
 def test_the_input_is_not_changed():
@@ -162,7 +163,10 @@ def test_a_compaction_reads_the_last_result_of_the_chat_and_does_not_hint_its_ow
     chat.work(2)
     summary = chat.compact(effort="max")
     kinds = hinted(summary["messages"])
-    assert ("result", [i for i, m in enumerate(summary["messages"]) if m["role"] == "tool"][-1]) in kinds
+    results = [i for i, m in enumerate(summary["messages"]) if m["role"] == "tool"]
+    # The compaction reads the chat up to the hint of its last request (the result before the newest one) and writes
+    # nothing new: the newest result and the instruction carry no hint, as the client replaces its history by the summary.
+    assert ("result", results[-2]) in kinds and ("result", results[-1]) not in kinds
     assert all(index != len(summary["messages"]) - 1 for _, index in kinds)
 
 

@@ -59,7 +59,11 @@ def test_a_route_that_is_not_claude_keeps_rejecting_xhigh_until_the_downgrade_se
     with pytest.raises(apierr.ApiError) as error:
         parse("chat", model, {"reasoning_effort": "xhigh"}, claude_xhigh_effort="max")
     assert error.value.status == 400
-    assert parse("chat", model, {"reasoning_effort": "xhigh"}, allow_effort_downgrade=True).effort == "high"
+    # With the setting on, a level the route lacks is served at the lowest level above it (max where the route has it),
+    # never a lower one; a route whose top is high serves its top.
+    levels = models.resolve(model)[0].get("reasoning_effort_levels") or ()
+    assert parse("chat", model, {"reasoning_effort": "xhigh"}, allow_effort_downgrade=True).effort == (
+        "max" if "max" in levels else "high")
 
 
 @pytest.mark.parametrize("model", ["claude-haiku-4-5-20251001", "zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash"])
@@ -88,7 +92,8 @@ def test_a_configured_default_of_xhigh_follows_the_same_choice():
     assert models.effective_effort(opus, None, "xhigh", "max") == "max"
     assert models.effective_effort(opus, None, "XHIGH", "max") == "max"
     assert models.effective_effort(opus, "low", "xhigh", "max") == "low"  # what the client sent is not touched
-    assert models.effective_effort(models.resolve("gpt-6-sol")[0], None, "xhigh", "max") == "high"  # the nearest level
+    # A route that is not Claude takes the lowest level above xhigh, never a lower one.
+    assert models.effective_effort(models.resolve("gpt-6-sol")[0], None, "xhigh", "max") == "max"
 
 
 # --- the configuration ---------------------------------------------------------------------------------------------------
