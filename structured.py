@@ -28,14 +28,19 @@ _TYPES = {
 }
 
 
-def instructions(spec, tools=False):
-    """Tell the model the contract; the adapter enforces it afterwards."""
+def instructions(spec, tools=False, tool_choice='auto'):
+    """Tell the model the contract; the adapter enforces it afterwards.
+
+    The tools sentence appears only when the model may call a tool: declared tools that
+    `tool_choice: none` forbids get the toolless contract. The text of the two usual cases is part of
+    the cached head and must not change.
+    """
     if spec['kind'] == 'json_object':
         shape = 'exactly one JSON object'
     else:
         shape = 'exactly one JSON value that conforms to the JSON Schema below'
     lead = ("Use the supplied tools as usual. Your final answer, the reply in which you call no tool, must be "
-            if tools else "Your reply must be ")
+            if tools and tool_choice != 'none' else "Your reply must be ")
     lines = ['[STRUCTURED OUTPUT FORMAT]',
              lead + shape + '. Output only that JSON. Do not wrap it in Markdown fences and do not add '
              'any other text.']

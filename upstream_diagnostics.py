@@ -10,6 +10,7 @@ import shutil
 import threading
 import time
 import uuid
+import weakref
 
 import journal
 from accounts import cfg_tag
@@ -24,17 +25,49 @@ _SIGNALS = ("stop_reason", "stopReason", "finish_reason", "finishReason", "statu
 _DUMP_SET = re.compile(r"^\d{8}-\d{6}-[^\W_]*-[0-9a-f]{12}-body\.json$")
 # Wire-trace folders are named by a sortable start stamp; anything else in the root is left alone.
 _TRACE_FOLDER = re.compile(r"^\d{8}-\d{6}-")
+# Traces of this process that are still being written: absolute root -> {folder name: how many}.
+_OPEN_TRACES = {}
+_OPEN_LOCK = threading.Lock()
+
+
+def _trace_root(root):
+    return os.path.normcase(os.path.abspath(os.fspath(root)))
+
+
+def _open_trace(root, name):
+    with _OPEN_LOCK:
+        names = _OPEN_TRACES.setdefault(root, {})
+        names[name] = names.get(name, 0) + 1
+
+
+def _close_trace(root, name):
+    with _OPEN_LOCK:
+        names = _OPEN_TRACES.get(root) or {}
+        if name in names:
+            names[name] -= 1
+            if names[name] <= 0:
+                del names[name]
+            if not names:
+                del _OPEN_TRACES[root]
 
 
 def prune_traces(root, keep, limit):
-    """Keep the newest `limit` trace folders under root (0 = unlimited); never the one just made."""
+    """Keep the newest `limit` trace folders under root (0 = unlimited); never the one just made.
+
+    A trace that is still being written is never removed, however old its folder is: with more requests in
+    flight than `limit` the directory briefly holds more folders, and the surplus goes at the first prune after
+    those traces have closed."""
     if limit <= 0:
         return
     try:
         folders = sorted(entry.name for entry in os.scandir(root)
                          if entry.is_dir(follow_symlinks=False) and _TRACE_FOLDER.match(entry.name))
+        # Read after the listing: a trace registers before it creates its folder, so every folder in
+        # the listing that belongs to an open trace is in this snapshot.
+        with _OPEN_LOCK:
+            open_now = set(_OPEN_TRACES.get(_trace_root(root), ()))
         for name in folders[:max(0, len(folders) - limit)]:
-            if name != keep:
+            if name != keep and name not in open_now:
                 shutil.rmtree(os.path.join(root, name), ignore_errors=True)
     except OSError:
         pass  # housekeeping must never break a request
@@ -98,12 +131,19 @@ class WireTrace:
         self._offset = 0
         self._hash = hashlib.sha256()
         self._raw = self._timeline = None
+        self._release = None
         root = cfg.get(root_key)
         self.enabled = bool(root)
         if not self.enabled:
             return
         try:
             self.folder = pathlib.Path(root) / trace_id
+            # Open from before the folder exists to after the handles are closed, so a prune never sees it
+            # unprotected. The finalizer also lets go of a trace that is dropped without close().
+            where = _trace_root(root)
+            self._release = weakref.finalize(self, _close_trace, where, trace_id)
+            self._release.atexit = False
+            _open_trace(where, trace_id)
             self.folder.mkdir(parents=True, exist_ok=False)
             (self.folder / "request-body.json").write_bytes(payload)
             self._raw = (self.folder / response_file).open("wb")
@@ -171,6 +211,8 @@ class WireTrace:
                         handle.close()
                 except OSError:
                     self.failed = True
+        if self._release is not None:
+            self._release()  # now a prune may remove the folder; calling it again does nothing
 
 
 class AttemptTrace:

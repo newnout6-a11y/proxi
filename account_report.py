@@ -2,14 +2,12 @@
 import concurrent.futures
 
 import console_log
-import journal
-from accounts import enabled
+from accounts import UNNAMED, account_tag, enabled
 from session import SessionPool
 
-
-def account_tag(backend):
-    cfg = getattr(backend, "cfg", None) or {}
-    return journal.tag(cfg.get("account_id") or cfg.get("page_uuid")) or "account"
+# Balance lookups in flight for one report. Not account_refresh_parallel: that bounds the dispatcher's
+# background renewals, while a report is a client waiting on every account's answer.
+BALANCE_PARALLEL = 8
 
 
 def account_managers(runtime):
@@ -61,8 +59,7 @@ def collect(runtime, *, force_refresh=False):
     if len(rows) == 1:
         infos = [fetch(rows[0])]
     else:
-        parallel = max(1, int(getattr(runtime, 'cfg', {}).get('account_refresh_parallel', 3)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, parallel, len(rows))) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(BALANCE_PARALLEL, len(rows))) as pool:
             infos = list(pool.map(fetch, rows))
     entries = []
     for (backend, manager), info in zip(rows, infos):
@@ -131,7 +128,7 @@ def balance_report(entries):
     accounts = []
     for entry in entries:
         info = entry["info"]
-        item = {"account": account_tag(entry["backend"]), "state": entry["state"],
+        item = {"account": account_tag(entry["backend"], UNNAMED), "state": entry["state"],
                 "available": entry["available"], "monthly_allocation": info.get("monthly_allocation"),
                 "reset_date": info.get("reset_date"), "stale": bool(info.get("stale"))}
         error = info.get("error") or info.get("stale_error")
@@ -153,7 +150,7 @@ def usage_report(runtime, rows=None):
     available, unreported = [], False
     for backend, manager in rows:
         usage = manager.usage()
-        tag = account_tag(backend)
+        tag = account_tag(backend, UNNAMED)
         items = [dict(item, account=tag) for item in usage.get("recent") or []]
         recent.extend(items)
         used = console_log.number(usage.get("session_used")) or 0.0

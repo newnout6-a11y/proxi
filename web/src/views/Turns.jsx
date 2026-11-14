@@ -5,7 +5,7 @@ import { Section, ease } from '../motion.jsx';
 import { Empty, Tag } from '../ui.jsx';
 import { TapeLegend, TurnTape } from '../charts.jsx';
 import { LEVELS, STATUS_TONE, TURN_STATUS } from '../catalog.js';
-import { buildTraces, costOf, phasesOf, scaleOf, statusAt } from '../turns.js';
+import { buildTraces, costOf, phasesOf, scaleOf, staleLimit, statusAt } from '../turns.js';
 import { fmtAgo, fmtClock, fmtFixed, fmtInt, fmtMs, fmtTokens } from '../format.js';
 import { TurnsArt } from '../stage/Art.jsx';
 
@@ -39,13 +39,15 @@ export default function Turns({ journal, overview, embedded }) {
   const [open, setOpen] = useState(null);
   const [now, setNow] = useState(() => Date.now() / 1000);
   const list = traces.slice(0, 120);
-  const running = list.some((trace) => statusAt(trace, now) === 'running');
+  // A silent turn is given up on only after the relay's own turn timeout (the overview carries the one in force).
+  const stale = staleLimit(overview?.resources?.turn_timeout);
+  const running = list.some((trace) => statusAt(trace, now, stale) === 'running');
   useEffect(() => {
     if (!running) return undefined;
     const timer = setInterval(() => setNow(Date.now() / 1000), 1000);
     return () => clearInterval(timer);
   }, [running]);
-  const max = scaleOf(list, now);
+  const max = scaleOf(list, now, stale);
 
   return (
     <Section embedded={embedded} className="turns">
@@ -64,7 +66,7 @@ export default function Turns({ journal, overview, embedded }) {
         )}
         {list.map((trace) => {
           const isOpen = open === trace.id;
-          const phases = phasesOf(trace, now);
+          const phases = phasesOf(trace, now, stale);
           const { status } = phases;
           const cost = costOf(trace, status);
           const totalIn = (trace.inputTokens || 0) + (trace.cacheRead || 0) + (trace.cacheWrite || 0);

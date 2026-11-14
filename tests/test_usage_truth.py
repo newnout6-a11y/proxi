@@ -405,12 +405,12 @@ def test_a_retry_cancelled_before_posting_does_not_inherit_the_previous_attempts
     takes = []
     holder = {}
 
-    def take(self, cancelled):
+    def take(self, cancelled, account=None):
         takes.append(1)
         if len(takes) == 2:
             holder['session']._cancelled = True
             raise InterruptedError('upstream retry cancelled')
-        return original(self, cancelled)
+        return original(self, cancelled, account)
 
     monkeypatch.setattr(AttemptBudget, 'take', take)
 

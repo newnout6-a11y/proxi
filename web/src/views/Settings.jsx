@@ -27,7 +27,7 @@ const OPTION_LABELS = {
   reasoning_effort: { auto: 'по умолчанию модели' },
 };
 
-function Field({ name, field, value, onChange, pending, dirty }) {
+function Field({ name, field, value, onChange, pending, dirty, labels }) {
   const id = `setting-${name}`;
   const hint = `${id}-hint`;
   let control;
@@ -36,7 +36,7 @@ function Field({ name, field, value, onChange, pending, dirty }) {
   } else if (field.enum) {
     control = (
       <select id={id} value={value ?? ''} aria-describedby={hint} onChange={(e) => onChange(e.target.value)}>
-        {field.enum.map((option) => <option key={option} value={option}>{OPTION_LABELS[name]?.[option] || option}</option>)}
+        {field.enum.map((option) => <option key={option} value={option}>{labels?.[option] || OPTION_LABELS[name]?.[option] || option}</option>)}
       </select>
     );
   } else if (field.type === 'string') {
@@ -193,6 +193,14 @@ function routeLabel(model) {
   return 'нет ресурса';
 }
 
+// A route that takes a level and drops it ("accepted-ignored") must not read as "the provider chooses".
+function effortText(model) {
+  if (!model.reasoning) return 'без мышления';
+  const levels = (model.reasoning_effort_levels || []).join(' · ');
+  if (levels) return levels;
+  return model.reasoning_effort_control === 'accepted-ignored' ? 'принимает уровень, игнорирует' : 'выбирает провайдер';
+}
+
 function Catalog({ apiKey, onUnauthorized, onData }) {
   const [data, setData] = useState(null);
   const [query, setQuery] = useState('');
@@ -234,7 +242,7 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
           <span className="model-name" title={`${model.label} · ${model.id}`}><strong>{model.label}</strong><code>{model.id}</code></span>
           <span className="model-provider">{model.provider}</span>
           <span className="num">{fmtTokens(model.context)}</span>
-          <span className="model-effort"><span>Effort: {model.reasoning ? (model.reasoning_effort_levels || []).join(' · ') || 'выбирает провайдер' : 'без мышления'}</span>
+          <span className="model-effort"><span>Effort: {effortText(model)}</span>
             <span>Verbosity: {model.verbosity_levels?.length ? model.verbosity_levels.join(' · ') : 'не поддерживается'}</span>
           </span>
           <span className="model-route" title={model.routable ? undefined : model.route_reason}>
@@ -310,11 +318,15 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
   const effortValue = merged.reasoning_effort;
   // With approximation on, the relay takes the nearest level itself, so no level is an error.
   const approximate = !!merged.allow_effort_downgrade;
+  // A route that ignores effort ("accepted-ignored") lists no level yet takes every one the relay knows, so none is an error.
+  const ignoresEffort = selectedModel?.reasoning_effort_control === 'accepted-ignored';
   const effortOptions = selectedModel ? ['auto', ...(selectedModel.reasoning_effort_levels || [])] : null;
-  const unsupportedEffort = effortOptions && effortValue && !effortOptions.includes(effortValue);
+  const unsupportedEffort = !ignoresEffort && effortOptions && effortValue && !effortOptions.includes(effortValue);
   const warnEffort = unsupportedEffort && !approximate;
-  const effortChoices = approximate && schema.reasoning_effort?.enum ? schema.reasoning_effort.enum
+  const effortChoices = (approximate || ignoresEffort) && schema.reasoning_effort?.enum ? schema.reasoning_effort.enum
     : effortOptions && [...new Set([...effortOptions, ...(unsupportedEffort ? [effortValue] : [])])];
+  const effortLabels = ignoresEffort ? Object.fromEntries((effortChoices || [])
+    .filter((level) => level !== 'auto').map((level) => [level, `${level} · модель игнорирует`])) : undefined;
   const role = merged[ROLE_KEY];
   const roleBytes = useMemo(() => (typeof role === 'string' ? textBytes(role) : 0), [role]);
   const limit = roleLimit(schema[ROLE_KEY], Number(merged.max_prompt_bytes));
@@ -361,6 +373,7 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
               pending={keys.some((key) => state.pending_restart.includes(key))} disabled={!state.writable} /> : keys.map((key) => (
               <Field key={key} name={key} field={key === 'reasoning_effort' && effortChoices
                 ? { ...schema[key], enum: effortChoices } : schema[key]}
+                labels={key === 'reasoning_effort' ? effortLabels : undefined}
                 value={key in draft ? draft[key] : state.settings[key]}
                 pending={state.pending_restart.includes(key)}
                 dirty={key in changes}

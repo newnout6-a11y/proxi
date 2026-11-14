@@ -18,7 +18,7 @@ SZ, EXPAND_SZ, BINARY, DWORD, MULTI_SZ = 1, 2, 3, 4, 7
 KEY_SET_VALUE = 2
 FIVE = ('low', 'medium', 'high', 'xhigh', 'max')
 FOUR = ('low', 'medium', 'high', 'max')
-LIBRARY_ID = '71edc3b5-0000-4000-8000-000000000000'
+LIBRARY_ID = '00000000-0000-4000-8000-0000000000a1'
 USER_ROWS = [{'name': 'claude-opus-5-5', 'labelOverride': 'Opus 5.5 (relay)'},
              {'name': 'claude-sonnet-5-5', 'labelOverride': 'Sonnet 5.5 (relay)'},
              {'name': 'claude-haiku-4-5-20251001', 'labelOverride': 'Haiku 4.5 (relay)'}]
@@ -166,6 +166,11 @@ def policy_values(rows, **extra):
     return {'inferenceProvider': ('gateway', SZ), 'inferenceModels': (json.dumps(rows), SZ), **extra}
 
 
+def test_the_configuration_id_is_visibly_synthetic():
+    # An id that opens like a real installation's would make a copied fixture look like private data.
+    assert LIBRARY_ID.startswith('00000000-')
+
+
 def test_desktop_contains_all_eligible_claude_models_and_no_fabricated_provider_tiers():
     available = entries()
     previous = [{'name': 'claude-opus-5-5', 'maxEffort': 'xhigh', 'custom': True},
@@ -282,6 +287,75 @@ def test_a_string_encoded_local_list_stays_a_string(tmp_path, monkeypatch, capsy
     assert code == 0, error
     encoded = json.loads(path.read_bytes())['inferenceModels']
     assert isinstance(encoded, str) and len(json.loads(encoded)) == 9 and ' ' not in encoded.split('"name"')[0]
+
+
+@pytest.mark.parametrize('as_string', [False, True])
+def test_a_current_local_list_is_not_rewritten_and_makes_no_second_backup(tmp_path, monkeypatch, capsys, as_string):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary', json.dumps(USER_ROWS) if as_string else USER_ROWS)
+    backups = tmp_path / 'backups'
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--config-library', path.parent, '--write', '--backup-dir', backups]
+    code, first, error = cli(capsys, *arguments)
+    assert code == 0 and first['written'] is True and first['changed'] is True, error
+    synchronized, stamp = path.read_bytes(), path.stat().st_mtime_ns
+    code, second, error = cli(capsys, *arguments)
+    assert code == 0 and second['written'] is False and second['changed'] is False, error
+    assert second['backup'] is None and second['models'] == first['models']
+    assert path.read_bytes() == synchronized and path.stat().st_mtime_ns == stamp
+    assert [item.read_bytes() for item in backups.iterdir()] == [data]
+
+
+def test_a_current_local_list_in_another_layout_is_left_alone_not_reformatted(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary')
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--config-library', path.parent]
+    assert cli(capsys, *arguments, '--write', '--backup-dir', tmp_path / 'backups')[0] == 0
+    reindented = json.dumps(json.loads(path.read_bytes()), indent=4).encode('utf-8')
+    path.write_bytes(reindented)
+    code, report, error = cli(capsys, *arguments, '--write', '--backup-dir', tmp_path / 'backups2')
+    assert code == 0 and report['written'] is False and report['changed'] is False, error
+    assert path.read_bytes() == reindented and not (tmp_path / 'backups2').exists()
+
+
+def test_a_dry_run_reports_whether_a_write_would_change_anything_and_never_claims_it_wrote(tmp_path, monkeypatch,
+                                                                                         capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary')
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--config-library', path.parent]
+    code, report, error = cli(capsys, *arguments)
+    assert code == 0 and report['written'] is False and report['changed'] is True, error
+    assert cli(capsys, *arguments, '--write', '--backup-dir', tmp_path / 'backups')[0] == 0
+    code, report, error = cli(capsys, *arguments)
+    assert code == 0 and report['written'] is False and report['changed'] is False, error
+
+
+def test_a_current_user_policy_is_not_written_again_and_makes_no_second_backup(tmp_path, monkeypatch, capsys):
+    state = registry(monkeypatch, hkcu=policy_values(USER_ROWS))
+    backups = tmp_path / 'backups'
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--write', '--backup-dir', backups]
+    code, first, error = cli(capsys, *arguments)
+    assert code == 0 and first['written'] is True and first['changed'] is True, error
+    assert len(state.writes) == 1
+    code, second, error = cli(capsys, *arguments)
+    assert code == 0 and second['written'] is False and second['changed'] is False, error
+    assert second['backup'] is None and len(state.writes) == 1 and len(list(backups.iterdir())) == 1
+
+
+def test_user_policy_values_are_compared_parsed_so_other_json_formatting_is_not_a_change(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch, hkcu=policy_values(USER_ROWS))
+    catalog = anthropic_catalog(tmp_path)
+    report, rows = preview(capsys, tmp_path, '--desktop-catalog', catalog)
+    assert report['changed'] is True
+    pretty = {'inferenceProvider': ('gateway', SZ), 'inferenceModels': (json.dumps(rows, indent=2), SZ)}
+    state = registry(monkeypatch, hkcu=pretty)
+    code, report, error = cli(capsys, '--relay-config', relay_config(tmp_path), '--desktop-catalog', catalog,
+                              '--write', '--backup-dir', tmp_path / 'backups')
+    assert code == 0 and report['written'] is False and report['changed'] is False, error
+    assert state.writes == [] and state.hives['HKCU'] == pretty and not (tmp_path / 'backups').exists()
 
 
 def test_user_policy_in_effect_is_the_only_target_and_the_local_file_is_left_alone(tmp_path, monkeypatch, capsys):
@@ -572,6 +646,77 @@ def test_cli_keeps_the_users_list_and_reports_what_changed(tmp_path, monkeypatch
     report, rows = preview(capsys, tmp_path, '--config-library', path.parent, '--include-unlisted',
                            '--default-model', 'claude-opus')
     assert report['default_model'] == 'claude-opus-5-5' and rows[1]['name'] == 'claude-sonnet-5-5'
+
+
+OWNED_DRIFT = {'name': 'claude-opus-5-5', 'labelOverride': 'mine', 'maxEffort': 'xhigh', 'isFamilyDefault': False,
+               'anthropicFamilyTier': 'sonnet', 'custom': {'keep': True}}
+OWNED_IN_SYNC = {'name': 'claude-sonnet-5-5', 'isFamilyDefault': True, 'anthropicFamilyTier': 'sonnet',
+                 'maxEffort': 'high'}
+OWNED_OBSOLETE = {'name': 'claude-haiku-4-5-20251001', 'maxEffort': 'high', 'isFamilyDefault': True,
+                  'anthropicFamilyTier': 'haiku'}
+OVERWRITES = {('claude-opus-5-5', 'maxEffort'): ('xhigh', 'high'), ('claude-opus-5-5', 'isFamilyDefault'): (False, True),
+              ('claude-opus-5-5', 'anthropicFamilyTier'): ('sonnet', 'opus'),
+              ('claude-haiku-4-5-20251001', 'maxEffort'): ('high', None)}
+
+
+def overwrites(report):
+    return {(item['model'], item['field']): (item['was'], item['now']) for item in report['changed_fields']}
+
+
+def test_summary_lists_each_overwritten_field_of_an_existing_row_in_a_preview(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary', [OWNED_DRIFT, OWNED_IN_SYNC, OWNED_OBSOLETE])
+    report, rows = preview(capsys, tmp_path, '--config-library', path.parent,
+                           '--desktop-catalog', anthropic_catalog(tmp_path))
+    assert overwrites(report) == OVERWRITES and len(report['changed_fields']) == len(OVERWRITES)
+    assert all(set(item) == {'model', 'field', 'was', 'now'} for item in report['changed_fields'])
+    assert path.read_bytes() == data and rows[0]['custom'] == {'keep': True} and rows[0]['labelOverride'] == 'mine'
+
+
+def test_summary_lists_the_same_overwrites_when_writing_and_none_for_a_current_list(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary', [OWNED_DRIFT, OWNED_IN_SYNC, OWNED_OBSOLETE])
+    arguments = ['--relay-config', relay_config(tmp_path), '--desktop-catalog', anthropic_catalog(tmp_path),
+                 '--config-library', path.parent, '--write', '--backup-dir', tmp_path / 'backups']
+    code, report, error = cli(capsys, *arguments)
+    assert code == 0 and report['written'] is True, error
+    assert overwrites(report) == OVERWRITES
+    code, report, error = cli(capsys, *arguments)
+    assert code == 0 and report['written'] is False and report['changed_fields'] == []
+
+
+def test_a_toggled_effort_mapping_shows_up_as_overwritten_max_effort_values(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, data = local_library(tmp_path / 'configLibrary', [OWNED_IN_SYNC])
+    catalog = anthropic_catalog(tmp_path)
+    relay = relay_config(tmp_path, allow_effort_downgrade=True)
+    report, rows = preview(capsys, tmp_path, '--config-library', path.parent, '--desktop-catalog', catalog, relay=relay)
+    assert overwrites(report) == {('claude-sonnet-5-5', 'maxEffort'): ('high', 'max')}
+
+
+def test_new_rows_are_additions_not_overwrites():
+    previous = [OWNED_IN_SYNC]
+    result = build_catalog(entries(), previous)
+    assert len(result) > 1 and sync.changed_fields(previous, result) == []
+
+
+def test_only_the_fields_the_script_owns_can_change_in_an_existing_row():
+    previous = [{'name': name, 'labelOverride': 'mine', 'supports1m': True, 'behavesAs': 'x', 'custom': {'a': [1]},
+                 'isFamilyDefault': 'junk', 'anthropicFamilyTier': 'junk', 'maxEffort': 'junk'}
+                for name in sorted(claude_ids())]
+    result = build_catalog(entries(), previous)
+    assert {change['field'] for change in sync.changed_fields(previous, result)} == set(sync.OWNED_FIELDS)
+    for before, after in zip(previous, result):
+        assert {key: value for key, value in after.items() if key not in sync.OWNED_FIELDS} == {
+            key: value for key, value in before.items() if key not in sync.OWNED_FIELDS}
+
+
+def test_string_rows_become_objects_and_every_added_field_is_listed():
+    previous = ['claude-opus-5-5']
+    changes = sync.changed_fields(previous, build_catalog(entries(), previous))
+    assert {(change['field'], change['was']) for change in changes} == {
+        ('isFamilyDefault', None), ('anthropicFamilyTier', None), ('maxEffort', None)}
+    assert {change['model'] for change in changes} == {'claude-opus-5-5'}
 
 
 # Bug 39: models Desktop knows for Code and Cowork

@@ -209,17 +209,19 @@ def test_unchanged_catalog_is_not_rewritten_and_makes_no_second_backup(tmp_path,
     assert len(list(backups.iterdir())) == 1
 
 
-def test_preview_masks_credentials_but_keeps_comments_and_credential_references(tmp_path, capsys):
+def test_preview_masks_credentials_and_comments_but_keeps_credential_references(tmp_path, capsys):
     masked, full = tmp_path / 'masked.yml', tmp_path / 'full.yml'
     code, summary, _, profile = client(tmp_path, capsys, '--output', str(masked))
     assert code == 0 and summary['preview_redacted'] is True and summary['written'] is False
     original = profile.read_bytes()
     text = masked.read_text(encoding='utf-8')
-    for private in ('other-private', 'header-private', 'plain-private', 'block-private', 'second-private-line'):
+    for private in ('other-private', 'header-private', 'plain-private', 'block-private', 'second-private-line',
+                    'Keep profile header', 'Keep selected model'):
         assert private not in text
-    for kept in ('# Keep profile header', '# Keep selected model', 'apiKeyEnv: KEEP_OTHER_KEY',
-                 'apiKeyEnv: KEEP_RELAY_KEY', 'maxTokens: 4096', 'enabled: true'):
+    for kept in ('apiKeyEnv: KEEP_OTHER_KEY', 'apiKeyEnv: KEEP_RELAY_KEY', 'maxTokens: 4096', 'enabled: true'):
         assert kept in text
+    # A comment stays where it was, so a dropped or repeated one is still visible; only its words are gone.
+    assert text.splitlines()[0] == '# ***' and text.count('# ***') == 2
     provider = YAML().load(text)[1]['config']['providers']['other']
     assert provider['apiKey'] == '***' and provider['token'] == '***'
     assert dict(provider['headers']) == {'Authorization': '***', 'X-Custom': '***'}
@@ -230,6 +232,7 @@ def test_preview_masks_credentials_but_keeps_comments_and_credential_references(
     assert code == 0 and summary['preview_redacted'] is False
     revealed = YAML().load(full.read_text(encoding='utf-8'))[1]['config']['providers']['other']
     assert revealed['apiKey'] == 'other-private' and revealed['token'] == 'block-private\nsecond-private-line'
+    assert '# Keep profile header' in full.read_text(encoding='utf-8')
     assert profile.read_bytes() == original
 
 
@@ -249,12 +252,12 @@ def test_masking_keeps_anchors_aliases_numbers_and_every_other_byte():
         environment: {PORT: 8080, NAME: value-private}\r
         last: end'''.encode('utf-8')
     masked = mask_profile(raw).decode('utf-8')
-    assert masked == '''# header\r
+    assert masked == '''# ***\r
 - id: x\r
   config:\r
     providers:\r
       other:\r
-        apiKey: &shared '***'   # note\r
+        apiKey: &shared '***'   # ***\r
         backup: {token: *shared, retries: 3}\r
         password: '***'\r
         pin: 123456\r
@@ -263,6 +266,95 @@ def test_masking_keeps_anchors_aliases_numbers_and_every_other_byte():
         env: [FIRST_NAME, SECOND_NAME]\r
         environment: {PORT: 8080, NAME: '***'}\r
         last: end'''
+
+
+LEAKY_PROFILE = '''# old key: SECRET-IN-COMMENT
+- id: llm-pi-ai   # trailing SECRET-AFTER-ID
+  config:
+    # before providers SECRET-BEFORE
+    providers:
+      a:
+        apiKey: SECRET-PLAIN
+        apiKeyEnv: MY_ENV_NAME
+        headers: {Authorization: Bearer SECRET-FLOW, X-Other: SECRET-HDR2} # after flow SECRET-AFTERFLOW
+        env: [A=SECRET-ENVLIST, KEEP_NAME, SECRET_KEY=SECRET-ENVSECRET]
+        url: https://user:SECRET-URL@host.example/v1?token=SECRET-QUERY&limit=5
+        command: [run, --api-key, SECRET-ARG, --token=SECRET-EQ, --port, '8080', --verbose]
+        quoted: "https://:SECRET-QUOTED@host.example/x" # after quoted SECRET-AFTERQUOTED
+        auth: {type: api, key: SECRET-AUTHKEY}
+        words: run --password SECRET-INLINE --retries 3
+        script: |
+          fetch https://u:SECRET-BLOCKURL@h.example/p
+          keep # this is not a comment
+        header: |  # header comment SECRET-BLOCKHDR
+          plain text
+        folded: >-
+          text # not a comment either
+        fragment: http://host.example/#fragment
+        hashes: "quoted # not a comment"
+        glued: value#notacomment
+        port: 8080
+        enabled: true
+      retool:
+        displayName: 'Retool Relay'
+        reasoning: medium
+        models: []
+# end SECRET-END'''
+
+
+def test_masking_covers_comments_urls_secret_arguments_env_items_and_auth_keys():
+    masked = mask_profile(LEAKY_PROFILE.encode('utf-8')).decode('utf-8')
+    assert 'SECRET-' not in masked and 'SECRET_KEY=***' in masked
+    lines = masked.splitlines()
+    assert lines[0] == '# ***' and lines[1] == '- id: llm-pi-ai   # ***' and lines[3] == '    # ***'
+    assert lines[-1] == '# ***' and '        header: | # ***' in lines
+    # A block scalar keeps its style and indentation; only the secret inside it changes.
+    assert '        script: |' in lines and '          fetch https://***@h.example/p' in lines
+    assert '          keep # this is not a comment' in lines
+    assert '        headers: {Authorization: \'***\', X-Other: \'***\'} # ***' in lines
+    assert '        quoted: "https://***@host.example/x" # ***' in lines
+    for kept in ('apiKeyEnv: MY_ENV_NAME', 'port: 8080', 'enabled: true', 'fragment: http://host.example/#fragment',
+                 'hashes: "quoted # not a comment"', 'glued: value#notacomment', 'text # not a comment either',
+                 'keep # this is not a comment', 'plain text'):
+        assert kept in masked
+    providers = YAML().load(masked)[0]['config']['providers']
+    shown = providers['a']
+    assert shown['apiKey'] == '***' and dict(shown['auth']) == {'type': 'api', 'key': '***'}
+    assert list(shown['env']) == ['A=***', 'KEEP_NAME', 'SECRET_KEY=***']
+    assert shown['url'] == 'https://***@host.example/v1?token=***&limit=5'
+    assert list(shown['command']) == ['run', '--api-key', '***', '--token=***', '--port', '8080', '--verbose']
+    assert shown['words'] == 'run --password *** --retries 3'
+    assert shown['script'] == 'fetch https://***@h.example/p\nkeep # this is not a comment\n'
+    assert providers['retool']['displayName'] == 'Retool Relay'
+
+
+def test_masking_a_profile_with_a_bom_and_crlf_keeps_both_and_masks_the_comments():
+    raw = b'\xef\xbb\xbf' + LEAKY_PROFILE.replace('\n', '\r\n').encode('utf-8')
+    masked = mask_profile(raw)
+    assert masked.startswith(b'\xef\xbb\xbf# ***\r\n') and b'SECRET-' not in masked
+    assert masked.count(b'\n') == masked.count(b'\r\n') and masked.endswith(b'# ***')
+
+
+def test_a_comment_only_file_and_a_comment_without_a_line_end_are_masked():
+    assert mask_profile(b'# SECRET only\n# SECRET again') == b'# ***\n# ***'
+    assert mask_profile(b'- a # SECRET') == b'- a # ***'
+
+
+def test_a_masked_preview_masked_again_does_not_change():
+    once = mask_profile(LEAKY_PROFILE.encode('utf-8'))
+    assert mask_profile(once) == once
+
+
+def test_the_preview_of_a_profile_masks_everything_but_the_written_profile_keeps_it(tmp_path, capsys):
+    leaky = LEAKY_PROFILE.replace('      retool:\n        displayName', "      retool:\n        apiKeyEnv: KEEP_RELAY_KEY\n        displayName")
+    code, summary, error, profile = client(tmp_path, capsys, '--output', str(tmp_path / 'masked.yml'),
+                                           text=leaky + '\n')
+    assert code == 0, error
+    assert 'SECRET-' not in (tmp_path / 'masked.yml').read_text(encoding='utf-8')
+    code, summary, error, _ = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'))
+    assert code == 0 and summary['written'] is True, error
+    saved = profile.read_text(encoding='utf-8')
+    assert 'SECRET-IN-COMMENT' in saved and 'SECRET-PLAIN' in saved and 'SECRET-URL' in saved
 
 
 def test_relay_root_options_reach_the_harness_catalog_filter(tmp_path, capsys):

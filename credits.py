@@ -90,16 +90,19 @@ class CreditsManager:
                 raise ValueError("invalid upstream balance object")
             org = data["org"]
             available = org.get("balance")
-            allocation = org.get("monthlyAllocation", 0.0)
+            # An allocation Retool leaves out (or sends as null) is unknown, not zero; an explicit 0 is a real zero.
+            allocation = org.get("monthlyAllocation")
             if isinstance(available, bool) or isinstance(allocation, bool):
                 raise ValueError("invalid upstream balance amount")
-            available, allocation = float(available), float(allocation)
-            if not math.isfinite(available) or not math.isfinite(allocation):
+            available = float(available)
+            allocation = None if allocation is None else float(allocation)
+            if not math.isfinite(available) or (allocation is not None and not math.isfinite(allocation)):
                 raise ValueError("invalid upstream balance amount")
             info = {
                 "available": round(available, 4),
                 "monthly_allocation": allocation,
-                "used_month": round(max(0.0, allocation - available), 4) if allocation else 0.0,
+                "used_month": (None if allocation is None
+                               else round(max(0.0, allocation - available), 4) if allocation else 0.0),
                 "reset_date": org.get("resetDate"),
                 "is_low": org.get("isLow", False),
                 "session_used": round(self.session_used, 4),

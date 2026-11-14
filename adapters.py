@@ -259,7 +259,6 @@ class ChatAdapter(_Base):
         if self.writer:
             self.writer.data(self._chunk({}, finish))
             prompt, completion = self.usage(prompt_text)
-            reasoning = self._reasoning_usage()
             usage_dict = {
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
@@ -294,7 +293,6 @@ class ChatAdapter(_Base):
 
     def payload(self, reason, prompt_text=None):
         prompt, completion = self.usage(prompt_text)
-        reasoning = self._reasoning_usage()
         return {"id": self.id, "object": "chat.completion", "created": self.created,
                 "model": self.parsed.model,
                 "choices": [{"index": 0, "message": {"role": "assistant",
@@ -334,6 +332,7 @@ class ResponsesAdapter(_Base):
         self.id = "resp_" + uuid.uuid4().hex[:20]
         self.created = int(time.time())
         self.seq = 0
+        self._begun = False
         self.item_id = "msg_" + uuid.uuid4().hex[:20]
         self.reasoning_id = "rs_" + uuid.uuid4().hex[:20]
         self._items = []
@@ -352,9 +351,28 @@ class ResponsesAdapter(_Base):
         self.writer.event(name, payload)
 
     def begin(self):
+        self._begun = True
         self._emit("response.created", {"response": {"id": self.id, "object": "response",
                                                      "created_at": self.created, "model": self.parsed.model,
                                                      "status": "in_progress", "output": []}})
+
+    def fail(self, error, extra=None):
+        """End a stream that failed after it started: an `error` event, then the terminal response.failed.
+
+        codex-rs ignores `error`; without response.failed it sees the stream end before response.completed,
+        asks again up to stream_max_retries times (every attempt paid) and never shows the message. Both events
+        carry the same code, so a client that stops at the first one, as ai-sdk does, classifies it alike. The
+        relay's own code stays in `relay_code`.
+        """
+        if not self.writer:
+            return
+        if not self._begun:
+            self.begin()  # response.failed needs the id that response.created announces
+        failure = error.responses_error()
+        self._emit("error", {**error.responses_envelope(), **(extra or {}), **failure, "relay_code": error.code})
+        self._emit("response.failed", {"response": {"id": self.id, "object": "response",
+                                                    "created_at": self.created, "model": self.parsed.model,
+                                                    "status": "failed", "output": [], "error": failure}})
 
     def _ensure_item(self, kind, item_id, call=None):
         if item_id in self._indices:
@@ -654,6 +672,9 @@ class StructuredOutputAdapter:
     def begin(self):
         self.adapter.begin()
 
+    def fail(self, error, extra=None):
+        self.adapter.fail(error, extra)
+
     def _release(self):
         self.released = True
         text = ''.join(self.parts)
@@ -679,8 +700,14 @@ class StructuredOutputAdapter:
             self.adapter.feed(event)
 
     def end(self, reason, prompt_text=None):
+        if reason == 'cancelled':
+            # The client left or the turn was aborted: nothing is validated and nothing buffered is
+            # released, so the request ends like any other cancelled one and is no upstream error.
+            return self.adapter.end(reason, prompt_text)
         if reason == 'tool_calls' or self.released:
             self._release()
+        elif reason == 'timeout':
+            raise apierr.upstream_timeout('upstream turn timed out before the structured reply was complete')
         else:
             try:
                 if reason != 'stop':

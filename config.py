@@ -88,7 +88,8 @@ DEFAULTS = {
     "min_account_balance": 20,
     "account_balance_interval": 300,
     "account_refresh_parallel": 3,
-    # Pause after Retool's hourly managed-key limit; doubles (up to 3600) when the account fails again soon after.
+    # Pause after Retool's hourly managed-key limit; a limit right after the return adds 5 minutes
+    # to it, up to max(this, 20 minutes).
     "account_rate_limit_cooldown": 900,
     "agent_mode": 2,
     "model": "claude-opus-5-5",

@@ -1,5 +1,6 @@
 """Optional quotas and explicit runtime bounds must not add healthy-request waits."""
 import json
+import urllib.error
 
 import pytest
 
@@ -18,6 +19,18 @@ def test_opt_in_quota_returns_retry_time_without_sleeping(monkeypatch):
     limiter = proxy.RateLimiter(2, 1)
     assert limiter.take() == 0
     assert limiter.take() == 0.5
+
+
+@pytest.mark.parametrize("wait,sent", [(0.5, "1"), (0.05, "1"), (1.2, "2"), (3.0, "3")])
+def test_the_relays_own_429_sends_whole_seconds_in_retry_after(relay, monkeypatch, wait, sent):
+    monkeypatch.setattr(proxy.RateLimiter, "take", lambda self: wait)
+    try:
+        relay.request("/v1/chat/completions", {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]})
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 429 and exc.headers["retry-after"] == sent
+        assert json.loads(exc.read())["error"]["type"] == "rate_limit_error"
+    else:
+        raise AssertionError("the request was not limited")
 
 
 def load_config(tmp_path, monkeypatch, **settings):

@@ -42,6 +42,7 @@ def test_single_account_gate_moves_into_the_first_pool_record_and_keeps_gated_mo
     fable = models.resolve("claude-fable-5")[0]
     single = config.load(str(admin_relay.path))
     assert models.catalog_routable(fable, single, offline_pool(single).backends)
+    assert single["config_warnings"] == []  # without accounts[] the root is the source of the descriptor
 
     assert "provider_access" in admin.ACCOUNT_RECORD_KEYS
     status, _, _ = post_account(admin_relay)
@@ -49,28 +50,35 @@ def test_single_account_gate_moves_into_the_first_pool_record_and_keeps_gated_mo
     saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
     first, second = saved["accounts"]
     assert first["provider_access"] == RETENTION and "provider_access" not in second
+    # With accounts[] a root copy is ignored and warned about at every start: the descriptor moves, it is not copied.
+    assert "provider_access" not in saved
     # The pool reads the descriptor only from the account record: the gated model must survive the conversion.
     reloaded = config.load(str(admin_relay.path))
+    assert reloaded["config_warnings"] == []
     backends = offline_pool(reloaded).backends
     assert [SessionPool._routable(backend, fable) for backend in backends] == [True, False]
     assert models.catalog_routable(fable, reloaded, backends)
 
 
+@pytest.mark.parametrize("root_copy", [True, False])
 @pytest.mark.parametrize("second_gate", [{"anthropic": {"resource_name": "resource-acc-b", "byok": True}}, None])
-def test_deleting_the_first_account_hands_the_root_descriptor_to_the_new_first_account(pool, second_gate):
+def test_deleting_the_first_account_leaves_no_descriptor_in_the_root(pool, second_gate, root_copy):
     first_gate = {"anthropic": {"resource_name": "resource-acc-a", "data_retention_enabled": True}}
     saved = pool.saved()
     saved["accounts"][0]["provider_access"] = first_gate
-    saved["provider_access"] = first_gate  # the root mirrors accounts[0], as after a single -> pool conversion
+    if root_copy:
+        saved["provider_access"] = first_gate  # left by a conversion made before the root copy was dropped
     if second_gate:
         saved["accounts"][1]["provider_access"] = second_gate
     pool.path.write_text(json.dumps(saved), encoding="utf-8")
     assert pool.call("/admin/api/accounts/" + pool.tags[0], {}, method="DELETE")[0] == 200
     saved = pool.saved()
     assert [item.get("provider_access") for item in saved["accounts"]] == [second_gate]
-    assert saved.get("provider_access") == second_gate
-    assert "resource-acc-a" not in json.dumps(saved.get("provider_access"))
-    assert config.load(str(pool.path))["accounts"][0].get("provider_access") == second_gate
+    # The new first account keeps its own descriptor; mirrored into the root it would be warned about at every start.
+    assert "provider_access" not in saved and "resource-acc-a" not in json.dumps(saved)
+    reloaded = config.load(str(pool.path))
+    assert reloaded["accounts"][0].get("provider_access") == second_gate
+    assert reloaded["config_warnings"] == []
 
 
 # -- both built-in roles -------------------------------------------------------------
@@ -124,6 +132,18 @@ def test_an_old_over_long_role_does_not_block_other_settings(admin_relay):
     assert admin_relay.patch({"max_prompt_bytes": 1_000_000})[0] == 400
     assert admin_relay.patch({"relay_system_prompt": None})[0] == 200
     assert admin_relay.patch({"max_prompt_bytes": 1_000_000})[0] == 200
+
+
+@pytest.mark.parametrize("role", ["\ud800", "role \udfff end", "half a pair \ud83d"])
+def test_a_role_with_an_unpaired_surrogate_is_a_400_that_names_the_cause(admin_relay, role):
+    before = admin_relay.path.read_bytes()
+    status, body, _ = admin_relay.patch({"relay_system_prompt": role})  # "\ud800" is valid JSON, but not UTF-8 text
+    error = body["error"]
+    assert status == 400 and error["code"] == "invalid_request_error" and error["param"] == "relay_system_prompt"
+    assert "surrogate" in error["message"] and "codec" not in error["message"]
+    assert admin_relay.path.read_bytes() == before
+    # A complete pair (written as two escapes) is an ordinary character.
+    assert admin_relay.patch({"relay_system_prompt": "complete pair \U0001F600"})[0] == 200
 
 
 # -- journal -------------------------------------------------------------------------
@@ -202,6 +222,24 @@ def test_reason_follows_the_account_list_discovery_is_judged_against(pool, monke
     assert narrowed["routable"] is False and narrowed["route_blocker"] == "no_resource"
 
 
+def test_blocked_reason_joins_every_distinct_refusal_like_discovery(pool):
+    entry = models.resolve("claude-fable-5")[0]
+    fable = lambda: {item["id"]: item for item in pool.call("/admin/api/models")[1]["data"]}["claude-fable-5"]  # noqa: E731
+    reasons = [models.route_block_reason(entry, backend.cfg) for backend in pool.backends]
+    assert all(reasons) and len(set(reasons)) == 1  # two private resources refuse with the same hint
+    shown = fable()
+    assert (shown["routable"], shown["route_blocker"], shown["route_reason"]) == (False, "blocked", reasons[0])
+
+    # A managed resource is refused with a hint of its own: the operator sees both, as discovery says it.
+    pool.backends[1].cfg["provider_resource_name"] = "__managed__"
+    reasons = [models.route_block_reason(entry, backend.cfg) for backend in pool.backends]
+    assert all(reasons) and len(set(reasons)) == 2
+    shown = fable()
+    published, discovery = models.catalog_visibility(entry, pool.runtime.cfg, pool.runtime.accounts.backends)
+    assert (shown["routable"], shown["route_blocker"], published) == (False, "blocked", False)
+    assert shown["route_reason"] == discovery == "; ".join(reasons)
+
+
 # -- overview ------------------------------------------------------------------------
 def test_overview_session_speaks_for_the_enabled_accounts_only(pool):
     first, second = pool.backends
@@ -216,3 +254,13 @@ def test_overview_session_speaks_for_the_enabled_accounts_only(pool):
     assert session["error"] is None and session["last_success_at"] == 1700000100.0
     assert session["accounts"] == {"enabled": 1, "failing": 0}
     assert {"keepalive", "persistence_error"} <= set(session)
+
+
+def test_overview_publishes_the_turn_timeout_in_force_that_the_ui_judges_a_silent_turn_by(admin_relay):
+    def timeouts():
+        overview = admin_relay.request("/admin/api/overview")[1]
+        return overview["resources"]["turn_timeout"], admin_relay.request("/admin/api/settings")[1]["settings"]["turn_timeout"]
+
+    assert timeouts() == (900, 900)
+    assert admin_relay.patch({"turn_timeout": 7200})[0] == 200
+    assert timeouts() == (900, 7200)  # saved for the next start: the running relay still times a turn out after 900 s

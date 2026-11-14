@@ -19,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
 import direct
-import journal
 import models
+from accounts import cfg_tag
 from auth import upstream_headers
 from redact import redact
 
@@ -71,7 +71,7 @@ def probe(cfg, entry, *, effort=None, timeout=90, max_tokens=2048, surface='sand
                       for part in cfg.get('cookie', '').split(';') if '=' in part]
     secret_values += [str(cfg[key]) for key in models.PROVIDER_RESOURCE_KEY.values() if cfg.get(key)]
     row = dict(model=entry['id'], provider=entry['provider'],
-               account=journal.tag(cfg.get('account_id') or cfg.get('page_uuid')),
+               account=cfg_tag(cfg),
                sent_effort=effort, surface=surface, http=None, end_of_stream=False, text='', usage={},
                thinking_events=0, first_event_seconds=None)
     started = time.monotonic()
@@ -150,8 +150,7 @@ def main(argv=None):
         entries.append({'id': name, 'provider': provider, 'reasoning_effort_levels': []})
     accounts = load_accounts(args.config)
     if args.account:
-        accounts = [cfg for cfg in accounts
-                    if journal.tag(cfg.get('account_id') or cfg.get('page_uuid')) == args.account]
+        accounts = [cfg for cfg in accounts if cfg_tag(cfg) == args.account]
         if not accounts:
             parser.error('unknown or disabled account tag')
     jobs = []

@@ -155,10 +155,15 @@ def catalog_policy(config, catalog_output, mode, *, allowed_entries=None, requir
         allowed_entries = [entry for entry in models.catalog() if models.catalog_routable(entry, managed)]
     allowed = {entry['id']: entry for entry in allowed_entries}
 
-    variants = []
+    variants, fields = [], []
+
+    def reject(name, where, problem):
+        variants.append(name)
+        fields.append({"model": name, "field": where, "problem": problem})
+
     for name, model in configured.items():
         if not isinstance(model, dict):
-            variants.append(name)
+            reject(name, "entry", "is not an object")
             continue
         choices = model.get('variants') or {}
         if isinstance(choices, dict):
@@ -166,28 +171,33 @@ def catalog_policy(config, catalog_output, mode, *, allowed_entries=None, requir
         elif isinstance(choices, list) and all(isinstance(choice, dict) for choice in choices):
             choices = [(choice.get('id'), choice.get('settings', {})) for choice in choices]
         else:
-            variants.append(name)
+            reject(name, "variants", "is neither an object nor a list of objects")
             continue
         levels = allowed.get(name, {}).get('reasoning_effort_levels', [])
         if not allowed.get(name, {}).get('reasoning', True):
             levels = ['none']
+        default = 'settings' if 'settings' in model else 'options'
         choices.insert(0, (None, model.get('settings', model.get('options', {}))))
-        for label, options in choices:
+        for position, (label, options) in enumerate(choices):
+            where = default if position == 0 else 'variants.%s' % label
             if not isinstance(options, dict):
-                variants.append(name)
+                reject(name, where, "is not an object")
                 break
             efforts = effort_controls(options)
             if not efforts and label in models.EFFORT_ORDER:
                 efforts.append(label)
-            if (any(not isinstance(value, str) or value not in levels for value in efforts)
-                    or len({value for value in efforts if isinstance(value, str)}) > 1):
-                variants.append(name)
+            if any(not isinstance(value, str) or value not in levels for value in efforts):
+                reject(name, where, "has a reasoning effort the route does not accept")
+                break
+            if len({value for value in efforts if isinstance(value, str)}) > 1:
+                reject(name, where, "sets conflicting reasoning efforts")
                 break
     listed = {line.strip().removeprefix("retool-relay/") for line in catalog_output.splitlines()
               if line.strip().startswith("retool-relay/")}
     policy = {"configured_models": len(configured), "catalog_models": len(listed),
               "forbidden_models": sorted(set(configured) - set(allowed)),
               "forbidden_variants": sorted(set(variants)),
+              "forbidden_variant_fields": fields,
               "catalog_forbidden_models": sorted(listed - set(allowed)),
               "catalog_mismatch": sorted(listed.symmetric_difference(configured)),
               "missing_models": sorted(set(allowed) - set(configured)) if require_complete else []}

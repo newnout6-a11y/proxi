@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { STALE_AFTER, buildTraces, costOf, phasesOf, scaleOf, statusAt } from '../src/turns.js';
+import { STALE_AFTER, STALE_MARGIN, buildTraces, costOf, phasesOf, scaleOf, staleLimit, statusAt } from '../src/turns.js';
 import { MIN_FORECAST_SECONDS, burnRate, coverageOf, coveredSeconds, fmtSince, fmtSpan, uncoveredBuckets } from '../src/coverage.js';
 
 const ev = (ts, kind, data = {}) => ({ ts, kind, data, turn_id: 'test-turn' });
@@ -257,6 +257,39 @@ test('a running turn silent past the stale limit is interrupted by the clock and
   assert.deepEqual(phasesOf(trace, 101 + 3 * 86400), late);
   // The relay never recorded its end: it is not a complete cost, and no price was reported
   assert.deepEqual(costOf(trace, statusAt(trace, 101 + STALE_AFTER + 1)), { credits: null, unknown: 0, running: false, complete: false });
+});
+
+test('the silence that interrupts a running turn follows the relay turn timeout, and is never shorter than 20 minutes', () => {
+  assert.equal(STALE_AFTER, 20 * 60);
+  // The default timeout (15 minutes) is what the fixed limit was made for; a shorter one gives no reason to cut it
+  assert.equal(staleLimit(900), STALE_AFTER);
+  assert.equal(staleLimit(60), STALE_AFTER);
+  // Without a usable timeout nothing is known about the relay: the fixed limit stays
+  for (const unusable of [undefined, null, NaN, 0, -5, Infinity, '7200']) assert.equal(staleLimit(unusable), STALE_AFTER);
+  // A raised timeout is the longest a turn may legitimately stay silent, plus a margin for its end to arrive
+  assert.equal(staleLimit(3600), 3600 + STALE_MARGIN);
+  assert.equal(staleLimit(86400), 86400 + STALE_MARGIN);
+});
+
+test('a turn silent for hours keeps running while the relay allows it, then is interrupted at its last event', () => {
+  const [trace] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.thinking_start')]);
+  const hours = 5 * 3600;
+  const limit = staleLimit(86400);
+  // By the fixed limit this turn would have been given up on after 20 minutes
+  assert.equal(statusAt(trace, 101 + hours), 'interrupted');
+  assert.equal(statusAt(trace, 101 + hours, limit), 'running');
+  const running = phasesOf(trace, 101 + hours, limit);
+  assert.equal(running.open, true);
+  assert.equal(running.think, hours * 1000);
+  assert.equal(statusAt(trace, 101 + limit - 1, limit), 'running');
+  assert.equal(statusAt(trace, 101 + limit + 1, limit), 'interrupted');
+  const late = phasesOf(trace, 101 + limit + 1, limit);
+  assert.equal(late.open, false);
+  assert.equal(late.total, 1000);
+  assert.deepEqual(phasesOf(trace, 101 + limit + 99999, limit), late);
+  // With no finished turn the running ones set the shared scale, so the limit decides which still do
+  assert.equal(scaleOf([trace], 101 + hours), 1000);
+  assert.equal(scaleOf([trace], 101 + hours, limit), 1000 + hours * 1000);
 });
 
 test('an interrupted turn has no final price: it never ended, so even a silent attempt is no proven gap', () => {

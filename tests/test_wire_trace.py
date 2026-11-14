@@ -55,6 +55,115 @@ def test_default_cap_bounds_an_enabled_trace_directory(tmp_path):
     assert len(list(tmp_path.iterdir())) == 200
 
 
+# -- a trace that is still being written is never pruned -----------------------------------------------------
+def _stamped(count):
+    return [f"20261105-1{i // 3600:01d}{(i // 60) % 60:02d}{i % 60:02d}-abc-attempt1-{i:012x}" for i in range(count)]
+
+
+def test_open_traces_survive_when_more_requests_run_than_the_limit_allows(tmp_path):
+    cfg = {"upstream_trace_dir": str(tmp_path), "trace_max_folders": 3}
+    names = _trace_names(6)
+    traces = [WireTrace(cfg, name, b'{"body": 1}') for name in names]
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(names)
+    for trace, name in zip(traces, names):
+        trace.event("late_event")
+        trace.raw(b"late bytes")
+        assert not trace.failed
+        # Not a husk (Windows) and not unlinked (POSIX): every file of the trace is still there and still written.
+        assert sorted(p.name for p in (tmp_path / name).iterdir()) == [
+            "request-body.json", "response-body.ndjson", "timeline.jsonl"]
+        assert (tmp_path / name / "response-body.ndjson").read_bytes() == b"late bytes"
+    for trace in traces:
+        trace.close()
+    # Closed, they are ordinary folders again: the next prune brings the directory back to the limit.
+    WireTrace(cfg, _trace_names(7)[6], b"{}").close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == _trace_names(7)[4:]
+
+
+def test_a_long_request_is_skipped_by_pruning_and_goes_once_it_has_closed(tmp_path):
+    cfg = {"upstream_trace_dir": str(tmp_path), "trace_max_folders": 2}
+    names = _trace_names(8)
+    held = WireTrace(cfg, names[0], b"{}")  # the oldest folder, still being written
+    for name in names[1:5]:
+        WireTrace(cfg, name, b"{}").close()
+    assert (tmp_path / names[0] / "request-body.json").exists()
+    # Closed traces stay bounded as before; the open one is the only extra folder.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [names[0], names[3], names[4]]
+    held.close()
+    held.close()  # closing twice must not release anything else
+    assert (tmp_path / names[0]).exists()  # not removed by closing: pruning does that at its next run
+    WireTrace(cfg, names[5], b"{}").close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == names[4:6]
+
+
+def test_zero_still_means_unlimited_while_traces_are_open(tmp_path):
+    cfg = {"upstream_trace_dir": str(tmp_path), "trace_max_folders": 0}
+    traces = [WireTrace(cfg, name, b"{}") for name in _trace_names(5)]
+    assert len(list(tmp_path.iterdir())) == 5
+    for trace in traces:
+        trace.close()
+    WireTrace(cfg, _trace_names(6)[5], b"{}").close()
+    assert len(list(tmp_path.iterdir())) == 6
+
+
+def test_two_traces_with_one_name_in_different_roots_do_not_protect_each_other(tmp_path):
+    upstream, client = tmp_path / "upstream", tmp_path / "client"
+    name = _trace_names(1)[0]
+    held = WireTrace({"upstream_trace_dir": str(upstream)}, name, b"{}")
+    # The client root has an old closed folder with the same name and then fills past its limit.
+    cfg = {"client_trace_dir": str(client), "trace_max_folders": 1}
+    WireTrace(cfg, name, b"{}", root_key="client_trace_dir").close()
+    WireTrace(cfg, _trace_names(2)[1], b"{}", root_key="client_trace_dir").close()
+    assert sorted(p.name for p in client.iterdir()) == _trace_names(2)[1:]
+    assert (upstream / name / "request-body.json").exists()
+    held.close()
+
+
+def test_a_trace_dropped_without_close_does_not_pin_its_folder_for_ever(tmp_path):
+    import gc
+    cfg = {"upstream_trace_dir": str(tmp_path), "trace_max_folders": 1}
+    names = _trace_names(3)
+    WireTrace(cfg, names[0], b"{}")  # abandoned: nobody calls close()
+    gc.collect()
+    WireTrace(cfg, names[1], b"{}").close()
+    WireTrace(cfg, names[2], b"{}").close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == names[2:]
+
+
+def test_a_failed_trace_releases_its_name(tmp_path):
+    cfg = {"upstream_trace_dir": str(tmp_path), "trace_max_folders": 1}
+    name = _trace_names(1)[0]
+    first = WireTrace(cfg, name, b"{}")
+    duplicate = WireTrace(cfg, name, b"{}")  # the folder exists: this one fails ...
+    assert duplicate.failed
+    # ... and must not unprotect the live trace of the same folder.
+    for later in _trace_names(3)[1:]:
+        WireTrace(cfg, later, b"{}").close()
+        assert (tmp_path / name / "request-body.json").exists()
+    first.close()
+
+
+def test_pruning_scans_the_root_once_and_does_nothing_per_folder_but_the_removal(tmp_path, monkeypatch):
+    import os
+    import upstream_diagnostics
+    for name in _stamped(600):
+        (tmp_path / name).mkdir()
+    scans, removed = [], []
+    real_scandir, real_rmtree = os.scandir, upstream_diagnostics.shutil.rmtree
+    monkeypatch.setattr(upstream_diagnostics.os, "scandir",
+                        lambda path: scans.append(str(path)) or real_scandir(path))
+    monkeypatch.setattr(upstream_diagnostics.shutil, "rmtree",
+                        lambda path, **kw: removed.append(path) or real_rmtree(path, **kw))
+    old = "20261105-000000-held-attempt1-000000000001"  # sorts before every other folder
+    held = WireTrace({"upstream_trace_dir": str(tmp_path), "trace_max_folders": 1000}, old, b"{}")
+    upstream_diagnostics.prune_traces(str(tmp_path), "20261105-235959-none", 100)
+    # One listing of the root per prune (removing a folder lists that folder, not the root). 601 folders, the
+    # newest 100 stay; the 501 older ones go except the open trace.
+    assert scans.count(str(tmp_path)) == 2 and len(removed) == 500
+    assert (tmp_path / old / "request-body.json").exists()
+    held.close()
+
+
 def test_opt_in_trace_preserves_exact_request_response_and_parser_event(tmp_path, monkeypatch):
     cfg = {"base": "https://fixture.invalid", "upstream_trace_dir": str(tmp_path / "wire"),
            "upstream_error_dir": str(tmp_path / "summaries")}

@@ -1,13 +1,15 @@
 """Sync only an existing Proxi provider in a DeepSeek Harness profile patch.
 
-Preview is read-only and masks credentials unless --include-secrets is given.
---write requires an explicit same-volume backup directory and does nothing when
-the catalog is already current. Other providers, credentials, plugin
-configuration and the selected model remain unchanged. Reasoning models keep the
-existing default and selectors; a separate retool-text provider avoids inheriting
-that default for non-reasoning models.
+Preview is read-only and masks credentials and the text of comments unless
+--include-secrets is given. The masking goes by name and shape, so read a preview
+before sharing it. --write requires an explicit same-volume backup directory and
+does nothing when the catalog is already current. Other providers, credentials,
+plugin configuration and the selected model remain unchanged. Reasoning models keep
+the existing default and selectors; a separate retool-text provider avoids
+inheriting that default for models without selectors.
 """
 import argparse
+import bisect
 import copy
 import datetime
 from io import StringIO
@@ -18,7 +20,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.probe_client_settings import routable_entries
-from scripts.sync_opencode_catalog import MASK, is_secret_key, read_file, write_backed_up, write_preview
+from scripts.sync_opencode_catalog import (MASK, is_environment_list, is_secret_flag, is_secret_key, mask_string,
+                                           mask_text, read_file, write_backed_up, write_preview)
+
+STR = 'tag:yaml.org,2002:str'
 
 
 def _copy(value):
@@ -223,8 +228,32 @@ def encode_document(original, document, result):
     return source.encode('utf-8')
 
 
+def _comment_spans(source, scalars):
+    """(start, end) of every YAML comment: a `#` outside all scalars that starts a line or follows whitespace."""
+    spans = sorted((node.start_mark.index, node.end_mark.index) for node in scalars)
+    starts, line_end = [start for start, _ in spans], re.compile(r'[\r\n]')
+    found, position = [], source.find('#')
+    while position >= 0:
+        index = bisect.bisect_right(starts, position) - 1
+        outside = index < 0 or position >= spans[index][1]
+        if outside and (position == 0 or source[position - 1] in ' \t\r\n\ufeff'):
+            stop = line_end.search(source, position)
+            end = stop.start() if stop else len(source)
+            found.append((position, end))
+            position = end
+        position = source.find('#', position + 1)
+    return found
+
+
 def mask_profile(encoded):
-    """Profile bytes with credential values replaced by MASK; every other byte is kept."""
+    """Profile bytes without credentials or comment text; the structure is kept.
+
+    MASK replaces the values under credential keys, the argument after a secret flag, the value of each NAME=value
+    item of an env list, the user info and secret parameters of URLs and secret NAME=value text. Every comment keeps
+    its place but reads `# ***`, because a comment can quote an old key. Every other byte is kept, except that a plain
+    or quoted value holding a masked URL or argument is rewritten in double quotes. The rules go by name and shape:
+    review a preview before sharing it.
+    """
     from ruamel.yaml.error import YAMLError
     from ruamel.yaml.nodes import MappingNode, ScalarNode, SequenceNode
     source = decode_profile(encoded)
@@ -233,32 +262,76 @@ def mask_profile(encoded):
         root = yaml.compose(source)
     except YAMLError as error:
         raise ValueError('The preview is not valid YAML: %s' % _problem(error)) from None
-    secrets, seen = {}, set()
+    secrets, partial, scalars, seen = {}, {}, [], set()
 
-    def visit(node, secret):
-        if (id(node), secret) in seen:
+    def visit(node, secret, assignments=False):
+        if (id(node), secret, assignments) in seen:
             return
-        seen.add((id(node), secret))
+        seen.add((id(node), secret, assignments))
         if isinstance(node, MappingNode):
             for key, value in node.value:
                 name = key.value if isinstance(key, ScalarNode) else ''
-                visit(value, secret or is_secret_key(name, isinstance(value, MappingNode)))
+                visit(value, secret or is_secret_key(name, isinstance(value, MappingNode)),
+                      is_environment_list(name, isinstance(value, SequenceNode)))
+        elif isinstance(node, SequenceNode):
+            flagged = False
+            for item in node.value:
+                visit(item, secret or flagged, assignments)
+                flagged = isinstance(item, ScalarNode) and is_secret_flag(item.value)
+        elif isinstance(node, ScalarNode) and node.value:
+            if secret:
+                # Numbers, booleans and dates are not credentials; text and custom tags are.
+                if node.tag == STR or not node.tag.startswith('tag:yaml.org,2002:'):
+                    secrets[id(node)] = node
+            elif node.tag == STR and node.style not in ('|', '>'):
+                masked = mask_string(node.value, assignments)
+                if masked != node.value:
+                    partial[id(node)] = (node, masked)
+
+    def collect(node, visited):
+        """Every scalar, keys included: a `#` inside one is text, not a comment."""
+        if id(node) in visited:
+            return
+        visited.add(id(node))
+        if isinstance(node, ScalarNode):
+            scalars.append(node)
+        elif isinstance(node, MappingNode):
+            for key, value in node.value:
+                collect(key, visited)
+                collect(value, visited)
         elif isinstance(node, SequenceNode):
             for item in node.value:
-                visit(item, secret)
-        elif secret and isinstance(node, ScalarNode) and node.value:
-            # Numbers, booleans and dates are not credentials; text and custom tags are.
-            if node.tag == 'tag:yaml.org,2002:str' or not node.tag.startswith('tag:yaml.org,2002:'):
-                secrets[id(node)] = node
+                collect(item, visited)
+
+    def replacement(node, text):
+        start, end = node.start_mark.index, node.end_mark.index
+        old = source[start:end]
+        # Keep an anchor (aliases still resolve); drop its tag, which would not fit the masked text.
+        anchors = ''.join(re.findall(r'&\S+\s+', re.match(r'(?:(?:&\S+|!\S*)\s+)*', old).group()))
+        tail = next((ending for ending in ('\r\n', '\n', '\r') if old.endswith(ending)), '')
+        return start, end, anchors + text + tail
+
+    def block_edit(node):
+        """A block scalar is masked where it stands, so its style and indentation survive (plugin source stays readable)."""
+        start, end = node.start_mark.index, node.end_mark.index
+        old = source[start:end]
+        head = re.match(r'((?:(?:&\S+|!\S*)\s+)*[|>][-+0-9]*)([ \t]+#[^\r\n]*)?', old)
+        if not head:
+            return None
+        # A comment on the header line belongs to the scalar's own text, so the generic comment scan skips it.
+        new = head.group(1) + (' # ' + MASK if head.group(2) else '') + mask_text(old[head.end():])
+        return (start, end, new) if new != old else None
+
     if root is not None:
         visit(root, False)
-    for node in sorted(secrets.values(), key=lambda item: item.start_mark.index, reverse=True):
-        start, end = node.start_mark.index, node.end_mark.index
-        text = source[start:end]
-        # Keep an anchor (aliases still resolve); drop its tag, which would not fit the masked text.
-        anchors = ''.join(re.findall(r'&\S+\s+', re.match(r'(?:(?:&\S+|!\S*)\s+)*', text).group()))
-        tail = next((ending for ending in ('\r\n', '\n', '\r') if text.endswith(ending)), '')
-        source = source[:start] + anchors + "'" + MASK + "'" + tail + source[end:]
+        collect(root, set())
+    edits = [replacement(node, "'" + MASK + "'") for node in secrets.values()]
+    edits += [replacement(node, json.dumps(masked, ensure_ascii=False)) for node, masked in partial.values()]
+    edits += [edit for edit in (block_edit(node) for node in scalars if node.style in ('|', '>') and id(node) not in secrets)
+              if edit]
+    edits += [(start, end, '# ' + MASK) for start, end in _comment_spans(source, scalars)]
+    for start, end, text in sorted(edits, key=lambda edit: edit[0], reverse=True):
+        source = source[:start] + text + source[end:]
     try:
         yaml.compose(source)
     except YAMLError as error:
@@ -290,7 +363,7 @@ def main(argv=None):
     parser.add_argument('--relay-config', default=str(Path(__file__).resolve().parents[1] / 'config.json'))
     parser.add_argument('--output', help='New private preview file; never overwritten')
     parser.add_argument('--include-secrets', action='store_true',
-                        help='Keep credentials in the --output preview; they are masked as *** by default')
+                        help='Keep credentials and comments in the --output preview; both are masked as *** by default')
     parser.add_argument('--write', action='store_true')
     parser.add_argument('--backup-dir')
     args = parser.parse_args(argv)

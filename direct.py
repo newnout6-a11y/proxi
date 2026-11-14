@@ -23,7 +23,6 @@ import journal
 import client_context
 import console_log
 import native_history
-import models as model_catalog
 from accounts import account_tag, idle_block
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
@@ -1242,7 +1241,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             while True:
                 if is_cancelled():
                     return
-                budget.take(is_cancelled)
+                budget.take(is_cancelled, session.backend)
                 trace = AttemptTrace(cfg, budget, request_id, body.get("model"), payload)
                 holder["trace"] = trace
                 request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,

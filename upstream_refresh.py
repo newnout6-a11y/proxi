@@ -80,12 +80,16 @@ class Refresher:
                 self._last_result = False
                 return False, self.last_failure_kind, self.last_error
 
-    def _mark_adopted(self):
+    def _mark_adopted(self, from_disk=False):
         # Credentials renewed elsewhere (another request, an external sign-in) prove the session lives.
+        # Those read from config.json are saved there by definition: an earlier failure to save the
+        # session they replace no longer describes anything.
         self.last_success_at = time.time()
         self.last_error = None
         self.last_failure_kind = None
         self._last_result = True
+        if from_disk:
+            self.persistence_error = None
         return True, None, None
 
     def _refresh_locked(self, force=False, *, rejected_cookie=None):
@@ -100,7 +104,7 @@ class Refresher:
                 return self._mark_adopted()
             try:
                 if reload_auth(self.cfg):
-                    return self._mark_adopted()
+                    return self._mark_adopted(from_disk=True)
             except Exception as exc:
                 self.persistence_error = "cannot read session configuration: " + type(exc).__name__
             now = time.monotonic()

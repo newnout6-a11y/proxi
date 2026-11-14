@@ -97,6 +97,37 @@ def test_default_options_and_nested_effort_controls_are_also_validated(mode):
     assert not result['passed']
 
 
+def rejected(mode, model):
+    result = catalog_policy(wrap({'gpt-6-sol': model}, mode), 'retool-relay/gpt-6-sol\n', mode)
+    assert not result['passed'] and result['forbidden_variants'] == ['gpt-6-sol']
+    return result['forbidden_variant_fields']
+
+
+@pytest.mark.parametrize('mode', ['opencode', 'opencode2'])
+def test_each_rejection_names_the_model_the_field_and_the_problem(mode):
+    block = 'settings' if mode == 'opencode2' else 'options'
+    variant = ([{'id': 'high', 'settings': {'reasoningEffort': 'xhigh'}}] if mode == 'opencode2'
+               else {'high': {'reasoningEffort': 'xhigh'}})
+    refused = 'has a reasoning effort the route does not accept'
+    assert rejected(mode, {block: {'reasoningEffort': 'xhigh'}}) == [{'model': 'gpt-6-sol', 'field': block,
+                                                                      'problem': refused}]
+    assert rejected(mode, {'variants': variant}) == [{'model': 'gpt-6-sol', 'field': 'variants.high',
+                                                      'problem': refused}]
+    assert rejected(mode, {block: {'reasoningEffort': 'high', 'effort': 'low'}}) == [
+        {'model': 'gpt-6-sol', 'field': block, 'problem': 'sets conflicting reasoning efforts'}]
+    assert rejected(mode, {'settings': 'text'}) == [{'model': 'gpt-6-sol', 'field': 'settings',
+                                                     'problem': 'is not an object'}]
+    assert rejected(mode, {'variants': 'text'}) == [
+        {'model': 'gpt-6-sol', 'field': 'variants', 'problem': 'is neither an object nor a list of objects'}]
+    assert rejected(mode, 'text') == [{'model': 'gpt-6-sol', 'field': 'entry', 'problem': 'is not an object'}]
+
+
+@pytest.mark.parametrize('mode', ['opencode', 'opencode2'])
+def test_a_rejection_never_repeats_the_configured_value(mode):
+    block = 'settings' if mode == 'opencode2' else 'options'
+    assert 'private-level-value' not in json.dumps(rejected(mode, {block: {'reasoningEffort': 'private-level-value'}}))
+
+
 def desktop(app_data, *versions, executable=True):
     for version in versions:
         folder = app_data / 'ai.opencode.desktop' / 'cli' / version
