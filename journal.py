@@ -8,6 +8,7 @@ file and can be followed live by long-lived admin streams.
 import collections
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -313,13 +314,15 @@ class Journal:
         count = int(window // bucket)
         buckets = [{"t": int(start + index * bucket), "requests": 0, "errors": 0, "latency": [],
                     "ttft": [], "credits": 0.0, "cache_read": 0, "cache_write": 0, "input": 0,
-                    "output": 0, "turns": 0, "tools": 0, "commands": 0} for index in range(count)]
+                    "output": 0, "turns": 0, "tools": 0, "commands": 0, "credits_unknown": 0} for index in range(count)]
         totals = collections.Counter()
         statuses = collections.Counter()
         models = collections.Counter()
         categories = collections.Counter()
         levels = collections.Counter()
         latency_all, ttft_all = [], []
+        costs = {}
+        current_attempt = {}
         for event in self._snapshot():
             if event["ts"] < start:
                 continue
@@ -328,6 +331,13 @@ class Journal:
             slot = buckets[min(count - 1, int((event["ts"] - start) // bucket))]
             data = event.get("data") or {}
             kind = event["kind"]
+            turn = event.get('turn_id') or event.get('request_id') or ('event', event['seq'])
+            if kind == 'turn.begin':
+                costs.setdefault((turn, 0), {'known': False, 'slot': slot})
+            elif kind == 'upstream.usage_start':
+                costs.pop((turn, 0), None)
+                current_attempt[turn] = data.get('attempt', 0)
+                costs.setdefault((turn, current_attempt[turn]), {'known': False, 'slot': slot})
             if event["level"] == "error":
                 slot["errors"] += 1
                 totals["errors"] += 1
@@ -347,13 +357,20 @@ class Journal:
                 slot["ttft"].append(data["ttft_ms"])
                 ttft_all.append(data["ttft_ms"])
             elif kind == "upstream.usage":
-                slot["credits"] += float(data.get("credits") or 0)
+                value = data.get('credits')
+                known_cost = type(value) in (int, float) and math.isfinite(value) and value >= 0
+                attempt = data.get('attempt', current_attempt.get(turn, 0))
+                if attempt != 0:
+                    costs.pop((turn, 0), None)
+                cost = costs.setdefault((turn, attempt), {'known': False, 'slot': slot})
+                cost['known'] |= known_cost or data.get('credits_reported') is True
+                slot["credits"] += value if known_cost else 0
                 slot["cache_read"] += int(data.get("cache_read") or 0)
                 slot["cache_write"] += int(data.get("cache_write") or 0)
                 slot["input"] += int(data.get("input_tokens") or 0)
                 slot["output"] += int(data.get("output_tokens") or 0)
                 totals["output_tokens"] += int(data.get("output_tokens") or 0)
-                totals["credits"] += float(data.get("credits") or 0)
+                totals["credits"] += value if known_cost else 0
                 totals["cache_read"] += int(data.get("cache_read") or 0)
                 totals["cache_write"] += int(data.get("cache_write") or 0)
                 totals["input_tokens"] += int(data.get("input_tokens") or 0)
@@ -363,10 +380,15 @@ class Journal:
             elif kind == "exec.result":
                 slot["commands"] += 1
                 totals["commands"] += 1
+        for cost in costs.values():
+            if not cost['known']:
+                cost['slot']['credits_unknown'] += 1
+                totals['credits_unknown'] += 1
         for slot in buckets:
             slot["latency"] = round(sum(slot["latency"]) / len(slot["latency"])) if slot["latency"] else None
             slot["ttft"] = round(sum(slot["ttft"]) / len(slot["ttft"])) if slot["ttft"] else None
             slot["credits"] = round(slot["credits"], 4)
+            slot['credits_complete'] = slot['credits_unknown'] == 0
 
         def percentile(values, share):
             if not values:
@@ -381,6 +403,8 @@ class Journal:
             "totals": {"requests": totals["requests"], "errors": totals["errors"], "turns": totals["turns"],
                        "tools": totals["tools"], "commands": totals["commands"],
                        "credits": round(totals["credits"], 4), "cache_read": cached,
+                       "credits_complete": totals['credits_unknown'] == 0,
+                       "credits_unknown": totals['credits_unknown'],
                        "cache_write": totals["cache_write"], "input_tokens": totals["input_tokens"],
                        "output_tokens": totals["output_tokens"],
                        "cache_hit_ratio": round(cached / prompt, 4) if prompt else None,

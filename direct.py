@@ -31,7 +31,7 @@ from upstream_diagnostics import AttemptTrace, prune_diagnostics
 ROUTE = "/api/gpt/copilotStreamGPT?origin=frontend"
 MIN_OUTPUT_TOKENS = 16
 # Billing and keep-alive events describe the attempt, not its content: never held back.
-_LIVE_EVENTS = frozenset({"credits", "thinking_heartbeat", "end"})
+_LIVE_EVENTS = frozenset({"credits", "usage", "thinking_heartbeat", "end"})
 _EMPTY_DUMPED = set()  # (request_purpose, model) pairs whose empty answer is already saved this run
 
 
@@ -40,7 +40,8 @@ def _int_setting(cfg, key, default):
         return max(0, int(cfg.get(key, default)))
     except (TypeError, ValueError, OverflowError):
         return default
-_ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku"}  # models proven to live only on the Assist list
+_ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku", 'gpt-4.1',
+                'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2'}
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
 
 
@@ -101,7 +102,12 @@ def _force_close_response(resp):
         except Exception:
             pass
         return
-    # Fallback for response shapes without a walkable socket chain.
+    # Fallback for response shapes without a walkable socket chain. Borrow the
+    # handle only to shut down reads; never steal ownership from an unseen
+    # Python socket. Closing an alias leaves that original object holding a
+    # stale number, whose later finalizer can kill a reused, unrelated socket.
+    # This is best effort: Winsock may require a real owning close to unblock a
+    # pending recv. Real HTTPResponse objects use the owning path above.
     try:
         fd = resp.fileno() if hasattr(resp, "fileno") else None
         if fd is not None and fd != -1:
@@ -116,7 +122,8 @@ def _force_close_response(resp):
                     s.shutdown(socket.SHUT_RDWR)
                 except Exception:
                     pass
-                s.close()
+                finally:
+                    s.detach()
             except Exception:
                 pass
     except Exception:
@@ -206,7 +213,7 @@ def tools_to_retool(tools):
             params[name] = _param_schema(properties[name], name in required)
         converted.append({"name": function["name"],
                           "description": function.get("description") or "",
-                          "params": params, "strict": True})
+                          "params": params, "strict": function.get("strict", True)})
     return converted
 
 
@@ -457,7 +464,15 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         block = {"type": "text", "text": head}
         if cache:
             block["cache"] = True
-        messages.append({"role": "system", "content": [block]})
+        blocks = [block]
+        first, separator, rest = head.partition('\n')
+        if first.startswith('x-anthropic-billing-header:') and separator and rest:
+            # Anthropic consumes this SDK attribution block. Combining real
+            # instructions with it makes those instructions disappear upstream.
+            # This split is deterministic from head, including on signed replay.
+            block['text'] = rest
+            blocks.insert(0, {'type': 'text', 'text': first})
+        messages.append({"role": "system", "content": blocks})
     history = [part for part in (chunks or []) if part]
     if not history:
         if prompt:
@@ -581,6 +596,8 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         body["providerResourceName"] = resource
     if model_provider.get("reasoningEffort"):
         body["reasoningEffort"] = model_provider["reasoningEffort"]
+    if model_provider.get('verbosity') is not None:
+        body['verbosity'] = model_provider['verbosity']
     if max_tokens:
         body["maxCompletionTokens"] = max(int(max_tokens), MIN_OUTPUT_TOKENS)
     if tools:
@@ -850,9 +867,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     """Yield normalised relay events from the direct NDJSON stream."""
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
-    # Output caps control the next generation, not the signed input prefix.
-    # OpenCode legitimately omits or changes them between tool follow-ups.
-    scope = json.dumps([getattr(session, "_native_conversation_key", None), model_provider,
+    # Output caps and verbosity control generation, not the signed input prefix.
+    # Clients legitimately omit or change them between tool follow-ups.
+    prefix_provider = {key: value for key, value in model_provider.items() if key != 'verbosity'}
+    scope = json.dumps([getattr(session, "_native_conversation_key", None), prefix_provider,
                         head, tools, tool_choice], sort_keys=True, ensure_ascii=True)
     parent, messages = history.resume(scope, client) if history is not None and client is not None else (None, None)
     if messages is not None:
@@ -874,6 +892,17 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             journal.emit("native_history.reset", "История или настройки изменились; прежняя подпись не переиспользуется",
                          "warn", reason="prefix_or_settings_mismatch")
         body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks, session=session)
+        cold = (native_history.unsigned_tool_transcript(client)
+                if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
+        if cold is not None:
+            # The opaque signed branch may have expired or belonged to another
+            # account. Client-visible calls/results are still valid protocol.
+            # Rebuild them without trusting any client-supplied thinking blocks.
+            initial = body['messages'][:1] if head else []
+            body['messages'] = native_history.cache_messages(initial + cold, cfg.get('direct_cache', True), tools)
+            body['rit'] = make_rit(body['messages'], tools)
+            journal.emit('native_history.cold', 'История инструментов восстановлена без старых thinking-подписей',
+                         'info', messages=len(cold), signatures=0)
     session._direct_reply = None
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
     if model_provider.get("model") in _ASSIST_ONLY:
@@ -1219,12 +1248,14 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         held.append(event)
             except BaseException as exc:
                 failure = exc
-                raise
+                if not isinstance(exc, Exception):
+                    raise
             finally:
                 current_trace = holder.get("trace")
                 possibly_billed = (current_trace is not None and
                                    (current_trace.http_status is None or 200 <= current_trace.http_status < 300))
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
+                    flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
                     if mark_unknown:
                         mark_unknown()
@@ -1242,10 +1273,19 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     trace.finish(outcome)
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)
+            if flags.get('cost_unknown') and not flags.get('usage_seen'):
+                # Include possibly billed failures/truncations before failover.
+                yield {'type': 'usage', 'usage': {}}
+            if failure is not None:
+                raise failure
             saw_end = bool(flags.get("end"))
             if is_cancelled():
                 yield {"type": "end", "reason": "cancelled"}
                 return
+            if saw_end and not flags.get('usage_seen') and not flags.get('cost_unknown'):
+                # An empty/no-telemetry attempt can still have been billed. Keep
+                # its unknown price visible when a later retry reports a cost.
+                yield {'type': 'usage', 'usage': {}}
             if not usable and saw_end:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if (usable or not saw_end or service_request or not budget.remaining
@@ -1450,18 +1490,36 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             if usage:
                 flags["usage_seen"] = True
-                flags["last_usage"] = usage
+                flags.setdefault("last_usage", {}).update(usage)
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
                                   (" " + client_context.label() if client_context.label() else ""))
             credits_value = console_log.number(usage.get("creditsUsed"))
+            normalized = {target: usage[source] for source, target in (
+                ('inputTokens', 'input_tokens'), ('outputTokens', 'output_tokens'),
+                ('promptTokensReadFromCache', 'cache_read'), ('promptTokensWrittenToCache', 'cache_write'))
+                if source in usage}
+            # Preserve a genuine provider counter if a route explicitly supplies
+            # it; current Retool captures normally omit this optional information.
+            reported_reasoning = usage.get('reasoningTokens')
+            details = usage.get('output_tokens_details')
+            if reported_reasoning is None and isinstance(details, dict):
+                reported_reasoning = details.get('reasoning_tokens', details.get('thinking_tokens'))
+            if reported_reasoning is not None:
+                normalized['reasoning_tokens'] = reported_reasoning
             if credits_value is not None:
+                # Metadata reports cumulative snapshots for ONE HTTP attempt.
+                # Emit only new cost, keeping distinct retries separately billed.
+                previous = flags.get('credits_snapshot')
+                flags['credits_snapshot'] = max(previous or 0, credits_value)
+                delta = credits_value - (previous or 0)
                 flags["credits_reported"] = True
-                yield {"type": "credits", "value": credits_value,
-                       "usage": {"input_tokens": usage.get("inputTokens"),
-                                 "output_tokens": usage.get("outputTokens"),
-                                 "cache_read": usage.get("promptTokensReadFromCache"),
-                                 "cache_write": usage.get("promptTokensWrittenToCache")}}
+                if previous is None or delta > 0:
+                    yield {"type": "credits", "value": max(0, delta), "usage": normalized}
+                elif normalized:
+                    yield {"type": "usage", "usage": normalized, "credits_reported": True}
+            elif usage:
+                yield {"type": "usage", "usage": normalized}
         elif kind == "error":
             raise _error_from_event(event)
 

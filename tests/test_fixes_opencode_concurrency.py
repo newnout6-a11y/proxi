@@ -36,6 +36,7 @@ def test_chat_adapter_cache_and_reasoning_details():
         "usage": {
             "input_tokens": 120,
             "output_tokens": 50,
+            "reasoning_tokens": 7,
             "cache_read": 1000,
             "cache_write": 200,
         }
@@ -43,7 +44,7 @@ def test_chat_adapter_cache_and_reasoning_details():
     payload = adapter.end("stop")
     usage = payload["usage"]
     assert usage["prompt_tokens_details"]["cached_tokens"] == 1000
-    assert usage["completion_tokens_details"]["reasoning_tokens"] > 0
+    assert usage["completion_tokens_details"]["reasoning_tokens"] == 7
     assert usage["credits_used"] == 0.015
 
 
@@ -65,6 +66,7 @@ def test_responses_adapter_cache_and_reasoning_details():
         "usage": {
             "input_tokens": 500,
             "output_tokens": 80,
+            "reasoning_tokens": 13,
             "cache_read": 450,
             "cache_write": 50,
         }
@@ -72,7 +74,7 @@ def test_responses_adapter_cache_and_reasoning_details():
     payload = adapter.end("stop")
     usage = payload["usage"]
     assert usage["input_token_details"]["cached_tokens"] == 450
-    assert usage["output_token_details"]["reasoning_tokens"] > 0
+    assert usage["output_token_details"]["reasoning_tokens"] == 13
     assert usage["credits_used"] == 0.02
 
 
@@ -544,6 +546,7 @@ def test_chat_adapter_streaming_full_cache_read_write_details():
         "usage": {
             "input_tokens": 10,
             "output_tokens": 100,
+            "reasoning_tokens": 11,
             "cache_read": 15000,
             "cache_write": 2500,
         }
@@ -561,8 +564,8 @@ def test_chat_adapter_streaming_full_cache_read_write_details():
     assert usage["prompt_tokens_details"]["cache_read_tokens"] == 15000
     assert usage["prompt_tokens_details"]["cache_creation_input_tokens"] == 2500
     assert usage["input_tokens_details"]["cached_tokens"] == 15000
-    assert usage["completion_tokens_details"]["reasoning_tokens"] > 0
-    assert usage["output_tokens_details"]["reasoning_tokens"] > 0
+    assert usage["completion_tokens_details"]["reasoning_tokens"] == 11
+    assert usage["output_tokens_details"]["reasoning_tokens"] == 11
     # prompt_tokens is total
     assert usage["prompt_tokens"] >= 15000 + 2500 + 10
 

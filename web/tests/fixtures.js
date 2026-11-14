@@ -25,6 +25,9 @@ const extraCatalog = [
 
 // Mirrors admin._schema: every field has a group, a real description and, where it applies, a unit.
 export const baseSchema = {
+  relay_system_prompt_mode: { type: 'string', label: 'Применение инструкций', group: 'instructions',
+    enum: ['standalone', 'append', 'replace'], restart_required: true },
+  relay_system_prompt: { type: 'string', label: 'Инструкции для модели', group: 'instructions', nullable: true, multiline: true, restart_required: true },
   model: { type: 'string', label: 'Модель по умолчанию', group: 'model', enum: catalog.map(({ id }) => id), restart_required: true,
     description: 'Модель для запросов, в которых клиент не указал свою' },
   show_thinking: { type: 'boolean', label: 'Передавать мышление модели', group: 'model', restart_required: true,
@@ -186,9 +189,10 @@ export function settingsResponse(settings, effective, schema) {
   return { settings, effective, schema, pending_restart: pending, restart_required: pending.length > 0, writable: true };
 }
 
-export async function mockAdmin(page, { rich = false, empty = false, overviewPatch = {} } = {}) {
+export async function mockAdmin(page, { rich = false, empty = false, overviewPatch = {}, metricsPatch = {} } = {}) {
   const schema = rich ? richSchema : baseSchema;
   const initial = { model: 'claude-opus-5-5', show_thinking: true, max_workers: 4, rate_limit_rps: 0,
+    relay_system_prompt_mode: 'standalone', relay_system_prompt: null,
     ...(rich ? { reasoning_effort: 'high', session_mode: 'per_conversation', enable_anthropic: true, enable_chat: true,
       min_account_balance: 20, cache_keepwarm_seconds: 240, upstream_empty_retries: 1, turn_timeout: 900 } : {}) };
   const events = empty ? [] : rich ? richJournal() : journal;
@@ -223,7 +227,8 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     if (path === '/admin/api/overview') return reply(200, overview);
     if (path === '/admin/api/metrics') {
       const windowSec = Number(url.searchParams.get('window')) || 3600;
-      return reply(200, { ...metricsFor(windowSec), buffered: events.length, last_seq: events.length });
+      const metrics = metricsFor(windowSec);
+      return reply(200, { ...metrics, ...metricsPatch, totals: { ...metrics.totals, ...metricsPatch.totals }, buffered: events.length, last_seq: events.length });
     }
     if (path === '/admin/api/models') return reply(200, { data: models, default_model: 'claude-opus-5-5' });
     if (path === '/admin/api/events') return reply(200, { data: state.cleared ? [] : events, last_seq: events.length ? events[events.length - 1].seq : 0 });
@@ -274,6 +279,7 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     if (path === '/admin/api/settings' && method === 'PATCH') {
       const body = request.postDataJSON();
       state.patches.push({ body, headers });
+      if (state.patchDelay) await new Promise((resolve) => setTimeout(resolve, state.patchDelay));
       state.settings = { ...state.settings, ...body.settings };
       const applied = Object.keys(body.settings).filter((key) => !schema[key].restart_required);
       for (const key of applied) state.effective[key] = body.settings[key];

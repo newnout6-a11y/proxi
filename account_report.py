@@ -60,7 +60,8 @@ def collect(runtime, *, force_refresh=False):
     if len(rows) == 1:
         infos = [fetch(rows[0])]
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
+        parallel = max(1, int(getattr(runtime, 'cfg', {}).get('account_refresh_parallel', 3)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, parallel, len(rows))) as pool:
             infos = list(pool.map(fetch, rows))
     entries = []
     for (backend, manager), info in zip(rows, infos):

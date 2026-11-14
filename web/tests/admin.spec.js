@@ -271,7 +271,7 @@ test('turn traces show hidden thinking and tool argument time', async ({ page })
     ev(22, 'tool.call', 'Инструмент клиента: Write', 'info', { turn_id: 'turn-beta-2', data: { name: 'Write', args_ms: 7100 } }),
   );
   const trace = page.locator('.trace', { hasText: 'effort high' }).first();
-  await expect(trace.locator('[title="Скрытое мышление"]')).toContainText('6,40 с', { timeout: 10000 });
+  await expect(trace.locator('[title="По событиям thinking от upstream"]')).toContainText('6,40 с', { timeout: 10000 });
   await expect(trace.locator('[title="Генерация аргументов инструментов"]')).toContainText('7,10 с');
 });
 
@@ -330,6 +330,83 @@ test('settings save only changed values with the CSRF header', async ({ page }) 
   await expect(page.getByText('ждут перезапуска: 1')).toBeVisible();
 });
 
+test('system role preserves multiline instructions, explicit empty text and reset to default', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  const editor = page.getByLabel('Инструкции для модели', { exact: true });
+  await expect(editor).toBeDisabled();
+  await page.getByLabel('Стандартная роль relay').uncheck();
+  await page.getByRole('radio', { name: /Дополнить клиента/ }).check();
+  const policy = 'Ты — инженер проекта.\nНе удаляй данные без подтверждения.';
+  await editor.fill(policy);
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect.poll(() => state.settings.relay_system_prompt).toBe(policy);
+  expect(state.settings.relay_system_prompt_mode).toBe('append');
+  await expect(page.locator('.savebar')).toHaveCount(0);
+  await editor.fill('');
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect.poll(() => state.settings.relay_system_prompt).toBe('');
+  await expect(page.locator('.savebar')).toHaveCount(0);
+  await page.getByLabel('Стандартная роль relay').check();
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect.poll(() => state.settings.relay_system_prompt).toBe(null);
+});
+
+test('typing during a pending save is preserved as a new draft', async ({ page }) => {
+  const state = await mockAdmin(page);
+  state.patchDelay = 800;
+  await login(page);
+  await nav(page, 'Настройки');
+  const input = page.locator('#setting-rate_limit_rps');
+  await input.fill('2');
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect.poll(() => state.patches.length).toBe(1);
+  await input.fill('3');
+  await expect(page.getByText('Настройки сохранены')).toBeVisible();
+  await expect(input).toHaveValue('3');
+  await expect(page.locator('.savebar')).toBeVisible();
+  expect(state.settings.rate_limit_rps).toBe(2);
+});
+
+test('incomplete usage is not shown as free inference or a reliable forecast', async ({ page }) => {
+  await mockAdmin(page, { metricsPatch: { totals: { credits: 0, credits_complete: false } },
+    overviewPatch: { balance: { available: 100, monthly_allocation: 3000, unreported_usage: true } } });
+  await login(page);
+  await expect(page.locator('.forecast')).toContainText('часть стоимости не сообщена');
+  await expect(page.locator('.stat').first()).toContainText('—');
+  await expect(page.getByText('есть неучтённый расход')).toBeVisible();
+});
+
+test('activity tabs and chart values work with the keyboard', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  const chart = page.locator('.chart').first();
+  await chart.focus();
+  await chart.press('End');
+  await expect(page.locator('.chart-tip')).toBeVisible();
+  await expect(page.locator('.chart-tip')).toContainText('кредиты');
+  await chart.press('Escape');
+  await expect(page.locator('.chart-tip')).toHaveCount(0);
+  await nav(page, 'Активность');
+  const turns = page.getByRole('tab', { name: /Ходы моделей/ });
+  await turns.focus();
+  await turns.press('ArrowRight');
+  await expect(page.getByRole('tab', { name: /Все события/ })).toBeFocused();
+  await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'activity-tab-events');
+});
+
+test('model controls stay readable on a narrow display', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 850 });
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  await expect(page.locator('.model-effort').first()).toBeVisible();
+  await expect(page.locator('.model-effort').first()).toContainText('Effort:');
+  await expect(page.locator('.model-effort').first()).toContainText('Verbosity:');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+});
+
 test('keyboard shortcuts switch sections and the theme toggles', async ({ page }) => {
   await mockAdmin(page);
   await login(page);
@@ -368,7 +445,7 @@ test('no glow, gradient, uppercase or heavy weight in any section', async ({ pag
   expect(found).toEqual({ overview: [], Активность: [], Аккаунты: [], Настройки: [] });
 });
 
-for (const width of [320, 414]) {
+for (const width of [280, 320, 414]) {
   test(`has no horizontal overflow at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 850 });
     await mockAdmin(page);

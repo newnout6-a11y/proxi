@@ -146,7 +146,7 @@ def test_insufficient_credits_from_a_persisted_error_is_402_like_the_pool():
 
 
 @pytest.mark.parametrize("model,configured,expected_resolution", [
-    ("zai-org/GLM-5.3", "max", "provider_managed"),
+    ("zai-org/GLM-5.3", "max", "exact"),
     ("claude-opus-5-5", "max", "exact"),
     ("gpt-5", "max", "compatibility"),
     ("zai-org/GLM-5.3", "auto", "model_default"),

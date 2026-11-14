@@ -199,7 +199,8 @@ def test_final_attempt_without_telemetry_estimates_only_its_context_and_output(d
     assert input_tokens(dialect, usage) == len("\nnew prompt") // 4
     assert usage["completion_tokens" if dialect == "chat" else "output_tokens"] == 8
     assert adapter.cache_read == adapter.cache_write == 0
-    assert usage["credits_used"] == 1
+    assert usage["credits_used"] is None
+    assert usage['reported_credits_used'] == 1 and usage['credits_complete'] is False
 
 
 def test_real_direct_and_orchestrator_retries_keep_one_context_and_bill_every_attempt(tmp_path, monkeypatch):

@@ -618,7 +618,7 @@ def test_direct_50_command_exec_followups_preserve_all_cache_breakpoints():
 
 
 def test_force_close_response_unblocks_winsock():
-    """Verify _force_close_response closes underlying socket descriptor to interrupt blocked recv()."""
+    """A real HTTPResponse exposes its socket owner; cancellation closes that owner."""
     import socket
     import threading
     import time
@@ -635,18 +635,22 @@ def test_force_close_response_unblocks_winsock():
         def reader():
             nonlocal unblocked
             try:
-                s1.recv(1024)
+                unblocked = s1.recv(1024) == b''
             except Exception:
                 unblocked = True
 
         t = threading.Thread(target=reader)
         t.start()
         time.sleep(0.05)
-        direct._force_close_response(FakeResp())
+        from types import SimpleNamespace
+        response = FakeResp()
+        response.fp = SimpleNamespace(raw=SimpleNamespace(_sock=s1))
+        direct._force_close_response(response)
         t.join(timeout=1.0)
         assert not t.is_alive(), "Socket thread must terminate upon force close"
         assert unblocked is True
     finally:
+        s1.close()
         s2.close()
 
 

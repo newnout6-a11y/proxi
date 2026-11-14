@@ -18,6 +18,15 @@ RATE_CACHE_WRITE = 0.000100
 RATE_OUTPUT = 0.000401
 
 
+def token_counter(value):
+    """A reported token count is a nonnegative finite integer, including zero."""
+    if type(value) is int:
+        return value if value >= 0 else None
+    if type(value) is float and math.isfinite(value) and value >= 0 and value.is_integer():
+        return int(value)
+    return None
+
+
 def cost_breakdown(usage):
     """Per-category credit cost and cache hit ratio for one turn's usage."""
     inp = int(usage.get("input_tokens") or 0)

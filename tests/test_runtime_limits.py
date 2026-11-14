@@ -212,9 +212,11 @@ def test_summary_turn_rebudgets_only_command_output_to_preserve_prompt_cap(tmp_p
     monkeypatch.setattr(executor, "run_command", execute)
     instance = runner(tmp_path, Session(), max_prompt_bytes=1500, exec_policy="allowlist",
                       max_exec_turns=step_cap, command_timeout=300, command_output_limit=64000,
-                      exec_allowlist=[r"^dir\b"])
+                      exec_allowlist=[r"^dir\b"], relay_system_prompt="client-system")
     out = queue.Queue()
-    asyncio.run(instance.run(parsed("REQUIRED ORIGINAL TASK"), out, {}))
+    request = parsed("REQUIRED ORIGINAL TASK")
+    request.system = ""  # Standalone relay execution; explicit client system belongs to the IDE.
+    asyncio.run(instance.run(request, out, {}))
     assert len(executions) == (step_cap or 3)
     assert "[ИТОГ]" in prompts[-1]
     assert all(len(prompt.encode("utf-8")) <= 1500 for prompt in prompts)

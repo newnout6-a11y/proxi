@@ -1,5 +1,10 @@
 # Coding clients
 
+Current route availability and installed-client evidence are recorded in
+[the model/client audit](model-client-audit-2026-11-04.md). A previous client
+setup or historical benchmark below does not establish that today's installed
+profile contains the same provider or that an old model/effort is still accepted.
+
 ## OpenCode
 
 OpenCode Desktop and CLI configure custom providers via `~/.config/opencode/opencode.jsonc` (or project-level `opencode.json`).
@@ -36,8 +41,8 @@ Example provider configuration with custom reasoning effort variants:
             "max": { "name": "Max", "reasoningEffort": "max", "settings": { "reasoningEffort": "max" } }
           }
         },
-        "gpt-6.1": {
-          "name": "GPT 6.1",
+        "gpt-6.1-sol": {
+          "name": "GPT 6.1 Sol",
           "limit": {
             "context": 1050000,
             "output": 128000
@@ -49,7 +54,6 @@ Example provider configuration with custom reasoning effort variants:
             "low": { "name": "Low", "reasoningEffort": "low", "settings": { "reasoningEffort": "low" } },
             "medium": { "name": "Medium", "reasoningEffort": "medium", "settings": { "reasoningEffort": "medium" } },
             "high": { "name": "High", "reasoningEffort": "high", "settings": { "reasoningEffort": "high" } },
-            "xhigh": { "name": "Extra High", "reasoningEffort": "xhigh", "settings": { "reasoningEffort": "xhigh" } },
             "max": { "name": "Max", "reasoningEffort": "max", "settings": { "reasoningEffort": "max" } }
           }
         }
@@ -63,22 +67,60 @@ Example provider configuration with custom reasoning effort variants:
 > [!NOTE]
 > OpenCode requires the `variants` field to be a dictionary/object mapping variant IDs to their configuration (`{ "id": { ... } }`). Passing an array (`[ ... ]`) causes schema validation failure and skips loading the provider.
 
+For an existing relay provider, `scripts/sync_opencode_catalog.py` builds the
+canonical catalog from the enabled account resources. Preview with `--output`
+first; writing requires `--write --backup-dir`. The current configured pool
+publishes 27 verified routes. Its effort lists, including GPT-6's lack of xhigh,
+come from the dated route checks rather than the native provider's larger list.
+
+The installed CLI syntaxes differ: OpenCode 1.19.3 uses `--model
+retool-relay/zai-org/GLM-5.3 --variant high`; OpenCode 2.2.5 uses `--model
+retool-relay/zai-org/GLM-5.3#high`. Version 2 rejects `--variant` before sending a
+model request. Both exact clients passed a real GLM high request through an
+isolated current-source relay; their timings and evidence are in the audit.
+
 ## DeepSeek Harness
 
-The Desktop shortcut `DeepSeek Harness.lnk` launches the installed
-`@deepseek-ai/dsh` Web UI. Its multi-provider adapter is `llm-pi-ai`; use an
+The current installed CLI (0.2.2-alpha.3) and Desktop (0.2.1-rc.5) use separate
+plugin patch lists at `~/.dsh/profiles/web/cordis.patch.yml` and
+`~/.dsh/profiles/desktop/cordis.patch.yml`. The `llm-pi-ai` node stores providers
+under `config.providers`. The existing Proxi route uses OpenAI Chat Completions.
+
+Both profiles have been reconciled to the same 27 verified IDs. The main
+`retool` group holds 26 reasoning models, preserving its medium default and
+every supported selector; `retool-text` holds GPT-4.1 without a reasoning
+selector. Both use the same existing connection and credential reference. This
+split avoids an installed SDK limitation: a provider-wide medium default is
+rejected for a non-reasoning model before HTTP, while simply deleting that
+default can silently disable thinking on a model with an off selector.
+
+To preview or update an existing profile, use `scripts/sync_harness_catalog.py
+--settings PATH`. Preview writes only with `--output`; replacing the profile
+requires `--write --backup-dir`. The utility splices only the Proxi blocks and
+keeps other bytes intact, including date headers and plugin source. The active
+provider/model and credentials are preserved. Both installed SDK versions
+passed default, off, high and rejection checks with the exact generated files;
+the SDK bundles and Desktop ASAR were not modified.
+
+### Historical Harness setup — 0.1.5-rc.2
+
+The earlier installed `DeepSeek Harness.lnk` setup launched the
+`@deepseek-ai/dsh` Web UI. Its multi-provider adapter was `llm-pi-ai`; use an
 OpenAI Chat Completions route for this relay. The same relay key also works
 with the OpenAI Responses and Anthropic Messages endpoints.
 
-The local setup adds `llm-pi-ai.providers.retool` to
+That local setup added `llm-pi-ai.providers.retool` to
 `%USERPROFILE%\.dsh\settings.yaml` and the credential reference
 `RETOOL_RELAY_API_KEY` to `%USERPROFILE%\.dsh\.credentials.yaml`.
 These files are outside this repository. Existing providers, comments, and the
 selected provider are preserved. Both documents are watched, so the running
-Harness picks up the added route without restarting existing chats.
+Harness could pick up the added route without restarting existing chats. These
+paths and the abbreviated mapping below describe that earlier configuration;
+use the profile patch paths above for the current installed versions.
 
-The installed route contains all 29 currently routed models. This abbreviated
-example shows the exact provider fields and two model configurations:
+This abbreviated configuration shows two models. Generate the complete list
+and valid efforts from the current `/v1/models` response; this example is not
+a claim about today's installed Harness profile or catalog size:
 
 ```yaml
 llm-pi-ai:
@@ -108,7 +150,6 @@ llm-pi-ai:
             low: low
             medium: medium
             high: high
-            xhigh: xhigh
             max: max
         - id: claude-opus-5-5
           name: Claude Opus 5.5
@@ -151,8 +192,8 @@ upstream response supplied no visible thinking text.
 
 ### Keep the upstream conversation warm
 
-The relay needs the client's stable dialogue identity to reuse a thread and
-WebSocket. It accepts `x-session-affinity`, `x-session-id`, `x-opencode-session`,
+The direct transport uses the client's stable dialogue identity to reuse its
+native history and cache context. It accepts `x-session-affinity`, `x-session-id`, `x-opencode-session`,
 or explicit request fields `conversation`, `conversation_id`, and `session_id`.
 Parent agents and subagents must use different identities. A single static
 provider-wide header would mix their conversations and must not be used.
@@ -162,8 +203,8 @@ installed 2.1.310 does not include its internal agent ID in the normal metadata
 identity. Recognizing that metadata fixes the main conversation; it does not
 prove separate warm channels for every in-process child. Changed client
 histories still rotate their upstream context, and distinct supplied session
-IDs are isolated. Stateless direct inference would avoid this conversation-ID
-dependency; it is not enabled by the current agent transport fixes.
+IDs are isolated. Direct inference is the current transport; that does not
+eliminate the stable identity needed for signed tool-history continuation.
 
 Claude Code 2.1.310 supplies its current `session_id` inside the JSON string
 `metadata.user_id`. The relay recognizes that explicit session identity too;
@@ -185,21 +226,18 @@ Keep the SDK cache retention at its default or `short`: `none` also suppresses
 session affinity. Restart the Harness host after updating its adapter bundle;
 settings-file watching alone cannot replace already loaded JavaScript.
 
-The relay keeps receiving control frames while a persistent socket is idle,
-answers upstream ping and acknowledgement requests, and uses one ordered
-receiver. Its application buffer is bounded by `max_frame_bytes` in total and
-256 frames; overflow is an explicit upstream error. A dead idle socket is
-reconnected before the next prompt. This does not implement the native web's
-proactive sandbox-token refresh; disconnected sockets still reconnect normally.
+The direct route replays the accepted raw assistant blocks, including opaque
+thinking signatures, when client tool results strictly continue the same
+history. It keeps stable cache markers and a provider cache key. Changed
+instructions, tools, model or resource invalidate the old signed prefix;
+unchanged output-only verbosity does not. Unknown requests keep independent
+context. Cache lifetime and a hit still require upstream telemetry.
 
-For native client tools, a successful conversation caches the exact normalized
-client history and instruction/tool fingerprint in its upstream session. A
-strict append sends the new history suffix. Edited or compacted history and
-changed instructions/tools start a fresh upstream thread with the complete
-current context. Anonymous requests retain independent full-context threads.
-Message fingerprints use the same model-visible rendering as the bridge:
-moving SDK `cache_control` markers is not a content edit. Actual changes to
-text, tool calls/results and identifiers still invalidate the cached prefix.
+### Historical agent/WebSocket measurements — 2026-10-29
+
+The measurements below describe the former agent/WebSocket transport and an
+earlier installed Harness adapter. They do not describe the current direct
+request path or establish its present latency.
 
 A bounded live Opus 5.5 `max` comparison on 2026-10-29 used two short plain
 prompts on the same thread/socket. Cold setup took 0.589s to create the thread,
@@ -283,6 +321,54 @@ Claude Code 2.1.310 passed real Read/Edit/Bash plus three fixture tests. Thinkin
 blocks are collapsed by default: `Ctrl+O` expands them;
 `showThinkingSummaries: true` enables summaries. This cannot reveal text that
 Retool has redacted or omitted.
+
+## Claude Desktop on Windows
+
+The installed 4.4212.0.0 Code-mode client reads its gateway policy from
+`HKCU\Software\Policies\Claude`. Its native discovery filters the relay's
+27 routes to 11 currently available Claude models. It does not accept GPT or
+GLM merely because those models speak the same API; do not invent Anthropic
+family tiers for them.
+
+A nonempty `inferenceModels` policy is the authoritative list. Enabling
+discovery alone enriches those rows and does not add missing models. The
+maintainer `scripts/sync_claude_desktop_catalog.py` previews the compatible
+Claude subset and updates only that model-list value with `--write
+--backup-dir PATH`. The endpoint, key, authentication scheme, high default and
+all other policies are preserved. The installed policy now contains all 11
+Claude routes instead of only Opus/Sonnet 5.5.
+
+Native picker levels vary by model: a max cap on older five-level rows would
+offer the route-rejected xhigh. Those rows are capped at high; Opus 4.6 and
+Sonnet 4.6 keep their valid four-level max. Unknown 5.5 rows have no built-in
+effort selector in this installed version; setting their policy does not claim
+the GUI gained one. Their gateway default remains high.
+
+The installed ASAR's actual discovery/filter/merge/picker functions and bundled
+Agent SDK were executed without Electron or UI input. Exact SDK wrapper
+0.3.309 also returned a real answer through the current production relay using
+an explicitly selected cached Desktop runner 2.1.295. The embedded target is
+2.1.309; that target binary was not present, and this check does not claim the
+cached version is the target. See the dated audit for hashes, commands and
+scope. Opening and clicking the window is not a prerequisite for these code
+and protocol checks, and no GUI interaction pass is claimed.
+
+The gateway separates the SDK's leading `x-anthropic-billing-header` attribution
+line from its actual system instructions. Anthropic consumes that attribution
+block; merging instructions into it discards them upstream. This deterministic
+split also applies to native tool continuations and keeps cache hints on the
+real system prefix.
+
+Haiku 4.5 accepts verified `thinking: {type: "disabled"}`. The SDK's beta
+`thinking.display: "updates"` uses the route's available summaries, with
+`x-proxi-thinking-display: summarized` and a named compatibility warning; the
+beta's native update cadence is not implemented. Its exact session-title schema
+has a bounded, buffered post-validation path. A sole JSON Markdown fence may be
+removed; the object must still contain exactly one string `title`, no duplicate
+keys and a complete normal finish. Invalid output becomes an error before any
+title content is emitted. `x-proxi-output-format: validated-session-title`
+identifies this service exception; arbitrary structured-output schemas remain
+unsupported. This is validation/normalization, not native constrained decoding.
 
 ## IDE commands and subagents
 

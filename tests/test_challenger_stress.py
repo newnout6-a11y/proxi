@@ -245,10 +245,9 @@ def test_adversarial_reasoning_effort_matrix():
         models.resolve_tolerant("claude-haiku-4-5-20251001", "invalid_value")
     assert raised_invalid.value.status == 400
 
-    # 3. Non-reasoning models must return None without raising unhandled 400
-    for non_reasoning in ["zai-org/GLM-5.3-Flash"]:
-        entry_nr, eff_nr = models.resolve_tolerant(non_reasoning, "high", allow_downgrade=True)
-        assert eff_nr is None, f"Non-reasoning model {non_reasoning} must return None effort"
+    # 3. The live-verified GLM Flash route preserves supported reasoning effort.
+    _, eff_glm = models.resolve_tolerant('zai-org/GLM-5.3-Flash', 'high', allow_downgrade=True)
+    assert eff_glm == 'high'
 
 
 def test_stress_full_context_preservation_huge_dialogue():

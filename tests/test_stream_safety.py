@@ -126,6 +126,35 @@ def test_force_close_defuses_response_reader():
                 pass
 
 
+def test_force_close_fallback_never_steals_the_original_socket_handle():
+    """An unowned descriptor must not leave a live Python socket holding a closed handle."""
+    import socket
+
+    original, peer = socket.socketpair()
+    try:
+        class ResponseWithoutSocketChain:
+            fp = SimpleNamespace(close=lambda: None)
+
+            def fileno(self):
+                return original.fileno()
+
+            def close(self):
+                pass
+
+        number = original.fileno()
+        direct._force_close_response(ResponseWithoutSocketChain())
+        assert original.fileno() == number
+        # The original owner must still own a valid handle and close it once.
+        # Otherwise its eventual finalizer can close an unrelated reused handle.
+        original.getsockname()
+    finally:
+        for sock in (original, peer):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 class _FakePeer:
     def __init__(self, ip):
         self._ip = ip

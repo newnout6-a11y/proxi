@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { RotateCcw, Save, Search } from 'lucide-react';
+import { RotateCcw, Save, Search, SlidersHorizontal } from 'lucide-react';
 import { api } from '../api.js';
 import { usePolling } from '../useJournal.js';
 import { Dot, Page, ease } from '../motion.jsx';
@@ -11,6 +11,7 @@ import { fmtInt, fmtTokens } from '../format.js';
 export const GROUPS = [
   { id: 'routing', title: 'Аккаунты и маршрутизация', hint: 'Когда аккаунт уходит в резерв и как часто проверяются баланс и сессия' },
   { id: 'model', title: 'Модель и мышление', hint: 'Что получает клиент, если не указал модель или effort сам' },
+  { id: 'instructions', title: 'Системные инструкции', hint: 'Задайте модели роль, стиль работы и границы' },
   { id: 'retries', title: 'Повторы и диагностика', hint: 'Сколько раз повторять пустой ответ и сколько диагностики хранить' },
   { id: 'cache', title: 'Кэш промпта', hint: 'Прогрев держит кэш тёплым, чтобы следующий ход читал его, а не платил за запись' },
   { id: 'exec', title: 'Локальные команды', hint: 'Может ли модель запускать команды на этой машине' },
@@ -28,19 +29,22 @@ const OPTION_LABELS = {
 
 function Field({ name, field, value, onChange, pending, dirty }) {
   const id = `setting-${name}`;
+  const hint = `${id}-hint`;
   let control;
   if (field.type === 'boolean') {
     control = <Toggle id={id} checked={!!value} label={field.label} onChange={onChange} />;
   } else if (field.enum) {
     control = (
-      <select id={id} value={value ?? ''} onChange={(e) => onChange(e.target.value)}>
+      <select id={id} value={value ?? ''} aria-describedby={hint} onChange={(e) => onChange(e.target.value)}>
         {field.enum.map((option) => <option key={option} value={option}>{OPTION_LABELS[name]?.[option] || option}</option>)}
       </select>
     );
+  } else if (field.type === 'string') {
+    control = <input id={id} type="text" value={value ?? ''} aria-describedby={hint} onChange={(e) => onChange(e.target.value)} />;
   } else {
     control = (
       <span className="number-field">
-        <input id={id} type="number" min={field.min} max={field.max} step={field.type === 'integer' ? 1 : 'any'} value={value ?? ''}
+        <input id={id} type="number" min={field.min} max={field.max} step={field.type === 'integer' ? 1 : 'any'} value={value ?? ''} aria-describedby={hint}
           onChange={(e) => {
             const raw = e.target.value;
             onChange(raw === '' ? '' : field.type === 'integer' ? parseInt(raw, 10) : parseFloat(raw));
@@ -54,7 +58,7 @@ function Field({ name, field, value, onChange, pending, dirty }) {
     <div className={`setting ${pending ? 'pending' : ''} ${dirty ? 'dirty' : ''}`}>
       <label htmlFor={id}>
         <strong>{field.label}</strong>
-        {description && <small>{description}</small>}
+        {description && <small id={hint}>{description}</small>}
       </label>
       <div className="setting-control">
         {pending && <Tag tone="warn" title="Сохранено, применится после перезапуска">ждёт перезапуска</Tag>}
@@ -65,14 +69,52 @@ function Field({ name, field, value, onChange, pending, dirty }) {
   );
 }
 
+const PROMPT_MODES = [
+  { id: 'standalone', title: 'Самостоятельные запросы', text: 'Своя роль для запросов без системных инструкций клиента' },
+  { id: 'append', title: 'Дополнить клиента', text: 'Добавить свою роль после системных инструкций IDE' },
+  { id: 'replace', title: 'Заменить роль клиента', text: 'Использовать свою роль вместо системных инструкций IDE' },
+];
+
+function SystemInstructions({ settings, defaultPrompt, onChange, pending, disabled }) {
+  const standard = settings.relay_system_prompt === null;
+  return (
+    <div className="prompt-editor">
+      <fieldset className="prompt-modes" disabled={disabled}>
+        <legend>Как применять роль</legend>
+        {PROMPT_MODES.map((mode) => (
+          <label key={mode.id} className={`prompt-mode ${settings.relay_system_prompt_mode === mode.id ? 'selected' : ''}`}>
+            <input type="radio" name="system-mode" value={mode.id} checked={settings.relay_system_prompt_mode === mode.id}
+              onChange={() => onChange('relay_system_prompt_mode', mode.id)} />
+            <span><strong>{mode.title}</strong><small>{mode.text}</small></span>
+          </label>
+        ))}
+      </fieldset>
+      <div className="prompt-toolbar">
+        <label className="check"><input type="checkbox" checked={standard} disabled={disabled}
+          onChange={(e) => onChange('relay_system_prompt', e.target.checked ? null : '')} />Стандартная роль relay</label>
+        {pending && <Tag tone="warn">ждёт перезапуска</Tag>}
+      </div>
+      <label className="prompt-label" htmlFor="system-instructions">Инструкции для модели</label>
+      <textarea id="system-instructions" rows={standard ? 3 : 7} value={standard ? defaultPrompt || '' : settings.relay_system_prompt ?? ''} disabled={disabled || standard}
+        aria-describedby="system-instructions-hint" spellCheck={false}
+        placeholder={standard ? 'Используется встроенная роль relay' : 'Ты — инженер моего проекта. Отвечай по-русски. Проверяй изменения тестами. Перед удалением данных запрашивай подтверждение.'}
+        onChange={(e) => onChange('relay_system_prompt', e.target.value)} />
+      <div className="prompt-footer" id="system-instructions-hint">
+        <p>{standard ? 'Снимите флажок, чтобы задать собственные инструкции' : 'Пустой текст убирает собственную роль relay. Служебные проверки и заголовки IDE сохраняют свои инструкции'}</p>
+        <span className="mono">{fmtInt((settings.relay_system_prompt || '').length)} символов</span>
+      </div>
+    </div>
+  );
+}
+
 function Connection({ overview }) {
   const rows = [['OpenAI-совместимый адрес', overview?.connection?.openai_base_url], ['Anthropic-совместимый адрес', overview?.connection?.anthropic_base_url]];
   return (
-    <section className="panel connect" aria-label="Подключение IDE">
+    <section id="settings-connection" className="panel connect" aria-label="Подключение IDE">
       <div className="panel-head">
         <h2>Подключение IDE</h2>
-        <span className="status"><Dot tone={overview?.session?.error ? 'neg' : 'pos'} />
-          {overview?.session?.error ? 'сессия Retool с ошибкой' : 'сессия Retool активна'}</span>
+        <span className="status"><Dot tone={!overview ? 'muted' : overview.session?.error ? 'neg' : 'pos'} />
+          {!overview ? 'проверяем сессию' : overview.session?.error ? 'сессия Retool с ошибкой' : 'сессия Retool активна'}</span>
       </div>
       {rows.map(([label, value]) => (
         <div className="connect-row" key={label}>
@@ -86,13 +128,14 @@ function Connection({ overview }) {
   );
 }
 
-function Catalog({ apiKey, onUnauthorized }) {
+function Catalog({ apiKey, onUnauthorized, onData }) {
   const [data, setData] = useState(null);
   const [query, setQuery] = useState('');
   const [onlyRoutable, setOnlyRoutable] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [error, setError] = useState('');
   usePolling(async () => {
-    try { setData(await api(apiKey, 'models')); } catch (failure) { if (failure.status === 401) onUnauthorized(); }
+    try { const result = await api(apiKey, 'models'); setData(result); onData(result); setError(''); } catch (failure) { if (failure.status === 401) onUnauthorized(); else setError(failure.message); }
   }, 60000, [apiKey]);
   const all = data?.data || [];
   const items = all.filter((model) => (!onlyRoutable || model.routable)
@@ -101,7 +144,7 @@ function Catalog({ apiKey, onUnauthorized }) {
   items.sort((a, b) => (b.id === data?.default_model) - (a.id === data?.default_model));
   const shown = expanded || query ? items : items.slice(0, CATALOG_FOLD);
   return (
-    <section className="panel model-table" aria-label="Каталог моделей">
+    <section id="settings-catalog" className="panel model-table" aria-label="Каталог моделей">
       <div className="panel-head model-head">
         <div>
           <h2>Каталог моделей</h2>
@@ -118,12 +161,17 @@ function Catalog({ apiKey, onUnauthorized }) {
           </label>
         </div>
       </div>
+      {error && <p className="banner tone-neg" role="alert">Не удалось загрузить каталог: {error}</p>}
+      {!data && !error && <p className="model-empty muted" role="status">Загружаем модели</p>}
+      <div className="model-cols" aria-hidden="true"><span>Модель</span><span>Провайдер</span><span>Контекст</span><span>Управление ответом</span><span>Доступность</span></div>
       {shown.map((model) => (
         <article key={model.id} className={`model-card ${model.id === data?.default_model ? 'is-default' : ''}`}>
           <span className="model-name" title={`${model.label} · ${model.id}`}><strong>{model.label}</strong><code>{model.id}</code></span>
           <span className="model-provider">{model.provider}</span>
           <span className="num">{fmtTokens(model.context)}</span>
-          <span className="model-effort">{model.reasoning ? (model.reasoning_effort_levels || []).join(' · ') || 'есть' : 'нет'}</span>
+          <span className="model-effort"><span>Effort: {model.reasoning ? (model.reasoning_effort_levels || []).join(' · ') || 'выбирает провайдер' : 'без мышления'}</span>
+            <span>Verbosity: {model.verbosity_levels?.length ? model.verbosity_levels.join(' · ') : 'не поддерживается'}</span>
+          </span>
           <span className="model-route">
             <Dot tone={model.routable ? 'pos' : 'muted'} />{model.routable ? 'маршрут есть' : 'нет ресурса'}
             {model.id === data?.default_model && <Tag tone="accent">по умолчанию</Tag>}
@@ -147,28 +195,35 @@ export default function SettingsView({ apiKey, overview, onUnauthorized }) {
   const [state, setState] = useState(null);
   const [draft, setDraft] = useState({});
   const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [models, setModels] = useState(null);
 
   usePolling(async () => {
     try {
       setState(await api(apiKey, 'settings'));
+      setLoadError('');
     } catch (failure) {
       if (failure.status === 401) onUnauthorized();
+      else setLoadError(failure.message);
     }
   }, 30000, [apiKey]);
 
   const changes = useMemo(() => Object.fromEntries(Object.entries(draft)
-    .filter(([key, value]) => state && value !== state.settings[key] && value !== '')), [draft, state]);
+    .filter(([key, value]) => state && value !== state.settings[key]
+      && (value !== '' || state.schema[key]?.type === 'string'))), [draft, state]);
   const dirty = Object.keys(changes).length;
 
   async function save() {
+    const submitted = { ...changes };
     setSaving(true);
     try {
-      const result = await api(apiKey, 'settings', { method: 'PATCH', body: { settings: changes } });
+      const result = await api(apiKey, 'settings', { method: 'PATCH', body: { settings: submitted } });
       setState(result);
-      setDraft({});
+      setDraft((current) => Object.fromEntries(Object.entries(current)
+        .filter(([key, value]) => !(key in submitted) || value !== submitted[key])));
       toast({
         tone: 'success', title: 'Настройки сохранены',
-        text: result.applied.length ? `Применено сразу: ${result.applied.join(', ')}` : 'Изменения вступят в силу после перезапуска relay',
+        text: result.applied.length ? `Применено сразу: ${result.applied.map((key) => state.schema[key]?.label || key).join(', ')}` : 'Изменения вступят в силу после перезапуска relay',
       });
     } catch (failure) {
       if (failure.status === 401) onUnauthorized();
@@ -179,6 +234,10 @@ export default function SettingsView({ apiKey, overview, onUnauthorized }) {
   }
 
   const schema = state?.schema || {};
+  const selectedModel = models?.data.find((model) => model.id === (draft.model ?? state?.settings.model));
+  const effortValue = draft.reasoning_effort ?? state?.settings.reasoning_effort;
+  const effortOptions = selectedModel ? ['auto', ...(selectedModel.reasoning_effort_levels || [])] : null;
+  const unsupportedEffort = effortOptions && effortValue && !effortOptions.includes(effortValue);
   const byGroup = {};
   for (const [key, field] of Object.entries(schema)) (byGroup[groupOf(field)] ||= []).push(key);
 
@@ -187,22 +246,36 @@ export default function SettingsView({ apiKey, overview, onUnauthorized }) {
       <header className="page-head">
         <div>
           <h1>Настройки</h1>
-          <p className="page-meta">записываются в config.json и применяются после перезапуска relay, кроме помеченных «сразу» · подключение IDE и каталог моделей внизу</p>
+          <p className="page-meta">Модель, системная роль и поведение вашего relay</p>
         </div>
         <div className="head-actions">
           {state?.restart_required && <Tag tone="warn">ждут перезапуска: {state.pending_restart.length}</Tag>}
         </div>
       </header>
+      <div className="settings-index" role="navigation" aria-label="Группы настроек">
+        <SlidersHorizontal size={16} strokeWidth={1.5} aria-hidden="true" />
+        {[...GROUPS.filter((group) => Object.values(state?.schema || {}).some((field) => field.group === group.id)),
+          { id: 'connection', title: 'Подключение IDE' }, { id: 'catalog', title: 'Каталог' }].map((group) => (
+          <button type="button" key={group.id} onClick={() => document.getElementById(`settings-${group.id}`)?.scrollIntoView({ block: 'start' })}>{group.title}</button>
+        ))}
+      </div>
+      <p className="settings-note">Изменения сохраняются в config.json и применяются после перезапуска. Помеченные «сразу» действуют без перезапуска</p>
+      {loadError && <div className="banner tone-neg" role="alert">Не удалось загрузить настройки: {loadError}</div>}
+      {!state && !loadError && <div className="panel empty" role="status">Загружаем настройки</div>}
       {state && !state.writable && <div className="banner tone-warn">Файл конфигурации недоступен для записи</div>}
+      {unsupportedEffort && <div className="banner tone-warn" role="status">Уровень {effortValue} не поддерживается моделью {selectedModel.label}. Выберите доступный уровень или «по умолчанию модели»</div>}
       {state && GROUPS.map((group) => {
         const keys = byGroup[group.id] || [];
         if (!keys.length) return null;
         return (
-          <section key={group.id} className="panel settings-group" aria-label={group.title}>
+          <section id={`settings-${group.id}`} key={group.id} className="panel settings-group" aria-label={group.title}>
             <h2>{group.title}</h2>
             <p className="settings-hint">{group.hint}</p>
-            {keys.map((key) => (
-              <Field key={key} name={key} field={schema[key]}
+            {group.id === 'instructions' ? <SystemInstructions settings={{ ...state.settings, ...draft }} defaultPrompt={state.default_system_prompt}
+              onChange={(key, value) => setDraft((d) => ({ ...d, [key]: value }))}
+              pending={keys.some((key) => state.pending_restart.includes(key))} disabled={!state.writable} /> : keys.map((key) => (
+              <Field key={key} name={key} field={key === 'reasoning_effort' && effortOptions
+                ? { ...schema[key], enum: [...new Set([...effortOptions, ...(unsupportedEffort ? [effortValue] : [])])] } : schema[key]}
                 value={key in draft ? draft[key] : state.settings[key]}
                 pending={state.pending_restart.includes(key)}
                 dirty={key in changes}
@@ -212,14 +285,14 @@ export default function SettingsView({ apiKey, overview, onUnauthorized }) {
         );
       })}
       <Connection overview={overview} />
-      <Catalog apiKey={apiKey} onUnauthorized={onUnauthorized} />
+      <Catalog apiKey={apiKey} onUnauthorized={onUnauthorized} onData={setModels} />
       <AnimatePresence>
         {dirty > 0 && (
           <motion.div className="savebar" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}
             transition={{ duration: 0.2, ease }}>
             <span><b className="num">{dirty}</b> несохранённых: <span className="savebar-keys">{Object.keys(changes).map((k) => schema[k]?.label || k).join(', ')}</span></span>
             <Button icon={RotateCcw} onClick={() => setDraft({})}>Отменить</Button>
-            <Button icon={Save} tone="primary" onClick={save} disabled={saving}>{saving ? 'Сохранение' : 'Сохранить'}</Button>
+            <Button icon={Save} tone="primary" onClick={save} disabled={saving || !state?.writable}>{saving ? 'Сохранение' : 'Сохранить'}</Button>
           </motion.div>
         )}
       </AnimatePresence>

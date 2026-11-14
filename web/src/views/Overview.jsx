@@ -48,6 +48,7 @@ function Balance({ overview, metrics, windowSec, go }) {
 
   let forecast;
   if (!metrics) forecast = 'Прогноз появится после загрузки метрик';
+  else if (metrics.totals?.credits_complete === false || balance?.unreported_usage) forecast = 'Прогноз недоступен: часть стоимости не сообщена';
   else if (!perDay) forecast = `За ${window} кредиты не тратились, прогноза нет`;
   else {
     forecast = (
@@ -65,7 +66,7 @@ function Balance({ overview, metrics, windowSec, go }) {
           Доступно в пуле
           {summary && ` · ${fmtInt(summary.total)} ${plural(summary.total, ['аккаунт', 'аккаунта', 'аккаунтов'])}`}
         </span>
-        {balance?.stale && <Tag tone="warn">данные устарели</Tag>}
+        {balance?.unreported_usage ? <Tag tone="warn">есть неучтённый расход</Tag> : balance?.stale && <Tag tone="warn">данные устарели</Tag>}
       </div>
       <p className="figure-xl">
         <AnimatedNumber value={available} format={(v) => fmtFixed(v, 2)} />
@@ -107,7 +108,7 @@ function CacheFacts({ totals }) {
         <div><dt>записано в кэш</dt><dd className="num">{fmtTokens(totals.cache_write)}</dd></div>
         <div><dt>без кэша</dt><dd className="num">{fmtTokens(totals.input_tokens)}</dd></div>
       </dl>
-      <p className="muted small">Чтение из кэша стоит в разы дешевле записи. Высокая запись после паузы значит, что кэш успел остыть</p>
+      <p className="muted small">Всплеск записи — рост объёма записанного кэша. Причину проверяйте по событиям конкретного хода</p>
     </section>
   );
 }
@@ -160,7 +161,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
         </div>
         <div className="head-actions">
           {overview && (
-            <span className="status"><Dot tone={ok ? 'pos' : 'neg'} live={ok} />{ok ? 'Retool отвечает' : 'Retool недоступен'}</span>
+            <span className="status"><Dot tone={ok ? 'pos' : 'warn'} live={ok} />{ok ? 'Retool отвечает' : 'Состояние требует проверки'}</span>
           )}
           <Segmented value={windowSec} onChange={setWindowSec} label="Окно метрик" />
           <Button icon={RefreshCw} onClick={() => { refreshOverview(); loadMetrics(); }} aria-label="Обновить сводку">Обновить</Button>
@@ -172,8 +173,8 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
       <div className="ov-top">
         <Balance overview={overview} metrics={current} windowSec={windowSec} go={go} />
         <section className="panel stats" aria-label="Показатели за окно">
-          <Stat label="Потрачено за окно" value={fmtFixed(totals.credits, 2)}
-            note={busy ? `в среднем ${fmtFixed(totals.credits / busy, 2)} за активные ${span}` : 'расхода не было'} />
+          <Stat label="Потрачено за окно" value={totals.credits_complete === false ? totals.credits > 0 ? `≥ ${fmtFixed(totals.credits, 2)}` : '—' : fmtFixed(totals.credits, 2)}
+            note={totals.credits_complete === false ? 'часть стоимости не сообщена' : busy ? `в среднем ${fmtFixed(totals.credits / busy, 2)} за активные ${span}` : 'расхода не было'} />
           <Stat label="Запросы" value={fmtInt(totals.requests)}
             note={totals.errors ? `${fmtInt(totals.errors)} ${plural(totals.errors, ['ошибка', 'ошибки', 'ошибок'])}` : 'без ошибок'}
             tone={totals.errors ? 'neg' : undefined} />
@@ -212,7 +213,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
             <ul className="legend">
               <li><i className="lg-read-line" />чтение</li>
               <li><i className="lg-write-line" />запись</li>
-              <li><i className="lg-spike" />всплеск записи: кэш остыл и записан заново</li>
+              <li><i className="lg-spike" />всплеск записи</li>
             </ul>
           </div>
           <CacheChart buckets={buckets} windowSec={windowSec} />

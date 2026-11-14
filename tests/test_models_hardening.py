@@ -28,17 +28,31 @@ def test_synthetic_tolerant_model_has_bounded_output():
     assert entry["max_output"] == 128000
 
 
-def test_vision_flag_is_enforced_for_glm():
-    """GLM-5.3 (vision=False) previously accepted image blocks and failed at
-    upstream with a bare 400."""
-    data = {"model": "zai-org/GLM-5.3", "max_tokens": 16,
+@pytest.mark.parametrize('model', ['zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash'])
+@pytest.mark.parametrize('dialect', ['chat', 'responses', 'anthropic'])
+def test_verified_glm_routes_accept_image_blocks(model, dialect):
+    """Retool image acceptance is measured separately from native-provider modalities."""
+    data = {"model": model, "max_tokens": 16,
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "what is this"},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}]}]}
-    with pytest.raises(ApiError) as exc:
-        validate.parse_anthropic(data, {"strict_models": True})
-    assert exc.value.status == 422
-    assert "does not support image input" in exc.value.message
+    if dialect in ('chat', 'responses'):
+        data['messages'][0]['content'][-1] = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,aGk='}}
+    if dialect == 'responses':
+        data['input'] = data.pop('messages')
+    parsed = getattr(validate, 'parse_' + dialect)(data, {"strict_models": True})
+    assert parsed.entry['id'] == model
+    assert 'imageData' in str(parsed.message_chunks)
+
+
+def test_nonvision_model_is_rejected_before_upstream(monkeypatch):
+    entry = dict(models.resolve('zai-org/GLM-5.3')[0], id='synthetic-text-only', vision=False)
+    monkeypatch.setitem(models._BY_ID, entry['id'], entry)
+    data = {'model': entry['id'], 'messages': [{'role': 'user', 'content': [
+        {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,aGk='}}]}]}
+    with pytest.raises(ApiError) as caught:
+        validate.parse_chat(data, {'strict_models': True})
+    assert caught.value.status == 422 and 'does not support image input' in caught.value.message
 
 
 def test_vision_models_still_accept_images():

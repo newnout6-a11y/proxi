@@ -873,7 +873,7 @@ class SessionPool:
                 acc_cfg.update(acc)
                 # Pool controls belong to the account record, never inherited from the root.
                 acc_cfg.update(enabled=acc.get("enabled", True), priority=acc.get("priority", 0),
-                               label=acc.get("label", ""))
+                               label=acc.get("label", ""), provider_access=acc.get('provider_access', {}))
                 acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
                 acc_cfg["_account_ref"] = acc
                 acc_cfg["_disk_auth"] = (acc.get("cookie"), acc.get("xsrf"))
@@ -893,6 +893,7 @@ class SessionPool:
     @staticmethod
     def _check_route(backend, model_entry):
         if model_entry is not None:
+            model_catalog.require_route(model_entry, backend.cfg)
             model_catalog.provider_resource(backend.cfg, model_entry)
 
     @staticmethod

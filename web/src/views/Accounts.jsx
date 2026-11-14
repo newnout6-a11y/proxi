@@ -78,7 +78,7 @@ function AccountRow({ account, busy, onAction, onPatch, onDelete, lastEnabled })
       <div className="pool-actions">
         <Button icon={Wallet} disabled={busy || !!account.pending} onClick={() => onAction('balance')}>Баланс</Button>
         <Button icon={RotateCw} disabled={busy || !!account.pending} onClick={() => onAction('renew')}>Продлить</Button>
-        <button type="button" className="icon-button" aria-label={`Удалить аккаунт ${name}`} title="Удалить из config.json"
+        <button type="button" className="icon-button tone-danger" aria-label={`Удалить аккаунт ${name}`} title="Удалить из config.json"
           disabled={busy || account.pending === 'removed'} onClick={onDelete}>
           <Trash size={16} strokeWidth={1.5} />
         </button>
@@ -214,7 +214,7 @@ export default function Accounts({ apiKey, onUnauthorized }) {
       {adding && <AddForm busy={!!busy._new} onCancel={() => setAdding(false)} onSubmit={add} />}
       <section className="panel pool">
         <div className="pool-help">
-          <PoolScene />
+          <figure className="pool-demo"><figcaption>Как работает пул <span>пример маршрутизации</span></figcaption><PoolScene /></figure>
           <dl className="pool-rules">
             <div><dt>Порядок</dt><dd>Новый диалог получает включённый аккаунт с наименьшим приоритетом, при равенстве — менее загруженный. Начатый диалог остаётся на своём аккаунте</dd></div>
             <div><dt>Резерв</dt><dd>Аккаунт с балансом ниже {isNum(data?.limits?.min_account_balance) ? fmtInt(data.limits.min_account_balance) : 'порога'} кредитов отходит в резерв и получает запросы, только когда ниже порога все</dd></div>

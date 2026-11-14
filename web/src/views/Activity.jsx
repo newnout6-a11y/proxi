@@ -29,13 +29,23 @@ export default function Activity(props) {
         </div>
         <div className="tabs" role="tablist" aria-label="Вид активности">
           {TABS.map((item) => (
-            <button key={item.id} type="button" role="tab" aria-selected={tab === item.id} onClick={() => setTab(item.id)}>
+            <button key={item.id} id={`activity-tab-${item.id}`} type="button" role="tab" aria-selected={tab === item.id}
+              aria-controls={`activity-panel-${item.id}`} tabIndex={tab === item.id ? 0 : -1} onClick={() => setTab(item.id)}
+              onKeyDown={(event) => {
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                event.preventDefault();
+                const next = event.key === 'Home' ? 'turns' : event.key === 'End' ? 'events' : tab === 'turns' ? 'events' : 'turns';
+                setTab(next);
+                document.getElementById(`activity-tab-${next}`)?.focus();
+              }}>
               {item.label}<span className="chip-count num">{fmtInt(counts[item.id])}</span>
             </button>
           ))}
         </div>
       </header>
-      {tab === 'turns' ? <Turns {...props} embedded /> : <Journal {...props} embedded />}
+      <div role="tabpanel" id={`activity-panel-${tab}`} aria-labelledby={`activity-tab-${tab}`} tabIndex={0}>
+        {tab === 'turns' ? <Turns {...props} embedded /> : <Journal {...props} embedded />}
+      </div>
     </Page>
   );
 }

@@ -145,7 +145,9 @@ def test_changed_client_or_settings_never_receive_a_signature_from_another_prefi
 
     asyncio.run(scenario())
     assert len(sent) == 2
-    assert not any(m["role"] == "assistant" for m in sent[1]["messages"])
+    assert not any(b.get('type') in ('thinking', 'redacted_thinking')
+                   for m in sent[1]['messages'] if isinstance(m.get('content'), list)
+                   for b in m['content'] if isinstance(b, dict))
     assert "opaque-one" not in json.dumps(sent[1])
 
 

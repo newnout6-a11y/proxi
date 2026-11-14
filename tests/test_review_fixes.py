@@ -342,10 +342,13 @@ def test_failed_rotation_backs_off(monkeypatch, tmp_path, capsys):
     assert capsys.readouterr().out.count("rotation failed") == 1
 
 
-def test_responses_input_image_rejected_for_non_vision_model(tmp_path):
+def test_responses_input_image_rejected_for_non_vision_model(tmp_path, monkeypatch):
+    import models
+    entry = dict(models.resolve('zai-org/GLM-5.3')[0], id='synthetic-no-vision', vision=False)
+    monkeypatch.setitem(models._BY_ID, entry['id'], entry)
     cfg = _cfg(tmp_path, strict_models=True)
     with pytest.raises(apierr.ApiError) as err:
-        validate.parse_responses({"model": "zai-org/GLM-5.3", "input": [
+        validate.parse_responses({"model": entry['id'], "input": [
             {"role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]}]}, cfg)
     assert err.value.status == 422
 

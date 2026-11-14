@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import client_context
+import models
+from apierr import ApiError
 
 records = []
 task_sent = False
@@ -101,7 +103,30 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-def catalog_policy(config, catalog_output, mode):
+def effort_controls(value, depth=0):
+    if not isinstance(value, dict) or depth > 4:
+        return []
+    found = [value[key] for key in ('reasoningEffort', 'reasoning_effort', 'effort') if value.get(key) is not None]
+    for key in ('settings', 'options', 'body', 'extra_body', 'reasoning', 'output_config'):
+        found.extend(effort_controls(value.get(key), depth + 1))
+    provider_options = value.get('providerOptions')
+    if isinstance(provider_options, dict):
+        found.extend(effort_controls(provider_options.get('openai'), depth + 1))
+    thinking = value.get('thinking')
+    if isinstance(thinking, dict):
+        if thinking.get('type') == 'disabled':
+            found.append('none')
+        if thinking.get('effort') is not None:
+            found.append(thinking['effort'])
+        if thinking.get('budget_tokens') is not None:
+            try:
+                found.append(models.effort_from_budget(thinking['budget_tokens']))
+            except ApiError:
+                found.append(False)
+    return found
+
+
+def catalog_policy(config, catalog_output, mode, *, allowed_entries=None, require_complete=False):
     """Check both schemas and the listed catalog; migrated disabled flags lie."""
     if mode == "opencode2":
         configured = {}
@@ -109,21 +134,49 @@ def catalog_policy(config, catalog_output, mode):
             configured.update((document.get("info") or {}).get("providers", {}).get("retool-relay", {}).get("models", {}))
     else:
         configured = config.get("provider", {}).get("retool-relay", {}).get("models", {})
-    forbidden = {"gpt-6-astra", "gpt-6-luna", "claude-haiku-4-5-20251001"}
+    if allowed_entries is None:
+        managed = {key: '__managed__' for provider, key in models.PROVIDER_RESOURCE_KEY.items() if provider != 'google'}
+        allowed_entries = [entry for entry in models.catalog() if models.catalog_routable(entry, managed)]
+    allowed = {entry['id']: entry for entry in allowed_entries}
+
     variants = []
     for name, model in configured.items():
-        choices = model.get("variants", {})
-        if (isinstance(choices, dict) and "xhigh" in choices or
-                isinstance(choices, list) and any(choice.get("id") == "xhigh" for choice in choices)):
+        if not isinstance(model, dict):
             variants.append(name)
+            continue
+        choices = model.get('variants') or {}
+        if isinstance(choices, dict):
+            choices = list(choices.items())
+        elif isinstance(choices, list) and all(isinstance(choice, dict) for choice in choices):
+            choices = [(choice.get('id'), choice.get('settings', {})) for choice in choices]
+        else:
+            variants.append(name)
+            continue
+        levels = allowed.get(name, {}).get('reasoning_effort_levels', [])
+        if not allowed.get(name, {}).get('reasoning', True):
+            levels = ['none']
+        choices.insert(0, (None, model.get('settings', model.get('options', {}))))
+        for label, options in choices:
+            if not isinstance(options, dict):
+                variants.append(name)
+                break
+            efforts = effort_controls(options)
+            if not efforts and label in models.EFFORT_ORDER:
+                efforts.append(label)
+            if (any(not isinstance(value, str) or value not in levels for value in efforts)
+                    or len({value for value in efforts if isinstance(value, str)}) > 1):
+                variants.append(name)
+                break
     listed = {line.strip().removeprefix("retool-relay/") for line in catalog_output.splitlines()
               if line.strip().startswith("retool-relay/")}
     policy = {"configured_models": len(configured), "catalog_models": len(listed),
-              "forbidden_models": sorted(forbidden.intersection(configured)),
-              "forbidden_variants": sorted(variants),
-              "catalog_forbidden_models": sorted(forbidden.intersection(listed))}
+              "forbidden_models": sorted(set(configured) - set(allowed)),
+              "forbidden_variants": sorted(set(variants)),
+              "catalog_forbidden_models": sorted(listed - set(allowed)),
+              "catalog_mismatch": sorted(listed.symmetric_difference(configured)),
+              "missing_models": sorted(set(allowed) - set(configured)) if require_complete else []}
     policy["passed"] = bool(configured and listed) and not any(policy[key] for key in (
-        "forbidden_models", "forbidden_variants", "catalog_forbidden_models"))
+        "forbidden_models", "forbidden_variants", "catalog_forbidden_models", "catalog_mismatch", "missing_models"))
     return policy
 
 
@@ -132,6 +185,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["claude", "opencode", "opencode2"])
     parser.add_argument("--executable", help="Override the installed client executable path")
+    parser.add_argument('--relay-config', default=str(Path(__file__).resolve().parents[1] / 'config.json'))
+    parser.add_argument('--require-complete-catalog', action='store_true')
     options = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.handle_error = lambda *args: None
@@ -176,7 +231,14 @@ def main():
                 catalog = subprocess.run([exe, "models", *suffix], env=env, cwd=work, capture_output=True,
                                          text=True, encoding="utf-8", errors="replace", timeout=30)
                 catalog.check_returncode()
-                policy = catalog_policy(config, catalog.stdout, mode)
+                expected = None
+                if Path(options.relay_config).is_file():
+                    from scripts.audit_models import load_accounts
+                    account_configs = load_accounts(options.relay_config)
+                    expected = [entry for entry in models.catalog()
+                                if models.catalog_routable(entry, {'accounts': account_configs})]
+                policy = catalog_policy(config, catalog.stdout, mode, allowed_entries=expected,
+                                        require_complete=options.require_complete_catalog)
             result = subprocess.run(args, env=env, cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=85)
         try:
             stats = json.loads(result.stdout).get("subagent_stats")

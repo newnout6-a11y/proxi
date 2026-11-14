@@ -100,7 +100,7 @@ def _exec_runner(tmp_path, monkeypatch, steps, **overrides):
 
 def test_seven_successful_exec_steps_do_not_hit_the_attempt_limit(tmp_path, monkeypatch):
     runner, calls, diag = _exec_runner(tmp_path, monkeypatch, steps=7)
-    events = asyncio.run(run(runner, request(FIRST, tools=[])))
+    events = asyncio.run(run(runner, request(FIRST, tools=[], system='')))
     assert len(calls) == 8
     assert events[-1] == {"type": "end", "reason": "stop"}
     assert not any(e["type"] == "error" for e in events)
@@ -116,7 +116,7 @@ def test_retries_inside_one_exec_step_still_share_the_five_post_budget(tmp_path,
         return original(req, **kw) if not calls else (calls.append(1) or response(*END))
 
     monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
-    events = asyncio.run(run(runner, request(FIRST, tools=[])))
+    events = asyncio.run(run(runner, request(FIRST, tools=[], system='')))
     assert len(calls) == 1 + 5
     assert events[-1]["error"].code == "upstream_empty_turn"
     assert events[-1]["error"].upstream_attempts == 6
