@@ -1247,8 +1247,13 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   (`response_format`, `text.format`, `output_config.format`; `json_schema` и `json_object`)
   эмулируются: контракт попадает в инструкции, а ответ целиком проверяется по схеме до
   выдачи; невалидный ответ даёт 502 `upstream_invalid_output` без содержимого (это не
-  constrained decoding; признак — заголовок `x-proxi-output-format`). Непустой `stop`,
-  `n > 1`, формат вместе с обязательным вызовом tool и другие необеспечиваемые
+  constrained decoding; признак — заголовок `x-proxi-output-format`). Стоп-строки (`stop` в
+  Chat, `stop_sequences` в Messages) relay эмулирует: ответ обрывается на первой из них, сама
+  строка и всё после неё клиенту не отдаются, Messages получает `stop_reason: "stop_sequence"`
+  и `stop_sequence`, Chat — `finish_reason: "stop"`; генерация у провайдера при этом не
+  прерывается, и текст после стоп-строки оплачен. Их отправляет классификатор безопасности
+  Claude Desktop, и отказ блокировал каждую его проверку. В Responses такого параметра нет: там
+  `stop` по-прежнему 422. `n > 1`, формат вместе с обязательным вызовом tool и другие необеспечиваемые
   обязательные режимы отклоняются с 422 до inference. Необеспечиваемые
   sampling/необязательные hints проверяются по типу и обозначаются именами в
   `x-proxi-ignored-parameters` и журнале, без значений.

@@ -97,7 +97,6 @@ def test_http_ignored_verbosity_is_named_in_header_and_journal(relay, monkeypatc
 
 @pytest.mark.parametrize('dialect', ['chat', 'responses', 'anthropic'])
 @pytest.mark.parametrize('changes,param', [
-    ({'stop': ['PRIVATE-STOP']}, 'stop'), ({'stop_sequences': ['PRIVATE-STOP']}, 'stop_sequences'),
     ({'n': 2}, 'n'), ({'previous_response_id': 'PRIVATE-ID'}, 'previous_response_id'),
     ({'store': True}, 'store'), ({'background': True}, 'background'),
     ({'conversation': {'id': 'PRIVATE-ID'}}, 'conversation'), ({'truncation': 'auto'}, 'truncation'),
@@ -105,6 +104,15 @@ def test_http_ignored_verbosity_is_named_in_header_and_journal(relay, monkeypatc
 def test_material_unsupported_semantics_fail_before_generation(dialect, changes, param):
     with pytest.raises(apierr.ApiError) as error:
         parse(dialect, **changes)
+    assert error.value.status == 422 and error.value.param == param
+    assert 'PRIVATE' not in str(error.value)
+
+
+@pytest.mark.parametrize('changes,param', [({'stop': ['PRIVATE-STOP']}, 'stop'),
+                                           ({'stop_sequences': ['PRIVATE-STOP']}, 'stop_sequences')])
+def test_responses_has_no_stop_sequences_and_still_refuses_them(changes, param):
+    with pytest.raises(apierr.ApiError) as error:
+        parse('responses', **changes)
     assert error.value.status == 422 and error.value.param == param
     assert 'PRIVATE' not in str(error.value)
 

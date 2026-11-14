@@ -37,6 +37,8 @@ class _Base:
         self.output_tokens = None
         self.exec_lines = 0
         self.tool_calls = []
+        # The client's stop sequence the reply ended at (StopSequenceAdapter); None when it ended otherwise.
+        self.stop_sequence = None
         self._usage_offsets = (0, 0, 0)
         self._custom_tools = {
             tool.get("function", {}).get("name")
@@ -616,6 +618,8 @@ class AnthropicAdapter(_Base):
     def _stop_reason(self, reason):
         if reason == "timeout":
             return "max_tokens"
+        if self.stop_sequence is not None:
+            return "stop_sequence"
         if reason == "tool_calls" or self.tool_calls:
             return "tool_use"
         return "end_turn"
@@ -630,7 +634,8 @@ class AnthropicAdapter(_Base):
             self._open("text")
         self._close_blocks()
         self._emit("message_delta", {"type": "message_delta",
-                                     "delta": {"stop_reason": self._stop_reason(reason), "stop_sequence": None},
+                                     "delta": {"stop_reason": self._stop_reason(reason),
+                                               "stop_sequence": self.stop_sequence},
                                      "usage": usage})
         self._emit("message_stop", {"type": "message_stop"})
         if self.writer:
@@ -642,7 +647,7 @@ class AnthropicAdapter(_Base):
         non_cached = self.input_tokens if self.input_tokens is not None else max(0, raw_prompt - (self.cache_read or 0) - (self.cache_write or 0))
         return {"id": self.id, "type": "message", "role": "assistant", "model": self.parsed.model,
                 "content": [dict(block) for block in self._blocks] or [{"type": "text", "text": ""}],
-                "stop_reason": self._stop_reason(reason), "stop_sequence": None,
+                "stop_reason": self._stop_reason(reason), "stop_sequence": self.stop_sequence,
                 "usage": {"input_tokens": non_cached, "output_tokens": completion,
                           "cache_read_input_tokens": self.cache_read,
                           "cache_creation_input_tokens": self.cache_write,
@@ -722,6 +727,94 @@ class StructuredOutputAdapter:
         return self.adapter.end(reason, prompt_text)
 
 
+class StopSequenceAdapter:
+    """End the reply at the first of the client's stop sequences, the way the provider would: Retool has none.
+
+    Text is held back only while its end could still turn into a stop sequence. The sequence and everything after it
+    never reach the client, and the reply ends with stop_reason "stop_sequence" and the sequence (Messages) or
+    finish_reason "stop" (Chat). Of the stop sequences that occur, the one that is complete first wins, as when the
+    provider generates left to right. The upstream generation runs on: what the model writes after the sequence is paid
+    for and dropped, while its usage and cost still arrive.
+    """
+    _ACCOUNTING = ('usage_start', 'usage', 'credits')
+
+    def __init__(self, adapter, stops):
+        self.adapter = adapter
+        self.stops = list(stops)
+        self.longest = max(len(stop) for stop in self.stops)
+        self.pending = ''
+        self.matched = None
+
+    def __getattr__(self, name):
+        if name == 'adapter':
+            raise AttributeError(name)
+        return getattr(self.adapter, name)
+
+    def begin(self):
+        self.adapter.begin()
+
+    def fail(self, error, extra=None):
+        self.adapter.fail(error, extra)
+
+    def _base(self):
+        adapter = self.adapter
+        while isinstance(adapter, (StructuredOutputAdapter, StopSequenceAdapter)):
+            adapter = adapter.adapter
+        return adapter
+
+    def _held(self):
+        """How much of the end of the pending text is the start of a stop sequence (and must wait)."""
+        for size in range(min(len(self.pending), self.longest - 1), 0, -1):
+            tail = self.pending[-size:]
+            if any(stop.startswith(tail) for stop in self.stops):
+                return size
+        return 0
+
+    def _flush(self, final=False):
+        keep = 0 if final else self._held()
+        text, self.pending = self.pending[:len(self.pending) - keep], self.pending[len(self.pending) - keep:]
+        if text:
+            self.adapter.feed({'type': 'text', 'delta': text})
+
+    def feed(self, event):
+        kind = event.get('type')
+        if self.matched is not None:
+            if kind in self._ACCOUNTING:
+                self.adapter.feed(event)
+            return
+        if kind != 'text':
+            if kind not in self._ACCOUNTING:
+                self._flush(final=True)  # the text block ended: its held end can no longer become a stop sequence
+            self.adapter.feed(event)
+            return
+        self.pending += event['delta']
+        found = None
+        for stop in self.stops:
+            at = self.pending.find(stop)
+            if at >= 0 and (found is None or at + len(stop) < found[0] + len(found[1])):
+                found = (at, stop)
+        if found is None:
+            self._flush()
+            return
+        self.pending = self.pending[:found[0]]
+        self._flush(final=True)
+        self.matched = found[1]
+        self._base().stop_sequence = found[1]
+
+    def _reason(self, reason):
+        if self.matched is None:
+            self._flush(final=True)
+            return reason
+        # The reply ended at the sequence: whatever ended the upstream turn after it is not the client's affair.
+        return 'cancelled' if reason == 'cancelled' else 'stop'
+
+    def end(self, reason, prompt_text=None):
+        return self.adapter.end(self._reason(reason), prompt_text)
+
+    def payload(self, reason, prompt_text=None):
+        return self.adapter.payload(self._reason(reason), prompt_text)
+
+
 def for_dialect(dialect, parsed, writer=None):
     if dialect == "anthropic":
         adapter = AnthropicAdapter(parsed, writer)
@@ -731,8 +824,12 @@ def for_dialect(dialect, parsed, writer=None):
         adapter = ChatAdapter(parsed, writer)
     spec = getattr(parsed, 'structured_output', None)
     if spec:
-        return StructuredOutputAdapter(adapter, spec, tools=bool(getattr(parsed, 'tools', None)),
-                                       hint=structured.HINT if dialect == "anthropic" else '')
+        adapter = StructuredOutputAdapter(adapter, spec, tools=bool(getattr(parsed, 'tools', None)),
+                                          hint=structured.HINT if dialect == "anthropic" else '')
+    stops = getattr(parsed, 'stop_sequences', None)
+    if stops:
+        # Outside the structured check: the reply is cut at its stop sequence first, and what is left is validated.
+        adapter = StopSequenceAdapter(adapter, stops)
     return adapter
 
 def error_payload(dialect, err):
