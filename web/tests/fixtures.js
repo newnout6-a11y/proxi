@@ -51,9 +51,9 @@ export const DEFAULT_ROLES = [
 // Mirrors admin._schema: every field has a group, a real description and, where it applies, a unit.
 export const baseSchema = {
   relay_system_prompt_mode: { type: 'string', label: 'Применение инструкций', group: 'instructions',
-    enum: ['standalone', 'append', 'replace'], restart_required: true },
+    enum: ['standalone', 'append', 'replace'], restart_required: false },
   relay_system_prompt: { type: 'string', label: 'Инструкции для модели', group: 'instructions', nullable: true,
-    max_bytes: 32768, max_prompt_share: 0.5, restart_required: true },
+    max_bytes: 32768, max_prompt_share: 0.5, restart_required: false },
   model: { type: 'string', label: 'Модель по умолчанию', group: 'model', enum: catalog.map(({ id }) => id), restart_required: true,
     description: 'Модель для запросов, в которых клиент не указал свою' },
   show_thinking: { type: 'boolean', label: 'Передавать мышление модели', group: 'model', restart_required: true,

@@ -873,6 +873,8 @@ test('a spend chart whose prices are all reported has no lower-bound marks', asy
 });
 
 const clock = (ts) => new Date(ts * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', hour12: false });
+// A moment of another day carries its date ("5 ноября, 23:55"): the suite may run just after midnight.
+const since = (ts) => `(?:\\d{1,2} [а-яё]+, )?${clock(ts)}`;
 
 test('a window the journal covers only in part says how much it covers and greys out the charts before that', async ({ page }) => {
   const from = NOW - 600;
@@ -882,12 +884,12 @@ test('a window the journal covers only in part says how much it covers and greys
   const notice = page.locator('.banner.tone-warn');
   await expect(notice).toContainText('Журнал покрывает окно не полностью');
   await expect(notice).toContainText('данные за 10 мин из окна 60 мин');
-  await expect(notice).toContainText(`(с ${clock(from)})`);
+  await expect(notice).toContainText(new RegExp(`\\(с ${since(from)}\\)`));
   await expect(notice).toContainText('Суммы за окно неполные');
   // Both charts grey out what the journal does not cover: 49 of the 60 one-minute periods end before it began
   await expect(page.locator('.c-uncovered')).toHaveCount(2);
   const spend = page.locator('svg.chart').first();
-  await expect(spend).toHaveAttribute('aria-label', new RegExp(`Данные только с ${clock(from)}`));
+  await expect(spend).toHaveAttribute('aria-label', new RegExp(`Данные только с ${since(from)}`));
   await spend.focus();
   await spend.press('Home');
   await expect(spend).toHaveAttribute('aria-valuetext', /нет данных: журнал начат позже/);
