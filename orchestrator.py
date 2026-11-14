@@ -1225,11 +1225,15 @@ class TurnRunner:
                 else:
                     # __managed__: omit the field entirely (never send null).
                     model_provider.pop("providerResourceName", None)
+                # How many turns the pool has in flight, on this account and in all, this one included: the load this turn met.
+                counted = getattr(self.pool, "inflight", None)
+                load = ({} if counted is None else dict(zip(("inflight_account", "inflight_total"),
+                                                           counted(getattr(acquired, "backend", None)))))
                 log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
                     "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
                     isolated=bool(isolated), mode=self.cfg.get("session_mode"),
                     context_scope="text" if persistent_text else None,
-                    wait_ms=round((time.time() - turn_started) * 1000))
+                    wait_ms=round((time.time() - turn_started) * 1000), **load)
                 native_target, native_context = None, None
                 if native_tools:
                     prompt, native_target, native_context = await self._native_prompt(

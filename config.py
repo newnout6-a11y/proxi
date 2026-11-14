@@ -159,6 +159,12 @@ DEFAULTS = {
     # that account once more, before the conversation moves to another account (which writes its whole prefix again).
     # With a Retry-After from Retool it waits that long if that fits; 0 moves the conversation at once.
     "account_rate_limit_wait": 0,
+    # A conversation that has to change account (the account ran out, was signed out, reached the hourly limit or lost the route)
+    # leaves its signed thinking history behind: its next body differs from the cached one and the whole prefix is written again
+    # (79k to 580k tokens, 8 to 58 credits, 38 s to the first token), although the provider's cache is shared by the accounts.
+    # true takes the signed branches along, marked as read back from disk: a refusal that names the blocks forgets them and the
+    # next request goes unsigned, as every move did before. Off until a move has been seen to be accepted on the live relay.
+    "account_move_keeps_history": False,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -589,6 +595,8 @@ def _load(path):
         raise service_unavailable("account_rate_limit_wait must be between 0 and 120 seconds (0 moves the conversation at once)")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
+    if type(cfg["account_move_keeps_history"]) is not bool:
+        raise service_unavailable("account_move_keeps_history must be a boolean")
     if cfg["claude_xhigh_effort"] not in models.XHIGH_REPLACEMENTS:
         raise service_unavailable("claude_xhigh_effort must be one of: " + ", ".join(models.XHIGH_REPLACEMENTS))
     _check_web_search(cfg)

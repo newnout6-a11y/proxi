@@ -2,11 +2,13 @@
 import asyncio
 from collections import deque
 import contextlib
+import dataclasses
 import datetime as _datetime
 import hashlib
 import json
 import os
 import time
+import types
 import urllib.error
 import urllib.request
 import uuid
@@ -1301,6 +1303,37 @@ class SessionPool:
     def mode(self):
         return self.cfg["session_mode"]
 
+    def inflight(self, backend):
+        """(turns in flight on `backend`, turns in flight on all accounts): the leases given out and not yet released."""
+        sessions = [record[0] for record in self._active.values()]
+        return sum(1 for session in sessions if getattr(session, "backend", None) is backend), len(sessions)
+
+    def _carry_history(self, key, old, new):
+        """Put the signed branches of a conversation that changes account into its new session (account_move_keeps_history);
+        how many went, 0 when the setting is off or there was nothing to take.
+
+        The provider's cache is shared by the accounts: a prefix one account wrote was read whole by another (12 of 12 pairs
+        of conversations, 2026-11-07), so what a move cost, the whole prefix written again (79k to 580k tokens in the
+        journal), came from the signed thinking blocks the relay left behind: a body without them differs from the cached
+        one. Whether upstream accepts a signature on another account is not known, so the branches go as if they had been
+        read back from disk (restored): a refusal that names the blocks forgets them (conversation_state.refuse) and the next
+        request is sent unsigned, as every move was before."""
+        if not self.cfg.get("account_move_keeps_history", False):
+            return 0
+        try:
+            state = conversation_state.capture(key, old)
+            if state is None or not state.branches:
+                return 0
+            branches = [dataclasses.replace(branch, restored=True) for branch in state.branches]
+            conversation_state.apply(new, types.SimpleNamespace(
+                branches=branches, turn_ends=state.turn_ends, cache_key=state.cache_key,
+                prefix_tokens=state.prefix_tokens, warm_at=state.warm_at))
+            return len(branches)
+        except Exception as exc:  # noqa: BLE001 - a move must never fail for a history that cannot go along
+            journal.emit("account.history_kept_back", "История диалога не перенесена на другой аккаунт (%s)"
+                         % type(exc).__name__, "warn", conversation=journal.tag(key), error=type(exc).__name__)
+            return 0
+
     def _rebuild_cost(self, key):
         """What losing this conversation costs: its prefix is written again and its warm cache goes with the session.
 
@@ -1564,15 +1597,18 @@ class SessionPool:
                             self._check_route(replacement, model_entry)
                             old = session
                             session = RelaySession(replacement, await self._new_thread_id(replacement))
+                            carried = self._carry_history(key, old, session)
                             self._conversations[key] = session
                             await old.aclose()
-                            # The new account must write the prefix cache once.
+                            # Unless account_move_keeps_history took the signed branches along, the new account's first request
+                            # is sent without them: its body differs from the cached one and the prefix is written again.
                             journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
                                          conversation=journal.tag(key),
                                          from_account=account_tag(old.backend), to_account=account_tag(replacement),
                                          reason=(getattr(old.backend, "unavailable", None) or {}).get(
                                              "reason", "failover" if self._routable(old.backend, model_entry)
-                                             else "no_route"))
+                                             else "no_route"),
+                                         **({"carried_branches": carried} if carried else {}))
                     if session is None:
                         backend = affinity_backend or self._next_backend(model_entry, exclude)
                         self._check_route(backend, model_entry)
