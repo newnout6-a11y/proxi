@@ -315,7 +315,8 @@ def _parse_content(content, index, role, ignored=None):
         elif btype == "tool_result":
             call_id = block.get("tool_use_id") or block.get("tool_call_id") or "call"
             sub_text, sub_images = _parse_content(block.get("content"), index, "tool", ignored)
-            chunks.append(f"[tool_result id={call_id}: {sub_text}]")
+            failed = " is_error=true" if block.get("is_error") else ""
+            chunks.append(f"[tool_result id={call_id}{failed}: {sub_text}]")
             images.extend(sub_images)
         elif btype in ("tool_use", "tool_call"):
             name = block.get("name") or "tool"
@@ -381,16 +382,18 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
             call_id = message.get("tool_call_id") or message.get("call_id") or name
             convo_text = f"[tool result {name} id={call_id}]: {text}".strip()
             if images:
-                blocks = []
-                if text:
-                    blocks.append({"type": "text", "text": convo_text})
-                blocks.extend(images)
-                convo.append(blocks)
+                # The label stays when the result is nothing but the picture: it says which call the picture answers.
+                convo.append([{"type": "text", "text": convo_text}, *images])
             else:
                 convo.append(convo_text)
             continue
         if role == "assistant":
             calls = message.get("tool_calls") or []
+            legacy = message.get("function_call")
+            if isinstance(calls, list) and isinstance(legacy, dict) and legacy.get("name"):
+                # The deprecated form of one call. Its result is a "function" message that names the function and
+                # carries no id, so the name stands for the id here as it does for that result.
+                calls = calls + [{"id": legacy["name"], "function": legacy}]
             if isinstance(calls, list) and calls:
                 for call in calls:
                     if not isinstance(call, dict):
@@ -398,6 +401,10 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
                     fn = call.get("function") or {}
                     name = fn.get("name") or call.get("name") or "tool"
                     args = fn.get("arguments") or call.get("arguments") or ""
+                    if isinstance(call.get("custom"), dict):
+                        # A call to a custom tool of Chat: its one string is the input the model was offered the tool as.
+                        name = call["custom"].get("name") or "tool"
+                        args = json.dumps({"input": call["custom"].get("input", "")}, ensure_ascii=False)
                     call_id = call.get("id") or call.get("tool_call_id") or "call"
                     asst_text = f"Assistant: {text}\n[tool_call {name} id={call_id}: {str(args)}]".strip()
                     if images:
@@ -547,7 +554,11 @@ def _tools(data):
         where = f"tools[{index}]"
         if not isinstance(tool, dict):
             raise unprocessable(f"{where} must be an object", param=where)
-        kind = tool.get("type", "function")
+        kind = tool.get("type")
+        if kind is None or (kind == "custom" and isinstance(tool.get("input_schema"), dict)):
+            # The Messages API writes a client tool as "type": "custom", null, or no type at all; only a custom tool
+            # of OpenAI has no input_schema, and only that one takes the freeform input.
+            kind = "function"
         if kind == "namespace":
             namespace = tool.get("name")
             if not isinstance(namespace, str) or not namespace.strip() or not isinstance(tool.get("tools"), list):
@@ -571,13 +582,20 @@ def _tools(data):
                                     "such as a search MCP server or WebFetch", param=where + ".type")
             raise unprocessable(f"{where}.type must be 'function' or 'custom'", param=where + ".type")
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if kind == "custom" and isinstance(tool.get("custom"), dict):
+            fn = tool["custom"]  # Chat nests a custom tool under "custom", as it nests a function under "function"
         name = fn.get("name")
         if not isinstance(name, str) or not name.strip():
             raise unprocessable(f"{where}.function.name must be a non-empty string",
                                 param=where + ".function.name")
         if any(item["function"]["name"] == name for item in result):
             raise unprocessable(f"duplicate tool name '{name}'", param=where + ".name")
-        parameters = fn.get("parameters", fn.get("input_schema", {}))
+        parameters = fn.get("parameters")
+        if parameters is None:
+            # Responses writes a tool without parameters as null (FunctionTool.parameters is nullable)
+            parameters = fn.get("input_schema")
+        if parameters is None:
+            parameters = {}
         if kind == "custom":
             parameters = {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}
         if not isinstance(parameters, dict):
@@ -593,10 +611,10 @@ def _tools(data):
         })
         if kind == "custom":
             result[-1]["function"]["x-client-type"] = "custom"
-            if tool.get("format") is not None:
-                if not isinstance(tool["format"], dict):
+            if fn.get("format") is not None:
+                if not isinstance(fn["format"], dict):
                     raise unprocessable("custom tool format must be an object", param=where + ".format")
-                result[-1]["function"]["x-format"] = tool["format"]
+                result[-1]["function"]["x-format"] = fn["format"]
         if fn.get("strict") is not None:
             result[-1]["function"]["strict"] = _opt_bool(fn, "strict")
     return result
@@ -618,6 +636,8 @@ def _tool_choice(value):
             return "none"
         if choice_type == "any":
             return "required"
+        if choice_type == "custom" and isinstance(value.get("custom"), dict) and isinstance(value["custom"].get("name"), str):
+            return {"type": "function", "function": {"name": value["custom"]["name"]}}  # Chat's own shape
         if choice_type in ("tool", "custom") and isinstance(value.get("name"), str):
             name = value["name"]
             if value.get("namespace"):

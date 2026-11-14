@@ -8,9 +8,11 @@ import asyncio
 import contextlib
 import contextvars
 import decimal
+import functools
 import hashlib
 import http.client
 import json
+import math
 import pathlib
 import re
 import socket
@@ -235,6 +237,57 @@ def _allowed_values(schema):
     return None
 
 
+_STRICT_TOOL = contextvars.ContextVar("proxi_strict_tool", default=False)
+
+
+def _allows_null(schema):
+    """True when a schema says "X or null": a union with a null branch and another, a type list that holds "null" and
+    another type, or an enum with null among other values."""
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        return "null" in kind and any(item != "null" for item in kind)
+    options = schema.get("anyOf") if isinstance(schema.get("anyOf"), list) else schema.get("oneOf")
+    if isinstance(options, list):
+        branches = [option for option in options if isinstance(option, dict)]
+        if any(option.get("type") == "null" for option in branches):
+            return any(option.get("type") != "null" for option in branches)
+    values = schema.get("enum")
+    return isinstance(values, list) and None in values and any(value is not None for value in values)
+
+
+def _with_null(schema, node):
+    """`node`, what _param_schema made of `schema`, as an anyOf that still has a null branch when the schema allows null."""
+    if not _allows_null(schema) or node.get("type") == "null":
+        return node
+    null = {"type": "null", "required": False}
+    if node.get("type") == "anyOf":
+        if any(isinstance(branch, dict) and branch.get("type") == "null" for branch in node["anyOf"]):
+            return node
+        return dict(node, anyOf=list(node["anyOf"]) + [null])
+    inner = {key: value for key, value in node.items() if key not in ("required", "description")}
+    outer = {"type": "anyOf", "anyOf": [dict(inner, required=False), null], "required": node["required"]}
+    if "description" in node:
+        outer["description"] = node["description"]
+    return outer
+
+
+def _keeps_null(convert):
+    """Declare a field that may be null as "X or null" in a strict tool, at every depth.
+
+    Retool's strict mode makes every parameter required, and a field declared as plain X left the model no way to say
+    "none": it gave a placeholder (live, 2026-11-06: max_results 10, order "desc", since "1970-01-01" for a search that
+    wanted none of them) or refused to call the tool. With the null branch, which Retool accepts, both said null
+    (ultracode audit of the relay, C7). The children of a field are converted by the same function, so one wrapper
+    covers the properties and items below it; a tool that is not strict keeps the plain type, as its optional field can
+    be left out."""
+    @functools.wraps(convert)
+    def wrapper(schema, required):
+        node = convert(schema, required)
+        return _with_null(schema, node) if _STRICT_TOOL.get() and isinstance(schema, dict) else node
+    return wrapper
+
+
+@_keeps_null
 def _param_schema(schema, required):
     """Convert one JSON-Schema property to Retool's typed param shape.
 
@@ -356,8 +409,12 @@ def tools_to_retool(tools):
         schema = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
         required = set(_required_names(schema))
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-        for name in sorted(properties.keys()):
-            params[name] = _param_schema(properties[name], name in required)
+        token = _STRICT_TOOL.set(function.get("strict") is True)
+        try:
+            for name in sorted(properties.keys()):
+                params[name] = _param_schema(properties[name], name in required)
+        finally:
+            _STRICT_TOOL.reset(token)
         converted.append({"name": function["name"],
                           "description": function.get("description") or "",
                           "params": params, "strict": function.get("strict", False)})
@@ -391,9 +448,20 @@ def coerce_arguments(raw, params):
 _JSON_NULL = object()
 
 
+def _coerced_kind(spec):
+    """The type a string is coerced to for a field. A field that is "X or null" (an anyOf of X and null, how a strict
+    tool declares it) is an X, as it was before the null branch; a union of two types is not guessed at."""
+    kind = spec.get("type") if isinstance(spec, dict) else None
+    if kind == "anyOf":
+        kinds = {branch.get("type") for branch in spec.get("anyOf") or []
+                 if isinstance(branch, dict) and branch.get("type") != "null"}
+        return kinds.pop() if len(kinds) == 1 else None
+    return kind
+
+
 def _coerce_value(value, spec):
     """Coerce one string scalar like coerce_arguments; None when it stays a string."""
-    kind = spec.get("type") if isinstance(spec, dict) else None
+    kind = _coerced_kind(spec)
     if value == "null" and kind in ("number", "boolean", "array", "object"):
         # Retool has no way to declare "X or null", so an optional field of such a type is declared as X, and Claude
         # writes the string "null" when it means null: the client's tool refused middle="null", active="null" (protocol
@@ -435,7 +503,7 @@ class ArgStream:
         except ValueError:
             return False
         spec = self.params.get(name)
-        return isinstance(spec, dict) and spec.get("type") in ("number", "boolean", "array", "object")
+        return isinstance(spec, dict) and _coerced_kind(spec) in ("number", "boolean", "array", "object")
 
     def feed(self, chunk):
         out = []
@@ -606,6 +674,24 @@ def _has_cacheable_text(chunk):
     return any(not isinstance(block, dict) or block.get("type") == "text" for block in blocks)
 
 
+_CHOICE_WORDS = ("none", "auto", "required")
+
+
+def _forced_alone(tools, tool_choice):
+    """(tools, tool_choice) with a forced tool whose name is one of Retool's own choices made unambiguous.
+
+    toolChoice is one string, and "none", "auto" and "required" mean what they say whoever a client tool is called: forcing
+    a tool named "none" asked for no tool at all, "auto" for nothing in particular and "required" for any tool (ultracode
+    audit of the relay, C20). Such a tool is forced the way a lone tool is: the model is offered only that one and the
+    choice is "required". The list the caller holds is not changed."""
+    function = tool_choice.get("function") if isinstance(tool_choice, dict) else None
+    name = function.get("name") if isinstance(function, dict) else None
+    if name not in _CHOICE_WORDS:
+        return tools, tool_choice
+    kept = [tool for tool in tools or [] if tool.get("name") == name]
+    return (kept, "required") if kept else (tools, tool_choice)
+
+
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None):
     """Assemble the request body.
 
@@ -614,6 +700,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     intermediate multi-tool turns do not discard prefix caches.
     """
     messages = []
+    tools, tool_choice = _forced_alone(tools, tool_choice)
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
     prefix_key = cache_key_for(head, model_provider.get("model"), tools) if cache and head else None
     if head:
@@ -836,6 +923,26 @@ def _error_from_event(event):
     return apierr.upstream_error(text)
 
 
+def _without_inf(value):
+    if isinstance(value, dict):
+        return {key: _without_inf(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_without_inf(item) for item in value]
+    return None if isinstance(value, float) and not math.isfinite(value) else value
+
+
+def _wire_json(body):
+    """The request body as the ASCII JSON that goes upstream.
+
+    A number past the range of a double (1e400) that the client's own history holds is inf here, and Python writes it as
+    Infinity, which is no JSON: the endpoint refused the whole request (ultracode audit of the relay, G3.2). It goes as
+    null, which is what a JavaScript client writes for it as well."""
+    try:
+        return json.dumps(body, ensure_ascii=True, allow_nan=False).encode("utf-8")
+    except ValueError:
+        return json.dumps(_without_inf(body), ensure_ascii=True).encode("utf-8")
+
+
 def _ping(session, body):
     """Cheap request that re-reads the cached prefix so its TTL does not lapse.
 
@@ -848,7 +955,7 @@ def _ping(session, body):
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
-                                     data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
+                                     data=_wire_json(payload),
                                      headers=headers, method="POST")
     response = urllib.request.urlopen(request, timeout=120)
     abort = lambda: _force_close_response(response)
@@ -1281,6 +1388,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
+    tools, tool_choice = _forced_alone(tools, tool_choice)
     parent, messages = (conversation_state.resume(session, history, scope, client)
                         if history is not None and client is not None else (None, None))
     if messages is not None:
@@ -1575,7 +1683,7 @@ def _dump_empty_once(payload, flags, cfg, session, model=None):
 
 async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     if payload is None:
-        payload = json.dumps(body, ensure_ascii=True).encode("utf-8")
+        payload = _wire_json(body)
     elif json.loads(payload) != body:
         raise ValueError("replay payload does not match the supplied body")
     session._direct_reply = None
@@ -1855,6 +1963,16 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         session._active_direct_abort = None
 
 
+def _delta_target(event, current):
+    """The call a tool-call delta belongs to: the one it names, else the newest open one.
+
+    ReplyCapture, which records the signed history, has always read a delta's toolCallId; this read the newest open
+    call whatever the delta said, so with two calls open the client and the history disagreed about their arguments
+    (ultracode audit of the relay, G1.1). Retool tags no delta today, and then the newest open call is the one."""
+    named = event.get("toolCallId")
+    return named if isinstance(named, str) and named else current
+
+
 async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None, *, cache_scope=None):
     started = loop_now()
     think_started = None
@@ -1987,8 +2105,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 think_started = None
                 if event.get("partialSignature"):
                     yield {"type": "thinking_signature", "signature": event["partialSignature"]}
-            elif block == "tool_call" and current in calls:
-                call = calls[current]
+            elif block == "tool_call" and (target := _delta_target(event, current)) in calls:
+                call = calls[target]
                 piece = event.get("partialInputs") or ""
                 call["args"].append(piece)
                 emitted = call["stream"].feed(piece)

@@ -2,6 +2,7 @@
 import copy
 from dataclasses import dataclass
 import json
+import math
 
 INSTRUCTION_ROLES = ("system", "developer")
 INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
@@ -155,9 +156,18 @@ def client_messages(messages, image_converter, *, lead=None):
                     else:
                         raise ValueError("unsupported assistant block")
                 for item in message.get("tool_calls") or []:
+                    if isinstance(item.get("custom"), dict):
+                        # A call to a custom tool of Chat: its one string is the input the model was offered the tool as.
+                        calls.append(call(item.get("id"), item["custom"].get("name"),
+                                          {"input": item["custom"].get("input", "")}))
+                        continue
                     fn = item.get("function") or item
                     calls.append(call(item.get("id") or item.get("tool_call_id"), fn.get("name"),
                                       fn.get("arguments", "{}")))
+                legacy = message.get("function_call")
+                if isinstance(legacy, dict) and legacy.get("name"):
+                    # The deprecated form of one call; its "function" message carries the name, not an id (see below).
+                    calls.append(call(legacy["name"], legacy["name"], legacy.get("arguments", "{}")))
                 blocks = ([{"type": "text", "text": "".join(text)}] if any(text) else []) + calls
                 if not blocks:
                     continue
@@ -167,7 +177,8 @@ def client_messages(messages, image_converter, *, lead=None):
                 else:
                     result.append({"role": "assistant", "content": blocks})
             elif role in ("tool", "function"):
-                result.append(tool_result(message.get("tool_call_id") or message.get("call_id"), value,
+                result.append(tool_result(message.get("tool_call_id") or message.get("call_id")
+                                          or (message.get("name") if role == "function" else None), value,
                                           message.get("is_error", False)))
             elif role == "user":
                 pending = []
@@ -229,6 +240,25 @@ def unsigned_tool_transcript(client):
             elif role != 'user':
                 return None
     return copy.deepcopy(client) if has_results and not pending else None
+
+
+def _finite_float(text):
+    value = float(text)
+    return value if math.isfinite(value) else None
+
+
+def _no_constant(name):
+    return None
+
+
+def loads_finite(text):
+    """json.loads for the arguments of a tool call, with a number past the range of a double (1e400) read as null.
+
+    Python reads 1e400 as inf and writes it back as Infinity, which is no JSON: the next request upstream carried it
+    and was refused, and so was the Messages reply that held it (ultracode audit of the relay, G3.2). A JavaScript
+    client reads it as Infinity and writes null when it echoes the call, so null is also what its echo is compared
+    with. NaN and Infinity written out as words are read as null as well."""
+    return json.loads(text, parse_float=_finite_float, parse_constant=_no_constant)
 
 
 class ReplyCapture:
@@ -306,7 +336,7 @@ class ReplyCapture:
                 # A call without arguments arrives as one empty partialInputs: the stream gives the client {} for it
                 # (coerce_arguments), so the kept reply must say {} too, or its next turn can never continue it.
                 if raw:
-                    call["toolInput"] = json.loads(raw)
+                    call["toolInput"] = loads_finite(raw)
                 if not isinstance(call["toolInput"], dict):
                     return None
             if any(b["type"] == "thinking" and not b["signature"] for b in self.blocks):
@@ -348,7 +378,8 @@ class History:
         for snapshot in reversed(self.branches):
             offset = len(snapshot.client)
             if (scope != snapshot.scope or len(client) <= offset + 1
-                    or client[:offset] != snapshot.client or not same_echo(client[offset], snapshot.echo, defaults)):
+                    or not same_json(client[:offset], snapshot.client)
+                    or not same_echo(client[offset], snapshot.echo, defaults)):
                 continue
             tail = client[offset + 1:]
             calls = [b["toolCallId"] for b in snapshot.assistant if b["type"] == "tool_call"]
@@ -378,7 +409,7 @@ class History:
         if len(client) <= offset + 1:
             return "history:%d_of_%d_messages" % (len(client), offset + 2)
         for index, (ours, theirs) in enumerate(zip(client, snapshot.client)):
-            if ours != theirs:
+            if not same_json(ours, theirs):
                 return "message:%d:%s" % (index, ours.get("role"))
         if not same_echo(client[offset], snapshot.echo, defaults):
             return "echo:" + _echo_difference(client[offset], snapshot.echo)
@@ -422,6 +453,39 @@ def _complete_turns(messages, seen):
     return not pending and (not messages or messages[-1].get("role") != "assistant")
 
 
+def same_json(a, b):
+    """True when two parsed JSON values are the same values, as a JSON client holds them.
+
+    Python's == also says True == 1 and False == 0, so a history that held 1 where the model wrote true was taken for the
+    conversation the signed reply belongs to (bug summary of 2026-11-06, section 3, item 14). And Python keeps an integer
+    exact where a JavaScript client (Claude Code, the AI SDK) holds a double: the id 9007199254740993 the model wrote
+    comes back from it as 9007199254740992, which was taken for another reply, and the whole conversation was sent
+    again, uncached (ultracode audit of the relay, G3.1). Numbers are compared as doubles."""
+    try:
+        return _same_json(a, b)
+    except RecursionError:  # nested past what is worth comparing: not the same, and the turn goes the unsigned way
+        return False
+
+
+def _double(number):
+    try:
+        return float(number)
+    except OverflowError:  # an integer past the range of a double is infinity to JavaScript
+        return float("inf") if number > 0 else float("-inf")
+
+
+def _same_json(a, b):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return _double(a) == _double(b)
+    if isinstance(a, dict) and isinstance(b, dict):
+        return len(a) == len(b) and all(key in b and _same_json(value, b[key]) for key, value in a.items())
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(map(_same_json, a, b))
+    return a == b
+
+
 def tool_defaults(tools):
     """{tool name: {argument: default}} from the client's own tool schemas, for the arguments that declare a default."""
     found = {}
@@ -444,7 +508,7 @@ def same_echo(theirs, ours, defaults=None):
     false of Edit), so an argument that holds its schema default counts as absent on both sides. Before, such an echo
     failed the check and the next turn went cold, rewriting the whole cached conversation (Claude Desktop test run of
     2026-11-06: 233k tokens, 30.7 credits for one Edit)."""
-    if theirs == ours:
+    if same_json(theirs, ours):
         return True
     if not defaults or not isinstance(theirs, dict) or not isinstance(ours, dict):
         return False
@@ -455,11 +519,11 @@ def same_echo(theirs, ours, defaults=None):
             if isinstance(block, dict) and block.get("type") == "tool_call" and isinstance(block.get("toolInput"), dict):
                 known = defaults.get(block.get("toolName")) or {}
                 block = dict(block, toolInput={key: value for key, value in block["toolInput"].items()
-                                               if known.get(key, _MISSING) != value})
+                                               if not same_json(known.get(key, _MISSING), value)})
             blocks.append(block)
         return dict(message, content=blocks)
 
-    return without_defaults(theirs) == without_defaults(ours)
+    return same_json(without_defaults(theirs), without_defaults(ours))
 
 
 _SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")
@@ -485,7 +549,7 @@ def _echo_difference(ours, theirs):
         return "role"
     calls = [[b for b in m.get("content") or [] if b.get("type") == "tool_call"] for m in (ours, theirs)]
     for field, label in (("toolCallId", "call_ids"), ("toolName", "names"), ("toolInput", "arguments")):
-        if [b.get(field) for b in calls[0]] != [b.get(field) for b in calls[1]]:
+        if not same_json([b.get(field) for b in calls[0]], [b.get(field) for b in calls[1]]):
             return label
     return "text"
 
