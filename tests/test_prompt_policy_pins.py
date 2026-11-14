@@ -110,8 +110,9 @@ def test_a_file_that_disappears_returns_new_conversations_to_legacy_and_keeps_th
     store = make_store(tmp_path, doc(), clock=clock)
     store.plan(key("kept"))
     (tmp_path / "prompts.json").unlink()
-    clock.advance(pp.RELOAD_INTERVAL + 0.1)
-    store.maybe_reload()
+    for _ in range(2):      # a removal needs two looks, RELOAD_INTERVAL apart
+        clock.advance(pp.RELOAD_INTERVAL + 0.1)
+        store.maybe_reload()
     assert store.snapshot() is None
     assert store.plan(key("fresh")).legacy
     kept = store.plan(key("kept"))

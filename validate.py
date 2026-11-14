@@ -1,5 +1,6 @@
 """Strict request parsing for every supported dialect."""
 import base64
+import contextvars
 import hashlib
 import ipaddress
 import json
@@ -60,6 +61,29 @@ def _assert_public_peer(resp, where="image"):
 
 
 _IMAGE_OPENER = urllib.request.build_opener(_GuardedRedirectHandler())
+_IMAGE_FETCHES = contextvars.ContextVar("proxi_image_fetches", default=None)
+
+
+class ImageFetches:
+    """The remote images one request has downloaded, by URL, for the second parse of a body a prompt profile rewrote.
+
+    Used as a context manager it records, in the parses made inside it, what each download gave. Once `reuse` is set,
+    a parse made inside it takes those images from here instead of downloading them again: the rewrite leaves images
+    alone, so the second parse wants exactly the pictures the first one fetched (and must not fail on a link that has
+    stopped answering since). Outside any such block, and while `reuse` is off, every parse downloads as it always did."""
+
+    def __init__(self):
+        self.found = {}
+        self.reuse = False
+        self._tokens = []
+
+    def __enter__(self):
+        self._tokens.append(_IMAGE_FETCHES.set(self))
+        return self
+
+    def __exit__(self, *exc):
+        _IMAGE_FETCHES.reset(self._tokens.pop())
+        return False
 
 
 class Parsed:
@@ -220,23 +244,30 @@ def _extract_image_data(block, where):
                         mime_type = mime
                     data_b64 = rest.strip()
             elif url.startswith("http://") or url.startswith("https://"):
-                _assert_public_http_url(url, where)
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                max_bytes = 10 * 1024 * 1024
-                try:
-                    with _IMAGE_OPENER.open(req, timeout=10) as r:
-                        _assert_public_peer(r, where)
-                        ct = r.headers.get("content-type", "").split(";")[0].strip()
-                        if ct:
-                            mime_type = ct
-                        buf = r.read(max_bytes + 1)
-                        if len(buf) > max_bytes:
-                            raise unprocessable("failed to fetch image attachments: image exceeds maximum allowed size (10MB)", param=where)
-                        data_b64 = base64.b64encode(buf).decode("ascii")
-                except ApiError:
-                    raise
-                except Exception:
-                    raise unprocessable(f"failed to fetch image attachments from {url}", param=where)
+                fetches = _IMAGE_FETCHES.get()
+                kept = fetches.found.get(url) if fetches is not None and fetches.reuse else None
+                if kept is not None:
+                    mime_type, data_b64 = kept
+                else:
+                    _assert_public_http_url(url, where)
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    max_bytes = 10 * 1024 * 1024
+                    try:
+                        with _IMAGE_OPENER.open(req, timeout=10) as r:
+                            _assert_public_peer(r, where)
+                            ct = r.headers.get("content-type", "").split(";")[0].strip()
+                            if ct:
+                                mime_type = ct
+                            buf = r.read(max_bytes + 1)
+                            if len(buf) > max_bytes:
+                                raise unprocessable("failed to fetch image attachments: image exceeds maximum allowed size (10MB)", param=where)
+                            data_b64 = base64.b64encode(buf).decode("ascii")
+                    except ApiError:
+                        raise
+                    except Exception:
+                        raise unprocessable(f"failed to fetch image attachments from {url}", param=where)
+                    if fetches is not None:
+                        fetches.found[url] = (mime_type, data_b64)
     elif "imageData" in block:
         mime_type = block.get("mimeType") or "image/png"
         data_b64 = block.get("imageData")

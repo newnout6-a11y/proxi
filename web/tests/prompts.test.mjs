@@ -3,19 +3,19 @@ import test from 'node:test';
 import { MAX_TEXT_BYTES, insertAt as insertText, templateProblems, tokenize, utf8Bytes, variableNames, problemText } from '../src/prompts/template.js';
 import { diffLines, diffStats, foldDiff } from '../src/prompts/diff.js';
 import { normalizeParts, segmentHead, sourceKind, sourceLabel, summarizeKinds } from '../src/prompts/parts.js';
-import { describeEdit, flagsOf, joinFlags, newEdit, normalizeEditOps, opOf, setEditField, switchOp } from '../src/prompts/ops.js';
+import { describeEdit, flagValue, flagsOf, joinFlags, newEdit, normalizeEditOps, opOf, setEditField, switchOp } from '../src/prompts/ops.js';
 import { CONDITION_SPECS, conditionText, fromValues, normalizeConditions, setCondition, summarizeConditions, valuesOf } from '../src/prompts/conditions.js';
 import {
   addProfile, blankDocument, catchAllIndex, changedPaths, equalJson, errorHits, idOf, insertAt, locate, moveItem, newRule, normalizePath, patchProfile,
   pathLabel, profileNameError, profileUsage, protectedEnabled, pruneProfile, removeAt, removeProfile, removeText, renameProfile, renameText,
-  setProtected, setRelayText, setRuleField, STARTERS, starterProfile, textNameError, textUsage, uniqueName, updateAt,
+  setProtected, setRelayText, setRuleField, STARTERS, starterProfile, systemEditsOf, textNameError, textNameHint, textUsage, uniqueName, updateAt,
 } from '../src/prompts/draft.js';
 import {
-  BASELINE_DOCUMENT, DEFAULT_VARIABLES, MAX_DOCUMENT_BYTES, RELAY_TASK_VARIABLES, compileProfileName, detectDialect, failureLead, failureOf, forceProfile,
+  BASELINE_DOCUMENT, DEFAULT_VARIABLES, MAX_DOCUMENT_BYTES, RELAY_TASK_VARIABLES, compileName, compileProfileName, compileTextName, detectDialect, failureLead, failureOf, forceProfile,
   normalizeBuiltin, normalizeEditReport, normalizeLimits, normalizePins, normalizePreview, normalizePrompts, normalizeRecent, normalizeSaved, normalizeSpecialUses,
-  normalizeVariables, parseBody, parseHeaders, previewRequest,
+  normalizeVariables, parseBody, parseHeaders, previewRequest, warningsToShow,
 } from '../src/prompts/api.js';
-import { describeChange, describeGroup, describeReport, describeUnmatched, groupChanges, opLabel, scopeLabel, shortList } from '../src/prompts/changes.js';
+import { describeChange, describeGroup, describeReport, describeUnmatched, editTarget, groupChanges, opLabel, scopeLabel, shortList } from '../src/prompts/changes.js';
 import { fmtInt } from '../src/format.js';
 import { emptySample, newestSample, recentLabel, resolveSample } from '../src/prompts/sample.js';
 
@@ -218,10 +218,59 @@ test('a new edit starts empty, switching the operation keeps the shared fields, 
   assert.deepEqual(switchOp('client_system', { op: 'remove_tag', tag: 'env' }, 'keep_tag_inner'), { op: 'keep_tag_inner', tag: 'env' });
   assert.deepEqual(switchOp('client_system', { op: 'prepend', text: 'hi' }, 'remove_tag'), { op: 'remove_tag' });
   assert.deepEqual(switchOp('tools', { tool: 'bash', op: 'append', text: 'hi' }, 'hide'), { tool: 'bash', hide: true });
-  assert.deepEqual(setEditField({ op: 'replace_text', find: 'a', with: 'b', all: true }, 'all', false), { op: 'replace_text', find: 'a', with: 'b' });
   assert.deepEqual(setEditField({ op: 'remove_tag' }, 'tag', 'env'), { op: 'remove_tag', tag: 'env' });
   assert.deepEqual(setEditField({ tool: 'bash', op: 'append' }, 'tool', ''), { tool: '', op: 'append' });
   assert.deepEqual(setEditField({ op: 'keep_sections', headings: ['# A'] }, 'headings', []), { op: 'keep_sections' });
+});
+
+test('"all" of replace_text is on unless the edit says all: false, and the form writes exactly what the user chose', () => {
+  const fresh = newEdit('client_system', 'replace_text');
+  const edit = { op: 'replace_text', find: 'a', with: 'b' };
+  assert.deepEqual(fresh, { op: 'replace_text', with: '' });
+  // the relay replaces every occurrence while `all` is missing, so a box with no key behind it is ticked
+  assert.equal(flagValue('all', fresh.all), true);
+  assert.equal(flagValue('all', null), true);
+  assert.equal(flagValue('all', true), true);
+  assert.equal(flagValue('all', false), false);
+  // unticking is the explicit false, ticking is the default and leaves no key behind
+  const unticked = setEditField(edit, 'all', false);
+  assert.deepEqual(unticked, { ...edit, all: false });
+  assert.deepEqual(setEditField(unticked, 'all', true), edit);
+  assert.deepEqual(setEditField({ ...edit, all: true }, 'all', false), { ...edit, all: false });
+  assert.deepEqual(setEditField({ ...edit, all: true }, 'all', true), edit);
+  // a file with all: false, ticked and unticked again (a double click), is the same file
+  const file = { ...edit, all: false };
+  assert.equal(flagValue('all', file.all), false);
+  assert.equal(equalJson(setEditField(setEditField(file, 'all', true), 'all', false), file), true);
+  // a box whose default is no keeps being written only when ticked
+  const between = { op: 'remove_between', start: '<a>', end: '</a>' };
+  assert.equal(flagValue('inclusive', between.inclusive), false);
+  assert.deepEqual(setEditField(between, 'inclusive', true), { ...between, inclusive: true });
+  assert.deepEqual(setEditField({ ...between, inclusive: true }, 'inclusive', false), between);
+  // the operation can change under an edit that said all: false, and it keeps what both forms share
+  assert.deepEqual(switchOp('tools', { tool: 'bash', op: 'replace_text', find: 'a', with: 'b', all: false }, 'replace_text'), { tool: 'bash', op: 'replace_text', find: 'a', with: 'b', all: false });
+  assert.deepEqual(switchOp('user_blocks', { op: 'replace_text', find: 'a', with: 'b', all: false }, 'remove_regex'), { op: 'remove_regex' });
+});
+
+test('an edit that replaces always carries its replacement, empty or not, because the relay requires the key and an empty one deletes', () => {
+  assert.deepEqual(newEdit('client_system', 'replace_text'), { op: 'replace_text', with: '' });
+  assert.deepEqual(newEdit('client_system', 'replace_regex'), { op: 'replace_regex', with: '' });
+  assert.deepEqual(newEdit('user_blocks', 'replace_text'), { op: 'replace_text', with: '' });
+  assert.deepEqual(newEdit('tools', 'replace_text'), { tool: '', op: 'replace_text', with: '' });
+  assert.deepEqual(newEdit('tools', 'replace_regex'), { tool: '', op: 'replace_regex', with: '' });
+  assert.deepEqual(newEdit('client_system', 'remove_regex'), { op: 'remove_regex' });
+  assert.deepEqual(newEdit('client_system', 'append'), { op: 'append' });
+  // typed and emptied again, it stays an empty string; the other fields that are emptied still leave the edit
+  const typed = setEditField(newEdit('client_system', 'replace_text'), 'with', 'x');
+  assert.deepEqual(typed, { op: 'replace_text', with: 'x' });
+  assert.deepEqual(setEditField(typed, 'with', ''), { op: 'replace_text', with: '' });
+  assert.deepEqual(setEditField({ op: 'replace_text', find: 'a', with: '' }, 'find', ''), { op: 'replace_text', with: '' });
+  assert.deepEqual(setEditField({ op: 'remove_regex', pattern: 'x', flags: 'i' }, 'flags', ''), { op: 'remove_regex', pattern: 'x' });
+  assert.deepEqual(setEditField({ op: 'replace_text', with: 'x' }, 'with', undefined), { op: 'replace_text' });
+  // switching starts a replacing edit with an empty replacement, and keeps the one the form it comes from had
+  assert.deepEqual(switchOp('client_system', { op: 'prepend', text: 'hi' }, 'replace_text'), { op: 'replace_text', with: '' });
+  assert.deepEqual(switchOp('client_system', { op: 'replace_text', find: 'a', with: 'b' }, 'replace_regex'), { op: 'replace_regex', with: 'b' });
+  assert.deepEqual(switchOp('client_system', { op: 'replace_regex', pattern: 'a', with: 'b' }, 'remove_regex'), { op: 'remove_regex', pattern: 'a' });
 });
 
 test('regex flags are a subset of i, m and s in a fixed order', () => {
@@ -610,6 +659,24 @@ test('the answer of a save is the revision and the warnings, and a refusal opens
   assert.equal(failureLead({ status: 500 }), 'Ошибка');
 });
 
+test('the warnings about the document are the relay\'s list with it and, while that save stands, what the save said besides, each once', () => {
+  const list = (rev, warnings) => ({ rev, warnings });
+  assert.deepEqual(warningsToShow(list(4, ['a', 'b']), { rev: 4, warnings: ['a', 'b', 'c'] }), ['a', 'b', 'c']);
+  assert.deepEqual(warningsToShow(list(4, ['a']), { rev: 4, warnings: ['b', 'a'] }), ['a', 'b']);
+  assert.deepEqual(warningsToShow(list(4, ['a', 'a']), { rev: 4, warnings: ['a'] }), ['a']);
+  // the reading has not caught up with the save yet: the list that came with the previous document is not about this one
+  assert.deepEqual(warningsToShow(list(3, ['old']), { rev: 4, warnings: ['new', 'new'] }), ['new']);
+  // the first save of a relay with no file: there was no revision to read, and the save made the document
+  assert.deepEqual(warningsToShow(list(null, []), { rev: 1, warnings: ['first'] }), ['first']);
+  // somebody saved after that, there was no save: the relay's own list is all there is
+  assert.deepEqual(warningsToShow(list(5, ['x']), { rev: 4, warnings: ['y'] }), ['x']);
+  assert.deepEqual(warningsToShow(list(4, ['x']), { rev: null, warnings: [] }), ['x']);
+  assert.deepEqual(warningsToShow(list(4, ['x']), undefined), ['x']);
+  assert.deepEqual(warningsToShow(list(null, ['x']), undefined), ['x']);
+  assert.deepEqual(warningsToShow(null, { rev: 4, warnings: ['y'] }), []);
+  assert.deepEqual(warningsToShow(list(4, []), { rev: 4, warnings: [] }), []);
+});
+
 test('a profile name is judged by the relay pattern when there is one', () => {
   const strict = compileProfileName('[a-z][a-z0-9-]{0,7}');
   assert.equal(profileNameError('mine', [], strict), null);
@@ -618,6 +685,57 @@ test('a profile name is judged by the relay pattern when there is one', () => {
   assert.equal(profileNameError('Mine', []), null);
   assert.match(profileNameError('passthrough', [], strict), /встроенный/);
   assert.match(profileNameError('mine', ['mine'], strict), /уже есть/);
+});
+
+test('a text name is judged by the pattern the relay publishes, read the way Python reads it, and by the documented bans without one', () => {
+  // the rule of the relay today: a word character, then up to 63 of word characters, dots and hyphens; \w is Unicode in Python
+  const pattern = compileName('\\w[\\w.-]{0,63}');
+  for (const name of ['my_rules', 'a', '_x', 'a.b-c', 'правила', 'Текст2', 'x'.repeat(64), '٣x']) assert.equal(pattern.test(name), true, name);
+  for (const name of ['', '-x', '.x', 'a b', 'a:b', 'a{b}', 'a/b', 'a\nb', 'x'.repeat(65), 'a😀']) assert.equal(pattern.test(name), false, JSON.stringify(name));
+  const rule = compileTextName('\\w[\\w.-]{0,63}');
+  assert.equal(rule.source, '\\w[\\w.-]{0,63}');
+  assert.equal(textNameError('my_rules', [], rule), null);
+  assert.equal(textNameError('правила', ['other'], rule), null);
+  assert.match(textNameError('-x', [], rule), /^Имя текста: буквы, цифры, «_», «\.» и «-», до 64 знаков; начинается с буквы, цифры или «_»$/);
+  assert.match(textNameError('a b', [], rule), /^Имя текста:/);
+  assert.match(textNameError('x'.repeat(65), [], rule), /до 64 знаков/);
+  assert.match(textNameError('', [], rule), /Введите имя/);
+  assert.match(textNameError('x', ['x'], rule), /уже есть/);
+  assert.equal(textNameHint(rule), 'Буквы, цифры, «_», «.» и «-», до 64 знаков; начинается с буквы, цифры или «_»');
+  // no rule published: the screen keeps to what would break {{text:name}}, as before
+  assert.equal(textNameError('-x', []), null);
+  assert.equal(textNameError('-x', [], null), null);
+  assert.match(textNameError('a b', [], null), /нет пробелов/);
+  assert.match(textNameError('a{b}', []), /нет пробелов/);
+  assert.equal(textNameHint(null), 'Имя без пробелов, фигурных скобок и двоеточий');
+  // a rule other than today's is quoted, not described: the words would not be true of it
+  const other = compileTextName('[a-z]{1,8}');
+  assert.equal(textNameError('abc', [], other), null);
+  assert.equal(textNameError('Abc', [], other), 'Имя текста не подходит под правило relay: [a-z]{1,8}');
+  assert.equal(textNameError('toolongname', [], other), 'Имя текста не подходит под правило relay: [a-z]{1,8}');
+  assert.equal(textNameHint(other), 'Имя должно подходить под правило relay: [a-z]{1,8}');
+  // a rule that does not read here is no rule
+  assert.equal(compileName('\\Afoo\\Z'), null);
+  assert.equal(compileName('\\bfoo'), null);
+  assert.equal(compileName('(?P<n>x)'), null);
+  assert.equal(compileName('[a'), null);
+  assert.equal(compileName(undefined), null);
+  assert.equal(compileTextName('(?P<n>x)'), null);
+  assert.equal(compileTextName(''), null);
+  assert.equal(compileName('\\d+')?.test('123'), true);
+  assert.equal(compileName('\\d+')?.test('12a'), false);
+  assert.equal(compileName('[\\d.]+')?.test('1.5'), true);
+  assert.equal(compileName('a\\.b')?.test('a.b'), true);
+  assert.equal(compileName('a\\.b')?.test('axb'), false);
+  assert.equal(compileProfileName('[A-Za-z0-9][A-Za-z0-9._-]{0,63}')?.test('mine-first'), true);
+  assert.equal(compileProfileName('[A-Za-z0-9][A-Za-z0-9._-]{0,63}')?.test('мой'), false);
+  // the builtin answer carries it next to the profile name rule
+  const builtin = normalizeBuiltin({ profile_name: '[a-z]+', text_name: '\\w[\\w.-]{0,63}' });
+  assert.equal(builtin.textName.pattern.test('имя.v2'), true);
+  assert.equal(builtin.textName.pattern.test('имя v2'), false);
+  assert.equal(builtin.textName.source, '\\w[\\w.-]{0,63}');
+  assert.equal(normalizeBuiltin({}).textName, null);
+  assert.equal(normalizeBuiltin({ text_name: '' }).textName, null);
 });
 
 test('a rule field is written only when it differs from the default', () => {
@@ -641,6 +759,11 @@ test('whatever follows the first enabled rule that matches everything can never 
 test('the starting points keep both kinds of request as they are or start from the user\'s own text', () => {
   assert.deepEqual(STARTERS.map((item) => item.id), ['same', 'rules-first', 'exact']);
   assert.equal(starterProfile('same').head, '{{client_system}}{{relay_task}}{{exec_reminder}}');
+  // it keeps the system of the client and the tasks of the relay; it does not promise the role the old path gives a client with tools and no system
+  assert.match(STARTERS[0].hint, /System клиента и задачи relay как сейчас/);
+  assert.match(STARTERS[0].hint, /без system получит пустой head/);
+  assert.match(STARTERS[0].hint, /\{\{native_role\}\}/);
+  assert.doesNotMatch(STARTERS[0].hint, /без изменений/);
   assert.match(starterProfile('rules-first').head, /^Отвечай по-русски.*\n\n\{\{client_system\}\}/s);
   assert.doesNotMatch(starterProfile('exact').head, /client_system/);
   assert.deepEqual(starterProfile('nope'), starterProfile('same'));
@@ -654,6 +777,21 @@ test('a free name is the base itself, or the base with the next number', () => {
   assert.equal(uniqueName('mine', ['a']), 'mine');
   assert.equal(uniqueName('mine', ['mine']), 'mine-2');
   assert.equal(uniqueName('mine', ['mine', 'mine-2', 'mine-3']), 'mine-4');
+});
+
+test('the sample to start from is the newest request with a kept body that is not a service request', () => {
+  const entry = (request_id, extra) => ({ request_id, has_request: true, protected: false, ...extra });
+  assert.equal(newestSample([entry('title', { protected: true }), entry('work'), entry('older')]).request_id, 'work');
+  assert.equal(newestSample([entry('title', { protected: true }), entry('gone', { has_request: false }), entry('work')]).request_id, 'work');
+  assert.equal(newestSample([entry('title', { protected: true }), entry('compaction', { protected: true })]), null);
+  // a relay that says nothing about protection keeps the order it had
+  assert.equal(newestSample([{ request_id: 'x', has_request: true }]).request_id, 'x');
+  assert.equal(newestSample([]), null);
+  assert.deepEqual(normalizeRecent({ items: [{ request_id: 'a', protected: true, has_request: true }, { request_id: 'b', has_request: true }, { request_id: 'c', protected: 'yes' }] }).map((item) => item.protected),
+    [true, false, false]);
+  // a service request can still be chosen on purpose
+  const recent = [entry('title', { protected: true, ts: 1700000100 }), entry('work', { ts: 1700000000 })];
+  assert.equal(resolveSample({ ...emptySample(), requestId: 'title' }, recent).sample.request_id, 'title');
 });
 
 test('a sample is a recent request with a kept body, or a pasted body with its headers and dialect', () => {
@@ -779,4 +917,68 @@ test('the report on the edits of the client system is read edit by edit, with wh
     { number: 2, title: 'Убрать блок тега', matched: false, details: [['искали', 'available_skills']] });
   assert.deepEqual(describeReport({ index: 2, op: 'prepend', matched: null, count: 1 }, []).details, [['совпадений', '1']]);
   assert.equal(describeReport({ index: 0, op: 'brand_new', matched: true }).title, 'brand_new');
+});
+
+test('the report as the relay sends it, with the lengths before and after, says what was cut and finds the target in the edit of the profile', () => {
+  const edits = [
+    { op: 'remove_section', heading: '# Code comments' },
+    { op: 'remove_tag', tag: 'available_skills' },
+    { op: 'remove_regex', pattern: "^[ \\t]*Today's date:[^\\n]*\\n", flags: 'm' },
+    { op: 'replace_text', find: 'NOT PRESENT ANYWHERE', with: 'x' },
+    { op: 'append', text: 'Всегда отвечай по-русски.' },
+    { op: 'remove_between', start: '<!--', end: '-->' },
+    { op: 'keep_sections', headings: ['# Tone', '# Tools'] },
+  ];
+  const unmatched = [{ scope: 'client_system', index: 3, op: 'replace_text', target: 'NOT PRESENT ANYWHERE' }];
+  const row = (index, op, matched, before, after) => ({ index, op, matched, chars_before: before, chars_after: after });
+  const read = (item, specs = edits) => describeReport(item, unmatched, specs);
+
+  assert.deepEqual(read(row(0, 'remove_section', true, 11243, 10535)),
+    { number: 1, title: 'Убрать раздел', matched: true, details: [['цель', '# Code comments'], ['', `вырезано ${fmtInt(708)} символов`]] });
+  assert.deepEqual(read(row(1, 'remove_tag', true, 10535, 7570)).details, [['цель', 'available_skills'], ['', `вырезано ${fmtInt(2965)} символов`]]);
+  assert.deepEqual(read(row(2, 'remove_regex', true, 7570, 7538)).details, [['цель', "^[ \\t]*Today's date:[^\\n]*\\n"], ['', 'вырезано 32 символа']]);
+  // an edit that found nothing says what it looked for and nothing about lengths
+  assert.deepEqual(read(row(3, 'replace_text', false, 7538, 7538)),
+    { number: 4, title: 'Заменить текст', matched: false, details: [['искали', 'NOT PRESENT ANYWHERE']] });
+  // an edit that adds text names the text, and what it added is told as such
+  assert.deepEqual(read(row(4, 'append', true, 100, 126)).details, [['текст', 'Всегда отвечай по-русски.'], ['', 'добавлено 26 символов']]);
+  assert.deepEqual(read(row(5, 'remove_between', true, 50, 49)).details, [['цель', '<!-- … -->'], ['', 'вырезано 1 символ']]);
+  assert.deepEqual(read(row(6, 'keep_sections', true, 90, 60)).details, [['цель', '# Tone, # Tools'], ['', 'вырезано 30 символов']]);
+  // an edit that matched and changed nothing is said to
+  assert.deepEqual(read(row(0, 'remove_section', true, 40, 40)).details, [['цель', '# Code comments'], ['', 'текст не изменился']]);
+  // the lengths are never listed raw
+  assert.doesNotMatch(JSON.stringify(read(row(0, 'remove_section', true, 11243, 10535))), /chars_(before|after)|11243|10535/);
+
+  // without the edits of the profile the miss still has its target from the list of misses, and a hit has none to name
+  assert.deepEqual(read(row(3, 'replace_text', false, 5, 5), []).details, [['искали', 'NOT PRESENT ANYWHERE']]);
+  assert.deepEqual(read(row(0, 'remove_section', true, 11243, 10535), []).details, [['', `вырезано ${fmtInt(708)} символов`]]);
+  assert.deepEqual(describeReport(row(0, 'remove_section', true, 20, 10)).details, [['', 'вырезано 10 символов']]);
+  // the edit at that place is another one now (the form has changed since the answer): its target is not borrowed
+  assert.deepEqual(read(row(0, 'remove_tag', true, 20, 10)).details, [['', 'вырезано 10 символов']]);
+  // what the relay itself says about the target comes first
+  assert.deepEqual(read({ ...row(0, 'remove_section', true, 20, 10), target: '# Own' }).details, [['цель', '# Own'], ['', 'вырезано 10 символов']]);
+  // a relay that sends no lengths and no target leaves the line with the name of the edit and its place
+  assert.deepEqual(describeReport({ index: 4, op: 'append', matched: true }, [], []), { number: 5, title: 'Добавить в конец', matched: true, details: [] });
+  // a target the relay left empty is no target: the edit of the profile is asked
+  assert.deepEqual(describeReport({ index: 0, op: 'append', matched: true }, [{ scope: 'client_system', index: 0, op: 'append', target: '' }], [{ op: 'append', text: 'hi' }]).details, [['текст', 'hi']]);
+});
+
+test('what an edit of the client system looks for is the first thing its form names, in the order the relay uses', () => {
+  assert.equal(editTarget({ op: 'remove_section', heading: '# A' }), '# A');
+  assert.equal(editTarget({ op: 'keep_tag_inner', tag: 'env' }), 'env');
+  assert.equal(editTarget({ op: 'remove_between', start: 'a', end: 'b' }), 'a … b');
+  assert.equal(editTarget({ op: 'remove_between', start: 'a' }), 'a');
+  assert.equal(editTarget({ op: 'replace_text', find: 'old', with: 'new' }), 'old');
+  assert.equal(editTarget({ op: 'replace_regex', pattern: '^x', with: 'y' }), '^x');
+  assert.equal(editTarget({ op: 'prepend', text: 'hello' }), 'hello');
+  assert.equal(editTarget({ op: 'prepend', text: { file: 'prompts/hello.md' } }), 'файл prompts/hello.md');
+  assert.equal(editTarget({ op: 'keep_sections', headings: ['# A', '', '# B'] }), '# A, # B');
+  assert.equal(editTarget({ op: 'remove_tag' }), '');
+  assert.equal(editTarget({ op: 'future', other: 1 }), '');
+  assert.equal(editTarget(null), '');
+  assert.deepEqual(systemEditsOf({ profiles: { mine: { client_system: { edits: [{ op: 'remove_tag', tag: 'x' }] } } } }, 'mine'), [{ op: 'remove_tag', tag: 'x' }]);
+  assert.deepEqual(systemEditsOf({ profiles: { mine: { head: 'h' } } }, 'mine'), []);
+  assert.deepEqual(systemEditsOf({ profiles: { mine: { client_system: { edits: 'junk' } } } }, 'mine'), []);
+  assert.deepEqual(systemEditsOf({ profiles: {} }, 'passthrough'), []);
+  assert.deepEqual(systemEditsOf(null, 'mine'), []);
 });

@@ -34,5 +34,8 @@ export function resolveSample(state, recent = []) {
   return { sample: { kind: 'paste', request: body.body, dialect, headers: headers.headers, label: `своё тело · ${dialect}` }, error: '' };
 }
 
-/** The newest recent request whose body the relay still holds: the sample to start from. */
-export const newestSample = (recent) => recent.find((entry) => entry.has_request) || null;
+/**
+ * The newest recent request whose body the relay still holds and that is not a service request: the sample to start from.
+ * A title or a compaction goes through the protective rules unchanged, so it shows nothing of the profiles under edit.
+ */
+export const newestSample = (recent) => recent.find((entry) => entry.has_request && !entry.protected) || null;

@@ -66,9 +66,13 @@ class FakeStore:
         self.path = path
         self._errors = list(errors)
         self.constructed = []
+        self.reloads = 0
 
     def snapshot(self):
         return self.current
+
+    def maybe_reload(self):
+        self.reloads += 1
 
     def errors(self):
         return list(self._errors)

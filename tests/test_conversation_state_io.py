@@ -691,14 +691,26 @@ def test_conversation_keys_round_trip_and_name_distinct_files():
 
 def test_a_giant_conversation_key_is_not_stored_instead_of_breaking_the_header_line(tmp_path):
     history = native_history.History()
-    history.record("scope", [], [], [{"type": "text", "text": "x"}], {})
+    history.record("scope", [], [], [{"type": "text", "text": "x"}],
+                   {"role": "assistant", "content": [{"type": "text", "text": "x"}]})
     session = SimpleNamespace(backend=SimpleNamespace(cfg={"account_id": "acc-one"}), _native_history=history,
                               _cached_turn_ends=[0], _last_cache_key="k")
     assert cs.capture("header:" + "k" * 100, session) is not None
     assert cs.capture("header:" + "k" * 5000, session) is None
-    assert cs.capture("header:" + "ключ" * 400, session) is None  # escaped, it is 6 bytes a letter
+    # The limit counts the characters of the key, in whatever script: the JSON escapes of the header line are
+    # at most 12 bytes a character, far inside the 64 KiB the line may have.
+    assert cs.capture("header:" + "ключ" * 400, session) is not None
+    assert cs.capture("header:" + "🌍" * 2000, session) is not None
+    assert cs.capture("header:" + "ключ" * 600, session) is None
+    assert cs.capture(("header:" + "k" * 1500, "text" * 200), session) is None  # the parts of a scoped key add up
+    assert cs.key_chars(("ab", ("c", None))) == 3 and cs.key_chars(None) == 0
     store = cs.ConversationStore(tmp_path / "state")
     assert store.peek("header:" + "k" * 5000) is None  # asking about one is harmless
+    # The longest key that is stored really fits the header line, the way it is written.
+    key = "header:" + "🌍" * (cs.MAX_KEY_CHARS - len("header:"))
+    store.submit(cs.capture(key, session))
+    assert store.flush(5) and store.peek(key) is not None
+    assert store.load(key) is not None
     store.close()
 
 

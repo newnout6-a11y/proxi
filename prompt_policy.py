@@ -24,6 +24,20 @@ A tag block (remove_tag, keep_tag_inner) is one whose opening tag begins a line,
 prompt: a tag mentioned inside a sentence is not a block. Every pattern of every section is checked and compiled with the
 revision, and every "with" of replace_regex is checked against its pattern.
 
+Limits (review R1): text files are read only from prompts/ next to the prompts file (.md and .txt). A pattern has the syntax of
+`re` but is a pattern of the `regex` module, which runs it with the GIL released and under a time limit (REGEX_TIMEOUT per
+operation, REGEX_BUDGET per call): an edit that runs out of time is not applied (a warning of the head, `skipped: "timeout"` in
+the report of the body). The head is at most MAX_HEAD_BYTES (a document that cannot stay under it is refused, a head that
+goes over it is a 413); an edit may add at most MAX_EDIT_GROWTH characters to its text and the history edits (and, apart, the
+tool edits) of one request at most MAX_BODY_GROWTH in all (`skipped: "too_large"`).
+
+Pins (review R3-02): a conversation is held on the revision it started on (plan I3), and that holds across a restart of the
+relay when the stored conversations are on. The pins are written to <conversation_state_dir>/prompt-pins/ (pins.json: one record
+per pin under the sha256 of its (conversation key, purpose), never the key; revisions/<sha256>.json: the literal document of
+every revision a pin names, see Snapshot.literal_document and Snapshot.fingerprint). A restart reads them as dormant pins, and
+the first request of a conversation that has one is given a live pin on the revision it started on, made again from the stored
+document when the file has changed since. PromptStore.close() writes what is still waiting.
+
 Signatures and dataclass fields are a contract between work packages: change them only through the coordinator.
 """
 from __future__ import annotations
@@ -32,7 +46,9 @@ import collections
 import fnmatch
 import functools
 import hashlib
+import itertools
 import json
+import math
 import os
 import pathlib
 import re
@@ -52,10 +68,23 @@ import journal
 import models
 import structured
 
+try:
+    import regex as _regex
+except ImportError:     # the relay still starts without it: a document that has a regular expression is refused (see _compile_pattern)
+    _regex = None
+
 DEFAULT_FILE = "prompts.json"
 DOCUMENT_VERSION = 1
 MAX_TEXT_BYTES = 256 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
+# The literal document of a revision (every {"file": ...} text replaced by what was read) is what a pin keeps on disk. A file
+# that several texts name is inlined once per text, so it can be longer than the document and its files together; a literal
+# document over this size is not kept (the revision has no fingerprint, and the conversations on it are not pinned past a
+# restart).
+MAX_REVISION_BYTES = 4 * MAX_DOCUMENT_BYTES
+# A {"file": ...} text is read from this folder next to the prompts file, and only with one of these extensions.
+TEXT_DIR = "prompts"
+TEXT_SUFFIXES = (".md", ".txt")
 SNAPSHOT_HISTORY = 32
 RECENT_LIMIT = 100
 RELOAD_INTERVAL = 1.0
@@ -94,6 +123,23 @@ PROTECTED_RULES = (
 )
 
 MAX_PATTERN_CHARS = 512
+# What a compiled pattern may cost: the `regex` module writes a fixed repeat count (a{1000}) out copy by copy, so nested counts
+# multiply (a{1000}{1000} is a million of them, a{99999999} does not fit in memory). The estimate counts those copies.
+MAX_PATTERN_WEIGHT = 50_000
+# Regular expressions run in the `regex` module with a time limit (plan I11, review R1-01): Python's own `re` holds the GIL
+# while it matches, so one catastrophic pattern on untrusted text (a tool result, an AGENTS.md) would freeze every thread of
+# the relay. `regex` lets the other threads run while it matches (concurrent=True) and stops at the limit.
+REGEX_TIMEOUT = 0.25     # seconds one search or replacement may take
+REGEX_BUDGET = 1.0       # seconds all the regular expressions of one call (compose_head, rewrite) may take together
+# How large the texts that edits make may be (review R1-03). The head, in UTF-8 bytes, is what every request sends to Retool;
+# an edit may make the text it edits at most MAX_EDIT_GROWTH characters longer, and the edits of the history (and, apart from
+# them, those of the tools) of one request together at most MAX_BODY_GROWTH characters: replacing " " with a long text, or a
+# mid-conversation {{text}} wrapper, would otherwise multiply a small request by thousands.
+MAX_HEAD_BYTES = 1024 * 1024
+MAX_EDIT_GROWTH = 512 * 1024
+MAX_BODY_GROWTH = 4 * 1024 * 1024
+# A remove_regex of the client's system prompt keeps a list of the places it matched; it may match in this many.
+MAX_MATCHES = 200_000
 MAX_GLOB_CHARS = 200
 MAX_NAME_CHARS = 200
 MAX_EDITS = 200
@@ -109,6 +155,19 @@ RECENT_REQUESTS_KEPT = 10
 # far above max_conversations.
 MAX_PINS = 4096
 PIN_IDLE_SECONDS = 6 * 3600
+# Pins that survive a restart (review R3-02) are kept next to the stored conversations (cfg["conversation_state_dir"]), in this
+# folder: PINS_FILE and, in REVISIONS_DIR, one literal document for each revision a pin names. The pins file is written at most
+# once per PINS_WRITE_INTERVAL seconds, and a pin that was used again is written down as touched only when the stored touch is
+# PIN_TOUCH_INTERVAL old: a pin lives for hours, so the touch is a rough time. A new pin, a pin that moves to another revision
+# and an unpin are written at the next opportunity (an unpin at once).
+PINS_DIR = "prompt-pins"
+PINS_FILE = "pins.json"
+REVISIONS_DIR = "revisions"
+PINS_FORMAT = 1
+PINS_WRITE_INTERVAL = 1.0
+PIN_TOUCH_INTERVAL = 60.0
+MAX_PINS_BYTES = 8 * 1024 * 1024
+STALE_TEMP_SECONDS = 600.0
 # Saving replaces the file; a sharing violation is retried this many times, REPLACE_PAUSE seconds apart.
 REPLACE_ATTEMPTS = 4
 REPLACE_PAUSE = 0.05
@@ -120,20 +179,28 @@ VIRTUAL_RULE_NAME = "virtual model"
 TEXT_NAME = re.compile(r"\w[\w.-]{0,63}")
 TAG_NAME = re.compile(r"[A-Za-z_][\w.:-]{0,63}")
 _HEADING = re.compile(r"#{1,6}[ \t]+\S.*")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_HEX8 = re.compile(r"[0-9a-f]{8}")
 _BOOL_CONDITIONS = ("tools", "structured", "has_client_system")
 
 
 class PromptConfigError(ValueError):
-    """An invalid prompts document; `path` names the offending field, e.g. profiles.mine.head."""
+    """An invalid prompts document; `path` names the offending field, e.g. profiles.mine.head.
 
-    def __init__(self, path: str, message: str):
+    `message` is the full text for the author of the document (the admin shows it); `brief` says the same without quoting
+    anything the document says (a placeholder, a pattern, a name), and is what the journal gets (plan I7: no prompt text in
+    journal.jsonl). It is the message itself unless the message quotes the document.
+    """
+
+    def __init__(self, path: str, message: str, brief: str | None = None):
         super().__init__(f"{path}: {message}" if path else message)
         self.path = path
         self.message = message
+        self.brief = message if brief is None else brief
 
 
-def _err(path, message):
-    raise PromptConfigError(path, message)
+def _err(path, message, brief=None):
+    raise PromptConfigError(path, message, brief)
 
 
 def _path(parent, key):
@@ -335,13 +402,15 @@ def _parse_template(source, path, *, variables, texts=None):
             if texts is None:
                 _err(path, "{{text:...}} is not available here (%s)" % where)
             if reference not in texts:
-                _err(path, "unknown text %r in {{%s}} %s (define it under texts)" % (_clip(reference), _clip(name), where))
+                _err(path, "unknown text %r in {{%s}} %s (define it under texts)" % (_clip(reference), _clip(name), where),
+                     "unknown text in a {{text:...}} placeholder %s" % where)
             tokens.append(("text", reference))
         elif name in variables:
             tokens.append(("var", name))
         else:
             known = ", ".join(variables) if variables else "none"
-            _err(path, "unknown variable {{%s}} %s (known here: %s)" % (_clip(name), where, known))
+            _err(path, "unknown variable {{%s}} %s (known here: %s)" % (_clip(name), where, known),
+                 "unknown variable in a placeholder %s" % where)
     literal(source[last:], last)
     return _Template(tokens)
 
@@ -738,31 +807,258 @@ def _normalize_flags(flags, path):
     return "".join(char for char in REGEX_FLAGS if char in flags)
 
 
+def _brief_regex_error(exc, what="invalid regular expression"):
+    """`what`, with the position the engine reports: the message of the engine can quote a group name or an escape."""
+    position = getattr(exc, "pos", None)
+    return "%s at position %d" % (what, position) if isinstance(position, int) else what
+
+
+def _unrolled(node):
+    """How many pieces the `regex` module writes out for a parsed pattern: a fixed repeat count is spelled out copy by copy."""
+    total = 0
+    for op, av in _items(node):
+        if op in _REPEATS or op == _sre_const.POSSESSIVE_REPEAT:
+            low, _high, body = av
+            total += (max(low, 1) + 1) * _unrolled(body)
+        elif op == _sre_const.SUBPATTERN:
+            total += _unrolled(av[3])
+        elif op == _sre_const.BRANCH:
+            total += 1 + sum(_unrolled(alternative) for alternative in av[1])
+        elif op == _sre_const.ATOMIC_GROUP:
+            total += _unrolled(av)
+        elif op in (_sre_const.ASSERT, _sre_const.ASSERT_NOT):
+            total += _unrolled(av[1])
+        elif op == _sre_const.GROUPREF_EXISTS:
+            total += 1 + _unrolled(av[1]) + (_unrolled(av[2]) if av[2] else 0)
+        else:
+            total += 1
+    return total
+
+
+_REPEAT_COUNT = re.compile(r"\{(?:\d+(?:,\d*)?|,\d*)\}")
+
+
+def _fuzzy_lookalike(pattern):
+    """True when a `{` that `re` takes for a literal brace starts a fuzzy-match constraint in the `regex` module.
+
+    a{e<=1} matches only the text "a{e<=1}" in `re`, and "a" with one error in `regex`. A pattern written for `re` keeps
+    its meaning only if such a brace is escaped, so the pattern is refused. Braces inside a character set are literal in both.
+    """
+    index, size, in_set = 0, len(pattern), False
+    while index < size:
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if in_set:
+            in_set = char != "]"
+        elif char == "[":
+            in_set = True
+            index += 1 + (index + 1 < size and pattern[index + 1] == "^")
+            if index < size and pattern[index] == "]":      # a ] first in a set is a literal one
+                index += 1
+            continue
+        elif char == "{":
+            counted = _REPEAT_COUNT.match(pattern, index)
+            if counted:
+                index = counted.end()
+                continue
+            if index + 1 < size and (pattern[index + 1] in "deis" or pattern[index + 1].isdecimal()):
+                return True
+        index += 1
+    return False
+
+
+def _re_bits(flags):
+    bits = 0
+    for char, bit in (("i", re.IGNORECASE), ("m", re.MULTILINE), ("s", re.DOTALL)):
+        if char in flags:
+            bits |= bit
+    return bits
+
+
+def _regex_bits(flags):
+    bits = _regex.VERSION0
+    for char, bit in (("i", _regex.IGNORECASE), ("m", _regex.MULTILINE), ("s", _regex.DOTALL)):
+        if char in flags:
+            bits |= bit
+    return bits
+
+
 def _compile_pattern(pattern, flags, path):
-    """The compiled pattern, or PromptConfigError: bounded length, valid, and free of catastrophic backtracking."""
+    """The compiled pattern, or PromptConfigError: bounded length, valid, and free of catastrophic backtracking.
+
+    The syntax is the one of `re`: `re` parses the pattern first (what it refuses is refused, and so is what it warns about,
+    as a set that is a future syntax), the analysis below looks for what makes a backtracking engine blow up, and then the
+    `regex` module compiles it: every pattern runs there, under a time limit (see Deadline). The analysis is the first
+    line, a pattern it cannot judge (or judges wrongly) is stopped by the limit.
+    """
+    if _regex is None:
+        _err(path, "regular expressions need the 'regex' package, which is not installed (pip install regex)")
     if not isinstance(pattern, str) or not pattern:
         _err(path, "must be a non-empty string")
     if len(pattern) > MAX_PATTERN_CHARS:
         _err(path, "the pattern is longer than %d characters" % MAX_PATTERN_CHARS)
     flags = _normalize_flags(flags, path)
-    bits = 0
-    for char, bit in (("i", re.IGNORECASE), ("m", re.MULTILINE), ("s", re.DOTALL)):
-        if char in flags:
-            bits |= bit
     try:
         with _WARN_LOCK, _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
-            compiled = re.compile(pattern, bits)
-            tree = _sre_parse.parse(pattern, bits)
+            re.compile(pattern, _re_bits(flags))
+            tree = _sre_parse.parse(pattern, _re_bits(flags))
     except (re.error, RecursionError, OverflowError, ValueError) as exc:
-        _err(path, "invalid regular expression: %s" % exc)
-    if caught:
-        _err(path, "suspicious regular expression: %s" % caught[0].message)
+        _err(path, "invalid regular expression: %s" % exc, _brief_regex_error(exc))
+    # Only the warnings of the parser count: another thread's warning must not condemn the pattern.
+    suspicious = [item for item in caught if issubclass(item.category, FutureWarning)
+                  and str(item.message).startswith("Possible ")]
+    if suspicious:
+        _err(path, "suspicious regular expression: %s" % suspicious[0].message)
     problem = _regex_hazard(tree)
     if problem:
         _err(path, "the pattern can backtrack catastrophically (%s); use a possessive quantifier, an atomic group or "
                    "a simpler pattern" % problem)
-    return compiled
+    try:
+        weight = _unrolled(tree)
+    except RecursionError:
+        weight = MAX_PATTERN_WEIGHT + 1
+    if weight > MAX_PATTERN_WEIGHT:
+        _err(path, "the pattern repeats too much: nested repeat counts make it about %d pieces long (up to %d are "
+                   "allowed)" % (min(weight, 10 ** 12), MAX_PATTERN_WEIGHT))
+    if _fuzzy_lookalike(pattern):
+        _err(path, "a '{' that is not a repeat count (a{2,3}) starts a fuzzy-match constraint in the regex engine: "
+                   "write \\{ for a literal brace")
+    try:
+        return _regex.compile(pattern, _regex_bits(flags))
+    except (_regex.error, RecursionError, OverflowError, ValueError, MemoryError) as exc:
+        _err(path, "invalid regular expression: %s" % exc, _brief_regex_error(exc))
+
+
+def compile_pattern(pattern, flags=""):
+    """A pattern checked and compiled by the rules of a prompts document: PromptConfigError when it breaks one of them."""
+    return _compile_pattern(pattern, _normalize_flags(flags, "flags"), "pattern")
+
+
+def _check_template(pattern, flags, template, path):
+    """A replacement template that `re.sub` takes for this pattern, or PromptConfigError.
+
+    The `regex` module looks at a template only when something matches, so the stdlib parser judges it here; a template it
+    takes, the `regex` module expands the same way.
+    """
+    try:
+        re.compile(pattern, _re_bits(flags)).sub(template, "")
+    except (re.error, IndexError) as exc:
+        _err(path, "invalid replacement: %s" % exc, _brief_regex_error(exc, "invalid replacement"))
+
+
+# -- running a compiled pattern: a time limit and a limit on the size of the result ---------------------------------------
+
+
+class EditRefused(Exception):
+    """An edit that was not applied on this request; `reason` is what the journal and the preview call it."""
+    reason = "refused"
+
+
+class RegexTimeout(EditRefused):
+    """A pattern did not finish in its share of the time (REGEX_TIMEOUT for one operation, REGEX_BUDGET for a call)."""
+    reason = "timeout"
+
+
+class EditTooLarge(EditRefused):
+    """An edit would make its text longer than the limits allow."""
+    reason = "too_large"
+
+
+# What a refusal is called in the warnings of a head (the journal and the reports carry the reason itself).
+_REFUSALS = {"timeout": "it ran out of time (a pattern that takes too long on this text)",
+             "too_large": "its result would be too large"}
+
+
+_MIN_SLICE = 0.001
+
+# What compiling or expanding a pattern raises: `re` and `regex` have their own error classes (neither is a ValueError).
+REGEX_ERRORS = (re.error,) + ((_regex.error,) if _regex is not None else ())
+
+
+class Deadline:
+    """The regular-expression time of one call (compose_head, prompt_body.rewrite): REGEX_BUDGET seconds in all.
+
+    One operation may take REGEX_TIMEOUT at most (less when the budget is nearly gone). Without a budget, 200 edits that each
+    time out would cost 200 timeouts; with it, the first few do and the rest are refused at once.
+    """
+    __slots__ = ("per_operation", "left")
+
+    def __init__(self, budget=None, per_operation=None):
+        self.left = REGEX_BUDGET if budget is None else budget
+        self.per_operation = REGEX_TIMEOUT if per_operation is None else per_operation
+
+    def run(self, call):
+        """call(timeout) with the time that is left; RegexTimeout when none is, or when the call used all of it."""
+        if self.left < _MIN_SLICE:
+            raise RegexTimeout("the time for regular expressions is spent")
+        started = time.perf_counter()
+        try:
+            return call(min(self.per_operation, self.left))
+        except TimeoutError:
+            raise RegexTimeout("a regular expression ran out of time") from None
+        finally:
+            self.left -= time.perf_counter() - started
+
+
+def _limits(compiled, timeout):
+    """The keywords that make a `regex` pattern release the GIL while it matches and stop at the time limit."""
+    if _regex is not None and isinstance(compiled, _regex.Pattern):
+        return {"concurrent": True, "timeout": timeout}
+    return {}
+
+
+def regex_search(compiled, text, deadline=None):
+    """The first match of the compiled pattern in text, or None; RegexTimeout when the time is up."""
+    return (deadline or Deadline()).run(lambda timeout: compiled.search(text, **_limits(compiled, timeout)))
+
+
+def regex_spans(compiled, text, deadline=None):
+    """[(start, end)] of the matches of the compiled pattern that are not empty; RegexTimeout when the time is up.
+
+    At most MAX_MATCHES of them: a pattern that matches in hundreds of thousands of places would otherwise build a list as
+    big as the text before anything is cut (EditTooLarge).
+    """
+    def spans(timeout):
+        found = []
+        for match in compiled.finditer(text, **_limits(compiled, timeout)):
+            if match.end() > match.start():
+                found.append((match.start(), match.end()))
+                if len(found) > MAX_MATCHES:
+                    raise EditTooLarge("the pattern matches in more than %d places" % MAX_MATCHES)
+        return found
+    return (deadline or Deadline()).run(spans)
+
+
+def regex_remove(compiled, text, deadline=None):
+    """(text without the matches, how many there were); RegexTimeout when the time is up."""
+    return (deadline or Deadline()).run(lambda timeout: compiled.subn("", text, **_limits(compiled, timeout)))
+
+
+def regex_replace(compiled, template, text, deadline=None, room=None):
+    """(new text, matches replaced, characters taken out, characters put in): every match is replaced by the expansion of
+    template, a re.sub template.
+
+    The result may be at most `room` characters longer than text (MAX_EDIT_GROWTH by default), or EditTooLarge is raised.
+    The replacement is made by a function that keeps the count, so a pattern that matches everywhere cannot build a result
+    of any size before the check; the time is limited as in regex_search.
+    """
+    room = MAX_EDIT_GROWTH if room is None else room
+    removed = added = 0
+
+    def swap(match):
+        nonlocal removed, added
+        value = match.expand(template)
+        removed += match.end() - match.start()
+        added += len(value)
+        if added - removed > room:
+            raise EditTooLarge("the replacement would make the text more than %d characters longer" % room)
+        return value
+
+    new, count = (deadline or Deadline()).run(lambda timeout: compiled.subn(swap, text, **_limits(compiled, timeout)))
+    return new, count, removed, added
 
 
 # -- edits of the client's system prompt ----------------------------------------------------------------------------------
@@ -853,32 +1149,38 @@ def _markdown_headings(text):
     return found
 
 
-def _section_end(headings, position, level, size):
-    for other_level, start, _line in headings[position + 1:]:
-        if other_level <= level:
-            return start
-    return size
+def _section_ends(headings, size):
+    """[offset where the section of each heading ends]: at the next heading of the same or a higher level, else at `size`.
+
+    One pass over the headings with a stack of the sections still open, so that a document with many headings costs time
+    linear in them (a search forward from every heading, over a copy of the rest of the list, cost time squared).
+    """
+    ends = [size] * len(headings)
+    open_sections = []
+    for index, (level, start, _line) in enumerate(headings):
+        while open_sections and headings[open_sections[-1]][0] >= level:
+            ends[open_sections.pop()] = start
+        open_sections.append(index)
+    return ends
 
 
-def _op_remove_section(text, edit, snapshot):
+def _op_remove_section(text, edit, run):
     heading = edit["heading"].strip()
-    level = len(heading) - len(heading.lstrip("#"))
     headings = _markdown_headings(text)
+    ends = _section_ends(headings, len(text))
     spans = []
     for position, (_level, start, line) in enumerate(headings):
         if line != heading or (spans and start < spans[-1][1]):
             continue
-        spans.append((start, _section_end(headings, position, level, len(text))))
+        spans.append((start, ends[position]))
     return (_delete_spans(text, spans), True) if spans else (text, False)
 
 
-def _op_keep_sections(text, edit, snapshot):
+def _op_keep_sections(text, edit, run):
     wanted = {heading.strip() for heading in edit["headings"]}
     headings = _markdown_headings(text)
-    kept = []
-    for position, (level, start, line) in enumerate(headings):
-        if line in wanted:
-            kept.append((start, _section_end(headings, position, level, len(text))))
+    ends = _section_ends(headings, len(text))
+    kept = [(start, ends[position]) for position, (_level, start, line) in enumerate(headings) if line in wanted]
     if not kept:
         return text, False
     kept.append((0, headings[0][1]))
@@ -892,68 +1194,78 @@ def _op_keep_sections(text, edit, snapshot):
     return _delete_spans(text, spans), True
 
 
+# The attributes of a tag: no `<` or `>` among them and at most this many characters. Without a bound, every opening tag with
+# no `>` after it makes the engine read to the end of the text.
+_TAG_ATTRIBUTES = 512
+
+
 @functools.lru_cache(maxsize=512)
 def _tag_pattern(tag):
-    return re.compile(r"<(/?)%s(?=[\s/>])[^>]*>" % re.escape(tag))
-
-
-def _starts_a_line(text, position):
-    """True when only spaces and tabs stand between the start of the line and `position`."""
-    return not text[text.rfind("\n", 0, position) + 1:position].strip(" \t")
-
-
-def _with_indent(text, position):
-    """`position`, moved back to the start of its line when only indentation stands before it (so it goes with a tag)."""
-    return text.rfind("\n", 0, position) + 1 if _starts_a_line(text, position) else position
+    return re.compile(r"<(/?)%s(?=[\s/>])[^<>]{0,%d}>" % (re.escape(tag), _TAG_ATTRIBUTES))
 
 
 def _tag_elements(text, tag):
-    """[(open start, open end, close start, close end)] of the complete <tag>…</tag> blocks, nested ones included.
+    """[(open start, open anchor, open end, close start, close anchor, close end)] of the complete <tag>…</tag> blocks, nested
+    ones included, sorted as they are found.
 
     A block is a block only when its opening tag begins a line (after indentation), the way <env> and
     <available_skills> stand in a prompt; the closing tag may stand anywhere. A tag that is merely mentioned in a sentence
     or in the middle of a line is left alone, and so is what lies between its tags. Opening tags that are not at the
     start of a line still count for the nesting of blocks of the same name.
+
+    An anchor is the start of the line of a tag when only indentation stands before the tag on it (the indentation goes with
+    the tag when it is cut), else None. The scan is linear: the start of the line is tracked from one tag to the next, and the
+    indentation is read backwards only as far as blanks go.
     """
     elements, stack = [], []
+    line, seen = 0, 0
     for match in _tag_pattern(tag).finditer(text):
+        begin = match.start()
+        newline = text.rfind("\n", seen, begin)
+        if newline >= 0:
+            line = newline + 1
+        seen = begin
+        indent = begin
+        while indent > line and text[indent - 1] in " \t":
+            indent -= 1
+        anchor = line if indent == line else None
         if match.group(1):
             if stack:
-                opened, block = stack.pop()
-                if block:
-                    elements.append((opened.start(), opened.end(), match.start(), match.end()))
+                opened, opened_anchor = stack.pop()
+                if opened_anchor is not None:
+                    elements.append((opened.start(), opened_anchor, opened.end(), begin, anchor, match.end()))
         elif match.group(0).endswith("/>"):
-            if _starts_a_line(text, match.start()):
-                elements.append((match.start(), match.end(), match.end(), match.end()))
+            if anchor is not None:
+                elements.append((begin, anchor, match.end(), match.end(), None, match.end()))
         else:
-            stack.append((match, _starts_a_line(text, match.start())))
+            stack.append((match, anchor))
     return elements
 
 
-def _op_remove_tag(text, edit, snapshot):
+def _op_remove_tag(text, edit, run):
     elements = _tag_elements(text, edit["tag"])
     if not elements:
         return text, False
     spans = []
-    for start, _open_end, _close_start, end in sorted(elements):
+    for start, anchor, _open_end, _close_start, _close_anchor, end in sorted(elements):
         if not spans or start >= spans[-1][1]:
-            spans.append((_with_indent(text, start), end))
+            spans.append((anchor, end))
     return _delete_spans(text, spans), True
 
 
-def _op_keep_tag_inner(text, edit, snapshot):
+def _op_keep_tag_inner(text, edit, run):
     elements = _tag_elements(text, edit["tag"])
     if not elements:
         return text, False
     spans = []
-    for start, open_end, close_start, end in elements:
-        spans.append((_with_indent(text, start), open_end))
+    for _start, anchor, open_end, close_start, close_anchor, end in elements:
+        spans.append((anchor, open_end))
         if close_start < end:
-            spans.append((_with_indent(text, close_start), end))
+            spans.append((close_start if close_anchor is None else close_anchor, end))
     return _delete_spans(text, _merge_spans(spans)), True
 
 
-def _op_remove_between(text, edit, snapshot):
+def _op_remove_between(text, edit, run):
     start_marker, end_marker, inclusive = edit["start"], edit["end"], edit["inclusive"]
     spans, position, matched = [], 0, False
     while True:
@@ -971,30 +1283,45 @@ def _op_remove_between(text, edit, snapshot):
     return (_delete_spans(text, spans), True) if matched else (text, False)
 
 
-def _regex_spans(compiled, text):
-    return [(match.start(), match.end()) for match in compiled.finditer(text) if match.end() > match.start()]
+class _Run:
+    """What the edits of the client's system prompt run with: the snapshot (its compiled patterns), the regex time left and
+    how long the text may get."""
+    __slots__ = ("snapshot", "deadline", "ceiling")
+
+    def __init__(self, snapshot, deadline, original=""):
+        self.snapshot, self.deadline = snapshot, deadline
+        # No edit makes the text longer than a head may be, or than it was to begin with.
+        self.ceiling = max(len(original), MAX_HEAD_BYTES)
+
+    def room(self, text):
+        """How many characters one edit may add to `text`."""
+        return max(0, min(MAX_EDIT_GROWTH, self.ceiling - len(text)))
 
 
-def _op_remove_regex(text, edit, snapshot):
-    compiled = snapshot.regex(edit["pattern"], edit["flags"])
-    spans = _regex_spans(compiled, text)
+def _op_remove_regex(text, edit, run):
+    compiled = run.snapshot.regex(edit["pattern"], edit["flags"])
+    spans = regex_spans(compiled, text, run.deadline)
     if spans:
         return _delete_spans(text, spans), True
-    return text, compiled.search(text) is not None
+    return text, regex_search(compiled, text, run.deadline) is not None
 
 
-def _op_replace_regex(text, edit, snapshot):
+def _op_replace_regex(text, edit, run):
     if edit["with"] == "":
-        return _op_remove_regex(text, edit, snapshot)
-    result, count = snapshot.regex(edit["pattern"], edit["flags"]).subn(edit["with"], text)
+        return _op_remove_regex(text, edit, run)
+    result, count, _removed, _added = regex_replace(run.snapshot.regex(edit["pattern"], edit["flags"]), edit["with"], text,
+                                                    run.deadline, run.room(text))
     return result, count > 0
 
 
-def _op_replace_text(text, edit, snapshot):
+def _op_replace_text(text, edit, run):
     find, replacement = edit["find"], edit["with"]
     if find not in text:
         return text, False
     if replacement:
+        count = text.count(find) if edit["all"] else 1
+        if count * (len(replacement) - len(find)) > run.room(text):
+            raise EditTooLarge("the replacement would make the text more than %d characters longer" % run.room(text))
         return text.replace(find, replacement, -1 if edit["all"] else 1), True
     spans, position = [], 0
     while True:
@@ -1008,11 +1335,15 @@ def _op_replace_text(text, edit, snapshot):
     return _delete_spans(text, spans), True
 
 
-def _op_prepend(text, edit, snapshot):
+def _op_prepend(text, edit, run):
+    if len(edit["text"]) + 2 > run.room(text):
+        raise EditTooLarge("the text would make the system prompt more than %d characters longer" % run.room(text))
     return _join_blank(edit["text"], text), True
 
 
-def _op_append(text, edit, snapshot):
+def _op_append(text, edit, run):
+    if len(edit["text"]) + 2 > run.room(text):
+        raise EditTooLarge("the text would make the system prompt more than %d characters longer" % run.room(text))
     return _join_blank(text, edit["text"]), True
 
 
@@ -1023,19 +1354,66 @@ _SYSTEM_EDITORS = {
     "append": _op_append}
 
 
-def _apply_system_edits(text, edits, snapshot):
-    """(new text, [{"index", "op", "matched", "chars_before", "chars_after"}]): the edits run in order."""
+def _apply_system_edits(text, edits, snapshot, deadline=None):
+    """(new text, [{"index", "op", "matched", "chars_before", "chars_after"[, "skipped"]}]): the edits run in order.
+
+    An edit that cannot run on this text (a pattern out of time, see Deadline) leaves the text as it was, is not matched and
+    says why in "skipped".
+    """
     report = []
+    run = _Run(snapshot, deadline or Deadline(), text)
     for index, edit in enumerate(edits):
         before = len(text)
-        text, matched = _SYSTEM_EDITORS[edit["op"]](text, edit, snapshot)
-        report.append({"index": index, "op": edit["op"], "matched": matched, "chars_before": before,
-                       "chars_after": len(text)})
+        skipped = None
+        try:
+            text, matched = _SYSTEM_EDITORS[edit["op"]](text, edit, run)
+        except EditRefused as refused:
+            matched, skipped = False, refused.reason
+        entry = {"index": index, "op": edit["op"], "matched": matched, "chars_before": before, "chars_after": len(text)}
+        if skipped:
+            entry["skipped"] = skipped
+        report.append(entry)
     return text, report
 
 
+# What the edits of a system prompt gave. OpenCode sends the same system prompt on every turn of a conversation, so the second
+# turn costs a hash instead of the edits. One answer per (snapshot, profile, sha256 of the text), in a least-recently-used list
+# bounded by count and by characters; a snapshot is immutable, so an answer never goes stale.
+_MEMO = collections.OrderedDict()
+_MEMO_LOCK = threading.Lock()
+_MEMO_ENTRIES = 32
+_MEMO_CHARS = 4 * 1024 * 1024
+_MEMO_HELD = [0]
+_TOKENS = itertools.count(1)
+
+
+def _edited_system(snapshot, name, system, edits):
+    """(edited text, report) of the edits of profile `name` over `system`; the answer for a text seen before is remembered.
+
+    A refused edit (a pattern out of time) is remembered like any other result: the next turn gets the same head and does not
+    wait for the same pattern again.
+    """
+    key = (getattr(snapshot, "_token", id(snapshot)), name, hashlib.sha256(system.encode("utf-8", "surrogatepass")).digest())
+    with _MEMO_LOCK:
+        found = _MEMO.get(key)
+        if found is not None:
+            _MEMO.move_to_end(key)
+    if found is not None:
+        return found[0], [dict(entry) for entry in found[1]]
+    edited, report = _apply_system_edits(system, edits, snapshot)
+    if len(edited) <= _MEMO_CHARS:
+        with _MEMO_LOCK:
+            if key not in _MEMO:
+                _MEMO[key] = (edited, tuple(dict(entry) for entry in report))
+                _MEMO_HELD[0] += len(edited)
+            while _MEMO and (len(_MEMO) > _MEMO_ENTRIES or _MEMO_HELD[0] > _MEMO_CHARS):
+                _key, (dropped, _report) = _MEMO.popitem(last=False)
+                _MEMO_HELD[0] -= len(dropped)
+    return edited, report
+
+
 def _edit_target(edit):
-    """What an edit looks for, short enough for a warning."""
+    """What an edit looks for, short enough for the preview report (edits_unmatched); the journal never gets it."""
     for key in ("heading", "tag", "start", "find", "pattern", "text"):
         if key in edit:
             return _clip(edit[key], 60)
@@ -1150,7 +1528,11 @@ class _Profile:
 
 
 class _Data:
-    """What compiling a document produced: the tables behind a Snapshot."""
+    """What compiling a document produced: the tables behind a Snapshot.
+
+    `literal` is the document with every {"file": ...} text replaced by the text that was read (None when the document names
+    no file: it is its own literal document)."""
+    literal = None
 
 
 def _copy(value):
@@ -1159,6 +1541,42 @@ def _copy(value):
     if isinstance(value, list):
         return [_copy(item) for item in value]
     return value
+
+
+def _inlined(value, found):
+    """A copy of the document in which each dict that `found` names (by id) is replaced by the text that was read for it.
+
+    The text objects are shared, not copied: a file named many times costs one string in memory (its size shows up only when
+    the literal document is written out, see Snapshot._canonical)."""
+    if isinstance(value, dict):
+        if id(value) in found:
+            return found[id(value)]
+        return {key: _inlined(item, found) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_inlined(item, found) for item in value]
+    return value
+
+
+_UNSET = object()
+
+
+def _weight(value) -> int:
+    """A cheap lower bound of the length of the JSON of `value`, in characters; it stops counting past MAX_REVISION_BYTES."""
+    total, todo = 0, [value]
+    while todo and total <= MAX_REVISION_BYTES:
+        item = todo.pop()
+        if isinstance(item, str):
+            total += len(item) + 2
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                total += len(key) + 4
+                todo.append(child)
+        elif isinstance(item, list):
+            total += len(item) + 2
+            todo.extend(item)
+        else:
+            total += 1
+    return total
 
 
 def _nbytes(text):
@@ -1172,6 +1590,37 @@ def _object(value, path, what="an object"):
         if not isinstance(key, str):
             _err(path, "keys must be strings")
     return value
+
+
+def _no_half_pairs(document):
+    """Refuse a string that holds half of a surrogate pair ("\\ud83d"): JSON can carry it, no UTF-8 text can.
+
+    Such a text was accepted once and then failed every request that used it, while the head was encoded (a 500), and
+    /codex/models too. The walk is iterative, so a hostile nesting cannot exhaust the stack; the error names the field,
+    and for a key its parent, so the offending text is never echoed.
+    """
+    todo = [(document, "")]
+    while todo:
+        value, path = todo.pop()
+        if isinstance(value, str):
+            _utf8(value, path)
+        elif isinstance(value, dict):
+            children = []
+            for key, item in value.items():
+                if isinstance(key, str):
+                    _utf8(key, path)
+                    children.append((item, _path(path, key)))
+            todo.extend(reversed(children))
+        elif isinstance(value, list):
+            todo.extend(reversed([(item, "%s[%d]" % (path, index)) for index, item in enumerate(value)]))
+
+
+def _utf8(text, path):
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        _err(path, "contains an unpaired surrogate (half of a Unicode pair, such as \\ud83d), which cannot be sent as "
+                   "UTF-8 text")
 
 
 def _only_keys(value, path, allowed):
@@ -1189,9 +1638,13 @@ def _check_glob(value, path):
 
 
 class _Compiler:
-    """Validates one document and builds its tables; `files` lists every text file it looked at (also on a failure)."""
+    """Validates one document and builds its tables; `files` lists every text file it looked at (also on a failure).
 
-    def __init__(self, document, base_dir):
+    A `literal` compile is the one of a stored revision (see Snapshot.literal_document): its texts are all strings, a
+    {"file": ...} is refused (the file on disk is not what the revision was made of), and the size limit is the larger one of
+    a literal document."""
+
+    def __init__(self, document, base_dir, *, literal=False):
         self.document = document
         self.base = pathlib.Path(base_dir)
         self.files = []
@@ -1200,37 +1653,52 @@ class _Compiler:
         self.texts = {}
         self.patterns = {}
         self.warnings = []
+        self.literal = literal
+        self.limit = MAX_REVISION_BYTES if literal else MAX_DOCUMENT_BYTES
         self._files = {}
+        self._inlined = {}
         self.data = _Data()
 
     # -- sizes and files
     def _grow(self, count, path):
         self.total += count
-        if self.total > MAX_DOCUMENT_BYTES:
+        if self.total > self.limit:
             _err(path, "the document and its text files together are larger than %d MiB"
-                 % (MAX_DOCUMENT_BYTES // (1024 * 1024)))
+                 % (self.limit // (1024 * 1024)))
 
     def _size(self, text, path):
         if _nbytes(text) > MAX_TEXT_BYTES:
             _err(path, "a text is limited to %d KiB" % (MAX_TEXT_BYTES // 1024))
 
     def _locate(self, name, path):
+        """The resolved path of a text file: a regular .md or .txt file inside prompts/ next to the prompts file.
+
+        The folder is not the one of the prompts file itself, which also holds config.json (the cookies and the relay key)
+        and the journal: a document must not be able to read them into a head. Links are followed before the check, so a
+        link inside prompts/ that leads out (a symlink, a junction) is refused too.
+        """
         if not isinstance(name, str) or not name.strip():
             _err(path, "must be a non-empty relative path")
         windows = pathlib.PureWindowsPath(name)
         if ("\x00" in name or os.path.isabs(name) or windows.is_absolute() or windows.drive
                 or name.startswith(("/", "\\"))):
-            _err(path, "must be a relative path inside the folder of the prompts file")
+            _err(path, "must be a relative path inside the %s/ folder next to the prompts file" % TEXT_DIR)
         if ".." in re.split(r"[\\/]+", name):
             _err(path, "must not contain '..'")
+        if ":" in name:
+            _err(path, "must not contain ':' (a drive, a stream or a device)")
         try:
             base = self.base.resolve()
+            allowed = base / TEXT_DIR
             target = (base / name).resolve()
-            target.relative_to(base)
+            target.relative_to(allowed)
         except ValueError:
-            _err(path, "must stay inside the folder of the prompts file (links that lead out are refused too)")
+            _err(path, "must be a file inside the %s/ folder next to the prompts file (links that lead out of it are "
+                       "refused too)" % TEXT_DIR)
         except OSError as exc:
             _err(path, "cannot resolve the path: %s" % (exc.strerror or exc))
+        if target.suffix.lower() not in TEXT_SUFFIXES or pathlib.PurePath(name).suffix.lower() not in TEXT_SUFFIXES:
+            _err(path, "must name a %s file" % " or ".join(TEXT_SUFFIXES))
         return target
 
     def _file(self, name, path):
@@ -1243,7 +1711,7 @@ class _Compiler:
         except OSError as exc:
             if isinstance(exc, FileNotFoundError):
                 self.files.append((key, None, None))
-                _err(path, "file not found: %s" % _clip(name))
+                _err(path, "file not found: %s" % _clip(name), "file not found")
             self._unreadable(key, path, exc)
         self.files.append((key, info.st_mtime_ns, info.st_size))
         if not stat.S_ISREG(info.st_mode):
@@ -1285,7 +1753,11 @@ class _Compiler:
             self._size(value, path)
             return value
         if isinstance(value, dict) and set(value) == {"file"}:
-            return self._file(value["file"], _path(path, "file"))
+            if self.literal:
+                _err(path, "a stored revision names no file: its texts are in the document itself")
+            text = self._file(value["file"], _path(path, "file"))
+            self._inlined[id(value)] = text
+            return text
         _err(path, 'must be a string or {"file": "prompts/<name>.md"}')
 
     def _expand(self, source, path, *, regex_replacement=False):
@@ -1316,6 +1788,7 @@ class _Compiler:
     # -- the document
     def compile(self):
         document = _object(self.document, "", "a JSON object")
+        _no_half_pairs(document)
         try:
             raw = json.dumps(document, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         except (TypeError, ValueError, RecursionError) as exc:
@@ -1338,6 +1811,8 @@ class _Compiler:
         data.files = tuple(self.files)
         data.warnings = tuple(dict.fromkeys(self.warnings))
         data.size = self.total
+        if self._inlined:
+            data.literal = _inlined(self.document, self._inlined)
         return data
 
     def _compile_texts(self):
@@ -1435,6 +1910,32 @@ class _Compiler:
         if not repeats:
             _err(path, "the built-in profile %r cannot be redefined (an entry may only repeat it)" % name)
 
+    def _check_head_size(self, template, path):
+        """Refuse a head that cannot stay under MAX_HEAD_BYTES even without the client's system prompt.
+
+        What the document itself fixes is counted: the literals of the template, every {{text:...}} (a text used a thousand
+        times is a thousand copies) and the user's texts behind {{role}}, {{relay_task}}, {{native_role}} and {{structured}}.
+        What the client or the relay brings at run time is not known here; compose_head measures the whole head.
+        """
+        relay = {"role": "role", "relay_task": "role", "native_role": "native_role", "structured": "structured"}
+        sizes, total = {}, 0
+        for kind, value in template.tokens:
+            if kind == "lit":
+                total += _nbytes(value)
+            elif kind == "text":
+                if (kind, value) not in sizes:
+                    sizes[kind, value] = _nbytes(self.texts[value])
+                total += sizes[kind, value]
+            elif value in relay:
+                text = self.data.relay.get(relay[value])
+                if text:
+                    if (kind, value) not in sizes:
+                        sizes[kind, value] = _nbytes(text)
+                    total += sizes[kind, value]
+            if total > MAX_HEAD_BYTES:
+                _err(path, "the head can be longer than %d KiB without the client's system prompt: its literals and texts "
+                           "alone are over that (each use of a text counts again)" % (MAX_HEAD_BYTES // 1024))
+
     def _profile(self, name, raw, path):
         _object(raw, path)
         _only_keys(raw, path, _PROFILE_KEYS)
@@ -1444,6 +1945,7 @@ class _Compiler:
         head_path = _path(path, "head")
         head = self._text(raw["head"], head_path) if raw.get("head") is not None else "{{client_system}}"
         template = _parse_template(head, head_path, variables=VARIABLES, texts=self.texts)
+        self._check_head_size(template, head_path)
         system_edits = self._edit_list(raw.get("client_system"), _path(path, "client_system"), "edits",
                                        SYSTEM_EDIT_OPS, _SYSTEM_SPECS)
         history = raw.get("history")
@@ -1536,12 +2038,9 @@ class _Compiler:
             else:
                 out[key] = self._param(raw[key], kind, key_path, out)
         if "pattern" in out and out["pattern"] is not None:
-            compiled = self._pattern(out["pattern"], out["flags"], _path(path, "pattern"))
+            self._pattern(out["pattern"], out["flags"], _path(path, "pattern"))
             if _has_regex_with(spec):
-                try:
-                    compiled.sub(out["with"], "")
-                except (re.error, IndexError) as exc:
-                    _err(_path(path, "with"), "invalid replacement: %s" % exc)
+                _check_template(out["pattern"], out["flags"], out["with"], _path(path, "with"))
         if op == "drop_tag":
             if out["contains"] is not None and out["pattern"] is not None:
                 _err(path, "use either contains or pattern, not both")
@@ -1657,7 +2156,7 @@ class _Compiler:
             if len(name) > MAX_NAME_CHARS:
                 _err(_path(path, "name"), "is limited to %d characters" % MAX_NAME_CHARS)
             if name in names:
-                _err(_path(path, "name"), "duplicate rule name %r" % _clip(name))
+                _err(_path(path, "name"), "duplicate rule name %r" % _clip(name), "duplicate rule name")
             names.add(name)
             enabled = item.get("enabled", True)
             override = item.get("override_protected", False)
@@ -1769,6 +2268,10 @@ class Plan:
         variable set, keeps a Claude Code billing header line first (plan I5: head starts with
         that line and "\\n", which direct.build_body splits into its own block) and appends the
         structured contract when the template does not place {{structured}} (plan I10).
+
+        An edit that cannot run on this text (a pattern out of time, a result too long) leaves the text as it was and is named
+        in the warnings, without quoting its target. The edits of one system text are remembered per (revision, profile, text).
+        A head longer than MAX_HEAD_BYTES is apierr.ApiError 413 (prompt_too_large), which the runtime passes to the client.
         """
         head, parts, warnings, _report = _compose(self, client_system, sources)
         return head, parts, warnings
@@ -1792,13 +2295,15 @@ def _compose(plan, client_system, sources):
     edited, changed = system, False
     if profile.system_edits:
         if "client_system" in template.variables:
-            edited, report = _apply_system_edits(system, profile.system_edits, snapshot)
+            edited, report = _edited_system(snapshot, plan.profile, system, profile.system_edits)
             changed = edited != system
             for entry in report:
-                if not entry["matched"]:
-                    edit = profile.system_edits[entry["index"]]
-                    warnings.append("client_system.edits[%d] (%s %s) matched nothing"
-                                    % (entry["index"], edit["op"], _edit_target(edit)))
+                op = profile.system_edits[entry["index"]]["op"]
+                if entry.get("skipped"):
+                    warnings.append("client_system.edits[%d] (%s) was not applied: %s"
+                                    % (entry["index"], op, _REFUSALS.get(entry["skipped"], entry["skipped"])))
+                elif not entry["matched"]:
+                    warnings.append("client_system.edits[%d] (%s) matched nothing" % (entry["index"], op))
         else:
             warnings.append("client_system.edits are not applied: the head template does not use {{client_system}}")
     if (system.strip() and "client_system" not in template.variables
@@ -1842,10 +2347,9 @@ def _compose(plan, client_system, sources):
         return variable(name)
 
     pieces = [(source, text) for source, text in _render(template, expand) if text]
-    rendered = "".join(text for _source, text in pieces)
     parts = []
     if billing:
-        parts.append(Part("billing", billing + ("\n" if rendered or newline else "")))
+        parts.append(Part("billing", billing + ("\n" if pieces or newline else "")))
     for source, text in pieces:
         if source == "literal" and parts and parts[-1].source == "literal":
             parts[-1] = Part("literal", parts[-1].text + text)
@@ -1857,8 +2361,33 @@ def _compose(plan, client_system, sources):
             if parts:
                 parts.append(Part("literal", "\n\n"))
             parts.append(Part("relay:structured", contract))
+    _check_head_size(plan.profile, parts)
     head = "".join(part.text for part in parts)
     return head, parts, list(dict.fromkeys(warnings)), report
+
+
+def _check_head_size(profile, parts):
+    """ApiError 413 (prompt_too_large) when the head would be longer than MAX_HEAD_BYTES in UTF-8; nothing is joined yet.
+
+    The sizes of the pieces are added up first: a template that names a text a thousand times must not build 100 MiB of
+    string to find that out. The client reads the message (the runtime passes an ApiError on), so it names the profile and
+    the limit and quotes none of the texts.
+    """
+    characters = sum(len(part.text) for part in parts)
+    if characters * 4 <= MAX_HEAD_BYTES:
+        return
+    if characters > MAX_HEAD_BYTES:
+        size = "at least %d" % characters
+    else:
+        exact = sum(len(part.text.encode("utf-8", "surrogatepass")) for part in parts)
+        if exact <= MAX_HEAD_BYTES:
+            return
+        size = str(exact)
+    raise apierr.ApiError(
+        413, "prompt_too_large",
+        "the system prompt that profile '%s' builds is %s bytes, more than the %d bytes allowed: shorten the texts the "
+        "profile uses, or cut more of the client's system prompt with client_system.edits"
+        % (_clip(profile, 80), size, MAX_HEAD_BYTES))
 
 
 class Snapshot:
@@ -1866,9 +2395,16 @@ class Snapshot:
 
     Built by compile_document (or directly from a document: it is then validated the same way, with text files read
     relative to the folder of source_path or the working directory). `rev` is None for a draft compiled for a preview.
+
+    `literal_document` is the document the revision was compiled from with every {"file": ...} text replaced by the text that
+    was read for it: compiling it gives the same revision in everything a request can see (heads, edits, generation, rules,
+    Codex texts), whatever has become of the files. `fingerprint` is the sha256 of its canonical JSON, the name by which a
+    conversation pin recognises a revision across restarts. `restored` is True for a revision that was read back from the
+    pins folder (see PromptStore): it serves the conversations that were started on it and is never the current one.
     """
 
-    def __init__(self, rev: int, document: dict, source_path: str | None = None, *, base_dir=None, _compiled=None):
+    def __init__(self, rev: int, document: dict, source_path: str | None = None, *, base_dir=None, _compiled=None,
+                 _restored=False, _fingerprint=None):
         self._rev = rev
         self._source_path = source_path
         self._document = _copy(document)
@@ -1877,7 +2413,11 @@ class Snapshot:
                 base_dir = pathlib.Path(source_path).parent if source_path else pathlib.Path.cwd()
             _compiled = _Compiler(document, base_dir).compile()
         self._data = _compiled
+        self._literal = _compiled.literal
+        self._restored = bool(_restored)
+        self._fingerprint = _UNSET if _fingerprint is None else _fingerprint
         self._extra_patterns = {}
+        self._token = next(_TOKENS)        # what the memory of edited system prompts tells this snapshot by
 
     @property
     def rev(self):
@@ -1890,6 +2430,41 @@ class Snapshot:
     @property
     def document(self) -> dict:
         return _copy(self._document)
+
+    @property
+    def restored(self) -> bool:
+        return self._restored
+
+    @property
+    def literal_document(self) -> dict:
+        """The document with the texts of its {"file": ...} entries put in; a copy."""
+        return _copy(self._literal if self._literal is not None else self._document)
+
+    @property
+    def fingerprint(self) -> str | None:
+        """sha256 (hex) of the canonical JSON of the literal document, or None when that is longer than MAX_REVISION_BYTES.
+
+        The canonical JSON keeps the order of the keys (the order of codex.models and of the profiles means something), has
+        no spaces and does not escape non-ASCII text. The same literal content gives the same fingerprint however it was
+        written (a text in the document or in a file, with CRLF or LF line ends)."""
+        if self._fingerprint is _UNSET:
+            blob = self._canonical()
+            self._fingerprint = hashlib.sha256(blob).hexdigest() if blob is not None else None
+        return self._fingerprint
+
+    def _canonical(self) -> bytes | None:
+        """The bytes the fingerprint is taken of (and a stored revision is made of); None when they would be too many.
+
+        A text file named by many texts is one string in memory but many in this JSON, so the size is estimated first, over
+        the strings of the document: a document that would write out gigabytes is turned down before anything is built."""
+        document = self._literal if self._literal is not None else self._document
+        if _weight(document) > MAX_REVISION_BYTES:
+            return None
+        try:
+            blob = json.dumps(document, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError, RecursionError):
+            return None
+        return blob if len(blob) <= MAX_REVISION_BYTES else None
 
     @property
     def warnings(self) -> list[str]:
@@ -1925,11 +2500,14 @@ class Snapshot:
             raise KeyError(name)
         return self._data.relay.get(name)
 
-    def regex(self, pattern: str, flags: str = "") -> re.Pattern:
-        """The pattern compiled when the revision was compiled (plan I11); flags is a subset of "ims".
+    def regex(self, pattern: str, flags: str = ""):
+        """The pattern compiled when the revision was compiled (plan I11), a pattern of the `regex` module; flags is a subset
+        of "ims".
 
-        A pattern the revision does not contain is checked and compiled by the same rules, so an unsafe pattern never
-        gets through this door; it raises PromptConfigError.
+        Run it with regex_search, regex_spans, regex_remove or regex_replace (or the keywords of Deadline.run): they let
+        the other threads go on while it matches and stop it at the time limit. A pattern the revision does not contain is
+        checked and compiled by the same rules, so an unsafe pattern never gets through this door; it raises
+        PromptConfigError.
         """
         flags = _normalize_flags(flags, "flags")
         compiled = self._data.patterns.get((pattern, flags)) or self._extra_patterns.get((pattern, flags))
@@ -2011,17 +2589,161 @@ def _protected_rules():
 
 
 class _Pin:
-    __slots__ = ("rev", "created", "touched", "profile")
+    """A conversation's hold on a revision.
 
-    def __init__(self, rev, now):
+    `print` is the fingerprint of the revision (None for the legacy pin, and while nothing is persisted), `digest` the
+    (key digest, tag) it is stored under, `disk` what the pins file last said about it, (print, profile), and `disk_touched`
+    when that was, in clock units; `restored` says the pin came back from the pins file after a restart."""
+    __slots__ = ("rev", "created", "touched", "profile", "print", "digest", "disk", "disk_touched", "restored")
+
+    def __init__(self, rev, now, print_=None):
         self.rev, self.created, self.touched, self.profile = rev, now, now, None
+        self.print, self.digest, self.disk, self.disk_touched, self.restored = print_, None, None, None, False
+
+
+class _Dormant:
+    """A pin read from the pins file that no request has claimed yet: its conversation has not come back.
+
+    `print` is the fingerprint of its revision, None for the legacy pin; `created` and `touched` are wall-clock times."""
+    __slots__ = ("tag", "purpose", "print", "profile", "created", "touched")
+
+    def __init__(self, tag, purpose, print_, profile, created, touched):
+        self.tag, self.purpose, self.print, self.profile = tag, purpose, print_, profile
+        self.created, self.touched = created, touched
+
+
+def _pin_digest(key):
+    """What a pin is stored under: the sha256 of the canonical JSON of (conversation key, purpose). The key is never written."""
+    try:
+        text = json.dumps([key[0], key[1]], ensure_ascii=True, separators=(",", ":"))
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def _number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _stored_pin(digest, row):
+    """The dormant pin a record of the pins file stands for, or None when the record is not one.
+
+    "rev" is the fingerprint of the revision the conversation was started on, or LEGACY_REV (0) for a conversation that
+    started while no prompts file was loaded."""
+    if not (isinstance(digest, str) and _HEX64.fullmatch(digest) and isinstance(row, dict)):
+        return None
+    tag, purpose, profile = row.get("tag"), row.get("purpose"), row.get("profile")
+    created, touched = row.get("created"), row.get("touched")
+    if not (isinstance(tag, str) and _HEX8.fullmatch(tag) and isinstance(purpose, str) and len(purpose) <= 128
+            and (profile is None or isinstance(profile, str) and len(profile) <= 128)
+            and _number(created) and _number(touched)):
+        return None
+    revision = row.get("rev")
+    if type(revision) is int and revision == LEGACY_REV:
+        print_ = None
+    elif isinstance(revision, str) and _HEX64.fullmatch(revision):
+        print_ = revision
+    else:
+        return None
+    return _Dormant(tag, purpose, print_, profile, float(created), float(touched))
+
+
+def _stored_row(tag, purpose, print_, profile, created, touched):
+    return {"tag": tag, "purpose": purpose, "rev": LEGACY_REV if print_ is None else print_, "profile": profile,
+            "created": round(created, 3), "touched": round(touched, 3)}
+
+
+class _TooLarge(Exception):
+    """A stored file is larger than it may be."""
+
+
+def _read_limited(path, limit):
+    """The bytes of a file of at most `limit` bytes (_TooLarge past that); a file a scanner holds for a moment is tried again."""
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            with open(path, "rb") as handle:
+                blob = handle.read(limit + 1)
+            break
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(REPLACE_PAUSE)
+    if len(blob) > limit:
+        raise _TooLarge(str(path))
+    return blob
+
+
+def _put(path, blob):
+    """Write `blob` to `path` atomically: a temporary file in the same folder, flushed to disk, then os.replace (tried again
+    while Windows says a reader holds the target)."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=str(path.parent), prefix=".pins-", suffix=".tmp",
+                                         delete=False) as output:
+            temporary = output.name
+            output.write(blob)
+            output.flush()
+            os.fsync(output.fileno())
+        for attempt in range(REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, path)
+                temporary = None
+                return
+            except PermissionError:
+                if attempt == REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(REPLACE_PAUSE)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _tidy_temporaries(folder):
+    """Remove the temporary files an interrupted write of ours left in a pins folder (a recent one may be a write that is
+    going on). Anything else in the folder is not ours and stays."""
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return
+    for entry in entries:
+        name = entry.name
+        try:
+            if (name.startswith(".pins-") and name.endswith(".tmp") and entry.is_file(follow_symlinks=False)
+                    and time.time() - entry.stat().st_mtime > STALE_TEMP_SECONDS):
+                os.unlink(entry.path)
+        except OSError:
+            continue
+
+
+def _tidy_revisions(folder, keep):
+    """Remove from the folder of stored revisions the ones no pin names (`keep` is the set of fingerprints that are named),
+    and the temporary files of interrupted writes. A file that is not named <64 hex digits>.json is not ours and stays."""
+    _tidy_temporaries(folder)
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return
+    for entry in entries:
+        stem, _dot, suffix = entry.name.rpartition(".")
+        try:
+            if suffix == "json" and _HEX64.fullmatch(stem) and stem not in keep and entry.is_file(follow_symlinks=False):
+                os.unlink(entry.path)
+        except OSError:
+            continue
+
+
+class _DuplicateKey(ValueError):
+    """A JSON object that repeats a key; the key is in the message for the author, not in the brief of the journal."""
 
 
 def _no_duplicates(pairs):
     out = {}
     for key, value in pairs:
         if key in out:
-            raise ValueError("duplicate key %s" % json.dumps(key, ensure_ascii=False))
+            raise _DuplicateKey("duplicate key %s" % json.dumps(key, ensure_ascii=False))
         out[key] = value
     return out
 
@@ -2078,11 +2800,14 @@ class _PreviewSources:
         "project_context": "[PROJECT CONTEXT: filled in by the relay when it owns the request]",
         "exec_reminder": "[LOCAL EXEC REMINDER: filled in by the relay when it owns the request]"}
 
-    def __init__(self, snapshot, client_owned, contract):
+    def __init__(self, snapshot, client_owned, contract, relay_task=None):
         self.client_owned = client_owned
         self.placeholders = []
         self._snapshot = snapshot
         self._contract = contract
+        # A request is a relay task only when the client owns nothing and sent no tools (orchestrator.RelaySources):
+        # a client with tools and no system gets empty relay blocks there, so the preview shows none either.
+        self._relay_task = (not client_owned) if relay_task is None else relay_task
 
     def relay_role(self):
         import context
@@ -2095,6 +2820,8 @@ class _PreviewSources:
         return text if text is not None else orchestrator.DEFAULT_NATIVE_TOOLS_ROLE
 
     def _placeholder(self, name):
+        if not self._relay_task:
+            return ""
         self.placeholders.append(name)
         return self._PLACEHOLDERS[name]
 
@@ -2133,29 +2860,51 @@ class PromptStore:
     against the folder of cfg["_config_path"] when that is set, otherwise against the working
     directory. The constructor loads the file when it exists; maybe_reload() also picks up a
     file that appears, changes or disappears later (plan 4.3).
+
+    Pins survive a restart when the stored conversations are on (cfg["conversation_state"], cfg["conversation_state_dir"]; the
+    pins live in <conversation_state_dir>/prompt-pins/, see PINS_DIR). The constructor reads them as dormant pins; the first
+    plan() of a conversation that has one gives it a live pin on the revision it was started on: the current one when the
+    fingerprints agree, else a revision made again from the stored literal document (a restored revision: it gets the next
+    number, is kept with the history and never becomes the current one), else, when that is gone, the current revision. The
+    file is written from maybe_reload() (at most once per PINS_WRITE_INTERVAL), at once from unpin() and before save() changes
+    the file, and by close(), which the runtime calls when it stops. `wall` is the wall clock the stored times are in
+    (time.time); `clock` stays the clock of everything in memory.
     """
 
-    def __init__(self, cfg: dict, path: str | None = None, clock=time.monotonic):
+    def __init__(self, cfg: dict, path: str | None = None, clock=time.monotonic, *, wall=None):
         self.cfg = cfg
         configured = pathlib.Path(str(path or cfg.get("prompts_file") or DEFAULT_FILE))
         if not configured.is_absolute() and cfg.get("_config_path"):
             configured = pathlib.Path(cfg["_config_path"]).parent / configured
         self.path = configured
         self.clock = clock
+        self._wall = wall or time.time
         self._lock = threading.RLock()
         self._reload_lock = threading.RLock()
+        self._persist_lock = threading.RLock()
         self._ring_lock = threading.Lock()
         self._snapshot: Snapshot | None = None
         self._history = collections.OrderedDict()
         self._next_rev = 1
         self._pins = collections.OrderedDict()
+        self._pins_path = self._pin_folder(cfg)
+        self._dormant: dict[str, _Dormant] = {}
+        self._broken: dict[str, str] = {}
+        self._stored_prints: set[str] = set()
+        self._dirty = False
+        self._flushed = None
+        self._failing = False
+        self._closed = False
         self._errors: list[dict] = []
         self._ring = collections.deque(maxlen=RECENT_LIMIT)
         self._watched = [str(self.path)]
         self._signature = ((str(self.path), None),)
+        self._missing_since = None
         self._checked = clock()
         with self._reload_lock:
             self._refresh("startup")
+        if self._pins_path is not None:
+            self._load_pins()
 
     def snapshot(self) -> Snapshot | None:
         with self._lock:
@@ -2187,13 +2936,14 @@ class PromptStore:
         try:
             document = json.loads(text, object_pairs_hook=_no_duplicates)
         except (ValueError, RecursionError) as exc:
-            raise self._unreadable("invalid JSON: %s" % exc, signature) from None
+            brief = "invalid JSON: duplicate key" if isinstance(exc, _DuplicateKey) else None
+            raise self._unreadable("invalid JSON: %s" % exc, signature, brief) from None
         return document, signature
 
     @staticmethod
-    def _unreadable(message, signature):
+    def _unreadable(message, signature, brief=None):
         """A file-level error that remembers the stamp the file had before it was read: a rewrite during the read shows up."""
-        error = PromptConfigError("", message)
+        error = PromptConfigError("", message, brief)
         error.signature = signature
         return error
 
@@ -2206,6 +2956,7 @@ class PromptStore:
         return Snapshot(rev, document, str(self.path), _compiled=data), None, compiler.files
 
     def _watch(self, main_signature, files):
+        self._missing_since = None
         self._watched = [str(self.path)] + [path for path, _mtime, _size in files]
         self._signature = ((str(self.path), main_signature),) + tuple(
             (path, None if mtime is None else (mtime, size)) for path, mtime, size in files)
@@ -2215,13 +2966,7 @@ class PromptStore:
         try:
             document, main_signature = self._read_document()
         except FileNotFoundError:
-            self._watch(None, ())
-            with self._lock:
-                had = self._snapshot is not None or bool(self._errors)
-                self._snapshot, self._errors = None, []
-            if had:
-                self._emit("prompt.reload", "Файл промптов удалён: новые диалоги идут прежним путём", rev=None,
-                           source="removed")
+            self._vanished()
             return
         except PromptConfigError as exc:
             self._watch(getattr(exc, "signature", None), ())
@@ -2242,6 +2987,32 @@ class PromptStore:
             return
         self._install(snapshot, source, document)
 
+    def _vanished(self):
+        """The prompts file is not there: it counts as removed only when two looks, RELOAD_INTERVAL apart, both miss it.
+
+        An editor that saves by deleting the file and creating it again, or a sync client, leaves it missing for a moment.
+        Believing the first look would send every conversation that starts in that moment down the legacy path, and a
+        conversation keeps the path it started on until it is unpinned. While the removal is not confirmed the current
+        revision keeps serving; the signature that was remembered stays, so the next look sees the difference again, and
+        _watch (any look that finds the file, or a save) forgets the pending removal.
+        Without a revision to lose (nothing loaded, or only an error remembered) the file is simply forgotten at once.
+        """
+        now = self.clock()
+        with self._lock:
+            if self._snapshot is not None:
+                if self._missing_since is None:
+                    self._missing_since = now
+                    return
+                if now - self._missing_since < RELOAD_INTERVAL:
+                    return
+        self._watch(None, ())
+        with self._lock:
+            had = self._snapshot is not None or bool(self._errors)
+            self._snapshot, self._errors = None, []
+        if had:
+            self._emit("prompt.reload", "Файл промптов удалён: новые диалоги идут прежним путём", rev=None,
+                       source="removed")
+
     def _reject(self, error):
         """Remember a problem of the file on disk and journal it; a transient one that repeats is journaled once."""
         record = {"message": error.message, "param": error.path or None, "ts": round(time.time(), 3)}
@@ -2250,36 +3021,61 @@ class PromptStore:
             if getattr(error, "transient", False) and known == [(record["message"], record["param"])]:
                 return
             self._errors = [record]
-        self._emit("prompt.config_error", "Файл промптов не принят: %s" % _clip(str(error), 300), "error",
-                   param=error.path or None, error=_clip(error.message, 300))
+        self._emit("prompt.config_error",
+                   "Файл промптов не принят: %s" % _clip(("%s: %s" % (error.path, error.brief)) if error.path
+                                                         else error.brief, 300),
+                   "error", param=_clip(error.path, 200) or None, error=_clip(error.brief, 300))
 
     def _install(self, snapshot, source, document):
+        # The fingerprint is worked out here, not under a lock and not when the first pin is written: the pins that name
+        # this revision come as soon as it is the current one.
+        nameable = self._pins_path is None or snapshot.fingerprint is not None
         with self._lock:
             self._snapshot = snapshot
             self._history[snapshot.rev] = snapshot
-            while len(self._history) > SNAPSHOT_HISTORY:
-                self._history.popitem(last=False)
-            self._next_rev = snapshot.rev + 1
+            self._trim_history()
+            self._next_rev = max(self._next_rev, snapshot.rev + 1)
             self._errors = []
         canonical = json.dumps(document, sort_keys=True, ensure_ascii=False)
         self._emit("prompt.reload", "Промпты загружены: ревизия %d" % snapshot.rev, rev=snapshot.rev, source=source,
                    profiles=len(snapshot._data.profile_order) - 1,
                    rules=len(snapshot._data.override_rules) + len(snapshot._data.user_rules),
                    bytes=snapshot._data.size, sha8=sha8(canonical), warnings=len(snapshot._data.warnings))
+        if not nameable:
+            self._emit("prompt.pins_error", "Ревизия %d слишком велика, чтобы закрепления пережили перезапуск" % snapshot.rev,
+                       "warn", reason="revision_too_large", rev=snapshot.rev, limit=MAX_REVISION_BYTES)
+
+    def _trim_history(self):
+        """Forget the oldest revisions past SNAPSHOT_HISTORY, never the current one (called under _lock)."""
+        keep = self._snapshot.rev if self._snapshot is not None else None
+        while len(self._history) > SNAPSHOT_HISTORY:
+            for rev in self._history:
+                if rev != keep:
+                    del self._history[rev]
+                    break
+            else:
+                return
 
     def maybe_reload(self) -> None:
-        """Recompile when the prompts file or a referenced text changed; stat at most once per RELOAD_INTERVAL."""
+        """Recompile when the prompts file or a referenced text changed; stat at most once per RELOAD_INTERVAL.
+
+        It is also where the pins file is written when something changed (_flush_pins): the runtime calls it on every request."""
         now = self.clock()
+        due = False
         with self._lock:
-            if now - self._checked < RELOAD_INTERVAL:
-                return
-            self._checked = now
-        with self._reload_lock:
-            self._reload_if_changed()
+            if now - self._checked >= RELOAD_INTERVAL:
+                self._checked = now
+                due = True
+        if due:
+            with self._reload_lock:
+                self._reload_if_changed()
+        self._flush_pins()
 
     def _reload_if_changed(self):
         if self._disk_signature() != self._signature:
             self._refresh("file")
+        else:
+            self._missing_since = None
 
     def errors(self) -> list[dict]:
         """Problems of the file on disk that kept the previous revision: [{"message", "param", "ts"}], [] when valid."""
@@ -2304,6 +3100,8 @@ class PromptStore:
                     "the prompts changed since revision %s was read (now %s): load them again before saving"
                     % ("none" if base_rev is None else base_rev, "none" if expected is None else expected))
             snapshot = Snapshot(self._next_rev, document, str(self.path), _compiled=data)
+            # The pins of the revision that is about to stop being the current one are on disk before the file changes.
+            self._flush_pins(force=True)
             main_signature = self._write(document)
             self._watch(main_signature, compiler.files)
             self._install(snapshot, "admin", document)
@@ -2376,9 +3174,15 @@ class PromptStore:
         A conversation keeps the revision it first met, also when that was "no file" (LEGACY_REV). A profile the request
         names itself (@profile, x-proxi-profile) that the pinned revision lacks, while the current one has it, moves the
         pin to the current revision rather than refusing a model the catalog offers.
+
+        After a restart the first request of a conversation whose pin was stored takes the pin back (see PromptStore); the
+        plan is `pinned` as it is for any conversation that has met a request before. This is the only place plan() reads
+        the disk, and only once for each revision it has to make again.
         """
         now = self.clock()
         key = (inp.conversation_key, inp.purpose) if inp.conversation_key else None
+        if key is not None and self._dormant and key not in self._pins:
+            self._wake(key, now)
         with self._lock:
             current = self._snapshot
             chosen, pinned, pin = current, False, None
@@ -2386,16 +3190,19 @@ class PromptStore:
                 pin = self._pins.get(key)
                 if pin is not None and now - pin.touched > PIN_IDLE_SECONDS:
                     del self._pins[key]
+                    self._dirty = True
                     pin = None
                 if pin is not None:
                     if pin.rev == LEGACY_REV:
                         chosen, pinned = None, True
+                    elif current is not None and pin.rev == current.rev:
+                        chosen, pinned = current, True
                     elif pin.rev in self._history:
                         chosen, pinned = self._history[pin.rev], True
                     else:
                         pin = None
                 if pin is None:
-                    pin = _Pin(current.rev if current is not None else LEGACY_REV, now)
+                    pin = _Pin(current.rev if current is not None else LEGACY_REV, now, self._print_of(current))
                     self._pins[key] = pin
                     self._trim_pins(now)
                 pin.touched = now
@@ -2412,15 +3219,32 @@ class PromptStore:
         if plan.snapshot is not None and chosen is not None and key is not None and pin.rev != chosen.rev:
             with self._lock:
                 pin.rev = chosen.rev
+                pin.print = self._print_of(chosen)
         if key is not None:
             pin.profile = plan.profile
+            if self._pins_path is not None:
+                self._note(pin, now)
         return plan
+
+    def _print_of(self, snapshot):
+        """The fingerprint a pin on `snapshot` is stored by (None for the legacy pin and while nothing is persisted)."""
+        return snapshot.fingerprint if snapshot is not None and self._pins_path is not None else None
+
+    def _note(self, pin, now):
+        """Say that the pins file is out of date when what it holds about this pin is not what the pin is now.
+
+        The touch is rough on purpose: the file hears of it when the stored one is PIN_TOUCH_INTERVAL old."""
+        disk = pin.disk
+        if (disk is None or disk[0] != pin.print or disk[1] != pin.profile
+                or now - pin.disk_touched >= PIN_TOUCH_INTERVAL):
+            self._dirty = True
 
     def _trim_pins(self, now):
         while self._pins:
             key, pin = next(iter(self._pins.items()))
             if len(self._pins) > MAX_PINS or now - pin.touched > PIN_IDLE_SECONDS:
                 del self._pins[key]
+                self._dirty = True
             else:
                 break
 
@@ -2492,25 +3316,359 @@ class PromptStore:
 
     # -- pins -------------------------------------------------------------------------------------------------------
     def pins(self) -> list[dict]:
-        """[{"conversation": tag, "purpose", "rev", "profile", "age_s"}], the most recently used first."""
+        """[{"conversation": tag, "purpose", "rev", "profile", "age_s"}], the most recently used first.
+
+        The pins that came back from the pins file after a restart have "restored": true; the ones whose conversation has not
+        come back yet (dormant) are listed last, with the number of the revision they stand for when it is in memory and
+        None when it is still only a stored document (a legacy pin has rev 0, LEGACY_REV)."""
         now = self.clock()
         with self._lock:
-            items = [(key, pin.rev, pin.profile, pin.created) for key, pin in reversed(self._pins.items())
+            items = [(key, pin.rev, pin.profile, pin.created, pin.restored) for key, pin in reversed(self._pins.items())
                      if now - pin.touched <= PIN_IDLE_SECONDS]
-        return [{"conversation": journal.tag(key[0]), "purpose": key[1], "rev": rev, "profile": profile,
-                 "age_s": round(now - created, 1)} for key, rev, profile, created in items]
+            dormant = sorted(self._dormant.values(), key=lambda entry: entry.touched, reverse=True)
+            known = {}
+            if dormant:
+                for snapshot in [self._snapshot, *self._history.values()]:
+                    if snapshot is not None:
+                        known.setdefault(snapshot.fingerprint, snapshot.rev)
+        rows = []
+        for key, rev, profile, created, restored in items:
+            row = {"conversation": journal.tag(key[0]), "purpose": key[1], "rev": rev, "profile": profile,
+                   "age_s": round(now - created, 1)}
+            if restored:
+                row["restored"] = True
+            rows.append(row)
+        wall = self._wall()
+        for entry in dormant:
+            if wall - entry.touched <= PIN_IDLE_SECONDS:
+                rows.append({"conversation": entry.tag, "purpose": entry.purpose,
+                             "rev": LEGACY_REV if entry.print is None else known.get(entry.print),
+                             "profile": entry.profile, "age_s": round(max(0.0, wall - entry.created), 1),
+                             "restored": True})
+        return rows
 
     def unpin(self, conversation_key: str | None = None) -> int:
-        """Forget the pins of one conversation (its raw key or the tag pins() shows); None forgets all of them."""
+        """Forget the pins of one conversation (its raw key or the tag pins() shows); None forgets all of them.
+
+        The pins that came back from the pins file and have not been used yet are forgotten too, and the file is written at
+        once, so that an unpin is not undone by a restart."""
         with self._lock:
             if conversation_key is None:
-                count = len(self._pins)
+                count = len(self._pins) + len(self._dormant)
                 self._pins.clear()
-                return count
-            doomed = [key for key in self._pins if key[0] == conversation_key or journal.tag(key[0]) == conversation_key]
-            for key in doomed:
-                del self._pins[key]
-            return len(doomed)
+                self._dormant.clear()
+            else:
+                doomed = [key for key in self._pins
+                          if key[0] == conversation_key or journal.tag(key[0]) == conversation_key]
+                for key in doomed:
+                    del self._pins[key]
+                tag = journal.tag(conversation_key)
+                asleep = [digest for digest, entry in self._dormant.items()
+                          if entry.tag == conversation_key or (tag is not None and entry.tag == tag)]
+                for digest in asleep:
+                    del self._dormant[digest]
+                count = len(doomed) + len(asleep)
+            if count:
+                self._dirty = True
+        if count:
+            self._flush_pins(force=True)
+        return count
+
+    # -- pins on disk -----------------------------------------------------------------------------------------------
+    @staticmethod
+    def _pin_folder(cfg):
+        """<conversation_state_dir>/prompt-pins; None when the stored conversations are off or have no folder."""
+        if not cfg.get("conversation_state", True):
+            return None
+        directory = cfg.get("conversation_state_dir")
+        if not directory or not isinstance(directory, (str, os.PathLike)):
+            return None
+        try:
+            return pathlib.Path(os.path.abspath(os.fspath(directory))) / PINS_DIR
+        except (TypeError, ValueError, OSError):
+            return None
+
+    def _pins_problem(self, reason, exc=None):
+        self._emit("prompt.pins_error", "Закрепления промптов не прочитаны: %s" % reason, "warn", reason=reason,
+                   error=None if exc is None else type(exc).__name__)
+
+    def _load_pins(self):
+        """Read the pins file into dormant pins; a request of the conversation wakes its pin (plan()).
+
+        Nothing is written here: a store that only looks (a script that lists the models) leaves the files as they are. A
+        file that cannot be read or is not a pins file is ignored whole, a record that is not a pin one by one."""
+        wall = self._wall()
+        try:
+            blob = _read_limited(self._pins_path / PINS_FILE, MAX_PINS_BYTES)
+        except FileNotFoundError:
+            return
+        except (OSError, _TooLarge) as exc:
+            self._pins_problem("too_large" if isinstance(exc, _TooLarge) else "unreadable", exc)
+            return
+        try:
+            payload = json.loads(blob.decode("utf-8"))
+            version = payload["format"]
+            stored = payload["pins"] if type(version) is int and version == PINS_FORMAT else None
+            if not isinstance(stored, dict):
+                raise ValueError("not a pins file")
+        except (ValueError, KeyError, TypeError, RecursionError):
+            self._pins_problem("corrupt")
+            return
+        entries, invalid, expired = [], 0, 0
+        for digest, row in stored.items():
+            entry = _stored_pin(digest, row)
+            if entry is None:
+                invalid += 1
+            elif wall - entry.touched > PIN_IDLE_SECONDS:
+                expired += 1
+            else:
+                entries.append((digest, entry))
+        entries.sort(key=lambda item: item[1].touched)
+        over = max(0, len(entries) - MAX_PINS)
+        entries = entries[over:]
+        with self._lock:
+            self._dormant = dict(entries)
+            if invalid or expired or over:
+                self._dirty = True
+        revisions = {entry.print for _digest, entry in entries if entry.print is not None}
+        self._emit("prompt.pins_loaded", "Закрепления промптов прочитаны с диска: %d" % len(entries),
+                   "info" if entries else "debug", pins=len(entries), revisions=len(revisions),
+                   legacy=sum(1 for _digest, entry in entries if entry.print is None), expired=expired, invalid=invalid,
+                   over_limit=over)
+
+    def _wake(self, key, now):
+        """Give the conversation the live pin its stored one stands for, when it has a stored one and no live pin."""
+        digest = _pin_digest(key)
+        if digest is None:
+            return
+        with self._lock:
+            if digest not in self._dormant or key in self._pins:
+                return
+        try:
+            # A restored revision takes a number and joins the history: not while a reload or a save does the same.
+            with self._reload_lock:
+                self._wake_pin(key, digest, now)
+        except Exception as exc:  # noqa: BLE001 - a stored pin must never take a request down
+            with self._lock:
+                self._dormant.pop(digest, None)
+                self._dirty = True
+            self._emit("prompt.pins_error", "Закрепление промпта не восстановлено: %s" % type(exc).__name__, "error",
+                       reason="restore", error=type(exc).__name__)
+
+    def _wake_pin(self, key, digest, now):
+        with self._lock:
+            entry = self._dormant.get(digest)
+            if entry is None or key in self._pins:
+                return
+            current = self._snapshot
+        wall = self._wall()
+        snapshot, source, reason = None, None, None
+        if wall - entry.touched > PIN_IDLE_SECONDS:
+            reason = "expired"
+        elif entry.print is None:
+            source = "legacy"
+        elif current is not None and current.fingerprint == entry.print:
+            snapshot, source = current, "current"
+        else:
+            snapshot, reason = self._revision(entry.print, entry.tag)
+            source = "revision"
+        with self._lock:
+            if self._dormant.get(digest) is not entry or key in self._pins:
+                return                  # unpinned, or pinned afresh, while the revision was being made
+            del self._dormant[digest]
+            if reason is None:
+                # The file already says what this pin says: it is written again only when something about it changes (its
+                # touch, once it is a minute old), not because it woke.
+                pin = _Pin(LEGACY_REV if snapshot is None else snapshot.rev, now, entry.print)
+                pin.created = now - max(0.0, wall - entry.created)
+                pin.touched = now - max(0.0, wall - entry.touched)
+                pin.profile, pin.restored = entry.profile, True
+                pin.disk, pin.disk_touched = (entry.print, entry.profile), pin.touched
+                self._pins[key] = pin
+                self._trim_pins(now)
+            else:
+                self._dirty = True      # the file names a pin that cannot be taken back: it is not named again
+        if reason is None:
+            self._emit("prompt.pin_restored", "Закрепление диалога восстановлено после перезапуска: ревизия %s" % (
+                       "без файла" if snapshot is None else snapshot.rev), "debug", conversation=entry.tag,
+                       purpose=entry.purpose, source=source, rev=LEGACY_REV if snapshot is None else snapshot.rev)
+        else:
+            self._emit("prompt.pin_dropped", "Закрепление диалога не восстановлено (%s): он начнёт с текущей ревизии" % reason,
+                       "debug" if reason == "expired" else "info", conversation=entry.tag, purpose=entry.purpose,
+                       reason=reason, revision=None if entry.print is None else entry.print[:8])
+
+    def _find_revision(self, print_):
+        """The revision with this fingerprint among the ones in memory, or None (called under _lock)."""
+        for snapshot in [self._snapshot, *self._history.values()]:
+            if snapshot is not None and snapshot.fingerprint == print_:
+                return snapshot
+        return None
+
+    def _revision(self, print_, tag):
+        """(snapshot, None) for the revision with this fingerprint, made again from its stored document when it is not in
+        memory; (None, reason) when it cannot be. A revision is made once: it is looked for in memory first, and one that
+        could not be made is not tried again (a disk that was busy for a moment is)."""
+        with self._lock:
+            found = self._find_revision(print_)
+            broken = self._broken.get(print_)
+        if found is not None:
+            return found, None
+        if broken is not None:
+            return None, broken
+        snapshot, reason = self._read_revision(print_)
+        if snapshot is None:
+            if reason != "revision_unreadable":
+                with self._lock:
+                    self._broken[print_] = reason
+            self._emit("prompt.pins_error", "Ревизия закрепления не восстановлена: %s" % reason, "warn", reason=reason,
+                       revision=print_[:8], conversation=tag)
+        return snapshot, reason
+
+    def _read_revision(self, print_):
+        """(snapshot, None) made from revisions/<fingerprint>.json, or (None, reason). Called under _reload_lock."""
+        path = self._pins_path / REVISIONS_DIR / (print_ + ".json")
+        try:
+            blob = _read_limited(path, MAX_REVISION_BYTES)
+        except FileNotFoundError:
+            return None, "revision_missing"
+        except _TooLarge:
+            return None, "revision_corrupt"
+        except OSError:
+            return None, "revision_unreadable"
+        if hashlib.sha256(blob).hexdigest() != print_:
+            return None, "revision_corrupt"
+        try:
+            document = json.loads(blob.decode("utf-8"), object_pairs_hook=_no_duplicates)
+            data = _Compiler(document, self.path.parent, literal=True).compile()
+        except Exception:  # noqa: BLE001 - not JSON, not a document, or one this build refuses: it is not a revision
+            return None, "revision_invalid"
+        with self._lock:
+            rev = self._next_rev
+            self._next_rev = rev + 1
+        snapshot = Snapshot(rev, document, None, _compiled=data, _restored=True, _fingerprint=print_)
+        with self._lock:
+            self._history[rev] = snapshot
+            self._trim_history()
+        self._emit("prompt.revision_restored", "Ревизия %d восстановлена из закреплений" % rev, "info", rev=rev,
+                   revision=print_[:8], profiles=len(data.profile_order) - 1, bytes=len(blob))
+        return snapshot, None
+
+    def _flush_pins(self, force=False):
+        """Write the pins file when something changed since the last write: at most once per PINS_WRITE_INTERVAL, or at once
+        with `force`. Returns whether it wrote.
+
+        It never raises: a disk that fails is journaled (once until it works again) and tried again at the next
+        opportunity, and the request that came by goes on. A request that comes by while another thread is writing does not
+        wait for it (what changed since that write started is still marked, and goes out at the next opportunity)."""
+        if self._pins_path is None or not self._dirty or self._closed:
+            return False
+        if not self._persist_lock.acquire(blocking=force):
+            return False
+        try:
+            now = self.clock()
+            if not self._dirty or self._closed:
+                return False
+            if not force and self._flushed is not None and now - self._flushed < PINS_WRITE_INTERVAL:
+                return False
+            self._flushed = now
+            self._write_pins(now)
+            if self._failing:
+                self._failing = False
+                self._emit("prompt.pins_saved", "Закрепления промптов снова записываются", "info")
+            return True
+        except Exception as exc:  # noqa: BLE001 - keeping pins is best effort
+            with self._lock:
+                self._dirty = True
+            if not self._failing:
+                self._failing = True
+                self._emit("prompt.pins_error", "Закрепления промптов не записаны: %s" % type(exc).__name__, "warn",
+                           reason="write", error=type(exc).__name__, errno=getattr(exc, "errno", None))
+            return False
+        finally:
+            self._persist_lock.release()
+
+    def _write_pins(self, now):
+        """Write the pins file, the revisions it names and nothing else; remove the revisions it no longer names."""
+        started = time.perf_counter()
+        wall = self._wall()
+        with self._lock:
+            self._dirty = False
+            live = [(key, pin, pin.rev, pin.print, pin.profile, pin.created, pin.touched)
+                    for key, pin in self._pins.items() if now - pin.touched <= PIN_IDLE_SECONDS]
+            asleep = list(self._dormant.items())
+            known = {}
+            for snapshot in [self._snapshot, *self._history.values()]:
+                if snapshot is not None and snapshot.fingerprint is not None:
+                    known.setdefault(snapshot.fingerprint, snapshot)
+        folder = self._pins_path / REVISIONS_DIR
+        self._pins_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        folder.mkdir(mode=0o700, exist_ok=True)
+        ready = {}
+
+        def stored(print_):
+            """Whether a document for this revision is on disk. One that this process knows is put there the first time it
+            comes up (a file of an earlier run may be damaged: it is replaced by what the revision really is), and again when
+            it goes missing; one that only a stored document stands for is trusted as it is until a conversation wakes it."""
+            if print_ not in ready:
+                target = folder / (print_ + ".json")
+                have = print_ in self._stored_prints and target.exists()
+                if not have and print_ in known:
+                    blob = known[print_]._canonical()
+                    if blob is not None and hashlib.sha256(blob).hexdigest() == print_:
+                        _put(target, blob)
+                        self._stored_prints.add(print_)
+                        have = True
+                elif not have:
+                    have = target.exists()
+                ready[print_] = have
+            return ready[print_]
+
+        rows, marks = [], []
+        for key, pin, rev, print_, profile, created, touched in live:
+            if print_ is None and rev != LEGACY_REV:
+                continue                # a revision with no fingerprint cannot be named after a restart
+            if print_ is not None and not stored(print_):
+                continue
+            if pin.digest is None:
+                digest = _pin_digest(key)
+                if digest is None:
+                    continue
+                pin.digest = (digest, journal.tag(key[0]))
+            digest, tag = pin.digest
+            when = wall - max(0.0, now - touched)
+            rows.append((when, digest, _stored_row(tag, key[1], print_, profile, wall - max(0.0, now - created), when)))
+            marks.append((pin, print_, profile, touched))
+        for digest, entry in asleep:
+            if wall - entry.touched > PIN_IDLE_SECONDS or (entry.print is not None and not stored(entry.print)):
+                continue
+            rows.append((entry.touched, digest, _stored_row(entry.tag, entry.purpose, entry.print, entry.profile,
+                                                            entry.created, entry.touched)))
+        rows.sort(key=lambda item: item[0])
+        rows = rows[max(0, len(rows) - MAX_PINS):]
+        named = {row["rev"] for _when, _digest, row in rows if row["rev"] != LEGACY_REV}
+        payload = {"format": PINS_FORMAT, "saved_at": round(wall, 3),
+                   "pins": {digest: row for _when, digest, row in rows}}
+        blob = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        _put(self._pins_path / PINS_FILE, blob)
+        _tidy_revisions(folder, named)
+        _tidy_temporaries(self._pins_path)
+        written = {digest for _when, digest, _row in rows}
+        with self._lock:
+            for pin, print_, profile, touched in marks:
+                pin.disk, pin.disk_touched = (print_, profile), touched
+            for digest, entry in asleep:
+                if digest not in written and self._dormant.get(digest) is entry:
+                    del self._dormant[digest]
+        self._emit("prompt.pins_saved", "Закрепления промптов записаны: %d" % len(rows), "debug", pins=len(rows),
+                   revisions=len(named), bytes=len(blob), duration_ms=round((time.perf_counter() - started) * 1000, 1))
+
+    def close(self) -> None:
+        """Write what has not been written yet. The store goes on serving; nothing more is written after this.
+
+        The runtime calls it when it stops: a pin made in the last moments, and a touch, are then not lost."""
+        if self._pins_path is not None:
+            self._flush_pins(force=True)
+            self._closed = True
 
     # -- what the model saw -------------------------------------------------------------------------------------------
     def record(self, entry: dict) -> None:
@@ -2613,11 +3771,15 @@ class PromptStore:
                              "prompt_purpose"):
                     setattr(after, name, getattr(parsed, name))
         import orchestrator
+        if after is not parsed:
+            # Who owns the request and whether it is a relay task follow the body the client sent (plan I9), as at run time.
+            after.prompt_origin = orchestrator.client_origin(parsed)
         native_tools = after.tools or []
         owned = orchestrator._client_owns_instructions(after, orchestrator._purpose(after), native_tools)
         contract = structured_contract(snapshot, after.structured_output, tools=bool(native_tools),
                                        tool_choice=after.tool_choice)
-        sources = _PreviewSources(snapshot, owned, contract)
+        sources = _PreviewSources(snapshot, owned, contract,
+                                  relay_task=not owned and not orchestrator.client_tools(after))
         head, parts, notes, report = _compose(plan, orchestrator._client_system(after), sources)
         warnings = notes + warnings
         if sources.placeholders:
@@ -2632,7 +3794,7 @@ class PromptStore:
         if plan.profile is not None and plan.snapshot is not None:
             edits = plan.snapshot._data.profiles[plan.profile].system_edits
             for entry in report:
-                if not entry["matched"]:
+                if not entry["matched"] and not entry.get("skipped"):
                     unmatched.append({"scope": "client_system", "index": entry["index"], "op": entry["op"],
                                       "target": _edit_target(edits[entry["index"]])})
         unmatched.extend(body_unmatched)
@@ -2665,7 +3827,9 @@ class PromptStore:
             source = "relay:native_role" if native_tools else "relay:role"
             if not native_tools:
                 warnings.append("the local execution and project context blocks of a relay task are not shown")
-        contract = structured_contract(snapshot, parsed.structured_output, tools=bool(native_tools),
+        # The legacy head appends the built-in contract (orchestrator._run_once): relay_texts.structured wraps only the
+        # head of a profile, so the preview of the legacy path shows the contract exactly as the request gets it.
+        contract = structured_contract(None, parsed.structured_output, tools=bool(native_tools),
                                        tool_choice=parsed.tool_choice)
         parts = [Part(source, head)] if head else []
         if contract:

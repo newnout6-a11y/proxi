@@ -4,7 +4,7 @@ import { Button } from '../ui.jsx';
 import { Area, Check, IconBtn, Line, Select } from './controls.jsx';
 import { idOf, insertAt, isObject, moveItem, removeAt, updateAt } from './draft.js';
 import { useFocusLater } from './hooks.js';
-import { SCOPES, describeEdit, flagsOf, joinFlags, newEdit, opOf, setEditField, switchOp } from './ops.js';
+import { SCOPES, describeEdit, flagValue, flagsOf, joinFlags, newEdit, opOf, setEditField, switchOp } from './ops.js';
 
 const FLAG_LABELS = [['i', 'i · без учёта регистра'], ['m', 'm · ^ и $ на каждой строке'], ['s', 's · точка берёт и перевод строки']];
 
@@ -54,7 +54,7 @@ function Field({ field, edit, onChange, path }) {
   if (isObject(value) && value.file) return <FromFile label={field.label} value={value} />;
   const set = (next) => onChange(setEditField(edit, field.key, next));
   const common = { label: field.label, hint: field.hint, path: `${path}.${field.key}`, required: field.required };
-  if (field.kind === 'bool') return <Check label={field.label} checked={value === true} onChange={(next) => set(next || undefined)} path={common.path} />;
+  if (field.kind === 'bool') return <Check label={field.label} hint={field.hint} checked={flagValue(field.key, value)} onChange={set} path={common.path} />;
   if (field.kind === 'flags') return <Flags value={value} onChange={set} />;
   if (field.kind === 'lines') return <Lines {...common} value={value} placeholder={field.placeholder} onChange={set} />;
   if (field.kind === 'area') return <Area {...common} value={value} rows={3} placeholder={field.placeholder} onChange={set} />;

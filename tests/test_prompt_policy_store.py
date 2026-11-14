@@ -19,6 +19,13 @@ def doc(head="V1", **extra):
                     rules=[{"name": "all", "use": "a"}], **extra)
 
 
+def text_file(tmp_path):
+    """prompts/t.md next to the prompts file: where a {"file": ...} text is read from."""
+    path = tmp_path / "prompts" / "t.md"
+    path.parent.mkdir(exist_ok=True)
+    return path
+
+
 def mark():
     return journal.JOURNAL.last_seq
 
@@ -191,12 +198,12 @@ def test_a_change_of_mtime_alone_is_noticed(tmp_path):
 
 def test_a_text_file_that_changes_reloads_the_revision(tmp_path):
     clock = Clock()
-    (tmp_path / "t.md").write_text("one", encoding="utf-8")
-    document_ = document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}"}},
+    text_file(tmp_path).write_text("one", encoding="utf-8")
+    document_ = document(texts={"t": {"file": "prompts/t.md"}}, profiles={"a": {"head": "{{text:t}}"}},
                          rules=[{"name": "all", "use": "a"}])
     store = make_store(tmp_path, document_, clock=clock)
     assert store.snapshot().rev == 1
-    (tmp_path / "t.md").write_text("two!", encoding="utf-8")
+    text_file(tmp_path).write_text("two!", encoding="utf-8")
     tick(store, clock)
     assert store.snapshot().rev == 2
     plan = store.plan(inp())
@@ -207,12 +214,12 @@ def test_a_text_file_that_changes_reloads_the_revision(tmp_path):
 
 def test_a_text_file_touched_without_a_size_change_still_reloads(tmp_path):
     clock = Clock()
-    (tmp_path / "t.md").write_text("abc", encoding="utf-8")
-    document_ = document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}"}})
+    text_file(tmp_path).write_text("abc", encoding="utf-8")
+    document_ = document(texts={"t": {"file": "prompts/t.md"}}, profiles={"a": {"head": "{{text:t}}"}})
     store = make_store(tmp_path, document_, clock=clock)
-    info = (tmp_path / "t.md").stat()
-    (tmp_path / "t.md").write_text("xyz", encoding="utf-8")
-    os.utime(tmp_path / "t.md", ns=(info.st_atime_ns, info.st_mtime_ns + 7_000_000_000))
+    info = text_file(tmp_path).stat()
+    text_file(tmp_path).write_text("xyz", encoding="utf-8")
+    os.utime(text_file(tmp_path), ns=(info.st_atime_ns, info.st_mtime_ns + 7_000_000_000))
     tick(store, clock)
     assert store.snapshot().rev == 2 and store.snapshot()._data.texts["t"] == "xyz"
 
@@ -254,6 +261,8 @@ def test_a_removed_file_returns_new_conversations_to_legacy(tmp_path):
     since = mark()
     (tmp_path / "prompts.json").unlink()
     tick(store, clock)
+    assert store.snapshot() is not None and events(since) == []     # one look that misses the file is not believed
+    tick(store, clock)
     assert store.snapshot() is None and store.errors() == []
     (event,) = events(since)
     assert event["kind"] == "prompt.reload" and event["data"]["source"] == "removed" and event["data"]["rev"] is None
@@ -267,6 +276,8 @@ def test_a_removed_and_restored_file_continues_the_revision_numbers(tmp_path):
     store = make_store(tmp_path, doc(), clock=clock)
     (tmp_path / "prompts.json").unlink()
     tick(store, clock)
+    tick(store, clock)
+    assert store.snapshot() is None
     write_json(tmp_path / "prompts.json", doc("AGAIN"))
     tick(store, clock)
     assert store.snapshot().rev == 2 and store.plan(inp()).rev == 2
@@ -292,20 +303,20 @@ def test_a_broken_file_that_appears_later_is_reported_once(tmp_path):
 
 def test_a_text_file_that_appears_after_the_document_makes_it_valid(tmp_path):
     clock = Clock()
-    document_ = document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}"}})
+    document_ = document(texts={"t": {"file": "prompts/t.md"}}, profiles={"a": {"head": "{{text:t}}"}})
     store = make_store(tmp_path, document_, clock=clock)
     assert store.snapshot() is None and "file not found" in store.errors()[0]["message"]
-    (tmp_path / "t.md").write_text("arrived", encoding="utf-8")
+    text_file(tmp_path).write_text("arrived", encoding="utf-8")
     tick(store, clock)
     assert store.snapshot().rev == 1 and store.errors() == []
 
 
 def test_a_text_file_that_is_removed_keeps_the_last_good_revision(tmp_path):
     clock = Clock()
-    (tmp_path / "t.md").write_text("here", encoding="utf-8")
-    document_ = document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}"}})
+    text_file(tmp_path).write_text("here", encoding="utf-8")
+    document_ = document(texts={"t": {"file": "prompts/t.md"}}, profiles={"a": {"head": "{{text:t}}"}})
     store = make_store(tmp_path, document_, clock=clock)
-    (tmp_path / "t.md").unlink()
+    text_file(tmp_path).unlink()
     tick(store, clock)
     assert store.snapshot().rev == 1 and "file not found" in store.errors()[0]["message"]
 
@@ -459,10 +470,10 @@ def test_save_clears_the_error_of_a_broken_file(tmp_path):
 
 def test_a_saved_document_watches_its_text_files(tmp_path):
     clock = Clock()
-    (tmp_path / "t.md").write_text("one", encoding="utf-8")
+    text_file(tmp_path).write_text("one", encoding="utf-8")
     store = make_store(tmp_path, clock=clock)
-    store.save(document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}"}}), None)
-    (tmp_path / "t.md").write_text("two!", encoding="utf-8")
+    store.save(document(texts={"t": {"file": "prompts/t.md"}}, profiles={"a": {"head": "{{text:t}}"}}), None)
+    text_file(tmp_path).write_text("two!", encoding="utf-8")
     tick(store, clock)
     assert store.snapshot().rev == 2
 
@@ -504,6 +515,7 @@ def test_the_journal_gets_lengths_and_names_never_texts(tmp_path):
     rewrite(tmp_path / "prompts.json", document(texts={"secret": SECRET}, profiles={"p": {"head": "{{nope}}"}}))
     tick(store, clock)
     (tmp_path / "prompts.json").unlink()
+    tick(store, clock)
     tick(store, clock)
     found = events(since)
     assert [event["kind"] for event in found] == ["prompt.reload", "prompt.reload", "prompt.config_error",
@@ -725,13 +737,13 @@ def test_a_file_that_is_busy_for_a_moment_is_replaced_on_a_retry(tmp_path, monke
 
 
 def text_document():
-    return document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}"}},
+    return document(texts={"t": {"file": "prompts/t.md"}}, profiles={"a": {"head": "{{text:t}}"}},
                     rules=[{"name": "all", "use": "a"}])
 
 
 def test_after_a_save_the_next_reload_finds_nothing_new(tmp_path):
     clock = Clock()
-    (tmp_path / "t.md").write_text("one", encoding="utf-8")
+    text_file(tmp_path).write_text("one", encoding="utf-8")
     store = make_store(tmp_path, clock=clock)
     saved = store.save(text_document(), None)
     since = mark()
@@ -741,16 +753,16 @@ def test_after_a_save_the_next_reload_finds_nothing_new(tmp_path):
     assert events(since) == []
     assert not any(event["kind"] == "prompt.config_error" for event in events(since))
     # what is written next from outside is still noticed: the remembered state is the saved one, not a blind spot
-    (tmp_path / "t.md").write_text("two!", encoding="utf-8")
+    text_file(tmp_path).write_text("two!", encoding="utf-8")
     tick(store, clock)
     assert store.snapshot().rev == 2 and store.snapshot()._data.texts["t"] == "two!"
 
 
 def test_a_save_over_an_existing_revision_is_not_loaded_again_either(tmp_path):
     clock = Clock()
-    (tmp_path / "t.md").write_text("one", encoding="utf-8")
+    text_file(tmp_path).write_text("one", encoding="utf-8")
     store = make_store(tmp_path, text_document(), clock=clock)
-    saved = store.save(document(texts={"t": {"file": "t.md"}}, profiles={"a": {"head": "{{text:t}}!"}}), 1)
+    saved = store.save(document(texts={"t": {"file": "prompts/t.md"}}, profiles={"a": {"head": "{{text:t}}!"}}), 1)
     since = mark()
     tick(store, clock)
     tick(store, clock, 30)
@@ -839,9 +851,9 @@ def test_a_prompts_file_that_is_locked_for_a_moment_is_read_on_a_later_look(tmp_
 
 def test_a_text_file_that_is_locked_for_a_moment_is_read_on_a_later_look(tmp_path, monkeypatch):
     clock = Clock()
-    (tmp_path / "t.md").write_text("one", encoding="utf-8")
+    text_file(tmp_path).write_text("one", encoding="utf-8")
     store = make_store(tmp_path, text_document(), clock=clock)
-    (tmp_path / "t.md").write_text("two!", encoding="utf-8")
+    text_file(tmp_path).write_text("two!", encoding="utf-8")
     real, failures = open, []
 
     def locked(file, *args, **kwargs):

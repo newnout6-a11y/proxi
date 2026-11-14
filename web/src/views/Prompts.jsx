@@ -5,7 +5,7 @@ import { Button, Tag, useToast } from '../ui.jsx';
 import { Page, ease } from '../motion.jsx';
 import { usePolling } from '../useJournal.js';
 import { fmtInt } from '../format.js';
-import { failureLead, failureOf, loadPrompts, loadRecent, savePrompts } from '../prompts/api.js';
+import { failureLead, failureOf, loadPrompts, loadRecent, savePrompts, warningsToShow } from '../prompts/api.js';
 import { ErrorContext, Notice } from '../prompts/controls.jsx';
 import { addProfile, blankDocument, changedPaths, equalJson, errorHits, insertAt, locate, newRule, normalizePath, pathLabel, profilesOf, rulesOf, starterProfile } from '../prompts/draft.js';
 import { useFocusLater } from '../prompts/hooks.js';
@@ -28,6 +28,7 @@ const TABS = [
   { id: 'pins', label: 'Пины' },
 ];
 const EDITING = ['profiles', 'rules', 'texts'];
+const NO_SAVE = { rev: null, warnings: [] };
 
 function initialTab() {
   const id = location.hash.replace(/^#prompts\/?/, '');
@@ -53,8 +54,8 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
   const [loadError, setLoadError] = useState('');
   const [saving, setSaving] = useState(false);
   const [failure, setFailure] = useState(null);
-  // What the relay said about the document at the last save, for a relay that does not list warnings with the document itself
-  const [savedWarnings, setSavedWarnings] = useState([]);
+  // What the relay said at the last save: the revision it made and its warnings, which name those of the engine as well
+  const [lastSave, setLastSave] = useState(NO_SAVE);
   const [tab, setTab] = useState(initialTab);
   const [selected, setSelected] = useState(null);
   const [expand, setExpand] = useState(null);
@@ -74,7 +75,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
     setBase({ document: next.document, rev: next.rev });
     setDraft(next.document);
     setFailure(null);
-    setSavedWarnings([]);
+    setLastSave(NO_SAVE);
   }, []);
 
   const refresh = useCallback(async ({ force = false } = {}) => {
@@ -141,7 +142,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
     try {
       const result = await savePrompts(apiKey, submitted, base.rev);
       setBase({ document: submitted, rev: result.rev });
-      setSavedWarnings(result.warnings);
+      setLastSave({ rev: result.rev, warnings: result.warnings });
       toast({ tone: 'success', title: 'Промпты сохранены', text: `Ревизия ${result.rev}. Новые диалоги получат её сразу, начатые остаются на своей` });
       // The bar goes away with the save, and the focus with it, unless the user has moved on to a field of their own
       const active = document.activeElement;
@@ -203,8 +204,8 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
   };
 
   const builtin = server?.builtin;
-  // The relay lists its warnings with the document in force; the answer of the last save stands in when it does not
-  const docWarnings = server?.hasWarnings ? server.warnings : savedWarnings;
+  // The relay lists its warnings with the document in force; the answer of the last save adds those of the engine
+  const docWarnings = warningsToShow(server, lastSave);
   const profileNames = [...(builtin?.profiles?.length ? builtin.profiles : ['passthrough']), ...Object.keys(profilesOf(draft))];
   const counts = { profiles: Object.keys(profilesOf(draft)).length, rules: rulesOf(draft).length, texts: Object.keys(draft?.texts || {}).length };
   const live = { sampleState, setSampleState, resolved, recent, detected: sampleState.mode === 'paste' && !sampleState.dialect ? resolved.sample?.dialect : '', refreshRecent: loadSamples };
@@ -289,7 +290,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
                   ) : item.id === 'texts' ? (
                     <TextsTab doc={draft} setDoc={setDoc} builtin={builtin} />
                   ) : item.id === 'preview' ? (
-                    <PreviewTab apiKey={apiKey} doc={draft} dirty={dirty > 0} {...live} onUnauthorized={onUnauthorized} />
+                    <PreviewTab apiKey={apiKey} doc={draft} saved={base?.document} dirty={dirty > 0} {...live} onUnauthorized={onUnauthorized} />
                   ) : item.id === 'seen' ? (
                     <SeenTab items={recent} error={recentError} loading={recentLoading} refresh={loadSamples}
                       onPreview={(entry) => { setSampleState((state) => ({ ...state, mode: 'recent', requestId: entry.request_id })); setTab('preview'); focusLater(toActiveTab); }} />

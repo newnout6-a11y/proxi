@@ -117,11 +117,11 @@
       "publish_as_model": false
     },
     "bash-careful": {
-      "description": "рецепт 9: осторожный bash",
+      "description": "рецепт 9: осторожная команда shell (bash в OpenCode 1.x, shell в 2.x)",
       "head": "{{client_system}}",
       "tools": {
         "edits": [
-          {"tool": "bash", "op": "append", "text": "Не запускай команды, которые меняют систему или удаляют данные, без подтверждения пользователя."}
+          {"tool": ["bash", "shell"], "op": "append", "text": "Не запускай команды, которые меняют систему или удаляют данные, без подтверждения пользователя."}
         ]
       }
     }

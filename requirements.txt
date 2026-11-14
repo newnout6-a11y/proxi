@@ -1,5 +1,6 @@
 # Runtime dependency of the relay (pinned: WS client API differs between majors).
 websockets==13.1
+regex==2026.5.9
 
 # Test-only. They live here, not in a separate dev file, because the documented
 # test commands (`uv run --with-requirements requirements.txt ...`) and CI install

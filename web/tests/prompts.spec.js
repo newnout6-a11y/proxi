@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
-import { API_KEY, mockAdmin } from './fixtures.js';
-import { BUILTIN, SYSTEM_OPENCODE, initialDocument, mockPrompts } from './prompts-fixtures.js';
+import { API_KEY, NOW, mockAdmin } from './fixtures.js';
+import { BUILTIN, SYSTEM_OPENCODE, initialDocument, mockPrompts, recentRequests } from './prompts-fixtures.js';
 
 async function login(page) {
   await page.goto('./');
@@ -98,7 +98,7 @@ test('legacy mode still previews and lists pins, only the editors wait for a pro
   await tab(page, 'Тексты').click();
   await expect(page.getByRole('region', { name: 'Файл промптов не создан' })).toBeVisible();
   await tab(page, 'Пины').click();
-  await expect(page.locator('.pin-row')).toHaveCount(2);
+  await expect(page.locator('.pin-row')).toHaveCount(3);
 });
 
 test('a file the relay refused is reported with its reason and the revision that keeps working', async ({ page }) => {
@@ -170,7 +170,8 @@ test('edits of the client system are forms by operation: add, change, reorder an
   await expect(rows).toHaveCount(3);
   await rows.nth(2).getByLabel('Найти').fill('IMPORTANT');
   await rows.nth(2).getByLabel('Заменить на').fill('NOTE');
-  await rows.nth(2).getByLabel('Все вхождения').check();
+  // the relay replaces every occurrence unless told otherwise, so a new edit starts with the box ticked and says nothing about it
+  await expect(rows.nth(2).getByLabel('Все вхождения')).toBeChecked();
   await system.getByLabel('Новая правка').selectOption('remove_regex');
   await system.getByRole('button', { name: 'Добавить правку' }).click();
   await rows.nth(3).getByLabel('Регулярное выражение').fill('<env>[\\s\\S]*?</env>');
@@ -185,8 +186,93 @@ test('edits of the client system are forms by operation: add, change, reorder an
   expect(prompts.saves[0].body.document.profiles['mine-first'].client_system.edits).toEqual([
     { op: 'remove_tag', tag: 'available_skills' },
     { op: 'remove_regex', pattern: '<env>[\\s\\S]*?</env>', flags: 'is' },
-    { op: 'replace_text', find: 'IMPORTANT', with: 'NOTE', all: true },
+    { op: 'replace_text', find: 'IMPORTANT', with: 'NOTE' },
   ]);
+});
+
+test('"Все вхождения" is ticked unless the edit says all: false: unticking writes the false and a double click changes nothing', async ({ page }) => {
+  const document = initialDocument();
+  const profile = document.profiles['mine-first'];
+  // a profile the screen has already tidied, so that undoing an edit leaves nothing to save
+  delete profile.generation;
+  delete profile.publish_as_model;
+  delete profile.history.mid_system;
+  profile.client_system.edits.push({ op: 'replace_text', find: 'IMPORTANT', with: 'NOTE', all: false }, { op: 'replace_text', find: 'Tone', with: 'Voice' });
+  profile.history.user_blocks.push({ op: 'replace_text', find: 'Plan', with: 'Idea', all: false });
+  profile.tools.edits.push({ tool: 'edit', op: 'replace_text', find: 'file', with: 'path', all: false }, { tool: 'grep', op: 'replace_text', find: 'a', with: 'b', all: true });
+  const { prompts } = await openPrompts(page, { document });
+  const rows = (label) => section(page, label).locator('.p-edit');
+  const box = (label, index) => rows(label).nth(index).getByLabel('Все вхождения');
+
+  // the three lists read the missing key as "all", and the false as "only the first"
+  await expect(box('Правки system клиента', 2)).not.toBeChecked();
+  await expect(box('Правки system клиента', 3)).toBeChecked();
+  await expect(box('История диалога', 1)).not.toBeChecked();
+  await expect(box('Инструменты', 1)).not.toBeChecked();
+  await expect(box('Инструменты', 2)).toBeChecked();
+  await expect(rows('Правки system клиента').nth(2)).toContainText('Без галочки заменяется только первое вхождение');
+
+  // a double click turns the file into "all" and back: it is the same file, with nothing to save
+  await box('Правки system клиента', 2).dblclick();
+  await expect(box('Правки system клиента', 2)).not.toBeChecked();
+  await expect(savebar(page)).toHaveCount(0);
+
+  // unticking an edit that says nothing is the explicit false; ticking one that said false takes the key away
+  await box('Правки system клиента', 3).uncheck();
+  await box('Правки system клиента', 2).check();
+  await box('История диалога', 1).check();
+  await box('Инструменты', 1).check();
+  await box('Инструменты', 2).uncheck();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  const saved = prompts.saves[0].body.document.profiles['mine-first'];
+  expect(saved.client_system.edits.slice(2)).toEqual([
+    { op: 'replace_text', find: 'IMPORTANT', with: 'NOTE' },
+    { op: 'replace_text', find: 'Tone', with: 'Voice', all: false },
+  ]);
+  expect(saved.history.user_blocks[1]).toEqual({ op: 'replace_text', find: 'Plan', with: 'Idea' });
+  expect(saved.tools.edits.slice(1)).toEqual([
+    { tool: 'edit', op: 'replace_text', find: 'file', with: 'path' },
+    { tool: 'grep', op: 'replace_text', find: 'a', with: 'b', all: false },
+  ]);
+  // what the relay stored is what the boxes show now
+  await expect(savebar(page)).toHaveCount(0);
+  await expect(box('Правки system клиента', 2)).toBeChecked();
+  await expect(box('Правки system клиента', 3)).not.toBeChecked();
+});
+
+test('an edit that replaces with nothing deletes the text: the empty replacement is written, since the relay wants it said', async ({ page }) => {
+  const { prompts } = await openPrompts(page);
+  const system = section(page, 'Правки system клиента');
+  const rows = system.locator('.p-edit');
+  await system.getByLabel('Новая правка').selectOption('replace_text');
+  await system.getByRole('button', { name: 'Добавить правку' }).click();
+  await rows.nth(2).getByLabel('Найти').fill('IMPORTANT');
+  // the replacement is never typed: the edit is one the relay takes, and what it does is delete
+  await expect(rows.nth(2).getByLabel('Заменить на')).toHaveValue('');
+  await expect(rows.nth(2).getByLabel('Заменить на')).not.toHaveAttribute('aria-invalid', 'true');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  await expect(page.locator('.p-save-error')).toHaveCount(0);
+  expect(prompts.saves[0].body.document.profiles['mine-first'].client_system.edits[2]).toEqual({ op: 'replace_text', find: 'IMPORTANT', with: '' });
+
+  // typed and cleared again, it is still an empty string, and the same goes for the tools
+  await rows.nth(2).getByLabel('Найти').fill('IMPORTANT:');
+  await rows.nth(2).getByLabel('Заменить на').fill('NOTE');
+  await rows.nth(2).getByLabel('Заменить на').fill('');
+  const tools = section(page, 'Инструменты');
+  await tools.getByLabel('Новая правка').selectOption('replace_text');
+  await tools.getByRole('button', { name: 'Добавить правку' }).click();
+  await tools.locator('.p-edit').nth(1).getByLabel('Инструмент').fill('bash');
+  await tools.locator('.p-edit').nth(1).getByLabel('Найти').fill('Не запускай');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(2);
+  await expect(page.locator('.p-save-error')).toHaveCount(0);
+  const saved = prompts.saves[1].body.document.profiles['mine-first'];
+  expect(saved.client_system.edits[2]).toEqual({ op: 'replace_text', find: 'IMPORTANT:', with: '' });
+  expect(saved.tools.edits[1]).toEqual({ tool: 'bash', op: 'replace_text', find: 'Не запускай', with: '' });
+  // the live preview of the edit that deletes: the heading line of the section stays, the text it named is gone
+  await expect(live(page).getByRole('region', { name: 'Как сработали правки system клиента' }).locator('li').nth(2)).toContainText('Заменить текст');
 });
 
 test('the focus stays with the user in a list of edits: a new edit takes it, a move keeps it, a removal hands it on', async ({ page }) => {
@@ -277,6 +363,69 @@ test('history, tools, generation and publishing are saved only when they say som
   expect(saved.tools.edits).toEqual([{ tool: 'bash', op: 'append', text: 'Не запускай команды, меняющие систему, без подтверждения.' }, { tool: 'webfetch', hide: true }]);
   expect(saved.generation).toEqual({ effort: 'high', verbosity: 'low' });
   expect(saved.publish_as_model).toEqual(['claude-*', 'claude-opus-*']);
+});
+
+test('hiding a tool is an edit of a tool and nothing else: it is offered, shown as it is, edited, switched to another operation and back, and saved without an op', async ({ page }) => {
+  const document = initialDocument();
+  document.profiles['mine-first'].tools.edits.push({ tool: 'webfetch', hide: true });
+  const { prompts } = await openPrompts(page, { document });
+  const tools = section(page, 'Инструменты');
+  const hidden = tools.locator('.p-edit').nth(1);
+  // the relay lists hiding among the operations on tools, and the form of an existing one has a tool and no other parameter
+  await expect(tools.getByLabel('Новая правка').locator('option')).toHaveText([
+    'Добавить в конец описания', 'Добавить в начало описания', 'Заменить текст в описании', 'Заменить по выражению', 'Задать описание целиком', 'Скрыть инструмент']);
+  await expect(hidden.getByLabel('Операция правки 2')).toHaveValue('hide');
+  await expect(hidden.getByLabel('Операция правки 2').locator('option:checked')).toHaveText('Скрыть инструмент');
+  await expect(hidden.getByLabel('Инструмент')).toHaveValue('webfetch');
+  await expect(hidden).toContainText('Инструмент не попадёт к модели');
+  await expect(hidden.locator('.p-edit-fields > *')).toHaveCount(0);
+  await expect(hidden.getByLabel('Инструмент')).not.toHaveAttribute('aria-invalid', 'true');
+
+  // the name is edited like that of any tool, and an empty one is said to be missing
+  await hidden.getByLabel('Инструмент').fill('');
+  await expect(hidden.getByLabel('Инструмент')).toHaveAttribute('aria-invalid', 'true');
+  await hidden.getByLabel('Инструмент').fill('web*');
+  await expect(hidden.getByLabel('Инструмент')).not.toHaveAttribute('aria-invalid', 'true');
+
+  // another operation takes the tool along and leaves the hiding; the way back leaves what that operation had
+  await hidden.getByLabel('Операция правки 2').selectOption('append');
+  await expect(hidden.getByLabel('Инструмент')).toHaveValue('web*');
+  await hidden.getByLabel('Текст').fill('Осторожно.');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  expect(prompts.saves[0].body.document.profiles['mine-first'].tools.edits[1]).toEqual({ tool: 'web*', op: 'append', text: 'Осторожно.' });
+  await hidden.getByLabel('Операция правки 2').selectOption('hide');
+  await expect(hidden.locator('.p-edit-fields > *')).toHaveCount(0);
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(2);
+  expect(prompts.saves[1].body.document.profiles['mine-first'].tools.edits[1]).toEqual({ tool: 'web*', hide: true });
+
+  // a new one starts empty, asks for its tool, and is saved as tool and hide only
+  await tools.getByLabel('Новая правка').selectOption('hide');
+  await tools.getByRole('button', { name: 'Добавить правку' }).click();
+  const added = tools.locator('.p-edit').nth(2);
+  await expect(added.getByLabel('Инструмент')).toBeFocused();
+  await expect(added.getByLabel('Инструмент')).toHaveAttribute('aria-invalid', 'true');
+  await added.getByLabel('Инструмент').fill('mcp_*');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(3);
+  expect(prompts.saves[2].body.document.profiles['mine-first'].tools.edits.slice(1)).toEqual([{ tool: 'web*', hide: true }, { tool: 'mcp_*', hide: true }]);
+});
+
+test('a tool the document hides is shown as hidden even when the relay does not list that operation among those it offers', async ({ page }) => {
+  const document = initialDocument();
+  document.profiles['mine-first'].tools.edits.push({ tool: 'websearch', hide: true });
+  const without = { ...BUILTIN, edit_ops: { ...BUILTIN.edit_ops, tools: BUILTIN.edit_ops.tools.filter((op) => op !== 'hide') } };
+  const { prompts } = await openPrompts(page, { document, builtin: without });
+  const hidden = section(page, 'Инструменты').locator('.p-edit').nth(1);
+  await expect(hidden.getByLabel('Операция правки 2').locator('option:checked')).toHaveText('Скрыть инструмент');
+  await expect(hidden.getByLabel('Инструмент')).toHaveValue('websearch');
+  await expect(hidden).toContainText('Инструмент не попадёт к модели');
+  // a save of the document keeps the edit as it was
+  await head(page).fill('x {{client_system}}');
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  expect(prompts.saves[0].body.document.profiles['mine-first'].tools.edits[1]).toEqual({ tool: 'websearch', hide: true });
 });
 
 test('emptying the list of model masks keeps the list open for the next mask, and "all" and "none" are saved as they are', async ({ page }) => {
@@ -404,6 +553,12 @@ test('the live preview applies the profile under edit to the chosen sample and s
   const edited = panel.getByRole('region', { name: 'Как сработали правки system клиента' });
   await expect(edited.locator('li')).toHaveCount(2);
   await expect(edited.locator('li .tag', { hasText: 'сработала' })).toHaveCount(2);
+  // each says what it looked for, which comes from the edit in the profile, and how much it cut, which is the lengths the relay reports
+  await expect(edited.locator('li').nth(0)).toContainText('цель: # Code comments');
+  await expect(edited.locator('li').nth(0)).toContainText(/вырезано \d+ символ/);
+  await expect(edited.locator('li').nth(1)).toContainText('цель: available_skills');
+  await expect(edited).not.toContainText('chars_before');
+  await expect(edited).not.toContainText('chars_after');
 
   // an edit changes the answer within a moment
   const before = prompts.previews.length;
@@ -472,6 +627,37 @@ test('without a kept request the live panel asks for a sample and works from a p
   await expect(panel.getByRole('option', { name: 'Определить по телу (anthropic)' })).toBeAttached();
   await panel.getByLabel('Тело запроса (JSON)').fill('{"model": ');
   await expect(panel.getByText(/Не JSON/)).toBeVisible();
+});
+
+test('the starting profile says what it leaves a client with tools and no system, and the preview warns when the head comes out empty', async ({ page }) => {
+  await openPrompts(page);
+  await page.getByRole('button', { name: 'Новый профиль' }).click();
+  await expect(page.getByRole('radio', { name: /Как сейчас/ })).toBeChecked();
+  // it keeps the system of the client and the tasks of the relay, and no more than that: for a client with tools and no system the old path had a role
+  const starters = page.locator('.p-starters');
+  await expect(starters).toContainText('System клиента и задачи relay как сейчас');
+  await expect(starters).toContainText('Клиент с инструментами без system получит пустой head, а прежний путь дал бы ему роль {{native_role}}');
+  await expect(starters).not.toContainText('без изменений');
+  await page.getByLabel('Имя профиля').fill('same');
+  await page.getByRole('button', { name: 'Создать профиль' }).click();
+  await expect(head(page)).toHaveValue('{{client_system}}{{relay_task}}{{exec_reminder}}');
+
+  const panel = live(page);
+  const warning = panel.getByText('Модель не получит системного текста');
+  await panel.locator('summary', { hasText: 'Образец запроса' }).click();
+  await panel.getByRole('radio', { name: 'Своё тело запроса' }).check();
+  await panel.getByLabel('Заголовки').fill('User-Agent: opencode/1.4.2');
+  const tools = [{ name: 'bash', description: 'Run a command' }];
+  // a client with tools that sent no system: the head has nothing in it, and the model is told so before anyone finds out the hard way
+  await panel.getByLabel('Тело запроса (JSON)').fill(JSON.stringify({ model: 'claude-sonnet-5-5', tools, messages: [{ role: 'user', content: 'привет' }] }));
+  await expect(warning).toBeVisible();
+  const size = panel.locator('.p-facts div', { hasText: 'Размер head' }).locator('dd');
+  await expect(size).toHaveText(/^0 байт/);
+  await expect(panel).toContainText('Так бывает, когда клиент не прислал system');
+  // the same client with a system of its own has a head
+  await panel.getByLabel('Тело запроса (JSON)').fill(JSON.stringify({ model: 'claude-sonnet-5-5', system: 'Be brief.', tools, messages: [{ role: 'user', content: 'привет' }] }));
+  await expect(size).toHaveText(/^9 байт/);
+  await expect(warning).toHaveCount(0);
 });
 
 // --- rules ---------------------------------------------------------------------------------------------------------
@@ -787,6 +973,86 @@ test('a relay text the relay did not describe says so and starts empty', async (
   await expect(reminder.getByLabel('Обёртка напоминаний', { exact: true })).toHaveValue('');
 });
 
+test('a text name is judged by the pattern the relay publishes: what it would refuse is said in the form, before any save', async ({ page }) => {
+  const { prompts } = await openPrompts(page, {}, 'Тексты');
+  const named = page.getByRole('region', { name: 'Именованные тексты' });
+  const field = named.getByLabel('Новый текст: имя');
+  const add = named.getByRole('button', { name: 'Добавить текст' });
+  const refusal = named.locator('.p-add-text .p-error');
+  await expect(named.locator('.p-add-hint')).toContainText('Буквы, цифры, «_», «.» и «-», до 64 знаков');
+  for (const bad of ['-hidden', '.hidden', 'a b', 'a/b', 'a:b', 'a{b}', 'x'.repeat(65)]) {
+    await field.fill(bad);
+    await expect(add, bad).toBeDisabled();
+    await expect(refusal, bad).toContainText('Имя текста: буквы, цифры, «_», «.» и «-», до 64 знаков');
+  }
+  // what is unnamed is not yet wrong, and what the relay accepts goes through, letters of any script included
+  await field.fill('');
+  await expect(add).toBeDisabled();
+  await expect(refusal).toHaveCount(0);
+  for (const good of ['notes', 'правила', 'v1.2-final', '_x', 'x'.repeat(64)]) {
+    await field.fill(good);
+    await expect(add, good).toBeEnabled();
+    await expect(refusal, good).toHaveCount(0);
+  }
+  await field.fill('my_rules');
+  await expect(refusal).toContainText('Текст с таким именем уже есть');
+  await field.fill('правила');
+  await add.click();
+  const article = named.getByRole('article', { name: 'Текст правила' });
+  await expect(article).toBeVisible();
+
+  // a rename is judged by the same rule
+  await article.getByRole('button', { name: 'Переименовать' }).click();
+  for (const bad of ['-правила', 'two words']) {
+    await article.getByLabel('Новое имя').fill(bad);
+    await expect(article.getByRole('button', { name: 'Переименовать' }).last(), bad).toBeDisabled();
+    await expect(article.locator('.p-error'), bad).toContainText('Имя текста: буквы, цифры');
+  }
+  await article.getByLabel('Новое имя').fill('правила-2');
+  await expect(article.getByRole('button', { name: 'Переименовать' }).last()).toBeEnabled();
+  await article.getByLabel('Новое имя').press('Enter');
+
+  // and the name the screen let through is one the relay takes
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  expect(Object.keys(prompts.saves[0].body.document.texts)).toEqual(['my_rules', 'opus_role', 'правила-2']);
+  await expect(page.getByText('Промпты сохранены')).toBeVisible();
+});
+
+test('a text name rule other than the one the relay has today is quoted as it is written, not described', async ({ page }) => {
+  await openPrompts(page, { builtin: { ...BUILTIN, text_name: '[a-z]{1,8}' } }, 'Тексты');
+  const named = page.getByRole('region', { name: 'Именованные тексты' });
+  const field = named.getByLabel('Новый текст: имя');
+  const add = named.getByRole('button', { name: 'Добавить текст' });
+  await expect(named.locator('.p-add-hint')).toHaveText('Имя должно подходить под правило relay: [a-z]{1,8}');
+  await field.fill('Notes');
+  await expect(add).toBeDisabled();
+  await expect(named.locator('.p-add-text .p-error')).toHaveText('Имя текста не подходит под правило relay: [a-z]{1,8}');
+  await field.fill('notes');
+  await expect(add).toBeEnabled();
+  await expect(named.locator('.p-add-text .p-error')).toHaveCount(0);
+});
+
+test('a relay that publishes no text name rule leaves the screen with the bans it had, and the relay\'s own refusal reaches the save', async ({ page }) => {
+  const { text_name: _rule, ...older } = BUILTIN;
+  const { prompts } = await openPrompts(page, { builtin: older }, 'Тексты');
+  const named = page.getByRole('region', { name: 'Именованные тексты' });
+  const field = named.getByLabel('Новый текст: имя');
+  const add = named.getByRole('button', { name: 'Добавить текст' });
+  await expect(named.locator('.p-add-hint')).toHaveText('Имя без пробелов, фигурных скобок и двоеточий');
+  await field.fill('a b');
+  await expect(add).toBeDisabled();
+  await expect(named.locator('.p-add-text .p-error')).toHaveText('В имени нет пробелов, фигурных скобок и двоеточий');
+  await field.fill('-hidden');
+  await expect(add).toBeEnabled();
+  await add.click();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  await expect(page.locator('.p-save-error')).toContainText('Relay не принял документ: a text name uses letters, digits');
+  await expect(page.locator('.p-save-error code')).toHaveText('texts.-hidden');
+  await expect(savebar(page)).toBeVisible();
+});
+
 // --- preview -------------------------------------------------------------------------------------------------------
 
 test('a pasted request is previewed with its headers and dialect: rule, profile, revision, parts and what was changed', async ({ page }) => {
@@ -824,13 +1090,20 @@ test('a pasted request is previewed with its headers and dialect: rule, profile,
   await expect(edited.locator('li').nth(0)).toContainText('Убрать раздел');
   await expect(edited.locator('li').nth(0)).toContainText('правка 1');
   await expect(edited.locator('li').nth(0)).toContainText('сработала');
+  // the relay says which edit did what and how long the system was before and after; the target is read off the edit in the profile
   await expect(edited.locator('li').nth(0)).toContainText('цель: # Code comments');
+  await expect(edited.locator('li').nth(0)).toContainText('вырезано 116 символов');
   await expect(edited.locator('li').nth(1)).toContainText('Убрать блок тега');
   await expect(edited.locator('li').nth(1)).toContainText('сработала');
+  await expect(edited.locator('li').nth(1)).toContainText('цель: available_skills');
+  await expect(edited.locator('li').nth(1)).toContainText(/вырезано \d+ символ/);
+  await expect(edited).not.toContainText(/chars_(before|after)/);
   const history = result.getByRole('region', { name: 'Изменения истории' });
   await expect(history).toContainText('Убрать блок тега');
   await expect(history).toContainText('история · правка 1');
-  await expect(history).toContainText('цель: system-reminder');
+  // `target` of a change of the history is the kind of message it was made in, as the relay says
+  await expect(history).toContainText('цель: user');
+  await expect(history).not.toContainText('system-reminder');
   await expect(history).toContainText('позиции в теле: 0');
   await expect(result.getByRole('region', { name: 'Изменения инструментов' })).toContainText('Добавить в конец описания');
   await expect(result.getByRole('region', { name: 'Изменения инструментов' })).toContainText('инструменты · правка 1');
@@ -899,7 +1172,7 @@ test('a big body folds the entries of one edit into one line with a count, and a
   await expect(blocks).toContainText('Убрать блок тега');
   await expect(blocks).toContainText('история · правка 1');
   await expect(blocks).toContainText('12 раз');
-  await expect(blocks).toContainText('цель: system-reminder');
+  await expect(blocks).toContainText('цель: user');
   await expect(blocks).toContainText('позиции в теле: 0, 1, 2, 3, 4, 5 и ещё 6');
   await expect(blocks).toContainText('убрано симв.: 626');
   const mid = history.locator('li').nth(1);
@@ -917,7 +1190,9 @@ test('a big body folds the entries of one edit into one line with a count, and a
   await expect(tools.locator('li').nth(1)).toContainText('Скрыть инструмент');
   await expect(tools.locator('li').nth(1)).toContainText('инструменты · правка 3');
   await expect(tools.locator('li').nth(1)).toContainText('инструмент: webfetch');
-  await expect(tools.locator('li').nth(1)).toContainText('удалено: 1');
+  // a tool that is hidden takes its whole description out of the request: that is what the relay counts for it
+  await expect(tools.locator('li').nth(1)).toContainText('убрано симв.: 12');
+  await expect(tools.locator('li').nth(1)).not.toContainText('удалено');
 
   // an edit the relay skipped is not among the applied ones: it has a place of its own, and says why
   const skipped = result.getByRole('region', { name: 'Не применены' });
@@ -964,6 +1239,9 @@ test('a protected service request says so, and a request no rule takes falls bac
   await expect(result).toContainText('Ни одно правило не сработало и профиля по умолчанию нет');
   await expect(result.locator('.p-facts')).toContainText('legacy: прежний путь');
   await expect(result.getByText('Head пуст')).toBeVisible();
+  // the model is told there will be no system text, and the profile that is not there is not blamed for it
+  await expect(result.getByText('Модель не получит системного текста')).toBeVisible();
+  await expect(result).not.toContainText('шаблон профиля ничего не добавляет');
 });
 
 test('a recent request is previewed by its id, and only requests whose body the relay still holds are offered', async ({ page }) => {
@@ -980,6 +1258,32 @@ test('a recent request is previewed by its id, and only requests whose body the 
   expect(prompts.previews.at(-1).body).toEqual({ request_id: 'req-cc-1' });
   await select.selectOption('req-open-1');
   await expect(result.locator('.p-facts')).toContainText('mine-first');
+});
+
+test('the preview starts from the newest request that is not a service one, even when the relay still holds the body of a title', async ({ page }) => {
+  // the relay of today keeps no body of a service request; one that does must not make a title the sample the screen starts from
+  const title = { request_id: 'req-title-new', ts: NOW - 5, conversation: 'c-7f2a', rev: 3, pinned: false,
+    sample: { body: { model: 'claude-haiku-4-5', system: 'Generate a title', max_tokens: 64, messages: [{ role: 'user', content: 'привет' }] }, dialect: 'anthropic',
+      headers: { 'user-agent': 'opencode/1.4.2', 'x-test-purpose': 'session-title' } } };
+  const { prompts } = await openPrompts(page, { recent: [title, ...recentRequests()], keepProtected: true }, 'Предпросмотр');
+  const select = page.getByRole('region', { name: 'Образец' }).getByLabel('Запрос', { exact: true });
+  // the title is offered like the others for whoever wants to look at it, and it is the newest of them all
+  await expect(select.locator('option').nth(1)).toContainText('session-title');
+  await expect(select).toHaveValue('req-open-2');
+  const result = page.getByRole('region', { name: 'Результат предпросмотра' });
+  await expect(result.locator('.p-facts')).toContainText('mine-first');
+  await expect.poll(() => prompts.previews.length).toBeGreaterThan(0);
+  expect(prompts.previews.every((item) => item.body.request_id === 'req-open-2')).toBe(true);
+  // the profile editor starts from the same request
+  await tab(page, 'Профили').click();
+  await expect.poll(() => prompts.previews.some((item) => item.body.document?.default_profile === 'mine-first')).toBe(true);
+  expect(prompts.previews.every((item) => item.body.request_id === 'req-open-2')).toBe(true);
+  await expect(live(page)).toContainText('opencode · claude-sonnet-5-5');
+  // a title can still be chosen on purpose, and it is told to be a service request under protection
+  await tab(page, 'Предпросмотр').click();
+  await select.selectOption('req-title-new');
+  await expect(result).toContainText('Это служебный запрос под защитой');
+  await expect(result.locator('.p-facts')).toContainText('protected: service requests');
 });
 
 test('an unsaved draft is previewed until the saved revision is asked for, and the head is cut by code points', async ({ page }) => {
@@ -1007,6 +1311,20 @@ test('an unsaved draft is previewed until the saved revision is asked for, and t
   await expect.poll(() => prompts.previews.length).toBeGreaterThan(before);
   expect('document' in prompts.previews.at(-1).body).toBe(false);
   await expect(result.locator('.head-text [data-source="text:my_rules"]')).toBeVisible();
+});
+
+test('the report names what an edit looked for by the document the preview was judged by: the draft, or the saved revision', async ({ page }) => {
+  await openPrompts(page);
+  // the draft changes what the first edit looks for; the saved revision still looks for the old heading
+  await section(page, 'Правки system клиента').locator('.p-edit').first().getByLabel('Заголовок').fill('# Tool usage policy');
+  await tab(page, 'Предпросмотр').click();
+  const result = page.getByRole('region', { name: 'Результат предпросмотра' });
+  const first = result.getByRole('region', { name: 'Как сработали правки system клиента' }).locator('li').first();
+  await expect(first).toContainText('цель: # Tool usage policy');
+  await expect(first).toContainText('сработала');
+  await page.getByRole('group', { name: 'Документ' }).getByRole('button', { name: 'Сохранённая ревизия' }).click();
+  await expect(first).toContainText('цель: # Code comments');
+  await expect(first).not.toContainText('# Tool usage policy');
 });
 
 // --- what the model saw ----------------------------------------------------------------------------------------------
@@ -1085,7 +1403,8 @@ test('with no requests the list says what will appear there', async ({ page }) =
 test('pinned conversations show their revision against the current one and can be unpinned one by one', async ({ page }) => {
   const { prompts } = await openPrompts(page, {}, 'Пины');
   const rows = page.locator('.pin-row');
-  await expect(rows).toHaveCount(2);
+  // a conversation has a pin for each purpose: c-7f2a is listed twice
+  await expect(rows).toHaveCount(3);
   await expect(rows.nth(0)).toContainText('c-7f2a');
   await expect(rows.nth(0)).toContainText('client-tools');
   await expect(rows.nth(0)).toContainText('mine-first');
@@ -1094,9 +1413,15 @@ test('pinned conversations show their revision against the current one and can b
   await expect(rows.nth(0).locator('.tag')).toHaveClass(/tone-warn/);
   await expect(rows.nth(0).locator('.tag')).toHaveAttribute('title', /не видит новых правок/);
   await expect(rows.nth(1).locator('.tag')).toHaveClass(/tone-pos/);
+  await expect(rows.nth(2)).toContainText('c-7f2a');
+  await expect(rows.nth(2)).toContainText('client-service');
+  // an unpin takes the conversation off for every purpose it has, and the button of a conversation with several pins says so
+  await expect(rows.nth(0).getByRole('button', { name: 'Открепить диалог c-7f2a' })).toHaveAttribute('title', 'Снимет все закрепления этого диалога (2), не только это назначение');
+  await expect(rows.nth(1).getByRole('button', { name: 'Открепить диалог c-91d0' })).not.toHaveAttribute('title', /.+/);
   await rows.nth(0).getByRole('button', { name: 'Открепить диалог c-7f2a' }).click();
   await expect(page.getByText('Диалог откреплён')).toBeVisible();
   await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText('c-91d0');
   expect(prompts.pinActions).toHaveLength(1);
   expect(prompts.pinActions[0].body).toEqual({ action: 'unpin', conversation: 'c-7f2a' });
   expect(prompts.pinActions[0].headers['x-admin-request']).toBe('1');
@@ -1106,6 +1431,7 @@ test('applying the revision to every conversation asks first and says it costs a
   const { prompts } = await openPrompts(page, {}, 'Пины');
   await page.getByRole('button', { name: 'Применить ко всем' }).click();
   const confirm = page.getByRole('group').filter({ hasText: 'Применить текущую ревизию ко всем диалогам?' });
+  // three pins of two conversations: the question counts what the answer takes off, the conversations
   await expect(confirm).toContainText('у 2 диалогов');
   await expect(confirm).toContainText('ревизию 3');
   await expect(confirm).toContainText('сбрасывает кэш промпта и подписи thinking');
@@ -1119,11 +1445,33 @@ test('applying the revision to every conversation asks first and says it costs a
   await page.getByRole('button', { name: 'Применить ко всем' }).click();
   await page.getByRole('button', { name: 'Да, применить ко всем' }).click();
   await expect(page.getByText('Ревизия применена ко всем')).toBeVisible();
-  await expect(page.getByText('Снято закреплений: 2')).toBeVisible();
+  // what the relay reports is the pins it dropped, one for each purpose
+  await expect(page.getByText('Снято закреплений: 3')).toBeVisible();
   expect(prompts.pinActions).toHaveLength(1);
   expect(prompts.pinActions[0].body).toEqual({ action: 'apply_all' });
   await expect(page.getByText('Закреплённых диалогов нет')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Применить ко всем' })).toBeDisabled();
+});
+
+test('the question about applying to all counts conversations, one or several, however many purposes they are pinned for', async ({ page }) => {
+  const { prompts } = await openPrompts(page);
+  prompts.pins = [
+    { conversation: 'c-7f2a', purpose: 'client-tools', rev: 3, profile: 'mine-first', age_s: 60 },
+    { conversation: 'c-7f2a', purpose: 'client-service', rev: 3, profile: 'passthrough', age_s: 50 },
+    { conversation: 'c-7f2a', purpose: 'client-text', rev: 3, profile: null, age_s: 40 },
+  ];
+  await tab(page, 'Пины').click();
+  await expect(page.locator('.pin-row')).toHaveCount(3);
+  await page.getByRole('button', { name: 'Применить ко всем' }).click();
+  await expect(page.getByRole('group').filter({ hasText: 'Применить текущую ревизию ко всем диалогам?' })).toContainText('у 1 диалога,');
+  await page.getByRole('button', { name: 'Отмена' }).click();
+
+  prompts.pins = Array.from({ length: 5 }, (_, n) => ({ conversation: `c-${n % 5}`, purpose: n < 3 ? 'client-tools' : 'client-service', rev: 3, profile: 'mine-first', age_s: 10 + n }))
+    .concat([{ conversation: 'c-0', purpose: 'client-text', rev: 3, profile: 'mine-first', age_s: 99 }]);
+  await page.locator('.p-pins').getByRole('button', { name: 'Обновить' }).click();
+  await expect(page.locator('.pin-row')).toHaveCount(6);
+  await page.getByRole('button', { name: 'Применить ко всем' }).click();
+  await expect(page.getByRole('group').filter({ hasText: 'Применить текущую ревизию ко всем диалогам?' })).toContainText('у 5 диалогов,');
 });
 
 // --- saving ------------------------------------------------------------------------------------------------------------
@@ -1306,7 +1654,7 @@ for (const [status, lead, message] of [
   });
 }
 
-test('the relay\'s warnings about the document are shown for as long as they apply, and a save brings the new ones', async ({ page }) => {
+test('the relay\'s warnings about the document, its own and the engine\'s, are shown once each for as long as they apply, and a save brings the new ones', async ({ page }) => {
   const { prompts } = await openPrompts(page);
   const warnings = page.locator('.p-doc-warnings');
   await expect(warnings).toHaveCount(0);
@@ -1318,18 +1666,69 @@ test('the relay\'s warnings about the document are shown for as long as they app
   await expect(warnings).toHaveCount(0);
   await saveButton(page).click();
   await expect(warnings).toContainText('Предупреждения relay о документе');
-  await expect(warnings.locator('li')).toHaveCount(2);
-  await expect(warnings).toContainText('protected.enabled: false');
-  await expect(warnings).toContainText('rules[2] «opencode»: override_protected');
+  // the save names the relay's words and the engine's, the list that comes with the document names the same ones: each is shown once
+  const both = [
+    'Защита служебных запросов выключена (protected.enabled: false): заголовки, сжатие и проверки клиентов получат ваш промпт вместо своего',
+    'Правило «opencode» перекрывает защиту служебных запросов (override_protected)',
+    'protected.enabled is false: title, compaction and other service requests are no longer kept out of the profiles',
+    "rule 'opencode' overrides the protection of service requests",
+  ];
+  await expect(warnings.locator('li')).toHaveText(both);
   // the screen reloaded after the save: the list is the relay's own, and it is still there after another look at the file
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-  await expect(warnings.locator('li')).toHaveCount(2);
+  await expect(warnings.locator('li')).toHaveText(both);
+  await page.getByRole('button', { name: 'Перезагрузить' }).click();
+  await expect(warnings.locator('li')).toHaveText(both);
 
+  // the document read afresh has its rules closed: open the one to put right
+  await userRule(page, 2).getByRole('button', { name: /opencode/ }).first().click();
   await page.getByRole('switch', { name: 'Защита служебных запросов' }).click();
   await userRule(page, 2).getByLabel('Применять и к защищённым запросам (override_protected)').uncheck();
   await saveButton(page).click();
   await expect.poll(() => prompts.saves.length).toBe(2);
   await expect(warnings).toHaveCount(0);
+});
+
+test('a document that hides a tool is warned about as soon as it is read, because the list that comes with it has the engine\'s words too', async ({ page }) => {
+  const document = initialDocument();
+  document.profiles['mine-first'].tools.edits.push({ tool: 'webfetch', hide: true });
+  await openPrompts(page, { document });
+  const warnings = page.locator('.p-doc-warnings');
+  await expect(warnings.locator('li')).toHaveText(['profiles.mine-first hides a tool: removing a tool from a signed dialog resets its history, so keep such conversations pinned']);
+  // taking the edit away is judged when the document is saved, like every other warning
+  await page.getByRole('button', { name: 'Удалить правку 2' }).last().click();
+  await expect(warnings.locator('li')).toHaveCount(1);
+  await saveButton(page).click();
+  await expect(warnings).toHaveCount(0);
+});
+
+test('a relay that lists only its own words with the document still has the engine\'s words of its last save shown, for as long as that document stands', async ({ page }) => {
+  const { prompts } = await openPrompts(page, { listWarnings: 'document' });
+  const warnings = page.locator('.p-doc-warnings');
+  await expect(warnings).toHaveCount(0);
+  // a tool hidden and protection off: the engine has a word about the first, and the relay has one about the second
+  const tools = section(page, 'Инструменты');
+  await tools.getByLabel('Новая правка').selectOption('hide');
+  await tools.getByRole('button', { name: 'Добавить правку' }).click();
+  await tools.locator('.p-edit').nth(1).getByLabel('Инструмент').fill('webfetch');
+  await tab(page, 'Правила').click();
+  await page.getByRole('switch', { name: 'Защита служебных запросов' }).click();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  await expect(warnings.locator('li')).toHaveText([
+    'Защита служебных запросов выключена (protected.enabled: false): заголовки, сжатие и проверки клиентов получат ваш промпт вместо своего',
+    'profiles.mine-first hides a tool: removing a tool from a signed dialog resets its history, so keep such conversations pinned',
+    'protected.enabled is false: title, compaction and other service requests are no longer kept out of the profiles',
+  ]);
+
+  // somebody else saves another document meanwhile: what the last save said is not about it, and only the relay's own list is left
+  await tab(page, 'Профили').click();
+  await head(page).fill('x {{client_system}}');
+  prompts.rev = 9;
+  prompts.doc = { ...initialDocument(), protected: { enabled: false } };
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(page.locator('.p-conflict')).toBeVisible();
+  await expect(warnings.locator('li')).toHaveText(['Защита служебных запросов выключена (protected.enabled: false): заголовки, сжатие и проверки клиентов получат ваш промпт вместо своего']);
 });
 
 test('a relay that lists no warnings with the document still has the warnings of its last save shown', async ({ page }) => {
@@ -1463,7 +1862,8 @@ test('the name rule, the size limits, the special targets and the relay-only var
   await tab(page, 'Тексты').click();
   const structured = page.getByRole('article', { name: 'Обёртка структурированного ответа' });
   await structured.getByText('Пример контракта, как он выглядит в head').click();
-  await expect(structured).toContainText('Reply with one JSON object that matches the schema "answer".');
+  await expect(structured).toContainText('[STRUCTURED OUTPUT FORMAT]');
+  await expect(structured).toContainText('Schema name: example');
 });
 
 test('a relay that names no limits, special targets or name rule leaves the documented ones', async ({ page }) => {
@@ -1845,6 +2245,11 @@ for (const width of [280, 320, 414, 1440]) {
     await live(page).getByRole('button', { name: 'Итоговый head' }).click();
     expect((await overflow()).wide).toEqual([]);
     expect((await overflow()).page).toBeLessThanOrEqual(1);
+    // the form of a new profile with the starting points and their captions, and the question about applying to all
+    await page.getByRole('button', { name: 'Новый профиль' }).evaluate((element) => element.click());
+    await expect(page.locator('.p-starters')).toContainText('Клиент с инструментами без system');
+    expect({ ...(await overflow()), form: 'new profile' }).toEqual({ page: expect.any(Number), wide: [], form: 'new profile' });
+    expect((await overflow()).page).toBeLessThanOrEqual(1);
   });
 }
 
@@ -1909,6 +2314,9 @@ for (const theme of ['dark', 'light']) {
     await page.getByRole('button', { name: 'Переименовать' }).first().click();
     await page.getByLabel('Новое имя').fill('has space');
     await scan('the rename form of a text');
+    await page.getByRole('region', { name: 'Именованные тексты' }).getByLabel('Новый текст: имя').fill('bad name');
+    await expect(page.locator('.p-add-text .p-error')).toBeVisible();
+    await scan('a refused name of a new text');
     await tab(page, 'Предпросмотр').click();
     await page.getByRole('radio', { name: 'Своё тело запроса' }).check();
     await page.getByLabel('Тело запроса (JSON)').fill('{oops');
@@ -1916,6 +2324,10 @@ for (const theme of ['dark', 'light']) {
     await page.getByLabel('Тело запроса (JSON)').fill(JSON.stringify({ model: 'm', system: 'Короткий', messages: [] }));
     await page.getByLabel('Заголовки').fill('User-Agent: opencode/1');
     await scan('a preview of a pasted request');
+    // the head of the draft is {{client_system}} by now: a client that sends no system leaves it empty, and the notice says so
+    await page.getByLabel('Тело запроса (JSON)').fill(JSON.stringify({ model: 'm', tools: [{ name: 'bash' }], messages: [] }));
+    await expect(page.getByText('Модель не получит системного текста')).toBeVisible();
+    await scan('a preview whose head is empty');
     await tab(page, 'Что увидела модель').click();
     await page.locator('.seen-item').nth(4).click();
     await scan('a protected request among the recent ones');

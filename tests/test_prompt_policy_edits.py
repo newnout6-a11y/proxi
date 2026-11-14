@@ -311,7 +311,8 @@ def test_a_missing_target_is_a_warning_and_not_an_error(tmp_path):
     assert "<env>" not in head
     unmatched = [line for line in warnings if "matched nothing" in line]
     assert len(unmatched) == 7
-    assert "client_system.edits[0] (remove_section # Gone) matched nothing" in warnings
+    assert "client_system.edits[0] (remove_section) matched nothing" in warnings
+    assert not any("# Gone" in line for line in warnings)
     assert not any("edits[1]" in line for line in warnings)
 
 

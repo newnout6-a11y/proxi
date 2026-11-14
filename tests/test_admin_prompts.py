@@ -106,12 +106,14 @@ def test_the_builtin_vocabularies_are_the_constants_of_the_engine(api):
     assert builtin["edit_ops"] == {"client_system": list(prompt_policy.SYSTEM_EDIT_OPS),
                                    "mid_system": list(prompt_policy.MID_SYSTEM_MODES),
                                    "user_blocks": list(prompt_policy.USER_BLOCK_OPS),
-                                   "tools": list(prompt_policy.TOOL_EDIT_OPS)}
+                                   # a hidden tool is {"tool", "hide": true}: the form offers it as one more operation
+                                   "tools": [*prompt_policy.TOOL_EDIT_OPS, "hide"]}
     assert builtin["special_uses"] == list(prompt_policy.SPECIAL_USES)
     assert builtin["profiles"] == ["passthrough"] == list(prompt_policy.BUILTIN_PROFILES)
     assert builtin["limits"] == {"max_text_bytes": prompt_policy.MAX_TEXT_BYTES,
                                  "max_document_bytes": prompt_policy.MAX_DOCUMENT_BYTES}
     assert builtin["profile_name"] == prompt_policy.PROFILE_NAME.pattern
+    assert builtin["text_name"] == prompt_policy.TEXT_NAME.pattern
 
 
 def test_the_builtin_conditions_name_every_condition_with_its_kind_and_known_values(api):

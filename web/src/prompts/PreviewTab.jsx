@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { previewRequest } from './api.js';
+import { systemEditsOf } from './draft.js';
 import { usePreview } from './hooks.js';
 import HeadView from './HeadView.jsx';
 import { PreviewFacts, PreviewLists } from './PreviewResult.jsx';
@@ -7,13 +8,18 @@ import SampleInput from './SampleInput.jsx';
 import { Notice } from './controls.jsx';
 import { TriangleAlert } from 'lucide-react';
 
-/** One request through the whole document: which rule and profile took it, the head the model gets and what was changed. */
-export default function PreviewTab({ apiKey, doc, dirty, sampleState, setSampleState, resolved, recent, detected, refreshRecent, onUnauthorized }) {
+/**
+ * One request through the whole document: which rule and profile took it, the head the model gets and what was changed.
+ * `saved` is the document in force, which answers when the draft is not the one judged.
+ */
+export default function PreviewTab({ apiKey, doc, saved, dirty, sampleState, setSampleState, resolved, recent, detected, refreshRecent, onUnauthorized }) {
   const [source, setSource] = useState('draft');
   const judged = dirty && source === 'draft';
   const judgedDoc = judged ? doc : undefined;
   const body = useMemo(() => (resolved.sample ? previewRequest(resolved.sample, judgedDoc) : null), [resolved.sample, judgedDoc]);
   const { data, error, loading } = usePreview(apiKey, body, { onUnauthorized });
+  // the profile that answered is looked for in the document that was judged: its edits say what the report is about
+  const specs = data ? systemEditsOf(judged ? doc : saved ?? doc, data.profile) : [];
 
   return (
     <div className="p-preview">
@@ -45,7 +51,7 @@ export default function PreviewTab({ apiKey, doc, dirty, sampleState, setSampleS
           <>
             <PreviewFacts data={data} />
             <HeadView head={data.head} parts={data.parts} tall />
-            <PreviewLists data={data} />
+            <PreviewLists data={data} specs={specs} />
           </>
         )}
       </section>

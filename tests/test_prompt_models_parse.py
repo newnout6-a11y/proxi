@@ -70,10 +70,14 @@ def refused(call, status=400, param="model"):
     ("gpt-6-sol@x", ("gpt-6-sol", "x", None)),
     # Whitespace around the parts was always ignored around the effort; it is around the profile too.
     ("  claude-opus-5-5 @ mine # high ", ("claude-opus-5-5", "mine", "high")),
-    # A tail that is no effort stays in the name, as before.
+    # A tail that is no effort stays in the name, as before; so does an '@' after anything that is not a catalog model.
     ("claude-opus-5-5#bogus", ("claude-opus-5-5#bogus", None, None)),
-    ("a:b@mine", ("a:b", "mine", None)),
-    ("a#b@mine", ("a#b", "mine", None)),
+    ("a:b@mine", ("a:b@mine", None, None)),
+    ("a#b@mine", ("a#b@mine", None, None)),
+    ("claude-sonnet-4-5@20250929", ("claude-sonnet-4-5@20250929", None, None)),
+    ("claude-sonnet-4-5@20250929#high", ("claude-sonnet-4-5@20250929", None, "high")),
+    ("custom-model@mine:max", ("custom-model@mine", None, "max")),
+    ("vendor/claude-opus-9@v2", ("vendor/claude-opus-9@v2", None, None)),
     ("", ("", None, None)), ("   ", ("", None, None)), (None, ("", None, None)),
     ("#high", ("", None, "high")), (":max", ("", None, "max")),
 ])
@@ -113,11 +117,11 @@ def test_the_error_quotes_a_bounded_part_of_a_hostile_name():
 
 
 def test_profile_names_follow_prompt_policy_and_nothing_else(monkeypatch):
-    assert models.parse_model_name("m@" + LONGEST).profile == LONGEST
+    assert models.parse_model_name("gpt-6-sol@" + LONGEST).profile == LONGEST
     monkeypatch.setattr(prompt_policy, "PROFILE_NAME", re.compile(r"[a-z]{1,3}"))
-    assert models.parse_model_name("m@abc").profile == "abc"
-    refused(lambda: models.parse_model_name("m@abcd"))
-    refused(lambda: models.parse_model_name("m@ab1"))
+    assert models.parse_model_name("gpt-6-sol@abc").profile == "abc"
+    refused(lambda: models.parse_model_name("gpt-6-sol@abcd"))
+    refused(lambda: models.parse_model_name("gpt-6-sol@ab1"))
 
 
 def test_no_catalog_id_and_no_alias_contains_the_profile_separator():
@@ -187,11 +191,11 @@ def test_effort_downgrade_still_works_behind_a_profile(capsys):
     capsys.readouterr()
 
 
-def test_an_unknown_base_is_reported_without_the_profile_and_strict_off_keeps_its_id():
+def test_a_name_with_an_at_sign_after_an_unknown_model_is_one_unknown_model_and_strict_off_keeps_its_id():
     message = refused(lambda: models.resolve("claude-opus-9@mine"), status=404, param=None)
-    assert "claude-opus-9" in message and "mine" not in message
+    assert message == "unknown model 'claude-opus-9@mine'; see GET /v1/models"
     entry, _ = models.resolve("claude-opus-9@mine", strict=False)
-    assert entry["id"] == "claude-opus-9"
+    assert entry["id"] == "claude-opus-9@mine"
 
 
 def test_canonical_name_resolves_aliases_and_keeps_the_profile():
@@ -263,9 +267,10 @@ def test_a_missing_name_stands_for_the_default_model_and_its_profile(dialect):
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)
-def test_strict_models_off_accepts_an_unknown_base_with_a_profile(dialect):
+def test_strict_models_off_passes_a_name_with_an_at_sign_after_an_unknown_model_on_as_it_is(dialect):
     parsed = parse(dialect, body(dialect, "custom-model@mine"), dict(CFG, strict_models=False))
-    assert (parsed.model, parsed.requested_model, parsed.virtual_profile) == ("custom-model", "custom-model", "mine")
+    assert (parsed.model, parsed.requested_model, parsed.virtual_profile) == (
+        "custom-model@mine", "custom-model@mine", None)
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)

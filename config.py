@@ -116,6 +116,9 @@ DEFAULTS = {
 REQUIRED = ("base", "page_uuid", "ua")
 PROMPTS_FILE = "prompts.json"
 PROMPTS_FILE_MAX_CHARS = 4096
+# The counts and sizes of the stored conversations: whole positive numbers.
+STATE_NUMBERS = ("conversation_state_max_conversations", "conversation_state_ttl",
+                 "conversation_state_max_file_bytes", "conversation_state_max_total_bytes")
 
 # Cookie values that are just host names are not secrets.
 HOSTNAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
@@ -405,6 +408,20 @@ def _provider_access_warnings(cfg, record, name):
     return warnings
 
 
+def _whole_number(value):
+    """The integer a setting says: a whole number or its text; None for true/false, a fraction or anything else."""
+    if type(value) is int:
+        return value
+    if type(value) is float:
+        return int(value) if math.isfinite(value) and value == int(value) else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _check_pool_fields(record, name):
     """Admin pool controls: enabled (bool), priority (0..99, lower first), label (short text)."""
     if "enabled" in record and type(record["enabled"]) is not bool:
@@ -455,6 +472,12 @@ def _load(path):
         if value:
             cfg[key] = value
 
+    # Before the loop below, which would turn true into 1, 1.9 into 1 and crash on infinity.
+    for num_key in STATE_NUMBERS:
+        if _whole_number(cfg[num_key]) is None:
+            raise service_unavailable(f"config value '{num_key}' must be an integer (a whole number: "
+                                      "not true/false, not a fraction)")
+
     for num_key in ("port", "agent_mode", "max_body_bytes", "max_frame_bytes", "max_workers",
                     "turn_timeout", "recv_timeout", "upstream_timeout",
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
@@ -504,8 +527,7 @@ def _load(path):
         raise service_unavailable("conversation_state must be a boolean")
     if not isinstance(cfg["conversation_state_dir"], str):
         raise service_unavailable("conversation_state_dir must be a string (empty = <state-dir>/conversations)")
-    for key in ("conversation_state_max_conversations", "conversation_state_ttl",
-                "conversation_state_max_file_bytes", "conversation_state_max_total_bytes"):
+    for key in STATE_NUMBERS:
         if cfg[key] < 1:
             raise service_unavailable(f"{key} must be positive (set conversation_state to false to switch it off)")
     if cfg["conversation_state_max_file_bytes"] > cfg["conversation_state_max_total_bytes"]:

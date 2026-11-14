@@ -647,6 +647,21 @@ def _profile_pattern():
     return prompt_policy.PROFILE_NAME
 
 
+def _names_a_catalog_model(base):
+    """Whether `base`, what a client name has before its '@', is a catalog id or alias, as resolve() reads names.
+
+    An effort level written after it is ignored here: claude-opus-5-5#high@mine is a malformed virtual name (the
+    effort goes after the profile), not the name of some other model."""
+    for separator in ('#', ':'):
+        if separator in base:
+            head, tail = base.split(separator, 1)
+            if tail.strip().lower() in EFFORT_ORDER:
+                base = head.strip()
+            break
+    name = _canonical(base)
+    return name in _BY_ID or ('/' in name and _canonical(name.split('/', 1)[1]) in _BY_ID)
+
+
 def parse_model_name(name):
     """Take a client model name apart: <base>[@<profile>][#effort | :effort] -> ModelName(base, profile, effort).
 
@@ -654,6 +669,10 @@ def parse_model_name(name):
     '#', else the first ':', and only when what follows is a known level; any other tail stays in the name.
     Whitespace around the parts is ignored. A name without '@' comes out exactly as it did before profiles
     existed. A malformed profile part, or an effort written before it, is a 400 on param "model".
+
+    '@' separates a profile only after a model of the catalog (an id, an alias, either with a provider prefix). In any
+    other name it belongs to the model id, as it did before profiles existed: claude-sonnet-4-5@20250929 (a Vertex
+    style id) is one unknown model, which strict_models refuses and strict_models: false passes on as it is.
     """
     original = (name or '').strip()
     shown = original[:100]
@@ -669,6 +688,8 @@ def parse_model_name(name):
     if not at:
         return ModelName(text, None, effort)
     base, profile = base.strip(), profile.strip()
+    if base and not _names_a_catalog_model(base):
+        return ModelName(text, None, effort)
     if VIRTUAL_SEPARATOR in profile:
         raise bad_request("model '%s' has more than one '@'; write <model>@<profile>[#effort]" % shown, param='model')
     for separator in ('#', ':'):

@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { TriangleAlert } from 'lucide-react';
 import { BASELINE_DOCUMENT, forceProfile, previewRequest } from './api.js';
 import { Disclosure, Notice } from './controls.jsx';
+import { systemEditsOf } from './draft.js';
 import { diffLines } from './diff.js';
 import DiffView from './DiffView.jsx';
 import HeadView from './HeadView.jsx';
@@ -60,7 +61,7 @@ export default function LivePreview({ apiKey, doc, profile, sampleState, setSamp
           ) : (
             <HeadView head={data.head} parts={data.parts} label="Итоговый head профиля" />
           )}
-          <PreviewLists data={data} />
+          <PreviewLists data={data} specs={systemEditsOf(doc, profile)} />
         </div>
       )}
     </section>

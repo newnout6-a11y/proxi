@@ -422,8 +422,11 @@ def with_payload(blob, payload):
 CORRUPTIONS = {
     "truncated": (lambda blob: blob[:len(blob) // 2], "corrupt"),
     "empty": (lambda blob: b"", "corrupt"),
-    "garbage": (lambda blob: bytes(range(256)) * 4, "format"),
+    "cut_inside_the_signature": (lambda blob: blob[:10], "corrupt"),
+    "garbage": (lambda blob: bytes(range(256)) * 4, None),  # no signature of ours: not ours to judge or remove
     "foreign_version": (lambda blob: blob.replace(b'"format":1', b'"format":2', 1), "format"),
+    "foreign_blocks": (lambda blob: blob.replace(cs.STAMP.encode(), b"f" * len(cs.STAMP), 1), "format"),
+    "no_stamp": (lambda blob: blob.replace(b'"blocks":"' + cs.STAMP.encode() + b'",', b"", 1), "format"),
     "header_not_json": (lambda blob: cs.MAGIC + b"{not json\n" + split(blob)[1], "corrupt"),
     "payload_not_zlib": (lambda blob: with_payload(blob, b"this is not a zlib stream"), "corrupt"),
     "payload_wrong_shape": (lambda blob: with_payload(blob, zlib.compress(b'{"branches": "no"}')), "corrupt"),
@@ -441,13 +444,15 @@ def test_a_damaged_or_foreign_file_is_ignored_and_removed_and_the_conversation_g
     before.stop()
     path = state_file(state)
     damaged = mutate(path.read_bytes())
+    assert damaged != path.read_bytes()
     path.write_bytes(damaged)
     seq = journal.JOURNAL.last_seq
     after = processes(state, scripts=[DONE])
     events = asyncio.run(after.turn(parsed(messages)))
     assert events[-1] == {"type": "end", "reason": "stop"} and not any(e["type"] == "error" for e in events)
     assert "SIG-" not in json.dumps(after.sent[0].body)
-    assert [event["data"]["reason"] for event in stored(seq, "conversation_state.dropped")] == [reason]
+    assert [event["data"]["reason"] for event in stored(seq, "conversation_state.dropped")] == (
+        [] if reason is None else [reason])
     assert not stored(seq, "conversation_state.restored")
     # The damaged bytes are gone: the turn that followed stored a good state under the same name.
     assert path.read_bytes() != damaged
@@ -527,6 +532,9 @@ def test_a_branch_recorded_live_is_still_kept_when_upstream_refuses_a_request_bu
     assert not [e for e in stored(seq, "conversation_state.dropped") if e["data"]["reason"] == "rejected"]
 
 
+SIGNATURE_REFUSAL = b'{"message": "messages.1.content.0: Invalid `signature` in `thinking` block"}'
+
+
 @pytest.mark.parametrize("status,forgotten", [(400, True), (422, True), (408, False), (413, False), (429, False),
                                               (500, False), (503, False)])
 def test_only_a_refusal_of_the_request_itself_discards_a_restored_branch(tmp_path, processes, status, forgotten):
@@ -534,13 +542,18 @@ def test_only_a_refusal_of_the_request_itself_discards_a_restored_branch(tmp_pat
     before = processes(state, scripts=tool_scripts(2))
     messages = asyncio.run(converse(before, "chat", 2))
     before.stop()
-    after = processes(state, scripts=[refused(status, b"{}")])
+    # Every status carries the same words about the blocks: here the status decides (the words, in
+    # test_conversation_state_review).
+    after = processes(state, scripts=[refused(status, SIGNATURE_REFUSAL)])
     seq = journal.JOURNAL.last_seq
     events = asyncio.run(after.turn(parsed(messages)))
     assert events[-1]["type"] == "error"
     assert [branch.restored for branch in after.pool._conversations[KEY]._native_history.branches] == (
         [] if forgotten else [True])
-    assert bool([e for e in stored(seq, "conversation_state.dropped") if e["data"]["reason"] == "rejected"]) is forgotten
+    dropped = [e for e in stored(seq, "conversation_state.dropped") if e["data"]["reason"] == "rejected"]
+    assert bool(dropped) is forgotten
+    if forgotten:  # the status upstream sent, not the 400 the relay answers its client with for both
+        assert dropped[0]["data"]["upstream_status"] == status
 
 
 def test_a_process_that_dies_between_the_temporary_file_and_the_replace_leaves_the_previous_state(tmp_path):
@@ -553,7 +566,8 @@ import native_history
 
 def capture(label, pad):
     snapshot = native_history.Snapshot("scope", [], [{"role": "user", "content": label * pad}],
-                                       [{"type": "thinking", "thinking": "", "signature": "S-" + label}], {})
+                                       [{"type": "thinking", "thinking": "", "signature": "S-" + label}],
+                                       {"role": "assistant", "content": []})
     return cs.Capture("crash", cs.key_digest("crash"), "acc-one", (snapshot,), (0,), "key-" + label, 0, 1.0, (label,))
 
 store = cs.ConversationStore(sys.argv[1])
@@ -576,7 +590,8 @@ os._exit(3)  # not reached: the writer thread ended the process first
     assert loaded.cache_key == "key-A" and loaded.branches[0].assistant[0]["signature"] == "S-A"  # the older, whole one
     assert [path.name for path in state.iterdir() if path.name.startswith(cs.TEMP_PREFIX)]  # what the death left
     seq = journal.JOURNAL.last_seq
-    store = cs.ConversationStore(state)  # the next start: the leftover is a fresh write, left alone, the file is used
+    store = cs.ConversationStore(state)  # the next start: the leftover is nobody's write any more, the file is used
+    assert [path.name for path in state.iterdir() if path.name.startswith(cs.TEMP_PREFIX)] == []
     assert store.peek("crash").account == "acc-one"
     assert store.load("crash").state.cache_key == "key-A"
     assert not stored(seq, "conversation_state.dropped")
@@ -598,19 +613,44 @@ def test_a_failed_replacement_leaves_the_previous_complete_file(tmp_path, monkey
     store.close()
 
 
-def test_foreign_files_and_stale_temporaries_in_the_directory(tmp_path):
+def leftover(key, label="0" * 8):
+    """The name of the temporary file a write of `key` leaves behind when its process dies."""
+    return cs.TEMP_PREFIX + cs.key_digest(key) + "-" + label
+
+
+def test_foreign_files_stay_and_the_leftovers_of_dead_writes_go_at_the_next_start(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
-    (state / "notes.txt").write_text("not ours")
-    (state / "something.state.bak").write_text("not ours either")
-    old, fresh = state / (cs.TEMP_PREFIX + "x-old"), state / (cs.TEMP_PREFIX + "x-fresh")
+    foreign = {"notes.txt": b"not ours", "something.state.bak": b"not ours either",
+               "game.state": b"somebody else's save game",
+               cs.key_digest("lookalike") + cs.SUFFIX: b"our kind of name, but not our signature",
+               ".write-by-another-program": b"somebody else's temporary file"}
+    for name, content in foreign.items():
+        (state / name).write_bytes(content)
+    old, fresh = state / leftover("a-dead-write", "0" * 8), state / leftover("a-recent-write", "f" * 8)
     old.write_bytes(b"half a write")
-    fresh.write_bytes(b"a write in progress")
-    stale = time.time() - cs.TEMP_TTL - 60
+    fresh.write_bytes(b"a write that died a moment ago")
+    stale = time.time() - 86400
     os.utime(old, (stale, stale))
+    seq = journal.JOURNAL.last_seq
     cs.ConversationStore(state).close()
-    assert sorted(path.name for path in state.iterdir()) == sorted(
-        ["notes.txt", "something.state.bak", fresh.name])
+    # Any age: the relay that was writing it is gone. Nothing else is touched, and nothing is said about it.
+    assert sorted(path.name for path in state.iterdir()) == sorted(foreign)
+    assert not stored(seq, "conversation_state.dropped")
+    assert all((state / name).read_bytes() == content for name, content in foreign.items())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows refuses to remove a file that is open")
+def test_a_temporary_file_that_is_still_open_is_left_to_its_writer(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    busy = state / leftover("being-written")
+    with open(busy, "wb") as handle:
+        handle.write(b"a write in progress")
+        cs.ConversationStore(state).close()
+        assert busy.exists()
+    cs.ConversationStore(state).close()
+    assert not busy.exists()
 
 
 # -- limits ---------------------------------------------------------------------------------------------------------
@@ -745,7 +785,7 @@ def test_a_state_that_stays_too_large_is_said_once_and_never_retried_without_a_c
 
 
 def test_a_transient_failure_stays_marked_for_a_retry_until_the_next_state_is_submitted(tmp_path, monkeypatch):
-    store = cs.ConversationStore(tmp_path / "state")
+    store = cs.ConversationStore(tmp_path / "state", io_pause=0)  # no pause here: that is test_conversation_state_review
     key_id = cs.key_digest("flaky")
     monkeypatch.setattr(cs.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError(errno.EIO, "gone")))
     store.submit(capture_of("flaky"))

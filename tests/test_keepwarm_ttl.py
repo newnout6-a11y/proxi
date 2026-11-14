@@ -79,7 +79,8 @@ def test_regular_pings_keep_every_touch_inside_the_window_until_the_idle_limit(m
 
 @pytest.mark.parametrize("setting", ["cache_keepwarm_seconds", "cache_keepwarm_turn_offset"])
 def test_a_setting_that_would_miss_the_window_is_pulled_back_inside_it(monkeypatch, setting):
-    """3600 s between pings (the admin allows it) or a first in-turn ping at 285 s could never read the cache."""
+    """3600 s between pings (config.json takes it; the admin stops at PING_LATEST) or a first in-turn ping at 285 s could
+    never read the cache."""
     if setting == "cache_keepwarm_seconds":
         target = warm_session(_warm_at=START)
         clock, pings = drive(monkeypatch, target, {setting: 3600, "cache_keepwarm_idle": 5000}, seconds=700)

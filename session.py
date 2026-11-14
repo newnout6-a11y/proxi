@@ -1,6 +1,7 @@
 """Upstream Retool transport: thread creation, WebSocket turns, retries, cancellation."""
 import asyncio
 from collections import deque
+import contextlib
 import datetime as _datetime
 import hashlib
 import json
@@ -478,10 +479,11 @@ class RelaySession:
         """Yield normalised provider events, cleaning its poller on every exit."""
         if self.cfg.get("transport") == "direct":
             args = self._direct or {}
-            async for event in direct.iter_events(
+            async with contextlib.aclosing(direct.iter_events(
                     self.cfg, self, model_provider, prompt, args.get("head"), args.get("tools"),
-                    args.get("tool_choice"), args.get("max_tokens"), args.get("chunks")):
-                yield event
+                    args.get("tool_choice"), args.get("max_tokens"), args.get("chunks"))) as events:
+                async for event in events:
+                    yield event
             return
         try:
             await self.open()
@@ -857,8 +859,9 @@ class SessionLease:
         if self.released:
             yield {"type": "end", "reason": "cancelled"}
             return
-        async for event in self.session.stream(prompt, model_provider, tool_names):
-            yield event
+        async with contextlib.aclosing(self.session.stream(prompt, model_provider, tool_names)) as events:
+            async for event in events:
+                yield event
 
 
 class _Dependent:
@@ -916,19 +919,27 @@ class SessionPool:
         # Conversations that outlive a restart (conversation_state.ConversationStore), if one is attached.
         self._store = store
         self._state_skipped = set()
+        # Stored states being read, or read ahead of the request that will use them (conversation_state.Reading),
+        # and the conversations whose session is being made from one: nothing of a conversation is registered
+        # before its stored state is, so a request cancelled meanwhile leaves no empty session behind, and one
+        # that arrives meanwhile waits for it instead of starting from nothing beside it.
+        self._reads = {}
+        self._restoring = {}
 
     def attach_store(self, store):
         """Keep the state of conversations in `store` (None switches it off) from now on."""
         self._store = store
+        self._reads.clear()
 
-    def _persist(self, key):
+    def _persist(self, key, urgent=False):
         """Queue the stored copy of a conversation whose history, cache marks or account moved since the last one.
 
         The state is captured here, on the event loop, as references to immutable data; serializing and writing
-        it is the store's own thread's work, so a turn never waits for the disk and a failure cannot reach it."""
+        it is the store's own thread's work, so a turn never waits for the disk and a failure cannot reach it.
+        A conversation whose stored state is still being read is left alone: what it holds is not its state yet."""
         store = self._store
         owner = self._conversations.get(key)
-        if store is None or owner is None or self.mode != "per_conversation":
+        if store is None or owner is None or self.mode != "per_conversation" or key in self._restoring:
             return
         try:
             captured = conversation_state.capture(key, owner)
@@ -937,7 +948,7 @@ class SessionPool:
             if captured.mark == owner._state_mark and not store.failed(captured.key_id):
                 return
             owner._state_mark = captured.mark
-            store.submit(captured)
+            store.submit(captured, urgent)
         except Exception as exc:  # noqa: BLE001 - storing state must never break a request
             journal.emit("conversation_state.save_failed", "Состояние диалога не сохранено: capture (%s)"
                          % type(exc).__name__, "warn", conversation=journal.tag(key), reason="capture",
@@ -946,11 +957,12 @@ class SessionPool:
     def persist_pending(self):
         """Queue every conversation that has not been stored since it last moved (used when the relay stops)."""
         for key in list(self._conversations):
-            self._persist(key)
+            self._persist(key, urgent=True)
 
     def close_store(self, timeout=5.0):
         """Let the store finish writing what is queued, then detach it."""
         store, self._store = self._store, None
+        self._reads.clear()
         if store is not None:
             store.close(timeout)
 
@@ -966,22 +978,35 @@ class SessionPool:
             return "account_unavailable"
         return None if self._routable(backend, model_entry) else "no_route"
 
-    def _stored_affinity(self, conversation_key, model_entry, exclude):
+    def _stored_binding(self, keys, model_entry, exclude):
+        """(meta, backend, refusal) of the first of `keys` that has a stored state.
+
+        The backend is the account the state belongs to (None when that account is gone) and the refusal is why
+        that account cannot take this request (_state_refusal), else None. Nothing is stored: (None, None, None)."""
+        store = self._store
+        meta = next((found for found in (store.peek(key) for key in keys) if found is not None), None)
+        if meta is None:
+            return None, None, None
+        backend = next((item for item in self.backends if cfg_identity(item.cfg) == meta.account), None)
+        return meta, backend, self._state_refusal(backend, model_entry, exclude)
+
+    def _stored_affinity(self, conversation_key, model_entry, exclude, session_key=None):
         """The account a conversation stored before a restart belonged to, while it can still serve this request.
 
-        Mirrors the affinity of a live conversation (the main one, else its text one) under the same conditions:
-        an account that is switched off, paused, signed out, out of balance or without a route to the model is
-        not returned, and the conversation then moves the way a live one does, without its signed state."""
+        Mirrors the affinity of a live conversation under the same conditions. The file of the session the request
+        will use comes first (`session_key`: the text session of a plain chat has a file of its own, on an account
+        that may not be the main one's), then the main one, then the text one. An account that is switched off,
+        paused, signed out, out of balance or without a route to the model is not returned, and the conversation
+        then moves the way a live one does, without its signed state."""
         store = self._store
         if store is None or self.mode != "per_conversation" or not conversation_key:
             return None
         try:
-            meta = next((found for found in (store.peek(key) for key in (conversation_key, (conversation_key, "text")))
-                         if found is not None), None)
+            keys = list(dict.fromkeys(key for key in (session_key, conversation_key, (conversation_key, "text"))
+                                      if key))
+            meta, backend, reason = self._stored_binding(keys, model_entry, exclude)
             if meta is None:
                 return None
-            backend = next((item for item in self.backends if cfg_identity(item.cfg) == meta.account), None)
-            reason = self._state_refusal(backend, model_entry, exclude)
             if reason is None:
                 return backend
             if reason != "account_excluded" and (meta.key_id, reason) not in self._state_skipped:
@@ -994,24 +1019,112 @@ class SessionPool:
                          error=type(exc).__name__)
         return None
 
-    async def _restore_state(self, key, session):
-        """Give a session just created for a stored conversation its signed history and cache marks back."""
-        store = self._store
-        if store is None or self.mode != "per_conversation":
+    def _scoped_key(self, conversation_key, context_scope):
+        """The key of the pool session a request of this kind uses (acquire() and peek() agree on it)."""
+        if context_scope and (conversation_key or self.mode == "shared"):
+            return (None if self.mode == "shared" else conversation_key, context_scope)
+        return conversation_key
+
+    def _reading(self, key, meta):
+        """The read of the state stored for `key`: the one under way (or done, of the file as it still is), else a new
+        one."""
+        loop = asyncio.get_running_loop()
+        for name, old in list(self._reads.items()):
+            if old.done and loop.time() - old.born > conversation_state.RESTORE_KEEP:
+                del self._reads[name]  # nobody came for it
+        reading = self._reads.get(key)
+        if reading is None or not reading.current(meta):
+            while len(self._reads) >= conversation_state.RESTORE_READAHEAD and key not in self._reads:
+                del self._reads[next(iter(self._reads))]
+            reading = self._reads[key] = conversation_state.Reading(self._store, key, meta, loop)
+        return reading
+
+    async def load_stored(self, conversation_key=None, *, isolated=False, context_scope=None, model_entry=None,
+                          exclude=()):
+        """Read the state stored for the conversation that peek() is about to be asked about, so that peek can show it.
+
+        The first request of a conversation after a restart (or an eviction) has no live session for peek to show,
+        and its signed history is on disk. This reads it on the executor, in the time acquire() allows; it is the
+        very read acquire() then uses. Nothing is applied or registered, and nothing that goes wrong reaches the
+        request: peek then shows no branch, as it did before the state was kept."""
+        if isolated or self._store is None or self.mode != "per_conversation":
+            return
+        key = self._scoped_key(conversation_key, context_scope)
+        if not key or key in self._conversations:
             return
         try:
+            meta, _, refusal = self._stored_binding([key], model_entry, exclude)
+            if meta is not None and refusal is None:
+                await self._reading(key, meta).wait()
+        except Exception:  # noqa: BLE001 - acquire() meets the same failure and reports it
+            return
+
+    def _stored_view(self, key, model_entry, exclude):
+        """The branches stored for a conversation that has no live session, as a session shows them, once they have
+        been read (load_stored) and the account they belong to can serve the request: what acquire() gives back."""
+        reading = self._reads.get(key)
+        loaded = reading.loaded if reading is not None and self._store is not None else None
+        if loaded is None or self.mode != "per_conversation":
+            return None
+        meta = self._store.peek(key)
+        if meta is None or not reading.current(meta):
+            return None
+        backend = next((item for item in self.backends if cfg_identity(item.cfg) == loaded.header["account"]), None)
+        if self._state_refusal(backend, model_entry, exclude) is not None:
+            return None
+        return conversation_state.StoredSession(backend, loaded.state.branches)
+
+    async def _restore_state(self, key, session):
+        """Give a session that is about to be registered for a stored conversation its signed history and cache marks back.
+
+        (meta, loaded) when it did, for the caller to report once the session is registered. Nothing is registered
+        yet: a request cancelled here leaves no empty session behind (the read stays for the next one), and a
+        request of the same conversation that comes meanwhile waits at the gate, to continue from this session."""
+        store = self._store
+        if store is None or self.mode != "per_conversation":
+            return None
+        gate = reading = None
+        try:
             meta = store.peek(key)
-            if meta is not None and meta.account != cfg_identity(session.backend.cfg):
+            if meta is None:
+                return None
+            if meta.account != cfg_identity(session.backend.cfg):
                 # The conversation lives on another account than its stored state: nothing of it may follow.
                 # _stored_affinity has usually said why already; say it once, not for every such request.
                 if not any(key_id == meta.key_id for key_id, _ in self._state_skipped):
                     self._state_skipped.add((meta.key_id, "account_changed"))
                     store.skip(meta, "account_changed")
-                return
-            await conversation_state.restore(store, key, session)
+                return None
+            gate = self._restoring[key] = asyncio.Event()
+            reading = self._reading(key, meta)
+            loaded = await reading.wait()
+            if self._reads.get(key) is reading:
+                del self._reads[key]
+            if loaded is None:
+                return None
+            conversation_state.adopt(session, key, loaded)
+            return meta, loaded
         except Exception as exc:  # noqa: BLE001 - a stored state must never break a request
+            if reading is not None and self._reads.get(key) is reading:
+                del self._reads[key]  # it failed or ran out of time: the next request starts over
             journal.emit("conversation_state.restore_failed", "Не удалось восстановить состояние диалога (%s)"
                          % type(exc).__name__, "warn", conversation=journal.tag(key), error=type(exc).__name__)
+            return None
+        finally:
+            if gate is not None:
+                if self._restoring.get(key) is gate:
+                    del self._restoring[key]
+                gate.set()
+
+    def _report_restored(self, restored):
+        """Say, once the session is registered, that a stored state was put into it."""
+        store = self._store
+        if restored is None or store is None:
+            return
+        try:
+            store.restored(*restored)
+        except Exception:  # noqa: BLE001 - a report must never break the request it is about
+            pass
 
     @staticmethod
     def _route_refusal(backend, model_entry):
@@ -1256,16 +1369,17 @@ class SessionPool:
 
         It makes acquire's own choice, an account that can no longer serve the model (or that failed this request)
         included, so that a caller can read what the request is about to continue, its signed history, before the
-        turn begins."""
+        turn begins. A conversation whose state is only on disk, and has been read ahead (load_stored), shows what
+        acquire() will make of it: its account and its stored branches (conversation_state.StoredSession)."""
         if isolated:
             return None
-        key = conversation_key
-        if context_scope and (conversation_key or self.mode == "shared"):
-            key = (None if self.mode == "shared" else conversation_key, context_scope)
+        key = self._scoped_key(conversation_key, context_scope)
         if self._on_shared_session(isolated, context_scope):
             session = self._shared
         elif key and (self.mode == "per_conversation" or (self.mode == "shared" and context_scope)):
             session = self._conversations.get(key)
+            if session is None:
+                return self._stored_view(key, model_entry, exclude)
         else:
             session = None
         if session is None or not (self._usable(session.backend, exclude) and self._routable(session.backend, model_entry)):
@@ -1301,7 +1415,8 @@ class SessionPool:
             if affinity_backend is None and affinity_parent is None:
                 # No live conversation: one stored before a restart returns to its own account, under the
                 # same conditions (the account can serve this model now), so its cache is still reachable.
-                affinity_backend = self._stored_affinity(conversation_key, model_entry, exclude)
+                affinity_backend = self._stored_affinity(conversation_key, model_entry, exclude,
+                                                         self._scoped_key(conversation_key, context_scope))
             if context_scope and (conversation_key or self.mode == "shared"):
                 conversation_key = (None if self.mode == "shared" else conversation_key, context_scope)
             if self._on_shared_session(isolated, context_scope):
@@ -1323,6 +1438,14 @@ class SessionPool:
                 lock = self._conversation_locks.setdefault(key, asyncio.Lock())
                 self._conversation_refs[key] = self._conversation_refs.get(key, 0) + 1
                 referenced = True
+                gate = self._restoring.get(key)
+                if gate is not None:
+                    # The request that holds this conversation is reading its stored state: continue from the
+                    # session it is about to register, not beside it with nothing.
+                    try:
+                        await asyncio.wait_for(gate.wait(), conversation_state.RESTORE_TIMEOUT + 5)
+                    except asyncio.TimeoutError:
+                        pass
                 if lock.locked() and (getattr(self._conversations.get(key), "_direct", None)
                                       or getattr(self._conversations.get(key), "_cached_head", None)
                                       or self.cfg.get("transport") == "direct"
@@ -1381,11 +1504,14 @@ class SessionPool:
                         backend = affinity_backend or self._next_backend(model_entry, exclude)
                         self._check_route(backend, model_entry)
                         session = RelaySession(backend, await self._new_thread_id(backend))
+                        # Before it is registered: whoever looks for this conversation meanwhile waits at the gate
+                        # or starts cold without touching its file, and a cancelled request leaves nothing behind.
+                        restored = await self._restore_state(key, session)
                         self._conversations[key] = session
                         journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),
                                      account=account_tag(backend), pool=len(self._conversations))
-                        await self._restore_state(key, session)
+                        self._report_restored(restored)
                     keep = True
                     self._check_route(session.backend, model_entry)
             else:

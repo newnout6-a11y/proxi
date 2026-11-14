@@ -31,6 +31,12 @@ export function PreviewFacts({ data, forced = false }) {
           Это служебный запрос под защитой: он идёт с system клиента как есть, ваши правила к нему не применяются
         </Notice>
       )}
+      {data.head_bytes === 0 && (
+        <Notice tone="warn" icon={TriangleAlert}>
+          Модель не получит системного текста: head собрался пустым.
+          {data.profile !== null && !data.protected && ' Так бывает, когда клиент не прислал system, а шаблон профиля ничего не добавляет от себя'}
+        </Notice>
+      )}
       {legacy && !forced && (
         <Notice tone="warn" icon={TriangleAlert}>
           Ни одно правило не сработало и профиля по умолчанию нет: действует прежний путь, документ промптов этот запрос не меняет
@@ -61,7 +67,7 @@ function Row({ title, where, count = 1, status, details = [], note, tone = 'mute
         {status && <>{' '}{status}</>}
         {count > 1 && <>{' '}<span className="p-change-count mono">{fmtInt(count)} {plural(count, ['раз', 'раза', 'раз'])}</span></>}
       </span>
-      {details.length > 0 && <span className="p-change-details mono">{details.map(([name, value]) => `${name}: ${value}`).join(' · ')}</span>}
+      {details.length > 0 && <span className="p-change-details mono">{details.map(([name, value]) => (name ? `${name}: ${value}` : value)).join(' · ')}</span>}
       {note && <span className={tone === 'warn' ? 'p-change-note' : 'muted small'}>{note}</span>}
     </li>
   );
@@ -72,9 +78,10 @@ const total = (groups) => groups.reduce((sum, group) => sum + group.count, 0);
 /**
  * Warnings, what the edits of the client's system did, the edits that matched nothing, and what happened to the history
  * and the tools. A big body leaves one entry per message: they are folded by edit, and an edit the relay skipped is
- * listed apart with its reason.
+ * listed apart with its reason. `specs` are the edits of the client's system as the profile that answered has them: the
+ * report says which edit did what, and the edit itself says what it looked for.
  */
-export function PreviewLists({ data }) {
+export function PreviewLists({ data, specs = [] }) {
   const report = data.edits || [];
   const history = useMemo(() => groupChanges(data.history_changes), [data.history_changes]);
   const tools = useMemo(() => groupChanges(data.tools_changes), [data.tools_changes]);
@@ -95,7 +102,7 @@ export function PreviewLists({ data }) {
       {report.length > 0 && (
         <Section title="Как сработали правки system клиента" count={report.length}>
           {report.map((row) => {
-            const change = describeReport(row, data.edits_unmatched);
+            const change = describeReport(row, data.edits_unmatched, specs);
             return (
               <Row key={row.index} title={change.title} where={`правка ${change.number}`} details={change.details} tone={row.matched === false ? 'warn' : 'muted'}
                 status={row.matched === null ? null : <Tag tone={row.matched ? 'pos' : 'warn'}>{row.matched ? 'сработала' : 'не нашла'}</Tag>} />

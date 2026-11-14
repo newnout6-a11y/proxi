@@ -3,7 +3,7 @@ import { Plus, Trash } from 'lucide-react';
 import { Button, Tag } from '../ui.jsx';
 import { fmtInt } from '../format.js';
 import { Area, Disclosure, IconBtn, Line, Notice } from './controls.jsx';
-import { isObject, removeText, renameText, setRelayText, textNameError, textUsage, textsOf } from './draft.js';
+import { isObject, removeText, renameText, setRelayText, textNameError, textNameHint, textUsage, textsOf } from './draft.js';
 import { useFocusLater } from './hooks.js';
 
 const RELAY_TEXTS = [
@@ -29,7 +29,7 @@ function TextBody({ label, value, onChange, path, limit, rows = 6, placeholder }
   return <Area label={label} labelHidden value={typeof value === 'string' ? value : ''} onChange={onChange} rows={rows} limit={limit} path={path} placeholder={placeholder} />;
 }
 
-function NamedText({ doc, setDoc, name, limit, onRemoved, onRenamed }) {
+function NamedText({ doc, setDoc, name, limit, pattern, onRemoved, onRenamed }) {
   const value = doc.texts[name];
   const used = textUsage(doc, name);
   const [renaming, setRenaming] = useState(false);
@@ -37,7 +37,7 @@ function NamedText({ doc, setDoc, name, limit, onRemoved, onRenamed }) {
   const article = useRef(null);
   const focusLater = useFocusLater();
   const taken = Object.keys(doc.texts).filter((key) => key !== name);
-  const error = renaming ? textNameError(draft, taken) : null;
+  const error = renaming ? textNameError(draft, taken, pattern) : null;
   const set = (next) => setDoc((current) => ({ ...current, texts: { ...current.texts, [name]: next } }));
   // the form opens on its field and closes onto the button that opened it
   const rename = (open) => {
@@ -82,13 +82,13 @@ function NamedText({ doc, setDoc, name, limit, onRemoved, onRenamed }) {
   );
 }
 
-function NamedTexts({ doc, setDoc, limit }) {
+function NamedTexts({ doc, setDoc, limit, pattern }) {
   const texts = textsOf(doc);
   const names = Object.keys(texts);
   const [name, setName] = useState('');
   const root = useRef(null);
   const focusLater = useFocusLater();
-  const error = textNameError(name, names);
+  const error = textNameError(name, names, pattern);
   const articles = () => [...(root.current?.querySelectorAll('.p-texts > .p-text') || [])];
   // a removed text takes its buttons along: the focus goes to the text that took its place, or to the form that adds one
   const removed = (key) => {
@@ -109,11 +109,11 @@ function NamedTexts({ doc, setDoc, limit }) {
         </div>
       </div>
       {!names.length && <p className="p-empty-line muted">Текстов пока нет</p>}
-      {names.map((key) => <NamedText key={key} doc={doc} setDoc={setDoc} name={key} limit={limit} onRemoved={removed} onRenamed={renamed} />)}
+      {names.map((key) => <NamedText key={key} doc={doc} setDoc={setDoc} name={key} limit={limit} pattern={pattern} onRemoved={removed} onRenamed={renamed} />)}
       <form className="p-add-text" onSubmit={(event) => { event.preventDefault(); if (!error) { setDoc((current) => ({ ...current, texts: { ...textsOf(current), [name]: '' } })); setName(''); } }}>
         <Line label="Новый текст: имя" value={name} onChange={setName} placeholder="my_rules" />
         <Button type="submit" icon={Plus} disabled={!!error}>Добавить текст</Button>
-        <p className="p-hint p-add-hint">Имя без пробелов, фигурных скобок и двоеточий</p>
+        {name && error ? <p className="p-error p-add-hint">{error}</p> : <p className="p-hint p-add-hint">{textNameHint(pattern)}</p>}
       </form>
     </section>
   );
@@ -215,7 +215,7 @@ function RelayText({ doc, setDoc, builtin, info }) {
 export default function TextsTab({ doc, setDoc, builtin }) {
   return (
     <div className="p-texts-tab">
-      <NamedTexts doc={doc} setDoc={setDoc} limit={builtin.limits.textBytes} />
+      <NamedTexts doc={doc} setDoc={setDoc} limit={builtin.limits.textBytes} pattern={builtin.textName} />
       <section className="panel p-texts" aria-label="Тексты relay">
         <div className="panel-head">
           <div>
