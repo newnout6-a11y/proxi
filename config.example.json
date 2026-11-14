@@ -77,6 +77,8 @@
   "claude_xhigh_effort_note": "у моделей Claude в Retool нет уровня xhigh, а Claude Desktop шлёт его всем моделям. Запрос с xhigh получает этот уровень (high или max) вместо ошибки 400, независимо от allow_effort_downgrade; для остальных недостающих уровней (minimal, none) подбор по-прежнему включается только им. Меняется в админке, применяется после перезапуска: смена уровня посреди диалога переписывает кэш",
   "compaction_keep_effort": true,
   "compaction_keep_effort_note": "сжатие истории клиентом (OpenCode, Claude Code) идёт на effort диалога, а не на том, что прислал агент сжатия: смена effort сбрасывает подписанную историю и кэш сообщений, и весь диалог пишется заново. Effort диалога берётся, только если он не ниже effort запроса: relay никогда не понижает effort ради кэша. false оставляет effort клиента",
+  "codex_memory_jobs": true,
+  "codex_memory_jobs_note": "задачи памяти Codex: при запуске он извлекает память из старых тредов, по запросу без инструментов со строгой схемой на тред, около 5 кредитов каждый (gpt-6-luna выполняет gpt-6.1-terra). false: relay отвечает на них ошибкой 400, ничего не тратя, и Codex не пополняет память, пока их снова не включат; меняется в админке без перезапуска",
   "infer_conversations": true,
   "stabilize_client_prompts": true,
   "stable_prompt_date": false,
