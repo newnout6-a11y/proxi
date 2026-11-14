@@ -186,6 +186,10 @@ DEFAULTS = {
     # (retool_refresh).
     "retool_catalog_refresh_hours": 6,
     "retool_catalog_probes": 10,
+    # After each catalog look the relay writes its models into OpenCode's settings file (client_sync): the file named
+    # here, or ~/.config/opencode/opencode.jsonc (opencode.json) when empty; false leaves OpenCode's file alone.
+    "opencode_sync": True,
+    "opencode_settings": "",
     "account_balance_interval": 300,
     "account_refresh_parallel": 3,
     # Pause after Retool's hourly managed-key limit; a limit right after the return adds 5 minutes
@@ -771,6 +775,8 @@ def _load(path):
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     if type(cfg["account_move_keeps_history"]) is not bool:
         raise service_unavailable("account_move_keeps_history must be a boolean")
+    if type(cfg["opencode_sync"]) is not bool or not isinstance(cfg["opencode_settings"], str):
+        raise service_unavailable("opencode_sync must be a boolean and opencode_settings a path (empty: OpenCode's own)")
     if cfg["claude_xhigh_effort"] not in models.XHIGH_REPLACEMENTS:
         raise service_unavailable("claude_xhigh_effort must be one of: " + ", ".join(models.XHIGH_REPLACEMENTS))
     _check_web_search(cfg)

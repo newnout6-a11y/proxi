@@ -31,6 +31,7 @@ import forced_choice
 import generation
 import minara_refresh
 import retool_refresh
+import client_sync
 import models as model_catalog
 import sse
 import models
@@ -137,6 +138,9 @@ class Runtime:
         self.catalog = minara_refresh.CatalogRefresher(cfg, self.accounts)
         # Retool's new models, from Retool's own registry (retool_refresh); started with the pool too.
         self.retool_catalog = retool_refresh.CatalogRefresher(cfg, self.accounts)
+        # After each look OpenCode's model list follows what the relay publishes (client_sync).
+        self.client_sync = client_sync.OpenCodeSync(cfg)
+        self.catalog.after_look = self.retool_catalog.after_look = self.client_sync
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.runner.accounts = self.accounts
         self.prompts = prompt_policy.PromptStore(cfg)

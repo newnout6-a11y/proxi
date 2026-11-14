@@ -162,9 +162,10 @@ Minara добавляет модели между ручными замерам�
 Всё это relay пишет в `minara_models.auto.json` рядом с `config.json` (в git не попадает) и
 кладёт поверх `minara_models.json` при запуске. Запись из этого файла действует, пока она
 новее `minara_models.json`: каталог, пересобранный вручную позже, снова главнее. Итог
-каждой проверки — событие `catalog.refresh` в журнале. Списки моделей в OpenCode и Claude
-Desktop — файлы клиентов: новая модель появляется там после `sync_opencode_catalog.py` или
-ручной правки (Claude Desktop), Codex и Claude Code видят её сразу.
+каждой проверки — событие `catalog.refresh` в журнале. Codex и Claude Code видят новую модель
+сразу. Список моделей OpenCode relay обновляет сам после каждой проверки (`client_sync.py`,
+настройка `opencode_sync`, подробности в README, «Каталог Retool обновляется сам»): OpenCode
+видит его после своего перезапуска. Список Claude Desktop правится вручную.
 
 ## Добавление аккаунтов
 

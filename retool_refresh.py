@@ -165,6 +165,7 @@ class CatalogRefresher:
         self._thread = None
         self.last = None
         self.next_at = None
+        self.after_look = None  # called with "retool" after every look (client_sync.OpenCodeSync: the client lists)
 
     # -- lifecycle ---------------------------------------------------------------------------------------------------
     def start(self):
@@ -185,12 +186,22 @@ class CatalogRefresher:
             self.next_at = time.time() + delay
             if self._stop.wait(delay):
                 return
-            try:
-                self.run_once()
-            except Exception as exc:  # noqa: BLE001 - a failed look waits for the next one; the relay goes on
-                journal.emit("catalog.retool_refresh_failed", "Проверка каталога Retool не удалась: %s" % type(exc).__name__,
-                             "warn", upstream="retool", error=type(exc).__name__)
+            self.look()
             delay = self.hours * 3600.0
+
+    def look(self):
+        """One look (run_once), then `after_look`, even after a failed look: the client lists follow what is published."""
+        try:
+            self.run_once()
+        except Exception as exc:  # noqa: BLE001 - a failed look waits for the next one; the relay goes on
+            journal.emit("catalog.retool_refresh_failed", "Проверка каталога Retool не удалась: %s" % type(exc).__name__,
+                         "warn", upstream="retool", error=type(exc).__name__)
+        if self.after_look is not None and not self._stop.is_set():
+            try:
+                self.after_look("retool")
+            except Exception as exc:  # noqa: BLE001 - the client list waits for the next look
+                journal.emit("client.opencode_sync_failed", "Список моделей OpenCode не обновлён: %s" % type(exc).__name__,
+                             "warn", client="opencode", reason="retool", error=type(exc).__name__)
 
     # -- one look ----------------------------------------------------------------------------------------------------
     def _live(self):

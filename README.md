@@ -907,6 +907,8 @@ Windows PowerShell 5.1 через `*>>`, могут быть в UTF-16 или с
 | account_refresh_parallel | 3 — сколько фоновых проверок аккаунтов (продление/баланс) диспетчер ведёт одновременно; на запрос баланса по `/v1/balance`, `/health` и в админке не влияет (там до 8 параллельно) |
 | retool_catalog_refresh_hours | 6 — как часто relay сам читает реестр моделей Retool и публикует новую чатовую модель, ответившую на вопрос (часы, 0–168; 0 — не проверять), см. «Каталог Retool обновляется сам» |
 | retool_catalog_probes | 10 — сколько новых моделей Retool одна проверка может спросить (0–50) |
+| opencode_sync | true — после каждой проверки каталога (Retool и Minara) relay сам переписывает список своих моделей в файле настроек OpenCode, с резервной копией в `catalog-backups`; `false` — файл OpenCode не трогается, см. «Каталог Retool обновляется сам» |
+| opencode_settings | "" — файл настроек OpenCode для `opencode_sync`; пусто — `~/.config/opencode/opencode.jsonc` или `opencode.json` |
 | account_move_keeps_history | false — диалог, которому приходится сменить аккаунт (баланс, вход, часовой лимит, нет маршрута), оставляет на старом подписанные блоки рассуждений: его первый запрос на новом отличается от закэшированного, и весь префикс пишется заново (79 тыс.–580 тыс. токенов в журнале, 8–58 кредитов, 38 с до первого токена). Кэш провайдера при этом общий для аккаунтов (префикс, записанный на одном аккаунте, целиком прочитан на другом: 12 пар из 12, 2026-11-07), так что переписывать его заставляет потеря подписей, а не смена аккаунта. `true` — подписанные ветки едут с диалогом как восстановленные с диска (`carried_branches` в `account.migrate`); принимает ли upstream подпись на другом аккаунте, не проверено, поэтому отказ, который называет блоки, забывает ветки, а следующий запрос уходит без подписей, как раньше. Применяется сразу |
 | account_rate_limit_cooldown | 900 — на сколько секунд аккаунт уходит из пула после ответа Retool о часовом лимите managed-ключей (1–3600); повтор сразу после возврата удлиняет паузу на 5 минут за раз, потолок — большее из этого значения и 20 минут; заголовок `Retry-After`, если Retool его пришлёт, главнее. Применяется после перезапуска |
 | account_rate_limit_wait | 0 — сколько секунд (0–120) запрос диалога с префиксом не меньше 8000 токенов один раз ждёт аккаунт, ответивший о часовом лимите, и спрашивает его ещё раз, прежде чем диалог переедет на другой аккаунт и запишет весь префикс заново; аккаунт на время ожидания не исключается; `Retry-After`, если Retool его пришлёт и он не больше значения, задаёт ожидание, без него ждём всё значение; `0` — переезжать сразу. Применяется сразу. Подробности: «Установка», пункт про часовой лимит Retool |
@@ -1164,10 +1166,18 @@ retool-edge.com): названия, окна, пределы вывода, ур�
   строка `[catalog] Retool: …` в консоли.
 
 Всё это relay пишет в `retool_models.auto.json` рядом с `config.json` (в git не попадает) и
-кладёт в каталог при каждом запуске. Запись из ручного каталога всегда главнее. Списки моделей
-в OpenCode и Claude Desktop — файлы клиентов: новая модель появляется там после
-`scripts/sync_opencode_catalog.py` (или ручной правки для Claude Desktop), Codex и Claude Code
-видят её сразу.
+кладёт в каталог при каждом запуске. Запись из ручного каталога всегда главнее. Codex и Claude
+Code видят новую модель и новые уровни сразу. Список моделей **OpenCode** relay обновляет сам
+(`client_sync.py`, настройка `opencode_sync`). После каждой проверки каталога, Retool или
+Minara, он запускает `scripts/sync_opencode_catalog.py --write` для файла настроек OpenCode:
+`opencode_settings`, а если она пуста — `~/.config/opencode/opencode.jsonc` (или
+`opencode.json`). Актуальный список не переписывается. Перед каждым изменением прежний файл
+сохраняется в `catalog-backups` рядом с ним. Итог — событие `client.opencode_synced` или
+`client.opencode_sync_failed` в журнале и строка `[catalog] OpenCode: …` в консоли. OpenCode
+читает файл при запуске, поэтому новый список видно после его перезапуска. Раньше список
+обновлялся только ручным запуском скрипта: 14 ноября у Gemini 4 Argon в OpenCode не было ни
+одного уровня effort, хотя relay получил их накануне. Список Claude Desktop по-прежнему правится
+вручную.
 
 ### Окно контекста у клиентов Claude
 
@@ -1851,7 +1861,7 @@ relay с этим делает. 429 приходит до начала гене�
 | История между ходами и перезапусками | `native_history.py`, `conversation_state.py`, `conversation_infer.py`, `compaction_tools.py`, `summary_guard.py` |
 | Ответ клиенту | `adapters.py` (Chat, Responses, Messages), `structured.py`, `forced_choice.py`, `generation.py`, `web_search.py` |
 | Клиенты и системный промпт | `client_context.py`, `context.py`, `prompt_policy.py` (профили и правила `prompts.json`), `prompt_body.py` (правки истории и tools), `prompt_stabilizer.py`, `tool_names.py`, `tool_union.py`, `tool_search_policy.py` |
-| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей), `minara_accounts.py` (токены Minara и их срок), `minara_catalog.py` (опубликованные модели Minara), `minara_refresh.py` (каталог Minara обновляется сам), `minara_probe.py` (замеры моделей Minara) |
+| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей), `minara_accounts.py` (токены Minara и их срок), `minara_catalog.py` (опубликованные модели Minara), `minara_refresh.py` (каталог Minara обновляется сам), `minara_probe.py` (замеры моделей Minara), `retool_catalog.py` (реестр моделей Retool), `retool_refresh.py` (каталог Retool обновляется сам), `client_sync.py` (список моделей OpenCode обновляется сам) |
 | Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `console_clock.py` (время в строках консоли), `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
 
 Путь запроса: proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
