@@ -14,6 +14,7 @@ import http.client
 import json
 import math
 import pathlib
+import random
 import re
 import socket
 import threading
@@ -25,6 +26,7 @@ import urllib.request
 import apierr
 import conversation_state
 import credits
+import forced_choice
 import journal
 import client_context
 import console_log
@@ -47,6 +49,32 @@ def _int_setting(cfg, key, default):
         return max(0, int(cfg.get(key, default)))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+# Retool's "Retool models are rate limited right now. Please try again shortly." (HTTP 429, or an error event inside a 200): a
+# limit of the moment on the models, not the account's hourly quota (that one parks the account: apierr.is_account_quota).
+# The request is refused before anything is generated, so asking again on the same account costs nothing, and moving to
+# another account would start the conversation's history and cache from nothing (79,000 tokens in one measured case).
+# These are the pauses before the 1st, 2nd and 3rd retry, on top of the 0.5, 1 and 2 seconds that AttemptBudget.take
+# adds before any further POST of a step.
+RATE_LIMIT_WAITS = (1.5, 3.0, 6.0)
+
+
+def _refused_for_now(error):
+    return (isinstance(error, apierr.ApiError) and error.status == 429 and error.code == "rate_limit_error"
+            and not apierr.is_account_quota(error))
+
+
+async def _pause(seconds, is_cancelled):
+    """Wait `seconds` in short slices; False when the request was cancelled meanwhile."""
+    deadline = loop_now() + seconds
+    while loop_now() < deadline:
+        if is_cancelled():
+            return False
+        await asyncio.sleep(min(0.25, max(0.0, deadline - loop_now())))
+    return not is_cancelled()
+
+
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku", 'gpt-4.1',
                 'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2'}
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
@@ -1385,6 +1413,11 @@ def scope_effort(scope):
 async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_choice, max_tokens,
                       chunks=None):
     """Yield normalised relay events from the direct NDJSON stream."""
+    # A route that refuses a forced choice is sent `auto` (forced_choice): the choice is neither sent nor part of the scope
+    # of the branch, which the next request continues whatever it forces.
+    required = forced_choice.requirement(model_provider.get("model"), tools, tool_choice)
+    if required is not None:
+        tool_choice = "auto"
     client = getattr(session, "_native_client_messages", None)
     history = getattr(session, "_native_history", None)
     scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
@@ -1528,9 +1561,15 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         # Start the scheduler with the turn, not after it: a session's first long
         # turn needs its anchored during-turn ping too.
         _ensure_keepwarm(session, cfg)
+
+    def open_stream(sent):
+        # Only a route that refuses a forced choice has a requirement: its reply is held until it holds the call.
+        return (_forced_stream(cfg, session, sent, param_types, required) if required is not None
+                else _stream_body(cfg, session, sent, param_types))
+
     try:
         try:
-            async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+            async with contextlib.aclosing(open_stream(body)) as stream:
                 async for event in stream:
                     note(event)
                     yield event
@@ -1551,7 +1590,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             body = {key: value for key, value in body.items() if key != "metadata"}
             if body.get("openAICacheKey"):
                 session._turn_body = body
-            async with contextlib.aclosing(_stream_body(cfg, session, body, param_types)) as stream:
+            async with contextlib.aclosing(open_stream(body)) as stream:
                 async for event in stream:
                     note(event)
                     yield event
@@ -1679,6 +1718,51 @@ def _dump_empty_once(payload, flags, cfg, session, model=None):
                  diagnostic_id=stamp)
     budget.empty_dump_id = stamp
     return stamp
+
+
+def _asked_for_call(body, text):
+    """The body with `text` as one more user turn after its last message.
+
+    Nothing of the body moves: the turn carries no cache mark and is not in the history that gets stored, so a request that
+    continues this one finds the prefix the cache holds. Only the integrity hint is made again, as it covers the messages."""
+    messages = [*body["messages"], {"role": "user", "content": [{"type": "text", "text": text}]}]
+    return {**body, "messages": messages, "rit": make_rit(messages, body.get("tools"))}
+
+
+async def _forced_stream(cfg, session, body, param_types, required):
+    """_stream_body for a route that refuses a forced tool choice: the call is asked for in words, and the reply checked.
+
+    The reply is released once it holds the call (forced_choice.Gate). An attempt that ends without it is asked again once,
+    more firmly: nothing of it reaches the client (its thinking, its text and the calls of other tools are dropped) and its
+    cost still counts. A second miss is the error a route that ignored a native choice earns in the orchestrator. Only the
+    accepted attempt leaves its reply on the session for the history to keep."""
+    attempt = 0
+    while True:
+        attempt += 1
+        gate = forced_choice.Gate(required)
+        end = None
+        sent = _asked_for_call(body, forced_choice.instruction(required, firm=attempt > 1))
+        async with contextlib.aclosing(_stream_body(cfg, session, sent, param_types)) as stream:
+            async for event in stream:
+                if event.get("type") == "end":
+                    end = event  # judged below: an attempt that missed the call must not end the turn
+                    continue
+                for ready in gate.feed(event):
+                    yield ready
+        if end is None:
+            return  # the stream ended with its error event, which the gate let through
+        if gate.complied or end.get("reason") == "cancelled":
+            yield end
+            return
+        budget = getattr(session, "_attempt_budget", None) or AttemptBudget()
+        final = attempt > 1 or not budget.remaining
+        journal.emit("turn.forced_choice_missed",
+                     "Модель не вызвала требуемый инструмент%s" % ("" if final else ": повтор с усиленной просьбой"),
+                     "warn", model=body.get("model"), tool=required.named, called=gate.called, wrote_text=gate.text,
+                     attempt=attempt)
+        if final:
+            raise budget.error("upstream_tool_choice_ignored" if gate.text or gate.called else "upstream_empty_turn",
+                               "upstream did not honor the required client tool choice")
 
 
 async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
@@ -1841,9 +1925,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     try:
         max_empty_retries = _int_setting(cfg, "upstream_empty_retries", 1)
         empty_retries = 0
+        max_limit_retries = _int_setting(cfg, "upstream_rate_limit_retries", 3)
+        limit_retries = 0
         while True:
             usable = False
             thinking_seen = False
+            spoke = False  # whether this attempt gave the consumer anything but billing and display status
             # Events of an attempt are held back until it proves usable, so a retried
             # attempt can never leak thinking blocks, signatures or blank text.
             held = []
@@ -1876,8 +1963,10 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         for pending in held:
                             yield pending
                         held.clear()
+                        spoke = True
                         yield event
                     elif kind in _LIVE_EVENTS or not may_retry:
+                        spoke = spoke or kind not in _LIVE_EVENTS
                         yield event
                     else:
                         held.append(event)
@@ -1893,6 +1982,8 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 # Without a status the request may still be in flight, unless it provably never left.
                 possibly_billed = (current_trace is not None and (
                     200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
+                if _refused_for_now(failure) and not flags.get("usage_seen"):
+                    possibly_billed = False  # refused before anything was generated: it cost nothing, as an HTTP 429 never does
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
                     flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
@@ -1915,6 +2006,23 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             if flags.get('cost_unknown') and not flags.get('usage_seen'):
                 # Include possibly billed failures/truncations before failover.
                 yield {'type': 'usage', 'usage': {}}
+            if (_refused_for_now(failure) and not spoke and not usable and limit_retries < max_limit_retries
+                    and budget.remaining and not is_cancelled()):
+                wait = RATE_LIMIT_WAITS[min(limit_retries, len(RATE_LIMIT_WAITS) - 1)] * random.uniform(0.75, 1.25)
+                limit_retries += 1
+                journal.emit("upstream.rate_limited",
+                             "Retool ограничил частоту запросов к моделям (429): повтор на том же аккаунте через %.1f с "
+                             "(%d из %d)" % (wait, limit_retries, max_limit_retries), "warn", model=body.get("model"),
+                             attempt=budget.used, wait=round(wait, 2), retry=limit_retries, retries=max_limit_retries,
+                             account=account_tag(getattr(session, "backend", None)),
+                             thread=journal.tag(getattr(session, "thread_id", None)))
+                if not await _pause(wait, is_cancelled):
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                text.clear()
+                thinking.clear()
+                holder["response"] = None
+                continue
             if failure is not None:
                 raise failure
             saw_end = bool(flags.get("end"))

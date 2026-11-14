@@ -13,8 +13,9 @@ import pytest
 import direct
 import validate
 from test_client_contracts import CFG, _body
-from test_native_context_reuse import FIRST, request, run
-from test_native_history import append_result, close, harness
+from test_forced_choice import harness
+from test_native_context_reuse import FIRST, native_choice_route, request, run
+from test_native_history import append_result, close
 from test_review_fixes_pr19 import END, THINKING, signature, text
 
 WORDS = ["none", "auto", "required"]
@@ -77,8 +78,8 @@ def test_the_transport_sends_it_that_way_on_the_first_request_and_on_the_resumed
 
     def forced_request(messages):
         parsed = request(messages, tools=copy.deepcopy(tools))
-        parsed.tool_choice = forced(name)
-        return parsed
+        # Claude's forced choice is asked for in words (test_forced_choice): the native body is a route that takes it.
+        return native_choice_route(parsed, forced(name))
 
     async def scenario():
         try:

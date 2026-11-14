@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import math
 
+import web_search
 INSTRUCTION_ROLES = ("system", "developer")
 INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
 _TEXT_BLOCKS = ("text", "input_text", "output_text", "summary_text")
@@ -144,15 +145,35 @@ def client_messages(messages, image_converter, *, lead=None):
                 continue
             if role == "assistant":
                 text, calls = [], []
+
+                def flush():
+                    """The assistant message so far (its text, then its calls), merged into the one before it if any."""
+                    nonlocal text, calls
+                    blocks = ([{"type": "text", "text": "".join(text)}] if any(text) else []) + calls
+                    text, calls = [], []
+                    if not blocks:
+                        return
+                    if result and result[-1]["role"] == "assistant":
+                        result[-1]["content"].extend(blocks)
+                        result[-1] = canonical_assistant(result[-1]["content"])
+                    else:
+                        result.append({"role": "assistant", "content": blocks})
+
                 for block in ([{"type": "text", "text": value}] if isinstance(value, str) else value or []):
                     kind = block.get("type")
                     if kind in ("thinking", "redacted_thinking"):
                         continue
                     if kind in ("text", "output_text", "summary_text"):
                         text.append(block["text"])
-                    elif kind in ("tool_use", "tool_call"):
+                    elif kind in ("tool_use", "tool_call", "server_tool_use"):
                         calls.append(call(block.get("id") or block.get("tool_call_id"),
                                           block.get("name"), block.get("input", block.get("arguments", {}))))
+                    elif kind == "web_search_tool_result":
+                        # A search the relay ran for the client: its result sits inside the assistant message the client
+                        # echoes, and upstream saw it as the result of the call before the reply went on.
+                        flush()
+                        result.append(tool_result(block.get("tool_use_id"), web_search.render_block_content(
+                            block.get("content"))))
                     else:
                         raise ValueError("unsupported assistant block")
                 for item in message.get("tool_calls") or []:
@@ -168,14 +189,7 @@ def client_messages(messages, image_converter, *, lead=None):
                 if isinstance(legacy, dict) and legacy.get("name"):
                     # The deprecated form of one call; its "function" message carries the name, not an id (see below).
                     calls.append(call(legacy["name"], legacy["name"], legacy.get("arguments", "{}")))
-                blocks = ([{"type": "text", "text": "".join(text)}] if any(text) else []) + calls
-                if not blocks:
-                    continue
-                if result and result[-1]["role"] == "assistant":
-                    result[-1]["content"].extend(blocks)
-                    result[-1] = canonical_assistant(result[-1]["content"])
-                else:
-                    result.append({"role": "assistant", "content": blocks})
+                flush()
             elif role in ("tool", "function"):
                 result.append(tool_result(message.get("tool_call_id") or message.get("call_id")
                                           or (message.get("name") if role == "function" else None), value,

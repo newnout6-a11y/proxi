@@ -175,16 +175,51 @@ def test_settings_are_whitelisted_and_changes_wait_for_restart(admin_relay):
 
 
 def test_admin_effort_validation_honors_explicit_compatibility(admin_relay):
-    assert admin_relay.patch({"reasoning_effort": "xhigh"})[0] == 400
-    status, _, _ = admin_relay.patch({"allow_effort_downgrade": True, "reasoning_effort": "xhigh"})
+    assert admin_relay.patch({"reasoning_effort": "minimal"})[0] == 400
+    status, _, _ = admin_relay.patch({"allow_effort_downgrade": True, "reasoning_effort": "minimal"})
     assert status == 200
     saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
-    assert saved["allow_effort_downgrade"] is True and saved["reasoning_effort"] == "xhigh"
+    assert saved["allow_effort_downgrade"] is True and saved["reasoning_effort"] == "minimal"
     before = admin_relay.path.read_bytes()
     assert admin_relay.patch({"allow_effort_downgrade": False})[0] == 400
     assert admin_relay.path.read_bytes() == before
     assert admin_relay.patch({"allow_effort_downgrade": True, "reasoning_effort": "ultra"})[0] == 400
     assert admin_relay.patch({"allow_effort_downgrade": False, "reasoning_effort": "max"})[0] == 200
+
+
+def test_the_settings_offer_the_level_that_xhigh_becomes_on_claude(admin_relay):
+    status, body, _ = admin_relay.request("/admin/api/settings")
+    field = body["schema"]["claude_xhigh_effort"]
+    assert status == 200 and field["type"] == "string" and field["enum"] == ["high", "max"] and field["group"] == "model"
+    assert field["restart_required"] is True and "xhigh" in field["description"]
+    assert body["settings"]["claude_xhigh_effort"] == "high" and body["pending_restart"] == []
+
+
+def test_the_choice_is_saved_and_waits_for_a_restart_and_nothing_else_is_accepted(admin_relay):
+    status, body, _ = admin_relay.patch({"claude_xhigh_effort": "max"})
+    assert status == 200 and body["pending_restart"] == ["claude_xhigh_effort"] and body["applied"] == []
+    assert json.loads(admin_relay.path.read_text(encoding="utf-8"))["claude_xhigh_effort"] == "max"
+    assert admin_relay.cfg["claude_xhigh_effort"] == "high"  # a change of effort mid-dialog rewrites its cache: not live
+    before = admin_relay.path.read_bytes()
+    for bad in ("medium", "xhigh", "MAX", "", None, 1, True):
+        assert admin_relay.patch({"claude_xhigh_effort": bad})[0] == 400, bad
+        assert admin_relay.path.read_bytes() == before
+
+
+def test_a_default_effort_of_xhigh_is_valid_for_a_claude_default_model_and_not_for_one_without_a_replacement(admin_relay):
+    assert admin_relay.patch({"reasoning_effort": "xhigh"})[0] == 200  # the saved default model is claude-opus-5-5
+    before = admin_relay.path.read_bytes()
+    assert admin_relay.patch({"model": "gpt-6-sol"})[0] == 400  # xhigh is saved: a GPT default would have no level for it
+    assert admin_relay.path.read_bytes() == before
+
+
+def test_the_models_say_where_xhigh_is_replaced(admin_relay):
+    status, body, _ = admin_relay.request("/admin/api/models")
+    rows = {row["id"]: row for row in body["data"]}
+    assert status == 200
+    assert rows["claude-opus-5-5"]["xhigh_replaced"] is True and rows["claude-sonnet-5-5"]["xhigh_replaced"] is True
+    assert rows["claude-haiku-4-5-20251001"]["xhigh_replaced"] is False  # its route ignores every level
+    assert rows["gpt-6-sol"]["xhigh_replaced"] is False and rows["zai-org/GLM-5.3"]["xhigh_replaced"] is False
 
 
 def test_rate_limit_changes_apply_to_new_admission_without_replacing_pool(admin_relay):
@@ -201,7 +236,7 @@ def test_rate_limit_changes_apply_to_new_admission_without_replacing_pool(admin_
                                      {"show_thinking": "false"}, {"max_workers": True}, {"max_workers": 0},
                                      {"max_frame_bytes": -1}, {"rate_limit_rps": float("inf")},
                                      {"rate_limit_burst": 0}, {"model": "unknown"},
-                                     {"reasoning_effort": "xhigh"}, {"session_mode": "invalid"}])
+                                     {"reasoning_effort": "minimal"}, {"session_mode": "invalid"}])
 def test_invalid_or_protected_settings_do_not_change_disk_or_runtime(admin_relay, changes):
     before = admin_relay.path.read_bytes()
     status, body, _ = admin_relay.patch(changes)

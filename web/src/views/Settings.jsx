@@ -25,7 +25,9 @@ const OPTION_LABELS = {
   session_mode: { per_conversation: 'сессия на каждый диалог', per_request: 'сессия на каждый запрос', shared: 'одна общая сессия' },
   exec_policy: { off: 'выключены', allowlist: 'только из списка разрешённых', allow_all: 'любые команды' },
   reasoning_effort: { auto: 'по умолчанию модели' },
+  claude_xhigh_effort: { high: 'high (по умолчанию)', max: 'max' },
 };
+const EFFORT_ORDER = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 function Field({ name, field, value, onChange, pending, dirty, labels }) {
   const id = `setting-${name}`;
@@ -323,13 +325,18 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
   const approximate = !!merged.allow_effort_downgrade;
   // A route that ignores effort ("accepted-ignored") lists no level yet takes every one the relay knows, so none is an error.
   const ignoresEffort = selectedModel?.reasoning_effort_control === 'accepted-ignored';
-  const effortOptions = selectedModel ? ['auto', ...(selectedModel.reasoning_effort_levels || [])] : null;
+  // A Claude route has no xhigh, yet the relay serves it at the level claude_xhigh_effort names: for such a model it is a choice, not an error.
+  const xhighAs = selectedModel?.xhigh_replaced ? merged.claude_xhigh_effort || 'high' : null;
+  const modelLevels = [...(selectedModel?.reasoning_effort_levels || []), ...(xhighAs ? ['xhigh'] : [])]
+    .sort((a, b) => EFFORT_ORDER.indexOf(a) - EFFORT_ORDER.indexOf(b));
+  const effortOptions = selectedModel ? ['auto', ...modelLevels] : null;
   const unsupportedEffort = !ignoresEffort && effortOptions && effortValue && !effortOptions.includes(effortValue);
   const warnEffort = unsupportedEffort && !approximate;
   const effortChoices = (approximate || ignoresEffort) && schema.reasoning_effort?.enum ? schema.reasoning_effort.enum
     : effortOptions && [...new Set([...effortOptions, ...(unsupportedEffort ? [effortValue] : [])])];
   const effortLabels = ignoresEffort ? Object.fromEntries((effortChoices || [])
-    .filter((level) => level !== 'auto').map((level) => [level, `${level} · модель игнорирует`])) : undefined;
+    .filter((level) => level !== 'auto').map((level) => [level, `${level} · модель игнорирует`]))
+    : xhighAs ? { xhigh: `xhigh · станет ${xhighAs}` } : undefined;
   const role = merged[ROLE_KEY];
   const roleBytes = useMemo(() => (typeof role === 'string' ? textBytes(role) : 0), [role]);
   const limit = roleLimit(schema[ROLE_KEY], Number(merged.max_prompt_bytes));

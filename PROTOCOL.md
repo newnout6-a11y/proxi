@@ -68,8 +68,12 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
   ставится на текстовый блок. Строка допустима только для одиночного prompt без истории.
 - Каждый tool — `name`, `description`, `params` (типизированные параметры с `required`)
   и `strict: true`; JSON Schema клиента преобразуется в этот вид.
-- `toolChoice` отправляется только если клиент задал не `auto` (`required` или имя инструмента);
-  `maxCompletionTokens` — только если клиент задал лимит, не меньше 16.
+- `toolChoice` отправляется только если клиент задал не `auto` (`required` или имя инструмента), и только модели,
+  которая его принимает (GPT, GLM): Retool отвечает 400 на `required` и имя для каждой модели Claude, поэтому её запросу
+  relay отправляет `auto`, а нужный вызов просит словами в последнем сообщении (README, «Ограничения маршрута Retool,
+  которые relay обходит»);
+  `maxCompletionTokens` — только если клиент задал лимит, не меньше 16 (маршрут Claude его не соблюдает, и небольшой
+  лимит относительно клиента relay держит сам, `adapters.OutputCapAdapter`).
 - `openAICacheKey` — `sha256(model, 0x00, tools JSON, 0x00, head)[:24]`; `rit` — не криптографический
   hint целостности от длины `messages` и `tools`.
 - Для каждой части `rit` длина — `JSON.stringify(value).length` в единицах UTF-16;
@@ -95,7 +99,7 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
   thinking/signature не меняются. Старый клиентский prefix остаётся текстовым
   до первой принятой точки продолжения. Состояние изолировано по аккаунту и
   диалогу; подробности и live-проверка — [в разборе](docs/thinking-latency-2026-11-04.md).
-- `reasoningEffort`: валидация по per-model списку уровней (`/v1/models → capabilities.reasoning_effort_levels`); набор включает `minimal` (GPT-5) и `max` (GPT-6*). Неподдерживаемый уровень даёт 400 до upstream. Только явный `allow_effort_downgrade: true` разрешает приближение известных уровней; requested/effective effort и причина попадают в журнал. Неизвестные значения всегда дают 400; конфликтующие thinking-контроли — 422. Live 2026-11-03: Opus 5.5 принимает high/max, GPT-6-sol и GPT-6.1-sol принимают max; xhigh отвергнут с 422 на всех проверенных GPT-6 маршрутах.
+- `reasoningEffort`: валидация по per-model списку уровней (`/v1/models → capabilities.reasoning_effort_levels`); набор включает `minimal` (GPT-5) и `max` (GPT-6*). Неподдерживаемый уровень даёт 400 до upstream. Только явный `allow_effort_downgrade: true` разрешает приближение известных уровней; единственное исключение — `xhigh` у моделей Claude: он обслуживается как `high` или `max` (настройка `claude_xhigh_effort`) и без этого флага. requested/effective effort и причина попадают в журнал. Неизвестные значения всегда дают 400; конфликтующие thinking-контроли — 422. Live 2026-11-03: Opus 5.5 принимает high/max, GPT-6-sol и GPT-6.1-sol принимают max; xhigh отвергнут с 422 на всех проверенных GPT-6 маршрутах.
 - `openAICacheKey`: ключ кэширования префикса промпта для KV-кэша.
 - `metadata.sandpackAgent: true`: открывает доступ к моделям, управляемым через Sandpack-инфраструктуру.
 

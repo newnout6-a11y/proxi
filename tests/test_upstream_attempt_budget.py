@@ -13,7 +13,7 @@ import direct
 import journal
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace
-from test_native_context_reuse import Backend, FIRST, request, run, setup
+from test_native_context_reuse import Backend, FIRST, native_choice_route, request, run, setup
 
 
 class Response(io.BytesIO):
@@ -29,7 +29,8 @@ def response(*events):
 def harness(tmp_path, monkeypatch):
     backend, pool, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[],
                                    base="https://example.invalid", cache_keepwarm_seconds=0,
-                                   upstream_error_dir=str(tmp_path), upstream_empty_retries=4)
+                                   upstream_error_dir=str(tmp_path), upstream_empty_retries=4,
+                                   openai_provider_resource_name="__managed__")
     monkeypatch.setattr(direct, "_EMPTY_DUMPED", set())
     backend.headers = lambda: {"cookie": "never-store-cookie"}
     calls, paid, traces, waits = [], [], [], []
@@ -137,8 +138,7 @@ def test_retry_preserves_task_and_can_still_call_a_tool(harness, monkeypatch, th
 
 @pytest.mark.parametrize("choice", ["required", {"type": "function", "function": {"name": "read_file"}}])
 def test_empty_retries_respect_required_or_named_tool_choice(harness, choice):
-    parsed = request(FIRST)
-    parsed.tool_choice = choice
+    parsed = native_choice_route(request(FIRST), choice)
     events = asyncio.run(run(harness.runner, parsed))
     assert len(harness.calls) == 5
     assert "required client tool choice" in str(events[-1]["error"])

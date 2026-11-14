@@ -353,8 +353,10 @@ def test_a_request_sent_without_an_answer_stays_a_possible_charge(tmp_path, monk
 
 @pytest.mark.parametrize('status', [429, 500, 503])
 def test_a_refusal_with_an_http_status_is_not_a_possible_charge(tmp_path, monkeypatch, status):
-    refusal = urllib.error.HTTPError('https://fixture.invalid', status, 'refused', {}, io.BytesIO(b'{}'))
-    events, error, unknown, _ = drive(tmp_path, monkeypatch, [refusal])
+    # a 429 is asked again on the same account (direct.RATE_LIMIT_WAITS): every attempt is refused, none is a charge
+    refusals = [urllib.error.HTTPError('https://fixture.invalid', status, 'refused', {}, io.BytesIO(b'{}'))
+                for _ in range(4 if status == 429 else 1)]
+    events, error, unknown, _ = drive(tmp_path, monkeypatch, refusals)
     assert error is not None and MARKER not in events and unknown == []
 
 

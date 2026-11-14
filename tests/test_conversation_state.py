@@ -543,8 +543,9 @@ def test_only_a_refusal_of_the_request_itself_discards_a_restored_branch(tmp_pat
     messages = asyncio.run(converse(before, "chat", 2))
     before.stop()
     # Every status carries the same words about the blocks: here the status decides (the words, in
-    # test_conversation_state_review).
-    after = processes(state, scripts=[refused(status, SIGNATURE_REFUSAL)])
+    # test_conversation_state_review). A 429 is asked again on the same account (direct.RATE_LIMIT_WAITS), so all four
+    # attempts are refused: each needs a refusal of its own, a body can be read once.
+    after = processes(state, scripts=[refused(status, SIGNATURE_REFUSAL) for _ in range(4 if status == 429 else 1)])
     seq = journal.JOURNAL.last_seq
     events = asyncio.run(after.turn(parsed(messages)))
     assert events[-1]["type"] == "error"

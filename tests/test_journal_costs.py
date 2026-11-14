@@ -396,8 +396,11 @@ def test_a_turn_refused_by_the_pool_costs_nothing(tmp_path, monkeypatch):
     pytest.param(urllib.error.URLError(ConnectionRefusedError(111, "refused")), id="refused"),
 ])
 def test_an_attempt_the_upstream_never_accepted_is_not_a_missing_price(tmp_path, monkeypatch, failure):
-    log, events, paid, sent = turn_metrics(tmp_path, monkeypatch, [failure])
-    assert events[-1]["type"] == "error" and len(sent) == 1 and paid == []
+    # a 429 is asked again on the same account (direct.RATE_LIMIT_WAITS): all four attempts are refused
+    attempts = 4 if getattr(failure, "code", None) == 429 else 1
+    steps = [http_error(429) for _ in range(attempts)] if attempts > 1 else [failure]  # a fresh refusal each time
+    log, events, paid, sent = turn_metrics(tmp_path, monkeypatch, steps)
+    assert events[-1]["type"] == "error" and len(sent) == attempts and paid == []
     assert [e for e in log.query() if e["kind"] == "upstream.usage_start"]
     totals = log.metrics()["totals"]
     assert totals["credits_unknown"] == 0 and totals["credits_complete"] is True

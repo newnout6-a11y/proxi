@@ -112,6 +112,21 @@ def stop_sequences(data, dialect):
     return list(dict.fromkeys(found))
 
 
+# Retool's Claude route takes maxCompletionTokens and ignores it: a cap of 300 returned 5,466 tokens and end_turn (protocol
+# test run of 2026-11-06), so the relay cuts the reply itself (adapters.OutputCapAdapter). It does that for the caps that
+# can bind: the route's answers end on their own after a few thousand tokens, and keeping a call of a client whole under a
+# cap means holding it back until it ends, which the callers with caps of 32,000 to 128,000 (Claude Code, Claude Desktop,
+# OpenCode) would pay for on every tool call with arguments they could not watch grow.
+OUTPUT_CAP_EMULATED_BELOW = 16384
+
+
+def output_cap(entry, max_tokens):
+    """The cap the relay enforces on the reply of a request, or None when the route keeps it or it cannot bind."""
+    if not max_tokens or max_tokens >= OUTPUT_CAP_EMULATED_BELOW or not models.ignores_output_cap(entry['id']):
+        return None
+    return max_tokens
+
+
 def structured_output(data, dialect):
     """The JSON contract of the reply, or None for plain text.
 
