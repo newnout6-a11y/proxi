@@ -661,6 +661,9 @@ def _error_from_event(event):
         message = message.get("message")
     status = event.get("statusCode")
     text = str(message or "upstream stream error")
+    if status in (429, None) and apierr.is_hourly_limit(text):
+        # The hourly managed-key quota belongs to the account, not to this one request.
+        return apierr.account_rate_limited(text)
     if status == 429:
         return apierr.too_many_requests(text)
     if status in (401, 403):
@@ -1281,7 +1284,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         error.upstream_status = exc.code
                         raise error
                     holder["response"] = exc
-                    error = apierr.ApiError(*_http_error(exc.code, detail))
+                    error = _api_error(exc.code, detail, exc.headers)
                     error.upstream_status = exc.code
                     error.diagnostic_id = diagnostic
                     raise error
@@ -1310,11 +1313,17 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             if trace:
                 trace.wire.event("reader_error", exception_type=type(exc).__name__)
             if not is_cancelled():
+                # urlopen wraps DNS, refused, TLS and send failures in URLError: the request never
+                # reached upstream. Any other failure (a read timeout, a closed connection)
+                # happens after it was sent and may still be billed.
+                unsent = isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError)
                 if isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException,
                                     OSError)):  # OSError covers ssl.SSLError (TLS drops mid-stream)
                     timed_out = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
                     exc = (apierr.upstream_timeout("Retool response timed out") if timed_out else
                            apierr.upstream_error("Retool connection failed: %s" % type(exc).__name__))
+                if unsent:
+                    exc.request_sent = False
                 hand_off_final(exc, queue)
         finally:
             _force_close_response(holder.get("response"))
@@ -1338,6 +1347,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             yield {"type": "usage_start"}
             queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
             holder["queue"] = queue
+            previous_trace = holder.get("trace")
             task = loop.run_in_executor(getattr(loop, "_relay_io_executor", None),
                                         contextvars.copy_context().run, worker, queue)
             flags = {"budget": budget}
@@ -1373,8 +1383,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     raise
             finally:
                 current_trace = holder.get("trace")
-                possibly_billed = (current_trace is not None and
-                                   (current_trace.http_status is None or 200 <= current_trace.http_status < 300))
+                if current_trace is previous_trace:
+                    current_trace = None  # this attempt stopped before creating a trace of its own
+                status = getattr(current_trace, "http_status", None)
+                # Without a status the request may still be in flight, unless it provably never left.
+                possibly_billed = (current_trace is not None and (
+                    200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
                 if not flags.get("credits_reported") and (flags.get("usage_seen") or possibly_billed):
                     flags['cost_unknown'] = True
                     mark_unknown = getattr(getattr(session, "_credits_manager", None), "mark_usage_unknown", None)
@@ -1659,3 +1673,12 @@ def _http_error(status, detail):
     if status in (400, 422):
         return (400, "invalid_request_error", text)
     return (502, "upstream_error", text)
+
+
+def _api_error(status, detail, headers=None):
+    error = apierr.ApiError(*_http_error(status, detail))
+    if status == 429 and apierr.is_hourly_limit(detail):
+        # The hourly managed-key quota is spent: the orchestrator parks this account and moves the turn.
+        error.account_quota = True
+        error.retry_after = apierr.retry_after_seconds((headers or {}).get("retry-after"))
+    return error

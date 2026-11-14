@@ -903,10 +903,18 @@ class SessionPool:
         self._active = {}
 
     @staticmethod
+    def _route_refusal(backend, model_entry):
+        """Why this account can never serve the model (a settled fact, unlike its health), or None."""
+        if model_entry is None:
+            return None
+        return (model_catalog.route_block_reason(model_entry, backend.cfg)
+                or model_catalog.resource_block_reason(model_entry, backend.cfg))
+
+    @staticmethod
     def _check_route(backend, model_entry):
-        if model_entry is not None:
-            model_catalog.require_route(model_entry, backend.cfg)
-            model_catalog.provider_resource(backend.cfg, model_entry)
+        reason = SessionPool._route_refusal(backend, model_entry)
+        if reason:
+            raise model_catalog.model_unavailable(model_entry, [reason])
 
     @staticmethod
     def _routable(backend, model_entry):
@@ -918,7 +926,7 @@ class SessionPool:
 
     @staticmethod
     def _usable(backend, exclude=()):
-        """The dispatcher marks exhausted or signed-out accounts unavailable; the
+        """The dispatcher marks exhausted, signed-out or rate-limited accounts unavailable; the
         operator can switch an account off."""
         return (backend not in exclude and getattr(backend, "unavailable", None) is None
                 and account_enabled(backend))
@@ -943,6 +951,11 @@ class SessionPool:
         if not backends:
             return apierr.service_unavailable("no enabled account: every account is switched off")
         reasons = [getattr(b, "unavailable", None) or {} for b in backends]
+        limited = [r for r in reasons if r.get("reason") == "rate_limited"]
+        if limited:
+            # The hourly limit clears by itself: say when, instead of a 402/503 that implies a manual fix.
+            wait = min(max(0.0, r.get("until_at", 0.0) - time.time()) for r in limited)
+            return apierr.accounts_rate_limited(wait, len(limited), len(backends))
         exhausted = [(journal.tag(b.cfg.get("account_id") or b.cfg.get("page_uuid")), r.get("available"))
                      for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
         if exhausted:
@@ -950,16 +963,34 @@ class SessionPool:
             return apierr.insufficient_credits(threshold or 0, exhausted)
         return apierr.service_unavailable("no usable account: Retool sessions need a new sign-in")
 
+    def model_refusal(self, model_entry):
+        """The settled 404 when no account can serve the model, else None.
+
+        The HTTP layer calls this before a response starts, so a stream gets a real status instead of
+        an SSE error. With no provider resource anywhere, only the model's own route facts count and
+        acquire() explains the missing resource, the same way discovery treats an unconfigured setup.
+        """
+        if model_entry is None:
+            return None
+        configured = any(backend.cfg.get(key) for backend in self.backends
+                         for key in model_catalog.PROVIDER_RESOURCE_KEY.values())
+        refusals = [self._route_refusal(backend, model_entry) if configured
+                    else model_catalog.route_block_reason(model_entry, backend.cfg)
+                    for backend in self.backends]
+        return model_catalog.model_unavailable(model_entry, refusals) if all(refusals) else None
+
     def _next_backend(self, model_entry=None, exclude=()) -> Backend:
-        routable = []
+        routable, refusals = [], []
         for backend in self.backends:
-            try:
-                self._check_route(backend, model_entry)
-            except apierr.ApiError:
-                continue
-            routable.append(backend)
-        if not routable:
-            raise apierr.service_unavailable("no account has a route for the requested model")
+            reason = self._route_refusal(backend, model_entry)
+            if reason:
+                refusals.append(reason)
+            else:
+                routable.append(backend)
+        if refusals and not routable:
+            # Every account refuses this model by configuration (unsupported, retired, gated, no
+            # resource): a settled 4xx that names the reason, never a retryable 503.
+            raise model_catalog.model_unavailable(model_entry, refusals)
         if not any(account_enabled(b) for b in routable) and any(account_enabled(b) for b in self.backends):
             raise apierr.service_unavailable("no enabled account has a route for the requested model")
         eligible = [backend for backend in routable if self._usable(backend, exclude)]
@@ -1095,9 +1126,9 @@ class SessionPool:
                 self._check_route(self.backend, model_entry)
                 if not account_enabled(self.backend):
                     raise apierr.service_unavailable("the shared-mode account is switched off")
-                if (self.backend in exclude or
-                        ((getattr(self.backend, "unavailable", None) or {}).get("reason") == "exhausted"
-                         and not self._reserve([self.backend], exclude))):
+                reason = (getattr(self.backend, "unavailable", None) or {}).get("reason")
+                if (self.backend in exclude or reason == "rate_limited" or
+                        (reason == "exhausted" and not self._reserve([self.backend], exclude))):
                     raise self._unusable_error([self.backend])
                 lock = self._lock
                 await lock.acquire()

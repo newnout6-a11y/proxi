@@ -5,7 +5,7 @@ import { usePolling } from '../useJournal.js';
 import { Dot, Page } from '../motion.jsx';
 import { Button, Empty, Tag, Toggle, useToast } from '../ui.jsx';
 import { ACCOUNT_STATE } from '../catalog.js';
-import { fmtAgo, fmtDay, fmtFixed, fmtInt, isNum, plural } from '../format.js';
+import { fmtAgo, fmtDay, fmtFixed, fmtInt, fmtShortTime, isNum, plural } from '../format.js';
 import { PoolScene } from '../stage/PoolScene.jsx';
 import { AddGuide, GuideNum } from '../stage/AddGuide.jsx';
 
@@ -47,6 +47,11 @@ function AccountRow({ account, busy, onAction, onPatch, onDelete, lastEnabled })
       <div className="pool-state">
         <span>{state.label}</span>
         {account.reserve && <Tag tone="warn" title="Все аккаунты ниже порога: этот обслуживает запросы из резерва">резерв</Tag>}
+        {account.enabled !== false && isNum(account.rate_limited_until) && (
+          <Tag tone="warn" title="Retool ответил: часовой лимит managed-ключей исчерпан. Ходы идут на другие аккаунты">
+            вернётся в {fmtShortTime(account.rate_limited_until)}
+          </Tag>
+        )}
         {account.stale && <Tag tone="warn">устарело</Tag>}
         {pending && <Tag tone="accent">{pending}</Tag>}
       </div>

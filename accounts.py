@@ -5,13 +5,16 @@ spread out, at most `account_refresh_parallel` checks run at once and a network
 failure pauses every account together, so 20-30 accounts never renew in one
 burst. An account whose renewal keeps failing with 401/403, or whose confirmed
 balance is below `min_account_balance`, leaves the routing pool until a later
-check succeeds.
+check succeeds. An account that spent Retool's hourly managed-key quota is parked
+for `account_rate_limit_cooldown` seconds and returns by itself.
 """
+import math
 import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import apierr
 import console_log
 import journal
 
@@ -22,6 +25,8 @@ NETWORK_PAUSE_MAX = 300.0
 AUTH_RETRY_MAX = 600.0
 PRIORITY_MAX = 99
 LABEL_MAX = 40
+RATE_LIMIT_COOLDOWN = 900.0  # default pause after Retool's hourly managed-key limit
+RATE_LIMIT_MAX = 3600.0      # the limit is a sliding hour: parking an account longer never helps
 
 
 def enabled(backend):
@@ -67,6 +72,8 @@ class AccountDispatcher:
         self.interval = float(cfg.get("session_refresh_interval", 900) or 0)
         self.threshold = float(cfg.get("min_account_balance", 20))
         self.balance_interval = float(cfg.get("account_balance_interval", 300) or 0)
+        self.rate_limit_cooldown = min(max(float(cfg.get("account_rate_limit_cooldown") or RATE_LIMIT_COOLDOWN),
+                                           1.0), RATE_LIMIT_MAX)
         self.parallel = max(1, int(cfg.get("account_refresh_parallel", 3) or 1))
         self.clock = clock
         self.rng = rng or random.Random()
@@ -123,6 +130,7 @@ class AccountDispatcher:
     def _tick(self):
         try:
             self.revive_renewed()
+            self.release_rate_limited()
             for backend, kind in self.due():
                 try:
                     self._executor.submit(self._run, backend, kind)
@@ -203,7 +211,8 @@ class AccountDispatcher:
         else:
             state["reasons"][reason] = dict(details, reason=reason)
         reasons = state["reasons"]
-        backend.unavailable = reasons.get("exhausted") or reasons.get("auth_dead")
+        # A parked account is never a reserve candidate, even when its balance is also low.
+        backend.unavailable = reasons.get("rate_limited") or reasons.get("exhausted") or reasons.get("auth_dead")
         return (before is None) != (backend.unavailable is None)
 
     def _announce(self, backend, changed, reason=None):
@@ -285,6 +294,61 @@ class AccountDispatcher:
             self._announce(backend, True, reason)
         return bool(revived)
 
+    def mark_rate_limited(self, backend, retry_after=None, request_id=None):
+        """Park an account that spent Retool's hourly managed-key quota; returns when it comes back.
+
+        The pause is `Retry-After` when Retool sends one, else `account_rate_limit_cooldown`. An
+        account that fails again within as long as it was parked gets twice the previous pause, up
+        to an hour. Turns that fail together share one pause and one journal line.
+        """
+        if backend not in self.state:
+            return None
+        now = self.clock()
+        with self._lock:
+            state = self.state[backend]
+            hold = state["reasons"].get("rate_limited")
+            if hold is not None and now < hold["until"]:
+                return hold["until_at"]
+            # A hold the scheduler has not released yet still ended at its own deadline.
+            returned = state.get("rl_released", float("-inf")) if hold is None else hold["until"]
+            previous = state.get("rl_pause", 0.0)
+            hint = retry_after if isinstance(retry_after, (int, float)) and 0 < retry_after < math.inf else None
+            if hint is not None:
+                pause, source = min(max(float(hint), 1.0), RATE_LIMIT_MAX), "retry_after"
+            elif previous and now - returned < previous:
+                pause, source = min(previous * 2, RATE_LIMIT_MAX), "escalated"
+            else:
+                pause, source = self.rate_limit_cooldown, "cooldown"
+            state["rl_pause"] = pause
+            until_at = time.time() + pause
+            self._set_reason(backend, "rate_limited", {"until": now + pause, "until_at": until_at,
+                                                       "pause": pause, "source": source})
+        tag = self._tag(backend)
+        text = "[account] %s исключён: часовой лимит Retool до %s (пауза %s%s)" % (
+            tag, time.strftime("%H:%M:%S", time.localtime(until_at)), apierr.wait_text(pause),
+            ", повторный лимит подряд" if source == "escalated" else "")
+        journal.emit("account.rate_limited", text, "warn", account=tag, until=round(until_at, 3),
+                     retry_in=pause, source=source, **({"request_id": request_id} if request_id else {}))
+        console_log.write(text)
+        return until_at
+
+    def release_rate_limited(self, now=None):
+        """Return accounts whose pause is over to the pool; the scheduler calls this every tick."""
+        now = self.clock() if now is None else now
+        released = []
+        with self._lock:
+            for backend in self.backends:
+                state = self.state[backend]
+                hold = state["reasons"].get("rate_limited")
+                if hold is None or now < hold["until"]:
+                    continue
+                state["rl_released"] = now
+                if self._set_reason(backend, "rate_limited", None):
+                    released.append(backend)
+        for backend in released:
+            self._announce(backend, True, None)
+        return bool(released)
+
     def recheck_exhausted(self):
         """Before answering 402, confirm excluded balances (a top-up is adopted at once)."""
         with self._lock:
@@ -353,5 +417,6 @@ class AccountDispatcher:
             return [{"account": self._tag(backend),
                      "state": (backend.unavailable or {}).get("reason", "active"),
                      "available": self.state[backend]["available"],
-                     "auth_failures": self.state[backend]["auth_failures"]}
+                     "auth_failures": self.state[backend]["auth_failures"],
+                     "rate_limited_until": (self.state[backend]["reasons"].get("rate_limited") or {}).get("until_at")}
                     for backend in self.backends]

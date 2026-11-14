@@ -197,10 +197,11 @@ def test_four_level_native_picker_retains_max_without_inventing_xhigh():
     assert compatible_effort_cap(levels, tuple(levels)) == 'max'
 
 
-def test_fable_does_not_get_an_invented_family_when_a_real_resource_is_configured():
+def test_fable_gets_the_family_tier_desktop_documents():
+    # Desktop's configuration reference lists haiku|sonnet|opus|fable|mythos; a stale tier is replaced.
     fable = models.resolve('claude-fable-5')[0]
     result = build_catalog([fable], [{'name': fable['id'], 'anthropicFamilyTier': 'opus'}])
-    assert 'anthropicFamilyTier' not in result[0]
+    assert result[0]['anthropicFamilyTier'] == 'fable' and result[0]['isFamilyDefault'] is True
 
 
 @pytest.mark.parametrize('previous', [{}, [None], 'invalid'])
@@ -668,7 +669,7 @@ def test_downgrade_mapping_makes_the_whole_native_picker_safe(levels, native, ex
     assert compatible_effort_cap(levels, native, allow_downgrade=True) == expected
 
 
-@pytest.mark.parametrize('name', ['claude-haiku-4-5-20251001', 'claude-opus-4-5-20251101',
+@pytest.mark.parametrize('name', ['claude-opus-4-5-20251101',
                                   'claude-sonnet-4-5-20250929', 'claude-opus-4-20250514',
                                   'claude-opus-4-1-20250805', 'claude-sonnet-4-20250514'])
 @pytest.mark.parametrize('downgrade', [False, True])
@@ -676,6 +677,14 @@ def test_models_without_a_native_effort_selector_never_get_a_cap(name, downgrade
     entry = models.resolve(name)[0]
     assert entry['reasoning_effort_levels']
     previous = [{'name': name, 'maxEffort': 'xhigh'}]
+    assert 'maxEffort' not in build_catalog([entry], previous, allow_downgrade=downgrade)[0]
+
+
+@pytest.mark.parametrize('downgrade', [False, True])
+def test_haiku_publishes_no_levels_because_the_route_ignores_effort_so_it_gets_no_cap(downgrade):
+    entry = models.resolve('claude-haiku-4-5-20251001')[0]
+    assert entry['reasoning_effort_levels'] == [] and entry['reasoning_effort_control'] == 'accepted-ignored'
+    previous = [{'name': entry['id'], 'maxEffort': 'xhigh'}]
     assert 'maxEffort' not in build_catalog([entry], previous, allow_downgrade=downgrade)[0]
 
 
@@ -687,10 +696,11 @@ def test_unknown_future_model_assumes_the_full_picker_so_the_cap_protects_it(dow
 
 
 def test_catalog_levels_take_precedence_over_the_builtin_table(tmp_path):
+    # Opus 4.6 has a four-level picker in the builtin table; the catalog says five, so the cap drops to high.
     catalog = load_desktop_catalog(anthropic_catalog(tmp_path, {'ccd': [('claude-sonnet-5-5', FOUR),
-                                                                        ('claude-haiku-4-5-20251001', FIVE)]}))
-    sonnet, haiku = (models.resolve(name)[0] for name in ('claude-sonnet-5-5', 'claude-haiku-4-5-20251001'))
-    rows = build_catalog([sonnet, haiku], [], desktop=catalog)
+                                                                        ('claude-opus-4-6', FIVE)]}))
+    sonnet, opus = (models.resolve(name)[0] for name in ('claude-sonnet-5-5', 'claude-opus-4-6'))
+    rows = build_catalog([sonnet, opus], [], desktop=catalog)
     assert rows[0]['maxEffort'] == 'max' and rows[1]['maxEffort'] == 'high'
 
 

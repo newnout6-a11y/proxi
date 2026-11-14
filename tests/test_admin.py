@@ -301,6 +301,43 @@ def test_turn_traces_and_metrics_aggregate_journal(admin_relay):
     assert len(metrics["buckets"]) == 60
 
 
+def test_turn_api_reports_an_unknown_price_as_null_and_metrics_report_coverage(admin_relay):
+    journal.JOURNAL.reset()
+    journal.emit("turn.begin", "", turn_id="priced", model="m")
+    journal.emit("upstream.usage_start", "", turn_id="priced", attempt=1)
+    journal.emit("upstream.usage", "", turn_id="priced", attempt=1, credits=0.25)
+    journal.emit("turn.end", "", "success", turn_id="priced", reason="stop", duration_ms=10)
+    journal.emit("turn.begin", "", turn_id="unpriced", model="m")
+    journal.emit("upstream.usage_start", "", turn_id="unpriced", attempt=2)
+    journal.emit("upstream.usage", "", "warn", turn_id="unpriced", attempt=2, credits=None, credits_reported=False)
+    journal.emit("turn.end", "", "success", turn_id="unpriced", reason="stop", duration_ms=10)
+    journal.emit("turn.begin", "", turn_id="rejected", model="m")
+    journal.emit("turn.end", "", "error", turn_id="rejected", reason="error", duration_ms=1)
+    journal.emit("turn.begin", "", turn_id="running", model="m")
+    journal.emit("upstream.usage_start", "", turn_id="running", attempt=3)
+    status, body, _ = admin_relay.request("/admin/api/turns")
+    traces = {item["turn_id"]: item for item in body["data"]}
+    assert status == 200
+    assert (traces["priced"]["credits"], traces["priced"]["credits_complete"], traces["priced"]["credits_unknown"]) == (
+        0.25, True, 0)
+    assert (traces["unpriced"]["credits"], traces["unpriced"]["credits_complete"],
+            traces["unpriced"]["credits_unknown"]) == (None, False, 1)
+    assert (traces["rejected"]["credits"], traces["rejected"]["credits_complete"]) == (0.0, True)
+    assert (traces["running"]["credits"], traces["running"]["credits_complete"], traces["running"]["status"]) == (
+        None, False, "running")
+    _, metrics, _ = admin_relay.request("/admin/api/metrics?window=3600")
+    totals = metrics["totals"]
+    assert totals["credits"] == 0.25 and totals["credits_unknown"] == 1 and totals["credits_complete"] is False
+    assert totals["credits_in_progress"] == 1 and totals["keepwarm_credits"] == 0
+    coverage = metrics["coverage"]
+    assert set(coverage) == {"complete", "window_start", "covered_from", "covered_seconds", "oldest_event_ts",
+                             "buffer_oldest_ts", "buffer_events", "buffer_capacity"}
+    # A just cleared journal cannot vouch for an hour of history.
+    assert coverage["complete"] is False and 0 <= coverage["covered_seconds"] < 3600
+    assert coverage["buffer_capacity"] == journal.CAPACITY and coverage["buffer_events"] == metrics["buffered"]
+    assert coverage["oldest_event_ts"] == coverage["buffer_oldest_ts"] and coverage["window_start"] % 60 == 0
+
+
 def test_live_stream_delivers_new_events_with_header_auth(admin_relay, monkeypatch):
     journal.JOURNAL.reset()
     monkeypatch.setattr(admin, "STREAM_MAX_SECONDS", 3)
@@ -428,14 +465,20 @@ def test_token_snapshots_do_not_hide_or_invent_an_extra_charge(reverse):
     totals = log.metrics()['totals']
     assert totals['credits'] == 1.5 and totals['credits_complete'] is True
     log.emit('upstream.usage_start', 'next', turn_id='t1', attempt=2)
+    # An attempt that has only started has reported nothing: it is not a missing price (yet).
+    assert log.metrics()['totals']['credits_complete'] is True
+    log.emit('upstream.usage', 'marker', turn_id='t1', attempt=2, credits=None, credits_reported=False)
     assert log.metrics()['totals']['credits_complete'] is False
 
 
 def test_a_billed_turn_cannot_mask_another_turn_without_telemetry():
     log = journal.Journal()
     log.emit('turn.begin', 'first', turn_id='t1')
-    log.emit('upstream.usage', 'known', turn_id='t1', credits=1)
+    log.emit('upstream.usage_start', 'attempt', turn_id='t1', attempt=1)
+    log.emit('upstream.usage', 'known', turn_id='t1', attempt=1, credits=1)
     log.emit('turn.begin', 'second', turn_id='t2')
+    log.emit('upstream.usage_start', 'attempt', turn_id='t2', attempt=2)
+    log.emit('upstream.usage', 'usage without a price', turn_id='t2', attempt=2, credits=None)
     log.emit('turn.end', 'second ended', turn_id='t2')
     assert log.metrics()['totals']['credits_complete'] is False
 

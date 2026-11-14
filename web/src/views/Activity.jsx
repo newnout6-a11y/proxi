@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Page } from '../motion.jsx';
 import { buildTraces } from '../turns.js';
 import { fmtInt } from '../format.js';
@@ -10,6 +10,8 @@ const TABS = [
   { id: 'events', label: 'Все события' },
 ];
 
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 function initialTab() {
   return location.hash === '#activity/events' ? 'events' : 'turns';
 }
@@ -17,8 +19,12 @@ function initialTab() {
 /** Turns and the raw journal are one stream of activity: a turn is a group of journal events. */
 export default function Activity(props) {
   const [tab, setTab] = useState(initialTab);
+  const panel = useRef(null);
+  // WAI-ARIA tabs: a panel joins the tab sequence only when it holds nothing focusable to land on
+  const [stop, setStop] = useState(false);
   useEffect(() => { history.replaceState(null, '', `#activity/${tab}`); }, [tab]);
-  const turns = buildTraces(props.journal.events).length;
+  useLayoutEffect(() => { setStop(!panel.current?.querySelector(FOCUSABLE)); });
+  const turns = useMemo(() => buildTraces(props.journal.events).length, [props.journal.events]);
   const counts = { turns, events: props.journal.events.length };
   return (
     <Page className="activity">
@@ -43,9 +49,15 @@ export default function Activity(props) {
           ))}
         </div>
       </header>
-      <div role="tabpanel" id={`activity-panel-${tab}`} aria-labelledby={`activity-tab-${tab}`} tabIndex={0}>
-        {tab === 'turns' ? <Turns {...props} embedded /> : <Journal {...props} embedded />}
-      </div>
+      {TABS.map((item) => {
+        const active = tab === item.id;
+        return (
+          <div key={item.id} ref={active ? panel : undefined} role="tabpanel" id={`activity-panel-${item.id}`}
+            aria-labelledby={`activity-tab-${item.id}`} hidden={!active} tabIndex={active && stop ? 0 : undefined}>
+            {active && (item.id === 'turns' ? <Turns {...props} embedded /> : <Journal {...props} embedded />)}
+          </div>
+        );
+      })}
     </Page>
   );
 }

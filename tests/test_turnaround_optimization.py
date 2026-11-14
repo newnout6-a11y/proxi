@@ -149,13 +149,15 @@ def test_reasoning_effort_clamping_and_preservation():
     entry_sonnet, effort_sonnet = models.resolve_tolerant("claude-sonnet-5", "high")
     assert effort_sonnet == "high"
 
-    # 3. Haiku only accepts low, medium, high, max: 'xhigh' clamps to 'high'
+    # 3. Haiku takes any known level and ignores it (live probe 2026-11-05): nothing to clamp.
     entry_haiku, effort_haiku = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh", allow_downgrade=True)
-    assert effort_haiku == "high"
+    assert effort_haiku is None
+    entry_opus_high, effort_opus_high = models.resolve_tolerant("claude-opus-5-5", "xhigh", allow_downgrade=True)
+    assert effort_opus_high == "high"
 
-    # 4. GLM Flash has live-verified thinking and retains supported effort.
+    # 4. GLM Flash ignores effort as well.
     entry_glm, effort_glm = models.resolve_tolerant("zai-org/GLM-5.3-Flash", "high", allow_downgrade=True)
-    assert effort_glm == 'high'
+    assert effort_glm is None
 
 
 def test_full_context_preservation_no_truncation():

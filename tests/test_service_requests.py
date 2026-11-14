@@ -284,6 +284,20 @@ def test_codex_per_request_hints_do_not_warn_on_every_turn(relay, monkeypatch):
     assert "PRIVATE-KEY" not in json.dumps(entries)
 
 
+@pytest.mark.parametrize("model", ["claude-haiku-4-5-20251001", "zai-org/GLM-5.3"])
+def test_effort_sent_to_a_route_that_ignores_it_is_not_a_warning(relay, monkeypatch, model):
+    log = journal.Journal()
+    monkeypatch.setattr(journal, "JOURNAL", log)
+    payload = {"model": model, "max_tokens": 2048, "thinking": {"type": "enabled", "budget_tokens": 1024},
+               "messages": [{"role": "user", "content": "hi"}]}
+    with relay.request("/v1/messages", payload) as response:
+        assert response.status == 200
+        names = response.headers["x-proxi-ignored-parameters"].split(",")
+    assert "thinking.budget_tokens" in names
+    entries = [e for e in log.query() if e["kind"] == "request.compatibility"]
+    assert len(entries) == 1 and entries[0]["level"] == "debug"
+
+
 def test_token_estimate_includes_large_tool_schema_and_remains_local(relay):
     payload = {"model": "claude-opus-5-5", "system": "System instructions",
                "messages": [{"role": "user", "content": "hi"}]}

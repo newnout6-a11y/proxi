@@ -268,7 +268,7 @@ def test_unknown_tool_choice_is_rejected_before_provider_request():
         validate.parse_responses(_body("responses", tool_choice={"type": "function", "name": "missing"}), CFG)
     assert raised.value.status == 422
 def test_unsupported_effort_is_clamped_to_the_nearest_supported_level():
-    entry, effort = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh", allow_downgrade=True)
+    entry, effort = models.resolve_tolerant("claude-opus-5-5", "xhigh", allow_downgrade=True)
     assert effort in entry["reasoning_effort_levels"]
     assert effort == "high"
     entry, effort = models.resolve_tolerant("gpt-5.5", "minimal", allow_downgrade=True)
@@ -290,7 +290,7 @@ def test_effort_no_provider_defines_is_rejected_not_clamped():
 
 def test_clamped_effort_still_validates_at_the_dialect_layer():
     parsed = validate.parse_anthropic({
-        "model": "claude-haiku-4-5-20251001", "max_tokens": 8,
+        "model": "claude-opus-5-5", "max_tokens": 8,
         "messages": [{"role": "user", "content": "x"}], "reasoning_effort": "xhigh"},
         dict(CFG, allow_effort_downgrade=True))
     assert parsed.effort == "high"

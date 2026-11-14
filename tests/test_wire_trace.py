@@ -12,7 +12,47 @@ import direct
 import apierr
 from scripts import replay_upstream
 from upstream_attempts import AttemptBudget
-from upstream_diagnostics import AttemptTrace
+from upstream_diagnostics import AttemptTrace, WireTrace
+
+
+def _trace_names(count, minute=12):
+    return [f"20261105-{minute:02d}00{i:02d}-abc-attempt1-{i:012x}" for i in range(count)]
+
+
+def test_trace_directory_keeps_only_the_newest_folders_and_leaves_other_entries(tmp_path):
+    cfg = {"upstream_trace_dir": str(tmp_path), "trace_max_folders": 3}
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "README.txt").write_text("kept")
+    names = _trace_names(6)
+    for name in names:
+        trace = WireTrace(cfg, name, b"{}")
+        trace.close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(names[-3:] + ["notes", "README.txt"])
+
+
+def test_client_traces_use_the_same_cap(tmp_path):
+    cfg = {"client_trace_dir": str(tmp_path), "trace_max_folders": 2}
+    names = [name.replace("-attempt1-", "-client-") for name in _trace_names(4)]
+    for name in names:
+        WireTrace(cfg, name, b"{}", root_key="client_trace_dir").close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == names[-2:]
+
+
+def test_zero_keeps_every_trace_and_the_new_folder_is_never_pruned(tmp_path):
+    cfg = {"upstream_trace_dir": str(tmp_path), "trace_max_folders": 0}
+    for name in _trace_names(5):
+        WireTrace(cfg, name, b"{}").close()
+    assert len(list(tmp_path.iterdir())) == 5
+    late = _trace_names(1, minute=0)[0]  # sorts before everything (clock moved back)
+    WireTrace(dict(cfg, trace_max_folders=2), late, b"{}").close()
+    assert late in {p.name for p in tmp_path.iterdir()}
+
+
+def test_default_cap_bounds_an_enabled_trace_directory(tmp_path):
+    cfg = {"upstream_trace_dir": str(tmp_path)}
+    for name in [f"20261105-1{i // 3600:01d}{(i // 60) % 60:02d}{i % 60:02d}-abc-attempt1-{i:012x}" for i in range(205)]:
+        WireTrace(cfg, name, b"{}").close()
+    assert len(list(tmp_path.iterdir())) == 200
 
 
 def test_opt_in_trace_preserves_exact_request_response_and_parser_event(tmp_path, monkeypatch):

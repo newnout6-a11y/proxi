@@ -2,6 +2,8 @@
 
 Effort capabilities describe the Retool route rather than the provider-wide union.
 """
+import datetime
+
 from apierr import ApiError, bad_request, not_found, service_unavailable
 
 # Accepted reasoning effort values per Retool route (bundle plus dated live probes).
@@ -9,8 +11,8 @@ EFFORTS_BY_PROVIDER = {
     "openai": ("minimal", "low", "medium", "high", "xhigh", "max", "none"),
     "anthropic": ("low", "medium", "high", "max"),
     "google": ("low", "medium", "high"),
-    # Both GLM routes accepted and answered low/medium/high/max on 2026-11-04.
-    # This is Retool's control surface; public Z.ai has a narrower native list.
+    # Both GLM routes accepted low/medium/high/max on 2026-11-04, but a 2026-11-05 probe
+    # found no behavioural difference between them (see _EFFORT_IGNORED below).
     "retool-fast": ("low", "medium", "high", "max"),
 }
 
@@ -18,8 +20,6 @@ EFFORTS_BY_PROVIDER = {
 # xhigh entries: copilotStreamGPT rejects that value with HTTP 422.
 _BASE_EFFORTS = ("low", "medium", "high")
 _EFFORTS_BY_MODEL = {
-    # Direct Assist route answered with thinking disabled, 2026-11-05.
-    "claude-haiku-4-5-20251001": ("none",) + _BASE_EFFORTS + ("max",),
     "gpt-5": _BASE_EFFORTS + ("minimal",),
     "gpt-5.1": ("none",) + _BASE_EFFORTS,
     "gpt-5.2": ("none",) + _BASE_EFFORTS,
@@ -77,7 +77,7 @@ CATALOG = [
     {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet 4", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
     {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "provider": "anthropic", "context": 1000000, "max_output": 128000, "reasoning": True, "tools": True, "vision": True},
-    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": True, "tools": True, "vision": True},
+    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5", "provider": "anthropic", "context": 200000, "max_output": 64000, "reasoning": False, "tools": True, "vision": True},
     {"id": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash (Preview)", "provider": "google", "context": 983040, "max_output": 65536, "reasoning": True, "tools": True, "vision": True},
     {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash", "provider": "google", "context": 1000000, "max_output": 65000, "reasoning": True, "tools": True, "vision": True},
@@ -115,36 +115,50 @@ _RETOOL_SOURCE = 'https://retool-edge.com/assets_vjs/main-CnZ2mbHm.js'
 _CLAUDE_DOCS = 'https://platform.claude.com/docs/en/models/'
 _LEGACY_CLAUDE = {'claude-opus-4-20250514', 'claude-opus-4-1-20250805',
                   'claude-sonnet-4-20250514'}
+# Small and fast models; the default applies where the model publishes selectable levels.
 _LOW_DEFAULTS = {'gpt-5-mini', 'gpt-5-nano', 'claude-haiku-4-5-20251001',
                  'gemini-3-flash-preview', 'gemini-3.5-flash',
-                 'gemini-3.1-flash-lite-preview', 'gemini-2.5-flash'}
+                 'gemini-3.1-flash-lite-preview', 'gemini-2.5-flash', 'zai-org/GLM-5.3-Flash'}
 _HIGH_DEFAULTS = {'gpt-6-astra', 'claude-fable-5'}
+# Retool takes a reasoningEffort for these models and changes nothing: no thinking events and no
+# ordering of output tokens or latency across levels (scripts/probe_effort_effect.py, 2026-11-05).
+# The control is accepted, never forwarded and never published as selectable.
+_EFFORT_IGNORED = {'claude-haiku-4-5-20251001', 'zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash'}
+
+
+def _recommended_effort(name, levels):
+    if not levels:
+        return None
+    return 'low' if name in _LOW_DEFAULTS else 'high' if name in _HIGH_DEFAULTS else 'medium'
+
 
 for _model in CATALOG:
     _default_efforts = (_BASE_EFFORTS if _model['provider'] == 'openai'
                         else EFFORTS_BY_PROVIDER.get(_model['provider'], ()))
     _model['reasoning_effort_levels'] = list(_EFFORTS_BY_MODEL.get(_model['id'], _default_efforts))
-    if not _model.get('reasoning'):
+    if not _model.get('reasoning') or _model['id'] in _EFFORT_IGNORED:
         _model['reasoning_effort_levels'] = []
     _levels = _model['reasoning_effort_levels']
-    _model['default_reasoning_effort'] = (
-        ('low' if _model['id'] in _LOW_DEFAULTS else
-         'high' if _model['id'] in _HIGH_DEFAULTS else 'medium') if _levels else None)
-    _model['reasoning_effort_control'] = 'selectable' if _levels else 'provider-managed'
+    _model['default_reasoning_effort'] = _recommended_effort(_model['id'], _levels)
+    _model['reasoning_effort_control'] = ('accepted-ignored' if _model['id'] in _EFFORT_IGNORED else
+                                          'selectable' if _levels else 'provider-managed')
     _model['metadata_checked_at'] = _AUDIT_DATE
     _model['metadata_source'] = [_RETOOL_SOURCE]
     _model['metadata_status'] = 'verified'
     if _model['provider'] == 'openai':
-        # Mini/nano inherit the family levels; their registry entries omit an
-        # explicit list. Do not claim those controls were individually tested.
+        # Mini/nano inherit the family limits; their registry entries omit an
+        # explicit effort list. Do not claim more than the 2026-11-05 effort probe showed.
         if _model['id'] in {'gpt-5-mini', 'gpt-5-nano'}:
             _model['metadata_status'] = 'partial'
-            _model['metadata_notes'] = 'Effort levels inherit the Retool GPT family; not individually verified.'
+            _model['reasoning_effort_checked_at'] = '2026-11-05'
+            _model['metadata_notes'] = ('Effort low/medium/high measurably changes output tokens and latency '
+                                        '(live probe 2026-11-05, two runs per level); minimal was not tested. '
+                                        'Other limits inherit the Retool GPT family and are not individually verified.')
     elif _model['provider'] == 'anthropic':
         if _model['id'] in _LEGACY_CLAUDE:
             _model['metadata_status'] = 'provisional'
             _model['metadata_source'].append('https://platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy')
-            _model['metadata_notes'] = 'Legacy 200K context; conservative 32K Opus/64K Sonnet output pending route verification.'
+            _model['metadata_notes'] = 'Legacy 200K context; 32K Opus/64K Sonnet output were never verified on a route.'
         else:
             _slug = _model['id'].removeprefix('claude-')
             _slug = _slug.rsplit('-', 1)[0] if _slug[-8:].isdigit() else _slug
@@ -171,23 +185,59 @@ for _name in ('gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'):
 
 for _name in ('zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash'):
     _entry = _BY_ID[_name]
-    _entry['reasoning_effort_checked_at'] = '2026-11-04'
-    _entry['metadata_notes'] = ('Live Retool route accepted low/medium/high/max and emitted reasoning on '
-                                '2026-11-04. This does not establish distinct provider budget values. '
+    _entry['reasoning_effort_checked_at'] = '2026-11-05'
+    _entry['metadata_notes'] = ('Live Retool route accepted low/medium/high/max and emitted reasoning at every level '
+                                'on 2026-11-04, but a 2026-11-05 probe (eight runs per extreme level of a hard '
+                                'counting question) found no consistent change in thinking volume, output tokens or '
+                                'latency: effort is accepted, not forwarded and not published. '
                                 'Retool image inputs passed two randomized quadrant-color tests per route; '
                                 'this does not establish the underlying provider vision implementation. '
                                 'Maximum context/output sizes were not stress-tested.')
     _entry['metadata_source'].append('https://docs.z.ai/guides/capabilities/thinking')
 
+_entry = _BY_ID['claude-haiku-4-5-20251001']
+_entry['reasoning_effort_checked_at'] = '2026-11-05'
+_entry['metadata_notes'] = ('Retool accepts reasoningEffort for this model and ignores it: no thinking events and no '
+                            'ordering of output tokens or latency across none/low/medium/high/max (live probe '
+                            '2026-11-05), so the route is listed as not reasoning. Anthropic lists "Default effort: '
+                            'Not supported" for Haiku 4.5, whose extended thinking is manual (budget_tokens); no '
+                            'thinking appeared through this route at any level that was tried.')
+
 _BUDGET_TO_EFFORT = ((1024, 'low'), (8192, 'medium'), (24576, 'high'))
 
+# Anthropic lifecycle (deprecated, retired) in UTC, from
+# https://platform.claude.com/docs/en/about-claude/model-deprecations as checked on 2026-11-05.
+# "Requests to retired models fail", so a retired model is never routed, with or without BYOK.
+_DEPRECATIONS_URL = 'https://platform.claude.com/docs/en/about-claude/model-deprecations'
+_LIFECYCLE = {
+    'claude-opus-4-20250514': ('2026-04-14', '2026-06-15'),
+    'claude-opus-4-1-20250805': ('2026-06-05', '2026-08-05'),
+    'claude-sonnet-4-20250514': ('2026-04-14', '2026-06-15'),
+    'claude-sonnet-4-5-20250929': ('2026-09-30', '2026-11-30'),
+}
+for _name, (_deprecated, _retires) in _LIFECYCLE.items():
+    _entry = _BY_ID[_name]
+    _entry.update(deprecated_at=_deprecated, retires_at=_retires)
+    _entry['metadata_source'].append(_DEPRECATIONS_URL)
+    if _name in _LEGACY_CLAUDE:
+        _entry['metadata_notes'] += ' Retired by Anthropic on %s.' % _retires
+_BY_ID['claude-sonnet-4-5-20250929']['metadata_notes'] = (
+    'Deprecated by Anthropic on 2026-09-30; retirement is scheduled for 2026-11-30, '
+    'when the relay stops publishing this model.')
+
 # Dated route facts, separate from model limits and per-account resource access.
+_RETOOL_RETIRED = ("Retool's managed key answers 400 'not available right now' (App Builder) and 422 "
+                   "'not available when using Retool's managed key for Assist' (live check 2026-11-05); "
+                   "a retired model does not come back with your own key.")
 _UNSUPPORTED_ROUTES = {
     'gpt-5.3-codex': 'Retool Assist uses an upstream Chat endpoint this model rejects; Responses is required.',
-    'claude-sonnet-4-20250514': 'Retool Assist returns provider 404 not_found for this model.',
+    'claude-opus-4-20250514': 'Retired by Anthropic on 2026-06-15. ' + _RETOOL_RETIRED,
+    'claude-opus-4-1-20250805': 'Retired by Anthropic on 2026-08-05. ' + _RETOOL_RETIRED,
+    'claude-sonnet-4-20250514': ('Retired by Anthropic on 2026-06-15; '
+                                 'Retool Assist returns provider 404 not_found for this model.'),
     'gpt-6-luna': 'Unavailable on the Retool React route; Assist rejects this model.',
 }
-_BYOK_ROUTES = {'gpt-6-astra', 'claude-opus-4-20250514', 'claude-opus-4-1-20250805'}
+_BYOK_ROUTES = {'gpt-6-astra'}
 _RETENTION_ROUTES = {'claude-fable-5'}
 _VERIFIED_ROUTES = {
     'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-5', 'gpt-5-mini', 'gpt-5-nano',
@@ -197,9 +247,12 @@ _VERIFIED_ROUTES = {
     'claude-sonnet-4-5-20250929', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001',
     'zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash',
 }
+# Every route fact above came from a live request. The Gemini entries were never probed.
+_PROBED_ROUTES = _VERIFIED_ROUTES | set(_UNSUPPORTED_ROUTES) | _BYOK_ROUTES | _RETENTION_ROUTES
 for _model in CATALOG:
     _name = _model['id']
-    _model['route_checked_at'] = '2026-11-05'
+    if _name in _PROBED_ROUTES:
+        _model['route_checked_at'] = '2026-11-05'
     if _name in _UNSUPPORTED_ROUTES:
         _model.update(route_status='unsupported', route_reason=_UNSUPPORTED_ROUTES[_name])
     elif _name in _BYOK_ROUTES or _name in _RETENTION_ROUTES:
@@ -215,6 +268,49 @@ for _name in ('gpt-6.1-terra', 'gpt-4.1'):
     _BY_ID[_name].update(metadata_checked_at='2026-11-05',
                         metadata_source=['https://retool-edge.com/assets_vjs/main-DVkrwaG2.js'])
 _BY_ID['claude-opus-5']['route_reason'] = 'Low effort answered; other small-output probes sometimes returned thinking only.'
+_BY_ID['claude-sonnet-4-5-20250929']['route_reason'] = (
+    'Synthetic questions answered on Retool direct/Assist route. Anthropic retires this model on '
+    '2026-11-30; the relay stops publishing it on that date.')
+
+# Input limits Retool applies per route (COPILOT_MODEL_INPUT_CONTEXT_SIZE_MAP, see
+# docs/model-catalog-audit.md). A model missing here has no verified route limit, so discovery
+# publishes no max_input_tokens for it.
+_ROUTE_INPUT_TOKENS = {
+    'claude-opus-4-6': 872000, 'claude-opus-4-7': 872000, 'claude-opus-4-8': 872000, 'claude-opus-5': 872000,
+    'claude-opus-5-5': 872000, 'claude-fable-5': 872000, 'claude-sonnet-4-6': 936000,
+}
+for _name, _limit in _ROUTE_INPUT_TOKENS.items():
+    _BY_ID[_name]['route_input_tokens'] = _limit
+
+
+def _today():
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def _access_hint(entry, cfg):
+    """How an operator unlocks a BYOK/retention model: the config keys and the account entry to edit."""
+    provider = entry['provider']
+    key = PROVIDER_RESOURCE_KEY[provider]
+    resource = cfg.get(key)
+    flags = '"byok": true' + (' or "data_retention_enabled": true' if entry['id'] in _RETENTION_ROUTES else '')
+    declared = ('provider_access.%s = {"resource_name": "<value of %s>", %s}' % (provider, key, flags))
+    access = cfg.get('provider_access')
+    access = access.get(provider) if isinstance(access, dict) else None
+    if not resource:
+        return ("Set %s to your own resource in this account's entry of config.json, then declare it with %s."
+                % (key, declared))
+    if resource == '__managed__':
+        if entry['id'] in _RETENTION_ROUTES:
+            return ('If Retool shows data retention enabled for Anthropic models, add provider_access.%s = '
+                    '{"resource_name": "__managed__", "data_retention_enabled": true} to this account\'s entry of '
+                    'config.json; a "__managed__" resource never counts as BYOK.' % provider)
+        return ('%s is "__managed__": Retool-managed keys never count as BYOK. Use your own resource there and '
+                'declare it with %s.' % (key, declared))
+    if isinstance(access, dict) and access.get('resource_name') not in (None, resource):
+        return ('provider_access.%s.resource_name does not match %s; they must be identical. Add %s to this '
+                "account's entry of config.json." % (provider, key, declared))
+    return ("Add %s to this account's entry of config.json (a top-level provider_access counts only "
+            "when there is no accounts[])." % declared)
 
 
 def route_block_reason(entry, cfg):
@@ -223,6 +319,9 @@ def route_block_reason(entry, cfg):
         return 'Google requires a real BYOK resource; managed Google is not supported.'
     if name in _UNSUPPORTED_ROUTES:
         return _UNSUPPORTED_ROUTES[name]
+    retires = entry.get('retires_at')
+    if retires and retires <= _today().isoformat():
+        return 'Retired by Anthropic on %s; requests to retired models fail.' % retires
     if name not in _BYOK_ROUTES | _RETENTION_ROUTES:
         return None
     provider = entry['provider']
@@ -235,7 +334,28 @@ def route_block_reason(entry, cfg):
     retention = access.get('data_retention_enabled') is True
     if byok or (name in _RETENTION_ROUTES and retention):
         return None
-    return entry.get('route_reason') or 'Required provider access is not configured.'
+    return '%s %s' % (entry.get('route_reason') or 'Required provider access is not configured.',
+                      _access_hint(entry, cfg))
+
+
+def resource_block_reason(entry, cfg):
+    """Why this account has no provider resource for the model, or None."""
+    key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
+    if not key:
+        return "provider '%s' is not routed" % entry['provider']
+    if not cfg.get(key):
+        kind = ('a real Google BYOK resource' if entry['provider'] == 'google'
+                else "a resource name, or '__managed__'")
+        return "needs config key '%s' in the account entry (%s)" % (key, kind)
+    return None
+
+
+def model_unavailable(entry, reasons):
+    """A settled refusal: the model exists, but no account can serve it as configured.
+
+    404 is how both API families say a model is not served here; neither SDK retries it.
+    """
+    return not_found("model '%s' is not available: %s" % (entry['id'], '; '.join(dict.fromkeys(reasons))))
 
 
 def require_route(entry, cfg):
@@ -247,37 +367,93 @@ def catalog():
     return CATALOG
 
 
-def catalog_routable(entry, cfg, backends=None):
-    """Discovery uses enabled tenants' resources, as the actual pool does.
+def account_config(root, record):
+    """One account's effective config, built exactly as SessionPool builds its backends.
+
+    Resources are inherited from the root only within the same tenant; the pool controls
+    (enabled, priority, label, provider_access) belong to the account record alone.
+    """
+    merged = {key: value for key, value in root.items() if key != 'accounts'}
+    if str(record.get('base', root.get('base', ''))).rstrip('/') != str(root.get('base', '')).rstrip('/'):
+        for key in PROVIDER_RESOURCE_KEY.values():
+            if key not in record:
+                merged.pop(key, None)
+    merged.update(record)
+    merged.update(enabled=record.get('enabled', True), priority=record.get('priority', 0),
+                  label=record.get('label', ''), provider_access=record.get('provider_access', {}))
+    return merged
+
+
+def discovery_configs(cfg, backends):
+    """Configs of the accounts that can serve a request for the shared-mode main path or any pool path."""
+    if backends is not None:
+        configs = [backend.cfg for backend in backends]
+    else:
+        records = cfg.get('accounts')
+        configs = ([account_config(cfg, record) for record in records if isinstance(record, dict)]
+                   if isinstance(records, list) and records else [cfg])
+    if cfg.get('session_mode') == 'shared':
+        # Without a context scope only the pool's first account serves requests.
+        configs = configs[:1]
+    return [item for item in configs if item.get('enabled', True)]
+
+
+def catalog_visibility(entry, cfg, backends=None):
+    """(published, reason): discovery uses enabled tenants' resources, as the actual pool does.
 
     Resource configuration is separate from model availability or account health:
     a temporarily empty balance does not erase an installed model's metadata.
     """
-    if backends is None:
-        configs = [item for item in (cfg.get('accounts') or [cfg]) if item.get('enabled', True)]
-    else:
-        configs = [backend.cfg for backend in backends if backend.cfg.get('enabled', True)]
+    configs = discovery_configs(cfg, backends)
     if not configs:
-        return False
-    eligible = [item for item in configs if not route_block_reason(entry, item)]
+        return False, 'no enabled account'
+    refusals = [route_block_reason(entry, item) for item in configs]
+    eligible = [item for item, reason in zip(configs, refusals) if not reason]
     if not eligible:
-        return False
+        return False, '; '.join(dict.fromkeys(refusals))
     if cfg.get('show_unrouted_models'):
-        return True
+        return True, None
     if not any(item.get(key) for item in configs for key in PROVIDER_RESOURCE_KEY.values()):
-        return True  # Unconfigured setup still exposes metadata; requests explain missing resources.
+        return True, None  # Unconfigured setup still exposes metadata; requests explain missing resources.
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
-    return bool(key and any(item.get(key) for item in eligible))
+    if key and any(item.get(key) for item in eligible):
+        return True, None
+    return False, 'no enabled account sets %s' % key
+
+
+def catalog_routable(entry, cfg, backends=None):
+    return catalog_visibility(entry, cfg, backends)[0]
+
+
+def default_model_warning(cfg, backends=None):
+    """Why requests without 'model' would be refused, or None. A hidden default gives no other hint."""
+    name = cfg.get('model')
+    try:
+        entry = resolve(name, strict=cfg.get('strict_models', True))[0]
+    except ApiError:
+        return "default model '%s' is not in the catalog; requests without 'model' are refused" % name
+    published, reason = catalog_visibility(entry, cfg, backends)
+    if published:
+        return None
+    return "default model '%s' is not published (%s); requests without 'model' are refused" % (entry['id'], reason)
 
 
 def desktop_metadata(entry, entries):
-    """Additional Anthropic Desktop discovery fields; IDs stay canonical."""
-    result = {'display_name': entry['label'], 'description': 'Retool relay: ' + entry['label'],
-              'max_input_tokens': entry['context'], 'supports_1m': entry['context'] >= 1000000}
+    """Additional Anthropic Desktop discovery fields; IDs stay canonical.
+
+    Desktop reads supports_1m, or max_input_tokens >= 1M, as "1M confirmed" and adds a separate 1M
+    picker entry, so both follow the verified route input limit and never the model's public window.
+    """
+    result = {'display_name': entry['label'], 'description': 'Retool relay: ' + entry['label']}
+    limit = entry.get('route_input_tokens')
+    if limit:
+        result['max_input_tokens'] = limit
+        if limit >= 1000000:
+            result['supports_1m'] = True
     if entry['provider'] == 'anthropic':
         family = entry['id'].removeprefix('claude-').split('-', 1)[0]
-        if family not in {'opus', 'sonnet', 'haiku'}:
-            return result  # Desktop's documented tier enum does not establish Fable.
+        if family not in {'opus', 'sonnet', 'haiku', 'fable', 'mythos'}:  # Desktop's documented tier enum
+            return result
         result['anthropic_family_tier'] = family
         first = next(item['id'] for item in entries
                      if item['provider'] == 'anthropic' and item['id'].startswith('claude-' + family + '-'))
@@ -320,6 +496,9 @@ def codex_catalog(entries=None):
             'default_reasoning_summary': 'detailed' if entry.get('reasoning') else 'none',
             'support_verbosity': bool(entry.get('verbosity_levels')), 'default_verbosity': None,
             'apply_patch_tool_type': 'freeform',
+            # Codex before openai/codex 86b1123 requires this field and sends parallel_tool_calls=false
+            # without it, which the relay rejects; newer versions ignore the unknown key.
+            'supports_parallel_tool_calls': True,
             'truncation_policy': {'mode': 'tokens', 'limit': 10000},
             'context_window': entry.get('context', 128000),
             'effective_context_window_percent': 95,
@@ -348,6 +527,60 @@ def nearest_effort(levels, requested):
                                           _EFFORT_RANK.get(level, wanted)))
 
 
+def _effort_controls_sent(data):
+    """(client-facing name, value) for every effort or thinking control, where validate._effort reads it."""
+    found = []
+
+    def look(prefix, container):
+        if not isinstance(container, dict):
+            return
+        for key in ('reasoning_effort', 'reasoningEffort', 'effort'):
+            if container.get(key) is not None:
+                found.append((prefix + key, container[key]))
+        reasoning = container.get('reasoning')
+        if isinstance(reasoning, dict) and reasoning.get('effort') is not None:
+            found.append((prefix + 'reasoning.effort', reasoning['effort']))
+
+    look('', data)
+    for key in ('settings', 'options', 'body', 'extra_body'):
+        look(key + '.', data.get(key))
+    provider_options = data.get('providerOptions')
+    look('providerOptions.openai.', provider_options.get('openai') if isinstance(provider_options, dict) else None)
+    output = data.get('output_config')
+    if isinstance(output, dict) and output.get('effort') is not None:
+        found.append(('output_config.effort', output['effort']))
+    thinking = data.get('thinking')
+    if isinstance(thinking, dict):
+        for key in ('effort', 'budget_tokens'):
+            if thinking.get(key) is not None:
+                found.append(('thinking.' + key, thinking[key]))
+    messages = data.get('messages', data.get('input'))
+    for message in messages if isinstance(messages, list) else []:
+        inline = message.get('output_config') if isinstance(message, dict) else None
+        if (isinstance(message, dict) and message.get('role') in ('system', 'developer')
+                and isinstance(inline, dict) and inline.get('effort') is not None):
+            found.append(('messages.output_config.effort', inline['effort']))
+            break
+    return found
+
+
+def ignored_effort_controls(data, entry):
+    """Names of the controls a route with reasoning_effort_control "accepted-ignored" drops.
+
+    Retool takes these and changes nothing, so they are accepted (never a 400, which would break
+    clients that send one level to every model), not forwarded, and reported by name only.
+    """
+    reasons = bool(entry.get('reasoning', True))
+    # "none" asks for no reasoning: a route that never reasons already complies.
+    names = [name for name, value in _effort_controls_sent(data)
+             if reasons or str(value).lower() != 'none']
+    thinking = data.get('thinking')
+    kind = str(thinking.get('type') or '').lower() if isinstance(thinking, dict) else ''
+    if kind and (kind != 'disabled') != reasons:
+        names.append('thinking.type')  # an on/off switch this route cannot honour
+    return names
+
+
 def effective_effort(entry, effort=None, configured=None):
     """A global default is a preference; explicit client controls were validated by resolve."""
     if effort is not None or not configured or not entry.get("reasoning", True):
@@ -356,7 +589,7 @@ def effective_effort(entry, effort=None, configured=None):
     if configured != "auto" and configured not in EFFORT_ORDER:
         raise bad_request("invalid configured reasoning effort", param="reasoning_effort")
     levels = entry.get("reasoning_effort_levels", EFFORTS_BY_PROVIDER.get(entry["provider"], ()))
-    if entry.get("reasoning_effort_control") == "provider-managed" or not levels:
+    if entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") or not levels:
         return None
     if configured == "auto":
         preferred = entry.get("default_reasoning_effort")
@@ -368,11 +601,13 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
     """Resolve exactly; explicit compatibility permits known-level mapping.
 
     Compatibility mapping is opt-in. Clients copy one effort across models, so e.g. xhigh reaches
-    Haiku, which only understands low/medium/high/max. A value no provider
+    Opus, which only understands low/medium/high/max. A value no provider
     defines at all ("extra", "ultra", typos) is still rejected with a 400:
     clamping it to medium would silently downgrade a client that asked for
     more thinking (verified live 2026-11-01: the route answers 422 to such
-    values, so there is nothing to clamp towards).
+    values, so there is nothing to clamp towards). Models whose route ignores
+    effort (reasoning_effort_control "accepted-ignored") take every known level
+    and forward none.
     """
     raw_name = (model or default_model or "").strip()
     extracted_effort = effort
@@ -433,6 +668,13 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
     if effort is not None:
         if not entry.get('reasoning', True) and isinstance(effort, str) and effort.lower() == 'none':
             return entry, None  # An explicit disabled control is harmless; never forward it.
+        if entry.get('reasoning_effort_control') == 'accepted-ignored':
+            # The route takes any level some provider defines and changes nothing: accept it, forward nothing.
+            if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:
+                return entry, None
+            raise bad_request(
+                f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)}); the route ignores it",
+                param='reasoning_effort')
         allowed = entry.get('reasoning_effort_levels', EFFORTS_BY_PROVIDER.get(entry['provider'], ()))
         if not isinstance(effort, str) or effort.lower() not in allowed:
             raise bad_request(

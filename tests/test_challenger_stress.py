@@ -229,15 +229,14 @@ def test_adversarial_reasoning_effort_matrix():
         entry, eff = models.resolve_tolerant(m, "low")
         assert eff == "low", f"Effort low must be preserved on {m}"
 
-    # 2. Haiku accepts low, medium, high, max:
-    # Test valid levels
-    for valid_lvl in ["low", "medium", "high", "max"]:
+    # 2. Haiku and GLM take every level some provider defines and forward none: Retool ignores the
+    # value on those routes (live probe 2026-11-05), so a copied level is never a client error.
+    for valid_lvl in ["low", "medium", "high", "max", "xhigh"]:
         entry_h, eff_h = models.resolve_tolerant("claude-haiku-4-5-20251001", valid_lvl)
-        assert eff_h == valid_lvl
+        assert eff_h is None
 
-    # Test clamping of invalid levels on Haiku
     entry_h_clamp, eff_h_clamp = models.resolve_tolerant("claude-haiku-4-5-20251001", "xhigh", allow_downgrade=True)
-    assert eff_h_clamp == "high", "Haiku unsupported 'xhigh' must clamp to 'high'"
+    assert eff_h_clamp is None, "Haiku ignores effort, so there is nothing to clamp"
 
     # A value no provider defines is rejected with a 400 instead of being
     # silently clamped to medium (live 2026-11-01: the route 422s such values).
@@ -245,9 +244,9 @@ def test_adversarial_reasoning_effort_matrix():
         models.resolve_tolerant("claude-haiku-4-5-20251001", "invalid_value")
     assert raised_invalid.value.status == 400
 
-    # 3. The live-verified GLM Flash route preserves supported reasoning effort.
+    # 3. GLM Flash accepts and ignores effort as well.
     _, eff_glm = models.resolve_tolerant('zai-org/GLM-5.3-Flash', 'high', allow_downgrade=True)
-    assert eff_glm == 'high'
+    assert eff_glm is None
 
 
 def test_stress_full_context_preservation_huge_dialogue():

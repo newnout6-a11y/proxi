@@ -71,8 +71,9 @@ Implemented:
 - Model discovery and admin resource status use the actual enabled tenants,
   preserving tenant-specific resources and reacting to account disablement.
 - Model discovery includes Claude Desktop names, input-window metadata and
-  documented Opus/Sonnet/Haiku family defaults. Undocumented Fable family tiers
-  are not invented.
+  documented family defaults. Fable's tier was first left out as undocumented;
+  Desktop's configuration reference lists `sonnet|opus|haiku|fable|mythos`, so
+  Fable now gets `fable` (2026-11-05 review follow-up).
 - `scripts/audit_models.py` requires `--allow-paid`, never rotates credentials,
   enables local execution or overwrites existing evidence. Synthetic prompts,
   protocol completion, usage and redacted errors are recorded separately.

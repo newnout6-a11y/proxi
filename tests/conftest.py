@@ -13,6 +13,18 @@ import config as config_module
 KEY = "test-key-123"
 
 
+@pytest.fixture(autouse=True)
+def pinned_calendar(monkeypatch):
+    """Anthropic's retirement dates hide models by the calendar (models._today).
+
+    The suite describes the catalog as of 2026-11-05, so a model that retires later (Sonnet 4.5 on
+    2026-11-30) does not change published counts on the day it retires. Tests of the dates themselves
+    set their own date."""
+    import datetime
+    import models
+    monkeypatch.setattr(models, "_today", lambda: datetime.date(2026, 11, 5))
+
+
 class FakeCredits:
     def __init__(self):
         self.used = []

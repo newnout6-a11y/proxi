@@ -72,6 +72,7 @@ DEFAULTS = {
     "upstream_error_max_dumps": 50,        # newest private request-body dump sets kept; 0 = unlimited
     "upstream_attempt_summaries_max": 200,  # newest per-attempt *-response.json kept; 0 = unlimited
     "client_trace_dir": "",    # explicit private client request/response traces; disabled by default
+    "trace_max_folders": 200,  # newest trace folders kept in each trace directory; 0 = unlimited
     # Provider caches expire in minutes; re-read the prefix to hold it open.
     "cache_keepwarm_seconds": 240,
     # Idle warming stops this long after a conversation's last real request. A ping reads
@@ -87,6 +88,8 @@ DEFAULTS = {
     "min_account_balance": 20,
     "account_balance_interval": 300,
     "account_refresh_parallel": 3,
+    # Pause after Retool's hourly managed-key limit; doubles (up to 3600) when the account fails again soon after.
+    "account_rate_limit_cooldown": 900,
     "agent_mode": 2,
     "model": "claude-opus-5-5",
     "google_provider_resource_name": "",
@@ -329,6 +332,49 @@ def reload_auth(cfg):
         return True
 
 
+def _check_provider_access(access, name):
+    """Resource-bound BYOK/retention facts; every error names the provider and the field."""
+    if not isinstance(access, dict):
+        raise service_unavailable(f"{name}: 'provider_access' must be an object")
+    for provider, details in access.items():
+        where = f"{name}: provider_access.{provider}"
+        key = models.PROVIDER_RESOURCE_KEY.get(provider)
+        if key is None:
+            raise service_unavailable(f"{name}: provider_access has an unknown provider '{provider}' "
+                                      f"(known: {', '.join(sorted(models.PROVIDER_RESOURCE_KEY))})")
+        if not isinstance(details, dict):
+            raise service_unavailable(f"{where} must be an object")
+        unknown = sorted(set(details) - {'resource_name', 'byok', 'data_retention_enabled'})
+        if unknown:
+            raise service_unavailable(f"{where} has unknown field(s): {', '.join(map(str, unknown))} "
+                                      "(allowed: resource_name, byok, data_retention_enabled)")
+        resource = details.get('resource_name')
+        if not isinstance(resource, str) or not resource:
+            raise service_unavailable(f"{where}.resource_name must be a non-empty string "
+                                      f"(the same value as {key})")
+        for flag in ('byok', 'data_retention_enabled'):
+            if flag in details and type(details[flag]) is not bool:
+                raise service_unavailable(f"{where}.{flag} must be a boolean")
+        if details.get('byok') is True and resource == '__managed__':
+            raise service_unavailable(f"{where}.byok cannot be true when resource_name is '__managed__': "
+                                      "Retool-managed keys are never BYOK")
+
+
+def _provider_access_warnings(cfg, record, name):
+    """A descriptor only applies to the exact resource it names; say so when it names another."""
+    access = record.get('provider_access')
+    if not isinstance(access, dict):
+        return []
+    effective = models.account_config(cfg, record) if isinstance(cfg.get('accounts'), list) else cfg
+    warnings = []
+    for provider, details in access.items():
+        key = models.PROVIDER_RESOURCE_KEY[provider]
+        if details['resource_name'] != effective.get(key):
+            warnings.append(f"{name}: provider_access.{provider}.resource_name differs from {key}, "
+                            "so the descriptor is ignored until they are identical")
+    return warnings
+
+
 def _check_pool_fields(record, name):
     """Admin pool controls: enabled (bool), priority (0..99, lower first), label (short text)."""
     if "enabled" in record and type(record["enabled"]) is not bool:
@@ -337,16 +383,7 @@ def _check_pool_fields(record, name):
         raise service_unavailable(f"{name}: 'priority' must be an integer from 0 to 99")
     if "label" in record and (not isinstance(record["label"], str) or len(record["label"]) > 40):
         raise service_unavailable(f"{name}: 'label' must be text of at most 40 characters")
-    access = record.get('provider_access', {})
-    if not isinstance(access, dict):
-        raise service_unavailable(f"{name}: 'provider_access' must be an object")
-    for provider, details in access.items():
-        if (provider not in models.PROVIDER_RESOURCE_KEY or not isinstance(details, dict)
-                or set(details) - {'resource_name', 'byok', 'data_retention_enabled'}
-                or not isinstance(details.get('resource_name'), str) or not details['resource_name']):
-            raise service_unavailable(f"{name}: invalid provider_access descriptor")
-        if any(key in details and type(details[key]) is not bool for key in ('byok', 'data_retention_enabled')):
-            raise service_unavailable(f"{name}: provider_access flags must be booleans")
+    _check_provider_access(record.get('provider_access', {}), name)
 
 
 def load(path=CONFIG_PATH):
@@ -394,7 +431,9 @@ def _load(path):
                     "max_prompt_bytes", "cache_keepwarm_seconds", "cache_keepwarm_idle",
                     "cache_keepwarm_subagent_idle",
                     "cache_keepwarm_turn_offset", "account_balance_interval", "account_refresh_parallel",
-                    "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
+                    "account_rate_limit_cooldown",
+                    "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
+                    "trace_max_folders"):
         try:
             cfg[num_key] = int(cfg[num_key])
         except (TypeError, ValueError):
@@ -410,10 +449,13 @@ def _load(path):
         raise service_unavailable("min_account_balance must be a finite non-negative number")
     if cfg["account_balance_interval"] < 0 or cfg["account_refresh_parallel"] < 1:
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
+    if not 1 <= cfg["account_rate_limit_cooldown"] <= 3600:
+        raise service_unavailable("account_rate_limit_cooldown must be between 1 and 3600 seconds")
     if type(cfg["allow_effort_downgrade"]) is not bool:
         raise service_unavailable("allow_effort_downgrade must be a boolean")
     for key in ("max_exec_turns", "max_prompt_bytes", "command_output_limit",
-                "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max"):
+                "upstream_empty_retries", "upstream_error_max_dumps", "upstream_attempt_summaries_max",
+                "trace_max_folders"):
         if cfg[key] < 0:
             raise service_unavailable(f"{key} must be non-negative (0 disables the cap)")
     if cfg["cache_keepwarm_subagent_idle"] < 0:
@@ -438,6 +480,7 @@ def _load(path):
         raise service_unavailable("rate_limit_rps must be non-negative and rate_limit_burst must be at least 1")
 
     accounts = cfg.get("accounts")
+    warnings = []
     if accounts is not None:
         if not isinstance(accounts, list) or not accounts:
             raise service_unavailable("'accounts' must be a non-empty array")
@@ -448,6 +491,8 @@ def _load(path):
             if acc_missing:
                 raise service_unavailable(f"account #{i} is missing required credentials: " + ", ".join(acc_missing))
             _check_pool_fields(acc, f"account #{i}")
+        if "provider_access" in saved:
+            _check_provider_access(saved["provider_access"], "top-level")
         if not cfg.get("base") and accounts:
             cfg["base"] = accounts[0]["base"]
         if not cfg.get("page_uuid") and accounts:
@@ -456,8 +501,14 @@ def _load(path):
             cfg["cookie"] = accounts[0]["cookie"]
         if not cfg.get("xsrf") and accounts:
             cfg["xsrf"] = accounts[0]["xsrf"]
+        if saved.get("provider_access"):
+            warnings.append("top-level provider_access is ignored when accounts[] is present; move it into the "
+                            "entry of the account that owns the resource")
+        for i, acc in enumerate(accounts):
+            warnings.extend(_provider_access_warnings(cfg, acc, f"account #{i}"))
     else:
         _check_pool_fields(cfg, "the account")
+        warnings.extend(_provider_access_warnings(cfg, cfg, "the account"))
 
     missing = [k for k in REQUIRED if not cfg.get(k)]
     if missing:
@@ -505,6 +556,9 @@ def _load(path):
                     cookie_vals.append(val)
     cfg["cookie_values"] = cookie_vals
     cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
+    cfg["config_warnings"] = warnings
+    for text in warnings:
+        print("warning: " + text, file=sys.stderr)
     changed = _assign_account_ids(saved)
     if not isinstance(saved.get("accounts"), list):
         cfg["account_id"] = saved["account_id"]

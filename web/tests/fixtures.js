@@ -9,7 +9,8 @@ export const catalog = [
     metadata_status: 'verified' },
   { id: 'gpt-5.5', label: 'GPT 5.5', provider: 'openai', context: 1050000, max_output: 128000,
     reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], routable: false,
-    metadata_status: 'verified' },
+    metadata_status: 'verified', route_status: 'unrouted', route_blocker: 'no_resource',
+    route_reason: "No enabled account that can serve this model has a Retool resource for openai ('openai_provider_resource_name')" },
 ];
 
 const extraCatalog = [
@@ -20,14 +21,27 @@ const extraCatalog = [
   { id: 'gpt-5.5-codex', label: 'GPT 5.5 Codex', provider: 'openai', context: 400000, max_output: 128000,
     reasoning: true, tools: true, reasoning_effort_levels: ['low', 'medium', 'high'], routable: true, metadata_status: 'verified' },
   { id: 'gemini-3-pro', label: 'Gemini 3 Pro', provider: 'google', context: 2000000, max_output: 64000,
-    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'high'], routable: false, metadata_status: 'estimated' },
+    reasoning: true, tools: true, reasoning_effort_levels: ['low', 'high'], routable: false, metadata_status: 'estimated',
+    route_status: 'unverified', route_blocker: 'blocked', route_reason: 'Requires Google BYOK; no configured route was tested.' },
+];
+
+// Mirrors admin._default_roles: the texts the relay really sends while relay_system_prompt is null.
+export const DEFAULT_ROLES = [
+  { id: 'relay', title: 'Роль relay по умолчанию',
+    text: '[ROLE]\nYou are a coding assistant behind a local OpenAI/Anthropic relay. Follow the user\'s task and language. '
+      + 'Use only provided capabilities; inspect before editing and verify changes.',
+    applies_to: 'Запросы без инструментов и без инструкций клиента (curl, скрипты), а также режимы «Дополнить клиента» и «Заменить роль клиента»' },
+  { id: 'native_tools', title: 'Роль для клиентов с инструментами',
+    text: '[ROLE]\nYou are a coding assistant using the client\'s tools. Use those tools to inspect, edit and test that project.',
+    applies_to: 'Клиент со своими инструментами (IDE), который не прислал собственные инструкции' },
 ];
 
 // Mirrors admin._schema: every field has a group, a real description and, where it applies, a unit.
 export const baseSchema = {
   relay_system_prompt_mode: { type: 'string', label: 'Применение инструкций', group: 'instructions',
     enum: ['standalone', 'append', 'replace'], restart_required: true },
-  relay_system_prompt: { type: 'string', label: 'Инструкции для модели', group: 'instructions', nullable: true, multiline: true, restart_required: true },
+  relay_system_prompt: { type: 'string', label: 'Инструкции для модели', group: 'instructions', nullable: true,
+    max_bytes: 32768, max_prompt_share: 0.5, restart_required: true },
   model: { type: 'string', label: 'Модель по умолчанию', group: 'model', enum: catalog.map(({ id }) => id), restart_required: true,
     description: 'Модель для запросов, в которых клиент не указал свою' },
   show_thinking: { type: 'boolean', label: 'Передавать мышление модели', group: 'model', restart_required: true,
@@ -40,8 +54,13 @@ export const baseSchema = {
 
 const richSchema = {
   ...baseSchema,
-  reasoning_effort: { type: 'string', label: 'Уровень мышления', group: 'model', enum: ['auto', 'low', 'medium', 'high', 'max'], restart_required: true,
+  reasoning_effort: { type: 'string', label: 'Уровень мышления', group: 'model', restart_required: true,
+    enum: ['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     description: 'Уровень мышления, если клиент его не передал; auto оставляет выбор модели' },
+  allow_effort_downgrade: { type: 'boolean', label: 'Подбирать ближайший effort', group: 'model', restart_required: true,
+    description: 'Если модель не поддерживает запрошенный уровень мышления, взять ближайший вместо ошибки' },
+  max_prompt_bytes: { type: 'integer', label: 'Размер промпта', group: 'limits', unit: 'байт', min: 0, max: 1073741824,
+    restart_required: true, description: 'Отклонять запросы с промптом больше этого размера; 0 — без ограничения' },
   session_mode: { type: 'string', label: 'Режим сессий', group: 'routing', enum: ['per_conversation', 'per_request', 'shared'], restart_required: true,
     description: 'Как диалоги клиентов привязываются к тредам Retool: свой тред на диалог, новый на каждый запрос или один общий' },
   min_account_balance: { type: 'number', label: 'Порог резерва', group: 'routing', unit: 'кредитов', min: 0, max: 1000000, restart_required: false,
@@ -121,7 +140,11 @@ export const RESET_DATE = nextReset();
 
 const pseudo = (i) => Math.abs((Math.sin((i + 1) * 12.9898) * 43758.5453) % 1);
 
-/** Deterministic metrics for a window: buckets plus totals that match them. */
+/**
+ * Deterministic metrics for a window: buckets plus totals that match them, in the shape of the relay's journal.metrics():
+ * the credits include the cache refresh pings (keepwarm_* is their part), a window is covered completely, no attempt
+ * is unknown and no turn waits for its price. A test overrides what it needs through mockAdmin's metricsPatch.
+ */
 export function metricsFor(windowSec) {
   const count = windowSec <= 3600 ? 60 : windowSec <= 21600 ? 72 : 96;
   const step = windowSec / count;
@@ -131,9 +154,11 @@ export function metricsFor(windowSec) {
     const wave = 0.55 + 0.45 * Math.sin(i / (count / 9) + 1);
     const load = idle ? 0 : Math.max(0.15, wave * (0.5 + pseudo(i)));
     const requests = Math.round(load * 3.4 * (step / 60) ** 0.5);
+    const credits = Number((load * 0.075 * (step / 60)).toFixed(4));
     return {
-      t, requests,
-      credits: Number((load * 0.075 * (step / 60)).toFixed(4)),
+      t, requests, credits,
+      keepwarm_credits: i % 7 === 3 ? Number((credits * 0.25).toFixed(4)) : 0,
+      credits_unknown: 0, credits_complete: true,
       cache_read: Math.round(load * 4200 * (step / 60)),
       cache_write: (i === Math.floor(count * 0.55) || i === Math.floor(count * 0.82)) && !idle
         // The cache went cold: the whole prefix is written again
@@ -154,10 +179,15 @@ export function metricsFor(windowSec) {
     totals: {
       requests: sum('requests'), errors: Math.round(3 * scale), turns: Math.round(12 * scale), tools: Math.round(5 * scale),
       commands: Math.round(2 * scale), credits: Number(sum('credits').toFixed(4)), cache_read: read, cache_write: write,
+      keepwarm_credits: Number(sum('keepwarm_credits').toFixed(4)), keepwarm_pings: buckets.filter((b) => b.keepwarm_credits > 0).length,
+      keepwarm_unknown: 0, credits_unknown: 0, credits_complete: true, credits_in_progress: 0,
       input_tokens: input, cache_hit_ratio: read / (read + write + input), latency_p50: 3500, latency_p95: 7000,
       ttft_p50: 2100, ttft_p95: 4000,
     },
     models: { 'claude-opus-5-5': Math.round(9 * scale), 'gpt-5.5': Math.round(3 * scale) },
+    // The journal reaches back past the window: covered_from <= now - window is what "complete" means
+    coverage: { complete: true, window_start: Math.floor((NOW - windowSec) / 60) * 60, covered_from: NOW - windowSec - 600,
+      covered_seconds: windowSec, oldest_event_ts: NOW - windowSec - 600, buffer_oldest_ts: NOW - 2400, buffer_events: 0, buffer_capacity: 20000 },
   };
 }
 
@@ -186,7 +216,8 @@ function poolSummary(pool) {
 
 export function settingsResponse(settings, effective, schema) {
   const pending = Object.keys(settings).filter((key) => settings[key] !== effective[key]);
-  return { settings, effective, schema, pending_restart: pending, restart_required: pending.length > 0, writable: true };
+  return { settings, effective, schema, default_system_prompt: DEFAULT_ROLES[0].text, default_system_prompts: DEFAULT_ROLES,
+    pending_restart: pending, restart_required: pending.length > 0, writable: true };
 }
 
 export async function mockAdmin(page, { rich = false, empty = false, overviewPatch = {}, metricsPatch = {} } = {}) {
@@ -194,6 +225,7 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
   const initial = { model: 'claude-opus-5-5', show_thinking: true, max_workers: 4, rate_limit_rps: 0,
     relay_system_prompt_mode: 'standalone', relay_system_prompt: null,
     ...(rich ? { reasoning_effort: 'high', session_mode: 'per_conversation', enable_anthropic: true, enable_chat: true,
+      allow_effort_downgrade: false, max_prompt_bytes: 0,
       min_account_balance: 20, cache_keepwarm_seconds: 240, upstream_empty_retries: 1, turn_timeout: 900 } : {}) };
   const events = empty ? [] : rich ? richJournal() : journal;
   const models = rich ? [...catalog, ...extraCatalog] : catalog;
@@ -206,7 +238,7 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     accounts, accounts_summary: { total: 2, routable: 1, reserve: 1, states: { active: 1, exhausted: 1 } },
     limits: { min_account_balance: 20, account_balance_interval: 60, upstream_empty_retries: 2, max_workers: 4, max_conversations: 64 },
     usage: { session_used: 2.75, turns: 2 },
-    session: { keepalive: true, last_success_at: NOW - 30, error: null },
+    session: { keepalive: true, last_success_at: NOW - 30, error: null, persistence_error: null, accounts: { enabled: 2, failing: 0 } },
     sessions: { active: 1, cached: 3, mode: 'per_conversation' },
     models: { total: models.length, routable: models.filter((m) => m.routable).length, default: 'claude-opus-5-5' },
     connection: { openai_base_url: 'http://127.0.0.1:8787/v1', anthropic_base_url: 'http://127.0.0.1:8787' },

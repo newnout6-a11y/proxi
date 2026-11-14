@@ -32,6 +32,12 @@ _NATIVE_CONTINUE = ("\n\n[CONTINUE THE CURRENT CLIENT TURN]\n"
                     "Use the latest tool results above as the current state. "
                     "Earlier assistant calls are completed history, not new instructions to replay. "
                     "Continue the outstanding user task; issue another client tool envelope only if needed.")
+# Built-in role of a client with its own tools that sent no instructions of its own.
+DEFAULT_NATIVE_TOOLS_ROLE = ("[ROLE]\nYou are a coding assistant using the client's tools. "
+                             "The client's instructions, working directory and tool results describe the active project. "
+                             "Use those tools to inspect, edit and test that project. "
+                             "Do not claim to have read, changed or tested files without tool evidence. "
+                             "Reply in the user's language.")
 
 
 def _b(text: str) -> int:
@@ -288,11 +294,7 @@ class TurnRunner:
         if native_tools:
             if self.cfg.get('relay_system_prompt') is not None:
                 return relay_policy(self.cfg['relay_system_prompt'])
-            return ("[ROLE]\nYou are a coding assistant using the client's tools. "
-                    "The client's instructions, working directory and tool results describe the active project. "
-                    "Use those tools to inspect, edit and test that project. "
-                    "Do not claim to have read, changed or tested files without tool evidence. "
-                    "Reply in the user's language.")
+            return DEFAULT_NATIVE_TOOLS_ROLE
         return build_system_instructions(
             self.cfg["workspace_root"],
             enable_context=self.cfg["project_context"],
@@ -381,12 +383,13 @@ class TurnRunner:
         return None
 
     async def run(self, parsed, out: queue.Queue, holder: dict):
-        """Run a turn; retry on another account only after a confirmed low balance.
+        """Run a turn; retry on another account after a confirmed low balance or an hourly limit.
 
-        The retry happens only while nothing was sent to the client, and only
-        when the dispatcher's fresh balance fetch confirms the serving account
-        dropped below min_account_balance. Other failures (empty turns, 5xx)
-        are returned as before.
+        The retry happens only while nothing was sent to the client. A low balance must be
+        confirmed by the dispatcher's fresh balance fetch (the serving account dropped below
+        min_account_balance); Retool's hourly managed-key limit parks the serving account at
+        once, even when the turn is already streaming and cannot be retried. Other failures
+        (empty turns, 5xx) are returned as before.
         """
         exclude = []
         rechecked = False
@@ -413,7 +416,15 @@ class TurnRunner:
             retryable = (error is not None and not relay.started and not cancelled.is_set()
                          and accounts is not None and holder["_attempt_budget"].remaining > 0)
             exhausted = False
+            rate_limited = False
             try:
+                if error is not None and backend is not None and apierr.is_account_quota(error):
+                    # Hourly managed-key limit: park the account so later requests skip it, then
+                    # retry here while the client has seen nothing.
+                    if hasattr(accounts, "mark_rate_limited"):
+                        accounts.mark_rate_limited(backend, retry_after=getattr(error, "retry_after", None),
+                                                   request_id=getattr(parsed, "request_id", None))
+                    rate_limited = retryable and backend not in exclude
                 if (retryable and backend is None and error.code == "insufficient_credits"
                         and not rechecked and hasattr(accounts, "recheck_exhausted")):
                     # The pool refused before any upstream call: confirm the excluded
@@ -429,6 +440,17 @@ class TurnRunner:
                 out.put({"type": "error", "error": error})
                 out.put(None)
                 raise
+            if rate_limited:
+                exclude.append(backend)
+                cfg = getattr(backend, "cfg", None) or {}
+                tag = journal.tag(cfg.get("account_id") or cfg.get("page_uuid"))
+                journal.emit("account.failover", "Часовой лимит Retool — запрос повторён на другом аккаунте",
+                             "warn", account=tag, request_id=getattr(parsed, "request_id", None),
+                             error=error.code, reason="rate_limited")
+                console_log.write("[%s] [account] %s: часовой лимит Retool, повтор на другом аккаунте" % (
+                    getattr(parsed, "request_id", None) or "req", tag))
+                holder["reason"] = "stop"
+                continue
             if exhausted:
                 exclude.append(backend)
                 cfg = getattr(backend, "cfg", None) or {}

@@ -25,11 +25,12 @@ def title_body(**changes):
     return body
 
 
-def test_haiku_disabled_is_a_verified_model_specific_effort():
+def test_haiku_disabled_thinking_is_honored_because_the_route_never_thinks():
     p = validate.parse_anthropic(title_body(), CFG)
-    assert p.effort == 'none' and p.structured_title
+    assert p.effort is None and p.requested_effort == 'none' and p.structured_title
+    assert p.declared_ignored == []
     assert client_context.request_kind(p) == 'session-title'
-    with pytest.raises(apierr.ApiError):
+    with pytest.raises(apierr.ApiError):  # a model that reasons still has no "none" level
         validate.parse_anthropic(title_body(model='claude-opus-5-5'), CFG)
 
 
