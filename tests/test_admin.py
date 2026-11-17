@@ -318,7 +318,9 @@ def test_admin_requests_are_logged_but_polling_is_not(admin_relay):
     admin_relay.request("/health", key=None)
     kinds = [e["kind"] for e in journal.JOURNAL.query()]
     assert "admin.auth_failed" in kinds
-    http = [e for e in journal.JOURNAL.query() if e["kind"] == "http.request"]
+    # only this test's requests: a relay of an earlier test may still journal one that was finishing
+    http = [e for e in journal.JOURNAL.query() if e["kind"] == "http.request"
+            and str(e["data"].get("path", "")).startswith(("/admin", "/health"))]
     assert [e["data"]["path"] for e in http] == ["/admin/api/overview", "/health"]
     assert http[0]["data"]["status"] == 401 and http[0]["level"] == "warn"
 

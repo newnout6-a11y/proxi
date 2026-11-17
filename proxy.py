@@ -29,6 +29,7 @@ import conversation_infer
 import conversation_state
 import forced_choice
 import generation
+import minara_refresh
 import models as model_catalog
 import sse
 import models
@@ -38,7 +39,7 @@ import prompt_stabilizer
 import tool_search_policy
 import tool_union
 import validate
-from accounts import UNNAMED, AccountDispatcher, account_tag
+from accounts import UNNAMED, AccountDispatcher, MinaraAccount, account_tag
 from credits import CreditsManager
 from orchestrator import TurnRunner, acquire_plan, client_origin, journal_changes
 from session import Backend, SessionPool
@@ -124,6 +125,9 @@ class Runtime:
         backends = getattr(self.pool, "backends", None) or [self.backend]
         managers = {}
         for backend in backends:
+            if backend.cfg.get("upstream") == "minara":
+                managers[backend] = MinaraAccount(backend.cfg, backend=backend)
+                continue
             if not hasattr(backend, "refresher"):
                 continue
             managers[backend] = CreditsManager(
@@ -133,6 +137,8 @@ class Runtime:
             self.backend.cfg.get("base", cfg.get("base")),
             lambda: auth.upstream_headers(self.backend.cfg), getattr(self.backend, "refresher", None))
         self.accounts = AccountDispatcher(list(managers), cfg, managers)
+        # Minara's new models, prices and gone models, taken by the relay itself (minara_refresh); started with the pool.
+        self.catalog = minara_refresh.CatalogRefresher(cfg, self.accounts)
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.runner.accounts = self.accounts
         self.prompts = prompt_policy.PromptStore(cfg)
@@ -560,11 +566,17 @@ def make_handler(runtime: Runtime):
                 elif route == "models":
                     self._models()
                 elif route == "codex_models":
-                    entries = [entry for entry in model_catalog.catalog() if self._model_routable(entry)]
+                    entries = [entry for entry in model_catalog.catalog(cfg) if self._model_routable(entry)]
+                    if cfg.get("codex_catalog_gpt_only"):
+                        # Codex's picker offers GPT models only, Retool's and Minara's (the owner's choice, 2026-11-10):
+                        # Codex is OpenAI's client, and the Claude, GLM and Gemini routes have clients of their own.
+                        entries = [entry for entry in entries if entry.get("provider") == "openai"]
                     self._json(200, self._with_prompts(lambda snapshot: model_catalog.codex_catalog(entries, snapshot)))
                 elif route == "balance":
                     report = self._balance_report()
-                    self._json(200 if report["available"] is not None else 503, report)
+                    # A relay of Minara accounts only has no Retool total: its Minara credits are an answer too.
+                    known = report["available"] is not None or (report.get("minara") or {}).get("available") is not None
+                    self._json(200 if known else 503, report)
                 elif route == "usage":
                     self._json(200, self._usage_report())
                 elif route == "health":
@@ -704,7 +716,7 @@ def make_handler(runtime: Runtime):
                        {"x-proxi-token-count": "estimated", "x-proxi-token-count-basis": basis})
 
         def _models(self):
-            entries = [model for model in model_catalog.catalog() if self._model_routable(model)]
+            entries = [model for model in model_catalog.catalog(cfg) if self._model_routable(model)]
             published = self._with_prompts(lambda snapshot: entries + model_catalog.virtual_entries(entries, snapshot))
             data = [{
                 "id": model["id"],
@@ -766,13 +778,14 @@ def make_handler(runtime: Runtime):
             # expose readiness booleans, not organization financials or raw
             # upstream error text — those live behind /v1/balance with the key.
             refresher = getattr(account_report.serving_entry(entries)["backend"], "refresher", None)
-            session = {key: value for key, value in (refresher or runtime.backend.refresher).status().items()
-                       if not isinstance(value, str)}
+            refresher = refresher or getattr(runtime.backend, "refresher", None)
+            session = ({key: value for key, value in refresher.status().items()
+                        if not isinstance(value, str)} if refresher is not None else {"keepalive": False})
             payload = {
                 "ok": ok,
                 "uptime_seconds": round(time.time() - runtime.started, 1),
                 "session_mode": cfg["session_mode"],
-                "models": sum(1 for model in model_catalog.catalog() if self._model_routable(model)),
+                "models": sum(1 for model in model_catalog.catalog(cfg) if self._model_routable(model)),
                 "upstream": "ok" if ok else "degraded",
                 "balance_known": summary["balance_known"],
                 "session": session,
@@ -943,16 +956,20 @@ def make_handler(runtime: Runtime):
 
             effective_effort = models.effective_effort(parsed.entry, parsed.effort, cfg.get("reasoning_effort"),
                                                        cfg.get("claude_xhigh_effort", "high"))
+            # No level sent is "default" (the model's own), never "none": that is a level of its own on Minara (Opus
+            # 4.7 sends it as low), and the console printed the same word for both.
             self._effort_str = effective_effort or (
                 "provider" if parsed.entry.get("reasoning") and
-                parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored") else "none")
+                parsed.entry.get("reasoning_effort_control") in ("provider-managed", "accepted-ignored")
+                else "default" if parsed.entry.get("reasoning") and parsed.effort is None else "none")
 
             compatibility_headers = {}
             if substituted:
                 compatibility_headers['x-proxi-model-substituted'] = '%s=%s' % (parsed.requested_model, substituted)
             if parsed.structured_output:
                 compatibility_headers['x-proxi-output-format'] = parsed.structured_output['label']
-            if forced_choice.requirement(parsed.model, parsed.tools, parsed.tool_choice) is not None:
+            if forced_choice.requirement(parsed.model, parsed.tools, parsed.tool_choice,
+                                         getattr(parsed, "entry", None)) is not None:
                 compatibility_headers['x-proxi-tool-choice'] = 'emulated'
             if 'thinking.display' in parsed.declared_ignored:
                 compatibility_headers['x-proxi-thinking-display'] = 'summarized'
@@ -966,7 +983,7 @@ def make_handler(runtime: Runtime):
                 compatibility_headers['x-proxi-system-messages'] = 'inline-as-user-text'
                 journal.emit('request.compatibility',
                              'Системные сообщения внутри диалога переданы user-текстом на своих местах: '
-                             'Retool не принимает несколько system, head и подписи не меняются.', 'debug',
+                             'upstream не принимает несколько system, head и подписи не меняются.', 'debug',
                              request_id=self.request_id, control='mid_conversation_system',
                              handling='inline_user_text')
             if self._client_trace:
@@ -1227,7 +1244,7 @@ def make_handler(runtime: Runtime):
                     _, resolved = models.resolve_tolerant(
                         parsed.model, effort, strict=cfg["strict_models"], default_model=cfg.get("model"),
                         allow_downgrade=cfg.get("allow_effort_downgrade", False),
-                        xhigh_as=cfg.get("claude_xhigh_effort", "high"))
+                        xhigh_as=cfg.get("claude_xhigh_effort", "high"), cfg=cfg)
                 except apierr.ApiError as error:
                     raise apierr.bad_request("profile '%s' sets generation.effort to '%s': %s" % (
                         plan.profile, effort, error.message), param=where + "effort")
@@ -1269,7 +1286,7 @@ def make_handler(runtime: Runtime):
                 # TurnRunner confirms excluded balances once before it answers 402, so a top-up does not
                 # wait for the timer; a stream is refused only after the same confirmation.
                 recheck = getattr(runtime.accounts, "recheck_exhausted", None)
-                if recheck is not None and recheck():
+                if recheck is not None and recheck(entry):
                     error = runtime.pool.unavailable_error(entry, **scope)
             return error
 
@@ -1495,8 +1512,16 @@ def banner_lines(cfg, balance, warnings=()):
             line += (("  (partial: %d of %d accounts unknown)" % (unknown, balance.get("accounts_total", unknown)))
                      if unknown else "  (partial: monthly allocation unknown for some accounts)")
         lines.append(line)
-    else:
+    elif balance.get("accounts") and all(item.get("balance_supported") is False for item in balance["accounts"]):
+        lines.append(" balance:       unavailable (provider does not expose balance; configured routing only)")
+    elif not balance.get("minara"):
         lines.append(" upstream:      DEGRADED " + str(balance.get("error")))
+    minara = balance.get("minara")
+    if minara:
+        known = minara.get("available")
+        lines.append(" minara:        " + ("unknown" if known is None else "%s credits (~$%s)" % (known, minara.get("usd")))
+                     + " on %d account%s" % (minara["accounts_total"], "" if minara["accounts_total"] == 1 else "s")
+                     + ("  (%d unknown)" % minara["unknown_accounts"] if minara.get("unknown_accounts") else ""))
     lines += [" WARNING:       " + text for text in warnings]
     lines.append("=" * 64)
     return lines
@@ -1518,6 +1543,7 @@ def main(argv=None):
 
     backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
     runtime.accounts.start()
+    runtime.catalog.start()
     refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
     for r in refreshers:
         r.start()  # no-op for accounts the dispatcher schedules
@@ -1564,6 +1590,7 @@ def main(argv=None):
             refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
             for r in refreshers:
                 r.stop()
+            runtime.catalog.stop()
             runtime.accounts.stop()
 
 

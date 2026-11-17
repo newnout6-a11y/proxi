@@ -19,10 +19,12 @@ import auth
 import config
 import direct
 import journal
+import minara_accounts
 import models
 import native_history
 import prompt_policy
 from accounts import UNNAMED, account_tag, cfg_tag, enabled as account_enabled, priority as account_priority
+from minara_catalog import CREDITS_PER_USD
 from redact import redact
 import sse
 import structured
@@ -47,7 +49,8 @@ NEW_ACCOUNT_OPTIONAL = ("label", "provider_resource_name", "openai_provider_reso
 # Moved into accounts[0] when a single-account configuration becomes a pool. SessionPool reads
 # provider_access (like enabled, priority and label) only from the account record, never the root.
 ACCOUNT_RECORD_KEYS = ("base", "page_uuid", "cookie", "xsrf", "account_id", "thread_id", "label", "enabled",
-                       "priority", "provider_access", *models.PROVIDER_RESOURCE_KEY.values())
+                       "priority", "provider_access", "upstream", "bearer_token", "bearer_token_env",
+                       "minara_models", *models.PROVIDER_RESOURCE_KEY.values())
 # The role is sent with every request: capped outright and, when max_prompt_bytes is set, to a
 # share of it so the conversation itself still fits.
 ROLE_MAX_BYTES = 32 * 1024
@@ -93,11 +96,12 @@ def _list_param(query, name):
 
 def _plain(value, *, ascii_only=False):
     """No control characters; `ascii_only` also requires printable ASCII (values sent as HTTP headers)."""
-    return all(32 <= ord(char) < (127 if ascii_only else 0x110000) and ord(char) != 127 for char in value)
+    return all(32 <= ord(char) < (127 if ascii_only else 0x110000) and ord(char) != 127
+               and not 0xD800 <= ord(char) <= 0xDFFF for char in value)
 
 
-def _schema():
-    catalog_ids = [entry["id"] for entry in models.catalog()]
+def _schema(cfg=None):
+    catalog_ids = [entry["id"] for entry in models.catalog(cfg)]
     # (key, type, label, group, description, unit, min, max, enum)
     rows = [
         ("session_mode", "string", "Режим сессий", "routing",
@@ -469,14 +473,23 @@ class Admin:
         self.lock = threading.Lock()
         # Saving the prompts document: read the revision it replaces, save, journal what changed, as one step.
         self.prompts_lock = threading.Lock()
-        self.schema = _schema()
+        self.schema = _schema(self.cfg)
 
     def _account_secrets(self):
         """Credentials of every account; short values are skipped so they cannot mangle ordinary text."""
         secrets = []
+        # Pending accounts are saved before they are loaded into the routing pool.
+        # Their credentials must protect free-text responses too, including after
+        # restarting the old runtime with the same configuration file.
+        for record in self._records(self._saved()):
+            token = (os.environ.get(record.get("bearer_token_env") or "")
+                     or record.get("bearer_token"))
+            if isinstance(token, str) and token:
+                secrets.append(token)
         for backend in getattr(self.runtime.accounts, "backends", None) or []:
             cfg = getattr(backend, "cfg", None) or {}
-            secrets += [cfg.get("cookie"), cfg.get("xsrf")]
+            secrets += [cfg.get("cookie"), cfg.get("xsrf"), cfg.get("bearer_token"),
+                        os.environ.get(cfg.get("bearer_token_env") or "")]
             secrets += [part.partition("=")[2].strip() for part in str(cfg.get("cookie") or "").split(";")]
             secrets += cfg.get("cookie_values") or []
         secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= 8]
@@ -561,7 +574,7 @@ class Admin:
 
     def _models(self):
         data = []
-        for entry in models.catalog():
+        for entry in models.catalog(self.cfg):
             item = {**entry, "routable": self._routable(entry), "available_verified": None,
                     # xhigh is not an error on this route: it is served at the level claude_xhigh_effort names
                     "xhigh_replaced": models.replaces_xhigh(entry)}
@@ -592,6 +605,18 @@ class Admin:
                 "last_renewed_at": getattr(getattr(backend, "refresher", None), "last_success_at", None),
                 "error": self._safe(str(error))[:200] if error else None,
             })
+            if backend.cfg.get("upstream") == "minara":
+                # Credits from GET /auth/me (220 per US dollar); a Bearer token has no renewal, it expires (JWT exp).
+                available = entry["available"]
+                expires = info.get("expires_at")
+                accounts[-1].update(upstream="minara", balance_supported=True, balance_unit="minara_credits",
+                                    renewal_supported=False,
+                                    usd=round(available / CREDITS_PER_USD, 4) if available is not None else None,
+                                    expires_at=expires if expires is not None
+                                    else minara_accounts.expires_at(backend.cfg.get("bearer_token")))
+                accounts[-1].update({key: per_account[key] for key in (
+                    "attempts", "provider_cost", "provider_cost_currency", "provider_cost_complete")
+                    if key in per_account})
             if entry.get("rate_limited_until"):
                 accounts[-1]["rate_limited_until"] = entry["rate_limited_until"]
         return accounts
@@ -602,7 +627,10 @@ class Admin:
                     if account_enabled(backend) and getattr(backend, "refresher", None) is not None]
         statuses = [backend.refresher.status() for backend in backends]
         if not statuses:
-            return {**self.runtime.backend.refresher.status(), "accounts": {"enabled": 0, "failing": 0}}
+            refresher = getattr(self.runtime.backend, "refresher", None)
+            status = refresher.status() if refresher else {"keepalive": False, "last_success_at": None,
+                                                          "error": None, "persistence_error": None}
+            return {**status, "accounts": {"enabled": 0, "failing": 0}}
         renewed = [item.get("last_success_at") for item in statuses if item.get("last_success_at") is not None]
         return {"keepalive": any(item.get("keepalive") for item in statuses),
                 "last_success_at": max(renewed) if renewed else None,
@@ -666,6 +694,10 @@ class Admin:
     def _same_account(record, cfg):
         if record.get("account_id") and cfg.get("account_id"):
             return record["account_id"] == cfg["account_id"]
+        if record.get("upstream", "retool") != cfg.get("upstream", "retool"):
+            return False
+        if record.get("upstream") == "minara":
+            return False  # Bearer accounts require their assigned ID; a shared API base is not an identity.
         return (str(record.get("base") or "").rstrip("/") == str(cfg.get("base") or "").rstrip("/")
                 and record.get("page_uuid") == cfg.get("page_uuid"))
 
@@ -706,6 +738,10 @@ class Admin:
                 "monthly_allocation": None, "used_month": None, "reset_date": None, "stale": False,
                 "session_used": 0.0, "turns": 0, "auth_failures": 0, "last_renewed_at": None,
                 "last_balance_at": None, "error": None, "pending": "added", "_record": record})
+            if record.get("upstream") == "minara":
+                pool[-1].update(upstream="minara", balance_supported=False, balance_unit="minara_credits",
+                                renewal_supported=False,
+                                expires_at=minara_accounts.expires_at(minara_accounts.record_token(record)))
         return pool
 
     @staticmethod
@@ -829,6 +865,28 @@ class Admin:
 
     @staticmethod
     def _new_account(data):
+        if data.get("upstream") == "minara":
+            allowed = {"upstream", "base", "bearer_token", "bearer_token_env", "minara_models", "label"}
+            unknown = set(data) - allowed
+            if unknown:
+                raise apierr.bad_request("Unknown account field", param=sorted(unknown)[0])
+            record = copy.deepcopy(data)
+            record.setdefault("base", "https://api.minara.ai/v1")
+            if record.get("minara_models") in (None, []):
+                record.pop("minara_models", None)  # no list: every model minara_models.json publishes
+            try:
+                config.validate_minara_account(copy.deepcopy(record), "new account")
+            except apierr.ApiError as exc:
+                raise apierr.bad_request(exc.message)
+            if "label" in record and (not isinstance(record["label"], str) or len(record["label"]) > 40
+                                      or not _plain(record["label"])):
+                raise apierr.bad_request("'label' must be text of at most 40 characters", param="label")
+            record.update(enabled=True, priority=0)
+            return record
+        data = dict(data)
+        upstream = data.pop("upstream", "retool")
+        if upstream != "retool":
+            raise apierr.bad_request("Unknown upstream", param="upstream")
         unknown = set(data) - set(NEW_ACCOUNT_REQUIRED) - set(NEW_ACCOUNT_OPTIONAL)
         if unknown:
             raise apierr.bad_request("Unknown account field", param=sorted(unknown)[0])
@@ -866,37 +924,103 @@ class Admin:
         return record
 
     def _add_account(self, data):
+        if data.get("upstream") == "minara" and "bearer_tokens" in data:
+            return self._add_minara_accounts(data)
         record = self._new_account(data)
         with self._transaction() as (path, saved):
             for existing in self._records(saved):
-                if (str(existing.get("base") or saved.get("base") or "").rstrip("/").lower() == record["base"]
+                if (record.get("upstream") != "minara" and existing.get("upstream") != "minara"
+                        and str(existing.get("base") or saved.get("base") or "").rstrip("/").lower() == record["base"]
                         and str(existing.get("page_uuid") or "").lower() == record["page_uuid"]):
                     raise apierr.conflict("This Retool app is already in the pool")
-            if not isinstance(saved.get("accounts"), list):
-                # A single-account configuration becomes a pool; the account keeps its id and session.
-                # Its session must be in the file: RETOOL_COOKIE/RETOOL_XSRF are not, and a pool
-                # record without them would stop the relay from starting.
-                if not (saved.get("cookie") and saved.get("xsrf")) or not self.cfg.get("_persist_auth", True):
-                    raise apierr.conflict("The current account's session comes from RETOOL_COOKIE/RETOOL_XSRF, "
-                                          "not config.json; move it into the file before adding accounts")
-                first = {key: copy.deepcopy(saved[key]) for key in ACCOUNT_RECORD_KEYS if key in saved}
-                if not first.get("account_id") and self.cfg.get("account_id"):
-                    first["account_id"] = self.cfg["account_id"]
-                # The access descriptor moves with the account: with accounts[] a root copy is ignored,
-                # and config.load would warn about it at every start.
-                for key in ("cookie", "xsrf", "provider_access"):
-                    saved.pop(key, None)
-                saved["accounts"] = [first]
-            saved["accounts"].append(record)
-            for item in saved["accounts"]:
-                if isinstance(item, dict) and not all(item.get(key) for key in ("cookie", "xsrf", "base", "page_uuid")):
-                    raise apierr.conflict("An account in config.json has no stored session; fix the file first")
-            config._assign_account_ids(saved)
+            self._append_records(saved, [record])
             self._write(path, saved)
+        # No provider IO or live routing change: only extend redaction before
+        # emitting the new account's operator-controlled label to the journal.
+        if record.get("upstream") == "minara":
+            self._mask_tokens([os.environ.get(record.get("bearer_token_env") or "") or record.get("bearer_token")])
         tag = self._record_tag(record)
         journal.emit("admin.account", "Добавлен аккаунт %s, подключится после перезапуска" % tag, "success",
                      account=tag, label=record.get("label", ""))
         return self._account_response(tag, restart_required=True)
+
+    def _add_minara_accounts(self, data):
+        """Minara accounts from several Bearer tokens at once (minara_accounts.plan decides): each token is judged on its
+        own, the valid ones the pool does not have yet are saved in one write, and the answer reports every token by its
+        position in the list, never by its value."""
+        unknown = set(data) - {"upstream", "base", "bearer_tokens", "minara_models", "label"}
+        if unknown:
+            raise apierr.bad_request("Unknown account field", param=sorted(unknown)[0])
+        with self._transaction() as (path, saved):
+            results, records = minara_accounts.plan(
+                self._records(saved), data.get("bearer_tokens"), now=time.time(), label=data.get("label"),
+                base=data.get("base"), minara_models=data.get("minara_models"))
+            renewed = minara_accounts.apply_renewals(results)
+            if records:
+                self._append_records(saved, records)
+            if records or renewed:
+                self._write(path, saved)
+        self._mask_tokens([record["bearer_token"] for record in records] + renewed)
+        skipped = len(results) - len(records) - len(renewed)
+        if records or renewed:
+            journal.emit("admin.account", "Аккаунты Minara: добавлено %d, токен обновлён у %d; подключатся после "
+                         "перезапуска" % (len(records), len(renewed)), "success",
+                         accounts=[self._record_tag(record) for record in records], renewed=len(renewed), skipped=skipped)
+        return self._safe({"results": [self._token_result(result) for result in results], "added": len(records),
+                           "renewed": len(renewed), "skipped": skipped, "restart_required": bool(records or renewed)})
+
+    def _token_result(self, result):
+        """One token's outcome as the form reports it: its position, the account it became or already is, never the token."""
+        public = {key: result[key] for key in ("token", "status", "reason", "newer", "repeat_of", "expires_at",
+                                               "was_expires_at", "problem", "error") if key in result}
+        record = result.get("record") or result.get("of")
+        if record is not None:
+            public.update(account=self._record_tag(record), label=record.get("label") or "")
+        return public
+
+    def _append_records(self, saved, records):
+        """Append new account records to the file's accounts[], check that the relay still starts with them and give each
+        its account_id. A single-account file becomes a pool first. The caller holds the transaction and writes."""
+        if not isinstance(saved.get("accounts"), list):
+            # A single-account configuration becomes a pool; the account keeps its id and session.
+            # Its session must be in the file: RETOOL_COOKIE/RETOOL_XSRF are not, and a pool
+            # record without them would stop the relay from starting.
+            if saved.get("upstream") != "minara" and (
+                    not (saved.get("cookie") and saved.get("xsrf")) or not self.cfg.get("_persist_auth", True)):
+                raise apierr.conflict("The current account's session comes from RETOOL_COOKIE/RETOOL_XSRF, "
+                                      "not config.json; move it into the file before adding accounts")
+            first = {key: copy.deepcopy(saved[key]) for key in ACCOUNT_RECORD_KEYS if key in saved}
+            if not first.get("account_id") and self.cfg.get("account_id"):
+                first["account_id"] = self.cfg["account_id"]
+            # The access descriptor moves with the account: with accounts[] a root copy is ignored,
+            # and config.load would warn about it at every start.
+            for key in ("cookie", "xsrf", "provider_access", "upstream", "bearer_token", "bearer_token_env", "minara_models"):
+                saved.pop(key, None)
+            saved["accounts"] = [first]
+        saved["accounts"].extend(records)
+        try:
+            models.build_minara_catalog(saved["accounts"])
+        except apierr.ApiError as exc:
+            raise apierr.bad_request(exc.message)
+        for item in saved["accounts"]:
+            if isinstance(item, dict) and item.get("upstream") == "minara":
+                config.validate_minara_account(copy.deepcopy(item), "account")
+                continue
+            if isinstance(item, dict) and not all(item.get(key) for key in ("cookie", "xsrf", "base", "page_uuid")):
+                raise apierr.conflict("An account in config.json has no stored session; fix the file first")
+        config._assign_account_ids(saved)
+
+    def _mask_tokens(self, tokens):
+        """New accounts' tokens join the secrets every response and journal line is cleaned of (a renewal keeps them)."""
+        values = self.cfg.setdefault("cookie_values", [])
+        extras = self.cfg.setdefault("_extra_secrets", [])
+        for token in tokens:
+            if not token:
+                continue
+            if token not in values:
+                values.append(token)
+            if token not in extras:
+                extras.append(token)
 
     def _delete_account(self, tag):
         account = self._find(tag)
@@ -928,7 +1052,8 @@ class Admin:
         """The root mirrored the removed account: drop its identity and session there (a
         rotated cookie lives only in accounts[i], so the root copy may be older and differ);
         config.load fills base/page_uuid/cookie/xsrf from the first remaining account."""
-        for key in ("base", "page_uuid", "cookie", "xsrf", "account_id"):
+        for key in ("base", "page_uuid", "cookie", "xsrf", "account_id", "upstream", "bearer_token",
+                    "bearer_token_env", "minara_models"):
             saved.pop(key, None)
         if (saved.get("session_mode") or self.cfg.get("session_mode")) != "shared":
             saved.pop("thread_id", None)
@@ -1066,7 +1191,7 @@ class Admin:
             if candidate["reasoning_effort"] != "auto":
                 models.resolve_tolerant(candidate["model"], candidate["reasoning_effort"], strict=True,
                                         allow_downgrade=candidate["allow_effort_downgrade"],
-                                        xhigh_as=candidate["claude_xhigh_effort"])
+                                        xhigh_as=candidate["claude_xhigh_effort"], cfg=self.cfg)
             self._check_role_budget(candidate, changes, self.cfg.get("max_prompt_bytes"))
             changed = [key for key, value in changes.items() if desired[key] != value]
             saved.update(changes)

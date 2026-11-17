@@ -8,6 +8,11 @@ import urllib.request
 
 CACHE_TTL = 30.0
 HISTORY_MAX = 200
+# A cache write worth this much alone is called out (a `[WRITE COSTLY …]` marker in the `[cache]` line and a
+# cache.write_expensive event): one turn of 484,380 written tokens at Fable 5.2's $10/M is 1065 Minara credits, more than
+# a fresh account's 300-credit plan, and it took an account from +500 to -875 at once. A warning only: the turn is
+# billed by the time its usage arrives, so refusing it here would change nothing.
+WRITE_WARN = 300.0
 # The turn ids a manager remembers to count each billed attempt once. Every id is new (a uuid per attempt, per keepwarm
 # ping), so a repeat can only come from the same attempt reported twice, moments apart: a few thousand cover that, where
 # the set kept every id of the process's life (about 120 bytes each, some 2,000 a day).
@@ -66,6 +71,10 @@ def cost_breakdown(usage, model=None):
     write = int(usage.get("cache_write") or 0)
     prompt = inp + read + write
     rate = rates(model)
+    if isinstance(model, str) and model.startswith("minara/"):
+        return {"cost_input": None, "cost_cache_read": None, "cost_cache_write": None,
+                "cost_output": None, "prompt_tokens": prompt,
+                "cache_hit_ratio": round(read / prompt, 4) if prompt else None}
     return {
         "cost_input": round(inp * rate["input"], 5),
         "cost_cache_read": round(read * rate["cache_read"], 5),
@@ -74,6 +83,47 @@ def cost_breakdown(usage, model=None):
         "prompt_tokens": prompt,
         "cache_hit_ratio": round(read / prompt, 4) if prompt else None,
     }
+
+
+def minara_credits(usage):
+    """Minara's own credits for a turn already priced in US dollars (220 per dollar), None when unpriced.
+
+    Minara debits its own price list, so a turn carries provider_cost in USD and this is that figure in the currency its
+    balance speaks. It is never added to `credits`, which is Retool's unit: the two are kept apart everywhere
+    (account_report.aggregate_balance sums each in its own field)."""
+    cost = usage.get("provider_cost") if isinstance(usage, dict) else None
+    if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
+        return None
+    if (usage.get("provider_cost_currency") or "USD") != "USD":
+        return None
+    import minara_catalog
+    return round(cost * minara_catalog.CREDITS_PER_USD, 4)
+
+
+def write_cost(usage, model=None, pricing=None):
+    """Credits one turn paid for writing its prefix into the cache, or None when it cannot be told apart.
+
+    A cache write is the one line item that can cost more than a whole account: a 484,380-token write at Fable 5.2's
+    $10/M is 1065 Minara credits ($4.84), more than the 300-credit plan of a fresh account. Minara's own price list
+    (`pricing`, USD per million tokens) is what it debits, so the share is read from there rather than guessed from the
+    dollar total, which mixes input, output and reads together."""
+    if not isinstance(usage, dict) or not isinstance(pricing, dict):
+        return None
+    tokens = usage.get("cache_write")
+    if type(tokens) not in (int, float) or not math.isfinite(tokens) or tokens <= 0:
+        return None
+    try:
+        usd_per_million = float(pricing.get("cache_write", pricing["prompt"]) or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(usd_per_million) or usd_per_million <= 0:
+        return None
+    usd = tokens * usd_per_million / 1e6
+    if isinstance(model, str) and model.startswith("minara/"):
+        import minara_catalog
+        return round(usd * minara_catalog.CREDITS_PER_USD, 2)
+    # Retool bills its own fitted rate for a write (credits per token), not Minara's dollar price list.
+    return round(tokens * rates(model)["cache_write"], 5)
 
 
 class CreditsManager:
@@ -212,3 +262,19 @@ class CreditsManager:
                     "recent": list(self._history[-50:]), "recent_total": round(total, 4),
                     "unreported_usage": self._unreported_usage,
                     "available": (self._balance or {}).get("available")}
+
+
+def provider_cost_summary(records):
+    """Separate reported money from Retool credits; never infer a currency or sum unlike money."""
+    records = list(records)
+    priced = [r for r in records if type(r.get('provider_cost')) in (int, float)
+              and math.isfinite(r['provider_cost']) and r['provider_cost'] >= 0]
+    currencies = {r.get('provider_cost_currency') for r in priced}
+    summable = len(priced) == 1 or (bool(priced) and len(currencies) == 1 and None not in currencies)
+    total = sum(r['provider_cost'] for r in priced) if summable else None
+    overflow = total is not None and not math.isfinite(total)
+    return {'provider_cost': round(total, 10) if total is not None and not overflow else None,
+            'provider_cost_overflow': overflow,
+            'provider_cost_currency': next(iter(currencies)) if len(currencies) == 1 else None,
+            'provider_cost_complete': bool(records) and len(priced) == len(records),
+            'provider_cost_records': [dict(r) for r in records]}

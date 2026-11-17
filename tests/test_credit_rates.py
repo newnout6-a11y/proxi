@@ -69,3 +69,43 @@ def test_the_empty_turn_502_names_a_classifier_refusal_as_a_possible_cause():
     assert "classifier" in error.message and "system prompt" in error.message
     # another code keeps the message it is given
     assert AttemptBudget(threading.Event()).error("upstream_attempt_limit", "x").message == "x"
+
+
+def test_minara_credits_are_the_dollar_cost_at_220_per_dollar():
+    # Minara debits its own list at 220 credits a dollar; the turn carries provider_cost in USD.
+    usage = {"provider_cost": 0.5274504, "provider_cost_currency": "USD"}
+    assert credits.minara_credits(usage) == pytest.approx(116.0391, abs=1e-3)
+    assert credits.minara_credits({"provider_cost": 159.0}) == pytest.approx(34980.0, abs=1e-6)
+
+
+def test_minara_credits_are_none_without_a_usable_usd_cost():
+    for usage in ({}, {"provider_cost": None}, {"provider_cost": True}, {"provider_cost": float("nan")},
+                  {"provider_cost": -1.0}, {"provider_cost": 1.0, "provider_cost_currency": "EUR"}):
+        assert credits.minara_credits(usage) is None, usage
+
+
+def test_a_write_is_priced_alone_and_never_mixed_into_the_turn_total():
+    # The write that took an account from +500 to -875: 484,380 tokens at Fable 5.2's $10/M = $4.84 = 1065 credits.
+    pricing = {"quota_type": 0, "prompt": 8, "completion": 40, "cache_read": 0.2, "cache_write": 10}
+    usage = {"cache_write": 484380}
+    assert credits.write_cost(usage, "minara/claude-fable-5-2", pricing) == pytest.approx(1065.64, abs=0.01)
+
+
+def test_a_write_cost_is_none_without_a_readable_price_or_a_write():
+    assert credits.write_cost({"cache_read": 100}, "minara/x", {"prompt": 8}) is None
+    assert credits.write_cost({"cache_write": 1000}, "minara/x", None) is None
+    assert credits.write_cost({"cache_write": 1000}, "minara/x", {"billing_mode": "tiered_expr"}) is None
+
+
+def test_a_retool_write_is_priced_at_the_fitted_credit_rate():
+    usage = {"cache_write": 10_000}
+    assert credits.write_cost(usage, "claude-opus-5-5", {"prompt": 4}) == pytest.approx(
+        10_000 * credits.rates("claude-opus-5-5")["cache_write"], abs=1e-6)
+
+
+def test_a_write_worth_a_whole_plan_is_above_the_warning_threshold():
+    # A fresh Minara account carries 300 credits: one such turn is enough to overdraw it, which is why it is called out.
+    pricing = {"quota_type": 0, "prompt": 8, "completion": 40, "cache_read": 0.2, "cache_write": 10}
+    assert credits.write_cost({"cache_write": 484380}, "minara/claude-fable-5-2", pricing) >= credits.WRITE_WARN
+    # A small write on the same model stays quiet.
+    assert credits.write_cost({"cache_write": 9_738}, "minara/claude-fable-5-2", pricing) < credits.WRITE_WARN

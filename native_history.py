@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 import json
 import math
+import re
 import urllib.parse
 import weakref
 
@@ -749,10 +750,16 @@ def same_echo(theirs, ours, defaults=None):
     Claude Code fills the default of an optional argument the model left out before it echoes the call ("replace_all":
     false of Edit), so an argument that holds its schema default counts as absent on both sides. Before, such an echo
     failed the check and the next turn went cold, rewriting the whole cached conversation (Claude Desktop test run of
-    2026-11-06: 233k tokens, 30.7 credits for one Edit)."""
+    2026-11-06: 233k tokens, 30.7 credits for one Edit). It also drops a leading `cd <its own directory> && ` from a
+    command it echoes (_without_cd)."""
     if same_json(theirs, ours):
         return True
-    if not defaults or not isinstance(theirs, dict) or not isinstance(ours, dict):
+    if not isinstance(theirs, dict) or not isinstance(ours, dict):
+        return False
+    ours = _without_cd(ours, theirs)
+    if same_json(theirs, ours):
+        return True
+    if not defaults:
         return False
 
     def without_defaults(message):
@@ -766,6 +773,35 @@ def same_echo(theirs, ours, defaults=None):
         return dict(message, content=blocks)
 
     return same_json(without_defaults(theirs), without_defaults(ours))
+
+
+# `cd <directory> && ` at the start of a command: the directory bare, or quoted in either way.
+_CD_PREFIX = re.compile(r"""\s*cd\s+(?:"[^"]*"|'[^']*'|[^\s;&|"']+)\s*&&\s*""")
+
+
+def _without_cd(ours, theirs):
+    """The kept reply with the command of each call set to the client's echo of it, where that echo is the command
+    without a leading `cd <directory> && `; the reply itself when no call differs that way.
+
+    Claude Code 2.1.317 stores a Bash call whose command begins with `cd <its working directory> && ` without that
+    prefix, and echoes it so: the check failed and the next turn went cold, without the signed thinking (journal of
+    2026-11-09, Claude Desktop: 53 of 57 such turns, 4.2M tokens written again, about 360 credits in 106 minutes). The
+    command the client ran is the same; upstream still gets the call as the model wrote it."""
+    mine, echoed = ours.get("content"), theirs.get("content")
+    if not isinstance(mine, list) or not isinstance(echoed, list) or len(mine) != len(echoed):
+        return ours
+    blocks, changed = [], False
+    for kept, echo in zip(mine, echoed):
+        if (isinstance(kept, dict) and isinstance(echo, dict) and kept.get("type") == echo.get("type") == "tool_call"
+                and kept.get("toolName") == echo.get("toolName") and isinstance(kept.get("toolInput"), dict)
+                and isinstance(echo.get("toolInput"), dict)):
+            command, given = kept["toolInput"].get("command"), echo["toolInput"].get("command")
+            match = _CD_PREFIX.match(command) if isinstance(command, str) and isinstance(given, str) else None
+            if match and command[match.end():] == given:
+                kept = dict(kept, toolInput=dict(kept["toolInput"], command=given))
+                changed = True
+        blocks.append(kept)
+    return dict(ours, content=blocks) if changed else ours
 
 
 _SCOPE_PARTS = ("conversation", "provider", "head", "tools", "tool_choice")

@@ -57,6 +57,10 @@ function partialNote(balance, summary) {
 function Balance({ overview, metrics, windowSec, go }) {
   const balance = overview?.balance;
   const summary = overview?.accounts_summary;
+  // Retool's credits and Minara's are two currencies: the big figure is Retool's (its accounts only), Minara has its own
+  // line in credits and dollars (account_report.aggregate_balance keeps them apart).
+  const minara = balance?.minara || null;
+  const retoolAccounts = isNum(balance?.accounts_total) ? balance.accounts_total : summary?.total;
   const partial = partialNote(balance, summary);
   const available = balance?.available;
   const allocation = balance?.monthly_allocation;
@@ -90,8 +94,8 @@ function Balance({ overview, metrics, windowSec, go }) {
     <section className="panel instrument" aria-label="Баланс пула">
       <div className="instrument-head">
         <span className="instrument-label">
-          Доступно в пуле
-          {summary && ` · ${fmtInt(summary.total)} ${plural(summary.total, ['аккаунт', 'аккаунта', 'аккаунтов'])}`}
+          {minara ? 'Retool' : 'Доступно в пуле'}
+          {isNum(retoolAccounts) && ` · ${fmtInt(retoolAccounts)} ${plural(retoolAccounts, ['аккаунт', 'аккаунта', 'аккаунтов'])}`}
         </span>
         {balance?.unreported_usage ? <Tag tone="warn">есть неучтённый расход</Tag> : balance?.stale && <Tag tone="warn">данные устарели</Tag>}
       </div>
@@ -113,6 +117,22 @@ function Balance({ overview, metrics, windowSec, go }) {
         </span>
       </div>
       <p className="forecast">{forecast}</p>
+      {minara && (
+        <div className="minara-balance" aria-label="Баланс Minara">
+          <span className="instrument-label">
+            Minara · {fmtInt(minara.accounts_total)} {plural(minara.accounts_total, ['аккаунт', 'аккаунта', 'аккаунтов'])}
+          </span>
+          <span className="minara-figure">
+            <b className="num">{isNum(minara.available) ? fmtFixed(minara.available, 2) : '—'}</b> кредитов
+            {isNum(minara.usd) && <> · <b className="num">${fmtFixed(minara.usd, 2)}</b></>}
+          </span>
+          {minara.unknown_accounts > 0 && (
+            <Tag tone="warn" title="Баланс известен не у всех аккаунтов Minara: сумма неполна">
+              {`частично: ${fmtInt(minara.unknown_accounts)} из ${fmtInt(minara.accounts_total)} неизвестны`}
+            </Tag>
+          )}
+        </div>
+      )}
       <div className="instrument-foot">
         {summary && (
           <button type="button" className="link-button" onClick={() => go('accounts')}>
@@ -251,6 +271,11 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
         <section className="panel stats" aria-label="Показатели за окно">
           <Stat label="Потрачено за окно" value={totals.credits_complete === false ? totals.credits > 0 ? `≥ ${fmtFixed(totals.credits, 2)}` : '—' : fmtFixed(totals.credits, 2)}
             note={spendNote(totals, busy, span)} />
+          {isNum(totals.minara_credits) && (
+            <Stat label="Minara за окно" value={fmtFixed(totals.minara_credits, 2)}
+              note={`кредитов · $${fmtFixed(totals.minara_credits / 220, 2)}`}
+              title="Расход на моделях minara/* за окно. Minara считает свои кредиты (220 за доллар) отдельной валютой: они не входят в расход кредитов Retool выше." />
+          )}
           <Stat label="Запросы" value={fmtInt(totals.requests)}
             note={totals.errors ? `${fmtInt(totals.errors)} ${plural(totals.errors, ['ошибка', 'ошибки', 'ошибок'])}` : 'без ошибок'}
             tone={totals.errors ? 'neg' : undefined} />

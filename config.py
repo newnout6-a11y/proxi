@@ -15,6 +15,7 @@ import time
 from apierr import service_unavailable
 import auth
 import console_log
+import minara_catalog
 import models
 import web_search
 
@@ -108,6 +109,9 @@ DEFAULTS = {
     # (client_task "background"), about 5 credits each on gpt-6.1-terra. False answers them with a 400 before anything is
     # spent, so Codex makes no memories until they are switched on again; a switch in the admin, applied at once.
     "codex_memory_jobs": True,
+    # true: /codex/models lists GPT models only (Retool's and Minara's), so Codex's picker shows no Claude, GLM or Gemini
+    # route (the owner's config sets it, 2026-11-10).
+    "codex_catalog_gpt_only": False,
     # Codex's compaction goes out with no tools, so it shared nothing with the chat's cached prefix and wrote the whole history again
     # (31,943 tokens, 1.65 credits where the chat's last request wrote 9,807; about 31 credits at 330k tokens). True declares the chat's
     # tools again (compaction_tools), so the summary reads the chat's cache; False serves the request as Codex sent it. A switch in
@@ -167,6 +171,15 @@ DEFAULTS = {
     "cache_keepwarm_turn_offset": 200,
     # Accounts below this confirmed balance leave the routing pool.
     "min_account_balance": 20,
+    # Minara: how long the relay's cache marks keep a Claude prefix ("1h" or "5m"); the balance below which an account
+    # takes no new turn (credits; 0 = until Minara refuses); the waits before asking again when Minara has no channel.
+    "minara_cache_ttl": "1h",
+    "minara_min_credits": 0,
+    "minara_channel_retry_delays": [3, 8],
+    # Minara: how often the relay reads Minara's model list by itself and measures and publishes a model it adds (hours;
+    # 0 = never), and the most credits one such look may spend on measuring (minara_refresh).
+    "minara_catalog_refresh_hours": 6,
+    "minara_catalog_budget": 300,
     "account_balance_interval": 300,
     "account_refresh_parallel": 3,
     # Pause after Retool's hourly managed-key limit; a limit right after the return adds 5 minutes
@@ -550,6 +563,86 @@ def _whole_number(value):
     return None
 
 
+# Fields of the unified Retool/Minara routing removed on 2026-11-09: a config written then still loads.
+_LEGACY_MINARA_FIELDS = ('public_id', 'verbosity_levels')
+
+
+def _check_upstream(record, name, warnings=None):
+    kind = record.get('upstream', 'retool')
+    if kind not in ('retool', 'minara'):
+        raise service_unavailable(f"{name}: upstream must be retool or minara")
+    if kind != 'minara':
+        return
+    from urllib.parse import urlsplit
+    base = record.setdefault('base', 'https://api.minara.ai/v1')
+    if (not isinstance(base, str) or len(base) > 2048
+            or any(ord(c) < 33 or ord(c) > 126 for c in base)):
+        raise service_unavailable(f"{name}: base must be a printable ASCII HTTPS URL")
+    try:
+        url = urlsplit(base)
+        port = url.port
+    except ValueError:
+        raise service_unavailable(f"{name}: invalid Minara HTTPS URL or port") from None
+    if port is not None and not 1 <= port <= 65535:
+        raise service_unavailable(f"{name}: invalid Minara HTTPS port")
+    if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
+        raise service_unavailable(f"{name}: Minara base must be an HTTPS URL without credentials/query/fragment")
+    record['base'] = base.rstrip('/')
+    env = record.get('bearer_token_env')
+    if env is not None and (not isinstance(env, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', env)):
+        raise service_unavailable(f"{name}: bearer_token_env must name an environment variable")
+    token = os.environ.get(env, '') if env else record.get('bearer_token', '')
+    if (not isinstance(token, str) or not 1 <= len(token) <= 16384
+            or any(ord(c) < 33 or ord(c) > 126 for c in token)):
+        raise service_unavailable(f"{name}: Minara needs a bearer_token or populated bearer_token_env")
+    record['bearer_token'] = token
+    entries = record.get('minara_models')
+    if entries is None or entries == []:
+        # No list: the account serves every model minara_models.json publishes (minara_catalog).
+        record.pop('minara_models', None)
+        return
+    if not isinstance(entries, list):
+        raise service_unavailable(f"{name}: minara_models must be a list of model IDs (or be left out)")
+    seen = set()
+    for item in entries:
+        descriptor = {'id': item} if isinstance(item, str) else item
+        if not isinstance(descriptor, dict):
+            raise service_unavailable(f"{name}: invalid Minara model descriptor")
+        ident = descriptor.get('id')
+        if not isinstance(ident, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:-]{0,199}', ident) or ident in seen:
+            raise service_unavailable(f"{name}: Minara model IDs must be unique nonempty identifiers")
+        if minara_catalog.upstream_of(ident) is None:
+            raise service_unavailable(f"{name}: unknown Minara model '{ident}' (use an ID of Minara's /v1/models, "
+                                      "such as anthropic/claude-opus-5.5, or a published minara/... name)")
+        seen.add(ident)
+        legacy = [key for key in _LEGACY_MINARA_FIELDS if key in descriptor]
+        if legacy and warnings is not None:
+            warnings.append(f"{name}: model {ident}: {', '.join(legacy)} no longer used (Minara models are minara/... "
+                            "names of their own, never Retool's); remove the field")
+        unknown = set(descriptor) - {'id', *minara_catalog.OVERRIDABLE, *_LEGACY_MINARA_FIELDS}
+        if unknown:
+            raise service_unavailable(f"{name}: model {ident} has unknown fields: {', '.join(sorted(unknown))}")
+        for key in ('provider', 'label'):
+            if key in descriptor and (not isinstance(descriptor[key], str) or not descriptor[key].strip()
+                    or len(descriptor[key]) > 200 or any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF
+                                                       for c in descriptor[key])):
+                raise service_unavailable(f"{name}: model {key} must be nonempty text")
+        for key in ('tools', 'reasoning', 'image', 'forced_tool_choice'):
+            if key in descriptor and type(descriptor[key]) is not bool:
+                raise service_unavailable(f"{name}: model {key} must be boolean")
+        for key in ('context', 'max_output'):
+            if descriptor.get(key) is not None and (type(descriptor[key]) is not int or descriptor[key] < 1):
+                raise service_unavailable(f"{name}: model {key} must be positive integer")
+        levels = descriptor.get('reasoning_effort_levels', [])
+        if not isinstance(levels, list) or any(not isinstance(v, str) or v not in models.EFFORT_ORDER for v in levels):
+            raise service_unavailable(f"{name}: invalid model reasoning_effort_levels")
+
+
+def validate_minara_account(record, name='account'):
+    """Validate and resolve one provider record in memory (never persist resolved env secrets)."""
+    _check_upstream(record, name)
+
+
 def _check_pool_fields(record, name):
     """Admin pool controls: enabled (bool), priority (0..99, lower first), label (short text)."""
     if "enabled" in record and type(record["enabled"]) is not bool:
@@ -574,12 +667,18 @@ def _load(path):
     cfg = dict(DEFAULTS)
     saved = _read_file(path)
     cfg.update(saved)
+    if isinstance(saved.get("accounts"), list):
+        cfg["accounts"] = [dict(row) if isinstance(row, dict) else row for row in saved["accounts"]]
     # null selects the default role; "" and blank text mean no role of our own (context.relay_policy).
     if cfg.get('relay_system_prompt') is not None and not isinstance(cfg['relay_system_prompt'], str):
         raise service_unavailable("relay_system_prompt must be a string or null")
     if cfg.get('relay_system_prompt_mode') not in ('standalone', 'append', 'replace'):
         raise service_unavailable("relay_system_prompt_mode must be one of standalone, append, replace")
     cfg["_config_path"] = os.path.abspath(path)
+    # What the relay measured by itself since minara_models.json was made (minara_refresh), kept beside config.json: put
+    # over the catalog before the accounts' model lists are checked against it.
+    cfg["_minara_catalog_file"] = os.fspath(minara_catalog.overlay_path(cfg["_config_path"]))
+    minara_catalog.apply_overlay(cfg["_minara_catalog_file"])
     cfg["prompts_file"] = _prompts_path(cfg.get("prompts_file"), cfg["_config_path"])
     cfg["_persist_auth"] = not (os.environ.get("RETOOL_COOKIE") or os.environ.get("RETOOL_XSRF"))
     # The tenant the file itself names, before RETOOL_BASE overrides it in memory: the file's record is matched against
@@ -599,6 +698,8 @@ def _load(path):
         "transport": "RELAY_TRANSPORT",
     }
     for key, env_name in env_map.items():
+        if env_name.startswith("RETOOL_") and cfg.get("upstream") == "minara":
+            continue  # A Retool environment never changes a Bearer credential destination.
         value = os.environ.get(env_name)
         if value:
             cfg[key] = value
@@ -636,6 +737,20 @@ def _load(path):
         raise service_unavailable("min_account_balance must be a number")
     if not math.isfinite(cfg["min_account_balance"]) or cfg["min_account_balance"] < 0:
         raise service_unavailable("min_account_balance must be a finite non-negative number")
+    # A typo here failed silently (a ttl of "60m" became a 5-minute cache) or every Minara turn (a bad delay list).
+    if cfg.get("minara_cache_ttl") not in ("1h", "5m"):
+        raise service_unavailable('minara_cache_ttl must be "1h" or "5m"')
+    credits_floor = cfg.get("minara_min_credits")
+    if type(credits_floor) not in (int, float) or not math.isfinite(credits_floor) or credits_floor < 0:
+        raise service_unavailable("minara_min_credits must be a finite non-negative number")
+    delays = cfg.get("minara_channel_retry_delays")
+    if (not isinstance(delays, list) or len(delays) > 5
+            or any(type(item) not in (int, float) or not 0 <= item <= 60 for item in delays)):
+        raise service_unavailable("minara_channel_retry_delays must be a list of at most 5 waits of 0-60 seconds")
+    for key, top in (("minara_catalog_refresh_hours", 168), ("minara_catalog_budget", 5000)):
+        value = cfg.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= top:
+            raise service_unavailable("%s must be a number from 0 to %d" % (key, top))
     if cfg["account_balance_interval"] < 0 or cfg["account_refresh_parallel"] < 1:
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
     if not 1 <= cfg["account_rate_limit_cooldown"] <= 3600:
@@ -653,6 +768,8 @@ def _load(path):
         raise service_unavailable("compaction_keep_effort must be a boolean")
     if type(cfg["codex_memory_jobs"]) is not bool:
         raise service_unavailable("codex_memory_jobs must be a boolean")
+    if type(cfg["codex_catalog_gpt_only"]) is not bool:
+        raise service_unavailable("codex_catalog_gpt_only must be a boolean")
     if type(cfg["codex_compaction_cache"]) is not bool:
         raise service_unavailable("codex_compaction_cache must be a boolean")
     if type(cfg["infer_conversations"]) is not bool:
@@ -720,7 +837,9 @@ def _load(path):
         for i, acc in enumerate(accounts):
             if not isinstance(acc, dict):
                 raise service_unavailable(f"account #{i} must be an object")
-            acc_missing = [k for k in ("cookie", "xsrf", "base", "page_uuid") if not acc.get(k)]
+            _check_upstream(acc, f"account #{i}", warnings)
+            acc_missing = ([] if acc.get("upstream") == "minara" else
+                           [k for k in ("cookie", "xsrf", "base", "page_uuid") if not acc.get(k)])
             if acc_missing:
                 raise service_unavailable(f"account #{i} is missing required credentials: " + ", ".join(acc_missing))
             _check_pool_fields(acc, f"account #{i}")
@@ -729,26 +848,28 @@ def _load(path):
         if not cfg.get("base") and accounts:
             cfg["base"] = accounts[0]["base"]
         if not cfg.get("page_uuid") and accounts:
-            cfg["page_uuid"] = accounts[0]["page_uuid"]
+            cfg["page_uuid"] = accounts[0].get("page_uuid", "")
         if not cfg.get("cookie") and accounts:
-            cfg["cookie"] = accounts[0]["cookie"]
+            cfg["cookie"] = accounts[0].get("cookie", "")
         if not cfg.get("xsrf") and accounts:
-            cfg["xsrf"] = accounts[0]["xsrf"]
+            cfg["xsrf"] = accounts[0].get("xsrf", "")
         if saved.get("provider_access"):
             warnings.append("top-level provider_access is ignored when accounts[] is present; move it into the "
                             "entry of the account that owns the resource")
         for i, acc in enumerate(accounts):
             warnings.extend(_provider_access_warnings(cfg, acc, f"account #{i}"))
     else:
+        _check_upstream(cfg, "the account", warnings)
         _check_pool_fields(cfg, "the account")
         warnings.extend(_provider_access_warnings(cfg, cfg, "the account"))
 
-    missing = [k for k in REQUIRED if not cfg.get(k)]
+    retool_required = not accounts and cfg.get("upstream", "retool") != "minara"
+    missing = [k for k in REQUIRED if not cfg.get(k)] if retool_required else []
     if missing:
         raise service_unavailable("config is missing required keys: " + ", ".join(missing))
-    if not cfg.get("cookie"):
+    if retool_required and not cfg.get("cookie"):
         raise service_unavailable("config is missing 'cookie' (or RETOOL_COOKIE)")
-    if not cfg.get("xsrf"):
+    if retool_required and not cfg.get("xsrf"):
         raise service_unavailable("config is missing 'xsrf' (or RETOOL_XSRF)")
     if cfg["session_mode"] not in ("per_request", "per_conversation", "shared"):
         raise service_unavailable("session_mode must be 'per_request', 'per_conversation' or 'shared'")
@@ -760,10 +881,11 @@ def _load(path):
         raise service_unavailable("transport must be 'direct' (the legacy 'agent' WebSocket transport is disabled)")
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
         raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
+    cfg['_minara_models'] = models.build_minara_catalog(accounts or [cfg])
     if cfg.get("reasoning_effort") not in (None, "auto"):
         models.resolve_tolerant(cfg["model"], cfg["reasoning_effort"],
                                 strict=cfg["strict_models"], allow_downgrade=cfg["allow_effort_downgrade"],
-                                xhigh_as=cfg["claude_xhigh_effort"])
+                                xhigh_as=cfg["claude_xhigh_effort"], cfg=cfg)
 
     workspace = cfg.get("workspace_root") or os.getcwd()
     # Resolve symlinks/junctions so escapes are visible.
@@ -798,15 +920,20 @@ def _load(path):
     if search_key and search_key not in cookie_vals:
         cookie_vals.append(search_key)  # masked wherever the relay redacts secrets, should it ever show up in a message
     # The secrets that are no cookie: a renewal or a new sign-in rebuilds cookie_values and keeps these (auth.secret_values).
-    cfg["_extra_secrets"] = [search_key] if search_key else []
+    tokens = [r.get("bearer_token") for r in (accounts or [cfg]) if r.get("upstream") == "minara"]
+    cfg["_extra_secrets"] = ([search_key] if search_key else []) + [t for t in tokens if t]
+    cookie_vals.extend(t for t in tokens if t and t not in cookie_vals)
     if cfg["web_search_provider"] and not search_key:
         warnings.append("web_search_provider is %s, but the environment variable %s holds no key: WebSearch stays refused"
                         % (cfg["web_search_provider"], cfg["web_search_key_env"]))
-    cfg["_disk_auth"] = (cfg["cookie"], cfg["xsrf"])
+    cfg["_disk_auth"] = (cfg.get("cookie", ""), cfg.get("xsrf", ""))
     cfg["config_warnings"] = warnings
     for text in warnings:
         console_log.write("warning: " + text, file=sys.stderr)
     changed = _assign_account_ids(saved)
+    if isinstance(cfg.get("accounts"), list):
+        for row, disk in zip(cfg["accounts"], saved["accounts"]):
+            row["account_id"] = disk["account_id"]
     if not isinstance(saved.get("accounts"), list):
         cfg["account_id"] = saved["account_id"]
     if changed and cfg["_persist_auth"]:

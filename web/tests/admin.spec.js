@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
 import { API_KEY, DEFAULT_ROLES, MEMORY_KEY, ev, journal, mockAdmin } from './fixtures.js';
 import { NOW, PARTIAL_BALANCE, RESET_DATE, metricsFor } from './fixtures.js';
 
@@ -898,6 +899,18 @@ test('a balance known for only some of the accounts says how many are missing, a
   await expect(page.locator('.forecast')).toContainText('по известным балансам хватит примерно на');
 });
 
+test('the summary shows Minara credits and dollars on their own line, the big figure is Retool', async ({ page }) => {
+  const minara = { available: 14980.84, usd: 68.0947, unit: 'minara_credits', accounts_total: 44, unknown_accounts: 0 };
+  await mockAdmin(page, { overviewPatch: { balance: { ...PARTIAL_BALANCE, minara } } });
+  await login(page);
+  await expect(page.locator('.instrument-head .instrument-label')).toContainText('Retool · 2 аккаунта');
+  const line = page.locator('.minara-balance');
+  await expect(line).toContainText('Minara · 44 аккаунта');
+  await expect(line).toContainText('14 980,84');
+  await expect(line).toContainText('$68,09');
+  await expect(line.locator('.tag')).toHaveCount(0);
+});
+
 test('a balance with a known total but a missing monthly limit says so, and its forecast needs no qualifier', async ({ page }) => {
   await mockAdmin(page, { overviewPatch: { balance: { ...PARTIAL_BALANCE, unknown_accounts: 0 } } });
   await login(page);
@@ -1334,3 +1347,209 @@ for (const width of [280, 320, 414]) {
     await page.getByRole('tab', { name: /Все события/ }).count();
   });
 }
+
+test('adds a Minara bearer account without sending Retool credentials', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByRole('combobox', { name: 'Провайдер' }).selectOption('minara');
+  await page.getByLabel('Или переменная окружения с токеном').fill('MINARA_API_TOKEN');
+  // An environment variable and tokens in the field never go together: whichever is filled locks the other
+  await expect(page.getByLabel('Bearer-токены, по одному на строку')).toBeDisabled();
+  await page.getByLabel('Модели (необязательно)').fill('not json');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Укажите JSON-массив моделей или оставьте поле пустым');
+  await expect.poll(() => state.accountRequests.length).toBe(0);
+  await page.getByLabel('Модели (необязательно)').fill('[{"id":"openai/gpt-oss-20b","tools":true}]');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect.poll(() => state.accountRequests.length).toBe(1);
+  expect(state.accountRequests[0].body).toEqual({ upstream: 'minara', base: 'https://api.minara.ai/v1',
+    label: '', bearer_token_env: 'MINARA_API_TOKEN', minara_models: [{ id: 'openai/gpt-oss-20b', tools: true }] });
+  await expect(page.getByRole('heading', { name: 'Новый аккаунт' })).toHaveCount(0);
+});
+
+test('a Minara account needs no model list: empty means every published model', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByRole('combobox', { name: 'Провайдер' }).selectOption('minara');
+  await expect(page.getByText('Пусто — все опубликованные модели minara/…')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Добавить', exact: true })).toBeDisabled();
+  await page.getByLabel('Или переменная окружения с токеном').fill('MINARA_API_TOKEN');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect.poll(() => state.accountRequests.length).toBe(1);
+  expect(state.accountRequests[0].body).toEqual({ upstream: 'minara', base: 'https://api.minara.ai/v1', label: '',
+    bearer_token_env: 'MINARA_API_TOKEN' });
+});
+
+// Synthetic JWT-shaped strings: the mock reads only how they start, never what they say
+const SYNTHETIC = (n) => `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c3ludGhldGlj-${n}`;
+const LINES = (...items) => items.join(String.fromCharCode(10));
+
+test('several Minara tokens, one per line, become numbered accounts in one request', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByRole('combobox', { name: 'Провайдер' }).selectOption('minara');
+  await page.getByLabel('Bearer-токены, по одному на строку').fill(LINES(SYNTHETIC(1), '', `  ${SYNTHETIC(2)}  `, SYNTHETIC(3)));
+  await expect(page.getByText(/^Токенов: 3\./)).toBeVisible();
+  await expect(page.getByLabel('Или переменная окружения с токеном')).toBeDisabled();
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect.poll(() => state.accountRequests.length).toBe(1);
+  // No label and no model list: the server numbers the accounts and gives them every published model
+  expect(state.accountRequests[0].body).toEqual({ upstream: 'minara', base: 'https://api.minara.ai/v1',
+    bearer_tokens: [SYNTHETIC(1), SYNTHETIC(2), SYNTHETIC(3)] });
+  await expect(page.getByText('Добавлено: 3 аккаунта Minara')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Новый аккаунт' })).toHaveCount(0);
+  for (const label of ['Minara 1', 'Minara 2', 'Minara 3']) {
+    const row = page.locator('.pool-row', { hasText: label });
+    await expect(row).toContainText('подключится после перезапуска');
+    await expect(row).toContainText('баланс: после перезапуска');
+    await expect(row).toContainText(/токен до \d+ [а-яё]+, ещё 30\s+дн/);
+  }
+  // The page never shows a token it was given
+  expect(await page.locator('body').innerText()).not.toContain('eyJhbGci');
+});
+
+test('what a bulk add skipped stays on the form, line by line, without the tokens', async ({ page }) => {
+  const state = await mockAdmin(page);
+  state.knownTokens = { [SYNTHETIC(7)]: { account: 'm7a8b9c0', label: 'Minara 7' } };
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByRole('combobox', { name: 'Провайдер' }).selectOption('minara');
+  await page.getByLabel('Название').fill('Команда');
+  await page.getByLabel('Модели (необязательно)').fill('["minara/claude-opus-5-5"]');
+  const tokens = [SYNTHETIC(1), SYNTHETIC(7), 'eyJhbGciOiJIUzI1NiJ9.expired.c2ln', 'Minara 12 (alice)', SYNTHETIC(1)];
+  await page.getByLabel('Bearer-токены, по одному на строку').fill(LINES(...tokens));
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect.poll(() => state.accountRequests.length).toBe(1);
+  expect(state.accountRequests[0].body).toEqual({ upstream: 'minara', base: 'https://api.minara.ai/v1', label: 'Команда',
+    minara_models: ['minara/claude-opus-5-5'], bearer_tokens: tokens });
+  const report = page.getByRole('status', { name: 'Результат по токенам' });
+  await expect(report).toContainText('Добавлено 1 из 5, подключатся после перезапуска');
+  const rows = report.locator('li');
+  await expect(rows).toHaveCount(4);
+  await expect(rows.nth(0)).toContainText('строка 2');
+  await expect(rows.nth(0)).toContainText('уже в пуле');
+  await expect(rows.nth(0)).toContainText('Minara 7');
+  await expect(rows.nth(1)).toContainText('строка 3');
+  await expect(rows.nth(1)).toContainText('истёк');
+  await expect(rows.nth(2)).toContainText('строка 4');
+  await expect(rows.nth(2)).toContainText('в токене только латиница, цифры и знаки, без пробелов');
+  await expect(rows.nth(3)).toContainText('строка 5');
+  await expect(rows.nth(3)).toContainText('повторяет строку 1');
+  await expect(page.locator('.pool-row', { hasText: 'Команда 1' })).toContainText('подключится после перезапуска');
+  expect(await page.locator('body').innerText()).not.toContain('eyJhbGci');
+  await page.getByRole('button', { name: 'Отмена' }).click();
+  await expect(page.getByRole('heading', { name: 'Новый аккаунт' })).toHaveCount(0);
+});
+
+test('a Minara row shows credits with their dollar value and when its token expires', async ({ page }) => {
+  const state = await mockAdmin(page);
+  const DAY = 86400;
+  const minara = { upstream: 'minara', balance_unit: 'minara_credits', balance_supported: true, renewal_supported: false,
+    monthly_allocation: 500, turns: 2, attempts: 2, provider_cost: 0.05, provider_cost_currency: 'USD' };
+  Object.assign(state.pool[0], minara, { label: 'Minara 1', available: 412.35, usd: 1.8743, expires_at: NOW + 24 * DAY + 600 });
+  Object.assign(state.pool[1], minara, { label: 'Minara 2', available: 96.1, usd: 0.4368, expires_at: NOW + 2 * DAY,
+    state: 'active', reserve: false, routable: true });
+  state.pool.push({ ...state.pool[0], ...minara, account: 'm-dead', label: 'Minara 3', state: 'auth_dead', routable: false,
+    available: null, usd: null, error: 'token_expired', expires_at: NOW - DAY });
+  await login(page);
+  await nav(page, 'Аккаунты');
+  const [first, second, third] = ['Minara 1', 'Minara 2', 'Minara 3'].map((label) => page.locator('.pool-row', { hasText: label }));
+  await expect(first).toContainText('412,35');
+  await expect(first).toContainText('из 500 кредитов Minara · 1,87 USD');
+  await expect(first).toContainText(/токен до \d+ [а-яё]+, ещё 24\s+дн/);
+  await expect(first).not.toContainText('токен истекает');
+  await expect(second).toContainText('0,44 USD');
+  await expect(second.locator('.tag', { hasText: 'токен истекает' })).toBeVisible();
+  await expect(second).toContainText(/токен до \d+ [а-яё]+, \d\d:\d\d, осталось 2\s+дн/);
+  await expect(third).toContainText(/токен истёк \d+ [а-яё]+, нужен новый/);
+  await expect(third.locator('.pool-state')).toHaveText('токен истёк');
+  await expect(third).not.toContainText('token_expired');
+  await expect(third.locator('.pool-money-row')).not.toContainText('USD');
+  await expect(third.getByRole('button', { name: 'Баланс', exact: true })).toBeDisabled();
+  // a Bearer token is renewed by adding a newer token of its user: no renew button that cannot work
+  await expect(first.getByRole('button', { name: 'Продлить', exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+});
+
+test('Minara form stays readable in both themes and narrow screens', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByRole('combobox', { name: 'Провайдер' }).selectOption('minara');
+  await page.getByLabel('Bearer-токены, по одному на строку').fill(LINES(SYNTHETIC(1), 'not a token', SYNTHETIC(1)));
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect.poll(() => state.accountRequests.length).toBe(1);
+  await expect(page.getByRole('status', { name: 'Результат по токенам' })).toBeVisible();
+  for (const theme of ['dark', 'light']) {
+    await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
+    for (const width of [280, 320, 414, 1440]) {
+      await page.setViewportSize({ width, height: 1000 });
+      await expect(page.getByLabel('Bearer-токены, по одному на строку')).toBeVisible();
+      await expect(page.getByRole('status', { name: 'Результат по токенам' })).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+    }
+    await page.screenshot({ path: `../.agents/minara-form-${theme}.png`, fullPage: true });
+  }
+});
+
+// The design gate shows the accounts screen with Retool accounts and no open form; this scans what Minara adds to it.
+for (const theme of ['dark', 'light']) {
+  test(`axe finds nothing on Minara rows, the token form and its report (${theme})`, async ({ page }) => {
+    test.slow();
+    await page.addInitScript((value) => localStorage.setItem('relay.admin.theme', value), theme);
+    await page.setViewportSize({ width: 1280, height: 1000 });
+    const state = await mockAdmin(page);
+    const DAY = 86400;
+    const minara = { upstream: 'minara', balance_unit: 'minara_credits', balance_supported: true, renewal_supported: false,
+      monthly_allocation: 500, turns: 1, attempts: 1, provider_cost: 0.01, provider_cost_currency: 'USD' };
+    Object.assign(state.pool[0], minara, { label: 'Minara 1', available: 96.1, usd: 0.4368, expires_at: NOW + 2 * DAY });
+    state.pool.push({ ...state.pool[0], ...minara, account: 'm-dead', label: 'Minara 2', state: 'auth_dead', routable: false,
+      available: null, usd: null, error: 'token_expired', expires_at: NOW - DAY });
+    state.knownTokens = { [SYNTHETIC(7)]: { account: 'm7a8b9c0', label: 'Minara 7' } };
+    await login(page);
+    await nav(page, 'Аккаунты');
+    const violations = [];
+    const scan = async (label) => {
+      await page.waitForTimeout(300);
+      const result = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
+        .exclude('.ss-fit').analyze();
+      for (const found of result.violations) violations.push({ label, id: found.id, targets: found.nodes.map((node) => node.target.join(' ')) });
+    };
+    await scan('an expiring and an expired token');
+    await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+    await page.getByRole('combobox', { name: 'Провайдер' }).selectOption('minara');
+    await page.getByLabel('Модели (необязательно)').fill('not json');
+    await page.getByLabel('Bearer-токены, по одному на строку').fill(LINES(SYNTHETIC(1)));
+    await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+    await expect(page.getByRole('alert')).toBeVisible();
+    await scan('the form with a refused model list');
+    await page.getByLabel('Модели (необязательно)').fill('');
+    await page.getByLabel('Bearer-токены, по одному на строку').fill(LINES(SYNTHETIC(1), SYNTHETIC(7), 'eyJ.expired.x', 'note', SYNTHETIC(1)));
+    await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+    await expect(page.getByRole('status', { name: 'Результат по токенам' })).toBeVisible();
+    await scan('the report of a bulk add');
+    expect(violations).toEqual([]);
+  });
+}
+
+test('Minara account never labels monetary usage as Retool credits', async ({ page }) => {
+  const state = await mockAdmin(page);
+  Object.assign(state.pool[0], { upstream: 'minara', available: null, monthly_allocation: null,
+    session_used: null, turns: 3, attempts: 4, provider_cost: 0.12345, provider_cost_currency: null,
+    balance_supported: false, renewal_supported: false });
+  await login(page);
+  await nav(page, 'Аккаунты');
+  const row = page.locator('.pool-row').first();
+  await expect(row).toContainText('3 хода');
+  await expect(row).toContainText('валюта неизвестна');
+  await expect(row.getByRole('button', { name: 'Баланс', exact: true })).toBeDisabled();
+  await expect(row.getByRole('button', { name: 'Продлить', exact: true })).toHaveCount(0);
+});

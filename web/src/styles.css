@@ -17,6 +17,7 @@ h2 { font-size: var(--text-md); font-weight: 500; display: flex; align-items: ce
 .muted { color: var(--muted); }
 .small { font-size: var(--text-sm); }
 .neg-text { color: var(--neg); }
+.warn-text { color: var(--warn); }
 .app-root { min-height: 100vh; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: 0ms !important; animation: none !important; } }
 
@@ -171,6 +172,9 @@ nav { display: grid; gap: var(--space-6); }
 .scale-legend { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--space-2); font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); }
 .forecast { font-size: var(--text-sm); color: var(--ink-2); }
 .forecast b { color: var(--accent-text); font-weight: 500; }
+.minara-balance { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2) var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--line); }
+.minara-figure { font-size: var(--text-lg, 1.125rem); color: var(--ink-2); }
+.minara-figure b { color: var(--ink); font-weight: 500; }
 .instrument-foot { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-6); padding-top: var(--space-3); border-top: 1px solid var(--line); font-size: var(--text-sm); color: var(--muted); }
 .instrument-foot b { color: var(--ink); font-weight: 500; }
 
@@ -480,6 +484,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 .pool-demo figcaption { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); padding: 0 var(--space-4) var(--space-3); font-size: var(--text-sm); }
 .pool-demo figcaption span { color: var(--muted); font-size: var(--text-xs); }
 .add-layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: var(--space-6); align-items: start; }
+.add-layout-bearer { grid-template-columns: minmax(0, 1fr); }
 .add-guide-figure { display: grid; gap: var(--space-2); margin: 0; }
 .guide-num {
   display: inline-grid; place-items: center; width: 16px; height: 16px; margin-right: var(--space-2); border-radius: 4px;
@@ -503,6 +508,7 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 .pool-state { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); font-size: var(--text-sm); color: var(--ink-2); }
 .pool-money { display: grid; gap: 6px; min-width: 0; }
 .pool-money-row { display: flex; align-items: baseline; gap: var(--space-2); font-size: var(--text-sm); }
+.pool-money-row.is-wrapping { flex-wrap: wrap; row-gap: 0; }
 .pool-money-row b { font-weight: 500; font-size: var(--text-md); }
 .pool-meta, .pool-health { font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); }
 .pool-health { display: grid; gap: 2px; min-width: 0; }
@@ -517,11 +523,23 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
 .add-form .panel-head { margin-bottom: 0; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3) var(--space-4); }
 .field-wide { grid-column: 1 / -1; }
-.add-form input, .add-form textarea {
+.add-form input, .add-form textarea, .add-form select {
   width: 100%; padding: var(--space-2) var(--space-3); border-radius: var(--radius-control); border: 1px solid var(--line-strong);
   background: var(--raised); color: var(--ink); font-family: var(--mono); font-size: var(--text-sm); resize: vertical;
 }
-.add-form input { height: 36px; }
+.add-form input, .add-form select { height: 36px; }
+.add-form input:disabled, .add-form textarea:disabled { opacity: 0.55; cursor: not-allowed; }
+/* Bearer tokens, one per line: each stays on its own row (the report counts lines) and is masked like a password */
+.add-form .token-lines { white-space: pre; overflow-wrap: normal; overflow-x: auto; -webkit-text-security: disc; }
+.token-report { display: grid; gap: var(--space-2); padding: var(--space-3) var(--space-4); border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--raised); }
+.token-report-head { font-size: var(--text-sm); color: var(--ink); }
+.token-report-list { display: grid; gap: var(--space-1); margin: 0; padding: 0; list-style: none; }
+.token-report-list li {
+  display: grid; grid-template-columns: 5.5rem 6.5rem minmax(0, 1fr); align-items: center; gap: var(--space-3);
+  font-family: var(--mono); font-size: var(--text-xs); color: var(--muted);
+}
+.token-report-list .tag { justify-self: start; }
+.token-report-text { color: var(--ink-2); overflow-wrap: anywhere; }
 .form-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
 
 /* --- settings ---------------------------------------------------------------- */
@@ -661,6 +679,9 @@ g.on .c-read, g.on .c-write { fill: var(--ink-2); }
   .pool-state, .pool-money, .pool-health { grid-column: 1 / -1; }
   .pool-actions { grid-column: 1 / -1; grid-row: auto; flex-direction: row; flex-wrap: wrap; }
   .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .token-report-list { gap: var(--space-2); }
+  .token-report-list li { grid-template-columns: auto minmax(0, 1fr); gap: var(--space-1) var(--space-2); }
+  .token-report-text { grid-column: 1 / -1; }
   .activity .page-head .tabs { width: 100%; }
   .tabs button { flex: 1; justify-content: center; }
 }

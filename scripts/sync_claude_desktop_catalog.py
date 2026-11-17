@@ -106,12 +106,16 @@ def native_efforts(name, desktop=None):
 
 
 def claude_routes(entries):
-    return [entry for entry in entries if entry.get('provider') == 'anthropic' and entry['id'].startswith('claude-')]
+    """Claude routes Desktop can list: Retool's claude-* and Minara's minara/claude-* (Desktop keeps names that look
+    like an Anthropic model; minara/ holds no other vendor's name)."""
+    return [entry for entry in entries if entry.get('provider') == 'anthropic'
+            and (entry['id'].startswith('claude-') or entry['id'].startswith('minara/claude-'))]
 
 
 def _base_id(entry):
-    """The catalog model behind an entry: itself, or the base of a virtual <model>@<profile> entry."""
-    return entry.get('virtual', {}).get('base', entry['id'])
+    """The catalog model behind an entry: itself, or the base of a virtual <model>@<profile> entry. A Minara route is
+    Anthropic's model of the same name (minara/claude-opus-5-5 is claude-opus-5-5) for Desktop's own catalog."""
+    return entry.get('virtual', {}).get('base', entry['id']).removeprefix('minara/')
 
 
 def _rows_by_name(previous):
@@ -158,7 +162,8 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
     current = next(iter(old), None)
     if default_model is not None:
         try:
-            wanted = models.canonical_name(default_model)
+            wanted = models.canonical_name(default_model, {'_minara_models': {
+                entry['id']: entry for entry in entries if entry.get('upstream') == 'minara' and 'virtual' not in entry}})
         except ApiError:
             wanted = default_model
         if wanted not in by_id:
@@ -278,7 +283,8 @@ def load_relay_config(path):
         raise SyncError('Relay configuration %s has an invalid accounts section' % path) from error
     if not accounts:
         raise SyncError('The relay configuration has no enabled account')
-    return dict(root, accounts=accounts)
+    # The Minara models of its accounts, as the relay builds them (minara_models.json and the accounts' lists).
+    return dict(root, accounts=accounts, _minara_models=models.build_minara_catalog(accounts))
 
 
 def read_registry_policy(hive):
@@ -504,7 +510,7 @@ def run(args):
         warnings.append('bootstrapUrl is set: while a bootstrap response is available it overrides these '
                         'settings and may serve the model list itself')
     relay = load_relay_config(args.relay_config)
-    entries = [entry for entry in models.catalog() if models.catalog_routable(entry, relay)]
+    entries = [entry for entry in models.catalog(relay) if models.catalog_routable(entry, relay)]
     entries, virtual = sync_virtual_models.with_virtual_models(entries, args)
     desktop = _catalog_hint(args, warnings)
     result = build_catalog(entries, previous, default_model=args.default_model, desktop=desktop,

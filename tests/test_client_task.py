@@ -279,3 +279,33 @@ def test_the_service_prompt_list_is_what_it_was_with_the_compaction_prompts_name
         "You are a helpful AI assistant tasked with summarizing conversations.",
         "Summarize what was done in this conversation. Write like a pull request description.")
     assert client_context.COMPACTION_SYSTEM_PROMPTS == client_context.OPENCODE_SERVICE_PROMPTS[2:4]
+
+
+def test_a_compaction_followed_by_a_system_reminder_is_still_a_compaction():
+    # Claude Code 2.1.310 ends a /compact with a role:system <total_tokens> reminder after the instruction (end-to-end
+    # run of 2026-11-10): it arrives as a user turn wrapped as a reminder, and the instruction is the message before it.
+    body = {"model": "claude-opus-5-5", "max_tokens": 2000, "system": [{"type": "text", "text": "You are Claude Code."}],
+            "messages": [{"role": "user", "content": "inspect the project"},
+                         {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+                         {"role": "user", "content": [{"type": "text", "text": "CRITICAL: Respond with TEXT ONLY. Do NOT "
+                                                                               "call any tools.\n\nSummarize." + TAIL}]},
+                         {"role": "system", "content": "<total_tokens>15000000 tokens left</total_tokens>"}]}
+    parsed = validate.parse_anthropic(body, CFG)
+    assert client_context.client_task(parsed, {"client": "claude-code"}) == "compaction"
+    # a reminder alone after ordinary work is no compaction
+    body["messages"][2] = {"role": "user", "content": "continue the work"}
+    parsed = validate.parse_anthropic(body, CFG)
+    assert client_context.client_task(parsed, {"client": "claude-code"}) == ""
+
+
+def test_a_compaction_instruction_added_as_a_second_block_of_the_last_user_message_is_a_compaction():
+    # Claude Code 2.1.310 adds its /compact instruction as one more block of the last user message (final check)
+    body = {"model": "claude-opus-5-5", "max_tokens": 2000, "system": [{"type": "text", "text": "You are Claude Code."}],
+            "messages": [{"role": "user", "content": "inspect the project"},
+                         {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+                         {"role": "user", "content": [{"type": "text", "text": "What is 17 multiplied by 23?\n"},
+                                                      {"type": "text", "text": "CRITICAL: Respond with TEXT ONLY. Do NOT "
+                                                                               "call any tools.\n\nSummarize." + TAIL}]},
+                         {"role": "system", "content": "<total_tokens>15000000 tokens left</total_tokens>"}]}
+    parsed = validate.parse_anthropic(body, CFG)
+    assert client_context.client_task(parsed, {"client": "claude-code"}) == "compaction"

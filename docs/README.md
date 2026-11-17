@@ -8,6 +8,8 @@
 | Документ | О чём |
 |---|---|
 | [client-setup.md](client-setup.md) | Настройка клиентов под relay: Codex, Claude Code, Claude Desktop, OpenCode, DeepSeek Harness |
+| [minara.md](minara.md) | Отдельный набор моделей Minara `minara/…`: аккаунты, замер каталога, кэш, мышление, баланс |
+| [minara-questions.md](minara-questions.md) | Minara: вопросы владельцу, решения по ним и что из них сделано (9–10 ноября 2026) |
 | [prompt-control.md](prompt-control.md) | Управление системным промптом через `prompts.json`: профили, правила, правки истории и tools |
 | [prompt-control-plan.md](prompt-control-plan.md) | План работ по управлению промптом (5 ноября 2026) |
 | [direct-transport.md](direct-transport.md) | Прямой транспорт Retool и кэш контекста: устройство и замеры |
@@ -22,6 +24,7 @@
 
 | Дата | Документ | О чём |
 |---|---|---|
+| 2026-11-08 | [minara-integration-2026-11-08.md](reports/minara-integration-2026-11-08.md) | Minara Bearer, смешанный пул, многоэтапные проверки, реальные клиенты и live-приёмка |
 | 2026-10-29…11-05 | [model-catalog-audit.md](reports/model-catalog-audit.md) | Аудит каталога моделей `models.py` и источники его данных |
 | 2026-10-31 | [direct-inference-audit.md](reports/direct-inference-audit.md) | Исследование backend Retool, с которого начался прямой транспорт |
 | 2026-11-01 | [review-and-merge-2026-11-01.md](reports/review-and-merge-2026-11-01.md) | Ревью и мерж стека PR #1–#14 |

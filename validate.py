@@ -292,9 +292,9 @@ def _client_model(model, cfg):
     An empty name, or one that is only an effort suffix, stands for the configured default model, as
     models.resolve reads it. The profile is only named here: that it exists is the prompt layer's check.
     """
-    named = model_catalog.parse_model_name(model)
+    named = model_catalog.parse_model_name(model, cfg)
     if not named.base:
-        named = model_catalog.parse_model_name(cfg.get("model"))
+        named = model_catalog.parse_model_name(cfg.get("model"), cfg)
     return named.base, named.profile
 
 
@@ -735,10 +735,10 @@ def _messages(data, *, min_items=1):
     return messages
 
 
-def _finish(data, parsed, dialect, search=False):
+def _finish(data, parsed, dialect, search=False, cfg=None):
     parsed.requested_effort = _effort(data)
     if parsed.requested_effort is None:
-        parsed.requested_effort = model_catalog.parse_model_name(data.get("model")).effort
+        parsed.requested_effort = model_catalog.parse_model_name(data.get("model"), cfg).effort
     parsed.structured_output = generation.structured_output(data, dialect)
     parsed.structured_title = bool(parsed.structured_output and parsed.structured_output['title'])
     parsed.verbosity, parsed.declared_ignored, parsed.routine_ignored = generation.controls(
@@ -759,6 +759,8 @@ def _finish(data, parsed, dialect, search=False):
     else:
         parsed.wants_usage = True
     parsed.tools = _tools(data, parsed if search else None)
+    if parsed.entry.get("upstream") == "minara" and parsed.tools and not parsed.entry.get("tools", False):
+        raise unprocessable("tools are not enabled for this Minara model", param="tools")
     parsed.tool_choice = _tool_choice(data.get("tool_choice"))
     names = [tool["function"]["name"] for tool in parsed.tools]
     if parsed.tool_choice == "required" and not names:
@@ -979,7 +981,7 @@ def _effort_of(data, cfg):
     """(entry, effort) of a request's model and effort controls under the config's effort rules."""
     return model_catalog.resolve_tolerant(
         _opt_str(data, "model"), _effort(data), strict=cfg["strict_models"], default_model=cfg.get("model"),
-        allow_downgrade=cfg.get("allow_effort_downgrade", False), xhigh_as=cfg.get("claude_xhigh_effort", "high"))
+        allow_downgrade=cfg.get("allow_effort_downgrade", False), xhigh_as=cfg.get("claude_xhigh_effort", "high"), cfg=cfg)
 
 
 @_in_fetch_scope
@@ -1003,7 +1005,7 @@ def parse_chat(data, cfg):
                          or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
     parsed.temperature = _opt_float(data, "temperature")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed, 'chat')
+    return _finish(data, parsed, 'chat', cfg=cfg)
 
 
 @_in_fetch_scope
@@ -1048,7 +1050,7 @@ def parse_responses(data, cfg):
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed, 'responses')
+    return _finish(data, parsed, 'responses', cfg=cfg)
 
 
 @_in_fetch_scope
@@ -1085,7 +1087,7 @@ def parse_anthropic(data, cfg):
     if stop is not None and not isinstance(stop, list):
         raise unprocessable("'stop_sequences' must be an array", param="stop_sequences")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed, 'anthropic', search=web_search.provider(cfg) is not None)
+    return _finish(data, parsed, 'anthropic', search=web_search.provider(cfg) is not None, cfg=cfg)
 
 
 def _effort(data):

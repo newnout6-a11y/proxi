@@ -8,6 +8,12 @@ Anthropic-клиентов (Codex, opencode, Aider, Continue, Claude Code, curl)
 Честная рамка: это адаптер к внутреннему протоколу, а не официальный API Retool.
 Совместимость ограничена списком ниже.
 
+Дополнительный upstream **Minara** даёт отдельный набор моделей `minara/…` (Claude, GPT,
+Gemini, Grok, GLM, DeepSeek, Kimi и другие) через Bearer-авторизацию. Эти модели обслуживают
+только аккаунты Minara, с моделями Retool они не смешиваются: провайдера выбирает клиент
+именем модели, например основной агент на Minara, субагенты на Retool. Настройка, замеры и
+ограничения: [Minara](docs/minara.md).
+
 ## Возможности
 
 - POST /v1/chat/completions — OpenAI Chat Completions, streaming и non-streaming.
@@ -1439,7 +1445,7 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   `cache_keepwarm_idle`.
   Остановка пишется в журнал событием `cache.keepwarm_stop`: `reason` (`idle_limit`,
   `subagent_done`, `account_unavailable`, `evicted`, `failures`, `last_turn_failed`,
-  `cache_expired`, `cache_rewritten`, `compacted`; `closed` — сессию закрыли
+  `cache_expired`, `cache_rewritten`, `compacted`, `too_small`; `closed` — сессию закрыли
   после уже отправленных пингов), `pings` и `idle_pings` цикла, `credits` — списанное этими
   пингами (известная часть), `idle_seconds` с последнего настоящего запроса, применённый
   `limit`, `subagent`, `account` и названия диалога. У `account_unavailable` есть
@@ -1452,6 +1458,8 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   как вход), `read_tokens`, `prefix_tokens`, `ping_credits` —
   цена перезаписавшего пинга — и `touch_age_seconds`. `compacted` — клиент сжал историю
   диалога: тело запроса сжатия не греется, а прежний префикс больше не продолжится.
+  `too_small` — префикс меньше 1024 токенов (есть `prefix_tokens`): провайдер такой не кэширует,
+  греть нечего; так было с запросами заголовков OpenCode на его `small_model`, по 618 токенов.
   `cache_rewritten`, `last_turn_failed` и `compacted` держатся на сессии: новый цикл
   прогрева, в том числе по запросу дочернего диалога, начинается только после следующего
   удачного хода этого диалога. Событие `cache.keepwarm` каждого
@@ -1772,16 +1780,16 @@ relay с этим делает. 429 приходит до начала гене�
 | Слой | Модули |
 |---|---|
 | HTTP и входящие запросы | `proxy.py` (сервер, маршруты, лимиты, слоты), `auth.py` (ключ relay, заголовки upstream), `validate.py` (строгий разбор трёх диалектов), `apierr.py` (ошибки в форме OpenAI/Anthropic), `sse.py`, `io_workers.py` |
-| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `upstream_attempts.py`, `upstream_diagnostics.py` |
+| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `minara.py` (транспорт Minara: чат и `/v1/messages`), `upstream_attempts.py`, `upstream_diagnostics.py` |
 | История между ходами и перезапусками | `native_history.py`, `conversation_state.py`, `conversation_infer.py`, `compaction_tools.py`, `summary_guard.py` |
 | Ответ клиенту | `adapters.py` (Chat, Responses, Messages), `structured.py`, `forced_choice.py`, `generation.py`, `web_search.py` |
 | Клиенты и системный промпт | `client_context.py`, `context.py`, `prompt_policy.py` (профили и правила `prompts.json`), `prompt_body.py` (правки истории и tools), `prompt_stabilizer.py`, `tool_names.py`, `tool_union.py`, `tool_search_policy.py` |
-| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей) |
-| Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
+| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей), `minara_accounts.py` (токены Minara и их срок), `minara_catalog.py` (опубликованные модели Minara), `minara_refresh.py` (каталог Minara обновляется сам), `minara_probe.py` (замеры моделей Minara) |
+| Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `console_clock.py` (время в строках консоли), `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
 
 Путь запроса: proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
 (контекст, exec-цикл) -> session.py (диалоги, ретраи, отмена) -> direct.py
-(direct-транспорт, prompt caching) -> adapters.py (три диалекта) + sse.py.
+(direct-транспорт, prompt caching) или, для моделей `minara/…`, minara.py -> adapters.py (три диалекта) + sse.py.
 Реверс-инжиниринг протокола — PROTOCOL.md. Локальные capture/probe-артефакты
 исключены из Git: они могут содержать credentials. Удаление файлов из текущей
 ветки не удаляет ранее опубликованные секреты из истории; их следует отозвать.

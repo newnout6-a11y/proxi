@@ -6,9 +6,11 @@ failure pauses every account together, so 20-30 accounts never renew in one
 burst. An account whose renewal keeps failing with 401/403, or whose confirmed
 balance is below `min_account_balance`, leaves the routing pool until a later
 check succeeds. An account that spent Retool's hourly managed-key quota is parked
-for `account_rate_limit_cooldown` seconds and returns by itself.
+for `account_rate_limit_cooldown` seconds and returns by itself. A Minara account
+whose Bearer token has expired leaves the pool without a request to Minara.
 """
 import math
+import collections
 import random
 import threading
 import time
@@ -16,10 +18,14 @@ import time
 import apierr
 import console_log
 import journal
+import minara_accounts
+from minara_catalog import CREDITS_PER_USD
 from io_workers import DaemonIOExecutor
 
 DEAD_AFTER = 3            # consecutive auth failures before an account leaves the pool
 FORCED_CHECK_GAP = 15.0   # at most one on-demand balance fetch per account per gap
+TOKEN_RECHECK = 120.0     # seconds between balance reads of a Minara account whose token was rejected: a brief
+                          # 401 of Minara's own took every account out for ten minutes
 STARTUP_SPREAD = 2.0      # seconds between accounts' first checks
 NETWORK_PAUSE_MAX = 300.0
 AUTH_RETRY_MAX = 600.0
@@ -29,6 +35,25 @@ RATE_LIMIT_COOLDOWN = 900.0  # default pause after Retool's hourly managed-key l
 RATE_LIMIT_MAX = 3600.0      # the limit is a sliding hour: parking an account longer never helps
 RATE_LIMIT_STEP = 300.0      # a limit right after the return adds five minutes to the pause ...
 RATE_LIMIT_CEILING = 1200.0  # ... up to twenty minutes, or the cooldown itself when that is longer
+EXPIRY_WARN_EVERY = 86400.0  # a token about to expire is announced at most once a day per account
+
+
+def _local_time(epoch):
+    """A moment as the console shows dates: 11.11.2026 14:05 local time."""
+    try:
+        return time.strftime("%d.%m.%Y %H:%M", time.localtime(epoch))
+    except (OverflowError, OSError, ValueError):
+        return "%d" % epoch
+
+
+def _time_left(seconds):
+    """3 дн 5 ч, 7 ч, 40 мин."""
+    hours = max(0, int(seconds // 3600))
+    if hours >= 24:
+        return "%d дн %d ч" % (hours // 24, hours % 24)
+    if hours:
+        return "%d ч" % hours
+    return "%d мин" % max(1, math.ceil(seconds / 60))
 
 
 def enabled(backend):
@@ -82,17 +107,293 @@ def idle_block(backend):
     return reason or "unavailable"
 
 
+class UnmeteredAccount:
+    """Provider balance is unavailable, not zero and not Retool credits. No network calls."""
+    supports_balance = False
+
+    def __init__(self):
+        self.last_error = None
+        self.last_fetched_at = None
+        self.session_used = None
+        self._lock = threading.RLock()
+        self._attempts = collections.OrderedDict()
+        self._active = {}
+        self._turn_count = 0
+        self._attempt_count = 0
+        self._priced_count = 0
+        self._currencies = {}
+        self._currency_counts = {}
+        self._currency_overflow = False
+        self._unknown_cost_count = 0
+        self._only_unknown_cost = None
+
+    def start_provider_turn(self):
+        with self._lock:
+            self._turn_count += 1
+
+    def _account(self, row, sign=1):
+        cost = row.get('provider_cost')
+        if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
+            return
+        self._priced_count += sign
+        currency = row.get('provider_cost_currency')
+        if currency is None:
+            self._unknown_cost_count += sign
+            # On removal the remaining singleton is another row, never the removed cost.
+            # Its historical row may already be evicted: return unknown conservatively.
+            self._only_unknown_cost = cost if sign > 0 and self._unknown_cost_count == 1 else None
+        elif currency in self._currencies or len(self._currencies) < 16:
+            self._currency_counts[currency] = self._currency_counts.get(currency, 0) + sign
+            self._currencies[currency] = self._currencies.get(currency, 0.0) + sign * cost
+            if self._currency_counts[currency] == 0:
+                self._currency_counts.pop(currency, None)
+                self._currencies.pop(currency, None)
+        else:
+            self._currency_overflow = True
+
+    def record_provider_usage(self, attempt_id, turn_id, usage, *, final=False):
+        """Bounded active/recent dedup plus lifetime totals; IDs are not retained forever."""
+        with self._lock:
+            row = self._active.get(attempt_id) or self._attempts.get(attempt_id)
+            if row is None:
+                row = {'attempt_id': attempt_id, 'turn_id': turn_id, 'ts': time.time()}
+                self._attempt_count += 1
+                self._active[attempt_id] = row
+            else:
+                self._account(row, -1)
+            row.update(usage)
+            self._account(row)
+            if final:
+                self._active.pop(attempt_id, None)
+                self._attempts[attempt_id] = row
+                self._attempts.move_to_end(attempt_id)
+                while len(self._attempts) > 50:
+                    self._attempts.popitem(last=False)
+
+    def finish_provider_attempt(self, attempt_id, turn_id):
+        self.record_provider_usage(attempt_id, turn_id, {}, final=True)
+
+    def get_balance(self, force_refresh=False):
+        return {'available': None, 'session_used': None, 'balance_supported': False,
+                'unit': None, 'stale': False, 'unreported_usage': True}
+
+    def balance_snapshot(self):
+        return self.get_balance()
+
+    def usage(self):
+        from credits import provider_cost_summary
+        with self._lock:
+            rows = [*self._attempts.values(), *self._active.values()]
+            recent = rows[-50:]
+            summary = provider_cost_summary(recent)
+            total = None
+            currency = None
+            if not self._currency_overflow:
+                if len(self._currencies) == 1 and not self._unknown_cost_count:
+                    currency, total = next(iter(self._currencies.items()))
+                elif not self._currencies and self._unknown_cost_count == 1:
+                    total = self._only_unknown_cost
+            complete = self._attempt_count == self._priced_count
+            overflow = total is not None and not math.isfinite(total)
+            summary.update(provider_cost=round(total, 10) if total is not None and not overflow else None,
+                           provider_cost_overflow=overflow,
+                           provider_cost_currency=currency, provider_cost_complete=complete)
+            return {'session_used': None, 'turns': self._turn_count, 'attempts': self._attempt_count,
+                    'recent': [dict(row) for row in recent], 'recent_total': None,
+                    'available': None, 'unreported_usage': not complete,
+                    'unit': None, **summary}
+
+    def mark_usage_unknown(self):
+        pass  # begin-attempt records an unpriced attempt, including network failures
+
+    def record_turn(self, turn_id, cost):
+        pass  # Upstream monetary cost must never be debited as Retool credits.
+
+
+def _minara_network_get(url, **kwargs):
+    from curl_cffi import requests
+    return requests.get(url, **kwargs)
+
+
+class MinaraAccount(UnmeteredAccount):
+    """A Minara account's credits, read from GET /auth/me (creditBalanceBreakdown: plan + extra).
+
+    Minara debits a reply's usage.cost at 220 credits per US dollar as soon as it ends, and lets the balance go below zero
+    (a turn is charged after it ran); at zero or below it answers 402. Between server reads the reported costs are taken
+    off the last balance, so an account near its end leaves the pool before its next reply would overdraw it.
+
+    The Bearer token is a JWT that lives 30 days: every balance answer carries `expires_at` (epoch seconds, None when the
+    token is not a readable JWT), and an expired token is never sent (Minara would answer 401)."""
+    supports_balance = True
+    keeps_local_debit = True  # account_report reads its snapshot, not the network, for passive reports
+    CACHE_SECONDS = 20.0
+
+    def __init__(self, cfg, fetch=None, backend=None):
+        super().__init__()
+        self.cfg = cfg
+        self._fetch = fetch
+        self.backend = backend
+        self._balance = None
+        self._fetched = float("-inf")
+        self._spent_since = 0.0
+        # The balance at which Minara last answered 402: whether its bonus ("extra") credits pay for API calls is not
+        # known (an account at plan -102 and extra 63 was refused), so a refusal holds until the balance grows.
+        self._refused_at = None
+        self._raw = None  # plan + extra of the last read, before a refusal holds it at 0
+        # One read at a time; a failed read is answered from memory for CACHE_SECONDS, as CreditsManager does. Without
+        # them every caller read /auth/me again, and an account whose read failed was asked on every call.
+        self._fetch_lock = threading.Lock()
+        self._failed_at = float("-inf")
+        self._failure = None
+        self._token_read = None  # the token whose expiry _expiry holds: read again only when the token changes
+        self._expiry = None
+
+    def expires_at(self):
+        """When the account's token stops working (epoch seconds, from the JWT payload); None when unknown."""
+        token = self.cfg.get("bearer_token")
+        with self._lock:
+            if token != self._token_read:
+                self._token_read, self._expiry = token, minara_accounts.expires_at(token)
+            return self._expiry
+
+    def expired(self, now=None):
+        expiry = self.expires_at()
+        return expiry is not None and (time.time() if now is None else now) >= expiry
+
+    def _stamped(self, snapshot):
+        snapshot["expires_at"] = self.expires_at()
+        return snapshot
+
+    def note_refusal(self):
+        """Minara answered 402: the account takes nothing until a later read shows more credits than now.
+
+        The mark is the server's balance (not the one shown, which a refusal holds at 0 or below), so a second 402 never
+        lowers it and lets the account back in at an unchanged balance. Before any read it is unknown: the first read
+        then sets it, so a top-up still brings the account back (it stayed out until a restart)."""
+        with self._lock:
+            raw = self._raw
+            current = (raw - self._spent_since) if raw is not None else float("inf")
+            self._refused_at = current if self._refused_at is None else max(self._refused_at, current)
+
+    def _origin(self):
+        base = str(self.cfg.get("base") or "https://api.minara.ai/v1").rstrip("/")
+        return base[:-3] if base.endswith("/v1") else base
+
+    def _read(self):
+        if self._fetch is not None:
+            return self._fetch()
+        # config._check_upstream resolves bearer_token_env into bearer_token in memory.
+        token = self.cfg.get("bearer_token") or ""
+        get = getattr(self.backend, "_minara_get", None) or _minara_network_get
+        response = get(self._origin() + "/auth/me", impersonate="chrome131", timeout=30, allow_redirects=False,
+                       headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+        if response.status_code in (401, 403):
+            raise apierr.upstream_auth_failed("Minara rejected the account token")
+        if response.status_code != 200:
+            raise apierr.upstream_error("Minara balance HTTP %s" % response.status_code)
+        return response.json()
+
+    def get_balance(self, force_refresh=False):
+        if self.expired():
+            # The dispatcher takes such an account out of the pool (check_expiry); asking Minara would only cost a 401.
+            return self._failed("token_expired")
+        asked_at = time.monotonic()
+        with self._lock:
+            fresh = asked_at - self._fetched < self.CACHE_SECONDS
+            if self._balance is not None and fresh and not force_refresh:
+                return self._stamped(dict(self._balance))
+            if not force_refresh and asked_at - self._failed_at < self.CACHE_SECONDS and self._failure:
+                return self._failed(self._failure, stamp=False)
+        with self._fetch_lock:
+            with self._lock:
+                # Another caller read it while this one waited: its answer is this one's too.
+                if self._fetched >= asked_at and self._balance is not None:
+                    return self._stamped(dict(self._balance))
+                if self._failed_at >= asked_at and self._failure:
+                    return self._failed(self._failure, stamp=False)
+            return self._fetch_balance()
+
+    def _fetch_balance(self):
+        with self._lock:
+            # What was spent until now; costs recorded while the read is under way stay on the local debit (Minara may
+            # answer the read before it debits them). They were zeroed with the rest.
+            spent_before = self._spent_since
+        try:
+            data = self._read()
+            parts = data.get("creditBalanceBreakdown") or {}
+            plan, extra = float(parts.get("plan")), float(parts.get("extra", 0) or 0)
+            if not (math.isfinite(plan) and math.isfinite(extra)):
+                raise ValueError("balance is not a number")
+            total = (data.get("creditBalance") or {}).get("total")
+            reward = (data.get("creditBalance") or {}).get("reward")
+            capacity = sum(float(value) for value in (total, reward) if value is not None) or None
+        except apierr.ApiError as error:
+            return self._failed(error.code)
+        except Exception as error:  # noqa: BLE001 - a balance read must never fail a turn
+            return self._failed(type(error).__name__)
+        with self._lock:
+            available = self._raw = plan + extra
+            if self._refused_at == float("inf"):
+                self._refused_at = available  # refused before the first read: this read is the mark
+            if self._refused_at is not None:
+                if available > self._refused_at + 1:
+                    self._refused_at = None  # topped up since the refusal
+                else:
+                    available = min(available, 0.0)
+            self._balance = {"available": round(available, 4), "plan": round(plan, 4), "extra": round(extra, 4),
+                             "monthly_allocation": capacity, "unit": "minara_credits", "balance_supported": True,
+                             "usd": round(available / CREDITS_PER_USD, 4), "session_used": None,
+                             "refused": self._refused_at is not None,
+                             "stale": False, "unreported_usage": False}
+            self._fetched = time.monotonic()
+            self._spent_since = max(0.0, self._spent_since - spent_before)
+            self.last_fetched_at = time.time()
+            self.last_error = None
+            return self._stamped(dict(self._balance))
+
+    def _failed(self, reason, stamp=True):
+        with self._lock:
+            if stamp:
+                self._failed_at, self._failure = time.monotonic(), reason
+            self.last_error = reason
+            snapshot = dict(self._balance) if self._balance else {
+                "available": None, "unit": "minara_credits", "balance_supported": True, "session_used": None,
+                "unreported_usage": True}
+            snapshot.update(error=reason, stale=self._balance is not None)
+            return self._stamped(snapshot)
+
+    def balance_snapshot(self):
+        """The last server balance less the costs reported since: no network."""
+        with self._lock:
+            if self._balance is None:
+                return self._stamped({"available": None, "unit": "minara_credits", "balance_supported": True})
+            snapshot = dict(self._balance)
+            snapshot["available"] = round(snapshot["available"] - self._spent_since, 4)
+            return self._stamped(snapshot)
+
+    def _account(self, row, sign=1):
+        super()._account(row, sign)
+        cost = row.get("provider_cost")
+        if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
+            self._spent_since += sign * cost * CREDITS_PER_USD
+
+
 class AccountDispatcher:
-    def __init__(self, backends, cfg, managers, *, clock=time.monotonic, rng=None):
+    def __init__(self, backends, cfg, managers, *, clock=time.monotonic, rng=None, wall=time.time):
         self.backends = list(backends)
         self.managers = dict(managers)
         self.interval = float(cfg.get("session_refresh_interval", 900) or 0)
         self.threshold = float(cfg.get("min_account_balance", 20))
+        # Minara credits are another unit (220 per US dollar): a turn on a long Claude context costs 5-50 of them.
+        # 0: an account takes turns until Minara refuses one (402), and that request moves to another account at once
+        # (mark_minara_refusal). A floor of 15 left up to 15 credits on each of 51 accounts.
+        self.minara_threshold = float(cfg.get("minara_min_credits", 0))
         self.balance_interval = float(cfg.get("account_balance_interval", 300) or 0)
         self.rate_limit_cooldown = min(max(float(cfg.get("account_rate_limit_cooldown") or RATE_LIMIT_COOLDOWN),
                                            1.0), RATE_LIMIT_MAX)
         self.parallel = max(1, int(cfg.get("account_refresh_parallel", 3) or 1))
         self.clock = clock
+        self.wall = wall  # token expiry is a moment in epoch seconds, not on the monotonic clock
         self.rng = rng or random.Random()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -107,13 +408,20 @@ class AccountDispatcher:
             offset = min(index * STARTUP_SPREAD, 60.0)
             self.state[backend] = {"next_refresh": now + offset, "next_balance": now + offset + 1.0,
                                    "auth_failures": 0, "soft_failures": 0, "running": set(), "reasons": {},
-                                   "last_forced": float("-inf"), "forced": None, "available": None}
+                                   "last_forced": float("-inf"), "forced": None, "available": None,
+                                   "expiry_warned": None}
             backend.unavailable = None
             if self.managers.get(backend) is not None:
                 backend.credits = self.managers[backend]
             refresher = getattr(backend, "refresher", None)
             if refresher is not None:
                 refresher.keepalive_owner = self
+
+    def threshold_of(self, backend):
+        """The balance below which this account takes no new turn, in its own unit."""
+        if (getattr(backend, "cfg", None) or {}).get("upstream") == "minara":
+            return self.minara_threshold
+        return self.threshold
 
     # -- lifecycle -----------------------------------------------------------
     def alive(self):
@@ -150,6 +458,7 @@ class AccountDispatcher:
         try:
             self.revive_renewed()
             self.release_rate_limited()
+            self.check_expiry()
             for backend, kind in self.due():
                 try:
                     self._executor.submit(self._run, backend, kind)
@@ -187,16 +496,20 @@ class AccountDispatcher:
                     continue
                 manager = self.managers.get(backend)
                 snapshot = getattr(manager, "balance_snapshot", None)
-                if snapshot and "exhausted" not in state["reasons"] and now - state["last_forced"] >= FORCED_CHECK_GAP:
+                if (snapshot and "exhausted" not in state["reasons"] and "auth_dead" not in state["reasons"]
+                        and now - state["last_forced"] >= FORCED_CHECK_GAP):
                     # A local debit crossed the threshold: confirm with the server now.
                     local = console_log.number(snapshot().get("available"), signed=True)
-                    if local is not None and (local <= 0 or local < self.threshold):
+                    if local is not None and (local <= 0 or local < self.threshold_of(backend)):
                         state["next_balance"] = min(state["next_balance"], now)
                         state["last_forced"] = now
-                if self.interval > 0 and now >= state["next_refresh"]:
+                if (getattr(backend, "refresher", None) is not None
+                        and self.interval > 0 and now >= state["next_refresh"]):
                     kind = "refresh"
-                elif (manager is not None and now >= state["next_balance"]
-                      and not ("auth_dead" in state["reasons"] and self.interval > 0)):
+                elif (manager is not None and getattr(manager, "supports_balance", True)
+                      and now >= state["next_balance"]
+                      and not ("auth_dead" in state["reasons"] and self.interval > 0
+                               and state["reasons"]["auth_dead"].get("error") != "token_rejected")):
                     # A signed-out account's balance fetch meets a 401 and renews the session itself (Refresher.call): one
                     # POST /api/refreshtoken a minute, past the backoff of the renewals above. Its balance is checked
                     # again as soon as a renewal brings it back (next_balance is in the past by then).
@@ -254,14 +567,70 @@ class AccountDispatcher:
         elif reason["reason"] == "rate_limited":
             return  # mark_rate_limited says it itself, with the time the account comes back
         elif reason["reason"] == "exhausted":
-            text = "[account] %s исключён: баланс %s < %s" % (
-                label, console_log.amount(reason.get("available"), signed=True), console_log.amount(self.threshold))
+            threshold = self.threshold_of(backend)
+            unit = " кредитов Minara" if (getattr(backend, "cfg", None) or {}).get("upstream") == "minara" else ""
+            text = "[account] %s исключён: баланс %s < %s%s" % (
+                label, console_log.amount(reason.get("available"), signed=True), console_log.amount(threshold), unit)
             journal.emit("account.exhausted", text, "warn", account=tag, available=reason.get("available"),
-                         threshold=self.threshold)
+                         threshold=threshold)
+        elif reason.get("error") == "token_rejected":
+            text = "[account] %s исключён: Minara отклонила токен (истёк или отозван), нужен новый токен" % label
+            journal.emit("account.auth_dead", text, "error", account=tag, error="token_rejected",
+                         status=reason.get("status"))
+        elif reason.get("error") == "token_expired":
+            text = "[account] %s исключён: токен Minara истёк %s, нужен новый токен" % (
+                label, _local_time(reason["expires_at"]))
+            journal.emit("account.auth_dead", text, "error", account=tag, error="token_expired",
+                         expires_at=reason["expires_at"])
         else:
             text = "[account] %s исключён: сессия не продлевается, нужен новый вход" % label
             journal.emit("account.auth_dead", text, "error", account=tag, error=reason.get("error"))
         console_log.write(text)
+
+    def check_expiry(self, backends=None, now=None):
+        """Judge the Minara accounts' Bearer tokens by the expiry written in them; returns the accounts whose token expired.
+
+        An expired token takes its account out of the pool as auth_dead with no request to Minara (it would answer 401),
+        and the account comes back if it gets a token that has not expired. A token with less than three days left is
+        announced in the journal and on the console, at most once a day per account. A token whose expiry cannot be read
+        changes nothing."""
+        now = self.wall() if now is None else now
+        expired, changed, expiring = [], [], []
+        with self._lock:
+            for backend in self.backends if backends is None else backends:
+                state = self.state.get(backend)
+                read = getattr(self.managers.get(backend), "expires_at", None)
+                if state is None or read is None:
+                    continue
+                expiry = read()
+                if type(expiry) not in (int, float) or not math.isfinite(expiry):
+                    expiry = None  # unknown: nothing is judged by it
+                dead = state["reasons"].get("auth_dead")
+                if expiry is not None and now >= expiry:
+                    expired.append(backend)
+                    if dead is None or dead.get("expires_at") != expiry:
+                        if self._set_reason(backend, "auth_dead", {"error": "token_expired", "expires_at": expiry}):
+                            changed.append((backend, backend.unavailable))
+                    continue
+                if dead is not None and dead.get("error") == "token_expired":
+                    # The account has a token that is still valid now: back to the pool, its balance read at once.
+                    state["next_balance"] = min(state["next_balance"], self.clock())
+                    if self._set_reason(backend, "auth_dead", None):
+                        changed.append((backend, backend.unavailable))
+                warned = state["expiry_warned"]
+                if (expiry is not None and expiry - now < minara_accounts.WARN_SECONDS and enabled(backend)
+                        and (warned is None or now - warned >= EXPIRY_WARN_EVERY)):
+                    state["expiry_warned"] = now
+                    expiring.append((backend, expiry))
+        for backend, reason in changed:
+            self._announce(backend, True, reason)
+        for backend, expiry in expiring:
+            text = "[account] %s: токен Minara истекает %s (через %s), нужен новый токен" % (
+                self._tag(backend), _local_time(expiry), _time_left(expiry - now))
+            journal.emit("account.token_expiring", text, "warn", account=account_tag(backend), expires_at=expiry,
+                         days_left=round((expiry - now) / 86400, 2))
+            console_log.write(text)
+        return expired
 
     def refresh(self, backend):
         refresher = backend.refresher
@@ -386,38 +755,99 @@ class AccountDispatcher:
             self._announce(backend, True, reason)
         return bool(released)
 
-    def recheck_exhausted(self):
-        """Before answering 402, confirm excluded balances (a top-up is adopted at once)."""
+    def confirm_minara_token(self, backend):
+        """A chat request of this Minara account was answered 401/403: read /auth/me now (check_balance marks the account
+        token_rejected when it refuses the token too). True when the account is out of the pool afterwards."""
+        if backend not in self.state:
+            return False
+        self.check_balance(backend)
+        return getattr(backend, "unavailable", None) is not None
+
+    def mark_minara_refusal(self, backend, error):
+        """Minara refused a request of this account: 402 takes it out as exhausted, 401/403 as auth_dead (the token was
+        revoked or expired before the date written in it). True when it is out of the pool now, for the caller to move
+        the request. No balance read is needed: the regular one brings the account back once it shows more credits than
+        at the refusal (MinaraAccount.note_refusal), or once its token is accepted again."""
+        if backend not in self.state:
+            return False
+        rejected = getattr(error, "code", None) == "upstream_auth_error"
+        manager = self.managers.get(backend)
+        if not rejected and getattr(manager, "note_refusal", None) is not None:
+            manager.note_refusal()  # the transport did it already; again is harmless and covers another transport
         with self._lock:
-            exhausted = [b for b in self.backends if "exhausted" in self.state[b]["reasons"] and enabled(b)]
-        restored = False
-        for backend in exhausted:
-            if not self.check_balance_now(backend):
-                restored = True
-        return restored
+            state = self.state[backend]
+            if rejected:
+                changed = self._set_reason(backend, "auth_dead", {"error": "token_rejected",
+                                                                  "status": getattr(error, "upstream_status", None)})
+                state["next_balance"] = self.clock() + self._jitter(TOKEN_RECHECK)
+            else:
+                available = state["available"]
+                changed = self._set_reason(backend, "exhausted", {
+                    "available": min(available, 0.0) if isinstance(available, (int, float)) else 0.0,
+                    "threshold": self.threshold_of(backend), "refused": True})
+            reason = backend.unavailable
+        self._announce(backend, changed, reason)
+        return True
+
+    def recheck_exhausted(self, entry=None):
+        """Before answering 402, confirm excluded balances (a top-up is adopted at once).
+
+        Only the accounts of the request's provider are read (`entry`, the model entry: a minara/* request never reads
+        Retool's accounts, nor the reverse), several at once: one after another, 51 spent Minara accounts took 15 s
+        before the 402 could be answered."""
+        minara = (entry or {}).get("upstream") == "minara" if entry is not None else None
+        with self._lock:
+            exhausted = [b for b in self.backends if "exhausted" in self.state[b]["reasons"] and enabled(b)
+                         and (minara is None or ((getattr(b, "cfg", None) or {}).get("upstream") == "minara") == minara)]
+        if not exhausted:
+            return False
+        if len(exhausted) == 1:
+            return not self.check_balance_now(exhausted[0])
+        from io_workers import DaemonIOExecutor
+        pool = DaemonIOExecutor(min(8, len(exhausted)), thread_name_prefix="recheck")
+        try:
+            # every read finishes before the answer (a top-up of any of them is adopted), at once rather than in turn
+            return not all(list(pool.map(self.check_balance_now, exhausted)))
+        finally:
+            pool.shutdown(wait=False)
 
     def check_balance(self, backend):
         """Fetch this account's balance; True when it is confirmed below the threshold."""
         manager = self.managers.get(backend)
         if manager is None:
             return False
+        if backend in self.check_expiry([backend]):
+            # An expired token is never sent: the answer would be a 401 and the balance would stay what it was.
+            with self._lock:
+                state = self.state[backend]
+                state["next_balance"] = self.clock() + self._jitter(3600.0)
+                return "exhausted" in state["reasons"]
         info = manager.get_balance(force_refresh=True)
         available = console_log.number(info.get("available"), signed=True)
         fresh = available is not None and not info.get("error") and not info.get("stale_error")
+        # A Bearer token has no renewal (no refresher): Minara's 401/403 means a new token is needed.
+        rejected = (info.get("error") == "upstream_auth_error" and getattr(backend, "refresher", None) is None
+                    and (getattr(backend, "cfg", None) or {}).get("upstream") == "minara")
         now = self.clock()
         changed = False
         with self._lock:
             state = self.state[backend]
             state["next_balance"] = now + self._jitter(self.balance_interval if fresh and self.balance_interval > 0
+                                                       else TOKEN_RECHECK if rejected
                                                        else 60.0 if not fresh else 3600.0)
+            dead = state["reasons"].get("auth_dead") or {}
+            if rejected and dead.get("error") != "token_rejected":
+                changed = self._set_reason(backend, "auth_dead", {"error": "token_rejected", "status": None})
+            elif fresh and dead.get("error") == "token_rejected":
+                changed = self._set_reason(backend, "auth_dead", None)  # the token is accepted again
             if fresh:
                 state["available"] = available
                 # A balance of 0 buys nothing whatever the threshold (min_account_balance 0 left such an account usable).
-                if available <= 0 or available < self.threshold:
+                if available <= 0 or available < self.threshold_of(backend):
                     changed = self._set_reason(backend, "exhausted",
-                                               {"available": available, "threshold": self.threshold})
+                                               {"available": available, "threshold": self.threshold_of(backend)}) or changed
                 else:
-                    changed = self._set_reason(backend, "exhausted", None)
+                    changed = self._set_reason(backend, "exhausted", None) or changed
             exhausted = "exhausted" in state["reasons"]
             reason = backend.unavailable
         self._announce(backend, changed, reason)

@@ -238,6 +238,40 @@ function poolSummary(pool) {
     routable: live.filter((a) => a.routable && a.enabled !== false).length, reserve: live.filter((a) => a.reserve).length, states };
 }
 
+// What POST /admin/api/accounts answers to several Minara tokens (admin._add_minara_accounts, minara_accounts.plan), by
+// simple marks instead of a JWT: a token that does not start with eyJ is invalid, one with ".expired." has expired, one in
+// state.knownTokens ({token: {account, label}}) is already in the pool, a repeat of an earlier one is a repeat.
+function bulkMinara(state, body) {
+  const known = state.knownTokens || {};
+  const taken = state.pool.map((a) => /^Minara (\d+)$/.exec(a.label || '')).filter(Boolean).map((m) => Number(m[1]));
+  let number = Math.max(0, ...taken);
+  const seen = new Map();
+  const results = body.bearer_tokens.map((raw, index) => {
+    const token = String(raw).trim();
+    const position = index + 1;
+    if (!token.startsWith('eyJ') || /\s/.test(token)) {
+      return { token: position, status: 'invalid', problem: 'format', error: 'a token is printable ASCII without spaces, at most 16384 characters' };
+    }
+    if (seen.has(token)) {
+      const first = seen.get(token);
+      return { token: position, status: 'duplicate', reason: 'same_token', repeat_of: first.position, expires_at: first.expires_at,
+        account: first.account, label: first.label };
+    }
+    if (known[token]) return { token: position, status: 'duplicate', reason: 'same_token', expires_at: NOW + 20 * 86400, ...known[token] };
+    if (token.includes('.expired.')) return { token: position, status: 'expired', expires_at: NOW - 86400 };
+    number += 1;
+    const label = body.label ? (body.bearer_tokens.length === 1 ? body.label : `${body.label} ${number}`) : `Minara ${number}`;
+    const added = { ...poolAccount(`m-new-${number}`, label, 0), upstream: 'minara', balance_unit: 'minara_credits',
+      balance_supported: false, renewal_supported: false, expires_at: NOW + 30 * 86400, available: null, monthly_allocation: null,
+      used_month: null, reset_date: null, last_renewed_at: null, last_balance_at: null, pending: 'added', state: 'pending', routable: false };
+    state.pool.push(added);
+    seen.set(token, { position, account: added.account, label, expires_at: added.expires_at });
+    return { token: position, status: 'added', account: added.account, label, expires_at: added.expires_at };
+  });
+  const added = results.filter((item) => item.status === 'added').length;
+  return { results, added, skipped: results.length - added, restart_required: added > 0 };
+}
+
 // Mirrors models.replaces_xhigh: a Claude route whose levels the client can pick has no xhigh, and the relay serves it at another level.
 const withXhighFlag = (entry) => ({ ...entry, xhigh_replaced: entry.provider === 'anthropic'
   && entry.reasoning_effort_control === 'selectable' && !entry.reasoning_effort_levels.includes('xhigh') });
@@ -317,6 +351,7 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     if (path === '/admin/api/accounts' && method === 'POST') {
       const body = request.postDataJSON();
       state.accountRequests.push({ method, path, body, headers });
+      if (Array.isArray(body.bearer_tokens)) return reply(200, bulkMinara(state, body));
       const added = { ...poolAccount('acc-new', body.label || '', 0), available: null, monthly_allocation: null, used_month: null,
         reset_date: null, last_renewed_at: null, last_balance_at: null, pending: 'added', state: 'pending', routable: false };
       state.pool.push(added);

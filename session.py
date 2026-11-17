@@ -90,7 +90,8 @@ class Backend:
         self.cfg = cfg
         self._http_post = http_post or self._default_post
         self._ws_connect = ws_connect or websockets.connect
-        self.refresher = refresher if refresher is not None else Refresher(cfg)
+        self.refresher = (None if cfg.get("upstream") == "minara" else
+                          refresher if refresher is not None else Refresher(cfg))
 
     # -- HTTP ---------------------------------------------------------------
     def headers(self):
@@ -277,6 +278,14 @@ class _SocketReader:
             pass
 
 
+def _without_attribution(head):
+    """A head without Claude Code's attribution line: its fingerprint changes with every conversation and after a
+    compaction, and neither Anthropic (it consumes the line) nor Minara (the relay leaves it out) caches it, so a change
+    of it alone moves no cached prefix (cache.head_changed fired after every Claude Code compaction)."""
+    first, separator, rest = head.partition("\n")
+    return rest if separator and first.startswith("x-anthropic-billing-header:") else head
+
+
 class RelaySession:
     """One WebSocket turn stream bound to a single Retool thread."""
 
@@ -316,7 +325,7 @@ class RelaySession:
         """Direct transport: cacheable head, chunked history and native client tools."""
         prior = self._direct or {}
         if head:
-            if self._cached_head and self._cached_head != head:
+            if self._cached_head and _without_attribution(self._cached_head) != _without_attribution(head):
                 # Head churn invalidates the cached prefix, so every history
                 # breakpoint misses and the whole prompt is written again.
                 journal.emit("cache.head_changed", "Head изменился — кэш префикса будет перезаписан", "info",
@@ -496,7 +505,12 @@ class RelaySession:
         """Yield normalised provider events, cleaning its poller on every exit."""
         if self.cfg.get("transport") == "direct":
             args = self._direct or {}
-            async with contextlib.aclosing(direct.iter_events(
+            if self.cfg.get("upstream") == "minara":
+                import minara
+                transport = minara
+            else:
+                transport = direct
+            async with contextlib.aclosing(transport.iter_events(
                     self.cfg, self, model_provider, prompt, args.get("head"), args.get("tools"),
                     args.get("tool_choice"), args.get("max_tokens"), args.get("chunks"))) as events:
                 async for event in events:
@@ -909,15 +923,7 @@ class SessionPool:
             if custom_ws == getattr(websockets, "connect", None):
                 custom_ws = None
             for acc in self.cfg["accounts"]:
-                acc_cfg = dict(self.cfg)
-                if acc.get("base", self.cfg.get("base", "")).rstrip("/") != self.cfg.get("base", "").rstrip("/"):
-                    for resource_key in model_catalog.PROVIDER_RESOURCE_KEY.values():
-                        if resource_key not in acc:
-                            acc_cfg.pop(resource_key, None)
-                acc_cfg.update(acc)
-                # Pool controls belong to the account record, never inherited from the root.
-                acc_cfg.update(enabled=acc.get("enabled", True), priority=acc.get("priority", 0),
-                               label=acc.get("label", ""), provider_access=acc.get('provider_access', {}))
+                acc_cfg = model_catalog.account_config(self.cfg, acc)
                 acc_cfg["cookie_values"] = self.cfg.get("cookie_values", [])
                 acc_cfg["_account_ref"] = acc
                 acc_cfg["_disk_auth"] = (acc.get("cookie"), acc.get("xsrf"))
@@ -1225,11 +1231,15 @@ class SessionPool:
             # The hourly limit clears by itself: say when, instead of a 402/503 that implies a manual fix.
             wait = min(max(0.0, r.get("until_at", 0.0) - time.time()) for r in limited)
             return apierr.accounts_rate_limited(wait, len(limited), len(backends))
+        minara = all((getattr(b, "cfg", None) or {}).get("upstream") == "minara" for b in backends)
         exhausted = [(account_tag(b, UNNAMED), r.get("available"))
                      for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
         if exhausted:
             threshold = next(r.get("threshold") for r in reasons if r.get("reason") == "exhausted")
-            return apierr.insufficient_credits(threshold or 0, exhausted)
+            return apierr.insufficient_credits(threshold or 0, exhausted, "Minara" if minara else "Retool")
+        if minara:
+            return apierr.service_unavailable("no usable Minara account: their tokens expired or were rejected; "
+                                              "add new tokens (admin, Accounts) and restart the relay")
         return apierr.service_unavailable("no usable account: Retool sessions need a new sign-in")
 
     def _on_shared_session(self, isolated=False, context_scope=None):
@@ -1283,8 +1293,11 @@ class SessionPool:
             return "reserve", spare
         # A signed-out account is still better than no account: its 401 makes the
         # refresher re-read config.json, so a fresh sign-in is adopted at once.
+        # A Bearer token (Minara) has no refresher and never changes before a restart: an expired or rejected one would
+        # only be sent to be refused, once per dead account per request.
         signed_out = [backend for backend in routable if backend not in exclude and account_enabled(backend)
-                      and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"]
+                      and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"
+                      and (getattr(backend, "cfg", None) or {}).get("upstream") != "minara"]
         if signed_out:
             return "signed_out", signed_out
         raise self._unusable_error(routable)
@@ -1685,7 +1698,8 @@ class SessionPool:
                         # or starts cold without touching its file, and a cancelled request leaves nothing behind.
                         restored = await self._restore_state(key, session)
                         self._conversations[key] = session
-                        journal.emit("session.create", "Новый диалог — новый тред Retool", "info",
+                        journal.emit("session.create", "Новый диалог — новый тред %s" % (
+                                         "Minara" if backend.cfg.get("upstream") == "minara" else "Retool"), "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),
                                      account=account_tag(backend), pool=len(self._conversations))
                         self._report_restored(restored)

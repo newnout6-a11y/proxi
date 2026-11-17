@@ -6,7 +6,9 @@ import collections
 import copy
 import datetime
 import fnmatch
+import re
 import console_log
+import minara_catalog as minara_routes
 
 from apierr import ApiError, bad_request, not_found, service_unavailable
 
@@ -342,7 +344,51 @@ def _access_hint(entry, cfg):
             "when there is no accounts[])." % declared)
 
 
+_MINARA_MODELS = {}
+
+
+def build_minara_catalog(configs):
+    """Build routes without changing the live registry (safe before config persistence).
+
+    Every Minara account serves the models minara_models.json publishes, or exactly its own minara_models list
+    (minara_catalog). The routes are minara/<name>; no Retool model is ever among them."""
+    try:
+        routes = minara_routes.build(configs)
+    except ValueError as exc:
+        raise service_unavailable(str(exc)) from None
+    for entry in routes.values():
+        # The window and output ceiling are the model's own: the relay's audited catalog has them for the models Retool
+        # serves too (minara/claude-opus-5-5 is claude-opus-5-5). The others stay unknown.
+        same = _BY_ID.get(_canonical(entry['id'][len('minara/'):]))
+        if same is not None:
+            for key in ('context', 'max_output'):
+                if entry.get(key) is None and same.get(key) is not None:
+                    entry[key] = same[key]
+    return routes
+
+
+def configure_minara(configs):
+    """Install explicitly configured routes; no guessed provider-wide capabilities."""
+    routes = build_minara_catalog(configs)
+    _MINARA_MODELS.clear()
+    _MINARA_MODELS.update(routes)
+
+
+def _minara_reason(entry, cfg):
+    if entry.get('upstream') == 'minara':
+        if cfg.get('upstream', 'retool') != 'minara':
+            return 'route requires a Minara account'
+        return (None if entry['upstream_model'] in minara_routes.served(cfg)
+                else 'model is not configured on this Minara account')
+    if cfg.get('upstream', 'retool') == 'minara':
+        return 'route requires a Retool account'
+    return None
+
+
 def route_block_reason(entry, cfg):
+    reason = _minara_reason(entry, cfg)
+    if reason or entry.get('upstream') == 'minara':
+        return reason
     name = entry['id']
     if entry['provider'] == 'google' and cfg.get('google_provider_resource_name') == '__managed__':
         return 'Google requires a real BYOK resource; managed Google is not supported.'
@@ -369,6 +415,8 @@ def route_block_reason(entry, cfg):
 
 def resource_block_reason(entry, cfg):
     """Why this account has no provider resource for the model, or None."""
+    if entry.get('upstream') == 'minara':
+        return _minara_reason(entry, cfg) or (None if cfg.get('bearer_token') else 'Minara token is not configured')
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
     if not key:
         return "provider '%s' is not routed" % entry['provider']
@@ -392,8 +440,28 @@ def require_route(entry, cfg):
     if reason:
         raise service_unavailable(f"model '{entry['id']}' is unavailable on this account: {reason}")
 
-def catalog():
-    return CATALOG
+def minara_catalog(cfg=None):
+    """A runtime's detached registry; only standalone tests use the explicit global helper."""
+    if cfg is None:
+        return _MINARA_MODELS
+    return cfg.get('_minara_models', _MINARA_MODELS)
+
+
+def minara_entry(name, cfg=None):
+    """The Minara route a client name means: its published minara/<name>, or the older minara/<upstream id>."""
+    routes = minara_catalog(cfg)
+    if name in routes:
+        return routes[name]
+    if isinstance(name, str) and name.startswith('minara/'):
+        upstream = name[len('minara/'):]
+        for entry in routes.values():
+            if entry.get('upstream_model') == upstream:
+                return entry
+    return None
+
+
+def catalog(cfg=None):
+    return CATALOG + list(minara_catalog(cfg).values())
 
 
 def account_config(root, record):
@@ -407,6 +475,14 @@ def account_config(root, record):
         for key in PROVIDER_RESOURCE_KEY.values():
             if key not in record:
                 merged.pop(key, None)
+    # Credentials belong to one upstream account, never to another record.
+    for key in ('bearer_token', 'bearer_token_env', 'minara_models'):
+        merged.pop(key, None)
+    if record.get('upstream', 'retool') == 'minara':
+        for key in ('cookie', 'xsrf', 'page_uuid', *PROVIDER_RESOURCE_KEY.values()):
+            merged.pop(key, None)
+        merged['base'] = record.get('base', 'https://api.minara.ai/v1')
+    merged['upstream'] = record.get('upstream', 'retool')
     merged.update(record)
     merged.update(enabled=record.get('enabled', True), priority=record.get('priority', 0),
                   label=record.get('label', ''), provider_access=record.get('provider_access', {}))
@@ -477,6 +553,8 @@ def catalog_visibility(entry, cfg, backends=None):
         return True, None
     if not pool_configured(pool):
         return True, None  # Unconfigured setup still exposes metadata; requests explain missing resources.
+    if entry.get('upstream') == 'minara':
+        return (True, None) if eligible else (False, 'no enabled Minara account')
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
     if key and any(item.get(key) for item in eligible):
         return True, None
@@ -491,7 +569,7 @@ def default_model_warning(cfg, backends=None):
     """Why requests without 'model' would be refused, or None. A hidden default gives no other hint."""
     name = cfg.get('model')
     try:
-        entry = resolve(name, strict=cfg.get('strict_models', True))[0]
+        entry = resolve(name, strict=cfg.get('strict_models', True), cfg=cfg)[0]
     except ApiError:
         return "default model '%s' is not in the catalog; requests without 'model' are refused" % name
     published, reason = catalog_visibility(entry, cfg, backends)
@@ -500,25 +578,39 @@ def default_model_warning(cfg, backends=None):
     return "default model '%s' is not published (%s); requests without 'model' are refused" % (entry['id'], reason)
 
 
+def _version_of(ident):
+    """The version numbers of a Claude id (claude-opus-5-5 -> (5, 5), claude-haiku-4-5-20251001 -> (4, 5)), for order."""
+    numbers = re.findall(r"(?<![0-9])([0-9]{1,2})(?![0-9])", ident.removeprefix('minara/'))
+    return tuple(int(number) for number in numbers[:2])
+
+
 def desktop_metadata(entry, entries):
     """Additional Anthropic Desktop discovery fields; IDs stay canonical.
 
     Desktop reads supports_1m, or max_input_tokens >= 1M, as "1M confirmed" and adds a separate 1M
     picker entry, so both follow the verified route input limit and never the model's public window.
     """
-    result = {'display_name': entry['label'], 'description': 'Retool relay: ' + entry['label']}
+    result = {'display_name': entry['label'], 'description':
+              ('Minara relay: ' if entry.get('upstream') == 'minara' else 'Retool relay: ') + entry['label']}
     limit = entry.get('route_input_tokens')
     if limit:
         result['max_input_tokens'] = limit
         if limit >= 1000000:
             result['supports_1m'] = True
     if entry['provider'] == 'anthropic':
-        family = entry['id'].removeprefix('claude-').split('-', 1)[0]
+        # A Minara Claude (minara/claude-opus-5-5) is of the same family as Retool's. The family has one default, its first
+        # row: Retool's where the relay has both, Minara's in a Minara-only relay.
+        family = entry['id'].removeprefix('minara/').removeprefix('claude-').split('-', 1)[0]
         if family not in {'opus', 'sonnet', 'haiku', 'fable', 'mythos'}:  # Desktop's documented tier enum
             return result
         result['anthropic_family_tier'] = family
-        first = next(item['id'] for item in entries
-                     if item['provider'] == 'anthropic' and item['id'].startswith('claude-' + family + '-'))
+        family_rows = [item for item in entries if item['provider'] == 'anthropic'
+                       and item['id'].removeprefix('minara/').startswith('claude-' + family + '-')]
+        retool_rows = [item for item in family_rows if item.get('upstream') != 'minara']
+        # Retool's catalog is in order, newest first; Minara's is sorted by name, oldest first (Opus 4.1 at $15/$75 was
+        # the family default of a Minara-only relay): there the newest version leads.
+        first = (retool_rows[0]['id'] if retool_rows else
+                 max((item['id'] for item in family_rows), key=_version_of, default=entry['id']))
         result['is_family_default'] = entry['id'] == first
     return result
 
@@ -615,6 +707,13 @@ def codex_catalog(entries=None, snapshot=None):
         overrides = _codex_overrides(snapshot, model)
         efforts = entry.get('reasoning_effort_levels', [])
         default = entry.get('default_reasoning_effort')
+        natural = default or entry.get('natural_reasoning_effort')
+        if entry.get('upstream') == 'minara' and natural in EFFORT_ORDER:
+            # Codex always sends its default level: for a Minara model it is the level that reasons as the model does with
+            # none sent (the effort study's "natural" one), listed beside the levels that do something else. Offered
+            # alone, the lists' first level was the default: max for Opus 5.5 and GPT-6.1 Sol, none for Sonnet 5.5.
+            efforts = sorted(set(efforts) | {natural}, key=EFFORT_ORDER.index)
+            default = natural
         if default not in efforts:
             default = 'medium' if 'medium' in efforts else (efforts[0] if efforts else None)
         levels = [{'effort': effort, 'description': effort.title() + ' reasoning effort'} for effort in efforts]
@@ -626,7 +725,8 @@ def codex_catalog(entries=None, snapshot=None):
             levels.append({'effort': 'ultra', 'description': 'Maximum reasoning with automatic task delegation'})
         result.append({
             'slug': entry['id'], 'display_name': entry.get('label', entry['id']),
-            'description': 'Retool relay: ' + entry.get('label', entry['id']),
+            'description': ('Minara relay: ' if entry.get('upstream') == 'minara' else 'Retool relay: ')
+                           + entry.get('label', entry['id']),
             'default_reasoning_level': default,
             'supported_reasoning_levels': levels,
             'shell_type': 'unified_exec', 'visibility': 'list', 'supported_in_api': True,
@@ -672,6 +772,10 @@ def substitute_for(name):
     `name` is the base of the client's name (no @profile, no effort suffix). Only a model of an unsupported route has a
     substitute (SUBSTITUTES): a model some account can serve is never replaced."""
     named = _canonical(name)
+    if named.lower().startswith('minara/'):
+        # A Minara model is served by Minara or refused: "minara/" is no vendor prefix to strip (minara/gpt-6-luna went to
+        # Retool's gpt-6.1-terra as Retool's gpt-6-luna would).
+        return None
     if '/' in named and named not in _BY_ID:
         named = _canonical(named.split('/', 1)[1])  # a provider prefix ("openai/gpt-6-luna") is read as resolve() reads it
     served = SUBSTITUTES.get(named)
@@ -695,7 +799,7 @@ def _profile_pattern():
     return prompt_policy.PROFILE_NAME
 
 
-def _names_a_catalog_model(base):
+def _names_a_catalog_model(base, cfg=None):
     """Whether `base`, what a client name has before its '@', is a catalog id or alias, as resolve() reads names.
 
     An effort level written after it is ignored here: claude-opus-5-5#high@mine is a malformed virtual name (the
@@ -707,10 +811,10 @@ def _names_a_catalog_model(base):
                 base = head.strip()
             break
     name = _canonical(base)
-    return name in _BY_ID or ('/' in name and _canonical(name.split('/', 1)[1]) in _BY_ID)
+    return minara_entry(name, cfg) is not None or name in _BY_ID or (not name.startswith('minara/') and '/' in name and _canonical(name.split('/', 1)[1]) in _BY_ID)
 
 
-def parse_model_name(name):
+def parse_model_name(name, cfg=None):
     """Take a client model name apart: <base>[@<profile>][#effort | :effort] -> ModelName(base, profile, effort).
 
     The effort follows the profile (claude-opus-5-5@mine#high) and is cut as it always was: at the first
@@ -723,6 +827,28 @@ def parse_model_name(name):
     style id) is one unknown model, which strict_models refuses and strict_models: false passes on as it is.
     """
     original = (name or '').strip()
+    if original.lower().endswith('[1m]'):
+        # Claude Code's 1M-context marker (minara/claude-fable-5-2[1m], a Desktop row with supports1m): it takes the marker
+        # off before an API request, and a client that passes the picker's name on still means the same model.
+        original = original[:-len('[1m]')].rstrip()
+    if minara_entry(original, cfg) is not None:
+        return ModelName(original, None, None)
+    if '#' in original or '@' in original:
+        base = original.split('@', 1)[0].split('#', 1)[0]
+        if minara_entry(base, cfg) is not None and ':' in base:
+            # Shield provider ID colons from the legacy effort delimiter below.
+            rest = original[len(base):]
+            profile = None
+            effort = None
+            if '#' in rest:
+                rest, effort = rest.rsplit('#', 1)
+                if effort not in EFFORT_ORDER:
+                    raise bad_request('invalid reasoning effort suffix', param='model')
+            if rest.startswith('@'):
+                profile = rest[1:]
+                if not _profile_pattern().fullmatch(profile):
+                    raise bad_request('invalid model profile', param='model')
+            return ModelName(base, profile, effort)
     shown = original[:100]
     text, effort = original, None
     for separator in ('#', ':'):
@@ -736,7 +862,7 @@ def parse_model_name(name):
     if not at:
         return ModelName(text, None, effort)
     base, profile = base.strip(), profile.strip()
-    if base and not _names_a_catalog_model(base):
+    if base and not _names_a_catalog_model(base, cfg):
         return ModelName(text, None, effort)
     if VIRTUAL_SEPARATOR in profile:
         raise bad_request("model '%s' has more than one '@'; write <model>@<profile>[#effort]" % shown, param='model')
@@ -762,19 +888,19 @@ def parse_model_name(name):
     return ModelName(base, profile, effort)
 
 
-def split_virtual(name):
+def split_virtual(name, cfg=None):
     """(base, profile) of <model>@<profile>[#effort]; the profile is None for a plain name, the effort is dropped."""
-    parsed = parse_model_name(name)
+    parsed = parse_model_name(name, cfg)
     return parsed.base, parsed.profile
 
 
-def canonical_name(name):
+def canonical_name(name, cfg=None):
     """The catalog id of a client model name, its @profile kept: 'claude-opus@mine#high' -> 'claude-opus-5-5@mine'.
 
     ApiError for an unknown model, as resolve(); the effort suffix is dropped.
     """
-    parsed = parse_model_name(name)
-    entry = resolve(parsed.base)[0]
+    parsed = parse_model_name(name, cfg)
+    entry = resolve(parsed.base, cfg=cfg)[0]
     return entry['id'] + (VIRTUAL_SEPARATOR + parsed.profile if parsed.profile else '')
 
 
@@ -848,8 +974,16 @@ def ignored_effort_controls(data, entry):
 
 def effective_effort(entry, effort=None, configured=None, xhigh_as=None):
     """A global default is a preference; explicit client controls were validated by resolve."""
+    if (effort is None and entry.get("upstream") == "minara" and entry.get("reasoning", True)
+            and (not configured or str(configured).lower() == "auto")):
+        # "auto" is the model's own default on Minara: nothing is sent. Sending medium switched thinking on for models
+        # that do not think unless asked (Claude 4.x, Opus 4.5 at default: 0 reasoning tokens in the effort study).
+        # A model whose own default lands on a channel that drops the cache marks names the level to send instead.
+        return entry.get("default_reasoning_effort")
     if effort is not None or not configured or not entry.get("reasoning", True):
         return effort
+    if entry.get("reasoning_effort_control") == "mapped" and isinstance(configured, str):
+        return (entry.get("effort_map") or {}).get(configured.lower())
     configured = configured.lower() if isinstance(configured, str) else configured
     if configured != "auto" and configured not in EFFORT_ORDER:
         raise bad_request("invalid configured reasoning effort", param="reasoning_effort")
@@ -872,7 +1006,7 @@ XHIGH_REPLACEMENTS = ("high", "max")
 
 def replaces_xhigh(entry):
     """True when xhigh is not an error on this route but another level: a Claude route whose levels the client can pick."""
-    return (entry.get('provider') == 'anthropic' and entry.get('reasoning_effort_control') == 'selectable'
+    return (entry.get('upstream') != 'minara' and entry.get('provider') == 'anthropic' and entry.get('reasoning_effort_control') == 'selectable'
             and 'xhigh' not in (entry.get('reasoning_effort_levels') or ()))
 
 
@@ -896,7 +1030,7 @@ def _setting_hint(effort, allowed):
     return '. ' + enable + 'use %s instead (the lowest level above it, or the top of this model)' % nearest
 
 
-def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False, xhigh_as=None):
+def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, allow_downgrade=False, xhigh_as=None, cfg=None):
     """Resolve exactly; explicit compatibility permits known-level mapping.
 
     Compatibility mapping is opt-in. Clients copy one effort across models, so e.g. xhigh reaches
@@ -919,8 +1053,8 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
     nearest level the substitute takes, when it lacks one (gpt-6-luna and gpt-6.1-terra take the same levels).
     """
     entry, level = _resolve_requested(model, effort, strict=strict, default_model=default_model,
-                                      allow_downgrade=allow_downgrade, xhigh_as=xhigh_as)
-    served = substitute_for(entry['id'])
+                                      allow_downgrade=allow_downgrade, xhigh_as=xhigh_as, cfg=cfg)
+    served = None if entry.get('upstream') == 'minara' else substitute_for(entry['id'])
     if served:
         entry = _BY_ID[served]
         levels = entry.get('reasoning_effort_levels') or []
@@ -929,15 +1063,15 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
     return entry, level
 
 
-def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade, xhigh_as=None):
-    parsed = parse_model_name(model or default_model)
+def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade, xhigh_as=None, cfg=None):
+    parsed = parse_model_name(model or default_model, cfg)
     extracted_effort = effort if effort is not None else parsed.effort
     base_name = parsed.base
     if xhigh_as and isinstance(extracted_effort, str) and extracted_effort.lower() == 'xhigh':
-        entry, _ = resolve(base_name, None, strict=strict, default_model=default_model)
+        entry, _ = resolve(base_name, None, strict=strict, default_model=default_model, cfg=cfg)
         extracted_effort = xhigh_replacement(entry, xhigh_as) or extracted_effort
     try:
-        return resolve(base_name, extracted_effort, strict=strict, default_model=default_model)
+        return resolve(base_name, extracted_effort, strict=strict, default_model=default_model, cfg=cfg)
     except ApiError as error:
         if not allow_downgrade:
             raise
@@ -945,7 +1079,7 @@ def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade,
             raise
         if extracted_effort is None or str(extracted_effort).lower() not in EFFORT_ORDER:
             raise  # not a level any provider defines: surface the 400, never guess
-        entry, _ = resolve(base_name, None, strict=strict, default_model=default_model)
+        entry, _ = resolve(base_name, None, strict=strict, default_model=default_model, cfg=cfg)
         levels = entry.get("reasoning_effort_levels") or []
         if not levels or not entry.get("reasoning", True):
             console_log.write("[effort] %s -> None (reasoning not supported) for %s" % (extracted_effort, entry["id"]))
@@ -955,14 +1089,19 @@ def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade,
         return entry, clamped
 
 
-def resolve(model, effort=None, *, strict=True, default_model=None):
-    parsed = parse_model_name(model or default_model)
+def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
+    parsed = parse_model_name(model or default_model, cfg)
     if effort is None:
         effort = parsed.effort
     name = _canonical(parsed.base)
     if not name:
         raise bad_request("'model' is required", param='model')
-    entry = _BY_ID.get(name)
+    entry = minara_entry(name, cfg) or _BY_ID.get(name)
+    if entry is None and name.lower().startswith("minara/"):
+        # "Minara/gpt-6.1-sol" is no vendor prefix either: it is refused, never resolved to Retool's gpt-6.1-sol.
+        entry = minara_entry("minara/" + name[len("minara/"):], cfg)
+        if entry is None:
+            raise not_found(f"unknown Minara model '{name}'; see GET /v1/models (no Minara account serves it)")
     if entry is None and '/' in name:
         stripped = _canonical(name.split('/', 1)[1])
         if stripped in _BY_ID:
@@ -976,6 +1115,20 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
     if effort is not None:
         if not entry.get('reasoning', True) and isinstance(effort, str) and effort.lower() == 'none':
             return entry, None  # An explicit disabled control is harmless; never forward it.
+        if entry.get('reasoning_effort_control') == 'mapped':
+            # A Minara model whose levels the effort study grouped into tiers: every level is accepted and sent as the
+            # level of its tier (None: nothing is sent), so a client that sends one level to every model never fails.
+            level = effort.lower() if isinstance(effort, str) else None
+            if level in EFFORT_ORDER:
+                return entry, (entry.get('effort_map') or {}).get(level)
+            raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
+                              param='reasoning_effort')
+        if entry.get('reasoning_effort_control') == 'passthrough':
+            # A Minara model that reasons, whose levels were not measured: the level goes to upstream as asked.
+            if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:
+                return entry, effort.lower()
+            raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
+                              param='reasoning_effort')
         if entry.get('reasoning_effort_control') == 'accepted-ignored':
             # The route takes any level some provider defines and changes nothing: accept it, forward nothing.
             if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:
@@ -996,6 +1149,9 @@ def resolve(model, effort=None, *, strict=True, default_model=None):
 
 
 def provider_resource(cfg, entry):
+    if entry.get('upstream') == 'minara':
+        require_route(entry, cfg)
+        return None
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
     if not key:
         raise service_unavailable(f"provider '{entry['provider']}' is not routed")

@@ -25,6 +25,18 @@ def test_relative_links_in_the_docs_point_at_existing_files():
     assert missing == []
 
 
+def test_the_readme_names_every_module_of_the_relay():
+    # "Модули по слоям" is the map of the flat set of modules in the root: a module it leaves out cannot be found from it
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert [path.name for path in sorted(ROOT.glob("*.py")) if f"`{path.name}`" not in readme] == []
+
+
+def test_the_docs_index_lists_every_guide():
+    index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    guides = [path.name for path in sorted((ROOT / "docs").glob("*.md")) if path.name != "README.md"]
+    assert [name for name in guides if f"]({name})" not in index] == []
+
+
 def load_with(tmp_path, monkeypatch, **settings):
     path = tmp_path / "config.json"
     saved = {"base": "https://tenant.invalid", "page_uuid": "p0", "ua": "ua", "cookie": "accessToken=fake-token",

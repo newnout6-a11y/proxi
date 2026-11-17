@@ -207,3 +207,11 @@ def test_a_relay_key_of_32_characters_or_more_needs_no_warning(multi):
     runtime = multi.runner_.runtime
     runtime.cfg["relay_api_key"] = "x" * 32
     assert proxy.startup_warnings(runtime) == []
+
+def test_minara_balance_unavailable_is_not_falsely_degraded(tmp_path):
+    cfg = runtime_config(tmp_path)
+    cfg.update(model='minara/openai/test', reasoning_effort='auto')
+    lines = proxy.banner_lines(cfg, {'available': None, 'error': None,
+        'accounts': [{'upstream': 'minara', 'balance_supported': False}]})
+    assert not any('DEGRADED' in line for line in lines)
+    assert any('configured routing only' in line for line in lines)

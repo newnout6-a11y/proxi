@@ -14,3 +14,6 @@ pytest-xdist>=3.6,<4
 # comments, quoting and unrelated profiles are preserved) and its tests, so the
 # relay runs without it. It stays in this file for the same reason as pytest.
 ruamel.yaml>=0.18.6,<0.19
+
+# Browser TLS impersonation required by the optional Minara upstream.
+curl_cffi==0.17.0

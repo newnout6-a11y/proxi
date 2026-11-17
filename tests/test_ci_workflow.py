@@ -24,6 +24,15 @@ def test_admin_ui_job_rebuilds_dist_checks_drift_and_runs_the_browser_gates_in_o
     assert "exit 1" in drift  # any change under dist (modified, deleted or new hashed assets) fails the job
 
 
+def test_ci_runs_every_unit_test_file_of_the_admin_ui():
+    # the step names its files one by one (a glob is not expanded by node on Windows), so a new file has to be added to it
+    workflow = YAML(typ="safe").load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    runs = [step.get("run", "") for step in workflow["jobs"]["tests"]["steps"]]
+    listed = {word for run in runs if "node --test" in run for word in run.split() if word.startswith("web/tests/")}
+    on_disk = {path.relative_to(ROOT).as_posix() for path in (ROOT / "web" / "tests").glob("*.test.mjs")}
+    assert on_disk and listed == on_disk
+
+
 def test_design_gate_is_an_npm_script_and_the_docs_install_from_the_lockfile():
     package = json.loads((ROOT / "web" / "package.json").read_text(encoding="utf-8"))
     assert package["scripts"]["test:design"] == "node scripts/accuracy_report.mjs"

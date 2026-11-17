@@ -787,3 +787,15 @@ def test_write_backed_up_keeps_the_signature_and_result_other_scripts_import(tmp
     backup = write_backed_up(str(path), b'old', b'new', str(tmp_path / 'backups'))
     assert isinstance(backup, Path) and backup.read_bytes() == b'old' and path.read_bytes() == b'new'
     assert backup.parent == (tmp_path / 'backups').resolve()
+
+
+def test_opencode_takes_images_where_the_model_sees_and_no_variant_is_switched_off():
+    # OpenCode 1.19 takes image input from modalities alone (end-to-end run of 2026-11-10: no relay model took a pasted
+    # image); a {"disabled": true} variant is never written, since OpenCode Desktop 2.x sends it as a request parameter.
+    before = source()
+    entries = [models.resolve(name)[0] for name in ('claude-opus-5-5', 'gpt-4.1')]
+    catalog = update_document(before, entries)['provider']['retool-relay']['models']
+    opus = catalog['claude-opus-5-5']
+    assert opus['modalities'] == {'input': ['text', 'image'] if opus['attachment'] else ['text'], 'output': ['text']}
+    assert catalog['gpt-4.1']['modalities']['output'] == ['text']
+    assert not any(value.get('disabled') for item in catalog.values() for value in item['variants'].values())
