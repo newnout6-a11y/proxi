@@ -153,3 +153,29 @@ def test_runner_measures_from_live_status_instead_of_buffer_flush(tmp_path, monk
     assert any(e["type"] == "thinking_status" for e in events)
     assert [f["ms"] for k, f in logs if k == "upstream.thinking_start"] == [6000]
     assert [f["thinking_ms"] for k, f in logs if k == "upstream.thinking_end"] == [280000]
+
+
+class ResponsesWriter:
+    def __init__(self):
+        self.events = []
+
+    def event(self, name, payload):
+        self.events.append((name, payload))
+
+    def done(self):
+        self.events.append(("done", None))
+
+
+def test_responses_adapter_streams_early_status_and_heartbeats_without_storing_thinking():
+    writer = ResponsesWriter()
+    adapter = adapters.ResponsesAdapter(parsed(), writer)
+    adapter.begin()
+    adapter.feed({"type": "thinking_status", "source": "relay"})
+    adapter.feed({"type": "thinking_start"})  # must not duplicate the placeholder
+    adapter.feed({"type": "thinking_heartbeat", "elapsed": 6.5})
+    adapter.feed({"type": "text", "delta": "done"})
+    final = adapter.end("stop")
+    deltas = [p["delta"] for name, p in writer.events if name == "response.reasoning_summary_text.delta"]
+    assert deltas == ["Модель думает…\n", "⏳ 6 с…\n"]
+    assert adapter.thinking == ""
+    assert final["output_text"] == "done"

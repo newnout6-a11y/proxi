@@ -122,6 +122,9 @@ class _Base:
         elif kind == "thinking_status":
             if self.parsed.show_thinking:
                 self._think_status()
+        elif kind == "thinking_heartbeat":
+            if self.parsed.show_thinking:
+                self._think_heartbeat(event.get("elapsed"))
         elif kind == "thinking_signature":
             if self.parsed.show_thinking:
                 self._signature(event.get("signature", ""))
@@ -224,6 +227,9 @@ class _Base:
         pass
 
     def _think_status(self):
+        pass
+
+    def _think_heartbeat(self, elapsed):
         pass
 
     def _signature(self, signature):
@@ -472,6 +478,7 @@ class ResponsesAdapter(_Base):
         self._frozen = {}
         self._bases = {}
         self._text_end = self._thinking_end = 0
+        self._thinking_indicated = False
         # Whether the reply ended because the client left or the turn timed out (f3, G2.1).
         self._cut_off = False
         self._tool_definitions = {
@@ -640,8 +647,21 @@ class ResponsesAdapter(_Base):
 
     def _think_start(self):
         label = getattr(self.parsed, "thinking_placeholder", "")
-        if label and self.writer:
+        if label and self.writer and not self._thinking_indicated and not self.thinking:
             self._think(label)
+            self._thinking_indicated = True
+
+    def _think_status(self):
+        self._think_start()
+
+    def _think_heartbeat(self, elapsed):
+        label = getattr(self.parsed, "thinking_placeholder", "")
+        if label and self.writer and not self.thinking and type(elapsed) in (int, float) and elapsed >= 4:
+            self._think_start()
+            self._think("⏳ %d с…\n" % int(elapsed))
+
+    def _usage_boundary(self):
+        self._thinking_indicated = False
 
     @staticmethod
     def _streams_arguments(call):
@@ -971,7 +991,7 @@ class AnthropicAdapter(_Base):
                           **self._usage_extras(), **self._price_usage(), "estimated": True}}
 
 
-_THINKING_EVENTS = ('thinking', 'thinking_start', 'thinking_status', 'thinking_signature')
+_THINKING_EVENTS = ('thinking', 'thinking_start', 'thinking_status', 'thinking_heartbeat', 'thinking_signature')
 
 
 class StructuredOutputAdapter:

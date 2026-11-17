@@ -117,7 +117,8 @@ BUILTIN_PROFILES = {"passthrough": {"description": "the client's system prompt, 
 # Service requests keep their own instructions unless the user disables protection (plan I6).
 PROTECTED_RULES = (
     {"name": "protected: service requests", "if": {"purpose": ["session-title", "auto-mode-check",
-                                                               "connection-probe", "client-service"]},
+                                                               "connection-probe", "prompt-suggestion",
+                                                               "client-service"]},
      "use": "passthrough"},
     {"name": "protected: Claude Code compaction", "if": {"request_class": ["compaction", "auxiliary"]},
      "use": "passthrough"},
@@ -1537,7 +1538,7 @@ _STRUCTURED_VARIABLES = ("default", "schema", "schema_name")
 _KNOWN_VALUES = {
     "client": CLIENTS, "dialect": DIALECTS,
     "purpose": ("client-tools", "client-text", "generation", "session-title", "auto-mode-check", "connection-probe",
-                "client-service")}
+                "prompt-suggestion", "client-service")}
 _PLACEHOLDER_WARNING = ("the blocks of a relay task are placeholders in the preview: the relay builds them from its "
                         "configuration when it owns the request")
 

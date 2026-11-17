@@ -43,6 +43,7 @@ LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "a
                  "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort",
                  "max_conversations", "conversation_wait", "account_rate_limit_wait", "account_move_keeps_history",
                  "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs", "codex_compaction_cache",
+                 "prompt_suggestion_model",
                  "models_dev_sync", "catalog_refresh_hours", "opencode_sync",
                  "stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout"}
 STREAM_MAX_SECONDS = 600
@@ -185,6 +186,11 @@ def _schema(cfg=None):
          "инструментов на тред, около 5 кредитов каждый. Выключено — relay отвечает на них ошибкой, ничего не "
          "тратя, и Codex не пополняет память, пока задачи снова не включат. Применяется сразу",
          None, None, None, None),
+        ("prompt_suggestion_model", "string", "Модель подсказок ввода", "model",
+         "Модель для служебных запросов [SUGGESTION MODE: ...] из Claude Desktop и Claude Code: auto выбирает "
+         "самую быструю доступную лёгкую модель (Haiku / Flash) в изолированной сессии, same оставляет модель чата. "
+         "Пустой ответ считается нормой без повторов и ошибок. Применяется сразу",
+         None, None, None, list(dict.fromkeys(["auto", "same", *catalog_ids]))),
         ("codex_compaction_cache", "boolean", "Сжатие Codex читает кэш чата", "model",
          "Сжатие истории Codex уходит без инструментов и ничего не делит с кэшем чата: вся история пишется заново, около "
          "31 кредита на 330 тысячах токенов. Включено — relay объявляет в сжатии инструменты чата, и сводка читает его кэш "

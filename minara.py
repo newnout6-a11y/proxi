@@ -1809,6 +1809,38 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 if stopped.is_set():
                     return
                 if response.status_code == 200:
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "text/event-stream" not in content_type:
+                        raise apierr.upstream_error("Minara did not return an SSE stream")
+                    saw_frame = False
+                    retry_stream = False
+                    for data in sse_data(response.iter_content(chunk_size=16384)):
+                        if stopped.is_set():
+                            return
+                        if not saw_frame and data != "[DONE]":
+                            saw_frame = True
+                            try:
+                                first_item = _bounded_json(data)
+                            except (ValueError, RecursionError):
+                                first_item = None
+                            if (isinstance(first_item, dict)
+                                    and ("error" in first_item or first_item.get("type") == "error")
+                                    and delays and time.monotonic() + delays[0] < deadline):
+                                retry_stream = True
+                                break
+                        put(data)
+                    if retry_stream:
+                        journal.emit("upstream.channel_retry",
+                                     "Minara: ошибка потока до начала генерации, повтор через %g с" % delays[0],
+                                     "info", upstream="minara", status=200, delay=delays[0], model=body.get("model"))
+                        holder["response"] = None
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                        if stopped.wait(delays.pop(0)):
+                            return
+                        continue
                     break
                 text = _error_body(response)
                 if (route["messages"] and not route["measured"] and response.status_code in (400, 404, 422)
@@ -1844,13 +1876,6 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                     pass
                 if stopped.wait(delays.pop(0)):
                     return
-            content_type = response.headers.get("content-type", "").lower()
-            if "text/event-stream" not in content_type:
-                raise apierr.upstream_error("Minara did not return an SSE stream")
-            for data in sse_data(response.iter_content(chunk_size=16384)):
-                if stopped.is_set():
-                    return
-                put(data)
         except apierr.ApiError as exc:
             put(exc)
         except Exception as exc:
@@ -1891,15 +1916,29 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
             raise apierr.upstream_timeout("Minara turn expired before upstream request")
         thread.start()
         started = True
+        wait_started = time.monotonic()
+        status_sent = False
+        upstream_spoke = False
+        next_heartbeat = wait_started + 6.5
+        expects_thinking = bool(level and level != "none")
         while True:
             if getattr(session, "_cancelled", False):
                 yield {"type": "end", "reason": "cancelled"}
                 return
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 raise apierr.upstream_timeout("Minara turn exceeded its deadline")
             try:
                 item = q.get_nowait()
             except queue.Empty:
+                if expects_thinking and not upstream_spoke:
+                    elapsed = now - wait_started
+                    if not status_sent and elapsed >= 1.5:
+                        status_sent = True
+                        yield {"type": "thinking_status", "source": "relay"}
+                    elif status_sent and now >= next_heartbeat:
+                        next_heartbeat = now + 5.0
+                        yield {"type": "thinking_heartbeat", "elapsed": round(elapsed, 1)}
                 await asyncio.sleep(0.01)
                 continue
             if item is None:
@@ -1917,6 +1956,8 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 head_marked = True
                 direct._head_started(head_gate, head_key)  # the answer began: the head is in the cache now
             for event in parser.feed(item):
+                if event.get("type") in ("thinking_start", "thinking", "text", "tool_call"):
+                    upstream_spoke = True
                 yield event
             if parser.done:
                 return

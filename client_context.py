@@ -39,8 +39,9 @@ _READ_LIMIT = 256 * 1024
 # re-read soon enough to show renames; a miss is retried less often.
 _TITLE_TTL = 15
 _MISS_TTL = 30
-SERVICE_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe"})
+SERVICE_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe", "prompt-suggestion"})
 CLIENT_TEXT_KINDS = SERVICE_KINDS | {"client-text"}
+SUGGESTION_PREFIX = "[SUGGESTION MODE:"
 # x-claude-code-request-class values whose system prompt is the client's own
 # output contract (summaries, titles, classifiers), never the chat the relay
 # policy is written for. The header needs CLAUDE_CODE_GATEWAY_HINT_HEADERS=1.
@@ -167,8 +168,23 @@ def keeps_client_prompt(purpose, identity=None):
     return purpose in SERVICE_KINDS or info.get("request_class") in OWN_PROMPT_CLASSES
 
 
+def is_prompt_suggestion(parsed):
+    """True for Claude Code / Claude Desktop next-prompt suggestion side requests ([SUGGESTION MODE: ...])."""
+    for block in _last_user_blocks(parsed):
+        if block.lstrip().startswith(SUGGESTION_PREFIX):
+            return True
+    for text in _trailing_user_texts(parsed):
+        stripped = text.lstrip()
+        if stripped.startswith(_REMINDER_PREFIX):
+            continue
+        return stripped.startswith(SUGGESTION_PREFIX)
+    return False
+
+
 def request_kind(parsed, identity=None):
     """Describe known client calls; prompt length alone says nothing about purpose."""
+    if is_prompt_suggestion(parsed):
+        return "prompt-suggestion"
     if getattr(parsed, "tools", None):
         return "client-tools"
     system = (getattr(parsed, "system", "") or "").lstrip()

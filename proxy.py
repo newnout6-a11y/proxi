@@ -640,6 +640,13 @@ def make_handler(runtime: Runtime):
                     self._stream_failure(dialect, err)
                 else:
                     self._respond_error(err, dialect)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+                self._close_if_body_unread()
+                self.close_connection = True
+                self._error_code = "client_disconnected"
+                journal.emit("http.client_disconnect",
+                             "Клиент закрыл соединение до окончания ответа (%s)" % type(exc).__name__,
+                             "info", request_id=self.request_id, path=self.path)
             except Exception as exc:  # never leak a bare traceback
                 self._close_if_body_unread()
                 console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]))
@@ -977,6 +984,8 @@ def make_handler(runtime: Runtime):
                                  parsed.requested_model, substituted), "info",
                              request_id=self.request_id, requested=parsed.requested_model, served=substituted)
             parsed.request_purpose = client_context.request_kind(parsed)
+            if parsed.request_purpose == "prompt-suggestion":
+                substituted = self._optimize_prompt_suggestion(parsed, substituted)
             # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
             # identity, so that every event of the request, the transport's included, says what it is.
             parsed.client_task = client_context.client_task(parsed)
@@ -1187,6 +1196,60 @@ def make_handler(runtime: Runtime):
             if carried:
                 parsed.tools = merged
                 parsed.carried_tools = frozenset(carried)
+
+        def _optimize_prompt_suggestion(self, parsed, substituted):
+            """Run [SUGGESTION MODE: ...] side requests on a fast light model with slimmed context and no tools."""
+            pref = str(cfg.get("prompt_suggestion_model") or "auto").strip()
+            if pref and pref != "same":
+                candidates = (pref,) if pref != "auto" else (
+                    "claude-haiku-4-5-20251001",
+                    "gpt-5.6-luna",
+                    "gpt-5.5",
+                    "minara/claude-haiku-5-5",
+                    "fast-auto",
+                )
+                profile = getattr(self, "_client_key_profile", None)
+                for candidate in candidates:
+                    try:
+                        cand_entry, _ = model_catalog.resolve(candidate, cfg=cfg)
+                        runtime.client_keys.enforce_request(profile, cand_entry["id"], candidate)
+                    except apierr.ApiError:
+                        continue
+                    if runtime.pool.model_refusal(cand_entry, isolated=True) is None:
+                        if cand_entry["id"] != parsed.model:
+                            parsed.entry = cand_entry
+                            parsed.model = cand_entry["id"]
+                            self._model = parsed.model
+                            substituted = parsed.model if parsed.model != parsed.requested_model else substituted
+                        break
+            levels = parsed.entry.get("reasoning_effort_levels") or ()
+            parsed.effort = next((lvl for lvl in ("none", "minimal", "low") if lvl in levels), None)
+            parsed.tools = []
+            parsed.tool_choice = "auto"
+            parsed.web_search = None
+            parsed.show_thinking = False
+            parsed.thinking_placeholder = ""
+            parsed.max_tokens = max(16, min(parsed.max_tokens or 64, 64))
+            parsed.client_task = client_context.BACKGROUND
+            parsed.system = (
+                "Reply with ONLY a natural 2-12 word next user message in the user's language, with no quotes or meta-text."
+            )
+            chunks = list(getattr(parsed, "message_chunks", None) or ())
+            if len(chunks) > 1 or len(getattr(parsed, "prompt", "") or "") > 12000:
+                last_chunk = str(chunks[-1]) if chunks else str(getattr(parsed, "prompt", "") or "")
+                prior = [str(c) for c in chunks[:-1] if str(c).strip()]
+                kept = []
+                if prior and prior[0].startswith("User: ") and len(prior) > 6:
+                    kept.append(prior[0][:1200])
+                for item in prior[-6:]:
+                    trimmed = item[:1200]
+                    if not kept or kept[-1] != trimmed:
+                        kept.append(trimmed)
+                kept.append(last_chunk)
+                parsed.message_chunks = kept
+                parsed.prompt = "\n\n".join(kept)
+            parsed.native_messages = []
+            return substituted
 
         def _stabilize_prompt(self, parsed):
             """The client's system prompt with the parts that change between requests held as the conversation has them.

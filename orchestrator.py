@@ -453,6 +453,8 @@ def acquire_plan(cfg, parsed):
     purpose = _purpose(parsed)
     key = getattr(parsed, "conversation_key", None)
     parent_key = getattr(parsed, "parent_conversation_key", None)
+    if purpose == "prompt-suggestion":
+        return AcquirePlan("isolated", {"isolated": True})
     if getattr(parsed, "web_search", None) and len(getattr(parsed, "tools", None) or ()) == 1:
         # Claude Code runs WebSearch as a request of its own, carrying the id of the chat it serves: that is a job on its own
         # (a standalone head, one tool), and on the chat's session it would replace the head and the tools the chat's
@@ -1609,7 +1611,9 @@ class TurnRunner:
                                     # Tool envelopes are parsed only after the complete
                                     # upstream turn, so do not leak their markup to a
                                     # native client. Ordinary text remains streamed.
-                                    if direct_mode or not native_tools:
+                                    if purpose == "prompt-suggestion":
+                                        pass
+                                    elif direct_mode or not native_tools:
                                         out.put(event)
                                         visible_text += event["delta"]
                                     else:
@@ -1691,10 +1695,64 @@ class TurnRunner:
                                             | {"tool_type": definition.get("x-client-type", "function"),
                                                "done": complete})
                                 elif event["type"] == "tool_call":
-                                    # A call of a tool the client did not declare (under a forced choice, of another
-                                    # tool) has nothing to run it on the client and is not passed on; the journal names
-                                    # it instead of losing it without a trace (ultracode audit of the relay, C4).
-                                    if not event.get("partial"):
+                                    ptc_def = tool_definitions.get("run_code") if len(tool_definitions) == 1 else None
+                                    ptc_desc = str((ptc_def or {}).get("description") or "")
+                                    is_ptc = ptc_def is not None and "Execute a " in ptc_desc and "await tools." in ptc_desc
+                                    if is_ptc and event.get("partial"):
+                                        pass
+                                    elif is_ptc and not event.get("invalid"):
+                                        sub_name = str(event.get("name") or "").strip()
+                                        try:
+                                            args_obj = json.loads(event.get("arguments") or "{}")
+                                        except (ValueError, TypeError):
+                                            args_obj = None
+                                        if sub_name and isinstance(args_obj, dict):
+                                            args_json = json.dumps(args_obj, ensure_ascii=False)
+                                            if "Execute a Python program" in ptc_desc:
+                                                code = (
+                                                    "import json\n"
+                                                    "_res = await getattr(tools, %s)(json.loads(%s))\n"
+                                                    "print(_res if isinstance(_res, str) else json.dumps(_res, ensure_ascii=False, indent=2))"
+                                                    % (json.dumps(sub_name), json.dumps(args_json))
+                                                )
+                                            elif "the BODY of an async function" in ptc_desc:
+                                                code = "return await tools[%s](%s);" % (json.dumps(sub_name), args_json)
+                                            else:
+                                                code = (
+                                                    "const _res = await tools[%s](%s);\n"
+                                                    "console.log(typeof _res === \"string\" ? _res : JSON.stringify(_res, null, 2));"
+                                                    % (json.dumps(sub_name), args_json)
+                                                )
+                                            desc_label = str(args_obj.get("description") or ("Invoke %s tool" % sub_name)).strip()[:120]
+                                            wrapped_args = json.dumps(
+                                                {"code": code, "description": desc_label or ("Invoke %s tool" % sub_name)},
+                                                ensure_ascii=False,
+                                            )
+                                            streamed_tool_call = True
+                                            if direct_mode:
+                                                direct_target._direct_reply = None
+                                            log("tool.ptc_wrapped",
+                                                "Вызов %s обёрнут в run_code для PTC-режима клиента" % sub_name,
+                                                "info", original=sub_name, call_id=event.get("id"))
+                                            out.put({
+                                                "type": "tool_call",
+                                                "id": event.get("id") or ("call_" + uuid.uuid4().hex[:16]),
+                                                "name": "run_code",
+                                                "arguments": wrapped_args,
+                                                "tool_type": ptc_def.get("x-client-type", "function"),
+                                                "done": True,
+                                            })
+                                        else:
+                                            dropped_calls.append(event.get("name"))
+                                            log("tool.call_dropped",
+                                                "Вызов инструмента %s не передан клиенту: клиент его не объявлял" % (
+                                                    event.get("name"),),
+                                                "warn", name=event.get("name"), call_id=event.get("id"),
+                                                declared=len(tool_names))
+                                    elif not event.get("partial"):
+                                        # A call of a tool the client did not declare (under a forced choice, of another
+                                        # tool) has nothing to run it on the client and is not passed on; the journal names
+                                        # it instead of losing it without a trace (ultracode audit of the relay, C4).
                                         dropped_calls.append(event.get("name"))
                                         log("tool.call_dropped",
                                             "Вызов инструмента %s не передан клиенту: клиент его не объявлял" % (
@@ -2060,7 +2118,31 @@ class TurnRunner:
                                   + retry_instruction)
                         continue
 
+                    if purpose == "prompt-suggestion":
+                        cleaned = final_text.strip().strip("\"'«»").strip()
+                        meta_silent = (
+                            not cleaned
+                            or "\n" in cleaned
+                            or len(cleaned.split()) > 16
+                            or bool(re.search(
+                                r"(?:^\s*[\(\[].*[\)\]]\s*$|"
+                                r"^\s*(?:nothing|none|silent)\.?\s*$|"
+                                r"\b(?:no\s+suggestion|nothing\s+to\s+suggest|stay(?:ing)?\s+silent|"
+                                r"empty\s+response|no\s+natural\s+next)\b)",
+                                cleaned, re.IGNORECASE))
+                        )
+                        if not meta_silent:
+                            out.put({"type": "text", "delta": cleaned})
+                        out.put({"type": "end", "reason": holder.get("reason", "stop")})
+                        return
+
                     if not command and not final_text.strip():
+                        if dropped_calls:
+                            names = ", ".join(sorted({str(name)[:60] for name in dropped_calls})[:5])
+                            raise holder["_attempt_budget"].error(
+                                "upstream_invalid_output",
+                                "upstream returned only undeclared tool call(s) (%s) not in the client's tool list" % names,
+                            )
                         raise holder["_attempt_budget"].error()
 
                     if not can_exec or not command:
