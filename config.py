@@ -149,12 +149,18 @@ DEFAULTS = {
     # Provider caches expire in minutes; re-read the prefix to hold it open.
     "cache_keepwarm_seconds": 240,
     # Idle warming stops this long after a conversation's last real request. A ping reads
-    # the cached prefix (4e-6 credits/token), a miss writes it again (1e-4): 900 is the
-    # conversation_idle_timeout, after which the pool closes the conversation anyway.
+    # the cached prefix (4e-6 credits/token), a miss writes it again (1e-4). Under 1% of the
+    # main chats whose warming ended at 900 s came back in the next 15 minutes (live journal,
+    # 2026-11-06/07), so longer warming of a main chat does not pay.
     "cache_keepwarm_idle": 900,
     # A subagent that answered with a tool call is still expected back; one that answered
     # with plain text is done and is not warmed at all. 0 = no idle warming for subagents.
-    "cache_keepwarm_subagent_idle": 600,
+    # One waiting for a tool always came back in the live journal (4 of 4), two of them after
+    # a 15-minute test run, when 600 s of warming had let the cache expire: 46 credits of
+    # rewrites that two more pings each (7.7 credits) would have saved. 1800 s covers a tool
+    # of about half an hour; its seven pings cost less than one rewrite of the prefix on the
+    # measured rates of Claude, GPT and GLM-5.3 (credits.MODEL_RATES).
+    "cache_keepwarm_subagent_idle": 1800,
     "cache_keepwarm_during_turns": True,
     "cache_keepwarm_turn_offset": 200,
     # Accounts below this confirmed balance leave the routing pool.

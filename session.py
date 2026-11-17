@@ -881,6 +881,12 @@ class _Dependent:
         self.session = None
 
 
+def _kept_warm(session):
+    """True while the keepwarm cycle of `session` runs: its cache is being kept alive."""
+    task = getattr(session, "_warm_task", None)
+    return task is not None and not task.done()
+
+
 class SessionPool:
     """Bounded persistent conversations with one exclusive lease per request."""
 
@@ -1346,11 +1352,17 @@ class SessionPool:
     def _take_idle(self, make_room=False):
         """Remove, without awaiting, the conversations that have to go, and return their sessions to close.
 
-        Past the idle timeout a conversation always goes. When the pool is full and a new conversation needs a slot
-        (make_room), the idle ones that are cheapest to rebuild go first, the oldest first among equals, and no more than
-        make the room: a warm 345k-token conversation was evicted after 167 s to make room for one-shot test conversations
-        (a4 F3, 2026-11-06). The caller takes its slot before it awaits the closing, so that no other request can take the
-        freed slot in between: 1 or 2 of 5 new conversations met a 503 "pool is full" that way while idle ones existed."""
+        Past the idle timeout a conversation goes, unless its cache is still kept warm: closing the session ends its keepwarm,
+        and a subagent that waits for a long tool is warmed past the 15 minutes of the timeout (cache_keepwarm_subagent_idle,
+        30 minutes). Two subagents whose test run took 15 minutes were closed at the timeout, their cache expired and they
+        wrote 665k and 260k tokens again on their return, 46 credits (journal of 2026-11-06/07). The cycle ends by its own
+        limits (direct._keepwarm), and the conversation goes at the next look after that. When the pool is full and a new
+        conversation needs a slot (make_room), the idle ones whose cache is not kept warm go first: closing one stops no
+        keepwarm, and its history is stored (conversation_state). Among those and then among the warm ones the cheapest to
+        rebuild go first, the oldest first among equals, and no more than make the room: a warm 345k-token conversation was
+        evicted after 167 s to make room for one-shot test conversations (a4 F3, 2026-11-06). The caller takes its slot
+        before it awaits the closing, so that no other request can take the freed slot in between: 1 or 2 of 5 new
+        conversations met a 503 "pool is full" that way while idle ones existed."""
         now = time.monotonic()
         ttl = self.cfg.get("conversation_idle_timeout", 900)
         capacity = max(1, self.cfg.get("max_conversations", 128))
@@ -1358,12 +1370,14 @@ class SessionPool:
                 if not self._conversation_refs.get(key)
                 and not getattr(self._conversations.get(key), "_cache_dependents", 0)]
         expired = [key for key in sorted(idle, key=lambda key: self._last_used.get(key, 0))
-                   if ttl > 0 and now - self._last_used.get(key, now) >= ttl]
+                   if ttl > 0 and now - self._last_used.get(key, now) >= ttl
+                   and not _kept_warm(self._conversations.get(key))]
         gone = set(expired)
         order = list(expired)
         if make_room:
             order += sorted((key for key in idle if key not in gone),
-                            key=lambda key: (self._rebuild_cost(key), self._last_used.get(key, 0)))
+                            key=lambda key: (_kept_warm(self._conversations.get(key)), self._rebuild_cost(key),
+                                             self._last_used.get(key, 0)))
         closing = []
         for key in order:
             if key not in gone and len(self._conversation_locks) < capacity:

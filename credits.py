@@ -20,9 +20,20 @@ RATE_OUTPUT = 0.000401
 # Per-model rates, an exact least-squares fit (largest error 0.0000 credits) of the reported credits of every attempt in
 # the live journal of 2026-11-06: 753 attempts of Sonnet 5.5 and 120 of Opus 5.5. Sonnet costs half of Opus for input,
 # output and a cache write; a cache read is 4e-6 for both.
+# The others, the same fit of the journal of 2026-11-07 (largest error 0.0000 credits): gpt-6.1-sol over 781 attempts, GLM-5.3
+# over 321 and GLM-5.3-Flash over 224; their keepwarm pings were billed within 1.3% of what these rates give. gpt-6.1-terra
+# costs half of sol (5 attempts and 3 pings), claude-sonnet-5 1.5 times Sonnet 5.5 and gpt-5.5 is the fit of its 3 attempts:
+# each of them matched to the last digit. GLM and gpt-5.5 report no cache write: a prefix they do not read is billed as
+# plain input, and their cache_write says so.
 MODEL_RATES = {
     "claude-sonnet-5-5": {"input": 0.00004, "cache_read": 0.000004, "cache_write": 0.00005, "output": 0.0002},
     "claude-opus-5-5": {"input": 0.00008, "cache_read": 0.000004, "cache_write": 0.0001, "output": 0.0004},
+    "claude-sonnet-5": {"input": 0.00006, "cache_read": 0.000006, "cache_write": 0.000075, "output": 0.0003},
+    "gpt-6.1-sol": {"input": 0.00004, "cache_read": 0.000002, "cache_write": 0.00005, "output": 0.0002},
+    "gpt-6.1-terra": {"input": 0.00002, "cache_read": 0.000001, "cache_write": 0.000025, "output": 0.0001},
+    "gpt-5.5": {"input": 0.0001, "cache_read": 0.00001, "cache_write": 0.0001, "output": 0.0006},
+    "zai-org/GLM-5.3": {"input": 0.000112, "cache_read": 0.0000112, "cache_write": 0.000112, "output": 0.000352},
+    "zai-org/GLM-5.3-Flash": {"input": 0.00006, "cache_read": 0.000012, "cache_write": 0.00006, "output": 0.0002},
 }
 _DEFAULT_RATES = {"input": RATE_INPUT, "cache_read": RATE_CACHE_READ, "cache_write": RATE_CACHE_WRITE,
                   "output": RATE_OUTPUT}

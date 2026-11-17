@@ -291,6 +291,10 @@ def test_a_conversation_evicted_for_idleness_comes_back_with_its_signed_history(
 
     async def story():
         messages = await converse(process, "chat", 2)
+        # Idleness closes a conversation once its keepwarm has ended, not while it still runs.
+        cycle = process.pool._conversations[KEY]._warm_task
+        cycle.cancel()
+        await asyncio.gather(cycle, return_exceptions=True)
         process.pool._last_used[KEY] -= 10_000
         await process.pool._evict_idle()
         assert KEY not in process.pool._conversations
