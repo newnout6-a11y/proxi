@@ -160,6 +160,7 @@ class Runtime:
         # Conversations Claude Code's tool search was refused for (tool_search_policy).
         self.tool_search_guard = tool_search_policy.LoopGuard()
         self.limiter = RateLimiter(cfg["rate_limit_rps"], cfg["rate_limit_burst"])
+        self.client_keys = auth.ClientKeyManager(cfg)
         self.started = time.time()
         self.admin = admin_module.Admin(self)
         # After the journal is configured: scanning the stored conversations reports what it removed.
@@ -576,8 +577,11 @@ def make_handler(runtime: Runtime):
                     # A source past its budget of wrong keys is refused before its key is compared (auth.py).
                     self._throttle_auth_failure(failed=False)
                     query = parse_qs(parsed_url.query)
+                    self._client_key_profile = None
                     try:
-                        auth.verify(self.headers, (query.get("key") or [""])[0], cfg["relay_api_key"])
+                        self._client_key_profile = runtime.client_keys.authenticate(
+                            self.headers, (query.get("key") or [""])[0], cfg["relay_api_key"]
+                        )
                     except apierr.ApiError as exc:
                         # A missing key is a routine probe; a PRESENTED wrong key is
                         # brute-forcing and gets the always-on per-source budget.
@@ -603,7 +607,11 @@ def make_handler(runtime: Runtime):
                 elif route == "models":
                     self._models()
                 elif route == "codex_models":
-                    entries = [entry for entry in model_catalog.catalog(cfg) if self._model_routable(entry)]
+                    ck_prof = getattr(self, "_client_key_profile", None)
+                    entries = [
+                        entry for entry in model_catalog.catalog(cfg)
+                        if self._model_routable(entry) and auth.model_allowed_for_profile(ck_prof, entry["id"])
+                    ]
                     if cfg.get("codex_catalog_gpt_only"):
                         # Codex's picker offers GPT models only, Retool's and Minara's (the owner's choice, 2026-11-10):
                         # Codex is OpenAI's client, and the Claude, GLM and Gemini routes have clients of their own.
@@ -611,8 +619,12 @@ def make_handler(runtime: Runtime):
                     self._json(200, self._with_prompts(lambda snapshot: model_catalog.codex_catalog(entries, snapshot)))
                 elif route == "balance":
                     report = self._balance_report()
-                    # A relay of Minara accounts only has no Retool total: its Minara credits are an answer too.
-                    known = report["available"] is not None or (report.get("minara") or {}).get("available") is not None
+                    known = (
+                        report["available"] is not None
+                        or (report.get("minara") or {}).get("available") is not None
+                        or (report.get("usd") or {}).get("available") is not None
+                        or (report.get("accounts") and all(item.get("balance_supported") is False for item in report["accounts"]))
+                    )
                     self._json(200 if known else 503, report)
                 elif route == "usage":
                     self._json(200, self._usage_report())
@@ -753,7 +765,11 @@ def make_handler(runtime: Runtime):
                        {"x-proxi-token-count": "estimated", "x-proxi-token-count-basis": basis})
 
         def _models(self):
-            entries = [model for model in model_catalog.catalog(cfg) if self._model_routable(model)]
+            ck_prof = getattr(self, "_client_key_profile", None)
+            entries = [
+                model for model in model_catalog.catalog(cfg)
+                if self._model_routable(model) and auth.model_allowed_for_profile(ck_prof, model["id"])
+            ]
             published = self._with_prompts(lambda snapshot: entries + model_catalog.virtual_entries(entries, snapshot))
             data = [{
                 "id": model["id"],
@@ -762,6 +778,7 @@ def make_handler(runtime: Runtime):
                 "label": model["label"],
                 "context_window": model["context"],
                 "max_output_tokens": model.get("max_output"),
+                **({"pricing": model["pricing"]} if model.get("pricing") else {}),
                 **model_catalog.desktop_metadata(model, entries),
                 **{key: model[key] for key in ("metadata_checked_at", "metadata_source", "metadata_status", "metadata_notes")
                    if key in model},
@@ -814,7 +831,8 @@ def make_handler(runtime: Runtime):
             # /health is the only unauthenticated route and carries CORS *: it must
             # expose readiness booleans, not organization financials or raw
             # upstream error text — those live behind /v1/balance with the key.
-            refresher = getattr(account_report.serving_entry(entries)["backend"], "refresher", None)
+            serving = account_report.serving_entry(entries)
+            refresher = getattr(serving["backend"], "refresher", None) if serving is not None else None
             refresher = refresher or getattr(runtime.backend, "refresher", None)
             session = ({key: value for key, value in refresher.status().items()
                         if not isinstance(value, str)} if refresher is not None else {"keepalive": False})
@@ -945,6 +963,9 @@ def make_handler(runtime: Runtime):
             parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
+            runtime.client_keys.enforce_request(
+                getattr(self, "_client_key_profile", None), parsed.model, parsed.requested_model
+            )
             substituted = model_catalog.substitute_for(parsed.requested_model)
             if substituted != parsed.model:
                 substituted = None
@@ -1047,8 +1068,11 @@ def make_handler(runtime: Runtime):
                     raise unavailable
 
             events = queue.Queue()
+            ck_prof = getattr(self, "_client_key_profile", None)
             holder = {"reason": "stop", "session": None, "cancel_event": threading.Event(),
-                      "_request_started_monotonic": self._request_started_monotonic}
+                      "_request_started_monotonic": self._request_started_monotonic,
+                      "_client_key_id": ck_prof["id"] if ck_prof and not ck_prof.get("master") else None,
+                      "_client_key_recorder": runtime.client_keys.record_usage}
             self._holder = holder
             self._model_called = True
             fut = runtime.submit_turn(parsed, events, holder)

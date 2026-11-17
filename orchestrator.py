@@ -1650,6 +1650,7 @@ class TurnRunner:
                                         holder['_attempt_usage'] = {}
                                         holder['_attempt_credited'] = False
                                         holder['_attempt_minara'] = None
+                                        holder['_attempt_usd'] = None
                                     out.put(event)
                                 elif (event["type"] == "tool_call" and searcher is not None and direct_mode
                                       and event.get("name") == search_spec["name"]):
@@ -1707,6 +1708,13 @@ class TurnRunner:
                                     breakdown = credits.cost_breakdown(usage, parsed.model)
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
                                     provider_cost = usage.get('provider_cost')
+                                    usd_spent = None
+                                    if (isinstance(provider_cost, (int, float)) and not isinstance(provider_cost, bool)
+                                            and math.isfinite(provider_cost)
+                                            and (usage.get('provider_cost_currency') or 'USD').upper() == 'USD'):
+                                        before_usd = holder.get('_attempt_usd') or 0.0
+                                        usd_spent = round(max(0.0, float(provider_cost) - before_usd), 10)
+                                        holder['_attempt_usd'] = float(provider_cost)
                                     minara_credits = credits.minara_credits(usage)
                                     # The attempt's Minara credits so far, against what earlier usage of the same attempt
                                     # already said: the journal and the console's spent= add each event's share once.
@@ -1716,16 +1724,27 @@ class TurnRunner:
                                         minara_spent = round(max(0.0, minara_credits - before), 4)
                                         holder['_attempt_minara'] = minara_credits
                                         event = dict(event, minara_credits=minara_spent)
+                                    if usd_spent is not None:
+                                        event = dict(event, cost_usd=usd_spent)
+                                    ck_id = holder.get('_client_key_id')
+                                    ck_rec = holder.get('_client_key_recorder')
+                                    if ck_id and callable(ck_rec):
+                                        ck_rec(
+                                            ck_id,
+                                            input_tokens=(delta.get('input_tokens') or 0) + (delta.get('cache_read') or 0) + (delta.get('cache_write') or 0),
+                                            output_tokens=delta.get('output_tokens') or 0,
+                                            cost_usd=usd_spent,
+                                        )
                                     if not known and provider_cost is not None:
-                                        # Minara reports a cost in USD (or the relay estimated one from the catalog): the
-                                        # turn is priced, only not in Retool credits. It was a warning on every turn.
+                                        # Minara or a universal provider reports a cost in USD (or the relay estimated one
+                                        # from the catalog): the turn is priced, only not in Retool credits.
                                         log('upstream.usage', 'Токены получены; стоимость %s %.6f%s%s' % (
                                                 usage.get('provider_cost_currency') or 'USD', provider_cost,
                                                 ' (оценка по прайсу)' if usage.get('provider_cost_estimated') else '',
                                                 ' = %s кредитов Minara' % minara_credits
                                                 if minara_credits is not None else ''),
                                             'info', credits=None, attempt=journal_attempt, credits_reported=False,
-                                            provider_cost=provider_cost, minara_credits=minara_spent,
+                                            provider_cost=provider_cost, cost_usd=usd_spent, minara_credits=minara_spent,
                                             provider_cost_estimated=bool(usage.get('provider_cost_estimated')), **delta,
                                             **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
                                     else:

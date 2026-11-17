@@ -47,9 +47,9 @@ class UpstreamDriver(ABC):
         raise NotImplementedError
 
     def make_account_manager(self, backend, root_cfg: dict):
-        """Return the account balance/usage manager for `backend` (`CreditsManager`, `MinaraAccount`, `UnmeteredAccount`, etc.)."""
-        from accounts import UnmeteredAccount
-        return UnmeteredAccount()
+        """Return the account balance/usage manager for `backend` (`CreditsManager`, `MinaraAccount`, `ProviderBalanceAccount`)."""
+        from drivers.balance_checkers import ProviderBalanceAccount
+        return ProviderBalanceAccount(backend.cfg, backend=backend)
 
     async def discover_models(self, cfg: dict) -> list[dict]:
         """Fetch raw model descriptors offered by this upstream endpoint; [] if unsupported."""

@@ -153,7 +153,7 @@ class _Attempt:
     A Minara attempt is priced in Minara's own credits (220 per US dollar of its list), never in Retool's: `minara` keeps
     them apart from `price`, and either one makes the attempt known. Until 2026-11-13 only Retool's `credits` did, so
     every Minara turn showed no price in the turn list and counted as "без цены" in the metrics."""
-    __slots__ = ("where", "observed", "known", "price", "minara")
+    __slots__ = ("where", "observed", "known", "price", "minara", "usd")
 
     def __init__(self, where):
         self.where = where
@@ -161,6 +161,7 @@ class _Attempt:
         self.known = False  # a valid price was reported
         self.price = 0.0
         self.minara = None  # Minara credits, None until a Minara price came
+        self.usd = None  # USD cost, None until a USD price came
 
     @property
     def unknown(self):
@@ -190,9 +191,9 @@ class _Turn:
         self.current = number
         return self.attempts.setdefault(number, _Attempt(where))
 
-    def usage(self, number, price, where, minara=None):
+    def usage(self, number, price, where, minara=None, usd=None):
         """Apply one usage event; returns the attempt and the change in its 'unknown' state (-1, 0, +1). `price` is in
-        Retool credits, `minara` in Minara credits: either one prices the attempt."""
+        Retool credits, `minara` in Minara credits, `usd` in US dollars: any of them prices the attempt."""
         if number is None:
             number = self.current if self.current is not None else 0
         attempt = self.attempts.get(number)
@@ -206,6 +207,9 @@ class _Turn:
         if minara is not None:
             attempt.known = True
             attempt.minara = (attempt.minara or 0.0) + minara
+        if usd is not None:
+            attempt.known = True
+            attempt.usd = (attempt.usd or 0.0) + usd
         return attempt, int(attempt.unknown) - int(before)
 
     @property
@@ -231,12 +235,18 @@ class _Turn:
     def summary(self):
         """(sum of valid Retool prices, attempts priced in Retool credits, unknown attempts)."""
         found = self.attempts.values()
-        return (sum(item.price for item in found), sum(item.known and item.minara is None for item in found),
+        return (sum(item.price for item in found),
+                sum(item.known and item.minara is None and item.usd is None for item in found),
                 sum(item.unknown for item in found))
 
     def minara_total(self):
         """The Minara credits of the turn's attempts, None when none was priced in them."""
         prices = [item.minara for item in self.attempts.values() if item.minara is not None]
+        return sum(prices) if prices else None
+
+    def usd_total(self):
+        """The USD cost of the turn's attempts, None when none was priced in USD."""
+        prices = [item.usd for item in self.attempts.values() if item.usd is not None]
         return sum(prices) if prices else None
 
 
@@ -245,15 +255,16 @@ class _Fine:
     __slots__ = ("requests", "errors", "latency_sum", "latency_n", "ttft_sum", "ttft_n", "credits", "keepwarm",
                  "keepwarm_pings", "keepwarm_unknown", "cache_read", "cache_write", "input", "output",
                  "turns", "tools", "commands", "unknown", "speed_output", "speed_duration", "speed_samples",
-                 "minara_credits")
+                 "minara_credits", "cost_usd")
 
     def __init__(self):
         self.requests = self.errors = self.latency_n = self.ttft_n = 0
         self.keepwarm_pings = self.keepwarm_unknown = self.cache_read = self.cache_write = 0
         self.input = self.output = self.turns = self.tools = self.commands = self.unknown = 0
         self.latency_sum = self.ttft_sum = self.credits = self.keepwarm = 0.0
-        # Minara's own credits (220 per US dollar) never enter `credits`, which is Retool's currency only.
+        # Minara's own credits (220 per US dollar) and universal USD costs never enter `credits` (Retool's currency only).
         self.minara_credits = 0.0
+        self.cost_usd = 0.0
         self.speed_output = self.speed_duration = self.speed_samples = 0
 
 
@@ -310,7 +321,8 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
     It takes no lock and reads no live state, so it may take as long as it likes without holding emit() back.
     """
     rows = [{"t": int(start + index * bucket), "requests": 0, "errors": 0, "latency": None, "ttft": None,
-             "credits": 0.0, "keepwarm_credits": 0.0, "minara_credits": 0.0, "cache_read": 0, "cache_write": 0,
+             "credits": 0.0, "keepwarm_credits": 0.0, "minara_credits": 0.0, "cost_usd": 0.0,
+             "cache_read": 0, "cache_write": 0,
              "input": 0, "output": 0, "turns": 0, "tools": 0, "commands": 0, "credits_unknown": 0}
             for index in range(count)]
     latency = [[0.0, 0] for _ in range(count)]
@@ -333,6 +345,7 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
         row["credits"] += slot.credits
         row["keepwarm_credits"] += slot.keepwarm
         row["minara_credits"] += slot.minara_credits
+        row["cost_usd"] += slot.cost_usd
         row["credits_unknown"] += slot.unknown
         pings += slot.keepwarm_pings
         pings_unknown += slot.keepwarm_unknown
@@ -355,12 +368,14 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
     credits_sum = sum(row["credits"] for row in rows)
     keepwarm_sum = sum(row["keepwarm_credits"] for row in rows)
     minara_sum = sum(row["minara_credits"] for row in rows)
+    usd_sum = sum(row["cost_usd"] for row in rows)
     for row, (latency_sum, latency_n), (ttft_sum, ttft_n) in zip(rows, latency, ttft):
         row["latency"] = round(latency_sum / latency_n) if latency_n else None
         row["ttft"] = round(ttft_sum / ttft_n) if ttft_n else None
         row["credits"] = round(row["credits"], 4)
         row["keepwarm_credits"] = round(row["keepwarm_credits"], 4)
         row["minara_credits"] = round(row["minara_credits"], 4)
+        row["cost_usd"] = round(row["cost_usd"], 6)
         row["credits_unknown"] = max(0, row["credits_unknown"])
         row["credits_complete"] = row["credits_unknown"] == 0
 
@@ -380,6 +395,7 @@ def _aggregate(fine, coarse, start, bucket, count, in_progress):
               "credits": round(credits_sum, 4), "cache_read": cached,
               "keepwarm_credits": round(keepwarm_sum, 4),
               "minara_credits": round(minara_sum, 4),
+              "cost_usd": round(usd_sum, 6),
               "keepwarm_pings": pings, "keepwarm_unknown": pings_unknown,
               "credits_complete": unknown == 0, "credits_unknown": unknown,
               "credits_in_progress": in_progress,
@@ -520,15 +536,17 @@ class _Rollup:
         elif kind == "upstream.usage":
             fine = self.fine_slot(index)
             price = _price(data.get("credits"))
-            # A Minara turn is priced in USD, never in Retool credits: its own credits go in a counter of their own, so
-            # the two currencies are never added together (account_report.aggregate_balance keeps them apart too). They
-            # price the attempt all the same: it is not one "без цены".
             minara = _price(data.get("minara_credits"))
-            attempt, change = self.turn(key, ts, restored).usage(_attempt_number(data), price, index, minara)
+            usd = _price(data.get("cost_usd"))
+            if usd is None and "cost_usd" not in data:
+                usd = _price(data.get("provider_cost"))
+            attempt, change = self.turn(key, ts, restored).usage(_attempt_number(data), price, index, minara, usd)
             if price is not None:
                 fine.credits += price
             if minara is not None:
                 fine.minara_credits += minara
+            if usd is not None:
+                fine.cost_usd += usd
             if change:
                 self._shift_unknown(now, attempt.where, change)
             fine.cache_read += _whole(data.get("cache_read"))
@@ -926,7 +944,7 @@ class Journal:
                                            "status": "running", "model": None, "effort": None,
                                            "transport": None, "dialect": None, "client": clients.get(str(event.get("request_id"))),
                                            "credits": None, "credits_complete": False, "credits_unknown": 0,
-                                           "minara_credits": None,
+                                           "minara_credits": None, "cost_usd": None, "account": event.get("account"),
                                            "ttft_ms": None, "duration_ms": None,
                                            "output_tokens": None, "tokens_per_second": None,
                                            "request_duration_ms": None,
@@ -937,6 +955,10 @@ class Journal:
             data = event.get("data") or {}
             trace["events"] += 1
             kind = event["kind"]
+            if not trace.get("account") and event.get("account"):
+                trace["account"] = event["account"]
+            if kind == "route.bound" and data.get("upstream"):
+                trace["upstream"] = data["upstream"]
             if kind == "turn.begin":
                 for key in ("model", "effort", "transport", "dialect"):
                     trace[key] = data.get(key)
@@ -957,8 +979,11 @@ class Journal:
             elif kind == "upstream.usage_start":
                 costs[turn_id].start(_attempt_number(data), None)
             elif kind == "upstream.usage":
+                usd_val = _price(data.get("cost_usd"))
+                if usd_val is None and "cost_usd" not in data:
+                    usd_val = _price(data.get("provider_cost"))
                 costs[turn_id].usage(_attempt_number(data), _price(data.get("credits")), None,
-                                     _price(data.get("minara_credits")))
+                                     _price(data.get("minara_credits")), usd_val)
                 trace["cache_read"] += _whole(data.get("cache_read"))
                 trace["cache_write"] += _whole(data.get("cache_write"))
             elif kind == "tool.call":
@@ -974,10 +999,12 @@ class Journal:
             trace["credits_complete"] = ended and not unknown
             if priced:
                 trace["credits"] = round(total, 5)
-            elif ended and not unknown:
+            elif ended and not unknown and costs[turn_id].minara_total() is None and costs[turn_id].usd_total() is None:
                 trace["credits"] = 0.0
             minara = costs[turn_id].minara_total()
             trace["minara_credits"] = round(minara, 4) if minara is not None else None
+            usd_tot = costs[turn_id].usd_total()
+            trace["cost_usd"] = round(usd_tot, 6) if usd_tot is not None else None
         return list(reversed(traces.values()))[:limit]
 
     def metrics(self, window=3600, bucket=60):

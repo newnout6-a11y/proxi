@@ -1,13 +1,17 @@
 """Relay-side authentication and upstream (Retool) auth headers."""
 import collections
+import fnmatch
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
+import secrets
 import threading
 import time
 
+import apierr
 from apierr import unauthorized
 
 CLIENT_VERSION = "4.84.0-16f3123 (Build 409813)"
@@ -292,3 +296,192 @@ def mask(key: str) -> str:
 
 def relay_key_source() -> str:
     return "RELAY_API_KEY env" if os.environ.get("RELAY_API_KEY") else "relay_key.txt/config"
+
+
+def generate_client_key() -> str:
+    """Generate a fresh virtual client API key (`sk-proxi-...`)."""
+    return "sk-proxi-" + secrets.token_urlsafe(24)
+
+
+def validate_client_key_entry(entry: dict, where: str = "client_keys") -> dict:
+    """Validate and normalize one `client_keys[]` entry."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"{where} entry must be an object")
+    kid = str(entry.get("id") or "").strip()
+    if not kid or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", kid) or kid == "master":
+        raise ValueError(f"{where}: invalid or reserved client key id '{kid}'")
+    raw_key = str(entry.get("key") or "").strip()
+    if len(raw_key) < 12 or any(ord(c) < 33 or ord(c) > 126 for c in raw_key):
+        raise ValueError(f"{where} ({kid}): 'key' must be at least 12 printable ASCII characters")
+    label = str(entry.get("label") or kid).strip()[:64]
+    enabled = entry.get("enabled", True)
+    if type(enabled) is not bool:
+        raise ValueError(f"{where} ({kid}): 'enabled' must be a boolean")
+    allowed = entry.get("allowed_models")
+    if allowed is not None:
+        if not isinstance(allowed, list) or not all(isinstance(x, str) and x.strip() for x in allowed):
+            raise ValueError(f"{where} ({kid}): 'allowed_models' must be a list of model patterns")
+        allowed = [x.strip() for x in allowed]
+    rpm = entry.get("rpm_limit")
+    if rpm is not None:
+        if type(rpm) is not int or rpm < 1 or rpm > 100_000:
+            raise ValueError(f"{where} ({kid}): 'rpm_limit' must be an integer from 1 to 100000 (or null)")
+    budget = entry.get("max_budget_usd")
+    if budget is not None:
+        if type(budget) not in (int, float) or isinstance(budget, bool) or not math.isfinite(budget) or budget < 0:
+            raise ValueError(f"{where} ({kid}): 'max_budget_usd' must be a non-negative number (or null)")
+        budget = round(float(budget), 6)
+    return {
+        "id": kid,
+        "label": label,
+        "key": raw_key,
+        "enabled": enabled,
+        "allowed_models": allowed,
+        "rpm_limit": rpm,
+        "max_budget_usd": budget,
+    }
+
+
+def model_allowed_for_profile(profile: dict | None, *model_names: str | None) -> bool:
+    """True when `profile` is master, has no `allowed_models` restriction, or matches one of `model_names`."""
+    if not profile or profile.get("master"):
+        return True
+    patterns = profile.get("allowed_models")
+    if not patterns:
+        return True
+    candidates = [m.strip().lower() for m in model_names if isinstance(m, str) and m.strip()]
+    if not candidates:
+        return True
+    for pat in patterns:
+        low_pat = pat.lower()
+        if any(fnmatch.fnmatchcase(c, low_pat) for c in candidates):
+            return True
+    return False
+
+
+class ClientKeyManager:
+    """Runtimeauthenticator, RPM rate limiter, USD budget enforcer, and usage tracker for `client_keys[]`."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._keys: dict[str, dict] = {}
+        self._usage: dict[str, dict] = {}
+        self._rpm_stamps: dict[str, collections.deque] = {}
+        self.reload(cfg.get("client_keys") or [])
+
+    def reload(self, raw_entries: list) -> None:
+        normalized: dict[str, dict] = {}
+        for idx, item in enumerate(raw_entries or []):
+            norm = validate_client_key_entry(item, f"client_keys[{idx}]")
+            normalized[norm["id"]] = norm
+        with self._lock:
+            self._keys = normalized
+            for kid in normalized:
+                self._usage.setdefault(
+                    kid,
+                    {"requests": 0, "input_tokens": 0, "output_tokens": 0, "spent_usd": 0.0, "last_used_at": None},
+                )
+
+    def authenticate(self, headers, query_key: str | None, master_key: str) -> dict:
+        """Verify master `relay_api_key` or an enabled virtual key from `client_keys[]` in constant time."""
+        presented = extract_key(headers)
+        from_header = bool(presented)
+        presented = presented or (query_key or "").strip()
+        if not presented:
+            raise unauthorized()
+        encoded = presented.encode("latin-1", "replace") if from_header else presented.encode("utf-8")
+
+        if hmac.compare_digest(encoded, master_key.encode("utf-8")):
+            return {"id": "master", "label": "master", "master": True}
+
+        with self._lock:
+            entries = list(self._keys.values())
+
+        matched = None
+        for entry in entries:
+            if hmac.compare_digest(encoded, entry["key"].encode("utf-8")):
+                matched = entry
+        if matched is None:
+            raise unauthorized("invalid relay API key")
+        if not matched.get("enabled", True):
+            raise unauthorized("client API key is disabled")
+        return dict(matched, master=False)
+
+    def enforce_request(self, profile: dict | None, resolved_model: str, requested_model: str | None = None) -> None:
+        """Check `allowed_models`, `max_budget_usd`, and `rpm_limit` for a virtual client key before dispatch."""
+        if not profile or profile.get("master"):
+            return
+        kid = profile["id"]
+        if not model_allowed_for_profile(profile, resolved_model, requested_model):
+            raise apierr.ApiError(
+                403,
+                "forbidden",
+                f"Client key '{profile.get('label') or kid}' is not permitted to access model '{requested_model or resolved_model}'",
+            )
+
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        with self._lock:
+            live = self._keys.get(kid, profile)
+            stats = self._usage.setdefault(
+                kid,
+                {"requests": 0, "input_tokens": 0, "output_tokens": 0, "spent_usd": 0.0, "last_used_at": None},
+            )
+            max_budget = live.get("max_budget_usd")
+            if max_budget is not None and stats["spent_usd"] >= max_budget:
+                raise apierr.ApiError(
+                    402,
+                    "insufficient_credits",
+                    f"Client key '{live.get('label') or kid}' has reached its USD budget (${max_budget:.4f})",
+                )
+            rpm = live.get("rpm_limit")
+            if rpm is not None and rpm > 0:
+                window = self._rpm_stamps.setdefault(kid, collections.deque())
+                while window and (now_mono - window[0]) >= 60.0:
+                    window.popleft()
+                if len(window) >= rpm:
+                    wait = max(0.1, 60.0 - (now_mono - window[0]))
+                    raise apierr.too_many_requests(
+                        f"Client key '{live.get('label') or kid}' exceeded RPM limit ({rpm}/min)",
+                        retry_after=wait,
+                    )
+                window.append(now_mono)
+            stats["requests"] += 1
+            stats["last_used_at"] = round(now_wall, 3)
+
+    def record_usage(self, key_id: str | None, *, input_tokens: int = 0, output_tokens: int = 0, cost_usd: float | None = None) -> None:
+        if not key_id or key_id == "master":
+            return
+        with self._lock:
+            stats = self._usage.get(key_id)
+            if stats is None:
+                return
+            stats["input_tokens"] += max(0, int(input_tokens or 0))
+            stats["output_tokens"] += max(0, int(output_tokens or 0))
+            if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool) and math.isfinite(cost_usd) and cost_usd > 0:
+                stats["spent_usd"] = round(stats["spent_usd"] + float(cost_usd), 8)
+
+    def list_public(self) -> list[dict]:
+        """Return safe masked metadata + live usage counters for Admin UI."""
+        with self._lock:
+            out = []
+            for kid, entry in self._keys.items():
+                stats = self._usage.get(kid) or {}
+                raw_k = entry["key"]
+                masked_k = f"{raw_k[:9]}…{raw_k[-4:]}" if len(raw_k) > 16 else mask(raw_k)
+                out.append({
+                    "id": kid,
+                    "label": entry["label"],
+                    "key_preview": masked_k,
+                    "enabled": entry["enabled"],
+                    "allowed_models": entry["allowed_models"],
+                    "rpm_limit": entry["rpm_limit"],
+                    "max_budget_usd": entry["max_budget_usd"],
+                    "requests": stats.get("requests", 0),
+                    "input_tokens": stats.get("input_tokens", 0),
+                    "output_tokens": stats.get("output_tokens", 0),
+                    "spent_usd": round(stats.get("spent_usd", 0.0), 6),
+                    "last_used_at": stats.get("last_used_at"),
+                })
+            return out

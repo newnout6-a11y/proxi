@@ -916,6 +916,17 @@ def _load(path):
         raise service_unavailable("'routes' must be an array")
     if not isinstance(cfg.get("client_keys"), list):
         raise service_unavailable("'client_keys' must be an array")
+    seen_client_key_ids = set()
+    for idx, ck in enumerate(cfg["client_keys"]):
+        try:
+            norm_ck = auth.validate_client_key_entry(ck, f"client_keys[{idx}]")
+        except ValueError as exc:
+            raise service_unavailable(str(exc)) from None
+        if norm_ck["id"] in seen_client_key_ids:
+            raise service_unavailable(f"client_keys[{idx}]: duplicate id '{norm_ck['id']}'")
+        seen_client_key_ids.add(norm_ck["id"])
+        if norm_ck["key"] not in provider_secrets:
+            provider_secrets.append(norm_ck["key"])
 
     accounts = cfg.get("accounts")
     warnings = []
