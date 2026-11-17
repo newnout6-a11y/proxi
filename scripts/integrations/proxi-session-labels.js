@@ -4,7 +4,14 @@ export const ProxiSessionLabels = async ({ client }) => ({
     if (input.model.providerID !== "retool-relay") return
     output.headers["X-Proxi-Client"] = "opencode"
     output.headers["X-Proxi-Session-Id"] = input.sessionID
-    output.headers["X-Proxi-Agent"] = input.agent
+    // HTTP/1 headers must be ASCII: an agent named in Cyrillic, CJK or emoji made fetch throw before the request went out,
+    // so every turn of that agent failed. Such a name goes percent-encoded, and the relay decodes it.
+    const agent = String(input.agent ?? "")
+    try {
+      output.headers["X-Proxi-Agent"] = /^[ -~]*$/.test(agent) ? agent : encodeURIComponent(agent)
+    } catch {
+      // A name that cannot be encoded (half of a surrogate pair) is left out: it is a label and must not fail a turn.
+    }
     try {
       const result = await client.session.get({ path: { id: input.sessionID } })
       const session = result.data

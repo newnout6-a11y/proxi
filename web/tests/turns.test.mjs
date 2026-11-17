@@ -1,12 +1,48 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { STALE_AFTER, STALE_MARGIN, TASK_LABEL, buildTraces, costOf, effortText, phasesOf, scaleOf, staleLimit, statusAt } from '../src/turns.js';
+import { STALE_AFTER, STALE_MARGIN, TASK_LABEL, buildTraces, costOf, effortText, phasesOf, scaleOf, speedOf, staleLimit, statusAt } from '../src/turns.js';
+import { fmtSpeed } from '../src/format.js';
 import { MIN_FORECAST_SECONDS, burnRate, coverageOf, coveredSeconds, fmtSince, fmtSpan, uncoveredBuckets } from '../src/coverage.js';
 
 const ev = (ts, kind, data = {}) => ({ ts, kind, data, turn_id: 'test-turn' });
 const finish = (ts, duration, reason = 'stop') => ev(ts, 'turn.end', { reason, duration_ms: duration });
 const relayStart = (ts) => ({ ts, kind: 'relay.start', data: {} });
 const forTurn = (id, events) => events.map((event) => ({ ...event, turn_id: id }));
+
+test('request speed uses completed authoritative telemetry, never guesses from usage or elapsed phases', () => {
+  const events = [ev(100, 'turn.begin'), ev(101, 'upstream.usage', { output_tokens: 200 }),
+    ev(104, 'turn.end', { reason: 'stop', duration_ms: 1000 }),
+    ev(104, 'request.speed', { reason: 'stop', duration_ms: 4000, output_tokens: 200, tokens_per_second: 50 })];
+  const [trace] = buildTraces(events);
+  assert.equal(speedOf(trace), 50);
+  assert.equal(fmtSpeed(speedOf(trace)), '50\u00a0ток/с');
+  assert.equal(speedOf(buildTraces(events.slice(0, -1))[0]), null);
+  assert.equal(speedOf(buildTraces([ev(100, 'turn.begin'), finish(104, 4000)])[0]), null);
+  assert.equal(speedOf({ ...trace, outputTokens: 0, tokensPerSecond: 0 }), 0);
+  assert.equal(fmtSpeed(0), '0\u00a0ток/с');
+  assert.equal(fmtSpeed(0.001), '<0,1\u00a0ток/с');
+  for (const status of ['running', 'cancelled', 'error', 'interrupted']) assert.equal(speedOf({ ...trace, status }), null);
+  for (const tokensPerSecond of [undefined, null, true, '50', -1, Infinity, NaN]) {
+    assert.equal(speedOf({ ...trace, tokensPerSecond }), null);
+    assert.equal(fmtSpeed(tokensPerSecond), '—');
+  }
+  for (const outputTokens of [null, true, '200', -1, 1.5, Infinity, NaN]) assert.equal(speedOf({ ...trace, outputTokens }), null);
+  for (const speedDuration of [null, true, '4000', 0, -1, Infinity, NaN]) assert.equal(speedOf({ ...trace, speedDuration }), null);
+});
+
+test('account retry turn ends cannot replace full request speed or count it twice', () => {
+  const events = [
+    ...forTurn('failed-account', [ev(100, 'turn.begin'), finish(103, 3000, 'error')]),
+    ...forTurn('final-account', [ev(103, 'turn.begin'), finish(104, 1000),
+      ev(104, 'request.speed', { reason: 'stop', duration_ms: 4000, output_tokens: 200, tokens_per_second: 50 })]),
+  ];
+  const traces = buildTraces(events);
+  assert.equal(speedOf(traces.find(trace => trace.id === 'failed-account')), null);
+  const final = traces.find(trace => trace.id === 'final-account');
+  assert.equal(final.duration, 1000);
+  assert.equal(final.speedDuration, 4000);
+  assert.equal(speedOf(final), 50);
+});
 
 test('unknown credits remain unknown and explicit zero remains known', () => {
   const [unknown] = buildTraces([ev(100, 'turn.begin'), ev(101, 'upstream.usage', { credits: null }), finish(102, 2000)]);

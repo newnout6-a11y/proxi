@@ -179,3 +179,47 @@ def test_the_other_dialects_infer_the_same_way(prompt_relay, dialect):
     assert relay.post(dialect, client_request(dialect, messages), {"user-agent": "headerless-agent/1"})[0] == 200
     assert len(relay.events(mark, "native_history.resume")) == 1
     assert signatures_in(relay.posts[-1]) == ["opaque-one"]
+
+
+def test_after_a_restart_a_conversation_kept_on_disk_is_found_by_its_history():
+    first = ConversationIndex()
+    key, how = first.identify("m", "sys", digests("hi"))
+    assert how == "new"
+    stored = {key}  # the conversation's state was saved under its key, then the relay restarted: a new, empty index
+    second = ConversationIndex()
+    found, how = second.identify("m", "sys", digests("hi", "answer", "more"), stored.__contains__)
+    assert (found, how) == (key, "stored")
+    # and the next request of it continues under that key as before
+    assert second.identify("m", "sys", digests("hi", "answer", "more", "again", "next"))[0] == key
+
+
+def test_the_longest_stored_prefix_wins_and_nothing_stored_is_a_new_conversation():
+    index = ConversationIndex()
+    short = index.identify("m", "sys", digests("a"))[0]
+    longer = ConversationIndex().identify("m", "sys", digests("a", "b", "c"))[0]
+    found, how = ConversationIndex().identify("m", "sys", digests("a", "b", "c", "d", "e"), {short, longer}.__contains__)
+    assert (found, how) == (longer, "stored")
+    alone, how = ConversationIndex().identify("m", "sys", digests("x", "y"), set().__contains__)
+    assert how == "new" and alone not in (short, longer)
+    # another system prompt never adopts a stored conversation of this one
+    other, how = ConversationIndex().identify("m", "other", digests("a", "b", "c", "d"), {short, longer}.__contains__)
+    assert how == "new"
+
+
+def test_a_headerless_conversation_resumes_its_signed_history_after_a_relay_restart(prompt_relay, tmp_path):
+    state = str(tmp_path / "state")
+    first = prompt_relay(conversation_state_dir=state)
+    messages = copy.deepcopy(USER)
+    for script in (tool_reply("c1", "opaque-one"), tool_reply("c2", "opaque-two")):
+        first.scripts.append(script)
+        status, payload, _ = first.post("chat", client_request("chat", messages), HARNESS)
+        assert status == 200, payload
+        messages = after_tool_call("chat", messages, payload)
+    first.runtime.close()  # a restart: the index of headerless conversations is in memory, the signed history on disk
+    second = prompt_relay(conversation_state_dir=state)
+    mark = second.mark()
+    second.scripts.append([text("done"), *END])
+    assert second.post("chat", client_request("chat", messages), HARNESS)[0] == 200
+    assert signatures_in(second.posts[-1]) == ["opaque-one", "opaque-two"]  # it went cold, with no signature, before
+    assert [event["data"].get("how") for event in stored(mark, "conversation.inferred")] == ["stored"]
+    assert not second.events(mark, "native_history.cold")

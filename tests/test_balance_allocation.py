@@ -7,7 +7,6 @@ import pytest
 
 import account_report
 import console_log
-import credits
 import proxy
 from credits import CreditsManager
 from test_review_fixes_proxy import multi  # noqa: F401 - fixture

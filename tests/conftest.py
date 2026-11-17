@@ -14,7 +14,6 @@ import urllib.request
 
 import pytest
 
-import apierr
 import proxy
 import config as config_module
 
@@ -143,6 +142,25 @@ def pinned_calendar(monkeypatch):
     import datetime
     import models
     monkeypatch.setattr(models, "_today", lambda: datetime.date(2026, 11, 5))
+
+
+@pytest.fixture(autouse=True)
+def diagnostics_in_a_temporary_folder(monkeypatch, tmp_path_factory):
+    """A config without upstream_error_dir writes its refused bodies to upstream_diagnostics.DEFAULT_DIR, relative to the
+    folder the run started in. A run from a checkout filled its logs/upstream-400 with scripted refusals (102 sets a run)
+    and pruned it to the newest 50: from the folder the relay works in, that deleted the real diagnostics kept there."""
+    import upstream_diagnostics
+    monkeypatch.setattr(upstream_diagnostics, "DEFAULT_DIR", str(tmp_path_factory.getbasetemp() / "upstream-400"))
+
+
+@pytest.fixture(autouse=True)
+def edits_remembered_by_this_test_only(monkeypatch):
+    """prompt_body remembers what a regular expression edit made of a text for as long as the revision lives: a test starts
+    with nothing remembered, so a refusal one test forced is not the result of another."""
+    import collections
+    import prompt_body
+    monkeypatch.setattr(prompt_body, "_EDIT_MEMO", collections.OrderedDict(), raising=False)
+    monkeypatch.setattr(prompt_body, "_EDIT_MEMO_HELD", [0], raising=False)
 
 
 @pytest.fixture(autouse=True)

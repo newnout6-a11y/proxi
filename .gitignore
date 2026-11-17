@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 *.bak
 *.log
+.ruff_cache/
 
 # runtime secrets and state (keep config.example.json in git)
 config.json
@@ -13,6 +14,8 @@ cookies.txt
 relay_key.txt
 commands.log
 relay.log
+# the old relay.log files the supervisor keeps beside it (scripts/run_relay.ps1: .1 to .3)
+relay.log.*
 relay.pid
 crash.log
 journal.jsonl
@@ -44,3 +47,11 @@ probes/chunks/
 
 # agent scratch work
 .agents/
+
+# Editor and agent tool state of this machine
+.zcode/
+.claude/worktrees/
+.claude/settings.local.json
+
+# A state folder for `python proxy.py --state-dir state` (journal, command log, conversations, upstream-400 dumps)
+/state/

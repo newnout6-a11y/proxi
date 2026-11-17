@@ -11,7 +11,6 @@ Code and the DeepSeek harness paid for each with failed tool calls:
   the booleans and lists of tavily_search."""
 import asyncio
 import copy
-import json
 
 import pytest
 

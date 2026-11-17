@@ -34,7 +34,8 @@ class StreamWriter:
         if self.broken:
             return
         try:
-            data = text.encode("utf-8")
+            # backslashreplace: a lone surrogate a client sent (U+D83D alone) stays a valid JSON escape instead of raising
+            data = text.encode("utf-8", "backslashreplace")
             self.handler.wfile.write(data)
             self.handler.wfile.flush()
             trace = getattr(self.handler, "_client_trace", None)

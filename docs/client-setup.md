@@ -1,7 +1,7 @@
 # Coding clients
 
 Current route availability and installed-client evidence are recorded in
-[the model/client audit](model-client-audit-2026-11-04.md). A previous client
+[the model/client audit](reports/model-client-audit-2026-11-04.md). A previous client
 setup or historical benchmark below does not establish that today's installed
 profile contains the same provider or that an old model/effort is still accepted.
 
@@ -132,8 +132,8 @@ The relay holds such a location where it first saw it (`prompt_stabilizer.SkillL
 (by working folder, name and description) is written into every later prompt, so the head stays put. The name and the
 description are the skill and are never touched, and `skill({name})` loads by name, so the model can still load every skill.
 A remembered file that is gone while the new one exists gives way to the new one, so the model is never pointed at a file that
-does not exist; an entry is forgotten after a week. The memory is written to `<conversation_state_dir>/client-prompts.json`
-and survives a relay restart. `prompt.stabilized` (debug) names what was held. `stabilize_client_prompts: false` in
+does not exist; an entry not used for a week is forgotten. The memory is written to `<conversation_state_dir>/client-prompts.json`
+(the time of use of a skill at most an hour late) and survives a relay restart. `prompt.stabilized` (debug) names what was held. `stabilize_client_prompts: false` in
 `config.json` switches this off.
 
 The same prompt carries `Today's date: ...`, regenerated on every request, so a conversation that crosses midnight rewrites its
@@ -265,8 +265,15 @@ selector GLM has today.
 `scripts/probe_client_settings.py` runs the installed clients against a local fake
 server with a deliberately invalid key. It finds the newest OpenCode Desktop CLI
 itself (override any client with `--executable`) and removes credential-like
-variables from the child environment. OpenCode gets no model request until its
-resolved configuration shows the fake endpoint, and the probe fails unless the fake
+variables from the child environment. The override moves only the `retool-relay`
+provider, so the OpenCode run is pinned to it as well: the probe passes `--model`
+and puts the default, small and agent models (build, explore, general, title,
+summary, compaction) in the override, keeping your own `retool-relay` choices and
+replacing a model of any other provider, which would otherwise get a real request
+with your own credentials (`auth.json`). OpenCode gets no model request until its
+resolved configuration shows the fake endpoint and only `retool-relay` models
+(OpenCode 2 lists its configuration sources unmerged, so there a model of another
+provider in any of them refuses the run), and the probe fails unless the fake
 server received requests, so an ignored endpoint override cannot pass silently; a
 client that ignored it would still carry only the invalid key, which the real relay
 rejects.
@@ -299,7 +306,11 @@ by that name and display name.
 To preview or update an existing profile, use `scripts/sync_harness_catalog.py
 --settings PATH`. Preview writes only with `--output`; replacing the profile
 requires `--write --backup-dir`. The utility splices only the Proxi blocks and
-keeps other bytes intact, including date headers and plugin source. The active
+keeps other bytes intact, including date headers and plugin source. It writes at
+the profile's own indentation (two spaces or four), and an anchor or tag on the
+provider's key line (`retool: &relay`) stays there; a Proxi block that another key
+shares through an alias (`*relay`, `<<: *relay`) is refused until the alias is
+expanded, because changing it would change that key too. The active
 provider/model and credentials are preserved. Both installed SDK versions
 passed default, off, high and rejection checks with the exact generated files;
 the SDK bundles and Desktop ASAR were not modified.
@@ -338,8 +349,10 @@ The first request of each conversation is journaled as `conversation.inferred` (
 metadata, a plugin that sets `x-proxi-session-id`) keeps it: nothing is inferred for it.
 
 An inferred conversation is a pool conversation like any other: it is kept 15 minutes after its last request, warmed
-by the cache keepwarm while it lasts, and stored for a restart. The index is in memory (24 hours, 20000 histories),
-so after a relay restart a Harness chat continues under a new key once and then as before.
+by the cache keepwarm while it lasts, and stored for a restart. The index is in memory (24 hours, 20000 histories); after
+a relay restart the first request of a Harness chat finds its stored conversation by its history (the longest history prefix
+a stored conversation began with) and resumes its signed history under the same key (`conversation.inferred`, `how:
+stored`).
 
 Harness 0.2.2-alpha.3 and later also offer the explicit way, the `llm-pi-ai/request-headers` plugin hook; a plugin that
 sets `x-proxi-session-id` to the hook's `request.sessionId` (and `x-proxi-client: harness`) gives an exact identity that
@@ -541,7 +554,7 @@ were disabled for the diagnostic; client project instructions were preserved.
 These are captured-request replay observations, not a live GUI latency promise.
 
 Direct model API findings and access limitations are recorded in
-[direct-inference-audit.md](direct-inference-audit.md). This follow-up does not
+[direct-inference-audit.md](reports/direct-inference-audit.md). This follow-up does not
 silently switch the client's model, credential or inference context.
 
 ## Codex
@@ -628,24 +641,33 @@ The relay keeps, per client and project, the tools a Codex has declared (`tool_u
 those and the ones it declares itself, so request 1 already carries what request 2 will bring and nothing changes upstream when
 a server comes up. What decides it:
 
-- **Whose list.** The client family (`tool_union_clients`, `["codex"]` by default, `[]` is off), the originator (the CLI and
-  the Desktop differ: 60 tools against 97), the model (the client builds a list per model), root agent or sub-agent
-  (`x-openai-subagent`, `x-codex-parent-thread-id`), the working folder (`<cwd>` of the environment context) and the prompt
-  profile and its revision. A conversation in another project, with another model, or a sub-agent does not inherit a list.
+- **Whose list.** The client family (`tool_union_clients`, `["codex", "claude-code"]` by default, `[]` is off), the
+  originator (the CLI and the Desktop differ: 60 tools against 97), the model (the client builds a list per model), root agent
+  or sub-agent (`x-openai-subagent`, `x-codex-parent-thread-id`, `x-claude-code-agent-id`), the working folder (`<cwd>` of the
+  environment context, or Claude Code's "Primary working directory"), the prompt profile and what it does to tools, and for
+  Claude Code the kind of agent (the opening of its system text, the attribution line left out). A conversation in another
+  project, with another model, or a sub-agent does not inherit a list. A tool the profile hides is never carried in.
+- **Who gets the whole union.** A new conversation (and a request without a conversation identity). A conversation that is
+  already running keeps the list it was given: what it declares, plus what it was given before, in the same definitions, so a
+  tool another session of the same key declares (an IDE's MCP server beside a terminal session) does not change its list, and
+  neither does the expiry of a carried tool. The relay remembers this for the last 512 conversations, in memory: after a
+  restart a running conversation is given the whole union once.
 - **Which definition.** A tool the client names in this request is the client's, in its newest definition; a tool it does not
   name is carried with the definition it had last. The upstream order is by name, so the order of declaration never matters.
 - **How long.** A tool the client has not declared for `tool_union_ttl` seconds (six hours) is dropped, so a server the user
   removes is gone from the list within hours; one union holds 400 tools at most, 64 clients are kept, a definition over 64 KB is
-  not carried. The memory is in the relay process: after a restart the first conversation learns the list again.
+  not carried. The union is kept in `<conversation_state_dir>/tool-union.json` and read back at start (without the tools not
+  declared for `tool_union_ttl`), so it survives a restart; it is in memory only when `conversation_state` is `false`.
 - **When the model calls a tool the client did not declare in this request.** If the client declared it before, the call goes to
   the client like any other (`tool.call` carries `"carried": true`). Codex 0.167 answers it with the tool result `unsupported
   call: ...` and goes on with the turn, also when the server has come up since (it routes a call with the tool list of the request
   that produced it); the model reads the error, and from the next request on the client declares the tool, so a retry works. A
   name the client never declared stays what it was: it is not passed on, and `tool.call_dropped` names it.
 
-`tools.carried` (info) says once per change how many tools were carried and which. Only the family `codex` is listed by default:
-Claude Code's list changes with what its ToolSearch loads, and OpenCode's with the agent, and a union would give an agent tools
-it was not given.
+`tools.carried` (info) says once per change how many tools were carried and which. The families `codex` and `claude-code` are
+listed by default. A request that carries Claude Code's tool search (`claude_tool_search` `native`, or after the loop guard)
+neither feeds the union nor is given it, since its list changes with what ToolSearch loads. OpenCode stays out: its list
+changes with the agent, and a union would give an agent tools it was not given.
 
 ### Compaction in Codex reads the cache of the chat
 

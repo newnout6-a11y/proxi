@@ -3,7 +3,6 @@ generators; a generator that is closed late leaves the state of a newer turn alo
 import asyncio
 import gc
 
-import pytest
 
 import apierr
 import client_context

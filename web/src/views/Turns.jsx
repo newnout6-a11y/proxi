@@ -5,8 +5,8 @@ import { Section, ease } from '../motion.jsx';
 import { Empty, Tag } from '../ui.jsx';
 import { TapeLegend, TurnTape } from '../charts.jsx';
 import { LEVELS, STATUS_TONE, TURN_STATUS } from '../catalog.js';
-import { TASK_LABEL, buildTraces, costOf, effortText, phasesOf, scaleOf, staleLimit, statusAt } from '../turns.js';
-import { fmtAgo, fmtClock, fmtFixed, fmtInt, fmtMs, fmtTokens } from '../format.js';
+import { TASK_LABEL, buildTraces, costOf, effortText, phasesOf, scaleOf, speedOf, staleLimit, statusAt } from '../turns.js';
+import { fmtAgo, fmtClock, fmtFixed, fmtInt, fmtMs, fmtSpeed, fmtTokens } from '../format.js';
 import { TurnsArt } from '../stage/Art.jsx';
 
 const LIVE_PHASE = { wait: 'ждём upstream', think: 'upstream: thinking', tools: 'аргументы инструмента', out: 'пишет ответ', exec: 'выполняет команду' };
@@ -16,6 +16,7 @@ const costNote = (cost) => (cost.running ? 'ход идёт' : cost.credits === 
 const costTitle = (cost) => (cost.running ? 'Ход ещё идёт: стоимость будет известна, когда upstream ответит'
   : cost.credits === null ? 'Стоимость не сообщена' : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена');
 const lowerBound = (cost) => cost.credits !== null && !cost.complete;
+const SPEED_TITLE = 'Выходные токены / время обработки запроса до завершения runner, включая ожидание, мышление, повторы и смену аккаунта, поиск и команды relay. Без отправки последних байтов клиенту. Не скорость декодирования; без полных данных — прочерк.';
 
 function Steps({ trace }) {
   const start = trace.started;
@@ -100,6 +101,7 @@ export default function Turns({ journal, overview, embedded }) {
                     {phases.tools > 0 && <span title="Генерация аргументов инструментов">инструменты {fmtMs(phases.tools)}</span>}
                     {phases.exec > 0 && <span title="Выполнение локальных команд relay; входит в «без детализации»">команды {fmtMs(phases.exec)}</span>}
                     <span>всего {fmtMs(phases.total)}</span>
+                    <span className="trace-speed" title={SPEED_TITLE}>скорость {fmtSpeed(speedOf(trace))}</span>
                   </span>
                 </span>
                 <span className="trace-num">{fmtMs(trace.ttft)}</span>

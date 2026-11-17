@@ -75,7 +75,10 @@ def http_errors(since):
     return [event for event in journal.JOURNAL.query(since=since, limit=20000) if event["kind"] == "http.error"]
 
 
-@pytest.mark.parametrize("reason", ["cancelled", "timeout"])
+# A turn ends "cancelled" while its client still reads only when the relay is stopping, which is a 503 for the client
+# (test_shutdown_cut_reply.py); when the client left, the handler cancels the turn and nobody reads the end. The adapter's
+# handling of a cancelled turn is tested above; over HTTP the clock's cut is what a client still connected can see.
+@pytest.mark.parametrize("reason", ["timeout"])
 def test_a_streamed_turn_cut_in_a_patch_is_no_error_in_the_journal(relay, reason):
     relay.fake.script = [{"type": "tool_call", "id": "c1", "name": "apply_patch", "tool_type": "custom",
                           "arguments": CUT}, {"type": "end", "reason": reason}]
@@ -87,7 +90,7 @@ def test_a_streamed_turn_cut_in_a_patch_is_no_error_in_the_journal(relay, reason
     assert http_errors(seq) == []
 
 
-@pytest.mark.parametrize("reason", ["cancelled", "timeout"])
+@pytest.mark.parametrize("reason", ["timeout"])
 def test_a_whole_answer_to_a_turn_cut_in_a_patch_is_no_error_either(relay, reason):
     relay.fake.script = [{"type": "tool_call", "id": "c1", "name": "apply_patch", "tool_type": "custom",
                           "arguments": CUT}, {"type": "end", "reason": reason}]

@@ -6,6 +6,7 @@ Opus dialog of 2026-11-06: seven of twelve turns started with native_history.res
 tokens, 7 to 21 credits each, 47% of what the build agent cost). The date line of the same prompt flips at midnight."""
 import copy
 import json
+import threading
 
 import pytest
 
@@ -111,6 +112,93 @@ def test_a_prompt_with_no_skills_is_returned_as_it_is():
     assert SkillLocations().stabilize("You are an agent.") == ("You are an agent.", [])
 
 
+def test_skills_used_every_day_survive_a_restart_a_week_after_they_were_first_seen(tmp_path):
+    """Only a new skill wrote the file, so the times in it stayed those of the first day: the first restart a week later
+    dropped every skill in daily use, and each conversation going on got a new head (native_history.reset)."""
+    now = [1000.0]
+    path = str(tmp_path / prompt_stabilizer.FILE_NAME)
+    memory = SkillLocations(path, clock=lambda: now[0], exists=lambda path: True)
+    memory.stabilize(system(FIRST))
+    for _ in range(8):
+        now[0] += 24 * 3600
+        assert memory.stabilize(system(OTHER)) == (system(FIRST), ["stageshow", "unslop"])
+    now[0] += 60
+    again = SkillLocations(path, clock=lambda: now[0], exists=lambda path: True)
+    assert again.stabilize(system(OTHER)) == (system(FIRST), ["stageshow", "unslop"])
+
+
+def test_a_skill_in_use_rewrites_the_file_at_most_once_an_hour(tmp_path, monkeypatch):
+    now = [1000.0]
+    memory = SkillLocations(str(tmp_path / prompt_stabilizer.FILE_NAME), clock=lambda: now[0], exists=lambda path: True)
+    writes, write = [], memory._write
+    monkeypatch.setattr(memory, "_write", lambda document: writes.append(now[0]) or write(document))
+    memory.stabilize(system(FIRST))  # new skills: written at once
+    for later in (10, 600, 2000):
+        now[0] = 1000.0 + later
+        memory.stabilize(system(OTHER))
+    assert writes == [1000.0]
+    now[0] = 1000.0 + prompt_stabilizer.TOUCH_SAVE_EVERY
+    memory.stabilize(system(OTHER))
+    assert writes == [1000.0, 1000.0 + prompt_stabilizer.TOUCH_SAVE_EVERY]
+
+
+def test_requests_that_learn_skills_at_the_same_time_leave_the_newest_memory_on_disk(tmp_path, monkeypatch):
+    """Two request threads wrote one temporary file at once: the rename of one failed while the other held the file open
+    (Windows), and the file put in place was the older document written over the start of the newer one."""
+    path = tmp_path / prompt_stabilizer.FILE_NAME
+    memory = SkillLocations(str(path), exists=lambda path: True)
+    writing, go = threading.Event(), threading.Event()
+    real_open = open
+
+    class SlowDisk:  # the first write of the file waits, as a slow disk makes the thread writing it wait
+        def __init__(self, handle):
+            self.handle = handle
+
+        def write(self, data):
+            if not writing.is_set():
+                writing.set()
+                assert go.wait(10)
+            return self.handle.write(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.handle.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    monkeypatch.setattr(prompt_stabilizer, "open", lambda *args, **kwargs: SlowDisk(real_open(*args, **kwargs)),
+                        raising=False)
+    first = threading.Thread(target=memory.stabilize, args=(system(FIRST),))
+    first.start()
+    assert writing.wait(10)
+    second = threading.Thread(target=memory.stabilize, args=(system(FIRST, folder="C:\\work\\other"),))
+    second.start()
+    second.join(10)  # it does not wait for the disk: its change is left to the thread that is writing
+    go.set()
+    first.join(10)
+    assert not first.is_alive() and not second.is_alive()
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert sorted((folder, name) for folder, name, *_ in document["skills"]) == [
+        ("C:\\work\\other", "stageshow"), ("C:\\work\\other", "unslop"),
+        ("C:\\work\\project", "stageshow"), ("C:\\work\\project", "unslop")]
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_half_of_a_surrogate_pair_in_a_skill_fails_neither_the_prompt_nor_the_file(tmp_path, monkeypatch):
+    """A client that cuts a description inside an emoji sends half of the pair as a JSON escape: encoding it for the digest
+    raised, and every request of that client went unstabilized."""
+    monkeypatch.setitem(DESCRIPTION, "stageshow", "Build faux product UI \ud83d")
+    cut = {"stageshow": AGENTS % "stageshow\ud83d", "unslop": CLAUDE % "unslop"}
+    path = tmp_path / prompt_stabilizer.FILE_NAME
+    assert SkillLocations(str(path), exists=lambda path: True).stabilize(system(cut)) == (system(cut), [])
+    again = SkillLocations(str(path), exists=lambda path: True)
+    moved = {"stageshow": CLAUDE % "stageshow", "unslop": AGENTS % "unslop"}
+    assert again.stabilize(system(moved)) == (system(cut), ["stageshow", "unslop"])
+
+
 # -- the date --------------------------------------------------------------------------------------------------------
 
 def test_a_conversation_keeps_the_date_it_began_with_until_it_has_been_idle_for_a_while():
@@ -192,3 +280,21 @@ def test_the_date_is_held_only_when_asked_for(prompt_relay, asked, expected):
     sent = two_processes(relay, system(FIRST, date="Fri Nov 06 2026"), system(FIRST, date="Sat Nov 07 2026"))
     assert "Today's date: " + expected in head_of(sent[1])
     assert (head_of(sent[0]) == head_of(sent[1])) is asked
+
+
+def test_the_admin_preview_shows_the_locations_the_relay_holds_and_remembers_nothing(prompt_relay):
+    """The preview showed the client's system as the client sent it: for an OpenCode process that lists a skill from the
+    other folder, another location and another head than the model got, so a user hunting a cache reset was pointed at a
+    difference that never reached the model."""
+    relay = prompt_relay()
+    two_processes(relay, system(FIRST), system(FIRST))
+    memory = relay.runtime.stabilizer.skills
+    before = copy.deepcopy(dict(memory._memory))
+    result = relay.runtime.prompts.preview(client_request("chat", copy.deepcopy(USER), system=system(OTHER)), "chat",
+                                           OPENCODE)
+    assert AGENTS % "stageshow" in result["head"] and CLAUDE % "stageshow" not in result["head"]
+    assert any("as the relay holds it" in line for line in result["warnings"])
+    elsewhere = relay.runtime.prompts.preview(
+        client_request("chat", copy.deepcopy(USER), system=system(OTHER, folder="C:\\work\\new")), "chat", OPENCODE)
+    assert CLAUDE % "stageshow" in elsewhere["head"]  # a folder the relay has not seen: shown as sent
+    assert dict(memory._memory) == before  # the preview learned and touched nothing

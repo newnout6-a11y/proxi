@@ -7,6 +7,7 @@ characters whose case folding the patterns' (?i) reaches), so that a trigger tha
 difference.
 """
 import random
+import time
 
 import pytest
 
@@ -135,3 +136,21 @@ def test_an_event_is_cleaned_in_every_field_and_key():
     assert secret not in str(event)
     assert event["data"]["nested"]["list"] == ["[redacted]", 1]
     assert "[redacted]" in event["data"]
+
+
+@pytest.mark.parametrize("text", ["build-" * 5000 + "disk-usage ok", "a-" * 16000 + " task-list", "x-" * 16000 + "key=1"])
+def test_a_long_run_of_hyphenated_words_is_redacted_in_linear_time(text):
+    """The two `name = value` patterns started a name at every '-' of a run and scanned the rest of it each time: 32k
+    characters of 'build-build-...' in a command output took 13 s on the relay's event loop (audit of 2026-11-08)."""
+    started = time.perf_counter()
+    assert redact.redact(text) == text
+    assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize("text, secret", [
+    ("--token: abcdefghijklmnop", "abcdefghijklmnop"), ("X" * 70 + "_API_KEY=abcdefghijklmnop", "abcdefghijklmnop"),
+    ('my-app-token = "secretvalue123"', "secretvalue123"), ("'db-password' : 'hunter2hunter2'", "hunter2hunter2"),
+    ("build-build-client_secret=abcdefghijklmnop", "abcdefghijklmnop"),
+])
+def test_names_with_dashes_and_long_names_are_masked_as_before(text, secret):
+    assert secret not in redact.redact(text)

@@ -184,16 +184,16 @@ def test_streaming_responses_have_cors_and_accept_same_key(relay):
 
 
 def test_legacy_cli_authenticates_and_renders_thinking(relay, monkeypatch, capsys):
-    import test_client
+    from scripts import relay_client
     relay.fake.script = [{"type": "thinking", "delta": "REAL_PROVIDER_SUMMARY"},
                          {"type": "text", "delta": "ANSWER"}]
-    monkeypatch.setattr("sys.argv", ["test_client.py", "hi", "--url", relay.url, "--key", relay.key])
-    test_client.main()
+    monkeypatch.setattr("sys.argv", ["relay_client.py", "hi", "--url", relay.url, "--key", relay.key])
+    relay_client.main()
     output = capsys.readouterr().out
     if "[Answer]" not in output:
         # CI-only transient (Windows runners): the first connection can be
         # refused/aborted against a live relay; the fixture is still serving.
-        test_client.main()
+        relay_client.main()
         output = capsys.readouterr().out
     assert "[Thinking]" in output and "REAL_PROVIDER_SUMMARY" in output
     assert "[Answer]" in output and "ANSWER" in output

@@ -3,7 +3,6 @@ import asyncio
 import http.client
 import json
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest

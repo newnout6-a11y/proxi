@@ -848,6 +848,23 @@ def test_a_revision_that_is_too_large_to_name_is_not_pinned_past_a_restart_and_t
     assert relay.stored()["pins"] == {}
 
 
+def test_a_conversation_on_a_revision_too_large_to_name_does_not_rewrite_the_file_on_every_request(relay, monkeypatch):
+    """Its pin is never written, so the file never held what the pin is: every request marked the file out of date, and it
+    was rewritten once a second (an fsync and two folder scans, on the request thread) for the life of the conversation."""
+    (relay.folder / "prompts").mkdir()
+    (relay.folder / "prompts" / "big.md").write_text("x" * (200 * 1024), encoding="utf-8")
+    relay.write(document(default_profile="mine", texts={"t%d" % n: {"file": "prompts/big.md"} for n in range(60)},
+                         profiles={"mine": {"head": "{{client_system}}"}}))
+    store = relay.start()
+    store.plan(conv("chat"))
+    relay.tick(store)
+    seen = spy_replace(monkeypatch)
+    for seconds in (2, 2, pp.PIN_TOUCH_INTERVAL + 1, 2):
+        store.plan(conv("chat"))
+        relay.tick(store, seconds)
+    assert seen == []
+
+
 def test_files_that_are_not_ours_stay_and_a_revision_nobody_names_goes(relay):
     relay.write(doc("V1"))
     store = relay.start()

@@ -3,11 +3,14 @@
 Run with claude, opencode or opencode2. Installed user settings are loaded, with
 only the endpoint/key overridden for this process. A single child agent is
 requested; the fake model never emits file, shell or network tool calls.
+OpenCode's override moves only the retool-relay provider, so its run is pinned
+to that provider too: --model, and the default, small and agent models in the
+override; the user's own retool-relay choices are kept, any other is replaced.
 
 The override is verified rather than assumed: credential-looking variables are
-removed from the child environment, OpenCode must report the fake endpoint in its
-resolved configuration before any model request is sent, and the probe fails
-unless the fake server actually received requests.
+removed from the child environment, OpenCode must report the fake endpoint and
+only retool-relay models in its resolved configuration before any model request
+is sent, and the probe fails unless the fake server actually received requests.
 """
 import argparse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -36,6 +39,13 @@ task_sent = False
 PROBE_KEY = "offline-test-key"
 # Variables a client could use to reach the real relay if an override were ignored.
 CREDENTIAL_ENV = re.compile(r"API[_-]?KEY|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|SECRET|PASSWORD|RELAY|RETOOL", re.I)
+PROVIDER = "retool-relay"
+# The OpenCode agents a probe run can reach: the parent (build), the child the fake spawns (explore;
+# general is the other built-in subagent) and the hidden ones OpenCode starts by itself.
+RUN_AGENTS = ("build", "explore", "general", "title", "summary", "compaction")
+SMALL_AGENTS = ("title", "summary")
+# The parent when none of the user's models is on the relay: the default of the catalog sync.
+DEFAULT_MODEL = "claude-opus-5-5"
 
 
 class ProbeError(RuntimeError):
@@ -143,14 +153,29 @@ def effort_controls(value, depth=0):
     return found
 
 
+def config_documents(config, mode):
+    """The configuration objects of a resolved config: OpenCode 2 lists one per source, unmerged."""
+    if mode == "opencode2" and isinstance(config, list):
+        return [document["info"] for document in config
+                if isinstance(document, dict) and isinstance(document.get("info"), dict)]
+    if mode != "opencode2" and isinstance(config, dict):
+        return [config]
+    raise ProbeError("the client's resolved configuration has an unexpected shape; no model request was sent "
+                     "because the models it would use cannot be checked")
+
+
+def relay_models(config, mode):
+    """The models the client's resolved configuration defines for the relay provider."""
+    section = "providers" if mode == "opencode2" else "provider"
+    configured = {}
+    for info in config_documents(config, mode):
+        configured.update(((info.get(section) or {}).get(PROVIDER) or {}).get("models") or {})
+    return configured
+
+
 def catalog_policy(config, catalog_output, mode, *, allowed_entries=None, require_complete=False):
     """Check both schemas and the listed catalog; migrated disabled flags lie."""
-    if mode == "opencode2":
-        configured = {}
-        for document in config:
-            configured.update((document.get("info") or {}).get("providers", {}).get("retool-relay", {}).get("models", {}))
-    else:
-        configured = config.get("provider", {}).get("retool-relay", {}).get("models", {})
+    configured = relay_models(config, mode)
     if allowed_entries is None:
         managed = {key: '__managed__' for provider, key in models.PROVIDER_RESOURCE_KEY.items() if provider != 'google'}
         allowed_entries = [entry for entry in models.catalog() if models.catalog_routable(entry, managed)]
@@ -207,6 +232,68 @@ def catalog_policy(config, catalog_output, mode, *, allowed_entries=None, requir
     return policy
 
 
+def run_models(config, mode):
+    """(field, reference) for each model setting of `config` that an OpenCode probe run can send a request with.
+
+    OpenCode 2 lists its sources apart, so a field can come once per source there.
+    """
+    found = []
+    for info in config_documents(config, mode):
+        # Any top-level text under a key with "model" in its name, so a renamed small-model key still counts.
+        found += [(key, value) for key, value in info.items() if "model" in key.lower() and isinstance(value, str)]
+        for section in ("agent", "agents"):  # OpenCode 1 and OpenCode 2
+            agents = info.get(section)
+            for name in RUN_AGENTS:
+                agent = agents.get(name) if isinstance(agents, dict) else None
+                if isinstance(agent, dict) and agent.get("model") is not None:
+                    found.append(("%s.%s.model" % (section, name), agent["model"]))
+    return found
+
+
+def is_relay(reference):
+    return isinstance(reference, str) and reference.startswith(PROVIDER + "/")
+
+
+def check_pinned(config, mode):
+    """Refuse a run whose resolved configuration names a model of another provider.
+
+    The probe overrides only the retool-relay endpoint, so such a model would get a real, paid request
+    with the user's own credentials (auth.json, a key in the file), outside the stripped environment.
+    OpenCode 2 lists its sources unmerged, so there a model of another provider in any of them refuses.
+    """
+    stray = sorted({"%s=%s" % (field, reference) for field, reference in run_models(config, mode)
+                    if not is_relay(reference)})
+    if stray:
+        raise ProbeError("the client's resolved configuration uses models of other providers (%s); no model request "
+                         "was sent because it could reach a real provider" % ", ".join(stray))
+
+
+def model_pins(config, mode):
+    """Override settings that keep every model of a probe run on the relay provider, and the run's --model.
+
+    The user's own retool-relay choices are kept, so the probe still tests them; every other model goes to
+    the user's relay default (else one of the relay models). The parent is also passed as --model: with no
+    `model` set, OpenCode runs the model its TUI used last, which no resolved configuration shows.
+    """
+    own = {}
+    for field, reference in run_models(config, mode):
+        if is_relay(reference):
+            own[field.replace("agents.", "agent.", 1)] = reference
+    default = own.get("model")
+    if default is None:
+        configured = relay_models(config, mode)
+        name = DEFAULT_MODEL if DEFAULT_MODEL in configured else next(iter(configured), None)
+        if name is None:
+            raise ProbeError("the client's resolved configuration defines no %s model to pin the run to; "
+                             "no model request was sent" % PROVIDER)
+        default = "%s/%s" % (PROVIDER, name)
+    parent = own.get("agent.build.model") or default
+    small = own.get("small_model") or default
+    agents = {name: {"model": own.get("agent.%s.model" % name) or (small if name in SMALL_AGENTS else parent)}
+              for name in RUN_AGENTS}
+    return {"model": default, "small_model": small, "agent": agents}, parent
+
+
 def routable_entries(relay_config):
     """Catalog the running relay would list for this configuration file.
 
@@ -255,6 +342,18 @@ def run_client(args, **kwargs):
     return subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", **kwargs)
 
 
+def resolved_config(exe, mode, env, cwd, url):
+    """OpenCode's resolved configuration under `env`, refused unless it uses the probe endpoint."""
+    suffix = ["--standalone"] if mode == "opencode2" else []
+    resolved = run_client([exe, "debug", "config", *suffix], env=env, cwd=cwd, timeout=30)
+    resolved.check_returncode()
+    config = json.loads(resolved.stdout)
+    if url + "/v1" not in json.dumps(config):
+        raise ProbeError("the client's resolved configuration does not use the probe endpoint; "
+                         "no model request was sent because it could reach the real relay")
+    return config
+
+
 def main(argv=None):
     global task_sent
     parser = argparse.ArgumentParser(description=__doc__)
@@ -298,27 +397,29 @@ def main(argv=None):
                     "description": "Offline child test", "prompt": "Return SUBAGENT_OK, no tools.", "model": "inherit", "effort": "xhigh", "tools": []}}),
                 "Run the proxi-smoke agent once, then return PROXI_SMOKE_OK. Do not use any other tools."]
     else:
-        config = {"provider": {"retool-relay": {"options": {"baseURL": url + "/v1", "apiKey": PROBE_KEY}}}}
-        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
-        args = [exe, "run", "--format", "json", "--title", "Proxi offline defaults probe", "Return PROXI_SMOKE_OK without tools."]
+        override = {"provider": {PROVIDER: {"options": {"baseURL": url + "/v1", "apiKey": PROBE_KEY}}}}
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(override)
+        args = [exe, "run", "--format", "json", "--title", "Proxi offline defaults probe"]
         if mode == "opencode2":
             args.insert(2, "--standalone")
     passed = False
-    policy = None
+    policy = pinned = None
     try:
         with tempfile.TemporaryDirectory(prefix="proxi-client-probe-") as work:
             if mode != "claude":
+                # The override moves only the relay provider, so the run's models are pinned to it as well,
+                # and the configuration the client resolves with those pins is checked before any request.
+                pins, parent = model_pins(resolved_config(exe, mode, env, work, url), mode)
+                env["OPENCODE_CONFIG_CONTENT"] = json.dumps({**override, **pins})
+                config = resolved_config(exe, mode, env, work, url)
+                check_pinned(config, mode)
+                pinned = {"--model": parent, **pins}
                 suffix = ["--standalone"] if mode == "opencode2" else []
-                resolved = run_client([exe, "debug", "config", *suffix], env=env, cwd=work, timeout=30)
-                resolved.check_returncode()
-                config = json.loads(resolved.stdout)
-                if url + "/v1" not in json.dumps(config):
-                    raise ProbeError("the client's resolved configuration does not use the probe endpoint; "
-                                     "no model request was sent because it could reach the real relay")
                 catalog = run_client([exe, "models", *suffix], env=env, cwd=work, timeout=30)
                 catalog.check_returncode()
                 policy = catalog_policy(config, catalog.stdout, mode, allowed_entries=expected,
                                         require_complete=options.require_complete_catalog)
+                args += ["--model", parent, "Return PROXI_SMOKE_OK without tools."]
             result = run_client(args, env=env, cwd=work, timeout=85)
         try:
             stats = json.loads(result.stdout).get("subagent_stats")
@@ -337,6 +438,7 @@ def main(argv=None):
             passed = passed and policy["passed"]
         report = {"mode": mode, "passed": passed, "executable": exe, "exit_code": result.returncode, "requests": records,
                   "catalog_policy": policy,
+                  "pinned_models": pinned,
                   "subagent_stats": stats,
                   "success_marker": "PROXI_SMOKE_OK" in result.stdout,
                   "stderr_tail": result.stderr[-1000:] if result.returncode else "",

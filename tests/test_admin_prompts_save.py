@@ -211,10 +211,11 @@ def test_the_limit_is_judged_on_the_declared_length_before_a_byte_is_read(api):
         connection.endheaders()  # the promised body never comes
         reply = connection.getresponse()
         assert reply.status == 413 and json.loads(reply.read())["error"]["code"] == "payload_too_large"
-        # The unread body would be taken for the next request: the connection is closed behind the answer.
-        with pytest.raises((http.client.HTTPException, OSError)):
-            connection.request("GET", "/health")
-            connection.getresponse().read()
+        # The unread body would be taken for the next request: the connection is closed behind the answer, and the answer
+        # says so, so a client opens a new connection for its next request instead of sending it into the old one.
+        assert (reply.getheader("connection") or "").lower() == "close"
+        connection.request("GET", "/health")
+        assert connection.getresponse().status in (200, 503)  # a request of its own, not the rest of an unread body
     finally:
         connection.close()
     assert api.store.calls == []

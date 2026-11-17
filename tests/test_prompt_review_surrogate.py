@@ -9,7 +9,7 @@ import pytest
 
 import prompt_policy as pp
 from prompt_support import client_request, prompt_relay  # noqa: F401
-from test_prompt_policy_common import document, make_store, write_json
+from test_prompt_policy_common import document, make_store
 
 HALF = "\ud83d"
 

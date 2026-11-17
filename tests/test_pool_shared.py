@@ -1,5 +1,4 @@
 import asyncio
-import types
 
 from session import SessionPool
 

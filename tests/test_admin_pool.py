@@ -501,3 +501,27 @@ def test_reserve_threshold_and_balance_interval_apply_without_a_restart(admin_re
     assert body["pending_restart"] == ["account_refresh_parallel"]
     dispatcher_ = admin_relay.runtime.accounts
     assert dispatcher_.threshold == 50.0 and dispatcher_.balance_interval == 120.0
+
+
+def test_an_account_whose_base_and_page_come_from_the_environment_is_not_listed_as_removed(tmp_path, monkeypatch):
+    # README: RETOOL_BASE and RETOOL_PAGE_UUID keep the account out of config.json; the file then holds neither
+    for name in ("RETOOL_COOKIE", "RETOOL_XSRF"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RETOOL_BASE", "https://tenant.invalid")
+    monkeypatch.setenv("RETOOL_PAGE_UUID", "page-from-env")
+    monkeypatch.setenv("RELAY_API_KEY", KEY)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"ua": "ua", "cookie": "accessToken=env-pool-cookie", "xsrf": "x",
+                                "workspace_root": str(tmp_path), "provider_resource_name": "__managed__"}),
+                    encoding="utf-8")
+    cfg = config.load(str(path))
+    cfg["host"], cfg["port"] = "127.0.0.1", 0
+    runtime = proxy.Runtime(cfg)
+    try:
+        admin_api = runtime.admin
+        pool = admin_api._pool()
+        assert len(pool) == 1 and pool[0]["pending"] is None  # the account the relay runs on, not "removed"
+        saved = admin_api._saved()
+        assert admin_api._saved_record(saved, pool[0]) is saved
+    finally:
+        runtime.close()

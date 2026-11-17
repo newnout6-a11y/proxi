@@ -4,9 +4,7 @@ isolated request context alignment, effort clamping, and full context preservati
 import asyncio
 import json
 import queue
-import pytest
 
-import apierr
 import config
 import direct
 import models

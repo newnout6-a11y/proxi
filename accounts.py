@@ -12,11 +12,11 @@ import math
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import apierr
 import console_log
 import journal
+from io_workers import DaemonIOExecutor
 
 DEAD_AFTER = 3            # consecutive auth failures before an account leaves the pool
 FORCED_CHECK_GAP = 15.0   # at most one on-demand balance fetch per account per gap
@@ -128,7 +128,9 @@ class AccountDispatcher:
             for state in self.state.values():
                 state["running"].clear()
         self._stop.clear()
-        self._executor = ThreadPoolExecutor(max_workers=self.parallel, thread_name_prefix="account-check")
+        # Daemon workers: a ThreadPoolExecutor is joined at interpreter exit, and a balance or renewal call under way
+        # (10-15 s network timeouts) kept a stopped relay alive after Ctrl+C.
+        self._executor = DaemonIOExecutor(self.parallel, thread_name_prefix="account-check")
         self._thread = threading.Thread(target=self._loop, name="account-dispatcher", daemon=True)
         self._thread.start()
 
@@ -188,12 +190,16 @@ class AccountDispatcher:
                 if snapshot and "exhausted" not in state["reasons"] and now - state["last_forced"] >= FORCED_CHECK_GAP:
                     # A local debit crossed the threshold: confirm with the server now.
                     local = console_log.number(snapshot().get("available"), signed=True)
-                    if local is not None and local < self.threshold:
+                    if local is not None and (local <= 0 or local < self.threshold):
                         state["next_balance"] = min(state["next_balance"], now)
                         state["last_forced"] = now
                 if self.interval > 0 and now >= state["next_refresh"]:
                     kind = "refresh"
-                elif manager is not None and now >= state["next_balance"]:
+                elif (manager is not None and now >= state["next_balance"]
+                      and not ("auth_dead" in state["reasons"] and self.interval > 0)):
+                    # A signed-out account's balance fetch meets a 401 and renews the session itself (Refresher.call): one
+                    # POST /api/refreshtoken a minute, past the backoff of the renewals above. Its balance is checked
+                    # again as soon as a renewal brings it back (next_balance is in the past by then).
                     kind = "balance"
                 else:
                     continue
@@ -221,7 +227,8 @@ class AccountDispatcher:
 
     # -- state ---------------------------------------------------------------
     def _set_reason(self, backend, reason, details):
-        """Returns True when routing eligibility changed. Caller holds the lock."""
+        """Returns True when the reason the account is out of the pool changed: it left, came back, or is out for another
+        reason now. Caller holds the lock."""
         state = self.state[backend]
         before = backend.unavailable
         if details is None:
@@ -229,9 +236,12 @@ class AccountDispatcher:
         else:
             state["reasons"][reason] = dict(details, reason=reason)
         reasons = state["reasons"]
-        # A parked account is never a reserve candidate, even when its balance is also low.
-        backend.unavailable = reasons.get("rate_limited") or reasons.get("exhausted") or reasons.get("auth_dead")
-        return (before is None) != (backend.unavailable is None)
+        # A parked account is never a reserve candidate, even when its balance is also low; nor is a signed-out one, whose
+        # requests all fail. Below the balance threshold too, a signed-out account used to show as "exhausted": it stayed a
+        # reserve, the richest one took every turn (a 401, then a failover logged as an empty balance), the alert that it
+        # needs a new sign-in never came, and a lone such account answered 402 "top up" instead of 503.
+        backend.unavailable = reasons.get("rate_limited") or reasons.get("auth_dead") or reasons.get("exhausted")
+        return (before or {}).get("reason") != (backend.unavailable or {}).get("reason")
 
     def _announce(self, backend, changed, reason=None):
         """`reason` is the state captured under the lock that changed it."""
@@ -241,6 +251,8 @@ class AccountDispatcher:
         if reason is None:
             text = "[account] %s снова в пуле" % label
             journal.emit("account.available", text, "success", account=tag)
+        elif reason["reason"] == "rate_limited":
+            return  # mark_rate_limited says it itself, with the time the account comes back
         elif reason["reason"] == "exhausted":
             text = "[account] %s исключён: баланс %s < %s" % (
                 label, console_log.amount(reason.get("available"), signed=True), console_log.amount(self.threshold))
@@ -368,9 +380,10 @@ class AccountDispatcher:
                     continue
                 state["rl_released"] = now
                 if self._set_reason(backend, "rate_limited", None):
-                    released.append(backend)
-        for backend in released:
-            self._announce(backend, True, None)
+                    # Back in the pool, or out for another reason it had meanwhile (a low balance, a dead session).
+                    released.append((backend, backend.unavailable))
+        for backend, reason in released:
+            self._announce(backend, True, reason)
         return bool(released)
 
     def recheck_exhausted(self):
@@ -399,7 +412,8 @@ class AccountDispatcher:
                                                        else 60.0 if not fresh else 3600.0)
             if fresh:
                 state["available"] = available
-                if available < self.threshold:
+                # A balance of 0 buys nothing whatever the threshold (min_account_balance 0 left such an account usable).
+                if available <= 0 or available < self.threshold:
                     changed = self._set_reason(backend, "exhausted",
                                                {"available": available, "threshold": self.threshold})
                 else:

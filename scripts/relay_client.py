@@ -1,7 +1,17 @@
-import argparse, http.client, json, sys, time, urllib.request, urllib.error
-from auth import client_headers
+"""Send one prompt to a running relay, or list its models or balance: a manual check of a live relay.
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    python scripts/relay_client.py --models
+    python scripts/relay_client.py --balance
+    python scripts/relay_client.py "Проверь проект" --effort high
+
+The key is the relay's own: RELAY_API_KEY, else relay_api_key of the relay's config, else relay_key.txt beside it.
+For a relay started with --config <folder>\\config.json, pass the same --config.
+"""
+import argparse, http.client, json, sys, time, urllib.request, urllib.error
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from auth import client_headers  # noqa: E402  (the relay modules live in the repository root)
 
 
 def _open_with_retry(req, timeout):
@@ -28,9 +38,11 @@ def main():
     parser.add_argument("--balance", action="store_true", help="Check credits balance")
     parser.add_argument("--models", action="store_true", help="List available models")
     parser.add_argument("--url", default="http://127.0.0.1:8787", help="Base URL of proxy")
-    parser.add_argument("--key", help="Relay key (otherwise RELAY_API_KEY or relay_key.txt)")
+    parser.add_argument("--key", help="Relay key (otherwise RELAY_API_KEY, the config's relay_api_key or the "
+                                      "relay_key.txt beside it)")
+    parser.add_argument("--config", help="The config.json the relay was started with (default: this checkout's)")
     args = parser.parse_args()
-    headers = client_headers(args.key)
+    headers = client_headers(args.key, args.config)
 
     if args.balance:
         with urllib.request.urlopen(urllib.request.Request(f"{args.url}/v1/balance", headers=headers)) as resp:
@@ -108,4 +120,5 @@ def main():
         print(f"\nERROR: {e}")
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     main()

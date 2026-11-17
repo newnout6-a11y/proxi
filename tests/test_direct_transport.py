@@ -142,6 +142,28 @@ def test_stream_errors_map_to_relay_statuses():
     assert direct._error_from_event({"error": "x", "statusCode": 404}).status == 400
     assert direct._error_from_event({"error": "x"}).status == 502
 
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("message", ["invalid x-api-key", "authentication_error: invalid key"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_managed_provider_key_failure_is_not_a_retool_session_failure(status, message, nested):
+    error = direct._error_from_event({"statusCode": status, "isUsingRetoolManagedKey": True,
+                                      "error": {"message": message} if nested else message})
+    assert (error.status, error.code, error.message) == (502, "upstream_error", message)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("managed", [False, None, True])
+def test_session_failures_keep_auth_classification_unless_the_managed_provider_key_failed(status, managed):
+    # A normal Retool session rejection stays actionable even when it used a managed model route; a user's own
+    # provider key is not silently reclassified as Retool's managed-key outage either.
+    message = "session expired" if managed else "invalid x-api-key"
+    event = {"statusCode": status, "error": message}
+    if managed is not None:
+        event["isUsingRetoolManagedKey"] = managed
+    error = direct._error_from_event(event)
+    assert (error.status, error.code) == (502, "upstream_auth_error")
+
 class DirectSession:
     """Session double that records what the direct transport would receive."""
 

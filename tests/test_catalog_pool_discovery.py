@@ -3,8 +3,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import account_report
-import admin
 import models
 import proxy
 from test_review_fixes_proxy import multi  # noqa: F401

@@ -9,7 +9,7 @@ import apierr
 import config
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCS = [ROOT / "README.md", ROOT / "PROTOCOL.md", ROOT / "web" / "DESIGN.md", *sorted((ROOT / "docs").glob("*.md"))]
+DOCS = [ROOT / "README.md", ROOT / "PROTOCOL.md", ROOT / "web" / "DESIGN.md", *sorted((ROOT / "docs").rglob("*.md"))]
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 
 

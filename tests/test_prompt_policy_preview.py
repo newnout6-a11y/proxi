@@ -331,6 +331,33 @@ def test_offline_copy_swaps_only_remote_images():
     assert pp._offline(untouched) is untouched
 
 
+def test_a_messages_image_named_by_url_is_never_downloaded_by_a_preview(tmp_path, monkeypatch):
+    # adapters-3: the parse downloads a URL source now, as it does an image_url, so the preview swaps it for a pixel first
+    store = make_store(tmp_path, document(profiles={"p": {"head": "{{client_system}}"}}, default_profile="p"))
+    monkeypatch.setattr(validate, "_assert_public_http_url", lambda *a, **k: pytest.fail("network"))
+    monkeypatch.setattr(validate._IMAGE_OPENER, "open", lambda *a, **k: pytest.fail("network"))
+    picture = {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}}
+    body = anthropic(system="SYS", tools=False, messages=[
+        {"role": "user", "content": [{"type": "text", "text": "look"}, copy.deepcopy(picture)]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "render", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [copy.deepcopy(picture)]}]}])
+    original = copy.deepcopy(body)
+    assert store.preview(body, "anthropic", {})["head"] == "SYS"
+    assert body == original                                       # the caller's body is not touched
+
+
+def test_offline_copy_gives_a_messages_image_named_by_url_the_pixel_as_base64_data():
+    by_url = {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}, "cache_control": {"type": "ephemeral"}}
+    inline = {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "QQ=="}}
+    body = {"a": [by_url, inline]}
+    out = pp._offline(body)
+    # a URL source takes only an http(s) link, so the data URL of an image_url cannot stand in for it
+    assert out["a"][0] == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                           "cache_control": {"type": "ephemeral"}}
+    assert out["a"][1] is inline and by_url["source"] == {"type": "url", "url": "https://x/y.png"}
+    assert validate._extract_image_data(out["a"][0], "preview")["imageData"] == "AAAA"
+
+
 # -- the virtual profile and errors ------------------------------------------------------------------------------------
 
 

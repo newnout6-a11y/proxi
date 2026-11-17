@@ -10,7 +10,6 @@ import io
 import json
 import time
 
-import pytest
 
 import adapters
 from prompt_support import KEY, PATHS, client_request, prompt_relay  # noqa: F401 - prompt_relay is a fixture

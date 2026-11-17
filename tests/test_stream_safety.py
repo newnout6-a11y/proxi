@@ -297,6 +297,9 @@ def test_rejected_body_dump_lands_files_and_never_raises(monkeypatch, tmp_path):
     """The upstream 400 capture must write the exact payload plus the error
     detail, and a failing dump must not break the turn."""
     monkeypatch.chdir(tmp_path)
+    # The folder the relay uses without upstream_error_dir, relative to where it runs (conftest moves it away for the rest of
+    # the suite; here the run is inside tmp_path).
+    monkeypatch.setattr(direct.upstream_diagnostics, "DEFAULT_DIR", "logs/upstream-400")
     direct._dump_rejected_body(b'{"messages": []}', '{"statusCode":400,"message":"Invalid request format"}')
     files = sorted(p.name for p in (tmp_path / "logs" / "upstream-400").iterdir())
     assert len(files) == 3  # exact body, upstream detail, correlated client metadata

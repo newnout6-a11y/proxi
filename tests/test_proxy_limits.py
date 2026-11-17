@@ -1,5 +1,6 @@
 """Optional quotas and explicit runtime bounds must not add healthy-request waits."""
 import json
+import threading
 import urllib.error
 
 import pytest
@@ -12,6 +13,27 @@ import proxy
 def test_disabled_local_quota_never_exhausts():
     limiter = proxy.RateLimiter(0, 1)
     assert all(limiter.take() == 0 for _ in range(1000))
+
+
+def test_turning_the_limit_off_while_a_request_takes_a_token_is_no_division_by_zero():
+    """The rate was read before the lock the admin's settings save changes it under: a limit turned off in between was a
+    ZeroDivisionError, a 500 for the request that was taking a token."""
+    limiter = proxy.RateLimiter(1, 1)
+    limiter.tokens = 0.0
+
+    class SavedFirst:  # the settings save takes the lock first and turns the limit off, as a thread switch lets it
+        def __init__(self):
+            self.inner = threading.Lock()
+
+        def __enter__(self):
+            self.inner.acquire()
+            limiter.rate = 0
+
+        def __exit__(self, *exc):
+            self.inner.release()
+
+    limiter.lock = SavedFirst()
+    assert limiter.take() == 0.0
 
 
 def test_opt_in_quota_returns_retry_time_without_sleeping(monkeypatch):

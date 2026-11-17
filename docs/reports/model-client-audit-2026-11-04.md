@@ -116,7 +116,7 @@ probe saves the sent synthetic bodies, PNGs and SHA-256 hashes under
 
 The requested quality comparison, exact default prompt, Retool-specific
 capabilities, sources and evidence limits are recorded in
-[relay-quality-and-prompts.md](relay-quality-and-prompts.md).
+[relay-quality-and-prompts.md](../relay-quality-and-prompts.md).
 
 Explicit instructions now belong to every client, including unknown tool-less
 IDEs. They do not receive the relay's host context/execution instructions, and
@@ -138,7 +138,7 @@ Superseded after the PR review: only leading system messages form the head. Late
 non-empty ones stay in place as `<system-reminder>` user text with
 `x-proxi-system-messages: inline-as-user-text`, so the head, the signed prefix and
 the cache survive them; blank effort records add nothing. Details and live checks:
-[relay-quality-and-prompts.md](relay-quality-and-prompts.md).
+[relay-quality-and-prompts.md](../relay-quality-and-prompts.md).
 
 Three isolated live gateway checks returned the expected markers for standalone
 custom policy (Chat), unknown-client instructions (Responses), and inline system
@@ -288,7 +288,7 @@ Unsupported sampling and optional cache/include/metadata fields are type-checked
 and exposed by names only through `x-proxi-ignored-parameters` and a compatibility
 journal event. This avoids silently pretending those controls reached Retool or
 logging their values. The exact audited field behavior and limits are documented
-in [relay-quality-and-prompts.md](relay-quality-and-prompts.md).
+in [relay-quality-and-prompts.md](../relay-quality-and-prompts.md).
 
 Initial regressions reproduced 76 failures out of 77; three test assertions were
 then corrected to expect tool_calls at intermediate tool turns. Independent

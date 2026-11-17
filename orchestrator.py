@@ -2,7 +2,9 @@
 import asyncio
 import collections
 import contextlib
+import contextvars
 import hashlib
+import math
 
 import direct
 import json
@@ -201,6 +203,19 @@ class _FailoverOut:
         if event.get("type") not in ("credits", "usage", "usage_start"):
             self.started = True
         self.out.put(event)
+
+
+async def _off_loop(fn, *args):
+    """Run a blocking call (a web search, a balance check) on the relay's daemon IO workers, with the caller's context.
+
+    The default executor (run_in_executor(None), asyncio.to_thread) is joined at interpreter exit: a search or a balance
+    call under way kept a stopped relay alive for its 10-20 s of network timeouts after Ctrl+C. Without the relay's pool
+    (a bare loop in tests) it is the default executor, as before."""
+    loop = asyncio.get_running_loop()
+    io_executor = getattr(loop, "_relay_io_executor", None)
+    if io_executor is None:
+        return await asyncio.to_thread(fn, *args)
+    return await loop.run_in_executor(io_executor, contextvars.copy_context().run, fn, *args)
 
 
 def _may_be_balance_related(error):
@@ -820,7 +835,7 @@ class TurnRunner:
                 backend = self.pool.backend
             data = await backend.get_messages(session.thread_id)
         except Exception as exc:
-            print("[explain] fetch failed:", exc, flush=True)
+            console_log.write("[explain] fetch failed: %s" % exc)
             return None
         # Retool returns messages newest-first.
         for message in data.get("messages", []):
@@ -865,7 +880,6 @@ class TurnRunner:
         A call counts against max_uses whether it succeeds or not (Anthropic's rule), and the ones past it get the
         max_uses_exceeded error as their result, so the model goes on with what it has. A provider that fails, or answers
         with a refusal, is an error result too: it never fails the turn."""
-        loop = asyncio.get_running_loop()
         outcomes = []
         for index, call in enumerate(calls):
             started, error, detail, results, query = time.time(), None, "", [], None
@@ -883,7 +897,7 @@ class TurnRunner:
             else:
                 try:
                     # Off the event loop: the provider is an HTTP call that may take seconds.
-                    found = await loop.run_in_executor(None, searcher.search, query.strip(), spec)
+                    found = await _off_loop(searcher.search, query.strip(), spec)
                     results = web_search.within_domains(found, spec)
                 except web_search.SearchError as failure:
                     error, detail = failure.code, failure.detail
@@ -903,6 +917,30 @@ class TurnRunner:
         return outcomes
 
     async def run(self, parsed, out: queue.Queue, holder: dict):
+        """Measure the client request across account retries; account turns keep their own timelines."""
+        started = holder.get("_request_started_monotonic")
+        if type(started) not in (int, float) or not math.isfinite(started):
+            started = time.monotonic()
+        holder["_speed_attempts"] = {}
+        holder["_speed_reason"] = "error"
+        try:
+            await self._run_request(parsed, out, holder)
+        except BaseException:
+            holder["_speed_reason"] = "error"
+            raise
+        finally:
+            duration = max(0, round((time.monotonic() - started) * 1000))
+            counts = holder["_speed_attempts"]
+            output = sum(counts.values()) if counts and all(value is not None for value in counts.values()) else None
+            cancelled = holder.get("cancel_event")
+            reason = "cancelled" if cancelled is not None and cancelled.is_set() else holder["_speed_reason"]
+            journal.emit("request.speed", "Скорость завершённого запроса", "info",
+                         turn_id=holder.get("turn_id"), request_id=getattr(parsed, "request_id", None),
+                         conversation=journal.tag(getattr(parsed, "conversation_key", None)),
+                         reason=reason, duration_ms=duration, output_tokens=output,
+                         tokens_per_second=journal.request_speed(output, duration))
+
+    async def _run_request(self, parsed, out: queue.Queue, holder: dict):
         """Run a turn; retry on another account after a confirmed low balance or an hourly limit.
 
         The retry happens only while nothing was sent to the client. A low balance must be
@@ -979,12 +1017,12 @@ class TurnRunner:
                     # The pool refused before any upstream call: confirm the excluded
                     # balances once, so a top-up is used without waiting for the timer.
                     rechecked = True
-                    if await asyncio.to_thread(accounts.recheck_exhausted):
+                    if await _off_loop(accounts.recheck_exhausted):
                         continue
                 if (retryable and backend is not None and backend not in exclude
                         and _may_be_balance_related(error)):
                     # With no account left, the next acquire raises a clear 402.
-                    exhausted = await asyncio.to_thread(accounts.check_balance_now, backend)
+                    exhausted = await _off_loop(accounts.check_balance_now, backend)
             except BaseException:
                 out.put({"type": "error", "error": error})
                 out.put(None)
@@ -1026,12 +1064,23 @@ class TurnRunner:
         search_spec = getattr(parsed, "web_search", None)
         searcher = web_search.provider(self.cfg) if search_spec else None
         search_uses = search_steps = 0
-        turn_started = time.time()
+        turn_started = time.monotonic()
+        output_attempts = {}
+        request_attempts = holder.setdefault("_speed_attempts", {})
         outcome = {"reason": None, "error": None, "first": False}
         trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None),
                  "conversation": journal.tag(getattr(parsed, "conversation_key", None))}
 
         def log(kind, message, level="info", **fields):
+            # Usage and credits can repeat one attempt's cumulative token snapshot. Keep that snapshot, not their sum.
+            if kind == "upstream.usage_start":
+                output_attempts.setdefault(fields["attempt"], None)
+                request_attempts.setdefault((turn_id, fields["attempt"]), None)
+            elif kind == "upstream.usage":
+                count = credits.token_counter((fields.get("usage_snapshot") or {}).get("output_tokens"))
+                if count is not None:
+                    output_attempts[fields["attempt"]] = count
+                    request_attempts[(turn_id, fields["attempt"])] = count
             journal.emit(kind, message, level, **trace, **fields)
 
         try:
@@ -1229,11 +1278,11 @@ class TurnRunner:
                 counted = getattr(self.pool, "inflight", None)
                 load = ({} if counted is None else dict(zip(("inflight_account", "inflight_total"),
                                                            counted(getattr(acquired, "backend", None)))))
-                log("session.acquire", "Сессия получена за %d мс" % round((time.time() - turn_started) * 1000),
+                log("session.acquire", "Сессия получена за %d мс" % round((time.monotonic() - turn_started) * 1000),
                     "debug", thread=journal.tag(getattr(acquired, "thread_id", None)),
                     isolated=bool(isolated), mode=self.cfg.get("session_mode"),
                     context_scope="text" if persistent_text else None,
-                    wait_ms=round((time.time() - turn_started) * 1000), **load)
+                    wait_ms=round((time.monotonic() - turn_started) * 1000), **load)
                 native_target, native_context = None, None
                 if native_tools:
                     prompt, native_target, native_context = await self._native_prompt(
@@ -1284,7 +1333,11 @@ class TurnRunner:
                             chunks.append(stream_prompt.strip())
                         elif chunks and prompt.startswith(parsed.prompt) and prompt != parsed.prompt:
                             chunks.append(prompt[len(parsed.prompt):])
-                        self._check_prompt(self._direct_text(instructions, chunks or [stream_prompt]))
+                        sent = self._check_prompt(self._direct_text(instructions, chunks or [stream_prompt]))
+                        if exec_chunks:
+                            # The token estimate counts what the model reads: a follow-up holds only its own step, after
+                            # the client's messages and the steps before it.
+                            parsed._full_prompt_text = sent
 
                         if native_tools:
                             tools_converted = direct.tools_to_retool(parsed.tools)
@@ -1450,7 +1503,11 @@ class TurnRunner:
                                         'info' if known else 'warn', credits=None, attempt=journal_attempt,
                                         credits_reported=bool(known), **delta,
                                         **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
-                                    if session is not None:
+                                    if session is not None and breakdown['prompt_tokens'] > 0:
+                                        # Only counts tell the size of the prefix. The empty usage of an attempt whose
+                                        # price is unknown (a timeout or a cut stream on a 200) has none: written as 0,
+                                        # it switched account_rate_limit_wait off for the conversation (_limit_pause)
+                                        # and made the pool take it for the cheapest to evict (_rebuild_cost).
                                         acquired._last_prefix_tokens = breakdown['prompt_tokens']
                                         _remember_prompt_size(acquired, parsed, breakdown['prompt_tokens'])
                                     out.put(event)
@@ -1471,10 +1528,11 @@ class TurnRunner:
                                         "%d%%" % round(hit * 100) if hit is not None else "—"),
                                         "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
                                         **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
-                                    if session is not None:
+                                    if session is not None and breakdown["prompt_tokens"] > 0:
                                         # Write through the lease: SessionLease only proxies
                                         # reads, so keepwarm (which holds the real session)
-                                        # saw prefix_tokens=0 forever.
+                                        # saw prefix_tokens=0 forever. A credits event without
+                                        # token counts says nothing of the prefix (see usage).
                                         acquired._last_prefix_tokens = breakdown["prompt_tokens"]
                                         _remember_prompt_size(acquired, parsed, breakdown["prompt_tokens"])
                                     out.put(event)
@@ -1609,8 +1667,11 @@ class TurnRunner:
                     can_exec = self._can_exec(exec_steps) and not final_summary and not client_owns_instructions
                     command = executor.extract_command(final_text) if can_exec and not client_has_tools else None
 
-                    if not final_summary and exec_steps and not self._can_exec(exec_steps):
-                        # Explicit step cap reached (max_exec_turns > 0 only).
+                    if (not final_summary and exec_steps and not self._can_exec(exec_steps)
+                            and (executor.extract_command(final_text) or not final_text.strip())):
+                        # Explicit step cap reached (max_exec_turns > 0 only) by a reply that asks for one more command, or by
+                        # an empty one. A reply that answers without a command is the final answer: the client has it already,
+                        # and asking again paid one more request and streamed a second answer after it.
                         final_summary = True
                         summary = ("\n\n[ИТОГ] Команды больше не выполняй. "
                                    "Дай итоговый ответ по уже собранной информации, на русском.")
@@ -1679,7 +1740,7 @@ class TurnRunner:
                         code, output = await asyncio.get_running_loop().run_in_executor(
                             None,
                             lambda: executor.run_command(
-                                command, self.cfg["workspace_root"],
+                                command, self.cfg["workspace_root"],  # noqa: B023 (awaited before the loop moves on)
                                 timeout=self.cfg["command_timeout"],
                                 limit=self.cfg["command_output_limit"],
                                 policy=self.cfg["exec_policy"],
@@ -1721,6 +1782,14 @@ class TurnRunner:
                     # output is already redacted above. Mask commands before upstream.
                     header = task_block + "\n\nPrevious steps: " + trail
                     safe_command = redact(command, cookie_values=self.cfg.get("cookie_values", ()))
+                    if direct_mode:
+                        # The task and the trail are for the agent transport, whose follow-up replaces its whole prompt.
+                        # The direct body keeps the client's messages and every earlier step after them, so a step adds
+                        # only the reply that asked for its command and the result: with the task in each follow-up, k
+                        # commands sent the conversation k + 1 times, and each step wrote one more copy of it to the cache.
+                        header = ""
+                        exec_chunks.append(("Assistant: " + redact(
+                            final_text, cookie_values=self.cfg.get("cookie_values", ()))).strip())
                     last_followup = (safe_command, code, output, header)
                     followup_text = executor.format_command_followup(safe_command, code, output, header)
                     exec_chunks.append(followup_text)
@@ -1746,7 +1815,7 @@ class TurnRunner:
             outcome["error"] = apierr.internal(str(exc))
             out.put({"type": "error", "error": outcome["error"]})
         finally:
-            duration = round((time.time() - turn_started) * 1000)
+            duration = round((time.monotonic() - turn_started) * 1000)
             err = outcome["error"]
             if err is not None:
                 log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]), "error",
@@ -1754,9 +1823,18 @@ class TurnRunner:
                 reason = "error"
             else:
                 reason = outcome["reason"] or holder.get("reason") or "stop"
+            holder["_speed_reason"] = reason
+            # Explicit account-quota refusals are free; retain their latency, but count no generated tokens.
+            if err is not None and apierr.is_account_quota(err):
+                number = next(reversed(output_attempts), None)
+                if number is not None and output_attempts[number] is None:
+                    request_attempts[(turn_id, number)] = 0
+            output_tokens = (sum(output_attempts.values()) if output_attempts
+                             and all(value is not None for value in output_attempts.values()) else None)
             log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
                 "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout", "length") else "success",
                 reason=reason, duration_ms=duration, exec_steps=exec_steps,
+                output_tokens=output_tokens, tokens_per_second=None,
                 retries=empty_retries + tool_retries,
                 **({"web_searches": search_uses} if search_uses else {}))
             out.put(None)

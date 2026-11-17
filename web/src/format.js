@@ -23,6 +23,13 @@ export function fmtNum(value, digits = 2) {
   return isNum(value) ? formatter(0, digits).format(value) : '—';
 }
 
+/** Reported end-to-end output rate; missing/invalid telemetry is not a zero rate. */
+export function fmtSpeed(value) {
+  if (!isNum(value) || value < 0) return '—';
+  if (value > 0 && value < 0.1) return `<0,1${NBSP}ток/с`;
+  return `${fmtNum(value, 1)}${NBSP}ток/с`;
+}
+
 export function fmtMs(ms) {
   if (!isNum(ms)) return '—';
   if (ms < 1000) return `${Math.round(ms)}${NBSP}мс`;

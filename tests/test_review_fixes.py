@@ -340,7 +340,9 @@ def test_failed_rotation_backs_off(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(journal.os, "replace", locked)
     for _ in range(5):
         j.emit("x.y", "event")
-    assert capsys.readouterr().out.count("rotation failed") == 1
+    captured = capsys.readouterr()
+    assert captured.err.count("rotation failed") == 1
+    assert "rotation failed" not in captured.out
 
 
 def test_responses_input_image_rejected_for_non_vision_model(tmp_path, monkeypatch):

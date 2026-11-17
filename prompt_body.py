@@ -21,11 +21,14 @@ message would be deleted (see rewrite).
 """
 from __future__ import annotations
 
+import collections
 import copy
 import fnmatch
 import functools
+import hashlib
 import json
 import re
+import threading
 
 import native_history
 import prompt_policy as policy
@@ -262,21 +265,88 @@ class _Context:
 # ---------------------------------------------------------------------------------------------
 
 def _remove_regex_fn(rx, context):
-    def apply(text):
+    def run(text):
         new, count = policy.regex_remove(rx, text, context.deadline)
         if not count or new == text:
             return None
         return new, len(text) - len(new), 0
+
+    def apply(text):
+        return _remembered(context, ("remove", rx.pattern, rx.flags), text, run)
     return apply
 
 
 def _replace_regex_fn(rx, template, context, scope):
     def apply(text):
-        new, _count, removed, added = policy.regex_replace(rx, template, text, context.deadline, context.allowance(scope))
-        if new == text:
-            return None
-        return new, removed, added
+        room = context.allowance(scope)
+
+        def run(text):
+            new, _count, removed, added = policy.regex_replace(rx, template, text, context.deadline, room)
+            if new == text:
+                return None
+            return new, removed, added
+        return _remembered(context, ("replace", rx.pattern, rx.flags, template, room), text, run)
     return apply
+
+
+# What a regular expression edit made of a text, by (revision, edit, sha256 of the text). The history comes back whole with
+# every request, and every turn ran each pattern over every message again under the time limit of one operation: a pattern
+# that is slow on a text (`[ \t]+$` on a table padded with blanks) finished on a quiet machine and ran out of time on a busy
+# one, so the body sent upstream changed from turn to turn and its cache was written again (audit prompt-a-1; the owner's
+# decision of 2026-11-08). A text keeps the result it got the first time, a refusal for its own time included, for as long
+# as the revision and the edit are the same. Nothing is learned: it is the same result, without running the pattern again.
+_EDIT_MEMO = collections.OrderedDict()
+_EDIT_MEMO_LOCK = threading.Lock()
+_EDIT_MEMO_ENTRIES = 8192
+_EDIT_MEMO_CHARS = 32 * 1024 * 1024
+_EDIT_MEMO_TEXT = 4 * 1024 * 1024  # a longer text is edited every time, as before
+_EDIT_MEMO_HELD = [0]
+
+
+def _remembered(context, edit, text, run):
+    """run(text), or what it gave for this text before. The work is charged either way (Deadline.charge), so a request whose
+    budget runs out is refused the same edits whatever is remembered; a budget refusal is never remembered."""
+    if len(text) > _EDIT_MEMO_TEXT:
+        return run(text)
+    key = (getattr(context.snapshot, "_token", id(context.snapshot)), edit,
+           hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest())
+    with _EDIT_MEMO_LOCK:
+        entry = _EDIT_MEMO.get(key)
+        if entry is not None:
+            _EDIT_MEMO.move_to_end(key)
+    if entry is not None:
+        context.deadline.charge(len(text))
+        return _memo_result(entry[0])
+    try:
+        result = run(text)
+    except (policy.OperationTimeout, policy.EditTooLarge) as refused:
+        found = _remember(key, ("refused", (type(refused), str(refused))), 0)
+    else:
+        found = _remember(key, ("ok", result), len(result[0]) if result else 0)
+    # Two request threads may both miss before either commits. Both have already charged their own work; both must
+    # return the committed winner, not the private result of their run (a timeout in one thread, success in the other).
+    return _memo_result(found)
+
+
+def _memo_result(found):
+    kind, value = found
+    if kind == "refused":
+        raise value[0](value[1])
+    return value
+
+
+def _remember(key, found, held):
+    """Commit the first outcome, returning that same outcome to every concurrent caller."""
+    with _EDIT_MEMO_LOCK:
+        if key in _EDIT_MEMO:
+            _EDIT_MEMO.move_to_end(key)
+            return _EDIT_MEMO[key][0]
+        _EDIT_MEMO[key] = (found, held)
+        _EDIT_MEMO_HELD[0] += held
+        while _EDIT_MEMO and (len(_EDIT_MEMO) > _EDIT_MEMO_ENTRIES or _EDIT_MEMO_HELD[0] > _EDIT_MEMO_CHARS):
+            _dropped, (_found, size) = _EDIT_MEMO.popitem(last=False)
+            _EDIT_MEMO_HELD[0] -= size
+        return found
 
 
 def _replace_text_fn(find, replacement, replace_all, context, scope):
@@ -699,7 +769,9 @@ class _Walk:
         if before == "A" and after == "A":
             return "would put two assistant messages next to each other"
         following = self.messages[index + 1] if index + 1 < size else None
-        if index == self.lead and isinstance(following, dict) and _kind(following, self.dialect) == "S":
+        # Judged by what is kept, not by the position: when two leading user messages both go, the second is no longer at
+        # self.lead, and the later system message used to be pulled into the head anyway.
+        if before is None and isinstance(following, dict) and _kind(following, self.dialect) == "S":
             return "would move a later system message into the head"
         return None
 
@@ -817,8 +889,7 @@ class _Tool:
 
     def __init__(self, top, holder, item, name, namespace=None):
         self.top, self.holder, self.item = top, holder, item
-        function = item.get("function")
-        self.fields = function if isinstance(function, dict) else item
+        self.fields = _tool_fields(item)
         self.names = (namespace + "." + name, name) if namespace else (name,)
 
     @property
@@ -826,11 +897,20 @@ class _Tool:
         return self.names[0]
 
 
+def _tool_fields(item):
+    """Where a tool's name and description live: "function" of a function tool, "custom" of a Chat custom tool in its nested
+    form ({type: custom, custom: {name}}, which validate accepts; the edits used to miss it), else the tool itself."""
+    for field in ("function", "custom"):
+        nested = item.get(field)
+        if isinstance(nested, dict) and (field == "function" or item.get("type") == "custom"):
+            return nested
+    return item
+
+
 def _tool_name(item):
     if not isinstance(item, dict):
         return None
-    function = item.get("function")
-    name = (function if isinstance(function, dict) else item).get("name")
+    name = _tool_fields(item).get("name")
     return name if isinstance(name, str) and name else None
 
 
@@ -856,8 +936,8 @@ def _collect_tools(tools):
 def _choice_names(choice):
     names = set()
     if isinstance(choice, dict):
-        function = choice.get("function")
-        for holder in (choice, function if isinstance(function, dict) else {}):
+        function, custom = choice.get("function"), choice.get("custom")
+        for holder in (choice, function if isinstance(function, dict) else {}, custom if isinstance(custom, dict) else {}):
             name = holder.get("name")
             if isinstance(name, str) and name:
                 names.add(name)
@@ -885,8 +965,7 @@ def _called_names(out, dialect):
         calls = message.get("tool_calls")
         for call in calls if isinstance(calls, list) else []:
             if isinstance(call, dict):
-                function = call.get("function")
-                name = (function if isinstance(function, dict) else call).get("name")
+                name = _tool_fields(call).get("name")  # a function call, or a Chat custom call {type: custom, custom: {name}}
                 if isinstance(name, str):
                     names.add(name)
         legacy = message.get("function_call")
@@ -894,7 +973,9 @@ def _called_names(out, dialect):
             names.add(legacy["name"])
         content = message.get("content")
         for block in content if isinstance(content, list) else []:
-            if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("name"), str):
+            # server_tool_use: a server tool (web_search) the conversation already used is a called tool too
+            if (isinstance(block, dict) and block.get("type") in ("tool_use", "server_tool_use")
+                    and isinstance(block.get("name"), str)):
                 names.add(block["name"])
     return names
 

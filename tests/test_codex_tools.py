@@ -5,12 +5,10 @@ Codex 0.166 sends its MCP servers as namespaces ("mcp__blender" holding "look").
 pattern. Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'". A memory job of Codex sent 3 MB to
 gpt-5.6-luna, the provider answered "Your input exceeds the context window of this model", and the relay passed that on
 as a temporary 502, which Codex asks again up to five times."""
-import json
 
 import pytest
 
 import adapters
-import apierr
 import direct
 import tool_names
 import validate

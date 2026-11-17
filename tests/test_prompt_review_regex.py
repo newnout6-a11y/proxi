@@ -459,6 +459,22 @@ def test_a_literal_brace_and_the_repeat_counts_keep_their_meaning(pattern, text,
     assert bool(compiled.search(text)) is found
 
 
+@pytest.mark.parametrize("pattern", [r"(?x)secret{ e<=1}", r"(?x)ab{ 2,3 }", "(?x)a{\n  i<=2}", r"(?x:ab{ 2 })c",
+                                     r"(?ix-s:a{ e})"])
+def test_in_verbose_mode_a_brace_followed_by_blanks_is_judged_as_the_regex_module_reads_it(pattern):
+    """`regex` skips blanks inside the braces in verbose mode and `re` does not: (?x)secret{ e<=1} was accepted as the
+    literal text "secret{e<=1}" and removed every one-error variant of "secret" from the system prompt and the history."""
+    with pytest.raises(pp.PromptConfigError, match="fuzzy"):
+        pp._compile_pattern(pattern, "", "pattern")
+
+
+@pytest.mark.parametrize("pattern, text, found", [
+    (r"secret{ e<=1}", "secret{ e<=1}", True), (r"secret{ e<=1}", "secrex", False), (r"(?x)a\{ e<=1\}", "a{e<=1}", True),
+    (r"(?x)a{2}", "aa", True), (r"(?x)[{ e}]+", "e", True)])
+def test_outside_verbose_mode_a_brace_followed_by_a_blank_stays_a_literal_one(pattern, text, found):
+    assert bool(pp._compile_pattern(pattern, "", "pattern").search(text)) is found
+
+
 @pytest.mark.parametrize("pattern", [r"\p{L}+", r"(?|a|b)", r"\m", r"(?V1)a", r"(?r)a", r"(?<name>a)", r"\X", r"\G",
                                      r"(?<=a+)b", r"(?P<n>a)(?P<n>b)", r"(?P>n)", r"(?(DEFINE)a)", r"\L<x>", r"[[:alpha:]]+",
                                      r"[a&&b]", r"[a-z--b]", r"[[a]", r"(?e)a", r"(?b)a", r"(?p)a", r"(?w)a", r"(?f)a"])

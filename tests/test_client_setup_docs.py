@@ -63,7 +63,7 @@ def test_the_harness_section_states_the_split_a_sync_produces_and_what_retool_te
 
 def test_the_audit_corrects_the_harness_split_it_recorded():
     entries, retool, text_group, provider = harness_split()
-    audit = flat((DOCS / 'model-client-audit-2026-11-04.md').read_text(encoding='utf-8'))
+    audit = flat((DOCS / 'reports' / 'model-client-audit-2026-11-04.md').read_text(encoding='utf-8'))
     recorded = audit.index('26 reasoning models in `retool`')
     correction = audit.index('so a sync now puts %d models in `retool` and %d in `retool-text`' % (
         len(retool), len(text_group)))
@@ -81,7 +81,7 @@ def test_the_opencode_cli_examples_name_models_that_publish_the_variant_they_sho
 def test_the_audit_withdraws_the_claim_that_haiku_publishes_a_none_level():
     haiku = models.resolve('claude-haiku-4-5-20251001')[0]
     assert haiku['reasoning_effort_levels'] == [] and haiku['reasoning_effort_control'] == 'accepted-ignored'
-    audit = flat((DOCS / 'model-client-audit-2026-11-04.md').read_text(encoding='utf-8'))
+    audit = flat((DOCS / 'reports' / 'model-client-audit-2026-11-04.md').read_text(encoding='utf-8'))
     claim = audit.index('Haiku exposes its verified `none` level')
     note = audit.index('**Correction', claim)
     assert note - claim < 300  # right behind the dated sentence, not somewhere else in the file

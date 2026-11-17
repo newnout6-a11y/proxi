@@ -42,3 +42,17 @@ test("Other providers are untouched; failed lookups keep request working", async
   await hooks["chat.headers"]({ model: { providerID: "retool-relay" }, sessionID: "ses_1", agent: "build" }, output)
   assert.equal(output.headers["X-Proxi-Session-Id"], "ses_1")
 })
+
+test("An agent named in Cyrillic, CJK or emoji goes percent-encoded, an ASCII name as it is", async () => {
+  const hooks = await ProxiSessionLabels({ client: { session: { get: async () => ({ data: {} }) } } })
+  for (const agent of ["ревьюер", "代码审查", "rev🚀"]) {
+    const output = { headers: {} }
+    await hooks["chat.headers"]({ model: { providerID: "retool-relay" }, sessionID: "ses_a", agent }, output)
+    assert.equal(decodeURIComponent(output.headers["X-Proxi-Agent"]), agent)
+    assert.match(output.headers["X-Proxi-Agent"], /^[\x20-\x7e]*$/)  // a header fetch accepts
+    new Headers(output.headers)
+  }
+  const output = { headers: {} }
+  await hooks["chat.headers"]({ model: { providerID: "retool-relay" }, sessionID: "ses_a", agent: "build" }, output)
+  assert.equal(output.headers["X-Proxi-Agent"], "build")
+})

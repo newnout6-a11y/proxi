@@ -7,8 +7,6 @@ import math
 import os
 from pathlib import Path
 import re
-import stat
-import tempfile
 import threading
 import time
 from urllib.parse import unquote, urlsplit
@@ -660,7 +658,9 @@ class Admin:
     def _records(saved):
         if isinstance(saved.get("accounts"), list):
             return [record for record in saved["accounts"] if isinstance(record, dict)]
-        return [saved] if saved.get("base") or saved.get("page_uuid") else []
+        # A file without accounts[] is the one account, whatever it holds: its base and page_uuid may come from RETOOL_BASE
+        # and RETOOL_PAGE_UUID (README), and then the account the relay runs on was listed as removed from config.json.
+        return [saved]
 
     @staticmethod
     def _same_account(record, cfg):
@@ -681,17 +681,21 @@ class Admin:
         runtime = self.runtime
         entries = account_report.collect(runtime)
         usage = account_report.usage_report(runtime, [(entry["backend"], entry["manager"]) for entry in entries])
-        records = self._records(self._saved()) if self.cfg.get("_config_path") else None
+        saved = self._saved() if self.cfg.get("_config_path") else None
+        records = self._records(saved) if saved is not None else None
+        # Without accounts[] the file's root and the one loaded account are the same account: nothing to match, nothing added.
+        single = saved is not None and not isinstance(saved.get("accounts"), list)
         pool = []
         for entry, item in zip(entries, self._accounts(entries, usage)):
             backend = entry["backend"]
-            removed = records is not None and not any(self._same_account(r, backend.cfg) for r in records)
+            removed = (records is not None and not single
+                       and not any(self._same_account(r, backend.cfg) for r in records))
             pool.append({**item, "label": backend.cfg.get("label") or "", "enabled": account_enabled(backend),
                          "priority": account_priority(backend),
                          "last_balance_at": getattr(entry["manager"], "last_fetched_at", None),
                          "pending": "removed" if removed else None, "_backend": backend})
         loaded = [entry["backend"].cfg for entry in entries]
-        for record in records or []:
+        for record in [] if single else records or []:
             if any(self._same_account(record, cfg) for cfg in loaded):
                 continue
             pool.append({
@@ -735,6 +739,8 @@ class Admin:
 
     def _saved_record(self, saved, account):
         backend = account.get("_backend")
+        if not isinstance(saved.get("accounts"), list) and backend is not None:
+            return saved  # the one account of a file without accounts[]
         for record in self._records(saved):
             if (self._same_account(record, backend.cfg) if backend is not None
                     else self._record_tag(record) == account["account"]):
@@ -1018,12 +1024,16 @@ class Admin:
             yield path, self._saved()
 
     @staticmethod
-    def _check_role_budget(candidate, changes):
+    def _check_role_budget(candidate, changes, live_cap=None):
         """The role travels with every request, so it must leave room under max_prompt_bytes.
 
-        Judged only when this save touches the role or the cap: an old over-long role never blocks other settings.
+        Judged only when this save touches the role or the cap: an old over-long role never blocks other settings. The role
+        applies at once and the cap only after a restart, so a role this save changes must also fit the cap in force now
+        (`live_cap`): checked against a raised cap still waiting for the restart, it went live and every request got 413.
         """
         role, cap = candidate.get("relay_system_prompt"), candidate.get("max_prompt_bytes")
+        if "relay_system_prompt" in changes and _role_limit(live_cap) < _role_limit(cap):
+            cap = live_cap
         if not isinstance(role, str) or not {"relay_system_prompt", "max_prompt_bytes"} & set(changes):
             return
         try:
@@ -1057,25 +1067,13 @@ class Admin:
                 models.resolve_tolerant(candidate["model"], candidate["reasoning_effort"], strict=True,
                                         allow_downgrade=candidate["allow_effort_downgrade"],
                                         xhigh_as=candidate["claude_xhigh_effort"])
-            self._check_role_budget(candidate, changes)
+            self._check_role_budget(candidate, changes, self.cfg.get("max_prompt_bytes"))
             changed = [key for key, value in changes.items() if desired[key] != value]
-            temporary = None
-            try:
-                saved.update(changes)
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
-                                                 prefix=".admin-", suffix=".tmp", delete=False) as output:
-                    temporary = output.name
-                    json.dump(saved, output, ensure_ascii=False, indent=2, allow_nan=False)
-                    output.write("\n")
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
-                os.replace(temporary, path)
-            except (OSError, ValueError):
-                raise apierr.service_unavailable("Cannot save relay settings")
-            finally:
-                if temporary and os.path.exists(temporary):
-                    os.unlink(temporary)
+            saved.update(changes)
+            # Through config._write_file, as the account pool writes: its temporary file is git-ignored and removed even when
+            # config.json is read-only. This one copied the read-only mode onto its own temporary file, whose removal then
+            # failed on Windows: a 500 instead of the 503, and a copy of config.json with every cookie left beside it.
+            self._write(path, saved)
             applied = [key for key in changes if key in LIVE_SETTINGS]
             journal.emit("admin.settings", "Настройки сохранены: %s" % (", ".join(changed) or "без изменений"),
                          "success", changed={key: {"from": self._loggable(key, desired[key]),
@@ -1290,9 +1288,16 @@ class Admin:
         handler.send_header("content-length", str(len(body)))
         handler.send_header("x-request-id", handler.request_id)
         security_headers(handler)
+        # The status line is out from here on: a failure must not answer a second time (_respond_error reads this flag).
+        handler._response_started = True
         handler.end_headers()
         if handler.command != "HEAD":
-            handler.wfile.write(body)
+            try:
+                handler.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                # The browser went away mid-download (a reload while the bundle loads): not an error of the relay, which
+                # used to log it as a 500 internal error and try to send that 500 on the same connection.
+                handler.close_connection = True
 
     def _events(self, query):
         data = self.runtime.journal.query(
@@ -1318,6 +1323,13 @@ class Admin:
         handler.send_header("x-request-id", handler.request_id)
         security_headers(handler)
         handler.end_headers()
+        # The status line is out: a failure from here on closes the connection instead of writing a second one into the body.
+        handler._response_started = True
+        # A journal stream lasts up to STREAM_MAX_SECONDS and every open admin tab keeps one: it gives its max_workers slot
+        # back, as an idle keep-alive connection does, or with a small max_workers model requests waited behind the admin.
+        if getattr(handler, "_holds_slot", False):
+            handler._holds_slot = False
+            handler.server.release_slot()
         writer = sse.StreamWriter(handler)
         writer.event("hello", {"last_seq": events.last_seq, "server_time": time.time()})
         deadline = time.monotonic() + STREAM_MAX_SECONDS
@@ -1347,6 +1359,10 @@ class Admin:
             self._static(handler, path)
             return
         # Credentials stay in headers, never URLs, static markup or responses.
+        # A source past its budget of wrong keys is refused before its key is compared (auth.py).
+        wait = auth.auth_failure_wait(handler.client_address[0])
+        if wait:
+            raise apierr.too_many_requests("too many auth failures", round(wait, 1))
         try:
             auth.verify(handler.headers, "", self.cfg["relay_api_key"])
         except apierr.ApiError as exc:
@@ -1406,7 +1422,7 @@ class Admin:
             self._mutation_guard(handler)
             validate.load_json(handler._read_body())
             self.runtime.journal.reset()
-            journal.emit("admin.journal_cleared", "Журнал в памяти очищен оператором", "warn")
+            journal.emit("admin.journal_cleared", "Журнал очищен оператором: события в памяти и файлы journal.jsonl на диске", "warn")
             payload = {"ok": True, "last_seq": self.runtime.journal.last_seq}
         elif handler.command == "PATCH" and path == "/admin/api/settings":
             # Guard failures must close a connection whose body was not consumed.

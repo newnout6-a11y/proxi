@@ -148,3 +148,45 @@ def test_a_client_that_echoes_the_number_itself_sends_valid_json_upstream_as_wel
     assert len(raws) == 2 and all(strict(raw) for raw in raws)
     replayed = next(m for m in strict(raws[1])["messages"] if m["role"] == "assistant")
     assert next(b for b in replayed["content"] if b["type"] == "tool_call")["toolInput"] == {"path": "a", "limit": None}
+
+
+def test_a_client_that_echoes_the_number_itself_goes_on_from_the_signed_reply_too(tmp_path, monkeypatch):
+    # Codex echoes the arguments string as the model wrote it; an Anthropic client echoes the number. Both used to go cold.
+    raws, _ = exchange(tmp_path, monkeypatch, '{"path": "a", "limit": 1e400}')
+    assert len(raws) == 2 and "sig-inf" in raws[1].decode()
+
+
+def test_an_echo_is_read_as_the_kept_reply_was():
+    assert native_history.finite_values({"limit": float("inf"), "n": [float("nan"), 2], "big": 10 ** 400}) == {
+        "limit": None, "n": [None, 2], "big": 10 ** 400}  # integers stay exact: JSON can carry them
+
+
+def test_a_client_that_echoes_a_huge_integer_as_the_model_wrote_it_sends_its_next_turn(tmp_path, monkeypatch):
+    # an integer past a double: kept exact on both sides; the length of the body as JavaScript counts it raised OverflowError
+    reply = [*THINKING, signature("sig-big"), {"event": "content_block_end", "type": "thinking"},
+             *call_events('{"path": "a", "limit": %s}' % ("9" * 400)), *END]
+    pool, runner, sent = harness(tmp_path, monkeypatch, [reply, [text("done"), *END]])
+    raws, opener = [], direct.urllib.request.urlopen
+
+    def capture(request, **kwargs):
+        raws.append(request.data)
+        return opener(request, **kwargs)
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", capture)
+
+    async def scenario():
+        try:
+            first = validate.parse_anthropic({"model": "claude-opus-5-5", "system": "CLIENT_SYSTEM", "max_tokens": 64,
+                                              "tools": READ_FILE, "messages": copy.deepcopy(FIRST)}, PARSE_CFG)
+            first.conversation_key = "header:client-a"
+            await run(runner, first)
+            await run(runner, second_request('{"path": "a", "limit": %s}' % ("9" * 400)))
+        finally:
+            await close(pool)
+
+    asyncio.run(scenario())
+    assert len(raws) == 2 and "sig-big" in raws[1].decode()
+
+
+def test_the_javascript_length_of_an_integer_past_a_double_does_not_fail():
+    assert direct._js_delta({"big": 10 ** 400}) == len("null") - len(str(10 ** 400))

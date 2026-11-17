@@ -2,7 +2,7 @@
 import pytest
 
 import prompt_policy as pp
-from test_prompt_policy_common import OPENCODE_SYSTEM, Sources, compile_doc, compose, document, plan_for, profile_doc
+from test_prompt_policy_common import OPENCODE_SYSTEM, compile_doc, compose, document, profile_doc
 
 
 def run_edits(tmp_path, system, *edits):

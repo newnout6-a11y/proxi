@@ -9,11 +9,9 @@ from pathlib import Path
 import pytest
 
 import direct
-import forced_choice
 import models
 import validate
-import web_search
-from test_forced_choice import READ, call, drive as drive_forced
+from test_forced_choice import READ, drive as drive_forced
 from test_native_context_reuse import FIRST, PARSE_CFG
 from test_native_history import tool_reply
 from test_rate_limit_retry import ANSWER, REFUSED, glm_turn

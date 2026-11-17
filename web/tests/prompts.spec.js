@@ -142,6 +142,11 @@ test('the publish masks say which models they publish and warn when they match n
   await expect(publish.locator('.p-publish-none')).toContainText('не подходят ни к одной модели');
   await expect(publish.locator('.p-publish-list')).toHaveCount(0);
   await publish.getByRole('button', { name: 'Убрать значение glm-*' }).click();
+  await masks.fill('claude-[^s]*');
+  await masks.press('Enter');
+  await expect(publish.locator('.p-publish-list')).toContainText('claude-sonnet-5-5@mine-first');
+  await expect(publish.locator('.p-publish-list')).not.toContainText('claude-opus-5-5@mine-first');
+  await publish.getByRole('button', { name: 'Убрать значение claude-[^s]*' }).click();
   await masks.fill('*GLM*');
   await masks.press('Enter');
   await expect(publish.locator('.p-publish-none')).toHaveCount(0);

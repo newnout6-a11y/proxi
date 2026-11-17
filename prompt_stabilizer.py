@@ -34,6 +34,10 @@ _LOCATION = re.compile(r"<location>(.*?)</location>", re.S)
 _FOLDER = re.compile(r"^[ \t]*Working directory:[ \t]*(.+?)[ \t]*$", re.M)
 _DATE = re.compile(r"(Today's date: )([A-Z][a-z]{2} [A-Z][a-z]{2} \d{2} \d{4})")
 FILE_NAME = "client-prompts.json"
+# A skill in use has its time written to the file at most this late (seconds). Only a new skill wrote the file before, so the
+# times in it stayed those of the day the skills were first seen: the first restart a week later dropped every skill in daily
+# use, and each conversation going on got a new head (native_history.reset, the whole prefix written to the cache again).
+TOUCH_SAVE_EVERY = 3600
 
 
 def _is_path(text):
@@ -48,13 +52,18 @@ class SkillLocations:
         self._path, self._ttl, self._max = path, ttl, max_entries
         self._clock, self._exists = clock, exists
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()  # held by the one thread writing the file (see _save)
         self._memory = collections.OrderedDict()
-        self._dirty = False
+        self._dirty = False  # the memory holds a location the file does not
+        self._touched = False  # the memory holds a later time of use than the file (written every TOUCH_SAVE_EVERY)
+        self._saved_at = float("-inf")
         self._warned = False
         self._load()
 
-    def stabilize(self, system):
-        """(system text with the remembered locations, names of the skills whose location was replaced)."""
+    def stabilize(self, system, remember=True):
+        """(system text with the remembered locations, names of the skills whose location was replaced).
+
+        remember=False only looks (the admin's preview): nothing is learned, touched or written."""
         if "<available_skills>" not in system:
             return system, []
         folder = _FOLDER.search(system)
@@ -70,8 +79,12 @@ class SkillLocations:
             seen = raw.strip()
             if not _is_path(seen):
                 return match.group(0)
-            digest = hashlib.sha256((description.group(1).strip() if description else "").encode("utf-8")).hexdigest()[:16]
-            chosen = self._choose((folder, name.group(1).strip(), digest), seen)
+            # surrogatepass: half of a surrogate pair (a client that cut a description inside an emoji sends it as a JSON
+            # escape) made encode raise, and the whole prompt of every request of that client went unstabilized
+            digest = hashlib.sha256((description.group(1).strip() if description else "").encode(
+                "utf-8", "surrogatepass")).hexdigest()[:16]
+            key = (folder, name.group(1).strip(), digest)
+            chosen = self._choose(key, seen) if remember else self._peek(key, seen)
             if chosen == seen:
                 return match.group(0)
             replaced.append(name.group(1).strip())
@@ -79,8 +92,19 @@ class SkillLocations:
             return "<skill>" + body[:location.start(1)] + fixed + body[location.end(1):] + "</skill>"
 
         text = _SKILL.sub(skill, system)
-        self._save()
+        if remember:
+            self._save()
         return text, replaced
+
+    def _peek(self, key, seen):
+        """The location _choose would give, without remembering anything."""
+        with self._lock:
+            entry = self._memory.get(key)
+            if entry is None or self._clock() - entry[1] > self._ttl or entry[0] == seen:
+                return seen
+            if not self._exists(entry[0]) and self._exists(seen):
+                return seen
+            return entry[0]
 
     def _choose(self, key, seen):
         with self._lock:
@@ -92,6 +116,7 @@ class SkillLocations:
                 self._remember(key, seen, now)
                 return seen
             entry[1] = now
+            self._touched = True
             self._memory.move_to_end(key)
             if entry[0] == seen:
                 return seen
@@ -117,25 +142,58 @@ class SkillLocations:
             for folder, name, digest, location, seen in document["skills"]:
                 if all(isinstance(item, str) for item in (folder, name, digest, location)) and now - seen < self._ttl:
                     self._memory[(folder, name, digest)] = [location, float(seen)]
-        except (OSError, ValueError, KeyError, TypeError):
+        except Exception:  # noqa: BLE001 - any file it cannot use (a hand edit, another layout, AttributeError, RecursionError,
+            # OverflowError) is no reason to keep the relay from starting: it is overwritten by the next save
             self._memory.clear()  # nothing to go on: the next prompt seen is the first
 
     def _save(self):
-        with self._lock:
-            if not (self._dirty and self._path):
+        """Writes the memory if it changed. One thread writes at a time, and it writes until nothing is left unsaved.
+
+        Requests run in threads of their own. Two of them that each learned a skill wrote one temporary file (named by the
+        process) at the same time: on Windows the rename of one failed while the other held the file open, the other
+        renamed a mix of both documents into place, and a write that took the older snapshot last put it over the newer.
+        A thread that finds the file being written leaves its change to the writer, which looks again before it lets go."""
+        if not ((self._dirty or self._touched) and self._path):
+            return
+        if not self._save_lock.acquire(blocking=False):
+            return
+        while True:
+            with self._lock:
+                now = self._clock()
+                if not (self._dirty or (self._touched and now - self._saved_at >= TOUCH_SAVE_EVERY)):
+                    self._save_lock.release()  # under self._lock: a change made after this look finds the file free
+                    return
+                self._dirty = self._touched = False
+                self._saved_at = now
+                document = {"version": 1, "skills": [[*key, value[0], value[1]] for key, value in self._memory.items()]}
+            if not self._write(document):
+                with self._lock:
+                    self._dirty = True  # the next request tries again
+                    self._save_lock.release()
                 return
-            self._dirty = False
-            document = {"version": 1, "skills": [[*key, value[0], value[1]] for key, value in self._memory.items()]}
+
+    def _write(self, document):
+        temporary = "%s.%d.tmp" % (self._path, os.getpid())
         try:
-            temporary = "%s.%d.tmp" % (self._path, os.getpid())
-            with open(temporary, "w", encoding="utf-8") as handle:
-                json.dump(document, handle, ensure_ascii=False)
+            text = json.dumps(document, ensure_ascii=False)
+            try:
+                data = text.encode("utf-8")
+            except UnicodeEncodeError:  # half of a surrogate pair in a skill: the file keeps it as a JSON escape
+                data = json.dumps(document).encode("ascii")
+            with open(temporary, "wb") as handle:
+                handle.write(data)
             os.replace(temporary, self._path)
-        except OSError as exc:
+            return True
+        except Exception as exc:  # noqa: BLE001 - the memory is a convenience: no failure to keep it may fail a request
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
             if not self._warned:
                 self._warned = True
                 journal.emit("prompt.stabilizer_save_failed", "Расположения навыков клиента не сохранены на диск: %s"
                              % type(exc).__name__, "warn")
+            return False
 
 
 class PinnedDate:
@@ -186,3 +244,13 @@ class Stabilizer:
             if changed:
                 done.append("date")
         return system, done
+
+    def look(self, system):
+        """What apply makes of `system` for a new conversation, without remembering anything: the admin's preview.
+
+        The preview showed the client's system as the client sent it, so for OpenCode it named another skill location (and
+        another head sha8) than the model got. A new conversation has no pinned date, so only the locations apply."""
+        if self.skills is None:
+            return system, []
+        system, names = self.skills.stabilize(system, remember=False)
+        return system, (["skill_locations:" + ",".join(dict.fromkeys(names))] if names else [])

@@ -3,6 +3,7 @@ import base64
 import contextvars
 import functools
 import hashlib
+import http.client
 import ipaddress
 import json
 import native_history
@@ -36,9 +37,15 @@ def _assert_public_http_url(url, where="image"):
             ip_obj = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
-        if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
-                or ip_obj.is_reserved or ip_obj.is_multicast or ip_obj.is_unspecified):
+        if _internal(ip_obj):
             raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
+
+
+def _internal(ip_obj):
+    """An address that is not on the public internet. not is_global also covers 100.64.0.0/10 (carrier-grade NAT and every
+    Tailscale node), which is neither private nor reserved: an image URL there made the relay fetch from inside the tailnet."""
+    return (not ip_obj.is_global or ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+            or ip_obj.is_reserved or ip_obj.is_multicast or ip_obj.is_unspecified)
 
 
 class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -59,13 +66,119 @@ def _assert_public_peer(resp, where="image"):
         peer = ipaddress.ip_address(sock.getpeername()[0])
     except (AttributeError, OSError, ValueError):
         return
-    if (peer.is_private or peer.is_loopback or peer.is_link_local
-            or peer.is_reserved or peer.is_multicast):
+    if _internal(peer):
         raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
 
 
-_IMAGE_OPENER = urllib.request.build_opener(_GuardedRedirectHandler())
 _IMAGE_FETCHES = contextvars.ContextVar("proxi_image_fetches", default=None)
+
+
+class _Disallowed(Exception):
+    """A connection that would have reached an address off the public internet."""
+
+
+def _connect_public(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, **_kwargs):
+    """socket.create_connection that connects only to public addresses, the very ones it checked.
+
+    The guard resolved the name and the connection resolved it again: a name that answered with a public address and
+    then with 127.0.0.1 (DNS rebinding) had its GET, path and query delivered inside the network before the peer check
+    refused the answer (audit of 2026-11-07). One lookup now serves both the check and the connect."""
+    host, port = address
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise OSError("cannot resolve %s" % host) from exc
+    checked = []
+    for family, socktype, proto, _name, sockaddr in infos:
+        try:
+            internal = _internal(ipaddress.ip_address(sockaddr[0]))
+        except ValueError:
+            internal = True
+        if internal:
+            raise _Disallowed(host)
+        checked.append((family, socktype, proto, sockaddr))
+    error = None
+    for family, socktype, proto, sockaddr in checked:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            error = exc
+            sock.close()
+    raise error or OSError("no address to connect to for %s" % host)
+
+
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_public
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    """TLS still verifies the certificate and sends SNI for the host name; only the address it connects to is pinned."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_public
+
+
+def _connection_class(req, plain, public):
+    # A request that goes through a proxy connects to the proxy (often 127.0.0.1): the proxy, not this connection,
+    # reaches the image host, whose address the guard checked before the request.
+    return plain if req.has_proxy() or getattr(req, "_tunnel_host", None) else public
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_connection_class(req, http.client.HTTPConnection, _PublicHTTPConnection), req)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_connection_class(req, http.client.HTTPSConnection, _PublicHTTPSConnection), req,
+                            context=self._context)
+
+
+def _image_proxies():
+    """The proxies of the system for http and https, read at each download (urllib reads the environment and, on Windows,
+    the registry): the opener of the module took them once, at import."""
+    proxies = urllib.request.getproxies()
+    return {scheme: proxies[scheme] for scheme in ("http", "https") if proxies.get(scheme)}
+
+
+def _via_proxy(url, proxies):
+    parsed = urllib.parse.urlparse(url)
+    if not proxies.get(parsed.scheme):
+        return False
+    try:
+        return not urllib.request.proxy_bypass(parsed.hostname or "")
+    except Exception:  # noqa: BLE001 - a bypass list it cannot read: the proxy applies, as urllib would decide
+        return True
+
+
+class _ImageOpener:
+    """Opens an image URL through the proxy of the system when one applies to it, else directly, to a public address checked
+    at the connect (_connect_public).
+
+    With a system proxy (v2rayN, Clash and the like set one on Windows) every image URL was refused: the peer check after
+    the request looked at the socket, which led to the proxy on 127.0.0.1. Through a proxy the address of the image host
+    is checked before the request (the proxy connects to it), and the peer check is left out."""
+
+    def open(self, req, timeout=None):
+        proxies = _image_proxies()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), _PublicHTTPHandler(),
+                                             _PublicHTTPSHandler(), _GuardedRedirectHandler())
+        response = opener.open(req, timeout=timeout)
+        response._proxi_via_proxy = _via_proxy(req.full_url, proxies)
+        return response
+
+
+_IMAGE_OPENER = _ImageOpener()
 
 
 class ImageFetches:
@@ -150,6 +263,8 @@ def load_json(raw: bytes):
         raise bad_request("request body must use valid UTF-8")
     except json.JSONDecodeError as exc:
         raise bad_request(f"invalid JSON body: {exc.msg} at line {exc.lineno}")
+    except RecursionError:  # a body nested past the decoder's depth was a 500 internal_error
+        raise bad_request("request body is nested too deeply")
     if not isinstance(data, dict):
         raise bad_request(f"request body must be a JSON object, got {type(data).__name__}")
     return data
@@ -240,6 +355,42 @@ def _opt_float(data, key):
     return float(value)
 
 
+def _fetch_remote(url, where):
+    """(mime type, base64 data) of the picture at an http(s) URL, downloaded once per request (ImageFetches).
+
+    The one download path of every image a client names by URL: an image_url, an input_image and a Messages image whose
+    source is a URL. The address is checked before the request, at every redirect and on the socket the request landed
+    on, and a picture past 10 MB is refused."""
+    fetches = _IMAGE_FETCHES.get()
+    kept = fetches.found.get(url) if fetches is not None else None
+    if kept is not None:
+        return kept
+    _assert_public_http_url(url, where)
+    mime_type = "image/png"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    max_bytes = 10 * 1024 * 1024
+    try:
+        with _IMAGE_OPENER.open(req, timeout=10) as r:
+            if not getattr(r, "_proxi_via_proxy", False):
+                _assert_public_peer(r, where)  # the socket of a proxied request leads to the proxy
+            ct = r.headers.get("content-type", "").split(";")[0].strip()
+            if ct:
+                mime_type = ct
+            buf = r.read(max_bytes + 1)
+            if len(buf) > max_bytes:
+                raise unprocessable("failed to fetch image attachments: image exceeds maximum allowed size (10MB)", param=where)
+            data_b64 = base64.b64encode(buf).decode("ascii")
+    except ApiError:
+        raise
+    except _Disallowed:
+        raise unprocessable("failed to fetch image attachments: disallowed destination host", param=where)
+    except Exception:
+        raise unprocessable(f"failed to fetch image attachments from {url}", param=where)
+    if fetches is not None:
+        fetches.found[url] = (mime_type, data_b64)
+    return mime_type, data_b64
+
+
 def _extract_image_data(block, where):
     """Extract Retool-compatible image dict {'type': 'image', 'imageData': str, 'mimeType': str}."""
     btype = block.get("type")
@@ -248,8 +399,24 @@ def _extract_image_data(block, where):
     if btype == "image":
         source = block.get("source")
         if isinstance(source, dict):
+            kind = source.get("type")
             mime_type = source.get("media_type") or "image/png"
             data_b64 = source.get("data")
+            if not data_b64 and kind == "url":
+                # The Messages API names a picture by URL as well. Only source.data was read, so such a block failed
+                # with "missing image attachments data" while the same link as an image_url was downloaded. As for an
+                # image_url, only a link that starts with http(s) goes out: the preview swaps every such link for a
+                # pixel (prompt_policy._offline), and urlparse reads " https://..." as https, so the guard alone would
+                # have resolved its host, from a preview too.
+                url = source.get("url")
+                if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                    raise unprocessable(f"{where}: image source url must be an http(s) URL", param=where)
+                mime_type, data_b64 = _fetch_remote(url, where)
+            elif not data_b64 and kind not in (None, "base64"):
+                # A picture in Anthropic's Files API (source "file", a file_id) exists only there and the relay has no
+                # bytes to pass on: the client is told which source the route cannot take, not that the data is missing.
+                raise unprocessable(f"{where}: image source type {kind!r} is not supported; send the image as base64 data "
+                                    "or an http(s) URL", param=where)
         elif "imageData" in block:
             mime_type = block.get("mimeType") or "image/png"
             data_b64 = block.get("imageData")
@@ -265,30 +432,7 @@ def _extract_image_data(block, where):
                         mime_type = mime
                     data_b64 = rest.strip()
             elif url.startswith("http://") or url.startswith("https://"):
-                fetches = _IMAGE_FETCHES.get()
-                kept = fetches.found.get(url) if fetches is not None else None
-                if kept is not None:
-                    mime_type, data_b64 = kept
-                else:
-                    _assert_public_http_url(url, where)
-                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    max_bytes = 10 * 1024 * 1024
-                    try:
-                        with _IMAGE_OPENER.open(req, timeout=10) as r:
-                            _assert_public_peer(r, where)
-                            ct = r.headers.get("content-type", "").split(";")[0].strip()
-                            if ct:
-                                mime_type = ct
-                            buf = r.read(max_bytes + 1)
-                            if len(buf) > max_bytes:
-                                raise unprocessable("failed to fetch image attachments: image exceeds maximum allowed size (10MB)", param=where)
-                            data_b64 = base64.b64encode(buf).decode("ascii")
-                    except ApiError:
-                        raise
-                    except Exception:
-                        raise unprocessable(f"failed to fetch image attachments from {url}", param=where)
-                    if fetches is not None:
-                        fetches.found[url] = (mime_type, data_b64)
+                mime_type, data_b64 = _fetch_remote(url, where)
     elif "imageData" in block:
         mime_type = block.get("mimeType") or "image/png"
         data_b64 = block.get("imageData")
@@ -472,7 +616,11 @@ def _render_chunks(messages, role_key="role", *, allow_system=True, lead=None, c
                 for call in calls:
                     if not isinstance(call, dict):
                         continue
-                    fn = call.get("function") or {}
+                    fn = call.get("function")
+                    if fn is not None and not isinstance(fn, dict):
+                        # a string or a number here used to raise AttributeError: a 500 instead of the field named
+                        raise unprocessable("tool_calls[].function must be an object", param="messages")
+                    fn = fn or {}
                     name = fn.get("name") or call.get("name") or "tool"
                     args = fn.get("arguments") or call.get("arguments") or ""
                     if isinstance(call.get("custom"), dict):
@@ -541,8 +689,10 @@ def _message_fingerprints(messages, lead=None):
     """Hash each bridge-visible message, preserving boundaries but not cache markers."""
     if lead is None:
         lead = native_history.leading_instructions(messages)
+    # surrogatepass: half of a surrogate pair that a JavaScript client cut inside an emoji (JSON carries it as an escape) is
+    # hashed as it is. Encoded strictly it raised UnicodeEncodeError, and every request of that conversation got a 500.
     return tuple(hashlib.sha256(json.dumps(_render_messages([message], lead=int(index < lead)), ensure_ascii=False,
-                                          sort_keys=True, separators=(",", ":")).encode("utf-8")).digest()
+                                          sort_keys=True, separators=(",", ":")).encode("utf-8", "surrogatepass")).digest()
                  for index, message in enumerate(messages))
 
 

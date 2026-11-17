@@ -3,6 +3,7 @@ bounded metadata lookups and a UTF-8 relay log."""
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -366,8 +367,15 @@ def test_run_relay_writes_utf8_log_without_nul_bytes(tmp_path):
     fake.write_text('@echo off\r\n"%s" -c "%s"\r\n' % (sys.executable, code), encoding="ascii")
     script = Path(__file__).resolve().parents[1] / "scripts" / "run_relay.ps1"
     state, log = tmp_path / "state", tmp_path / "state" / "relay.log"
+    # The supervisor starts nothing while the configured port is listening: give it a port no relay of this machine
+    # uses (the checkout's config.json may name the one a running relay serves on).
+    with socket.socket() as free:
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"port": port}), encoding="utf-8")
     proc = subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
-                             "-Python", str(fake), "-StateDir", str(state)],
+                             "-Python", str(fake), "-Config", str(config), "-StateDir", str(state)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + 60

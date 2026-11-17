@@ -63,7 +63,8 @@ def test_two_sub_agents_started_together_send_their_first_requests_one_after_the
         return answer(request_, **kwargs)
 
     monkeypatch.setattr(direct.urllib.request, "urlopen", slow_first)
-    system = "You are a file search specialist for Claude Code. " + uuid.uuid4().hex
+    # a head as large as a real one (it must be big enough to be cached, direct.HEAD_MIN_CHARS)
+    system = "You are a file search specialist for Claude Code. " + uuid.uuid4().hex + " " + "Search the code. " * 150
     statuses = []
 
     def agent(task, session):
@@ -94,3 +95,35 @@ def test_a_request_alone_or_after_the_head_was_written_does_not_wait(prompt_rela
         body = client_request("anthropic", [{"role": "user", "content": task}], system=system)
         assert relay.post("anthropic", body, {"x-claude-code-session-id": task})[0] == 200
     assert relay.events(mark, "cache.head_wait") == []
+
+
+def _attributed(fingerprint, text):
+    """Claude Code's system: the attribution line of its conversation, then the text every sub-agent of a kind shares."""
+    line = "x-anthropic-billing-header: cc_version=2.1.310.%s; cc_entrypoint=cli; cc_is_subagent=true;" % fingerprint
+    return [{"type": "text", "text": line}, {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+
+
+def _head(system, tools=None):
+    body = {"model": "claude-opus-5-5", "tools": tools, "messages": [{"role": "system", "content": system}]}
+    return direct._head_key(body)
+
+
+def test_sub_agents_whose_attribution_lines_differ_share_one_head():
+    shared = "You are a file search specialist for Claude Code. " + "Search the code. " * 150
+    first = [{"type": "text", "text": block["text"], "cache": "cache_control" in block}
+             for block in _attributed("2e4", shared)]
+    second = [{"type": "text", "text": block["text"], "cache": "cache_control" in block}
+              for block in _attributed("6cd", shared)]
+    assert _head(first) is not None and _head(first) == _head(second)
+    other = [dict(block) for block in second]
+    other[1]["text"] = shared + " a different kind of agent"
+    assert _head(other) != _head(first)
+
+
+def test_a_head_too_small_to_be_cached_is_not_gated():
+    tiny = [{"type": "text", "text": "Be brief.", "cache": True}]
+    assert _head(tiny) is None
+    # the same small system with a large list of tools is worth a cache entry, and is gated
+    tools = [{"name": "tool_%d" % n, "description": "Does a thing. " * 20, "input_schema": {"type": "object"}}
+             for n in range(10)]
+    assert _head(tiny, tools) is not None

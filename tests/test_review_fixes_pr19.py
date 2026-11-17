@@ -4,7 +4,6 @@ import io
 import json
 import os
 import ssl
-import threading
 import time
 from types import SimpleNamespace
 import urllib.error
@@ -16,7 +15,6 @@ import apierr
 import client_context
 import config
 import direct
-import journal
 import upstream_refresh
 import validate
 from scripts import replay_upstream

@@ -5,7 +5,7 @@ import { usePolling } from '../useJournal.js';
 import { Dot, Page } from '../motion.jsx';
 import { Button, Empty, Tag, Toggle, useToast } from '../ui.jsx';
 import { ACCOUNT_STATE } from '../catalog.js';
-import { fmtAgo, fmtDay, fmtFixed, fmtInt, fmtShortTime, isNum, plural } from '../format.js';
+import { fmtAgo, fmtDay, fmtFixed, fmtInt, fmtNum, fmtShortTime, isNum, plural } from '../format.js';
 import { PoolScene } from '../stage/PoolScene.jsx';
 import { AddGuide, GuideNum } from '../stage/AddGuide.jsx';
 
@@ -204,7 +204,7 @@ export default function Accounts({ apiKey, onUnauthorized }) {
           <h1>Аккаунты</h1>
           <p className="page-meta">
             {summary ? `в пуле ${fmtInt(summary.total)} · включено ${fmtInt(summary.enabled ?? enabledCount)} · в работе ${fmtInt(summary.routable)}` : 'пул аккаунтов Retool'}
-            {isNum(data?.limits?.min_account_balance) && ` · резерв ниже ${fmtInt(data.limits.min_account_balance)} кредитов`}
+            {isNum(data?.limits?.min_account_balance) && ` · резерв ниже ${fmtNum(data.limits.min_account_balance)} кредитов`}
           </p>
         </div>
         <div className="head-actions">
@@ -222,7 +222,7 @@ export default function Accounts({ apiKey, onUnauthorized }) {
           <figure className="pool-demo"><figcaption>Как работает пул <span>пример маршрутизации</span></figcaption><PoolScene /></figure>
           <dl className="pool-rules">
             <div><dt>Порядок</dt><dd>Новый диалог получает включённый аккаунт с наименьшим приоритетом, при равенстве — менее загруженный. Начатый диалог остаётся на своём аккаунте</dd></div>
-            <div><dt>Резерв</dt><dd>Аккаунт с балансом ниже {isNum(data?.limits?.min_account_balance) ? fmtInt(data.limits.min_account_balance) : 'порога'} кредитов отходит в резерв и получает запросы, только когда ниже порога все</dd></div>
+            <div><dt>Резерв</dt><dd>Аккаунт с балансом ниже {isNum(data?.limits?.min_account_balance) ? fmtNum(data.limits.min_account_balance) : 'порога'} кредитов отходит в резерв и получает запросы, только когда ниже порога все</dd></div>
             <div><dt>Выключен</dt><dd>Не получает запросов, не продлевается и не прогревает кэш. Его диалоги переезжают на другие аккаунты</dd></div>
           </dl>
         </div>
