@@ -550,13 +550,15 @@ def account_config(root, record):
             if key not in record:
                 merged.pop(key, None)
     # Credentials belong to one upstream account, never to another record.
-    for key in ('bearer_token', 'bearer_token_env', 'minara_models'):
+    for key in ('bearer_token', 'bearer_token_env', 'api_key', 'api_key_env', 'minara_models', 'providers'):
         merged.pop(key, None)
-    if record.get('upstream', 'retool') == 'minara':
+    kind = record.get('upstream', 'retool')
+    if kind != 'retool':
         for key in ('cookie', 'xsrf', 'page_uuid', *PROVIDER_RESOURCE_KEY.values()):
             merged.pop(key, None)
-        merged['base'] = record.get('base', 'https://api.minara.ai/v1')
-    merged['upstream'] = record.get('upstream', 'retool')
+        if kind == 'minara':
+            merged['base'] = record.get('base', 'https://api.minara.ai/v1')
+    merged['upstream'] = kind
     merged.update(record)
     merged.update(enabled=record.get('enabled', True), priority=record.get('priority', 0),
                   label=record.get('label', ''), provider_access=record.get('provider_access', {}))
@@ -568,6 +570,8 @@ def pool_configs(cfg, backends=None):
     records when there are none yet."""
     if backends is not None:
         return [backend.cfg for backend in backends]
+    if cfg.get('_empty_pool'):
+        return []
     records = cfg.get('accounts')
     return ([account_config(cfg, record) for record in records if isinstance(record, dict)]
             if isinstance(records, list) and records else [cfg])

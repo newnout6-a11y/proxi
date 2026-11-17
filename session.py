@@ -15,7 +15,9 @@ import uuid
 import weakref
 
 import direct
+import drivers
 import native_history
+import stream_watchdog
 
 import websockets
 
@@ -90,7 +92,7 @@ class Backend:
         self.cfg = cfg
         self._http_post = http_post or self._default_post
         self._ws_connect = ws_connect or websockets.connect
-        self.refresher = (None if cfg.get("upstream") == "minara" else
+        self.refresher = (None if cfg.get("upstream", "retool") != "retool" else
                           refresher if refresher is not None else Refresher(cfg))
 
     # -- HTTP ---------------------------------------------------------------
@@ -425,6 +427,15 @@ class RelaySession:
     async def _maybe_pong(self, raw):
         await _answer_control(self.ws, raw)
 
+    def abort_active_turn(self):
+        """Abort an in-flight direct HTTP stream on watchdog timeout without marking the session cancelled."""
+        abort = getattr(self, "_active_direct_abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:
+                pass
+
     async def aclose(self):
         # Marked before anything is awaited. A session the pool has closed (evicted, released for good, left for another
         # account) is not coming back: no keepwarm cycle starts on it (direct._ensure_keepwarm), and as a child it no
@@ -477,7 +488,9 @@ class RelaySession:
         completed = False
         self._output_started = False
         priced = False
-        turn = self._stream_turn(prompt, model_provider, tool_names)
+        raw_turn = self._stream_turn(prompt, model_provider, tool_names)
+        turn = (stream_watchdog.guard(raw_turn, self.cfg, on_timeout=self.abort_active_turn)
+                if self.cfg.get("transport") == "direct" else raw_turn)
         try:
             async for event in turn:
                 kind = event.get("type")
@@ -505,12 +518,8 @@ class RelaySession:
         """Yield normalised provider events, cleaning its poller on every exit."""
         if self.cfg.get("transport") == "direct":
             args = self._direct or {}
-            if self.cfg.get("upstream") == "minara":
-                import minara
-                transport = minara
-            else:
-                transport = direct
-            async with contextlib.aclosing(transport.iter_events(
+            driver = drivers.get_driver(self.cfg)
+            async with contextlib.aclosing(driver.stream_turn(
                     self.cfg, self, model_provider, prompt, args.get("head"), args.get("tools"),
                     args.get("tool_choice"), args.get("max_tokens"), args.get("chunks"))) as events:
                 async for event in events:
@@ -913,7 +922,7 @@ class SessionPool:
     def __init__(self, backend: Backend, store=None):
         self.backend = backend
         self.cfg = backend.cfg
-        self.backends = [backend]
+        self.backends = [] if self.cfg.get("_empty_pool") else [backend]
         if isinstance(self.cfg.get("accounts"), list) and self.cfg["accounts"]:
             self.backends = []
             custom_post = getattr(backend, "_http_post", None)
@@ -974,12 +983,18 @@ class SessionPool:
         if not isinstance(configs, list):
             # One account without accounts[]: the file has just become a pool of it and this one (admin._append_records).
             # The list holds that first account too, as a copy without "accounts" (never the root cfg, which holds the list).
-            configs = self.cfg["accounts"] = [{key: value for key, value in self.backend.cfg.items() if key != "accounts"}]
+            configs = self.cfg["accounts"] = ([] if self.cfg.get("_empty_pool")
+                                              else [{key: value for key, value in self.backend.cfg.items() if key != "accounts"}])
         if record.get("upstream") == "minara" and not record.get("bearer_token"):
             # config.load resolves bearer_token_env into the record's bearer_token in memory; a record taken from the admin
             # request has only the variable's name, and every request and balance read of the account would answer 401.
             import config  # local: session's imports stay those it starts with
             config.validate_minara_account(record)
+        elif record.get("upstream", "retool") not in ("retool", "minara") and record.get("api_key_env") and not record.get("api_key"):
+            resolved_key = os.environ.get(record["api_key_env"], "").strip()
+            if not resolved_key and record.get("auth_mode", "bearer") != "none":
+                raise apierr.service_unavailable(f"environment variable {record['api_key_env']} holds no API key")
+            record["api_key"] = resolved_key
         base = self.backends[0] if self.backends else self.backend
         custom_post = getattr(base, "_http_post", None)
         if custom_post == getattr(base, "_default_post", None):
@@ -993,8 +1008,12 @@ class SessionPool:
         acc_cfg["_disk_auth"] = (record.get("cookie"), record.get("xsrf"))
         backend = Backend(acc_cfg, http_post=custom_post, ws_connect=custom_ws)
         configs.append(record)
+        was_empty = not self.backends
+        self.cfg["_empty_pool"] = False
         # A new list, not an append: a request choosing an account on the event loop keeps reading the list it started with.
         self.backends = [*self.backends, backend]
+        if was_empty:
+            self.backend = backend
         return backend
 
     def remove_account(self, backend):
@@ -1788,7 +1807,8 @@ class SessionPool:
                         restored = await self._restore_state(key, session)
                         self._conversations[key] = session
                         journal.emit("session.create", "Новый диалог — новый тред %s" % (
-                                         "Minara" if backend.cfg.get("upstream") == "minara" else "Retool"), "info",
+                                         backend.cfg.get("provider_name")
+                                         or ("Minara" if backend.cfg.get("upstream") == "minara" else "Retool")), "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),
                                      account=account_tag(backend), pool=len(self._conversations))
                         self._report_restored(restored)

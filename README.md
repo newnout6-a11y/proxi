@@ -1858,7 +1858,7 @@ relay с этим делает. 429 приходит до начала гене�
 | Слой | Модули |
 |---|---|
 | HTTP и входящие запросы | `proxy.py` (сервер, маршруты, лимиты, слоты), `auth.py` (ключ relay, заголовки upstream), `validate.py` (строгий разбор трёх диалектов), `apierr.py` (ошибки в форме OpenAI/Anthropic), `sse.py`, `io_workers.py` |
-| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `minara.py` (транспорт Minara: чат и `/v1/messages`), `upstream_attempts.py`, `upstream_diagnostics.py` |
+| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `stream_watchdog.py` (таймауты первого токена, простоя и tool-call при стриминге), `drivers/` (реестр драйверов апстримов, пул `httpx`, пресеты провайдеров), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `minara.py` (транспорт Minara: чат и `/v1/messages`), `upstream_attempts.py`, `upstream_diagnostics.py` |
 | История между ходами и перезапусками | `native_history.py`, `conversation_state.py`, `conversation_infer.py`, `compaction_tools.py`, `summary_guard.py` |
 | Ответ клиенту | `adapters.py` (Chat, Responses, Messages), `structured.py`, `forced_choice.py`, `generation.py`, `web_search.py` |
 | Клиенты и системный промпт | `client_context.py`, `context.py`, `prompt_policy.py` (профили и правила `prompts.json`), `prompt_body.py` (правки истории и tools), `prompt_stabilizer.py`, `tool_names.py`, `tool_union.py`, `tool_search_policy.py` |

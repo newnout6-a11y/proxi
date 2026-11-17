@@ -16,4 +16,7 @@ pytest-xdist>=3.6,<4
 ruamel.yaml>=0.18.6,<0.19
 
 # Browser TLS impersonation required by the optional Minara upstream.
-curl_cffi==0.17.0
+curl_cffi>=0.15,<1
+
+# Persistent async HTTP/1.1 + HTTP/2 connection pooling and HTTP/SOCKS5 proxies for universal drivers.
+httpx[http2,socks]>=0.28,<1

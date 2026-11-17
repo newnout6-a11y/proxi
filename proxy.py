@@ -27,6 +27,8 @@ import compaction_tools
 import config as config_module
 import conversation_infer
 import conversation_state
+import drivers
+from drivers import http_pool
 import forced_choice
 import generation
 import minara_refresh
@@ -41,7 +43,7 @@ import prompt_stabilizer
 import tool_search_policy
 import tool_union
 import validate
-from accounts import UNNAMED, AccountDispatcher, MinaraAccount, account_tag, enabled
+from accounts import UNNAMED, AccountDispatcher, MinaraAccount, UnmeteredAccount, account_tag, enabled
 from credits import CreditsManager
 from orchestrator import TurnRunner, acquire_plan, client_origin, journal_changes
 from session import Backend, SessionPool
@@ -124,15 +126,20 @@ class Runtime:
         self.pool = SessionPool(self.backend)
         if getattr(self.pool, "backends", None):
             self.backend = self.pool.backend
-        backends = getattr(self.pool, "backends", None) or [self.backend]
+        pool_backends = getattr(self.pool, "backends", None)
+        backends = ([] if cfg.get("_empty_pool") and not pool_backends
+                    else (pool_backends or [self.backend]))
         managers = {}
         for backend in backends:
             manager = self.account_manager(backend)
             if manager is not None:
                 managers[backend] = manager
-        self.credits = managers.get(self.backend) or CreditsManager(
-            self.backend.cfg.get("base", cfg.get("base")),
-            lambda: auth.upstream_headers(self.backend.cfg), getattr(self.backend, "refresher", None))
+        if not backends or self.backend.cfg.get("upstream", "retool") != "retool":
+            self.credits = managers.get(self.backend) or UnmeteredAccount()
+        else:
+            self.credits = managers.get(self.backend) or CreditsManager(
+                self.backend.cfg.get("base", cfg.get("base")),
+                lambda: auth.upstream_headers(self.backend.cfg), getattr(self.backend, "refresher", None))
         self.accounts = AccountDispatcher(list(managers), cfg, managers)
         # Minara's new models, prices and gone models, taken by the relay itself (minara_refresh); started with the pool.
         self.catalog = minara_refresh.CatalogRefresher(cfg, self.accounts)
@@ -174,10 +181,13 @@ class Runtime:
         self.prompts.stabilizer = self.stabilizer  # the admin's preview shows the client's system as it is held
 
     def account_manager(self, backend):
-        """The balance of one account: Minara's credits, Retool's credits, or None for an account without one. The same
-        for the accounts of the start and for one the admin adds while the relay runs (admin._adopt)."""
-        if backend.cfg.get("upstream") == "minara":
+        """The balance of one account: Minara's credits, Retool's credits, live provider balance, or UnmeteredAccount.
+        The same for the accounts of the start and for one the admin adds while the relay runs (admin._adopt)."""
+        upstream = backend.cfg.get("upstream", "retool")
+        if upstream == "minara":
             return MinaraAccount(backend.cfg, backend=backend)
+        if upstream != "retool":
+            return drivers.get_driver(backend.cfg).make_account_manager(backend, self.cfg)
         if not hasattr(backend, "refresher"):
             return None
         return CreditsManager(backend.cfg.get("base", self.cfg.get("base")),
@@ -255,6 +265,7 @@ class Runtime:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        await http_pool.close_loop_clients()
         await self.loop.shutdown_asyncgens()
 
     def close(self):
@@ -1503,7 +1514,12 @@ def startup_config(argv=None):
     parser.add_argument("--state-dir", help="Directory for journal, command log, rejected upstream bodies "
                                             "and stored conversation state")
     args = parser.parse_args(argv)
-    cfg = config_module.load(os.path.abspath(args.config))
+    cfg_path = os.path.abspath(args.config)
+    bootstrap = (
+        os.path.normcase(cfg_path) == os.path.normcase(os.path.abspath(config_module.CONFIG_PATH))
+        and not os.path.exists(cfg_path)
+    )
+    cfg = config_module.load(cfg_path, bootstrap=bootstrap)
     state = os.path.abspath(args.state_dir or HERE)
     os.makedirs(state, exist_ok=True)
     for key, relative in (("command_log", "commands.log"), ("journal_path", "journal.jsonl"),
@@ -1580,7 +1596,10 @@ def balance_lines(balance):
     elif balance.get("accounts") and all(item.get("balance_supported") is False for item in balance["accounts"]):
         lines.append(" balance:       unavailable (provider does not expose balance; configured routing only)")
     elif not balance.get("minara"):
-        lines.append(" upstream:      DEGRADED " + str(balance.get("error")))
+        if balance.get("accounts") == [] and not balance.get("error"):
+            lines.append(" pool:          empty — add a provider or account in /admin")
+        else:
+            lines.append(" upstream:      DEGRADED " + str(balance.get("error")))
     minara = balance.get("minara")
     if minara:
         known = minara.get("available")
@@ -1604,7 +1623,9 @@ def main(argv=None):
     connections = threading.BoundedSemaphore(max(MAX_CONNECTIONS, 4 * cfg["max_workers"]))
     server = BoundedServer((cfg["host"], cfg["port"]), handler, slots, connections)
 
-    backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
+    pool_backends = getattr(runtime.pool, "backends", None)
+    backends = ([] if runtime.cfg.get("_empty_pool") and not pool_backends
+                else (pool_backends or [runtime.backend]))
     runtime.accounts.start()
     runtime.catalog.start()
     runtime.retool_catalog.start()
@@ -1613,8 +1634,9 @@ def main(argv=None):
         r.start()  # no-op for accounts the dispatcher schedules
     # The relay serves at once: the balances are read in the background, and their lines follow the banner.
     reading = sum(1 for backend in backends if enabled(backend))
-    pending = {"pending": "reading %d account%s in the background; the relay already serves" % (
-        reading, "" if reading == 1 else "s")}
+    pending = ({"accounts": []} if not backends else
+               {"pending": "reading %d account%s in the background; the relay already serves" % (
+                   reading, "" if reading == 1 else "s")})
     for line in banner_lines(cfg, pending, warnings):
         console_log.write(line)
     first_round = threading.Thread(target=startup_round, args=(runtime,), name="startup-balances", daemon=True)
@@ -1655,7 +1677,9 @@ def main(argv=None):
             server.server_close()
             runtime.close()
         finally:
-            backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
+            pool_backends = getattr(runtime.pool, "backends", None)
+            backends = ([] if runtime.cfg.get("_empty_pool") and not pool_backends
+                        else (pool_backends or [runtime.backend]))
             refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
             for r in refreshers:
                 r.stop()

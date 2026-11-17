@@ -1,4 +1,5 @@
 """Configuration loading, environment overrides and validation."""
+import copy
 import json
 from contextlib import contextmanager, nullcontext
 import hashlib
@@ -15,6 +16,7 @@ import time
 from apierr import service_unavailable
 import auth
 import console_log
+from drivers import presets as driver_presets
 import minara_catalog
 import models
 import retool_catalog
@@ -66,6 +68,9 @@ DEFAULTS = {
     "rate_limit_burst": 64.0,
     "turn_timeout": 900,
     "recv_timeout": 120,
+    "stream_first_token_timeout": 300,
+    "stream_idle_timeout": 120,
+    "stream_tool_timeout": 600,
     "upstream_timeout": 120,
     "session_refresh_interval": 900,
     "command_timeout": 300,
@@ -190,6 +195,12 @@ DEFAULTS = {
     # here, or ~/.config/opencode/opencode.jsonc (opencode.json) when empty; false leaves OpenCode's file alone.
     "opencode_sync": True,
     "opencode_settings": "",
+    # Universal providers (OpenCode-compatible schema), model routing aliases/fallbacks, and virtual client keys.
+    "providers": None,
+    "routes": [],
+    "client_keys": [],
+    "catalog_refresh_hours": 6,
+    "models_dev_sync": True,
     "account_balance_interval": 300,
     "account_refresh_parallel": 3,
     # Pause after Retool's hourly managed-key limit; a limit right after the return adds 5 minutes
@@ -222,6 +233,9 @@ JOURNAL_NUMBERS = ("journal_max_file_bytes", "journal_keep_files")
 # How long a new conversation waits for a slot of a full pool, and how long a request waits on an account that is at its
 # hourly limit: whole numbers of seconds, checked the same way.
 POOL_NUMBERS = ("conversation_wait", "account_rate_limit_wait")
+# Silence timeouts for stream_watchdog (whole seconds, 0 disables, up to 24h).
+STREAM_TIMEOUTS = ("stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout")
+STREAM_TIMEOUT_MAX = 86400
 
 # Cookie values that are just host names are not secrets.
 HOSTNAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
@@ -381,7 +395,8 @@ def _derived_account_id(record, saved, occurrence):
 
 
 def _assign_account_ids(saved):
-    records = saved.get("accounts") if isinstance(saved.get("accounts"), list) else [saved]
+    records = (saved.get("accounts") if isinstance(saved.get("accounts"), list)
+               else ([] if isinstance(saved.get("providers"), list) else [saved]))
     seen = set()
     changed = False
     for record in records:
@@ -664,8 +679,24 @@ def _check_pool_fields(record, name):
     _check_provider_access(record.get('provider_access', {}), name)
 
 
-def load(path=CONFIG_PATH):
+def ensure_bootstrap_file(path=CONFIG_PATH):
+    """Create a minimal provider-agnostic config.json when starting fresh without one."""
+    if os.path.exists(path):
+        return False
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        return False
+    initial = {"host": "127.0.0.1", "port": 8787, "providers": [], "routes": []}
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(initial, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return True
+
+
+def load(path=CONFIG_PATH, *, bootstrap=False):
     """Load config, apply env overrides, fill defaults, validate."""
+    if bootstrap and not os.path.isfile(path):
+        ensure_bootstrap_file(path)
     if not os.path.isfile(path):
         # Fail before storage_lock: it would create a stray .lock next to a missing file.
         _read_file(path)
@@ -718,13 +749,14 @@ def _load(path):
             cfg[key] = value
 
     # Before the loop below, which would turn true into 1, 1.9 into 1 and crash on infinity.
-    for num_key in STATE_NUMBERS + JOURNAL_NUMBERS + POOL_NUMBERS:
+    for num_key in STATE_NUMBERS + JOURNAL_NUMBERS + POOL_NUMBERS + STREAM_TIMEOUTS:
         if _whole_number(cfg[num_key]) is None:
             raise service_unavailable(f"config value '{num_key}' must be an integer (a whole number: "
                                       "not true/false, not a fraction)")
 
     for num_key in ("port", "agent_mode", "max_body_bytes", "max_frame_bytes", "max_workers",
                     "turn_timeout", "recv_timeout", "upstream_timeout",
+                    *STREAM_TIMEOUTS,
                     "session_refresh_interval", "max_conversations", "conversation_idle_timeout",
                     "conversation_wait",
                     "command_timeout", "command_output_limit", "max_exec_turns", "context_max_bytes",
@@ -761,10 +793,16 @@ def _load(path):
             or any(type(item) not in (int, float) or not 0 <= item <= 60 for item in delays)):
         raise service_unavailable("minara_channel_retry_delays must be a list of at most 5 waits of 0-60 seconds")
     for key, top in (("minara_catalog_refresh_hours", 168), ("minara_catalog_budget", 5000),
-                     ("retool_catalog_refresh_hours", 168), ("retool_catalog_probes", 50)):
+                     ("retool_catalog_refresh_hours", 168), ("retool_catalog_probes", 50),
+                     ("catalog_refresh_hours", 168)):
         value = cfg.get(key)
         if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= top:
             raise service_unavailable("%s must be a number from 0 to %d" % (key, top))
+    if type(cfg.get("models_dev_sync")) is not bool:
+        raise service_unavailable("models_dev_sync must be a boolean")
+    for key in STREAM_TIMEOUTS:
+        if not 0 <= cfg[key] <= STREAM_TIMEOUT_MAX:
+            raise service_unavailable(f"{key} must be between 0 and {STREAM_TIMEOUT_MAX} seconds (0 disables)")
     if cfg["account_balance_interval"] < 0 or cfg["account_refresh_parallel"] < 1:
         raise service_unavailable("account_balance_interval must be non-negative and account_refresh_parallel positive")
     if not 1 <= cfg["account_rate_limit_cooldown"] <= 3600:
@@ -845,11 +883,49 @@ def _load(path):
         # would be 429 forever.
         raise service_unavailable("rate_limit_rps must be non-negative and rate_limit_burst must be at least 1")
 
+    providers_raw = cfg.get("providers")
+    providers_meta = {}
+    provider_records = []
+    provider_secrets = []
+    if providers_raw is not None:
+        if not isinstance(providers_raw, list):
+            raise service_unavailable("'providers' must be an array of provider objects")
+        seen_cred_ids = set()
+        for idx, prov in enumerate(providers_raw):
+            try:
+                meta, expanded, sec = driver_presets.expand_provider_to_accounts(
+                    copy.deepcopy(prov), f"providers[{idx}]"
+                )
+            except ValueError as exc:
+                raise service_unavailable(str(exc)) from None
+            if meta["id"] in providers_meta:
+                raise service_unavailable(f"providers[{idx}]: duplicate provider id '{meta['id']}'")
+            providers_meta[meta["id"]] = meta
+            for rec in expanded:
+                if rec["account_id"] in seen_cred_ids:
+                    raise service_unavailable(f"providers[{idx}]: duplicate credential id '{rec['account_id']}'")
+                seen_cred_ids.add(rec["account_id"])
+                rec["_from_provider"] = True
+                provider_records.append(rec)
+            for val in sec:
+                if val not in provider_secrets:
+                    provider_secrets.append(val)
+    cfg["_providers_meta"] = providers_meta
+
+    if not isinstance(cfg.get("routes"), list):
+        raise service_unavailable("'routes' must be an array")
+    if not isinstance(cfg.get("client_keys"), list):
+        raise service_unavailable("'client_keys' must be an array")
+
     accounts = cfg.get("accounts")
     warnings = []
+    has_providers_key = providers_raw is not None
     if accounts is not None:
-        if not isinstance(accounts, list) or not accounts:
-            raise service_unavailable("'accounts' must be a non-empty array")
+        if not isinstance(accounts, list):
+            raise service_unavailable("'accounts' must be an array")
+        if not accounts and not has_providers_key:
+            # Allow empty accounts[] as a clean empty-pool bootstrap instead of requiring a dummy Retool record.
+            cfg["_empty_pool"] = True
         for i, acc in enumerate(accounts):
             if not isinstance(acc, dict):
                 raise service_unavailable(f"account #{i} must be an object")
@@ -874,12 +950,19 @@ def _load(path):
                             "entry of the account that owns the resource")
         for i, acc in enumerate(accounts):
             warnings.extend(_provider_access_warnings(cfg, acc, f"account #{i}"))
+    elif has_providers_key:
+        if not provider_records:
+            cfg["_empty_pool"] = True
+            cfg["accounts"] = []
+        else:
+            cfg["accounts"] = list(provider_records)
+        accounts = cfg["accounts"]
     else:
         _check_upstream(cfg, "the account", warnings)
         _check_pool_fields(cfg, "the account")
         warnings.extend(_provider_access_warnings(cfg, cfg, "the account"))
 
-    retool_required = not accounts and cfg.get("upstream", "retool") != "minara"
+    retool_required = (accounts is None and not has_providers_key and cfg.get("upstream", "retool") != "minara")
     missing = [k for k in REQUIRED if not cfg.get(k)] if retool_required else []
     if missing:
         raise service_unavailable("config is missing required keys: " + ", ".join(missing))
@@ -897,7 +980,7 @@ def _load(path):
         raise service_unavailable("transport must be 'direct' (the legacy 'agent' WebSocket transport is disabled)")
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
         raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
-    cfg['_minara_models'] = models.build_minara_catalog(accounts or [cfg])
+    cfg['_minara_models'] = models.build_minara_catalog(accounts if accounts is not None else [cfg])
     if cfg.get("reasoning_effort") not in (None, "auto"):
         models.resolve_tolerant(cfg["model"], cfg["reasoning_effort"],
                                 strict=cfg["strict_models"], allow_downgrade=cfg["allow_effort_downgrade"],
@@ -936,9 +1019,12 @@ def _load(path):
     if search_key and search_key not in cookie_vals:
         cookie_vals.append(search_key)  # masked wherever the relay redacts secrets, should it ever show up in a message
     # The secrets that are no cookie: a renewal or a new sign-in rebuilds cookie_values and keeps these (auth.secret_values).
-    tokens = [r.get("bearer_token") for r in (accounts or [cfg]) if r.get("upstream") == "minara"]
-    cfg["_extra_secrets"] = ([search_key] if search_key else []) + [t for t in tokens if t]
-    cookie_vals.extend(t for t in tokens if t and t not in cookie_vals)
+    tokens = [r.get("bearer_token") for r in (accounts if accounts is not None else [cfg]) if r.get("upstream") == "minara"]
+    all_non_cookie_secrets = ([search_key] if search_key else []) + [t for t in tokens if t] + provider_secrets
+    cfg["_extra_secrets"] = list(dict.fromkeys(all_non_cookie_secrets))
+    for secret in cfg["_extra_secrets"]:
+        if secret and secret not in cookie_vals:
+            cookie_vals.append(secret)
     if cfg["web_search_provider"] and not search_key:
         warnings.append("web_search_provider is %s, but the environment variable %s holds no key: WebSearch stays refused"
                         % (cfg["web_search_provider"], cfg["web_search_key_env"]))
@@ -947,11 +1033,19 @@ def _load(path):
     for text in warnings:
         console_log.write("warning: " + text, file=sys.stderr)
     changed = _assign_account_ids(saved)
-    if isinstance(cfg.get("accounts"), list):
-        for row, disk in zip(cfg["accounts"], saved["accounts"]):
+    if isinstance(saved.get("accounts"), list) and isinstance(cfg.get("accounts"), list):
+        for row, disk in zip(cfg["accounts"][:len(saved["accounts"])], saved["accounts"]):
             row["account_id"] = disk["account_id"]
-    if not isinstance(saved.get("accounts"), list):
+        if provider_records:
+            existing_ids = {row.get("account_id") for row in cfg["accounts"]}
+            for rec in provider_records:
+                if rec["account_id"] in existing_ids:
+                    raise service_unavailable(f"provider credential id '{rec['account_id']}' collides with an existing account_id")
+            cfg["accounts"].extend(provider_records)
+    elif not has_providers_key and not isinstance(saved.get("accounts"), list):
         cfg["account_id"] = saved["account_id"]
+    if isinstance(cfg.get("accounts"), list) and not cfg["accounts"]:
+        cfg["_empty_pool"] = True
     if changed and cfg["_persist_auth"]:
         try:
             _write_file(path, saved)
