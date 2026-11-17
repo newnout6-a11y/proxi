@@ -145,9 +145,12 @@ class Runtime:
         self.catalog = minara_refresh.CatalogRefresher(cfg, self.accounts)
         # Retool's new models, from Retool's own registry (retool_refresh); started with the pool too.
         self.retool_catalog = retool_refresh.CatalogRefresher(cfg, self.accounts)
+        # Universal providers' /models discovery + models.dev metadata enrichment (catalog.discovery).
+        import catalog as universal_catalog
+        self.provider_catalog = universal_catalog.UniversalCatalogRefresher(cfg, self)
         # After each look OpenCode's model list follows what the relay publishes (client_sync).
         self.client_sync = client_sync.OpenCodeSync(cfg)
-        self.catalog.after_look = self.retool_catalog.after_look = self.client_sync
+        self.catalog.after_look = self.retool_catalog.after_look = self.provider_catalog.after_look = self.client_sync
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.runner.accounts = self.accounts
         self.prompts = prompt_policy.PromptStore(cfg)
@@ -1629,6 +1632,7 @@ def main(argv=None):
     runtime.accounts.start()
     runtime.catalog.start()
     runtime.retool_catalog.start()
+    runtime.provider_catalog.start()
     refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
     for r in refreshers:
         r.start()  # no-op for accounts the dispatcher schedules
@@ -1683,6 +1687,7 @@ def main(argv=None):
             refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
             for r in refreshers:
                 r.stop()
+            runtime.provider_catalog.stop()
             runtime.catalog.stop()
             runtime.retool_catalog.stop()
             runtime.accounts.stop()

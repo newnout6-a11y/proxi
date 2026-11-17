@@ -26,7 +26,7 @@ import conversation_state
 import journal
 import console_log
 import models as model_catalog
-from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled, priority as account_priority
+from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -1344,14 +1344,19 @@ class SessionPool:
             wait = min(max(0.0, r.get("until_at", 0.0) - time.time()) for r in limited)
             return apierr.accounts_rate_limited(wait, len(limited), len(backends))
         minara = all((getattr(b, "cfg", None) or {}).get("upstream") == "minara" for b in backends)
+        universal = all((getattr(b, "cfg", None) or {}).get("upstream", "retool") not in ("retool", "minara") for b in backends)
         exhausted = [(account_tag(b, UNNAMED), r.get("available"))
                      for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
         if exhausted:
             threshold = next(r.get("threshold") for r in reasons if r.get("reason") == "exhausted")
-            return apierr.insufficient_credits(threshold or 0, exhausted, "Minara" if minara else "Retool")
+            unit_label = "Minara" if minara else ("Provider" if universal else "Retool")
+            return apierr.insufficient_credits(threshold or 0, exhausted, unit_label)
         if minara:
             return apierr.service_unavailable("no usable Minara account: their tokens expired or were rejected; "
                                               "add new tokens (admin, Accounts) and restart the relay")
+        if universal:
+            return apierr.service_unavailable("no usable provider credential: API keys were rejected or rate-limited; "
+                                              "check credentials in /admin")
         return apierr.service_unavailable("no usable account: Retool sessions need a new sign-in")
 
     def _on_shared_session(self, isolated=False, context_scope=None):
@@ -1387,6 +1392,31 @@ class SessionPool:
         reserved, awaited or counted. `configured` is refusal_reasons': acquire() always judges the resource.
         An account whose Retool plan refused the model a short while ago refuses it like a route fact (_refusals).
         """
+        if not backends:
+            raise apierr.service_unavailable("no upstream providers or accounts are configured; add a provider in /admin")
+        if isinstance(model_entry, dict) and model_entry.get("route_targets"):
+            fallback_reserve = None
+            fallback_signed_out = None
+            last_error = None
+            for target in model_entry["route_targets"]:
+                try:
+                    kind, found = self._candidates(backends, target, exclude, configured)
+                except apierr.ApiError as err:
+                    if last_error is None or err.status != 404:
+                        last_error = err
+                    continue
+                if kind == "ready":
+                    return "ready", found
+                if kind == "reserve" and fallback_reserve is None:
+                    fallback_reserve = found
+                elif kind == "signed_out" and fallback_signed_out is None:
+                    fallback_signed_out = found
+            if fallback_reserve is not None:
+                return "reserve", fallback_reserve
+            if fallback_signed_out is not None:
+                return "signed_out", fallback_signed_out
+            raise (last_error or apierr.service_unavailable(f"no target in route '{model_entry.get('id')}' is currently usable"))
+
         reasons = self._refusals(model_entry, backends, configured)
         routable = [backend for backend, reason in zip(backends, reasons) if not reason]
         refusals = [reason for reason in reasons if reason]
@@ -1404,11 +1434,11 @@ class SessionPool:
             return "reserve", spare
         # A signed-out account is still better than no account: its 401 makes the
         # refresher re-read config.json, so a fresh sign-in is adopted at once.
-        # A Bearer token (Minara) has no refresher and never changes before a restart: an expired or rejected one would
-        # only be sent to be refused, once per dead account per request.
+        # Static Bearer/API-key accounts (Minara, OpenRouter, Anthropic, etc.) have no browser cookie refresher:
+        # a rejected key would only be sent to fail again.
         signed_out = [backend for backend in routable if backend not in exclude and account_enabled(backend)
                       and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"
-                      and (getattr(backend, "cfg", None) or {}).get("upstream") != "minara"]
+                      and (getattr(backend, "cfg", None) or {}).get("upstream", "retool") == "retool"]
         if signed_out:
             return "signed_out", signed_out
         raise self._unusable_error(routable)
@@ -1441,23 +1471,24 @@ class SessionPool:
         return None
 
     def _next_backend(self, model_entry=None, exclude=()) -> Backend:
+        from catalog import router as catalog_router
         kind, candidates = self._candidates(self.backends, model_entry, exclude)
         if kind == "reserve":
             # Every account is below the reserve: spend the richest one down to zero.
             return max(candidates, key=lambda b: float("inf") if b.unavailable.get("available") is None
                        else b.unavailable["available"])
         counts = {b: 0 for b in self.backends}
+        inflight_counts = {b: 0 for b in self.backends}
         for s in self._conversations.values():
             if getattr(s, "backend", None) in counts:
                 counts[s.backend] += 1
         for session, _, _, _ in self._active.values():
             if getattr(session, "backend", None) in counts:
                 counts[session.backend] += 2
+                inflight_counts[session.backend] += 1
         idx = getattr(self, "_rr_index", 0)
-        self._rr_index = (idx + 1) % len(self.backends)
-        # Operator priority first (lower wins), then the least loaded, then round-robin.
-        return min(candidates, key=lambda b: (account_priority(b), counts[b],
-                                              (self.backends.index(b) - idx) % len(self.backends)))
+        self._rr_index = (idx + 1) % max(1, len(self.backends))
+        return catalog_router.select_candidate_backend(candidates, self.backends, counts, inflight_counts, idx)
 
     @property
     def mode(self):

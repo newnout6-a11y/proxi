@@ -980,7 +980,17 @@ def _load(path):
         raise service_unavailable("transport must be 'direct' (the legacy 'agent' WebSocket transport is disabled)")
     if cfg["exec_policy"] not in ("allow_all", "allowlist", "off"):
         raise service_unavailable("exec_policy must be 'allow_all', 'allowlist' or 'off'")
+    from catalog import router as catalog_router
     cfg['_minara_models'] = models.build_minara_catalog(accounts if accounts is not None else [cfg])
+    cfg['_provider_models'] = catalog_router.build_provider_catalog(cfg)
+    cfg['_route_aliases'] = catalog_router.build_route_aliases(cfg, models)
+    if 'model' not in saved and not any(
+        isinstance(a, dict) and a.get('upstream', 'retool') == 'retool'
+        for a in (accounts if isinstance(accounts, list) else ([] if cfg.get('_empty_pool') else [cfg]))
+    ):
+        first_route = next(iter(cfg['_route_aliases']), None) or next(iter(cfg['_provider_models']), None) or next(iter(cfg['_minara_models']), None)
+        if first_route:
+            cfg['model'] = first_route
     if cfg.get("reasoning_effort") not in (None, "auto"):
         models.resolve_tolerant(cfg["model"], cfg["reasoning_effort"],
                                 strict=cfg["strict_models"], allow_downgrade=cfg["allow_effort_downgrade"],

@@ -1153,6 +1153,22 @@ class TurnRunner:
                     "токен отклонён" if rejected else "баланс закончился"))
                 holder["reason"] = "stop"
                 continue
+            if (retryable and error is not None and backend is not None and backend not in exclude
+                    and (getattr(backend, "cfg", None) or {}).get("upstream", "retool") not in ("retool", "minara")
+                    and error.code in ("upstream_error", "service_unavailable", "upstream_timeout",
+                                       "upstream_auth_error", "insufficient_credits", "rate_limit_error")):
+                check_next = getattr(self.pool, "unavailable_error", None)
+                if check_next is not None and check_next(
+                    parsed.entry, exclude=(*exclude, backend), **acquire_plan(self.cfg, parsed).kwargs
+                ) is None:
+                    exclude.append(backend)
+                    journal.emit("account.failover", "Сбой апстрима провайдера — запрос переключён на резервный маршрут",
+                                 "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
+                                 error=error.code, reason="provider_failover")
+                    console_log.write("[%s] [account] %s: %s, failover на резервный маршрут" % (
+                        getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), error.code))
+                    holder["reason"] = "stop"
+                    continue
             if error is not None and apierr.is_plan_refusal(error):
                 # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
                 # the client gets the settled 404 that names the cause rather than a 502 it would only send again.
@@ -1400,7 +1416,12 @@ class TurnRunner:
                 # must come from the backend cfg the turn actually runs on, not the
                 # global config (accounts[] can span tenants).
                 acc_cfg = getattr(getattr(acquired, "backend", None), "cfg", None) or self.cfg
-                resource = model_catalog.provider_resource(acc_cfg, parsed.entry)
+                bound_entry = model_catalog.bind_entry_for_backend(parsed.entry, acc_cfg)
+                acquired._bound_entry = bound_entry
+                acquired._provider_options = dict(getattr(parsed, "provider_options", None) or {})
+                acquired._structured_output = getattr(parsed, "structured_output", None)
+                model_provider["model"] = bound_entry.get("upstream_model") or bound_entry["id"]
+                resource = model_catalog.provider_resource(acc_cfg, bound_entry)
                 if resource:
                     model_provider["providerResourceName"] = resource
                 else:
@@ -1487,8 +1508,10 @@ class TurnRunner:
                             parsed._full_prompt_text = sent
 
                         if native_tools:
-                            tools_converted = (parsed.tools if parsed.entry.get("upstream") == "minara"
-                                               else direct.tools_to_retool(parsed.tools))
+                            import drivers as _drivers
+                            uses_retool_tools = _drivers.get_driver(acc_cfg).capabilities.uses_retool_tool_schema
+                            tools_converted = (direct.tools_to_retool(parsed.tools) if uses_retool_tools
+                                               else parsed.tools)
                             if hasattr(direct_target, "register_tools"):
                                 direct_target.register_tools(tools_converted)
                             final_tools = tools_converted
