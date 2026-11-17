@@ -914,3 +914,37 @@ def test_minara_claude_routes_are_listed_after_retool_and_checked_against_anthro
     assert [row['name'] for row in rows] == ['claude-opus-5-5', 'minara/claude-opus-5-5']
     minara_row = rows[1]
     assert minara_row['labelOverride'] == 'Claude Opus 5.5 (Minara)' and not minara_row['isFamilyDefault']
+
+
+def test_universal_providers_and_claude_route_aliases_sync_to_desktop(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    path, _ = local_library(tmp_path / 'configLibrary', [{'name': 'or/anthropic/claude-opus-4.6', 'labelOverride': 'My Opus'}])
+    relay_file = tmp_path / 'config.json'
+    relay_file.write_text(json.dumps({
+        'allow_effort_downgrade': True,
+        'providers': [
+            {'id': 'or', 'preset': 'openrouter', 'api_key': 'sk-or-v1-synthetic0123456789abcdef'},
+        ],
+        'routes': [
+            {'id': 'claude-opus-ha', 'label': 'Claude Opus HA', 'targets': ['or/anthropic/claude-opus-4.6']},
+            {'id': 'smart-opus', 'label': 'Smart Opus', 'targets': ['or/anthropic/claude-opus-4.6']},
+        ],
+    }), encoding='utf-8')
+    (tmp_path / 'provider_models.auto.json').write_text(json.dumps({
+        'providers': {
+            'or': [
+                {'id': 'anthropic/claude-opus-4.6', 'context': 1000000, 'max_output': 128000, 'reasoning': True},
+                {'id': 'openai/gpt-5', 'context': 400000, 'max_output': 128000, 'reasoning': True},
+            ],
+        },
+    }), encoding='utf-8')
+    catalog = anthropic_catalog(tmp_path)
+    code, report, error = cli(capsys, '--relay-config', relay_file, '--desktop-catalog', catalog,
+                              '--config-library', path.parent, '--default-model', 'claude-opus-ha',
+                              '--write', '--backup-dir', tmp_path / 'backups')
+    assert code == 0 and report['written'] is True, error
+    rows = json.loads(path.read_bytes())['inferenceModels']
+    # Only names starting with claude-* (without other vendor substrings) enter Desktop; smart-opus and gpt-5 stay out.
+    assert [r['name'] for r in rows] == ['claude-opus-ha', 'or/anthropic/claude-opus-4.6']
+    assert rows[0]['maxEffort'] == 'max' and rows[0]['anthropicFamilyTier'] == 'opus'
+    assert rows[1]['labelOverride'] == 'My Opus' and rows[1]['maxEffort'] == 'max'

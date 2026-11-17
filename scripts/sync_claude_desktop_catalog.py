@@ -105,17 +105,35 @@ def native_efforts(name, desktop=None):
     return NATIVE_EFFORTS.get(name, DESKTOP_EFFORTS)
 
 
+_OTHER_VENDOR_SUBSTRINGS = ('gpt', 'glm', 'gemini', 'codex', 'solar', 'qwen', 'deepseek', 'llama', 'mistral', 'grok', 'kimi')
+
+
+def _is_desktop_claude_name(ident):
+    """Desktop keeps names that look like an Anthropic model and contain no other vendor's substring."""
+    base = ident.split('@', 1)[0]
+    bare = base.rsplit('/', 1)[-1]
+    if not bare.startswith('claude-'):
+        return False
+    low = base.lower()
+    return not any(vendor in low for vendor in _OTHER_VENDOR_SUBSTRINGS)
+
+
 def claude_routes(entries):
-    """Claude routes Desktop can list: Retool's claude-* and Minara's minara/claude-* (Desktop keeps names that look
-    like an Anthropic model; minara/ holds no other vendor's name)."""
+    """Claude routes Desktop can list: Retool's claude-*, Minara's minara/claude-*, universal <provider>/claude-*,
+    and route aliases naming a claude-* id without another vendor's name in the prefix."""
     return [entry for entry in entries if entry.get('provider') == 'anthropic'
-            and (entry['id'].startswith('claude-') or entry['id'].startswith('minara/claude-'))]
+            and _is_desktop_claude_name(entry['id'])]
 
 
 def _base_id(entry):
-    """The catalog model behind an entry: itself, or the base of a virtual <model>@<profile> entry. A Minara route is
-    Anthropic's model of the same name (minara/claude-opus-5-5 is claude-opus-5-5) for Desktop's own catalog."""
-    return entry.get('virtual', {}).get('base', entry['id']).removeprefix('minara/')
+    """The Anthropic catalog model behind an entry: itself, the primary target of a route alias, or the base of a
+    virtual <model>@<profile> entry, stripped of any provider prefix (minara/claude-opus-5-5 -> claude-opus-5-5)."""
+    if entry.get('is_route_alias') and entry.get('route_targets'):
+        raw = entry['route_targets'][0]['id']
+    else:
+        raw = entry.get('virtual', {}).get('base', entry['id'])
+    bare = raw.rsplit('/', 1)[-1]
+    return bare.replace('.', '-') if bare.startswith('claude-') else bare
 
 
 def _rows_by_name(previous):
@@ -161,9 +179,16 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
     names = [name for name in old if name in by_id] + [name for name in by_id if name not in old]
     current = next(iter(old), None)
     if default_model is not None:
+        names_cfg = {
+            '_minara_models': {entry['id']: entry for entry in entries
+                               if entry.get('upstream') == 'minara' and not entry.get('is_route_alias') and 'virtual' not in entry},
+            '_provider_models': {entry['id']: entry for entry in entries
+                                 if entry.get('provider_id') and not entry.get('is_route_alias') and 'virtual' not in entry},
+            '_route_aliases': {entry['id']: entry for entry in entries
+                               if entry.get('is_route_alias') and 'virtual' not in entry},
+        }
         try:
-            wanted = models.canonical_name(default_model, {'_minara_models': {
-                entry['id']: entry for entry in entries if entry.get('upstream') == 'minara' and 'virtual' not in entry}})
+            wanted = models.canonical_name(default_model, names_cfg)
         except ApiError:
             wanted = default_model
         if wanted not in by_id:
@@ -266,6 +291,11 @@ def load_desktop_catalog(path):
 
 def load_relay_config(path):
     """The relay's full configuration: root keys plus enabled accounts, without config.load() side effects."""
+    import minara_catalog
+    import retool_catalog
+    from catalog import router as catalog_router
+    from drivers import presets as driver_presets
+
     try:
         saved = json.loads(Path(path).read_text(encoding='utf-8-sig'))
     except FileNotFoundError:
@@ -274,17 +304,32 @@ def load_relay_config(path):
         raise SyncError('Relay configuration %s is not valid JSON: %s' % (path, error)) from error
     if not isinstance(saved, dict):
         raise SyncError('Relay configuration %s must hold a JSON object' % path)
-    root = dict(config.DEFAULTS, **saved)
+    root = dict(config.DEFAULTS, **saved, _config_path=str(Path(path).resolve()))
     if type(root['allow_effort_downgrade']) is not bool:
         raise SyncError('allow_effort_downgrade must be a boolean in the relay configuration')
+    if isinstance(saved.get('providers'), list):
+        pmeta = {}
+        for idx, prov in enumerate(saved['providers']):
+            try:
+                meta, _, _ = driver_presets.expand_provider_to_accounts(copy.deepcopy(prov), f'providers[{idx}]')
+                pmeta[meta['id']] = meta
+            except ValueError:
+                continue
+        root['_providers_meta'] = pmeta
     try:
         accounts = load_accounts(path)
     except (AttributeError, TypeError) as error:
         raise SyncError('Relay configuration %s has an invalid accounts section' % path) from error
     if not accounts:
         raise SyncError('The relay configuration has no enabled account')
-    # The Minara models of its accounts, as the relay builds them (minara_models.json and the accounts' lists).
-    return dict(root, accounts=accounts, _minara_models=models.build_minara_catalog(accounts))
+    minara_catalog.apply_overlay(minara_catalog.overlay_path(path))
+    retool_catalog.apply_overlay(retool_catalog.overlay_path(path))
+    # The Minara, universal provider, and route-alias models of this configuration.
+    root['accounts'] = accounts
+    root['_minara_models'] = models.build_minara_catalog(accounts)
+    root['_provider_models'] = catalog_router.build_provider_catalog(root)
+    root['_route_aliases'] = catalog_router.build_route_aliases(root, models)
+    return root
 
 
 def read_registry_policy(hive):

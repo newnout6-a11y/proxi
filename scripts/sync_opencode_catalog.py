@@ -19,6 +19,7 @@ import codecs
 import copy
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -85,6 +86,58 @@ def _clear_effort(value):
             value.pop('thinking')
 
 
+def _usd_cost(entry):
+    """OpenCode `cost` (USD per 1M tokens) when `entry['pricing']` carries verified USD input/output rates."""
+    pricing = entry.get('pricing')
+    if not isinstance(pricing, dict):
+        return None
+    inp, out = pricing.get('input'), pricing.get('output')
+    if (isinstance(inp, bool) or isinstance(out, bool)
+            or not isinstance(inp, (int, float)) or not isinstance(out, (int, float))
+            or not (math.isfinite(inp) and math.isfinite(out)) or inp < 0 or out < 0):
+        return None
+    cost = {'input': inp, 'output': out}
+    for key in ('cache_read', 'cache_write'):
+        val = pricing.get(key)
+        if not isinstance(val, bool) and isinstance(val, (int, float)) and math.isfinite(val) and val >= 0:
+            cost[key] = val
+    return cost
+
+
+def _small_candidates(entries, new_models):
+    """Published small/fast models in preference order: SMALL_MODELS first, then universal/alias small-tier models."""
+    ordered = [name for name in SMALL_MODELS if name in new_models]
+    seen = set(ordered)
+    ranked = []
+    for index, entry in enumerate(entries):
+        name = entry['id']
+        if name in seen or name not in new_models or 'virtual' in entry:
+            continue
+        if not (entry.get('provider_id') or entry.get('is_route_alias')):
+            continue
+        slug = str(entry.get('upstream_model') or name).rsplit('/', 1)[-1].split(':', 1)[0].lower()
+        cost = _usd_cost(entry)
+        rate = (cost['input'] + cost['output']) if cost is not None else float('inf')
+        if 'haiku' in slug:
+            tier = 0
+        elif 'flash-lite' in slug or 'flash_lite' in slug:
+            tier = 1
+        elif 'flash' in slug:
+            tier = 2
+        elif slug.endswith('-nano') or '-nano-' in slug:
+            tier = 3
+        elif slug.endswith('-mini') or '-mini-' in slug:
+            tier = 4
+        elif cost is not None and cost['input'] <= 0.5 and cost['output'] <= 2.0:
+            tier = 5
+        else:
+            continue
+        ranked.append((tier, rate, index, name))
+    ranked.sort()
+    ordered.extend(name for _, _, _, name in ranked)
+    return ordered
+
+
 def _named_objects(section):
     return [(name, item) for name, item in section.items() if isinstance(item, dict)] if isinstance(section, dict) else []
 
@@ -139,9 +192,12 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
         item.update(name=entry['label'], limit=limit,
                     tool_call=bool(entry.get('tools')), attachment=bool(entry.get('vision')),
                     reasoning=bool(entry.get('reasoning')))
-        # Retool credits have no verified USD conversion here. Do not publish
-        # the old placeholder as if an actual zero price had been measured.
-        if item.get('cost') == {'input': 0, 'output': 0}:
+        # Verified USD pricing (universal providers / models.dev / OpenRouter) is published as OpenCode `cost`;
+        # Retool credits have no verified USD conversion, so the old zero placeholder is dropped.
+        cost = _usd_cost(entry)
+        if cost is not None:
+            item['cost'] = cost
+        elif item.get('cost') == {'input': 0, 'output': 0}:
             item.pop('cost')
         item['variants'] = {level: {'name': level.title(), 'reasoningEffort': level,
                             'settings': {'reasoningEffort': level}, 'body': {'reasoningEffort': level}}
@@ -149,9 +205,14 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
         # OpenCode 1.19 adds its own low/medium/high to a reasoning model; every relay route takes those levels, so they
         # stay. They are not switched off with {"disabled": true}: OpenCode Desktop 2.2.5 sends "disabled" as a request
         # parameter instead of hiding the variant (audit f7b2ca6).
-        # OpenCode takes image input from modalities alone (attachment does not enable it): without them no relay model
+        # OpenCode takes image/PDF input from modalities alone (attachment does not enable it): without them no relay model
         # took a pasted image, the model answered that it "doesn't support image input".
-        item['modalities'] = {'input': ['text', 'image'] if entry.get('vision') else ['text'], 'output': ['text']}
+        input_modalities = ['text']
+        if entry.get('vision'):
+            input_modalities.append('image')
+        if entry.get('pdf'):
+            input_modalities.append('pdf')
+        item['modalities'] = {'input': input_modalities, 'output': ['text']}
         options = item.get('options')
         if not isinstance(options, dict):
             options = item['options'] = {}
@@ -179,11 +240,19 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
     provider.pop('blacklist', None)
     provider['whitelist'] = list(new_models)
     fallback = default_model if default_model in new_models else next(iter(new_models))
-    # The references are read against the Minara routes being published: without them every "minara/..." reference was
-    # an unknown model, and the sync moved each agent the user had put on Minara back to Retool.
-    names = {'_minara_models': {entry['id']: entry for entry in entries
-                                if entry.get('upstream') == 'minara' and 'virtual' not in entry}}
-    small = next((name for name in SMALL_MODELS if name in new_models), None)
+    # The references are read against the Minara, universal provider, and route-alias entries being published:
+    # without them every "minara/...", "<provider>/..." or route-alias reference was an unknown model, and the sync
+    # moved each agent the user had put on them back to the default model.
+    names = {
+        '_minara_models': {entry['id']: entry for entry in entries
+                           if entry.get('upstream') == 'minara' and not entry.get('is_route_alias') and 'virtual' not in entry},
+        '_provider_models': {entry['id']: entry for entry in entries
+                             if entry.get('provider_id') and not entry.get('is_route_alias') and 'virtual' not in entry},
+        '_route_aliases': {entry['id']: entry for entry in entries
+                           if entry.get('is_route_alias') and 'virtual' not in entry},
+    }
+    small_pool = _small_candidates(entries, new_models)
+    small = next(iter(small_pool), None)
 
     def update_reference(container, key, replacement):
         """Canonicalize a relay model reference; a removed model gets `replacement`, or no override at all.
@@ -222,7 +291,7 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
     # stalls without an error (OpenCode issue #46164). Only the small tier counts as cheap here.
     main = result.get('model')
     main_window = window(main)
-    roomy = next((name for name in SMALL_MODELS if main_window is not None and name in new_models
+    roomy = next((name for name in small_pool if main_window is not None and name in new_models
                   and new_models[name]['limit']['context'] >= main_window), None)
     for section in ('agent', 'mode'):
         for name, agent in _named_objects(result.get(section)):

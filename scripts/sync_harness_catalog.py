@@ -24,8 +24,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import sync_virtual_models
 from scripts.probe_client_settings import routable_entries
-from scripts.sync_opencode_catalog import (MASK, is_environment_list, is_secret_flag, is_secret_key, mask_string,
-                                           mask_text, read_file, write_backed_up, write_preview)
+from scripts.sync_opencode_catalog import (MASK, UNKNOWN_CONTEXT, UNKNOWN_OUTPUT, is_environment_list, is_secret_flag,
+                                           is_secret_key, mask_string, mask_text, read_file, write_backed_up,
+                                           write_preview)
 
 STR = 'tag:yaml.org,2002:str'
 
@@ -96,8 +97,10 @@ def update_document(document, entries):
         updated = []
         for entry in selected:
             item = _copy(old.get(entry['id']) or {})
-            item.update(id=entry['id'], name=entry['label'], contextWindow=entry['context'],
-                        maxTokens=entry['max_output'], input=['text', 'image'] if entry.get('vision') else ['text'])
+            item.update(id=entry['id'], name=entry['label'],
+                        contextWindow=entry['context'] or UNKNOWN_CONTEXT,
+                        maxTokens=entry['max_output'] or UNKNOWN_OUTPUT,
+                        input=['text', 'image'] if entry.get('vision') else ['text'])
             levels = entry.get('reasoning_effort_levels') or []
             item['reasoningEfforts'] = ({'off' if level == 'none' else level: level for level in levels}
                                         if entry.get('reasoning') and levels else False)

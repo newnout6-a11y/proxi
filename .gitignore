@@ -56,8 +56,12 @@ probes/chunks/
 # A state folder for `python proxy.py --state-dir state` (journal, command log, conversations, upstream-400 dumps)
 /state/
 
-# What the relay measured of Minara (minara_refresh) and published of Retool (retool_refresh) by itself, beside config.json
+# What the relay measured of Minara (minara_refresh), Retool (retool_refresh) and universal providers (catalog.discovery)
 /minara_models.auto.json
 /retool_models.auto.json
+/provider_models.auto.json
+/models_dev.cache.json
 .minara-catalog-*.tmp
 .retool-catalog-*.tmp
+.prov_models_*.tmp
+.models_dev_*.tmp

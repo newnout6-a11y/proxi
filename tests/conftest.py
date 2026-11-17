@@ -155,11 +155,12 @@ def diagnostics_in_a_temporary_folder(monkeypatch, tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def opencode_settings_never_the_users(monkeypatch, tmp_path_factory):
-    """After each catalog look the relay writes its models into OpenCode's settings file (client_sync), by default the
-    one in ~/.config/opencode: a test's look must never rewrite the owner's real file with a test catalog. The default
-    folder is an empty one here; a test that syncs names its own file (opencode_settings)."""
+    """After each catalog look the relay writes its models into OpenCode's and Harness's settings files (client_sync), by
+    default in ~/.config/opencode and ~/.dsh/profiles: a test's look must never rewrite the owner's real files with a test
+    catalog. Both default folders are empty ones here; a test that syncs names its own file."""
     import client_sync
     monkeypatch.setattr(client_sync, "DEFAULT_FOLDER", tmp_path_factory.getbasetemp() / "no-opencode-here")
+    monkeypatch.setattr(client_sync, "HARNESS_DEFAULT_FOLDER", tmp_path_factory.getbasetemp() / "no-harness-here", raising=False)
 
 
 @pytest.fixture(autouse=True)

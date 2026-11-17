@@ -407,3 +407,32 @@ def test_explicit_executable_wins_over_the_detected_desktop_cli(tmp_path, monkey
     assert code == 0 and report['executable'] == sys.executable
     assert all(args[0] == sys.executable for args, _ in calls)
     assert calls[-1][0][:4] == [sys.executable, 'run', '--standalone', '--format']
+
+
+def test_opencode2_object_model_references_are_normalized_and_checked():
+    v23_relay = [{
+        'type': 'document',
+        'info': {
+            'model': {'providerID': 'retool-relay', 'model': 'claude-opus-5-5'},
+            'small_model': {'providerID': 'retool-relay', 'model': 'claude-sonnet-5-5'},
+            'providers': {'retool-relay': {'models': {'claude-opus-5-5': {}, 'claude-sonnet-5-5': {}}}},
+            'agents': {
+                'build': {'model': {'providerID': 'retool-relay', 'model': 'claude-opus-5-5', 'variant': 'high'}},
+                'explore': {'model': {'providerID': 'retool-relay', 'model': 'claude-sonnet-5-5', 'variant': 'high'}},
+            },
+        },
+    }]
+    probe.check_pinned(v23_relay, 'opencode2')
+    pins, parent = probe.model_pins(v23_relay, 'opencode2')
+    assert parent == 'retool-relay/claude-opus-5-5#high'
+    assert pins['small_model'] == 'retool-relay/claude-sonnet-5-5'
+
+    v23_stray = [{
+        'type': 'document',
+        'info': {
+            'model': {'providerID': 'anthropic', 'model': 'claude-sonnet-4-5'},
+            'providers': {'retool-relay': {'models': {'claude-opus-5-5': {}}}},
+        },
+    }]
+    with pytest.raises(probe.ProbeError, match='model=anthropic/claude-sonnet-4-5'):
+        probe.check_pinned(v23_stray, 'opencode2')
