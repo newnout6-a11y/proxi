@@ -480,6 +480,11 @@ class _Rollup:
             self.fine_slot(index).commands += 1
 
 
+class _Secrets(list):
+    """The values to mask, and `pattern`, which finds any of them in a text (None when there are none)."""
+    pattern = None
+
+
 class Journal:
     def __init__(self, capacity=CAPACITY, clock=None):
         self._cond = threading.Condition()
@@ -491,6 +496,7 @@ class Journal:
         self._file_lock = threading.Lock()
         self._rotate_retry_at = 0.0
         self._clock = clock
+        self._pattern = (None, None)  # (the secrets it was built for, the pattern): see _pattern_of
         self.started = self._now()
         self._rollup = _Rollup(self.started)
 
@@ -591,15 +597,33 @@ class Journal:
         # The search provider's key lives in the environment, never in the config, and it still turned up in the journal:
         # a client's tool call that set it (a shell command) was journaled with its arguments (v3 run of 2026-11-07).
         values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))
-        return [value for value in values if isinstance(value, str) and len(value) >= 4]
+        found = _Secrets(value for value in values if isinstance(value, str) and len(value) >= 4)
+        found.pattern = self._pattern_of(found)
+        return found
+
+    def _pattern_of(self, secrets):
+        """The pattern that finds any of `secrets` in a text, or None when there are none.
+
+        The accounts are the same from one event to the next, so it is built again only when a secret changes (an account
+        added, a cookie rotated): the key is compared with the one it was built for, string by string, identity first."""
+        key = tuple(secrets)
+        cached, pattern = self._pattern
+        if cached == key:
+            return pattern
+        pattern = re.compile("|".join(re.escape(secret) for secret in sorted(set(key), key=len, reverse=True))) if key else None
+        self._pattern = (key, pattern)
+        return pattern
 
     def _clean(self, value, secrets, depth=0):
         if depth > 6:
             return "…"
         if isinstance(value, str):
             text = redact(value, cookie_values=(self._cfg or {}).get("cookie_values", ()))
-            for secret in secrets:
-                text = text.replace(secret, "[redacted]")
+            # Each secret is replaced in turn, as before; a text that holds none of them (nearly every one) skips the loop.
+            pattern = getattr(secrets, "pattern", False)  # False: a plain list, whose secrets are all tried
+            if pattern is False or (pattern is not None and pattern.search(text)):
+                for secret in secrets:
+                    text = text.replace(secret, "[redacted]")
             return text if len(text) <= 4000 else text[:4000] + "…[+%d]" % (len(text) - 4000)
         if isinstance(value, dict):
             cleaned = {}

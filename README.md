@@ -1667,6 +1667,7 @@ relay с этим делает. 429 приходит до начала гене�
 ## Тесты
 
     python -m pytest -q          # offline, без сети
+    python -m pytest -q -n 4     # то же в четыре процесса (pytest-xdist из requirements.txt): около минуты вместо четырёх
     python test_client.py --models
     python test_client.py "Проверь проект" --effort high
 
