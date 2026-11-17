@@ -61,6 +61,7 @@ def test_balance_parsers_for_openrouter_deepseek_moonshot_and_siliconflow():
 
 def test_usd_journal_ledger_health_balance_and_client_access_keys(monkeypatch, tmp_path):
     monkeypatch.delenv("RELAY_API_KEY", raising=False)
+    journal.JOURNAL.reset()
 
     def mock_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/api/v1/key"):

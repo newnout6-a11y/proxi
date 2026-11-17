@@ -33,6 +33,8 @@ def load_accounts(path):
     saved = json.loads(Path(path).read_text(encoding='utf-8-sig'))
     result = []
     raw_accounts = saved.get('accounts')
+    if 'accounts' in saved and not isinstance(raw_accounts, list):
+        raise TypeError('accounts must be a list')
     records = list(raw_accounts) if isinstance(raw_accounts, list) else ([] if 'providers' in saved else [saved])
     if isinstance(saved.get('providers'), list):
         for idx, prov in enumerate(saved['providers']):
@@ -42,7 +44,7 @@ def load_accounts(path):
             except ValueError:
                 continue
     for record in records:
-        if not isinstance(record, dict) or not record.get('enabled', True):
+        if not record.get('enabled', True):
             continue
         cfg = models.account_config(dict(config.DEFAULTS, **saved), record)
         cfg.pop('_config_path', None)

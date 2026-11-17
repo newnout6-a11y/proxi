@@ -1546,7 +1546,7 @@ def startup_config(argv=None):
         os.path.normcase(cfg_path) == os.path.normcase(os.path.abspath(config_module.CONFIG_PATH))
         and not os.path.exists(cfg_path)
     )
-    cfg = config_module.load(cfg_path, bootstrap=bootstrap)
+    cfg = config_module.load(cfg_path, bootstrap=True) if bootstrap else config_module.load(cfg_path)
     state = os.path.abspath(args.state_dir or HERE)
     os.makedirs(state, exist_ok=True)
     for key, relative in (("command_log", "commands.log"), ("journal_path", "journal.jsonl"),

@@ -999,7 +999,7 @@ class Journal:
             trace["credits_complete"] = ended and not unknown
             if priced:
                 trace["credits"] = round(total, 5)
-            elif ended and not unknown and costs[turn_id].minara_total() is None and costs[turn_id].usd_total() is None:
+            elif ended and not unknown:
                 trace["credits"] = 0.0
             minara = costs[turn_id].minara_total()
             trace["minara_credits"] = round(minara, 4) if minara is not None else None

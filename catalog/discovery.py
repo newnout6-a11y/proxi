@@ -220,14 +220,14 @@ def normalize_discovered_item(raw: dict) -> dict | None:
     return out
 
 
-async def discover_provider_models(cfg: dict) -> list[dict]:
+async def discover_provider_models(cfg: dict, *, timeout: float | None = None) -> list[dict]:
     """Query `GET <base_url>/models` for a universal provider/account config and return normalized descriptors."""
     base = str(cfg.get("base_url") or cfg.get("base") or "").rstrip("/")
     allow_insecure = bool(cfg.get("allow_insecure_http", False))
     url = http_pool.validate_endpoint_url(f"{base}/models", allow_insecure_http=allow_insecure)
     headers = build_auth_headers(cfg)
     client = http_pool.get_async_client(cfg)
-    timeout = http_pool.make_timeout(cfg, read_timeout=float(cfg.get("upstream_timeout") or 20.0))
+    req_timeout = http_pool.make_timeout(cfg, read_timeout=float(timeout or cfg.get("upstream_timeout") or 20.0))
 
     driver = str(cfg.get("driver") or cfg.get("upstream") or "openai-chat")
     whitelist = cfg.get("model_whitelist")
@@ -245,7 +245,7 @@ async def discover_provider_models(cfg: dict) -> list[dict]:
 
     for _ in range(max_pages):
         params = {"limit": 100, "after_id": after_id} if (driver == "anthropic-messages" and after_id) else None
-        resp = await client.get(url, headers=headers, params=params, timeout=timeout)
+        resp = await client.get(url, headers=headers, params=params, timeout=req_timeout)
         if resp.status_code >= 400:
             detail = ""
             try:

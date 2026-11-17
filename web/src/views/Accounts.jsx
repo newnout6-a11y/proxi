@@ -9,6 +9,7 @@ import { fmtAgo, fmtDay, fmtFixed, fmtInt, fmtNum, fmtShortTime, isNum, plural }
 import { describeResult, tokenExpiry, tokenLines, WARN_DAYS } from '../minara.js';
 import { PoolScene } from '../stage/PoolScene.jsx';
 import { AddGuide, GuideNum } from '../stage/AddGuide.jsx';
+import GatewayPanels from './GatewayPanels.jsx';
 
 const pct = (share) => `${Math.max(0, Math.min(1, share)) * 100}%`;
 const TOKEN_TONE = { expired: 'neg-text', expiring: 'warn-text' };
@@ -231,7 +232,7 @@ function AddForm({ onCancel, onSubmit, busy, report }) {
   );
 }
 
-export default function Accounts({ apiKey, onUnauthorized }) {
+export default function Accounts({ apiKey, onUnauthorized, refreshOverview }) {
   const toast = useToast();
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
@@ -343,6 +344,7 @@ export default function Accounts({ apiKey, onUnauthorized }) {
         <div className="banner tone-warn">Есть изменения пула, которые вступят в силу после перезапуска relay</div>
       )}
       {adding && <AddForm busy={!!busy._new} report={report} onCancel={close} onSubmit={add} />}
+      <GatewayPanels apiKey={apiKey} onUnauthorized={onUnauthorized} refreshOverview={refreshOverview} />
       <section className="panel pool">
         <div className="pool-help">
           <figure className="pool-demo"><figcaption>Как работает пул <span>пример маршрутизации</span></figcaption><PoolScene /></figure>

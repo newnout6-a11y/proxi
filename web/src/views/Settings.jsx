@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { RotateCcw, Save, Search, SlidersHorizontal } from 'lucide-react';
+import { Play, RefreshCw, RotateCcw, Save, Search, SlidersHorizontal } from 'lucide-react';
 import { api } from '../api.js';
 import { usePolling } from '../useJournal.js';
 import { Dot, Page, ease } from '../motion.jsx';
@@ -166,17 +166,58 @@ function sessionStatus(overview) {
     return { tone: 'warn', text: `ошибка сессии: ${failing} из ${enabled}`,
       title: `Продление сессии не удалось у ${failing} из ${enabled} включённых аккаунтов; остальные работают` };
   }
+  if (!overview.session?.keepalive && !overview.session?.error && !enabled) {
+    if (overview.providers?.length > 0) return { tone: 'pos', text: 'API-провайдеры активны' };
+    if (overview.accounts_summary?.total === 0) return { tone: 'warn', text: 'провайдеры не подключены' };
+  }
   return overview.session?.error ? { tone: 'neg', text: 'сессия Retool с ошибкой' } : { tone: 'pos', text: 'сессия Retool активна' };
 }
 
-function Connection({ overview }) {
+function Connection({ apiKey, overview, onUnauthorized }) {
+  const toast = useToast();
+  const [syncing, setSyncing] = useState(false);
+  const openaiUrl = overview?.connection?.openai_base_url || 'http://127.0.0.1:8787/v1';
+  const anthropicUrl = overview?.connection?.anthropic_base_url || 'http://127.0.0.1:8787';
+  const defaultModel = overview?.models?.default || 'claude-opus-5-5';
   const rows = [['OpenAI-совместимый адрес', overview?.connection?.openai_base_url], ['Anthropic-совместимый адрес', overview?.connection?.anthropic_base_url]];
   const session = sessionStatus(overview);
+  const opencodeSnippet = JSON.stringify({
+    provider: {
+      proxi: {
+        npm: '@ai-sdk/openai-compatible',
+        name: 'Proxi Gateway',
+        options: { baseURL: openaiUrl, apiKey: '{env:PROXI_API_KEY}' },
+      },
+    },
+  }, null, 2);
+  const claudeSnippet = `ANTHROPIC_BASE_URL=${anthropicUrl}\nANTHROPIC_AUTH_TOKEN=<ваш_ключ_relay_или_AccessKey>`;
+  const codexSnippet = `OPENAI_BASE_URL=${openaiUrl}\nOPENAI_API_KEY=<ваш_ключ_relay_или_AccessKey>\n# модель по умолчанию: ${defaultModel}`;
+
+  async function syncOpenCode() {
+    setSyncing(true);
+    try {
+      const res = await api(apiKey, 'clients/sync-opencode', { method: 'POST', body: {} });
+      toast(res.ok
+        ? { tone: 'success', title: 'OpenCode синхронизирован', text: 'Список моделей обновлён в opencode.jsonc' }
+        : { tone: 'warn', title: 'Синхронизация OpenCode', text: res.reason || res.result?.error || 'Не удалось обновить файл' });
+    } catch (failure) {
+      if (failure.status === 401) onUnauthorized();
+      else toast({ tone: 'error', title: 'Ошибка синхронизации', text: failure.message });
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   return (
     <section id="settings-connection" className="panel connect" aria-label="Подключение IDE">
       <div className="panel-head">
         <h2>Подключение IDE</h2>
-        <span className="status" title={session.title}><Dot tone={session.tone} />{session.text}</span>
+        <div className="head-actions">
+          <span className="status" title={session.title}><Dot tone={session.tone} />{session.text}</span>
+          <Button icon={RefreshCw} disabled={syncing} onClick={syncOpenCode}>
+            {syncing ? 'Синхронизация…' : 'Синхр. OpenCode'}
+          </Button>
+        </div>
       </div>
       {rows.map(([label, value]) => (
         <div className="connect-row" key={label}>
@@ -185,7 +226,24 @@ function Connection({ overview }) {
           {value && <CopyButton value={value} label={`Копировать: ${label}`} />}
         </div>
       ))}
-      <p className="muted small">Ключ — relay key: заголовок <code>Authorization: Bearer</code> или <code>x-api-key</code></p>
+      <p className="muted small">Ключ — relay key или виртуальный AccessKey: заголовок <code>Authorization: Bearer</code> или <code>x-api-key</code></p>
+      <details className="gw-details connect-snippets">
+        <summary>Готовые конфиги для OpenCode, Claude Code и Codex CLI</summary>
+        <div className="snippet-grid">
+          <div className="snippet-box">
+            <div className="snippet-head"><strong>OpenCode (opencode.jsonc)</strong><CopyButton value={opencodeSnippet} label="Копировать конфиг OpenCode" /></div>
+            <pre>{opencodeSnippet}</pre>
+          </div>
+          <div className="snippet-box">
+            <div className="snippet-head"><strong>Claude Code (.env / settings)</strong><CopyButton value={claudeSnippet} label="Копировать конфиг Claude Code" /></div>
+            <pre>{claudeSnippet}</pre>
+          </div>
+          <div className="snippet-box">
+            <div className="snippet-head"><strong>Codex CLI / OpenAI SDK</strong><CopyButton value={codexSnippet} label="Копировать конфиг Codex CLI" /></div>
+            <pre>{codexSnippet}</pre>
+          </div>
+        </div>
+      </details>
     </section>
   );
 }
@@ -207,26 +265,74 @@ function effortText(model) {
 }
 
 function Catalog({ apiKey, onUnauthorized, onData }) {
+  const toast = useToast();
   const [data, setData] = useState(null);
   const [query, setQuery] = useState('');
   const [onlyRoutable, setOnlyRoutable] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState('');
-  usePolling(async () => {
-    try { const result = await api(apiKey, 'models'); setData(result); onData(result); setError(''); } catch (failure) { if (failure.status === 401) onUnauthorized(); else setError(failure.message); }
-  }, 60000, [apiKey]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [pingTarget, setPingTarget] = useState('');
+  const [pinging, setPinging] = useState(false);
+  const [pingInfo, setPingInfo] = useState(null);
+
+  async function loadCatalog() {
+    try {
+      const result = await api(apiKey, 'models');
+      setData(result);
+      onData(result);
+      setError('');
+    } catch (failure) {
+      if (failure.status === 401) onUnauthorized();
+      else setError(failure.message);
+    }
+  }
+  usePolling(loadCatalog, 60000, [apiKey]);
+
   const all = data?.data || [];
+  const routableList = all.filter((m) => m.routable);
+  const activePingModel = pingTarget || data?.default_model || routableList[0]?.id || '';
   const items = all.filter((model) => (!onlyRoutable || model.routable)
     && (!query || `${model.id} ${model.label} ${model.provider}`.toLowerCase().includes(query.toLowerCase())));
   // The default model leads; a long catalog is folded unless searched or expanded.
   items.sort((a, b) => (b.id === data?.default_model) - (a.id === data?.default_model));
   const shown = expanded || query ? items : items.slice(0, CATALOG_FOLD);
+
+  async function refreshAllCatalog() {
+    setRefreshing(true);
+    try {
+      await api(apiKey, 'catalog/refresh', { method: 'POST', body: {} });
+      await loadCatalog();
+      toast({ tone: 'success', title: 'Каталог обновлён' });
+    } catch (failure) {
+      if (failure.status === 401) onUnauthorized();
+      else toast({ tone: 'error', title: 'Не удалось обновить каталог', text: failure.message });
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function runPing() {
+    if (!activePingModel) return;
+    setPinging(true);
+    setPingInfo(null);
+    try {
+      const res = await api(apiKey, 'models/ping', { method: 'POST', body: { model: activePingModel } });
+      setPingInfo(res);
+    } catch (failure) {
+      if (failure.status === 401) onUnauthorized();
+      else setPingInfo({ ok: false, model: activePingModel, error: failure.message });
+    } finally {
+      setPinging(false);
+    }
+  }
+
   return (
     <section id="settings-catalog" className="panel model-table" aria-label="Каталог моделей">
       <div className="panel-head model-head">
         <div>
           <h2>Каталог моделей</h2>
-          <p className="panel-meta">всего {fmtInt(all.length)} · с маршрутом {fmtInt(all.filter((m) => m.routable).length)}</p>
+          <p className="panel-meta">всего {fmtInt(all.length)} · с маршрутом {fmtInt(routableList.length)}</p>
         </div>
         <div className="head-actions">
           <div className="search compact">
@@ -237,8 +343,29 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
             <input type="checkbox" checked={onlyRoutable} onChange={(e) => setOnlyRoutable(e.target.checked)} />
             <span>Только с маршрутом</span>
           </label>
+          <Button icon={RefreshCw} disabled={refreshing} onClick={refreshAllCatalog}>
+            {refreshing ? 'Обновление…' : 'Обновить'}
+          </Button>
         </div>
       </div>
+      {routableList.length > 0 && (
+        <div className="catalog-ping-bar">
+          <select className="filter-select" aria-label="Модель для быстрой проверки" value={activePingModel}
+            onChange={(e) => { setPingTarget(e.target.value); setPingInfo(null); }}>
+            {routableList.map((m) => <option key={m.id} value={m.id}>{m.id}</option>)}
+          </select>
+          <Button icon={Play} disabled={pinging || !activePingModel} onClick={runPing}>
+            {pinging ? 'Проверка…' : 'Тест модели'}
+          </Button>
+          {pingInfo && (
+            <span className={`mono small ${pingInfo.ok ? '' : 'neg-text'}`} role="status">
+              {pingInfo.ok
+                ? `OK · ${fmtInt(pingInfo.latency_ms)} мс (TTFT ${fmtInt(pingInfo.ttft_ms)} мс) · ответ: ${pingInfo.reply}`
+                : `Ошибка: ${pingInfo.error}`}
+            </span>
+          )}
+        </div>
+      )}
       {error && <p className="banner tone-neg" role="alert">Не удалось загрузить каталог: {error}</p>}
       {!data && !error && <p className="model-empty muted" role="status">Загружаем модели</p>}
       <div className="model-cols" aria-hidden="true"><span>Модель</span><span>Провайдер</span><span>Контекст</span><span>Управление ответом</span><span>Доступность</span></div>
@@ -392,7 +519,7 @@ export default function SettingsView({ apiKey, overview, onUnauthorized, unsaved
           </section>
         );
       })}
-      <Connection overview={overview} />
+      <Connection apiKey={apiKey} overview={overview} onUnauthorized={onUnauthorized} />
       <Catalog apiKey={apiKey} onUnauthorized={onUnauthorized} onData={setModels} />
       <AnimatePresence>
         {dirty > 0 && (

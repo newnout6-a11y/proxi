@@ -13,13 +13,21 @@ const LIVE_PHASE = { wait: 'ждём upstream', think: 'upstream: thinking', too
 
 // "нет данных" and the lower-bound mark are for a turn that is over and lacks a price; a running turn just has none yet.
 // A Minara turn shows Minara's own credits (220 per dollar of its list), named as such: they are never Retool's.
-const shownCost = (cost) => (cost.minara !== undefined ? cost.minara : cost.credits);
+const isUsdOnly = (cost) => cost.usd !== undefined && cost.minara === undefined && cost.credits === null;
+const shownCost = (cost) => (cost.minara !== undefined ? cost.minara : cost.usd !== undefined && cost.credits === null ? cost.usd : cost.credits);
+const fmtCostValue = (cost) => {
+  const val = shownCost(cost);
+  if (val === null) return '—';
+  if (isUsdOnly(cost)) return `$${fmtFixed(val, val > 0 && val < 0.01 ? 4 : 2)}`;
+  return fmtFixed(val, 2);
+};
 const costNote = (cost) => (cost.running ? 'ход идёт' : shownCost(cost) === null ? 'нет данных'
-  : !cost.complete ? 'неполные данные' : cost.minara !== undefined ? 'кредитов Minara' : '');
+  : !cost.complete ? 'неполные данные' : cost.minara !== undefined ? 'кредитов Minara' : isUsdOnly(cost) ? 'USD' : '');
 const costTitle = (cost) => (cost.running ? 'Ход ещё идёт: стоимость будет известна, когда upstream ответит'
   : shownCost(cost) === null ? 'Стоимость не сообщена'
     : cost.minara !== undefined ? `Цена по прайсу Minara в её кредитах (220 за доллар): $${fmtFixed(cost.minara / 220, 4)}${cost.complete ? '' : '; часть стоимости не сообщена'}`
-      : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена');
+      : isUsdOnly(cost) ? `Расчётная стоимость по прайсу API / models.dev: $${fmtFixed(cost.usd, 6)}${cost.complete ? '' : '; часть стоимости не сообщена'}`
+        : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена');
 const lowerBound = (cost) => shownCost(cost) !== null && !cost.complete;
 const SPEED_TITLE = 'Выходные токены / время обработки запроса до завершения runner, включая ожидание, мышление, повторы и смену аккаунта, поиск и команды relay. Без отправки последних байтов клиенту. Не скорость декодирования; без полных данных — прочерк.';
 
@@ -40,13 +48,20 @@ function Steps({ trace }) {
   );
 }
 
-export default function Turns({ journal, overview, embedded }) {
+export default function Turns({ journal, overview, embedded, filterQuery = '', filterStatus = '' }) {
   const traces = useMemo(() => buildTraces(journal.events), [journal.events]);
   const [open, setOpen] = useState(null);
   const [now, setNow] = useState(() => Date.now() / 1000);
-  const list = traces.slice(0, 120);
   // A silent turn is given up on only after the relay's own turn timeout (the overview carries the one in force).
   const stale = staleLimit(overview?.resources?.turn_timeout);
+  const needle = filterQuery.trim().toLowerCase();
+  const filteredTraces = useMemo(() => traces.filter((trace) => {
+    const st = statusAt(trace, now, stale);
+    if (filterStatus && st !== filterStatus) return false;
+    if (needle && !`${trace.model || ''} ${trace.transport || ''} ${trace.dialect || ''} ${trace.id}`.toLowerCase().includes(needle)) return false;
+    return true;
+  }), [traces, now, stale, filterStatus, needle]);
+  const list = filteredTraces.slice(0, 120);
   const running = list.some((trace) => statusAt(trace, now, stale) === 'running');
   useEffect(() => {
     if (!running) return undefined;
@@ -112,7 +127,7 @@ export default function Turns({ journal, overview, embedded }) {
                 <span className="trace-num">{fmtMs(trace.ttft)}</span>
                 <span className="trace-num">{fmtTokens(trace.cacheRead)}{hit !== null && <small> · {Math.round(hit * 100)}%</small>}</span>
                 <span className="trace-num trace-cost" title={costTitle(cost)}>
-                  {lowerBound(cost) ? '≥ ' : ''}{fmtFixed(shownCost(cost), 2)}
+                  {lowerBound(cost) ? '≥ ' : ''}{fmtCostValue(cost)}
                   <small>{costNote(cost)}</small>
                 </span>
                 <time className="trace-when" title={fmtClock(trace.started)}>

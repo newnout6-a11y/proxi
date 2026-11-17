@@ -1031,6 +1031,8 @@ class SessionPool:
                 configs.remove(item)
         if self.backend is backend and self.backends:
             self.backend = self.backends[0]
+        if not self.backends:
+            self.cfg["_empty_pool"] = True
         return True
 
     def _persist(self, key, urgent=False):
