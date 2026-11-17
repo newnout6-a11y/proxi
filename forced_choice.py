@@ -44,7 +44,7 @@ def requirement(model, tools, choice, entry=None):
 
     `tools` are the declarations in either shape, `choice` the client's normalised tool_choice. A Minara route says it in
     its entry (forced_tool_choice false: every Claude route), which the Retool rule does not know."""
-    if entry is not None and entry.get("upstream") == "minara":
+    if entry is not None and entry.get("upstream", "retool") != "retool":
         refuses = entry.get("forced_tool_choice") is False
     else:
         refuses = models.refuses_forced_tool_choice(model)

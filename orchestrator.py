@@ -547,7 +547,7 @@ class TurnRunner:
         if not client or not key or peek is None:
             return None, None
         session = peek(key, model_entry=parsed.entry, exclude=exclude, **acquire_plan(self.cfg, parsed).kwargs)
-        if parsed.entry.get("upstream") == "minara":
+        if parsed.entry.get("upstream", "retool") != "retool":
             return self._minara_dialog_effort(parsed, session), None
         history = getattr(session, "_native_history", None)
         if history is None or not history.branches:
@@ -1289,7 +1289,9 @@ class TurnRunner:
             task_block = ""
             previous_steps = []
             last_followup = None
-            if parsed.entry.get("upstream") != "minara" and not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"]):
+            if (parsed.entry.get("upstream", "retool") == "retool"
+                    and not parsed.entry.get("route_targets")
+                    and not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"])):
                 raise apierr.service_unavailable(f"provider '{parsed.entry['provider']}' is not routed")
             # The resource is per-account (org-scoped UUID or __managed__): it is
             # resolved from the acquired session's backend cfg below. Resolving it
@@ -1436,7 +1438,7 @@ class TurnRunner:
                 log("route.bound", "Выбран фактический маршрут %s" % actual_upstream,
                     upstream=actual_upstream, model=parsed.model, upstream_model=model_provider.get("model"),
                     effective_effort=model_provider.get("reasoningEffort"), child=bool(parent_key))
-                if actual_upstream == "minara" and getattr(parsed, "client_task", "") not in client_context.SIDE_TASKS:
+                if actual_upstream != "retool" and getattr(parsed, "client_task", "") not in client_context.SIDE_TASKS:
                     # What the dialog's turns go with: its compaction keeps it (_minara_dialog_effort).
                     target = acquired.session if isinstance(acquired, SessionLease) else acquired
                     target._minara_effort = model_provider.get("reasoningEffort")
@@ -1530,8 +1532,11 @@ class TurnRunner:
                             final_choice,
                             getattr(parsed, "max_tokens", None),
                             chunks)
-                        direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
-                                                                 if native_tools or parsed.entry.get("upstream") == "minara" else None)
+                        direct_target._native_client_messages = (
+                            getattr(parsed, "native_messages", None)
+                            if native_tools or actual_upstream != "retool"
+                            else None
+                        )
                         # Which calls the client can receive: a call of another tool is dropped below, and is no part
                         # of what the turn delivered or of the branch kept for it (direct.iter_events).
                         direct_target._native_callable_tools = list(tool_names) if native_tools else None
