@@ -11,11 +11,16 @@ import { TurnsArt } from '../stage/Art.jsx';
 
 const LIVE_PHASE = { wait: 'ждём upstream', think: 'upstream: thinking', tools: 'аргументы инструмента', out: 'пишет ответ', exec: 'выполняет команду' };
 
-// "нет данных" and the lower-bound mark are for a turn that is over and lacks a price; a running turn just has none yet
-const costNote = (cost) => (cost.running ? 'ход идёт' : cost.credits === null ? 'нет данных' : cost.complete ? '' : 'неполные данные');
+// "нет данных" and the lower-bound mark are for a turn that is over and lacks a price; a running turn just has none yet.
+// A Minara turn shows Minara's own credits (220 per dollar of its list), named as such: they are never Retool's.
+const shownCost = (cost) => (cost.minara !== undefined ? cost.minara : cost.credits);
+const costNote = (cost) => (cost.running ? 'ход идёт' : shownCost(cost) === null ? 'нет данных'
+  : !cost.complete ? 'неполные данные' : cost.minara !== undefined ? 'кредитов Minara' : '');
 const costTitle = (cost) => (cost.running ? 'Ход ещё идёт: стоимость будет известна, когда upstream ответит'
-  : cost.credits === null ? 'Стоимость не сообщена' : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена');
-const lowerBound = (cost) => cost.credits !== null && !cost.complete;
+  : shownCost(cost) === null ? 'Стоимость не сообщена'
+    : cost.minara !== undefined ? `Цена по прайсу Minara в её кредитах (220 за доллар): $${fmtFixed(cost.minara / 220, 4)}${cost.complete ? '' : '; часть стоимости не сообщена'}`
+      : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена');
+const lowerBound = (cost) => shownCost(cost) !== null && !cost.complete;
 const SPEED_TITLE = 'Выходные токены / время обработки запроса до завершения runner, включая ожидание, мышление, повторы и смену аккаунта, поиск и команды relay. Без отправки последних байтов клиенту. Не скорость декодирования; без полных данных — прочерк.';
 
 function Steps({ trace }) {
@@ -107,7 +112,7 @@ export default function Turns({ journal, overview, embedded }) {
                 <span className="trace-num">{fmtMs(trace.ttft)}</span>
                 <span className="trace-num">{fmtTokens(trace.cacheRead)}{hit !== null && <small> · {Math.round(hit * 100)}%</small>}</span>
                 <span className="trace-num trace-cost" title={costTitle(cost)}>
-                  {lowerBound(cost) ? '≥ ' : ''}{fmtFixed(cost.credits, 2)}
+                  {lowerBound(cost) ? '≥ ' : ''}{fmtFixed(shownCost(cost), 2)}
                   <small>{costNote(cost)}</small>
                 </span>
                 <time className="trace-when" title={fmtClock(trace.started)}>

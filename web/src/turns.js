@@ -72,6 +72,7 @@ export function buildTraces(events) {
       trace = { id: event.turn_id, started: event.ts, ended: null, status: 'running', restored: false, model: null, effort: null,
         task: null, askedEffort: null, outputTokens: null, tokensPerSecond: null, speedDuration: null, speedReason: null,
         transport: null, dialect: null, ttft: null, duration: null, credits: null, creditsSum: null, creditsComplete: false,
+        minaraSum: null,
         phase: 'wait', phaseStarted: event.ts, waitStarted: event.ts, waitMs: 0, firstSignal: null,
         thinkingStarted: null, thinking: 0, textStarted: null, textMs: 0, toolOpen: new Map(), toolSpans: [], args: 0,
         execStarted: null, execMs: 0, inputTokens: 0, cacheRead: 0, cacheWrite: 0,
@@ -135,6 +136,12 @@ export function buildTraces(events) {
       if (isPrice(data.credits)) {
         attempt.known = true;
         trace.creditsSum = (trace.creditsSum ?? 0) + data.credits;
+      }
+      // A Minara attempt is priced in Minara's own credits, never in Retool's: its price is kept apart and never added
+      // to `credits`, yet it is a price all the same (until 2026-11-13 every Minara turn showed "нет данных" here).
+      if (isPrice(data.minara_credits)) {
+        attempt.known = true;
+        trace.minaraSum = (trace.minaraSum ?? 0) + data.minara_credits;
       }
       trace.inputTokens += Number(data.input_tokens) || 0;
       trace.cacheRead += Number(data.cache_read) || 0;
@@ -218,15 +225,17 @@ export function speedOf(trace) {
  * the turn ended, see buildTraces); one that only started (refused, 429/500, never left) cost nothing. `credits` is
  * the sum of the valid prices, else 0 for a turn that ended without an unknown attempt (also one that never reached
  * upstream), else null. `complete` holds only for a turn whose end the relay recorded and that has no unknown
- * attempt, so a running or interrupted turn is never complete: its price so far is a lower bound.
+ * attempt, so a running or interrupted turn is never complete: its price so far is a lower bound. A Minara turn is
+ * priced in Minara's own credits: `minara` (present only then) holds them and `credits`, Retool's, stays null.
  */
 export function costOf(trace, status = trace.status) {
   const running = status === 'running';
   const ended = !running && status !== 'interrupted';
   const attempts = [...trace.costAttempts.values()];
   const unknown = attempts.filter((attempt) => attempt.observed && !attempt.known).length;
-  const priced = attempts.some((attempt) => attempt.known);
-  return { credits: priced ? trace.creditsSum : ended && !unknown ? 0 : null, unknown, running, complete: ended && !unknown };
+  const minara = trace.minaraSum ?? null;
+  const credits = trace.creditsSum !== null ? trace.creditsSum : ended && !unknown && minara === null ? 0 : null;
+  return { credits, ...(minara !== null ? { minara } : {}), unknown, running, complete: ended && !unknown };
 }
 
 /** A turn silent for longer than this is not running any more: the relay's own turn timeout is 15 minutes by default. */

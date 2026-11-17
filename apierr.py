@@ -5,6 +5,9 @@ from email.utils import parsedate_to_datetime
 
 # Retool answers 429 with this sentence once an organization has spent its hourly managed-key budget.
 HOURLY_LIMIT = "hourly limit of managed api key usage"
+# Retool answers 402 "This model is not available for your plan." when the account's plan does not include the model the
+# request names (journal of 2026-11-12/13: three accounts refused every claude-opus-5-5 request, the others served it).
+NOT_IN_PLAN = "model is not available for your plan"
 
 # Anthropic documents a closed set of error types (platform.claude.com/docs/en/api/errors, checked
 # 2026-11-05). A relay code outside it is translated, or the client meets a type its error handling does
@@ -167,6 +170,16 @@ def account_rate_limited(message: str, retry_after=None) -> ApiError:
 
 def is_account_quota(error) -> bool:
     return getattr(error, "account_quota", False) is True
+
+
+def is_not_in_plan(text) -> bool:
+    """Retool's refusal of a model the account's plan does not include, as opposed to any other 402 (credits, a feature)."""
+    return NOT_IN_PLAN in " ".join(str(text or "").lower().split())
+
+
+def is_plan_refusal(error) -> bool:
+    """A refusal of this account for this model, made before anything was generated or billed (direct._api_error)."""
+    return getattr(error, "plan_refusal", False) is True
 
 
 def retry_after_seconds(value):

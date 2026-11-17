@@ -7,7 +7,11 @@ burst. An account whose renewal keeps failing with 401/403, or whose confirmed
 balance is below `min_account_balance`, leaves the routing pool until a later
 check succeeds. An account that spent Retool's hourly managed-key quota is parked
 for `account_rate_limit_cooldown` seconds and returns by itself. A Minara account
-whose Bearer token has expired leaves the pool without a request to Minara.
+whose Bearer token has expired leaves the pool without a request to Minara. An
+account whose Retool plan refused a model is held back from that model alone
+(`refused_models` on the backend) and keeps serving every other one: for five
+minutes, and for an hour when the refusal comes within an hour after the last
+hold of that pair ended.
 """
 import math
 import collections
@@ -27,6 +31,7 @@ FORCED_CHECK_GAP = 15.0   # at most one on-demand balance fetch per account per 
 TOKEN_RECHECK = 120.0     # seconds between balance reads of a Minara account whose token was rejected: a brief
                           # 401 of Minara's own took every account out for ten minutes
 STARTUP_SPREAD = 2.0      # seconds between accounts' first checks
+STARTUP_PARALLEL = 16     # balances read at a time in the first round of a start (check_all)
 NETWORK_PAUSE_MAX = 300.0
 AUTH_RETRY_MAX = 600.0
 PRIORITY_MAX = 99
@@ -36,6 +41,8 @@ RATE_LIMIT_MAX = 3600.0      # the limit is a sliding hour: parking an account l
 RATE_LIMIT_STEP = 300.0      # a limit right after the return adds five minutes to the pause ...
 RATE_LIMIT_CEILING = 1200.0  # ... up to twenty minutes, or the cooldown itself when that is longer
 EXPIRY_WARN_EVERY = 86400.0  # a token about to expire is announced at most once a day per account
+PLAN_REFUSAL_FIRST = 300.0   # the first refusal of a model by an account's Retool plan holds that pair for five minutes,
+PLAN_REFUSAL_HOLD = 3600.0   # one within an hour after the pair's last hold ended holds it for an hour
 
 
 def _local_time(epoch):
@@ -391,6 +398,8 @@ class AccountDispatcher:
         self.balance_interval = float(cfg.get("account_balance_interval", 300) or 0)
         self.rate_limit_cooldown = min(max(float(cfg.get("account_rate_limit_cooldown") or RATE_LIMIT_COOLDOWN),
                                            1.0), RATE_LIMIT_MAX)
+        self.plan_refusal_first = PLAN_REFUSAL_FIRST
+        self.plan_refusal_hold = PLAN_REFUSAL_HOLD
         self.parallel = max(1, int(cfg.get("account_refresh_parallel", 3) or 1))
         self.clock = clock
         self.wall = wall  # token expiry is a moment in epoch seconds, not on the monotonic clock
@@ -409,13 +418,57 @@ class AccountDispatcher:
             self.state[backend] = {"next_refresh": now + offset, "next_balance": now + offset + 1.0,
                                    "auth_failures": 0, "soft_failures": 0, "running": set(), "reasons": {},
                                    "last_forced": float("-inf"), "forced": None, "available": None,
-                                   "expiry_warned": None}
+                                   "expiry_warned": None, "plan_refusals": {}, "plan_released": {}}
             backend.unavailable = None
+            backend.refused_models = {}
             if self.managers.get(backend) is not None:
                 backend.credits = self.managers[backend]
             refresher = getattr(backend, "refresher", None)
             if refresher is not None:
                 refresher.keepalive_owner = self
+
+    def add_account(self, backend, manager):
+        """Take one account into the live routing pool, its state built exactly as __init__ builds the rest.
+
+        Its first check is due at once (a balance read, or the expiry its token names), so a wrong sign-in or an empty
+        account shows on the status page within seconds instead of after a restart."""
+        with self._lock:
+            if backend in self.state:
+                return
+            now = self.clock()
+            self.state[backend] = {"next_refresh": now, "next_balance": now, "auth_failures": 0,
+                                   "soft_failures": 0, "running": set(), "reasons": {},
+                                   "last_forced": float("-inf"), "forced": None, "available": None,
+                                   "expiry_warned": None, "plan_refusals": {}, "plan_released": {}}
+            backend.unavailable = None
+            backend.refused_models = {}
+            if manager is not None:
+                self.managers[backend] = manager
+                backend.credits = manager
+            refresher = getattr(backend, "refresher", None)
+            if refresher is not None:
+                refresher.keepalive_owner = self
+            # A new list: reports read it without the lock (account_report.account_managers).
+            self.backends = [*self.backends, backend]
+
+    def check_soon(self, backend):
+        """Judge this account again now: its token's expiry at once, its balance at the next tick (the regular check, so
+        the admin's request does not wait for Minara). For an account that has just got a new token."""
+        self.check_expiry([backend])
+        with self._lock:
+            state = self.state.get(backend)
+            if state is not None:
+                state["next_balance"] = min(state["next_balance"], self.clock())
+
+    def remove_account(self, backend):
+        """Take one account out of routing; True when it was there. Nothing of its state is read afterwards."""
+        with self._lock:
+            if backend not in self.state:
+                return False
+            self.backends = [item for item in self.backends if item is not backend]
+            self.state.pop(backend, None)
+            self.managers.pop(backend, None)
+        return True
 
     def threshold_of(self, backend):
         """The balance below which this account takes no new turn, in its own unit."""
@@ -458,6 +511,7 @@ class AccountDispatcher:
         try:
             self.revive_renewed()
             self.release_rate_limited()
+            self.release_plan_refusals()
             self.check_expiry()
             for backend, kind in self.due():
                 try:
@@ -471,7 +525,10 @@ class AccountDispatcher:
 
     def _unclaim(self, backend, kind):
         with self._lock:
-            self.state[backend]["running"].discard(kind)
+            state = self.state.get(backend)
+            if state is not None:
+                state["running"].discard(kind)
+            # Always given back, also for an account removed meanwhile: a slot lost here was lost for every account.
             self._busy = max(0, self._busy - 1)
 
     # -- scheduling ----------------------------------------------------------
@@ -529,14 +586,14 @@ class AccountDispatcher:
                 self.check_balance(backend)
         except Exception as exc:  # noqa: BLE001 - one account must not stop the others
             with self._lock:
-                key = "next_refresh" if kind == "refresh" else "next_balance"
-                self.state[backend][key] = self.clock() + 60.0
-            journal.emit("account.dispatcher", "Проверка аккаунта не удалась: %s" % type(exc).__name__, "warn",
-                         account=account_tag(backend), job=kind)
+                state = self.state.get(backend)
+                if state is not None:
+                    state["next_refresh" if kind == "refresh" else "next_balance"] = self.clock() + 60.0
+            if state is not None:  # an account removed while its check ran has nothing left to report
+                journal.emit("account.dispatcher", "Проверка аккаунта не удалась: %s" % type(exc).__name__, "warn",
+                             account=account_tag(backend), job=kind)
         finally:
-            with self._lock:
-                self.state[backend]["running"].discard(kind)
-                self._busy = max(0, self._busy - 1)
+            self._unclaim(backend, kind)
 
     # -- state ---------------------------------------------------------------
     def _set_reason(self, backend, reason, details):
@@ -755,6 +812,79 @@ class AccountDispatcher:
             self._announce(backend, True, reason)
         return bool(released)
 
+    def mark_plan_refusal(self, backend, model, request_id=None):
+        """Hold this account back from `model` alone after Retool's 402 "This model is not available for your plan."; returns
+        when the account is asked for that model again (epoch seconds), None for an account or a model it cannot hold.
+
+        The account keeps serving every other model: a client that asks for a model no plan offers takes no account out of
+        the pool for anything else. The pool reads the holds from `backend.refused_models` (SessionPool._plan_hold): a
+        conversation of this model bound to the account moves at its next request, and when every account that serves the
+        model is held, the request gets the pool's settled 404. Turns that fail together share one hold and one journal
+        line. The hold ends by itself (release_plan_refusals, every tick): the next request of the model asks the account
+        again. Its length is a ladder of two steps: `plan_refusal_first` for a pair (account, model), and
+        `plan_refusal_hold` for a refusal that comes within that long a time after the pair's last hold ended, and for each
+        one after it. A fault of Retool's that refuses every account for a few minutes so holds the pool for five minutes,
+        not an hour. Nothing of it outlives a restart.
+        """
+        if not isinstance(model, str) or not model:
+            return None
+        now = self.clock()
+        with self._lock:
+            state = self.state.get(backend)  # read under the lock: the admin may remove the account meanwhile
+            if state is None:
+                return None
+            holds, ended_at = state["plan_refusals"], state["plan_released"]
+            hold = holds.get(model)
+            if hold is not None and now < hold["until"]:
+                return hold["until_at"]
+            # When the pair's last hold ended: one the scheduler has not released yet still ended at its own deadline.
+            ended = hold["until"] if hold is not None else ended_at.get(model)
+            repeated = ended is not None and now - ended <= self.plan_refusal_hold
+            pause = self.plan_refusal_hold if repeated else self.plan_refusal_first
+            until_at = time.time() + pause
+            ended_at.pop(model, None)
+            holds[model] = {"until": now + pause, "until_at": until_at, "pause": pause, "repeated": repeated}
+            self._publish_plan_refusals(backend)
+        text = "[account] %s исключён для %s: модель не входит в тариф Retool (402) до %s (пауза %s%s)" % (
+            self._tag(backend), model, time.strftime("%H:%M:%S", time.localtime(until_at)), apierr.wait_text(pause),
+            ", повторный отказ подряд" if repeated else "")
+        journal.emit("account.model_refused", text, "warn", account=account_tag(backend), model=model,
+                     until=round(until_at, 3), retry_in=pause, repeated=repeated,
+                     **({"request_id": request_id} if request_id else {}))
+        console_log.write(text)
+        return until_at
+
+    def release_plan_refusals(self, now=None):
+        """End the holds whose time is over, so that the next request of the model asks the account again; the scheduler
+        calls this every tick. True when a hold ended.
+
+        When a hold ended stays in memory (`plan_released`, one entry per pair) for as long as a refusal then counts as a
+        repeated one (mark_plan_refusal), and no longer."""
+        now = self.clock() if now is None else now
+        released = []
+        with self._lock:
+            for backend in self.backends:
+                state = self.state[backend]
+                holds, ended_at = state["plan_refusals"], state["plan_released"]
+                ended = [model for model, hold in holds.items() if now >= hold["until"]]
+                for model in ended:
+                    ended_at[model] = holds.pop(model)["until"]
+                    released.append((backend, model))
+                for model in [model for model, at in ended_at.items() if now - at > self.plan_refusal_hold]:
+                    del ended_at[model]
+                if ended:
+                    self._publish_plan_refusals(backend)
+        for backend, model in released:
+            journal.emit("account.model_retry",
+                         "[account] %s: пауза для %s закончилась, следующий запрос этой модели снова спросит аккаунт" % (
+                             self._tag(backend), model), "info", account=account_tag(backend), model=model)
+        return bool(released)
+
+    def _publish_plan_refusals(self, backend):
+        """Caller holds the lock. The pool and the admin read a new dict each time, never one that changes under them."""
+        backend.refused_models = {model: {"until_at": hold["until_at"], "pause": hold["pause"]}
+                                  for model, hold in self.state[backend]["plan_refusals"].items()}
+
     def confirm_minara_token(self, backend):
         """A chat request of this Minara account was answered 401/403: read /auth/me now (check_balance marks the account
         token_rejected when it refuses the token too). True when the account is out of the pool afterwards."""
@@ -879,6 +1009,52 @@ class AccountDispatcher:
             with self._lock:
                 state["forced"] = None
             pending.set()
+
+    def check_all(self, parallel=None):
+        """Read every enabled account's balance now, `parallel` at a time (STARTUP_PARALLEL), and judge each one as the
+        regular check does: the first round of a start. Returns how many accounts it checked.
+
+        The regular round reads `account_refresh_parallel` (3) accounts at a time and spreads the first reads over a
+        minute: with 483 accounts the empty ones (most of the Minara pool) left the pool one by one for three minutes after
+        a start, and the start itself waited a minute more for the banner's own read of every balance (2026-11-13). An
+        account claimed here is left alone by the dispatcher's loop until its check is done; the relay stopping ends the
+        round between two accounts."""
+        claimed = []
+        with self._lock:
+            for backend in self.backends:
+                state = self.state.get(backend)
+                manager = self.managers.get(backend)
+                if (state is None or state["running"] or not enabled(backend) or manager is None
+                        or not getattr(manager, "supports_balance", True)):
+                    continue
+                state["running"].add("balance")
+                claimed.append(backend)
+
+        def check(backend):
+            try:
+                if not self._stop.is_set():
+                    self.check_balance(backend)
+            except Exception as exc:  # noqa: BLE001 - one account must not stop the others
+                with self._lock:
+                    state = self.state.get(backend)
+                    if state is not None:
+                        state["next_balance"] = self.clock() + 60.0
+                journal.emit("account.dispatcher", "Проверка аккаунта не удалась: %s" % type(exc).__name__, "warn",
+                             account=account_tag(backend), job="balance")
+            finally:
+                with self._lock:
+                    state = self.state.get(backend)
+                    if state is not None:
+                        state["running"].discard("balance")
+
+        if claimed:
+            workers = DaemonIOExecutor(min(max(1, int(parallel or STARTUP_PARALLEL)), len(claimed)),
+                                       thread_name_prefix="account-start")
+            try:
+                list(workers.map(check, claimed))
+            finally:
+                workers.shutdown(wait=False)
+        return len(claimed)
 
     def status(self):
         with self._lock:

@@ -13,6 +13,11 @@ HISTORY_MAX = 200
 # a fresh account's 300-credit plan, and it took an account from +500 to -875 at once. A warning only: the turn is
 # billed by the time its usage arrives, so refusing it here would change nothing.
 WRITE_WARN = 300.0
+# A Minara Claude reply that carried cache marks, read the cache, wrote nothing and came back with at least this many input
+# tokens is called out (cache.tail_unwritten, and a red line under its `[cache]` line): Minara bills a reply that writes
+# nothing at the input price for its whole prompt, the part it read from the cache included. 15 of 36 turns of one Fable
+# 5.2 session were such replies, 6,972 of its 9,876 credits (2026-11-13; minara.TOOL_RESULTS_END). A warning only.
+TAIL_UNWRITTEN_INPUT = 8192
 # The turn ids a manager remembers to count each billed attempt once. Every id is new (a uuid per attempt, per keepwarm
 # ping), so a repeat can only come from the same attempt reported twice, moments apart: a few thousand cover that, where
 # the set kept every id of the process's life (about 120 bytes each, some 2,000 a day).
@@ -106,22 +111,27 @@ def write_cost(usage, model=None, pricing=None):
     A cache write is the one line item that can cost more than a whole account: a 484,380-token write at Fable 5.2's
     $10/M is 1065 Minara credits ($4.84), more than the 300-credit plan of a fresh account. Minara's own price list
     (`pricing`, USD per million tokens) is what it debits, so the share is read from there rather than guessed from the
-    dollar total, which mixes input, output and reads together."""
+    dollar total, which mixes input, output and reads together. A price expression gives the write's share at the tier the
+    whole prompt falls in (minara.write_cost): without it a model priced by one (Sonnet 4.5, GPT-6) never got the warning."""
     if not isinstance(usage, dict) or not isinstance(pricing, dict):
         return None
     tokens = usage.get("cache_write")
     if type(tokens) not in (int, float) or not math.isfinite(tokens) or tokens <= 0:
         return None
+    if isinstance(model, str) and model.startswith("minara/"):
+        import minara_catalog
+        try:
+            import minara
+            usd = minara.write_cost(pricing, usage)
+        except Exception:  # noqa: BLE001 - a warning's figure must never fail the turn it is about
+            return None
+        return None if usd is None else round(usd * minara_catalog.CREDITS_PER_USD, 2)
     try:
         usd_per_million = float(pricing.get("cache_write", pricing["prompt"]) or 0)
     except (KeyError, TypeError, ValueError):
         return None
     if not math.isfinite(usd_per_million) or usd_per_million <= 0:
         return None
-    usd = tokens * usd_per_million / 1e6
-    if isinstance(model, str) and model.startswith("minara/"):
-        import minara_catalog
-        return round(usd * minara_catalog.CREDITS_PER_USD, 2)
     # Retool bills its own fitted rate for a write (credits per token), not Minara's dollar price list.
     return round(tokens * rates(model)["cache_write"], 5)
 
@@ -254,6 +264,20 @@ class CreditsManager:
                               or time.monotonic() - self._cached_at >= CACHE_TTL,
                         unreported_usage=self._unreported_usage,
                         estimated=self._balance_estimated)
+
+    def recent_balance(self, max_age):
+        """What get_balance() answers from its cache, for a balance read less than `max_age` seconds ago, else None: no
+        network. The dispatcher reads every account each account_balance_interval and the turns' debits are taken off
+        in between, so /health and the admin's polls (every 8 s) need no read of their own: they read all 60 Retool
+        balances every 30 s before, four seconds of every page with 78 accounts (2026-11-13)."""
+        with self._lock:
+            if not self._balance or self._balance.get("available") is None:
+                return None
+            if time.monotonic() - self._cached_at >= max_age:
+                return None
+            return dict(self._balance, stale=bool(self.last_error or self._unreported_usage or self._refresh_raced),
+                        unreported_usage=self._unreported_usage,
+                        **({"stale_error": self.last_error} if self.last_error else {}))
 
     def usage(self):
         with self._lock:

@@ -3,6 +3,7 @@ and how routing and the dispatcher honour those controls."""
 import asyncio
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -64,6 +65,11 @@ def pool(tmp_path):
         runtime.accounts.managers[backend] = manager
         backend.credits = manager
     runtime.credits = managers[0]
+    # An account added while the relay runs gets its manager from the runtime (admin._adopt): a Retool one would read its
+    # balance from the tenant over the network, so it gets a fake; a Minara one keeps its own (conftest keeps it offline).
+    real_manager = runtime.account_manager
+    runtime.account_manager = lambda backend: (real_manager(backend) if backend.cfg.get("upstream") == "minara"
+                                               else FakeManager(80.0))
     server = proxy.BoundedServer(("127.0.0.1", 0), proxy.make_handler(runtime), threading.BoundedSemaphore(8))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:%d" % server.server_address[1]
@@ -264,18 +270,22 @@ def test_renew_reports_success_and_a_redacted_failure_as_200(pool, monkeypatch):
 
 
 # -- add / delete ------------------------------------------------------------------
-def test_added_account_is_saved_with_an_id_and_waits_for_a_restart(pool):
+def test_added_account_is_saved_with_an_id_and_joins_the_pool_at_once(pool):
     status, body = pool.call("/admin/api/accounts", NEW, method="POST")
-    assert status == 200 and body["restart_required"] is True
+    assert status == 200 and body["restart_required"] is False
     account = body["account"]
-    assert (account["pending"], account["label"], account["enabled"], account["state"]) == \
-        ("added", "третий", True, "pending")
+    # Not "pending": the account is in the live pool, so it takes requests from the next one on.
+    assert (account["pending"], account["label"], account["enabled"]) == (None, "третий", True)
     record = pool.saved()["accounts"][2]
     assert record["cookie"] == NEW["cookie"] and record["base"] == NEW["base"]
     assert len(record["account_id"]) == 32 and account["account"] == journal.tag(record["account_id"])
+    # The pool grew by this account, and the dispatcher knows it (it would otherwise never read its balance).
+    assert len(pool.runtime.pool.backends) == 3
+    assert pool.runtime.pool.backends[2].cfg["label"] == "третий"
+    assert pool.runtime.pool.backends[2] in pool.runtime.accounts.state
     listing = accounts(pool)
-    assert [item["pending"] for item in listing["accounts"]] == [None, None, "added"]
-    assert listing["summary"]["total"] == 3 and listing["restart_required"] is True
+    assert [item["pending"] for item in listing["accounts"]] == [None, None, None]
+    assert listing["summary"]["total"] == 3 and listing["restart_required"] is False
     for payload in (body, listing):
         for secret in SECRETS:
             assert secret not in json.dumps(payload), secret
@@ -297,13 +307,15 @@ def test_invalid_new_accounts_are_rejected(pool, change):
     assert pool.path.read_bytes() == before
 
 
-def test_adding_to_a_single_account_config_converts_it_and_keeps_the_session(admin_relay):
+def test_adding_to_a_single_account_config_converts_it_and_keeps_the_session(admin_relay, monkeypatch):
+    # The added account joins the running pool at once; its balance would be read from the tenant over the network.
+    monkeypatch.setattr(admin_relay.runtime, "account_manager", lambda backend: FakeManager(80.0), raising=False)
     saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
     saved["account_id"] = "root-account"
     admin_relay.path.write_text(json.dumps(saved), encoding="utf-8")
     status, body, _ = admin_relay.request("/admin/api/accounts", NEW, method="POST",
                                           headers={"x-admin-request": "1", "origin": admin_relay.url})
-    assert status == 200 and body["account"]["pending"] == "added"
+    assert status == 200 and body["account"]["pending"] is None and body["restart_required"] is False
     saved = json.loads(admin_relay.path.read_text(encoding="utf-8"))
     first, second = saved["accounts"]
     assert first["account_id"] == "root-account"
@@ -314,7 +326,7 @@ def test_adding_to_a_single_account_config_converts_it_and_keeps_the_session(adm
     # The running account still finds its own record for cookie rotation.
     assert config._account_record(saved, admin_relay.runtime.backend.cfg) is first
     _, listing, _ = admin_relay.request("/admin/api/accounts")
-    assert [item["pending"] for item in listing["accounts"]] == [None, "added"]
+    assert [item["pending"] for item in listing["accounts"]] == [None, None]
     reloaded = config.load(str(admin_relay.path))
     assert reloaded["cookie"] == "accessToken=private-cookie-value" and len(reloaded["accounts"]) == 2
 
@@ -331,14 +343,18 @@ def test_single_account_cannot_be_disabled_or_deleted(admin_relay):
 
 
 def test_deleted_account_leaves_routing_now_and_config_for_good(pool):
+    removed = pool.backends[1]  # the pool list itself shrinks, so keep the backend before deleting it
     status, body = pool.call("/admin/api/accounts/" + pool.tags[1], {}, method="DELETE")
-    assert status == 200 and body == {"ok": True, "pending": "removed", "restart_required": True}
+    # Gone from routing at once: the record is out of config.json and the backend out of the pool.
+    assert status == 200 and body == {"ok": True, "pending": None, "restart_required": False}
     assert [record["account_id"] for record in pool.saved()["accounts"]] == ["acc-a"]
-    assert pool.backends[1].cfg["enabled"] is False
+    assert removed not in pool.runtime.pool.backends
+    assert removed not in pool.runtime.accounts.state
+    assert removed not in pool.runtime.accounts.managers
     listing = accounts(pool)
-    assert [item["pending"] for item in listing["accounts"]] == [None, "removed"]
-    assert listing["summary"]["total"] == 1 and listing["restart_required"] is True
-    assert pool.call("/admin/api/accounts/" + pool.tags[1], {"priority": 3}, method="PATCH")[0] == 409
+    assert [item["pending"] for item in listing["accounts"]] == [None]
+    assert listing["summary"]["total"] == 1 and listing["restart_required"] is False
+    assert pool.call("/admin/api/accounts/" + pool.tags[1], {"priority": 3}, method="PATCH")[0] == 404
     assert pool.call("/admin/api/accounts/" + pool.tags[0], {}, method="DELETE")[0] == 409
 
 
@@ -525,3 +541,58 @@ def test_an_account_whose_base_and_page_come_from_the_environment_is_not_listed_
         assert admin_api._saved_record(saved, pool[0]) is saved
     finally:
         runtime.close()
+
+
+def test_adding_an_account_keeps_the_others_secrets_masked(pool):
+    # cfg["accounts"] is the list the journal masks every account's cookie, xsrf and page from: it is extended, never
+    # replaced by the new record alone.
+    assert pool.call("/admin/api/accounts", NEW, method="POST")[0] == 200
+    records = pool.runtime.cfg["accounts"]
+    assert [record.get("account_id") for record in records][:2] == ["acc-a", "acc-b"] and len(records) == 3
+    secrets = journal.JOURNAL._secrets()
+    for value in ("accessToken=cookie-acc-a-123456; xsrfToken=xsrf-acc-a-123456", "xsrf-acc-b-123456",
+                  NEW["cookie"], NEW["xsrf"]):
+        assert value in secrets, value
+
+
+def test_a_minara_account_added_to_a_retool_pool_brings_its_models(pool):
+    from test_minara_accounts import jwt
+    assert "minara/claude-opus-5-5" not in pool.runtime.cfg["_minara_models"]
+    routes = pool.runtime.cfg["_minara_models"]  # the dict every account's cfg holds
+    status, body = pool.call("/admin/api/accounts", {"upstream": "minara", "bearer_tokens": [jwt("new-user")]},
+                             method="POST")
+    assert status == 200 and body["added"] == 1 and body["restart_required"] is False
+    assert pool.runtime.cfg["_minara_models"] is routes and "minara/claude-opus-5-5" in routes
+    added = pool.runtime.pool.backends[-1]
+    assert added.cfg["upstream"] == "minara" and added in pool.runtime.catalog.backends
+
+
+def test_a_switch_does_not_wait_for_a_renewal_in_flight_and_a_slow_answer_is_journaled(pool, monkeypatch):
+    # A renewal holds its account's refresher lock for its HTTP round trip: every switch of an account waited for every
+    # renewal in flight, 0.4 to 7.3 s a switch right after a start (2026-11-13). A switch, a priority or a label touches
+    # nothing a renewal writes (persist_auth merges its own cookie under storage_lock), so it waits for none.
+    renewing = pool.backends[1].refresher._lock
+    assert renewing.acquire(timeout=5)
+    try:
+        started = time.monotonic()
+        status, body = pool.call("/admin/api/accounts/" + pool.tags[0], {"enabled": False}, method="PATCH")
+        assert status == 200 and body["account"]["enabled"] is False and time.monotonic() - started < 5
+    finally:
+        renewing.release()
+    assert pool.saved()["accounts"][0]["enabled"] is False
+    # An admin answer that took a second or more is journaled with its time; a quick poll is not.
+    before = journal.JOURNAL.last_seq
+    pool.call("/admin/api/accounts")
+    deadline = time.monotonic() + 2
+    time.sleep(0.2)
+    assert not [e for e in journal.JOURNAL.query(since=before) if e["kind"] == "http.request"
+                and e["data"].get("path") == "/admin/api/accounts"]
+    monkeypatch.setattr(proxy, "SLOW_ADMIN_MS", 0)
+    pool.call("/admin/api/accounts")
+    while True:
+        slow = [e for e in journal.JOURNAL.query(since=before) if e["kind"] == "http.request"
+                and e["data"].get("path") == "/admin/api/accounts"]
+        if slow or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    assert slow and slow[0]["level"] == "warn" and " за " in slow[0]["message"]

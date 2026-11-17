@@ -44,6 +44,9 @@ def collect(runtime, *, force_refresh=False):
     active = [backend for backend, _ in rows
               if getattr(backend, "unavailable", None) is None and enabled(backend)]
     spare = [] if active else SessionPool._reserve([backend for backend, _ in rows])
+    # A Retool balance the dispatcher read within two of its intervals is the answer (CreditsManager.recent_balance).
+    interval = float((getattr(runtime, "cfg", None) or {}).get("account_balance_interval", 300) or 0)
+    recent_age = 2 * interval
 
     def fetch(row):
         backend, manager = row
@@ -67,6 +70,11 @@ def collect(runtime, *, force_refresh=False):
             info.setdefault("available", None)
             info["stale"] = bool(info.get("stale")) and info["available"] is not None
             return info
+        recent = getattr(manager, "recent_balance", None)
+        if not force_refresh and recent is not None and recent_age > 0:
+            info = recent(recent_age)
+            if info is not None:
+                return info
         return manager.get_balance(force_refresh=force_refresh)
 
     if len(rows) == 1:

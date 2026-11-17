@@ -314,6 +314,13 @@ def routable_entries(relay_config):
     cfg = {**RELAY_DEFAULTS, **saved}
     accounts = load_accounts(relay_config)
     backends = [SimpleNamespace(cfg=account) for account in accounts]
+    # The models the relay measured or published by itself since its catalogs were made (minara_refresh and
+    # retool_refresh write them beside config.json), as config.load puts them in: without them a model the relay already
+    # served never reached the client's list.
+    import minara_catalog
+    import retool_catalog
+    minara_catalog.apply_overlay(minara_catalog.overlay_path(relay_config))
+    retool_catalog.apply_overlay(retool_catalog.overlay_path(relay_config))
     # Minara models come from the accounts of this file (minara_models.json and their lists), as the relay builds them.
     cfg['_minara_models'] = models.build_minara_catalog(accounts)
     return [entry for entry in models.catalog(cfg) if models.catalog_routable(entry, cfg, backends)]

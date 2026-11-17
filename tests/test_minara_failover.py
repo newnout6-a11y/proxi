@@ -12,6 +12,7 @@ import pytest
 import accounts
 import apierr
 import config
+import console_log
 import journal
 import models
 import orchestrator
@@ -233,6 +234,34 @@ def test_the_balance_of_a_minara_only_relay_is_an_answer(relay):
     assert body['available'] is None and body['minara']['available'] == 400  # 2 accounts x 200 credits
 
 
+def test_a_marked_claude_reply_that_read_the_cache_and_wrote_nothing_is_said(relay, monkeypatch):
+    """Minara bills a reply that writes nothing to the cache at the input price for its whole prompt, the part it read
+    included (15 of 36 turns of one Fable 5.2 session, 2026-11-13): such a reply is a warning in the journal and a line
+    on the console. A reply that wrote its tail is not."""
+    relay.state.refusal = None
+    lines = []
+    monkeypatch.setattr(console_log, 'write', lambda line, **kwargs: lines.append(line))
+    answers = [{'prompt_tokens': 120_000, 'completion_tokens': 2,
+                'prompt_tokens_details': {'cached_tokens': 89_557, 'cache_write_tokens': 0}},
+               {'prompt_tokens': 120_000, 'completion_tokens': 2,
+                'prompt_tokens_details': {'cached_tokens': 89_557, 'cache_write_tokens': 30_439}}]
+
+    def post(url, **kwargs):
+        data = {'choices': [{'index': 0, 'delta': {'content': 'OK'}, 'finish_reason': 'stop'}], 'usage': answers.pop(0)}
+        return Response(200, ('data: ' + json.dumps(data) + '\n\ndata: [DONE]\n\n').encode())
+    for backend in relay.runtime.accounts.backends:
+        backend._minara_post = post
+    models.minara_entry(MODEL, relay.runtime.cfg)['cache'] = 'explicit'  # as a Claude route
+    before = journal.JOURNAL.last_seq
+    assert relay.ask('conv-unwritten')[0] == 200 and relay.ask('conv-written')[0] == 200
+    said = [event for event in journal.JOURNAL.query(since=before, limit=500) if event['kind'] == 'cache.tail_unwritten']
+    assert len(said) == 1 and said[0]['level'] == 'warn'
+    assert said[0]['data']['input_tokens'] == 30_443 and said[0]['data']['cache_read'] == 89_557
+    assert said[0]['message'].endswith('Minara ничего не записала в кэш: 30,443 токенов промпта оплачены по цене входа')
+    shown = [line for line in lines if '[cache.tail_unwritten]' in line]
+    assert len(shown) == 1 and '30,443' in shown[0]
+
+
 def test_each_request_of_a_forced_choice_asked_in_words_keeps_its_own_cost(relay):
     relay.state.refusal = None
     tools = [{'type': 'function', 'function': {'name': 'get_weather', 'parameters': {'type': 'object', 'properties': {}}}}]
@@ -427,3 +456,57 @@ def test_a_forced_call_asked_in_words_cut_after_it_left_is_not_sent_again(relay)
     tools = [{'type': 'function', 'function': {'name': 'get_weather', 'parameters': {'type': 'object', 'properties': {}}}}]
     status, body = relay.ask_with('conv-cut-forced', tools=tools, tool_choice='required')
     assert status >= 500 and len(posts) == 1
+
+
+def test_a_minara_turn_shows_its_price_on_the_balance_line_and_in_the_journal(relay, monkeypatch):
+    """The [balance] line under every Minara turn said spent=? though the [cache] line above it had the price; the same
+    holds for a model priced by an expression with Gemini 4's `ai` (audio input), which the relay could not read."""
+    relay.state.refusal = None
+    lines = []
+    monkeypatch.setattr(console_log, 'write', lambda line, **kwargs: lines.append(str(line)))
+    usage = {'prompt_tokens': 120_000, 'completion_tokens': 20,
+             'prompt_tokens_details': {'cached_tokens': 89_557, 'cache_write_tokens': 30_439}}
+
+    def post(url, **kwargs):
+        data = {'choices': [{'index': 0, 'delta': {'content': 'OK'}, 'finish_reason': 'stop'}], 'usage': usage}
+        return Response(200, ('data: ' + json.dumps(data) + '\n\ndata: [DONE]\n\n').encode())
+    for backend in relay.runtime.accounts.backends:
+        backend._minara_post = post
+    entry = models.minara_entry(MODEL, relay.runtime.cfg)
+    entry['pricing'] = {'quota_type': 0, 'billing_mode': 'tiered_expr', 'group_ratio': 1,
+                        'billing_expr': 'p * 2 + c * 10 + cr * 0.1 + cc * 0.1875 + ai * 2'}
+    before = journal.JOURNAL.last_seq
+    assert relay.ask('conv-priced-line')[0] == 200
+    credits = round((4 * 2 + 20 * 10 + 89_557 * 0.1 + 30_439 * 0.1875) / 1e6 * 220, 4)
+    cache = [line for line in lines if '[cache]' in line]
+    balance = [line for line in lines if '[balance]' in line]
+    assert len(cache) == 1 and 'credits=%s' % console_log.amount(credits) in cache[0]
+    assert len(balance) == 1 and 'spent=%s' % console_log.amount(credits) in balance[0]
+    priced = [event for event in journal.JOURNAL.query(since=before, limit=500) if event['kind'] == 'upstream.usage']
+    assert len(priced) == 1 and priced[0]['level'] == 'info' and priced[0]['data']['minara_credits'] == credits
+    trace = next(item for item in journal.JOURNAL.turns() if item['turn_id'] == priced[0]['turn_id'])
+    assert trace['minara_credits'] == credits and trace['credits_complete'] is True and trace['credits_unknown'] == 0
+
+
+def test_a_minara_turn_whose_price_cannot_be_read_says_why(relay, monkeypatch):
+    relay.state.refusal = None
+    lines = []
+    monkeypatch.setattr(console_log, 'write', lambda line, **kwargs: lines.append(str(line)))
+    models.minara_entry(MODEL, relay.runtime.cfg)['pricing'] = {
+        'quota_type': 0, 'billing_mode': 'tiered_expr', 'billing_expr': 'p * 2 + vid * 3'}
+    before = journal.JOURNAL.last_seq
+    assert relay.ask('conv-unreadable')[0] == 200
+    said = [event for event in journal.JOURNAL.query(since=before, limit=500) if event['kind'] == 'upstream.usage']
+    assert len(said) == 1 and said[0]['level'] == 'warn'
+    assert said[0]['message'].endswith('цену по прайсу Minara не посчитать: формула цены не читается: неизвестная '
+                                       'переменная vid')
+    assert said[0]['data']['price_problem'].endswith('неизвестная переменная vid')
+    assert any('[balance]' in line and 'spent=?' in line for line in lines)  # no figure made up
+
+
+def test_an_attempt_cut_before_its_usage_is_not_said_to_have_tokens():
+    parsed = types.SimpleNamespace(model='claude-opus-5-5', entry={})
+    assert orchestrator.TurnRunner._unpriced(parsed, {}) == (
+        'Попытка оборвалась до отчёта о расходе: стоимость неизвестна', {})
+    assert orchestrator.TurnRunner._unpriced(parsed, {'input_tokens': 5, 'output_tokens': 0})[0] == (
+        'Токены получены; стоимость upstream не сообщена')

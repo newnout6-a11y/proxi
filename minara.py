@@ -5,6 +5,8 @@ No automatic generation retries: a disconnected request may already have been bi
 import asyncio
 import contextlib
 import copy
+import datetime
+import functools
 import hashlib
 import json
 import math
@@ -13,6 +15,7 @@ import queue
 import re
 import threading
 import time
+import zoneinfo
 
 import apierr
 import client_context
@@ -208,7 +211,8 @@ def _cache_marks(messages, ttl, mark_tail=True):
             # A side request (a client's compaction, a one-shot job) is never continued: its own last message, the
             # instruction, would be written for an hour and never read (2,053 and 2,142 tokens of two Claude Code
             # compactions, 2026-11-10). The message before it, the end of the dialog's own history (a mid-turn
-            # compaction's latest tool results), is marked instead: everything up to there is read.
+            # compaction's latest tool results), is marked instead: everything up to there is read. Not on /v1/messages,
+            # where a reply that writes nothing costs the whole prompt at the input price (_stream marks the tail there).
             wanted.append(last_user[-2])
         # The end of the previous turn: the last user/tool message before the latest assistant reply.
         latest_assistant = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=None)
@@ -348,6 +352,21 @@ def _count(value):
     return value if type(value) is int and value >= 0 else None
 
 
+def _modalities(value):
+    """The audio and image tokens inside an OpenAI-shaped usage's prompt_tokens and completion_tokens: a price expression
+    that bills them apart (new-api's ai, img, ao, img_o) takes them out of p and c. Only the price reads them."""
+    found = {}
+    for field, source, target in (("prompt_tokens_details", "audio_tokens", "audio_input_tokens"),
+                                   ("prompt_tokens_details", "image_tokens", "image_input_tokens"),
+                                   ("completion_tokens_details", "audio_tokens", "audio_output_tokens"),
+                                   ("completion_tokens_details", "image_tokens", "image_output_tokens")):
+        details = value.get(field)
+        number = _count(details.get(source)) if isinstance(details, dict) else None
+        if number:
+            found[target] = number
+    return found
+
+
 def normalize_usage(value, pricing=None):
     result = {}
     for source, target in (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens")):
@@ -384,7 +403,8 @@ def normalize_usage(value, pricing=None):
     # 17,139 tokens reported 30.19 credits and was debited 18.88, the list price; balances over whole runs matched the list
     # to 0.0002 credits (end-to-end runs of 2026-11-10). So the list prices every reply it can read; what upstream reported
     # stays as upstream_cost, for diagnosis.
-    estimate = estimated_cost(pricing, result) if pricing is not None and 'input_tokens' in result else None
+    estimate = (estimated_cost(pricing, dict(result, **_modalities(value)))
+                if pricing is not None and 'input_tokens' in result else None)
     if estimate is not None:
         result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
         if reported is not None:
@@ -400,123 +420,418 @@ def normalize_usage(value, pricing=None):
 
 
 def estimated_cost(pricing, usage):
-    """USD for one reply at the catalog price (per million tokens): flat, or Minara's tiered expression; None when the
-    price cannot be read (per-request pricing, an expression this reader does not know)."""
-    if not isinstance(pricing, dict) or pricing.get("quota_type") not in (0, None):
+    """USD for one reply at the catalog price (per million tokens): flat, or Minara's price expression; None when the
+    price cannot be read (a price per request, an expression this reader does not know): price_problem says why."""
+    return _priced(pricing, usage)[0]
+
+
+# A reply with every counter the price expressions read: price_problem prices it to find out whether a price can be read.
+_PROBE_USAGE = {"input_tokens": 1000, "output_tokens": 1000, "cache_read": 1000, "cache_write": 1000}
+
+
+def price_problem(pricing):
+    """Why the relay cannot price the replies of a model with this catalog price, in a few Russian words; None when it
+    can. A model whose price cannot be read has every turn unpriced, and the catalog refresh does not measure it."""
+    return _priced(pricing, _PROBE_USAGE)[1]
+
+
+def write_cost(pricing, usage):
+    """USD the cache write of one reply cost at the catalog price (for an expression, at the tier the whole prompt falls
+    in), None when it cannot be told: the [WRITE COSTLY] warning (credits.write_cost) reads it."""
+    written = usage.get("cache_write") if isinstance(usage, dict) else None
+    if type(written) not in (int, float) or not math.isfinite(written) or written <= 0 or not isinstance(pricing, dict):
         return None
+    if pricing.get("quota_type") not in (0, None):
+        return None
+    if pricing.get("billing_mode") == "tiered_expr":
+        try:
+            formula = _formula(pricing.get("billing_expr"))
+            names = _token_names(formula.used, usage)
+            # Only the write is priced: the other counters are 0, the tier is still chosen by the whole prompt (len).
+            alone = dict.fromkeys(names, 0.0)
+            alone.update(len=names["len"], image_count=names["image_count"])
+            alone["cc" if "cc" in formula.used else "p"] = float(written)  # an unpriced write is billed as input
+            total = formula.value(alone) * float(pricing.get("group_ratio") or 1) / 1e6
+        except (ValueError, TypeError, ArithmeticError, RecursionError):
+            return None
+    elif pricing.get("billing_mode"):
+        return None
+    else:
+        try:
+            total = written * float(pricing.get("cache_write", pricing["prompt"]) or 0) / 1e6
+        except (KeyError, TypeError, ValueError):
+            return None
+    return round(total, 10) if math.isfinite(total) and total > 0 else None
+
+
+def _priced(pricing, usage):
+    """(USD or None, None or the reason the price cannot be read)."""
+    if not isinstance(pricing, dict):
+        return None, "в каталоге нет цены"
+    if pricing.get("quota_type") not in (0, None):
+        return None, "цена за запрос (quota_type %s), а не за токены" % pricing.get("quota_type")
     if pricing.get("billing_mode") == "tiered_expr":
         return _tiered_cost(pricing, usage)
     if pricing.get("billing_mode"):
-        return None
+        return None, "незнакомый способ расчёта %s" % str(pricing.get("billing_mode"))[:40]
     try:
         rates = {key: float(pricing[key]) for key in ("prompt", "completion")}
         read = float(pricing.get("cache_read", pricing["prompt"]) or 0)
         write = float(pricing.get("cache_write", pricing["prompt"]) or 0)
     except (KeyError, TypeError, ValueError):
-        return None
+        return None, "нет цены за токены (prompt, completion)"
     total = (usage.get("input_tokens", 0) * rates["prompt"] + usage.get("output_tokens", 0) * rates["completion"]
              + usage.get("cache_read", 0) * read + usage.get("cache_write", 0) * write) / 1e6
-    return round(total, 10) if math.isfinite(total) and total >= 0 else None
+    if not math.isfinite(total) or total < 0:
+        return None, "цена за токены не число"
+    return round(total, 10), None
 
 
 def _tiered_cost(pricing, usage):
-    """Minara's (new-api's) tiered price: an expression over p (uncached input), c (output), cr (cache read), cc and cc1h
-    (cache written for 5 minutes or an hour) and len (the whole prompt), in USD per million tokens, e.g.
-    "len > 272000 ? (p * 4 + c * 15 + cr * 0.2 + cc * 5) : (p * 2 + c * 10 + cr * 0.1 + cc * 2.5)" (GPT-6.1 Sol). Read
-    by a small parser, never eval(); with writes at cc it matched Minara's debits."""
+    """Minara's price expression (new-api's billing expression, its `tiered_expr` mode) for one reply: USD per million
+    tokens, e.g. "len > 272000 ? (p * 4 + c * 15 + cr * 0.2 + cc * 5) : (p * 2 + c * 10 + cr * 0.1 + cc * 2.5)" (GPT-6.1
+    Sol) or "p * 2 + c * 10 + cr * 0.1 + cc * 0.1875 + ai * 2" (Gemini 4 Carbon, whose `ai` is audio input). Read by a
+    small parser, never eval(); with writes at cc it matched Minara's debits. Returns (USD or None, None or the reason)."""
     expression = pricing.get("billing_expr")
-    if not isinstance(expression, str) or len(expression) > 2000:
-        return None
-    written = usage.get("cache_write", 0)
-    # Minara bills every write at the cc term, an hour-long one too (Haiku 5.5's 1h writes were debited at cc's $0.125/M,
-    # not cc1h's $0.2/M): cc1h stays 0.
-    names = {"p": usage.get("input_tokens", 0), "c": usage.get("output_tokens", 0), "cr": usage.get("cache_read", 0),
-             "cc": written, "cc1h": 0}
-    names["len"] = names["p"] + names["cr"] + written
+    if not isinstance(expression, str) or not expression.strip():
+        return None, "в прайсе нет формулы цены"
     try:
-        value = _Expression(expression, names).value()
+        formula = _formula(expression)
+        value = formula.value(_token_names(formula.used, usage))
         ratio = float(pricing.get("group_ratio") or 1)
-    except (ValueError, TypeError, ZeroDivisionError, RecursionError):
-        return None
+    except ValueError as error:
+        return None, "формула цены не читается: %s" % error
+    except (TypeError, ArithmeticError, RecursionError) as error:
+        return None, "формула цены не считается: %s" % type(error).__name__
     total = value * ratio / 1e6
-    return round(total, 10) if math.isfinite(total) and total >= 0 else None
+    if not math.isfinite(total) or total < 0:
+        return None, "формула цены дала не цену (%s)" % total
+    return round(total, 10), None
 
 
-class _Expression:
-    """ternary := comparison ["?" ternary ":" ternary]; comparison := sum [(">"|"<"|">="|"<="|"=="|"!=") sum];
-    sum := product (("+"|"-") product)*; product := unary (("*"|"/") unary)*; unary := ["-"] atom;
-    atom := number | name | "(" ternary ")". Anything else is a ValueError."""
+# The variables of new-api's price expressions for a chat reply (its pkg/billingexpr/expr.md and
+# service/tiered_settle.go, read on 2026-11-13): token counts, plus image_count (images a request makes, 1 for chat).
+TOKEN_VARIABLES = frozenset({"p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao",
+                             "image_count"})
+# Its functions. tier(name, value) names the tier the reply fell in and is worth `value`; fixed(usd) is a price per
+# request; param() and header() read the request, which the price is never given here: they read as absent (a rule such
+# as `|||when(header("anthropic-beta") has "fast-mode") * 6` does not apply). The clock functions take a time zone.
+_FUNCTIONS = {"tier": (2, 2), "fixed": (1, 1), "max": (1, 64), "min": (1, 64), "abs": (1, 1), "ceil": (1, 1),
+              "floor": (1, 1), "has": (2, 2), "param": (1, 1), "header": (1, 1), "hour": (0, 1), "minute": (0, 1),
+              "weekday": (0, 1), "month": (0, 1), "day": (0, 1), "when": (1, 1)}
+_CONSTANTS = {"true": True, "false": False, "nil": None, "null": None}
+_EXPRESSION_CHARS = 20_000
+_EXPRESSION_DEPTH = 60
+_EXPRESSION_TOKENS = re.compile(r"""
+    (?P<space>\s+)
+  | (?P<number>(?:\d[\d_]*(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)
+  | (?P<string>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')
+  | (?P<name>[A-Za-z_]\w*)
+  | (?P<op>&&|\|\||==|!=|>=|<=|[-+*/%()?:<>!,])
+""", re.VERBOSE)
 
-    def __init__(self, text, names):
-        self.tokens = re.findall(r"\d+(?:\.\d+)?|[A-Za-z_]\w*|>=|<=|==|!=|[-+*/()?:<>]|\S", text)
-        self.names = names
+
+def _token_names(used, usage):
+    """The values of an expression's variables for one reply, as new-api settles it (BuildTieredTokenParams).
+
+    `p` is the input the expression does not price apart: a cache read, a cache write, image or audio input it prices
+    with its own variable is left out of p, one it does not price stays in p at the input price (Grok 4.7 has no cc).
+    `c` likewise for audio and image output. `len` is the whole prompt and only chooses a tier. Minara bills every
+    cache write at cc, an hour-long one too (Haiku 5.5's 1h writes were debited at cc's $0.125/M, not cc1h's $0.2/M), so
+    cc1h and cc12h stay 0. The relay's input_tokens already leaves the cache read and write out."""
+    def count(key):
+        value = usage.get(key) if isinstance(usage, dict) else None
+        return float(value) if type(value) in (int, float) and math.isfinite(value) and value > 0 else 0.0
+
+    read, written = count("cache_read"), count("cache_write")
+    whole = count("input_tokens") + read + written
+    audio_in, image_in = count("audio_input_tokens"), count("image_input_tokens")
+    audio_out, image_out = count("audio_output_tokens"), count("image_output_tokens")
+    prompt = whole - sum(tokens for name, tokens in (("cr", read), ("cc", written), ("img", image_in), ("ai", audio_in))
+                         if name in used)
+    output = count("output_tokens") - sum(tokens for name, tokens in (("ao", audio_out), ("img_o", image_out))
+                                          if name in used)
+    return {"p": max(0.0, prompt), "c": max(0.0, output), "len": whole, "cr": read, "cc": written, "cc1h": 0.0,
+            "cc12h": 0.0, "img": image_in, "img_cr": 0.0, "img_o": image_out, "ai": audio_in, "ao": audio_out,
+            "image_count": 1.0}
+
+
+@functools.lru_cache(maxsize=256)
+def _formula(expression):
+    """The parsed expression (cached: every reply of a model prices the same text); ValueError when it cannot be read."""
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("пустая формула")
+    if len(expression) > _EXPRESSION_CHARS:
+        raise ValueError("формула длиннее %d знаков" % _EXPRESSION_CHARS)
+    text = expression.strip()
+    version = re.match(r"(v\d+)\s*:(?!:)", text)
+    if version:
+        if version[1] != "v1":
+            raise ValueError("версия формулы %s, известна только v1" % version[1])
+        text = text[version.end():]
+    parts = text.split("|||")
+    base = _ExpressionParser(parts[0]).parse()
+    rules = []
+    for part in parts[1:]:
+        rule = _ExpressionParser(part).parse()
+        # `when(condition) * factor`: the factor applies when the condition holds, else the rule is worth 1.
+        if rule[0] == "*" and rule[1][0] == "call" and rule[1][1] == "when":
+            rules.append((rule[1][2][0], rule[2]))
+        else:
+            rules.append((None, rule))
+    return _Formula(base, tuple(rules))
+
+
+class _Formula:
+    __slots__ = ("base", "rules", "used")
+
+    def __init__(self, base, rules):
+        self.base, self.rules = base, rules
+        used = set()
+        for node in (base, *(item for rule in rules for item in rule if item is not None)):
+            _variables(node, used)
+        self.used = frozenset(used)
+
+    def value(self, names):
+        total = _numeric(_evaluate(self.base, names))
+        for condition, factor in self.rules:
+            if condition is None or _truth(_evaluate(condition, names)):
+                total *= _numeric(_evaluate(factor, names))
+        return total
+
+
+def _variables(node, found):
+    if node[0] == "var":
+        found.add(node[1])
+    elif node[0] == "call":
+        for argument in node[2]:
+            _variables(argument, found)
+    elif node[0] not in ("num", "str", "const"):
+        for child in node[1:]:
+            if isinstance(child, tuple):
+                _variables(child, found)
+
+
+class _ExpressionParser:
+    """ternary := or ["?" ternary ":" ternary]; or := and (("||" | "or") and)*; and := comparison (("&&" | "and")
+    comparison)*; comparison := sum [(">" | "<" | ">=" | "<=" | "==" | "!=" | "has" | "contains") sum];
+    sum := product (("+" | "-") product)*; product := unary (("*" | "/" | "%") unary)*;
+    unary := ("-" | "+" | "!" | "not") unary | atom; atom := number | string | true | false | nil | name |
+    function "(" [ternary ("," ternary)*] ")" | "(" ternary ")". Unknown names and functions are a ValueError that names
+    them; nothing is evaluated here."""
+
+    def __init__(self, text):
+        self.tokens = []
+        at = 0
+        while at < len(text):
+            match = _EXPRESSION_TOKENS.match(text, at)
+            if match is None:
+                raise ValueError("непонятный знак «%s»" % text[at])
+            if match.lastgroup != "space":
+                self.tokens.append((match.lastgroup, match[0]))
+            at = match.end()
         self.at = 0
+        self.depth = 0
 
-    def value(self):
-        result = self._ternary()
+    def parse(self):
+        if not self.tokens:
+            raise ValueError("пустая формула")
+        node = self._ternary()
         if self.at != len(self.tokens):
-            raise ValueError("unexpected " + self.tokens[self.at])
-        return float(result)
+            raise ValueError("лишнее «%s»" % self.tokens[self.at][1])
+        return node
 
     def _peek(self):
-        return self.tokens[self.at] if self.at < len(self.tokens) else None
+        return self.tokens[self.at][1] if self.at < len(self.tokens) else None
 
     def _take(self, expected=None):
         token = self._peek()
-        if token is None or (expected is not None and token != expected):
-            raise ValueError("expected %s" % (expected or "a value"))
+        if token is None:
+            raise ValueError("формула оборвалась")
+        if expected is not None and token != expected:
+            raise ValueError("ждали «%s», а там «%s»" % (expected, token))
         self.at += 1
-        return token
+        return self.tokens[self.at - 1]
 
     def _ternary(self):
-        condition = self._comparison()
-        if self._peek() != "?":
-            return condition
-        self._take("?")
-        yes = self._ternary()
-        self._take(":")
-        no = self._ternary()
-        return yes if condition else no
+        self.depth += 1
+        if self.depth > _EXPRESSION_DEPTH:
+            raise ValueError("слишком глубокая вложенность")
+        node = self._or()
+        if self._peek() == "?":
+            self._take()
+            yes = self._ternary()
+            self._take(":")
+            node = ("if", node, yes, self._ternary())
+        self.depth -= 1
+        return node
+
+    def _or(self):
+        node = self._and()
+        while self._peek() in ("||", "or"):
+            self._take()
+            node = ("or", node, self._and())
+        return node
+
+    def _and(self):
+        node = self._comparison()
+        while self._peek() in ("&&", "and"):
+            self._take()
+            node = ("and", node, self._comparison())
+        return node
 
     def _comparison(self):
-        left = self._sum()
-        operator = self._peek()
-        if operator in (">", "<", ">=", "<=", "==", "!="):
-            self._take()
-            right = self._sum()
-            return {">": left > right, "<": left < right, ">=": left >= right, "<=": left <= right,
-                    "==": left == right, "!=": left != right}[operator]
-        return left
+        node = self._sum()
+        if self._peek() in (">", "<", ">=", "<=", "==", "!=", "has", "contains"):
+            operator = self._take()[1]
+            node = ("cmp", operator, node, self._sum())
+        return node
 
     def _sum(self):
-        total = self._product()
+        node = self._product()
         while self._peek() in ("+", "-"):
-            total = total + self._product() if self._take() == "+" else total - self._product()
-        return total
+            node = (self._take()[1], node, self._product())
+        return node
 
     def _product(self):
-        total = self._unary()
-        while self._peek() in ("*", "/"):
-            total = total * self._unary() if self._take() == "*" else total / self._unary()
-        return total
+        node = self._unary()
+        while self._peek() in ("*", "/", "%"):
+            node = (self._take()[1], node, self._unary())
+        return node
 
     def _unary(self):
-        if self._peek() == "-":
-            self._take()
-            return -self._unary()
+        if self._peek() in ("-", "+", "!", "not"):
+            operator = self._take()[1]
+            self.depth += 1
+            if self.depth > _EXPRESSION_DEPTH:
+                raise ValueError("слишком глубокая вложенность")
+            node = self._unary()
+            self.depth -= 1
+            return node if operator == "+" else ("neg" if operator == "-" else "not", node)
         return self._atom()
 
     def _atom(self):
-        token = self._take()
+        kind, token = self._take()
         if token == "(":
-            result = self._ternary()
+            node = self._ternary()
             self._take(")")
-            return result
-        if token[0].isdigit():
-            return float(token)
-        if token in self.names:
-            return float(self.names[token])
-        raise ValueError("unknown name " + token)
+            return node
+        if kind == "number":
+            return ("num", float(token.replace("_", "")))
+        if kind == "string":
+            return ("str", re.sub(r"\\(.)", r"\1", token[1:-1]))
+        if kind != "name":
+            raise ValueError("ждали число или имя, а там «%s»" % token)
+        if token in _CONSTANTS:
+            return ("const", _CONSTANTS[token])
+        if self._peek() == "(":
+            if token not in _FUNCTIONS:
+                raise ValueError("неизвестная функция %s" % token)
+            self._take("(")
+            arguments = []
+            if self._peek() != ")":
+                arguments.append(self._ternary())
+                while self._peek() == ",":
+                    self._take()
+                    arguments.append(self._ternary())
+            self._take(")")
+            fewest, most = _FUNCTIONS[token]
+            if not fewest <= len(arguments) <= most:
+                raise ValueError("у %s() не то число аргументов" % token)
+            return ("call", token, tuple(arguments))
+        if token not in TOKEN_VARIABLES:
+            raise ValueError("неизвестная переменная %s" % token)
+        return ("var", token)
+
+
+def _truth(value):
+    return bool(value)
+
+
+def _numeric(value):
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if type(value) in (int, float):
+        return float(value)
+    raise ValueError("в расчёт попало не число (%s)" % ("пусто" if value is None else type(value).__name__))
+
+
+def _clock(arguments, names):
+    zone = _evaluate(arguments[0], names) if arguments else "UTC"
+    if not isinstance(zone, str):
+        raise ValueError("часовой пояс не строка")
+    try:
+        return datetime.datetime.now(zoneinfo.ZoneInfo(zone or "UTC"))
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        raise ValueError("неизвестный часовой пояс %s" % zone[:40]) from None
+
+
+def _evaluate(node, names):
+    kind = node[0]
+    if kind in ("num", "str", "const"):
+        return node[1]
+    if kind == "var":
+        return names[node[1]]
+    if kind == "if":
+        return _evaluate(node[2] if _truth(_evaluate(node[1], names)) else node[3], names)
+    if kind == "or":
+        return _truth(_evaluate(node[1], names)) or _truth(_evaluate(node[2], names))
+    if kind == "and":
+        return _truth(_evaluate(node[1], names)) and _truth(_evaluate(node[2], names))
+    if kind == "not":
+        return not _truth(_evaluate(node[1], names))
+    if kind == "neg":
+        return -_numeric(_evaluate(node[1], names))
+    if kind == "cmp":
+        left, right = _evaluate(node[2], names), _evaluate(node[3], names)
+        operator = node[1]
+        if operator in ("has", "contains"):
+            return isinstance(left, str) and isinstance(right, str) and right in left
+        if operator in ("==", "!="):
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                left, right = float(left), float(right)
+            return (left == right) == (operator == "==")
+        if left is None or right is None:
+            return False  # an absent request field is no number
+        if isinstance(left, str) != isinstance(right, str):
+            raise ValueError("сравнение строки с числом")
+        return {">": left > right, "<": left < right, ">=": left >= right, "<=": left <= right}[operator]
+    if kind in ("+", "-", "*", "/", "%"):
+        left, right = _numeric(_evaluate(node[1], names)), _numeric(_evaluate(node[2], names))
+        if kind == "+":
+            return left + right
+        if kind == "-":
+            return left - right
+        if kind == "*":
+            return left * right
+        if right == 0:
+            raise ValueError("деление на ноль")
+        return left / right if kind == "/" else math.fmod(left, right)
+    if kind == "call":
+        name, arguments = node[1], node[2]
+        if name == "tier":
+            return _evaluate(arguments[1], names)
+        if name == "fixed":
+            return _numeric(_evaluate(arguments[0], names)) * 1e6  # USD per request, in the expression's per-million unit
+        if name in ("max", "min"):
+            values = [_numeric(_evaluate(argument, names)) for argument in arguments]
+            return max(values) if name == "max" else min(values)
+        if name in ("abs", "ceil", "floor"):
+            value = _numeric(_evaluate(arguments[0], names))
+            return abs(value) if name == "abs" else float(math.ceil(value) if name == "ceil" else math.floor(value))
+        if name == "has":
+            text, part = _evaluate(arguments[0], names), _evaluate(arguments[1], names)
+            return isinstance(text, str) and isinstance(part, str) and part in text
+        if name == "param":
+            return None
+        if name == "header":
+            return ""
+        if name == "when":
+            return 1.0 if _truth(_evaluate(arguments[0], names)) else 0.0
+        moment = _clock(arguments, names)
+        return float({"hour": moment.hour, "minute": moment.minute, "weekday": moment.isoweekday() % 7,
+                      "month": moment.month, "day": moment.day}[name])
+    raise ValueError("непонятный узел формулы")
 
 
 class EventParser:
@@ -622,8 +937,10 @@ class EventParser:
             usage["channel_path"] = "chat"
             if self.reply_id:
                 usage["channel"] = channel_of(self.reply_id)
-            if self.provider:
-                usage["provider"] = self.provider
+            # OpenRouter's provider when it names one, else the provider the channel itself is (Anthropic, Bedrock).
+            provider = provider_of(usage.get("channel"), self.provider)
+            if provider:
+                usage["provider"] = provider
             events.append({"type": "usage", "usage": usage})
         choices = item.get("choices", [])
         if not isinstance(choices, list):
@@ -887,6 +1204,18 @@ def channel_of(ident):
     return "other" if ident else None
 
 
+# Minara's own Anthropic and Bedrock channels are the provider themselves; OpenRouter names its own (Anthropic, Google,
+# Azure, ...) on the chat path only, and nothing names the one behind its /v1/messages replies.
+_CHANNEL_PROVIDER = {"anthropic": "Anthropic", "bedrock": "Amazon Bedrock"}
+
+
+def provider_of(channel, reported=None):
+    """Who served a Minara reply: the provider OpenRouter reported, else the one its channel is; None when unknown."""
+    if isinstance(reported, str) and reported:
+        return reported
+    return _CHANNEL_PROVIDER.get(channel)
+
+
 # ----- Claude through Minara's /v1/messages ------------------------------------------------------------------------------
 # Minara's chat path sends some Claude models and levels to Bedrock or Anthropic's API without the cache marks (Sonnet 4.6,
 # Opus 4.6 and Fable 5 at every level; Opus 4.7, 4.8, 5 and Sonnet 5 at none, minimal, xhigh and max): the whole prompt is
@@ -1022,11 +1351,41 @@ def _tool_input(arguments):
     return value if isinstance(value, dict) else {}
 
 
+# Minara's /v1/messages passes a request on in chat form, and a tool result loses its cache mark on the way (Fable 5.2 at
+# max through OpenRouter, 2026-11-13): a mark on the tool_result block, or on the tool_use it answers, is dropped, and one on
+# a text part inside its content reaches the model as text, because a content list arrives as its JSON (a result of 1,313
+# characters was 1,546 prompt tokens as a list of one text part and 1,173 as a string). Only a text block of the user turn
+# carries a mark there. A turn that ended in tool results therefore wrote nothing to the cache, and Minara bills a reply that
+# writes nothing at the input price for its whole prompt, the part it read from the cache included: 15 of 36 turns of one
+# Claude Desktop session (6,972 of 9,876 credits), and in a probe 20.5 credits for a turn that, written, costs 2.4. The mark
+# that became text also made the same tool result 25 tokens longer while it was marked than after, so the next request
+# could not read what this one wrote and wrote it again (36,864 tokens, then the same span less 25).
+# So a tool result goes as its text, and each run of tool results in a user turn is closed by this block, which carries the
+# turn's mark. It closes every such run, marked or not, so a turn reads the same in every request. In the probe each request
+# then wrote its tail (input 4) and the next one read all of it.
+TOOL_RESULTS_END = "<system-reminder>\nEnd of tool results.\n</system-reminder>"
+
+
+def _close_tool_results(turn):
+    """Put TOOL_RESULTS_END after the tool results of a user turn (messages_body puts them first) and move their mark to it."""
+    blocks = turn["content"]
+    count = sum(1 for block in blocks if block.get("type") == "tool_result")
+    if turn["role"] != "user" or not count:
+        return
+    end = {"type": "text", "text": TOOL_RESULTS_END}
+    for block in blocks[:count]:
+        mark = block.pop("cache_control", None)
+        if mark:
+            end["cache_control"] = mark
+    blocks.insert(count, end)
+
+
 def messages_body(body):
     """The /v1/messages request for a chat body of build_body: the same history, tools, marks and level.
 
     Thinking blocks are not sent back, as on the chat path: Minara's /v1/messages continued a tool loop without them on all
-    seven models and read the cache all the same (2026-11-10)."""
+    seven models and read the cache all the same (2026-11-10). A tool result goes as its text, and its mark goes onto the
+    block that closes the tool results of its turn (TOOL_RESULTS_END)."""
     system, turns = [], []
 
     def add(role, blocks):
@@ -1050,7 +1409,13 @@ def messages_body(body):
                     part.get("text", "") for part in _anthropic_parts(message.get("content")) if part["type"] == "text")}])
         elif role == "tool":
             parts = _anthropic_parts(message.get("content"))
-            result = {"type": "tool_result", "tool_use_id": message.get("tool_call_id"), "content": parts or ""}
+            marks = [part.pop("cache_control") for part in parts if "cache_control" in part]
+            # Text alone goes as one string, what the model reads natively; a content list would reach it as its JSON.
+            content = ("\n".join(part["text"] for part in parts) if all(part["type"] == "text" for part in parts)
+                       else parts)
+            result = {"type": "tool_result", "tool_use_id": message.get("tool_call_id"), "content": content}
+            if marks:
+                result["cache_control"] = marks[-1]  # _close_tool_results moves it to the text that closes the turn
             add("user", [result])
         elif role == "assistant":
             blocks = [part for part in _anthropic_parts(message.get("content")) if part["type"] == "text"]
@@ -1063,6 +1428,8 @@ def messages_body(body):
             add("assistant", blocks)
         else:
             add("user", _anthropic_parts(message.get("content")) or [{"type": "text", "text": "(empty)"}])
+    for turn in turns:
+        _close_tool_results(turn)
     upstream = body.get("model")
     result = {"model": upstream, "max_tokens": body.get("max_tokens") or MESSAGES_MAX_TOKENS, "messages": turns,
               "stream": True}
@@ -1108,6 +1475,9 @@ def normalize_messages_usage(value, pricing=None, channel=None):
     result["channel_path"] = "messages"
     if channel:
         result["channel"] = channel
+        provider = provider_of(channel)  # nothing in an Anthropic-shaped reply names OpenRouter's provider
+        if provider:
+            result["provider"] = provider
     estimate = estimated_cost(pricing, result) if pricing is not None and "input_tokens" in result else None
     if estimate is not None:
         result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
@@ -1330,6 +1700,13 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     # relay moved there itself (not measured) goes back to chat when /v1/messages refuses it.
     level = body.get("reasoning_effort") or "default"
     route = {"messages": use_messages(model_provider, body)}
+    if side and route["messages"]:
+        # A side request marks no tail of its own, so on /v1/messages it read the dialog's cache and wrote nothing, and
+        # Minara bills such a reply at the input price for its whole prompt (TOOL_RESULTS_END). There it writes its tail:
+        # the instruction at the write price instead of the whole conversation at the input price.
+        body = build_body(cfg, model_provider, head, prompt, None if text_only else tools,
+                          None if text_only else tool_choice, max_tokens, chunks, None if text_only else session,
+                          instruction)
     route["measured"] = route["messages"] and level in set(model_provider.get("messages_levels") or ())
     # Requests that go at once with one Claude head nobody has cached yet (Claude Code starts several subagents in one
     # message): the first writes it, the others wait for its answer to begin and then read it, as on Retool

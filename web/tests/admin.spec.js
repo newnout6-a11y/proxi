@@ -206,11 +206,12 @@ test('an account parked by the Retool hourly limit says so and when it returns',
   await expect(page.locator('.pool-row').nth(1)).not.toContainText('вернётся в');
 });
 
-test('accounts can be added and removed; both wait for a restart', async ({ page }) => {
+test('accounts can be added and removed without a restart', async ({ page }) => {
   const state = await mockAdmin(page);
   await login(page);
   await nav(page, 'Аккаунты');
   await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await expect(page.getByText(/Аккаунт сразу попадает в пул, перезапуск не нужен/)).toBeVisible();
   await page.getByLabel('Название').fill('третий');
   await page.getByLabel('Адрес Retool').fill('https://tenant.retool.com');
   await page.getByLabel('page_uuid приложения').fill('11111111-2222-3333-4444-555555555555');
@@ -219,11 +220,36 @@ test('accounts can be added and removed; both wait for a restart', async ({ page
   await page.getByLabel('Ресурс Anthropic (необязательно)').fill('anthropic-res');
   await page.getByRole('button', { name: 'Добавить', exact: true }).click();
   await expect(page.getByText('Аккаунт добавлен')).toBeVisible();
+  await expect(page.getByText('Уже в пуле, перезапуск не нужен')).toBeVisible();
   const post = state.accountRequests.find((r) => r.method === 'POST' && r.path === '/admin/api/accounts');
   // Empty optional fields are not sent.
   expect(post.body).toEqual({ label: 'третий', base: 'https://tenant.retool.com',
     page_uuid: '11111111-2222-3333-4444-555555555555', cookie: 'accessToken=abc', xsrf: 'xsrf-value',
     provider_resource_name: 'anthropic-res' });
+  const added = page.locator('.pool-row', { hasText: 'третий' });
+  await expect(added).not.toContainText('после перезапуска');
+  await expect(added.getByRole('button', { name: 'Баланс' })).toBeEnabled();
+  await expect(page.getByText(/вступят в силу после перезапуска/)).toHaveCount(0);
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Удалить аккаунт запасной' }).click();
+  await expect(page.getByText('Убран из пула, перезапуск не нужен')).toBeVisible();
+  await expect(page.locator('.pool-row', { hasText: 'запасной' })).toHaveCount(0);
+});
+
+test('an account the relay could not take in waits for a restart, and says so', async ({ page }) => {
+  const state = await mockAdmin(page);
+  state.restartRequired = true;
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Добавить аккаунт' }).click();
+  await page.getByLabel('Название').fill('третий');
+  await page.getByLabel('Адрес Retool').fill('https://tenant.retool.com');
+  await page.getByLabel('page_uuid приложения').fill('11111111-2222-3333-4444-555555555555');
+  await page.getByLabel('xsrf').fill('xsrf-value');
+  await page.getByLabel('Cookie').fill('accessToken=abc');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect(page.getByText('Подключится после перезапуска relay')).toBeVisible();
   const added = page.locator('.pool-row', { hasText: 'третий' });
   await expect(added).toContainText('подключится после перезапуска');
   await expect(added).toContainText('не подключён');
@@ -232,6 +258,7 @@ test('accounts can be added and removed; both wait for a restart', async ({ page
 
   page.once('dialog', (dialog) => dialog.accept());
   await page.getByRole('button', { name: 'Удалить аккаунт запасной' }).click();
+  await expect(page.getByText('Исчезнет из пула после перезапуска relay')).toBeVisible();
   await expect(page.locator('.pool-row', { hasText: 'запасной' })).toContainText('удалён');
 });
 
@@ -419,6 +446,11 @@ test('turn rows price a turn by the relay rules: nothing for a refused attempt, 
     eventAt('t-cancelled', -250, 'turn.begin', { model: 'model-cancelled' }),
     eventAt('t-cancelled', -250, 'upstream.usage_start', { attempt: 1 }),
     eventAt('t-cancelled', -247, 'turn.end', { reason: 'cancelled', duration_ms: 3000 }),
+    // A Minara reply: priced by Minara's list in its own credits, credits (Retool's) null; it was "нет данных" until 2026-11-13
+    eventAt('t-minara', -200, 'turn.begin', { model: 'minara/model-minara' }),
+    eventAt('t-minara', -200, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-minara', -197, 'upstream.usage', { credits: null, minara_credits: 71.0893, attempt: 1, credits_reported: false }),
+    eventAt('t-minara', -196, 'turn.end', { reason: 'stop', duration_ms: 4000 }),
     // Still running: one attempt priced, the next not yet; and one that has reported nothing
     eventAt('t-running', -20, 'turn.begin', { model: 'model-running' }),
     eventAt('t-running', -20, 'upstream.usage_start', { attempt: 1 }),
@@ -434,6 +466,9 @@ test('turn rows price a turn by the relay rules: nothing for a refused attempt, 
   await expect(cost('model-refused')).toHaveText('0,00');
   await expect(cost('model-unpriced')).toContainText('нет данных');
   await expect(cost('model-cancelled')).toContainText('нет данных');
+  await expect(cost('model-minara')).toContainText('71,09');
+  await expect(cost('model-minara')).toContainText('кредитов Minara');
+  await expect(cost('model-minara')).not.toContainText('нет данных');
   await expect(cost('model-running')).toContainText('≥ 0,50');
   await expect(cost('model-running')).toContainText('ход идёт');
   await expect(cost('model-waiting')).toContainText('ход идёт');
@@ -1403,11 +1438,12 @@ test('several Minara tokens, one per line, become numbered accounts in one reque
   expect(state.accountRequests[0].body).toEqual({ upstream: 'minara', base: 'https://api.minara.ai/v1',
     bearer_tokens: [SYNTHETIC(1), SYNTHETIC(2), SYNTHETIC(3)] });
   await expect(page.getByText('Добавлено: 3 аккаунта Minara')).toBeVisible();
+  await expect(page.getByText('Уже в пуле, перезапуск не нужен')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Новый аккаунт' })).toHaveCount(0);
   for (const label of ['Minara 1', 'Minara 2', 'Minara 3']) {
     const row = page.locator('.pool-row', { hasText: label });
-    await expect(row).toContainText('подключится после перезапуска');
-    await expect(row).toContainText('баланс: после перезапуска');
+    await expect(row).not.toContainText('после перезапуска');
+    await expect(row).toContainText('баланс: ещё не проверялся');
     await expect(row).toContainText(/токен до \d+ [а-яё]+, ещё 30\s+дн/);
   }
   // The page never shows a token it was given
@@ -1430,7 +1466,7 @@ test('what a bulk add skipped stays on the form, line by line, without the token
   expect(state.accountRequests[0].body).toEqual({ upstream: 'minara', base: 'https://api.minara.ai/v1', label: 'Команда',
     minara_models: ['minara/claude-opus-5-5'], bearer_tokens: tokens });
   const report = page.getByRole('status', { name: 'Результат по токенам' });
-  await expect(report).toContainText('Добавлено 1 из 5, подключатся после перезапуска');
+  await expect(report).toContainText('Добавлено 1 из 5, уже в пуле');
   const rows = report.locator('li');
   await expect(rows).toHaveCount(4);
   await expect(rows.nth(0)).toContainText('строка 2');
@@ -1442,7 +1478,7 @@ test('what a bulk add skipped stays on the form, line by line, without the token
   await expect(rows.nth(2)).toContainText('в токене только латиница, цифры и знаки, без пробелов');
   await expect(rows.nth(3)).toContainText('строка 5');
   await expect(rows.nth(3)).toContainText('повторяет строку 1');
-  await expect(page.locator('.pool-row', { hasText: 'Команда 1' })).toContainText('подключится после перезапуска');
+  await expect(page.locator('.pool-row', { hasText: 'Команда 1' })).not.toContainText('после перезапуска');
   expect(await page.locator('body').innerText()).not.toContain('eyJhbGci');
   await page.getByRole('button', { name: 'Отмена' }).click();
   await expect(page.getByRole('heading', { name: 'Новый аккаунт' })).toHaveCount(0);

@@ -30,6 +30,8 @@ import conversation_state
 import forced_choice
 import generation
 import minara_refresh
+import retool_refresh
+import client_sync
 import models as model_catalog
 import sse
 import models
@@ -39,7 +41,7 @@ import prompt_stabilizer
 import tool_search_policy
 import tool_union
 import validate
-from accounts import UNNAMED, AccountDispatcher, MinaraAccount, account_tag
+from accounts import UNNAMED, AccountDispatcher, MinaraAccount, account_tag, enabled
 from credits import CreditsManager
 from orchestrator import TurnRunner, acquire_plan, client_origin, journal_changes
 from session import Backend, SessionPool
@@ -125,20 +127,20 @@ class Runtime:
         backends = getattr(self.pool, "backends", None) or [self.backend]
         managers = {}
         for backend in backends:
-            if backend.cfg.get("upstream") == "minara":
-                managers[backend] = MinaraAccount(backend.cfg, backend=backend)
-                continue
-            if not hasattr(backend, "refresher"):
-                continue
-            managers[backend] = CreditsManager(
-                backend.cfg.get("base", cfg.get("base")),
-                (lambda b=backend: auth.upstream_headers(b.cfg)), backend.refresher)
+            manager = self.account_manager(backend)
+            if manager is not None:
+                managers[backend] = manager
         self.credits = managers.get(self.backend) or CreditsManager(
             self.backend.cfg.get("base", cfg.get("base")),
             lambda: auth.upstream_headers(self.backend.cfg), getattr(self.backend, "refresher", None))
         self.accounts = AccountDispatcher(list(managers), cfg, managers)
         # Minara's new models, prices and gone models, taken by the relay itself (minara_refresh); started with the pool.
         self.catalog = minara_refresh.CatalogRefresher(cfg, self.accounts)
+        # Retool's new models, from Retool's own registry (retool_refresh); started with the pool too.
+        self.retool_catalog = retool_refresh.CatalogRefresher(cfg, self.accounts)
+        # After each look OpenCode's model list follows what the relay publishes (client_sync).
+        self.client_sync = client_sync.OpenCodeSync(cfg)
+        self.catalog.after_look = self.retool_catalog.after_look = self.client_sync
         self.runner = TurnRunner(cfg, self.credits, self.pool)
         self.runner.accounts = self.accounts
         self.prompts = prompt_policy.PromptStore(cfg)
@@ -170,6 +172,16 @@ class Runtime:
         self.stabilizer = prompt_stabilizer.Stabilizer(
             cfg, os.path.join(folder, prompt_stabilizer.FILE_NAME) if folder else None)
         self.prompts.stabilizer = self.stabilizer  # the admin's preview shows the client's system as it is held
+
+    def account_manager(self, backend):
+        """The balance of one account: Minara's credits, Retool's credits, or None for an account without one. The same
+        for the accounts of the start and for one the admin adds while the relay runs (admin._adopt)."""
+        if backend.cfg.get("upstream") == "minara":
+            return MinaraAccount(backend.cfg, backend=backend)
+        if not hasattr(backend, "refresher"):
+            return None
+        return CreditsManager(backend.cfg.get("base", self.cfg.get("base")),
+                              (lambda b=backend: auth.upstream_headers(b.cfg)), backend.refresher)
 
     def submit(self, coroutine):
         with self._lifecycle_lock:
@@ -466,12 +478,22 @@ def make_handler(runtime: Runtime):
                 snapshot = getattr(manager, "balance_snapshot", None)
                 if snapshot:
                     tag = account_tag(backend, UNNAMED) if backend is not None and len(runtime.accounts.backends) > 1 else None
-                    console_log.write(console_log.balance_line(self.request_id, snapshot(), self._credits_used, account=tag))
-            # Admin polling and live streams would drown the journal in its own traffic.
-            if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400:
+                    # A Minara account's balance is in Minara credits: so is what this request spent there.
+                    minara = (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
+                    spent = getattr(self, "_minara_used", None) if minara else self._credits_used
+                    console_log.write(console_log.balance_line(self.request_id, snapshot(), spent, account=tag))
+            # Admin polling and live streams would drown the journal in its own traffic. A slow answer is journaled all the
+            # same (the live journal stream excepted, which lasts by design): a page that took seconds to open left no
+            # trace anywhere but the console (2026-11-13).
+            slow_admin = took >= SLOW_ADMIN_MS and self.path.split("?", 1)[0] != "/admin/api/events/stream"
+            if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400 and not slow_admin:
                 return
-            level = "error" if status >= 500 or status == 0 else "warn" if status >= 400 else "success"
-            journal.emit("http.request", "%s %s → %s" % (self.command, self.path, status or "—"), level,
+            level = ("error" if status >= 500 or status == 0 else "warn" if status >= 400
+                     or (route == "admin" and slow_admin) else "success")
+            message = "%s %s → %s" % (self.command, self.path, status or "—")
+            if route == "admin" and slow_admin:
+                message += " за %.1f с" % (took / 1000)
+            journal.emit("http.request", message, level,
                          request_id=self.request_id, method=self.command, path=self.path, route=route,
                          status=status, duration_ms=round(took), slot_wait_ms=round(slot_wait * 1000),
                          model=None if model == "-" else model,
@@ -508,6 +530,7 @@ def make_handler(runtime: Runtime):
             self._model = "-"
             self._effort_str = ""
             self._credits_used = None
+            self._minara_used = None  # Minara credits of a Minara request (never added to Retool's _credits_used)
             self._model_called = False
             self._holder = None
             self._error_code = None
@@ -1329,6 +1352,12 @@ def make_handler(runtime: Runtime):
                 cost = console_log.number(event.get("value"))
                 if cost is not None:
                     self._credits_used = (self._credits_used or 0.0) + cost
+            elif event.get("type") == "usage":
+                # A Minara reply's share in Minara's own credits (the orchestrator puts each event's share on it): the
+                # [balance] line under a Minara turn said spent=? every time, next to a balance in the same credits.
+                cost = console_log.number(event.get("minara_credits"))
+                if cost is not None:
+                    self._minara_used = (self._minara_used or 0.0) + cost
 
         def _trace_relay_event(self, event):
             trace = self._client_trace
@@ -1398,6 +1427,8 @@ def make_handler(runtime: Runtime):
 MAX_CONNECTIONS = 512
 # A request that waited this long for a slot says so in the console line of its reply.
 SLOT_WAIT_NOTE = 0.5
+# An admin answer that took this long (ms) is journaled, though the admin's quick polls are not.
+SLOW_ADMIN_MS = 1000
 
 
 class BoundedServer(ThreadingHTTPServer):
@@ -1488,6 +1519,29 @@ def startup_balance(runtime):
     return account_report.balance_report(account_report.collect(runtime, force_refresh=True))
 
 
+def startup_round(runtime):
+    """The first balance round of a start, while the relay already serves: every enabled account's balance at once
+    (AccountDispatcher.check_all, which also takes the empty ones out of the pool), then the banner's balance lines.
+
+    The start used to read every balance for the banner before it served at all: with 483 accounts that was a minute
+    after the journal's restore, the console full of "[account] ... исключён" lines and no request answered, while the
+    dispatcher read the same balances again three at a time (2026-11-13). Returns the balance report, None when the round
+    failed (the dispatcher's regular checks go on)."""
+    started = time.monotonic()
+    try:
+        check = getattr(runtime.accounts, "check_all", None)
+        checked = check() if check is not None else 0
+        # The balances were just read: the report takes them from the managers' caches, not from the network again.
+        balance = account_report.balance_report(account_report.collect(runtime))
+    except Exception as exc:  # noqa: BLE001 - the relay serves whatever the round could not read
+        console_log.write("[startup] balance round failed: %s" % type(exc).__name__)
+        return None
+    for line in balance_lines(balance):
+        console_log.write("[startup]" + line)
+    console_log.write("[startup] balances of %d accounts read in %.0f s" % (checked, time.monotonic() - started))
+    return balance
+
+
 def startup_warnings(runtime):
     """Conditions that make requests fail later without any other hint, in banner order."""
     backends = getattr(runtime.accounts, "backends", None)
@@ -1504,6 +1558,17 @@ def banner_lines(cfg, balance, warnings=()):
               " model default: " + cfg["model"] + " | effort: " + cfg["reasoning_effort"],
               " session mode:  " + cfg["session_mode"] + " | workspace: " + cfg["workspace_root"],
               " exec policy:   " + cfg["exec_policy"] + " | max turns: " + str(cfg["max_exec_turns"])]
+    lines += balance_lines(balance)
+    lines += [" WARNING:       " + text for text in warnings]
+    lines.append("=" * 64)
+    return lines
+
+
+def balance_lines(balance):
+    """The banner's balance lines; `pending` (a text) while the start's balance round still runs (startup_round)."""
+    if balance.get("pending"):
+        return [" balance:       " + str(balance["pending"])]
+    lines = []
     if balance.get("available") is not None:
         allocation = balance.get("monthly_allocation")
         line = (" balance:       " + str(balance["available"]) + " / " + ("?" if allocation is None else str(allocation)))
@@ -1522,8 +1587,6 @@ def banner_lines(cfg, balance, warnings=()):
         lines.append(" minara:        " + ("unknown" if known is None else "%s credits (~$%s)" % (known, minara.get("usd")))
                      + " on %d account%s" % (minara["accounts_total"], "" if minara["accounts_total"] == 1 else "s")
                      + ("  (%d unknown)" % minara["unknown_accounts"] if minara.get("unknown_accounts") else ""))
-    lines += [" WARNING:       " + text for text in warnings]
-    lines.append("=" * 64)
     return lines
 
 
@@ -1544,12 +1607,18 @@ def main(argv=None):
     backends = getattr(runtime.pool, "backends", None) or [runtime.backend]
     runtime.accounts.start()
     runtime.catalog.start()
+    runtime.retool_catalog.start()
     refreshers = list({id(b.refresher): b.refresher for b in backends if getattr(b, "refresher", None)}.values())
     for r in refreshers:
         r.start()  # no-op for accounts the dispatcher schedules
-    balance = startup_balance(runtime)
-    for line in banner_lines(cfg, balance, warnings):
+    # The relay serves at once: the balances are read in the background, and their lines follow the banner.
+    reading = sum(1 for backend in backends if enabled(backend))
+    pending = {"pending": "reading %d account%s in the background; the relay already serves" % (
+        reading, "" if reading == 1 else "s")}
+    for line in banner_lines(cfg, pending, warnings):
         console_log.write(line)
+    first_round = threading.Thread(target=startup_round, args=(runtime,), name="startup-balances", daemon=True)
+    first_round.start()
 
     stop_requested = threading.Event()
 
@@ -1591,7 +1660,9 @@ def main(argv=None):
             for r in refreshers:
                 r.stop()
             runtime.catalog.stop()
+            runtime.retool_catalog.stop()
             runtime.accounts.stop()
+            first_round.join(timeout=2.0)  # stopped, the dispatcher ends the round between two accounts
 
 
 if __name__ == "__main__":

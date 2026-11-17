@@ -164,7 +164,9 @@ const spendRows = (bucket) => {
   // The credits already contain the cache refresh pings: their part is named, never added to the figure
   const warm = bucket.keepwarm_credits > 0 ? [['в т. ч. прогрев кэша', fmtFixed(bucket.keepwarm_credits, 2)]] : [];
   const unpriced = bucket.credits_unknown > 0 ? [['без цены', fmtInt(bucket.credits_unknown)]] : [];
-  return [['кредиты', ...credits], ...warm, ...unpriced, ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
+  // Minara's own credits are a currency of their own: named apart, never added to Retool's figure
+  const minara = bucket.minara_credits > 0 ? [['кредиты Minara', fmtFixed(bucket.minara_credits, 2)]] : [];
+  return [['кредиты', ...credits], ...warm, ...minara, ...unpriced, ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
 };
 
 const NO_DATA = 'нет данных: журнал начат позже';
