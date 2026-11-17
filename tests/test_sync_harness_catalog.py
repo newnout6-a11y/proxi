@@ -543,3 +543,19 @@ def test_harness_sync_supports_universal_providers_route_aliases_and_unknown_lim
     assert retool_by_id['local/custom-reasoner']['contextWindow'] == 128000
     assert retool_by_id['local/custom-reasoner']['maxTokens'] == 32000
     assert text_by_id['local/custom-plain']['reasoningEfforts'] is False
+
+
+def test_models_with_only_none_effort_route_to_retool_text_for_strict_dsh_hmr():
+    # Models like minara/deepseek-v4-flash expose only ['none'] (disable thinking). dsh-llm-pi-ai's strict
+    # assertServiceable() rejects reasoningEfforts={'off': 'none'} during live desktop HMR reloads unless routed
+    # as reasoningEfforts=False under retool-text.
+    entries = [
+        models.resolve('gpt-6-sol')[0],
+        {'id': 'minara/deepseek-v4-flash', 'label': 'DeepSeek V4 Flash', 'context': 262144, 'max_output': 65536,
+         'vision': False, 'reasoning': True, 'reasoning_effort_levels': ['none']},
+    ]
+    result = update_document(source(), entries)
+    providers = result[1]['config']['providers']
+    assert [m['id'] for m in providers['retool']['models']] == ['gpt-6-sol']
+    assert [m['id'] for m in providers['retool-text']['models']] == ['minara/deepseek-v4-flash']
+    assert providers['retool-text']['models'][0]['reasoningEfforts'] is False
