@@ -33,6 +33,7 @@ import client_context
 import console_log
 import native_history
 import models as model_catalog
+import summary_guard
 from accounts import account_tag, idle_block
 from upstream_attempts import AttemptBudget
 from upstream_diagnostics import AttemptTrace, prune_diagnostics
@@ -2065,8 +2066,20 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         # turn needs its anchored during-turn ping too. A one-shot job has no next request to keep a prefix for.
         _ensure_keepwarm(session, cfg)
 
+    # The compaction of a Codex chat, whose tools the relay declared again so that it reads the chat's cache (proxy.
+    # _codex_chat_tools): Codex cannot take a call in reply to it, so a reply with one is not passed on (_summary_stream). The
+    # request that is sent when the calls do not stop is the one Codex made, from the client's own text and with no tools.
+    guarded = (side_request and task == client_context.COMPACTION and required is None and bool(tools)
+               and client_context.current().get("compaction_tools") == "restored")
+
+    def text_only():
+        return build_body(cfg, model_provider, head, prompt, None, "none", max_tokens, chunks, session=None, mark_tail=False)
+
     def open_stream(sent):
-        # Only a route that refuses a forced choice has a requirement: its reply is held until it holds the call.
+        # A compaction whose tools the relay declared again must end in text (summary_guard); a route that refuses a forced choice
+        # has a requirement: its reply is held until it holds the call.
+        if guarded:
+            return _summary_stream(cfg, session, sent, param_types, text_only)
         return (_forced_stream(cfg, session, sent, param_types, required) if required is not None
                 else _stream_body(cfg, session, sent, param_types))
 
@@ -2341,6 +2354,49 @@ async def _forced_stream(cfg, session, body, param_types, required):
         if final:
             raise budget.error("upstream_tool_choice_ignored" if gate.text or gate.called else "upstream_empty_turn",
                                "upstream did not honor the required client tool choice")
+
+
+async def _summary_stream(cfg, session, body, param_types, text_only):
+    """_stream_body for the compaction of a Codex chat whose tools the relay declared again: the reply is text, or it is asked again.
+
+    The tools are there so that the request shares the chat's cached prefix (compaction_tools), and Codex cannot take a call in
+    reply to its compaction (summary_guard). The reply is released once the attempt has ended without a call (summary_guard.Gate).
+    An attempt that called a tool is dropped, its cost still counts, and the request is asked once more with one instruction as a
+    user turn of its own after the last message (nothing of the body moves: the turn carries no cache mark and is not stored). A
+    second call sends the request Codex itself made, with no tools and the history as text (`text_only`), which cannot call
+    anything: it writes the history again, as the compaction did before the tools were declared, and that is the worst it costs."""
+    attempt = 0
+    while True:
+        attempt += 1
+        fallback = attempt > summary_guard.TRIES_WITH_TOOLS
+        if fallback:
+            sent = text_only()
+        elif attempt == 1:
+            sent = body
+        else:
+            sent = _asked_for_call(body, summary_guard.INSTRUCTION)
+        gate = summary_guard.Gate()
+        end = None
+        async with contextlib.aclosing(_stream_body(cfg, session, sent, None if fallback else param_types)) as stream:
+            async for event in stream:
+                if event.get("type") == "end":
+                    end = event  # judged below: an attempt that called a tool must not end the turn
+                    continue
+                for ready in gate.feed(event):
+                    yield ready
+        if end is None:
+            return  # the stream ended with its error event, which the gate let through
+        if not gate.called or end.get("reason") == "cancelled":
+            for ready in gate.release():
+                yield ready
+            yield end
+            return
+        journal.emit("turn.compaction_tool_call",
+                     "Модель вызвала инструмент вместо сводки сжатия: ответ отброшен, %s" % (
+                         "запрос повторён с просьбой ответить текстом" if attempt < summary_guard.TRIES_WITH_TOOLS else
+                         "запрос идёт без инструментов, как его прислал Codex"),
+                     "warn", model=body.get("model"), called=gate.called, wrote_text=gate.text, attempt=attempt,
+                     tools_kept=attempt < summary_guard.TRIES_WITH_TOOLS)
 
 
 async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
