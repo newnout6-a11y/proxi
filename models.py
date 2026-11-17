@@ -454,14 +454,23 @@ def _minara_reason(entry, cfg):
             return 'route requires a Minara account'
         return (None if entry['upstream_model'] in minara_routes.served(cfg)
                 else 'model is not configured on this Minara account')
-    if cfg.get('upstream', 'retool') == 'minara':
+    if entry.get('provider_id'):
+        if cfg.get('provider_id') != entry['provider_id']:
+            return "route requires provider '%s'" % entry['provider_id']
+        return None
+    if cfg.get('upstream', 'retool') != 'retool':
         return 'route requires a Retool account'
     return None
 
 
 def route_block_reason(entry, cfg):
+    if entry.get('route_targets'):
+        reasons = [route_block_reason(target, cfg) for target in entry['route_targets']]
+        if any(r is None for r in reasons):
+            return None
+        return reasons[0] if reasons else 'route alias has no targets'
     reason = _minara_reason(entry, cfg)
-    if reason or entry.get('upstream') == 'minara':
+    if reason or entry.get('upstream', 'retool') != 'retool':
         return reason
     name = entry['id']
     if entry['provider'] == 'google' and cfg.get('google_provider_resource_name') == '__managed__':
@@ -489,8 +498,23 @@ def route_block_reason(entry, cfg):
 
 def resource_block_reason(entry, cfg):
     """Why this account has no provider resource for the model, or None."""
+    if entry.get('route_targets'):
+        reasons = []
+        for target in entry['route_targets']:
+            r = route_block_reason(target, cfg) or resource_block_reason(target, cfg)
+            if r is None:
+                return None
+            reasons.append(r)
+        return reasons[0] if reasons else 'route alias has no targets'
     if entry.get('upstream') == 'minara':
         return _minara_reason(entry, cfg) or (None if cfg.get('bearer_token') else 'Minara token is not configured')
+    if entry.get('provider_id'):
+        reason = _minara_reason(entry, cfg)
+        if reason:
+            return reason
+        if cfg.get('auth_mode') == 'none' or cfg.get('api_key'):
+            return None
+        return "API key is not configured for provider '%s'" % entry['provider_id']
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
     if not key:
         return "provider '%s' is not routed" % entry['provider']
@@ -521,6 +545,49 @@ def minara_catalog(cfg=None):
     return cfg.get('_minara_models', _MINARA_MODELS)
 
 
+def provider_catalog(cfg=None):
+    """Universal provider catalog (`<provider_id>/<model_id>` -> entry) attached to `cfg`."""
+    if not isinstance(cfg, dict):
+        return {}
+    return cfg.get('_provider_models') or {}
+
+
+def route_alias_catalog(cfg=None):
+    """User-configured model aliases & fallback groups (`<route_id>` -> entry) attached to `cfg`."""
+    if not isinstance(cfg, dict):
+        return {}
+    return cfg.get('_route_aliases') or {}
+
+
+def universal_entry(name, cfg=None):
+    """Resolve a user route alias or `<provider_id>/<model_id>` entry from `cfg`."""
+    if not isinstance(name, str) or not name:
+        return None
+    aliases = route_alias_catalog(cfg)
+    if name in aliases:
+        return aliases[name]
+    prov = provider_catalog(cfg)
+    if name in prov:
+        return prov[name]
+    if '/' in name:
+        for entry in prov.values():
+            if f"{entry['provider_id']}/{entry['upstream_model']}" == name:
+                return entry
+    return None
+
+
+def bind_entry_for_backend(entry, backend_cfg):
+    """Bind a route-alias `entry` (with `route_targets`) to the concrete target served by `backend_cfg`."""
+    if not isinstance(entry, dict) or not entry.get('route_targets') or not isinstance(backend_cfg, dict):
+        return entry
+    for target in entry['route_targets']:
+        if not route_block_reason(target, backend_cfg) and not resource_block_reason(target, backend_cfg):
+            bound = dict(target)
+            bound['alias_id'] = entry['id']
+            return bound
+    return entry
+
+
 def minara_entry(name, cfg=None):
     """The Minara route a client name means: its published minara/<name>, or the older minara/<upstream id>."""
     routes = minara_catalog(cfg)
@@ -535,7 +602,14 @@ def minara_entry(name, cfg=None):
 
 
 def catalog(cfg=None):
-    return CATALOG + list(minara_catalog(cfg).values())
+    aliases = route_alias_catalog(cfg)
+    base_list = [aliases.get(m['id'], m) for m in CATALOG]
+    seen = {m['id'] for m in base_list}
+    for item in list(minara_catalog(cfg).values()) + list(provider_catalog(cfg).values()) + list(aliases.values()):
+        if item['id'] not in seen:
+            seen.add(item['id'])
+            base_list.append(item)
+    return base_list
 
 
 def account_config(root, record):
@@ -550,13 +624,15 @@ def account_config(root, record):
             if key not in record:
                 merged.pop(key, None)
     # Credentials belong to one upstream account, never to another record.
-    for key in ('bearer_token', 'bearer_token_env', 'minara_models'):
+    for key in ('bearer_token', 'bearer_token_env', 'api_key', 'api_key_env', 'minara_models', 'providers'):
         merged.pop(key, None)
-    if record.get('upstream', 'retool') == 'minara':
+    kind = record.get('upstream', 'retool')
+    if kind != 'retool':
         for key in ('cookie', 'xsrf', 'page_uuid', *PROVIDER_RESOURCE_KEY.values()):
             merged.pop(key, None)
-        merged['base'] = record.get('base', 'https://api.minara.ai/v1')
-    merged['upstream'] = record.get('upstream', 'retool')
+        if kind == 'minara':
+            merged['base'] = record.get('base', 'https://api.minara.ai/v1')
+    merged['upstream'] = kind
     merged.update(record)
     merged.update(enabled=record.get('enabled', True), priority=record.get('priority', 0),
                   label=record.get('label', ''), provider_access=record.get('provider_access', {}))
@@ -568,6 +644,8 @@ def pool_configs(cfg, backends=None):
     records when there are none yet."""
     if backends is not None:
         return [backend.cfg for backend in backends]
+    if cfg.get('_empty_pool'):
+        return []
     records = cfg.get('accounts')
     return ([account_config(cfg, record) for record in records if isinstance(record, dict)]
             if isinstance(records, list) and records else [cfg])
@@ -596,7 +674,8 @@ def pool_configured(configs):
     Switched-off accounts and accounts that do not serve a given request count too: whether the pool has
     resources does not depend on who is enabled right now or which path a request takes.
     """
-    return any(item.get(key) for item in configs for key in PROVIDER_RESOURCE_KEY.values())
+    return (any(item.get(key) for item in configs for key in PROVIDER_RESOURCE_KEY.values())
+            or any(item.get('provider_id') for item in configs))
 
 
 def refusal_reasons(entry, configs, configured=True):
@@ -625,10 +704,15 @@ def catalog_visibility(entry, cfg, backends=None):
         return False, '; '.join(dict.fromkeys(refusals))
     if cfg.get('show_unrouted_models'):
         return True, None
+    if entry.get('route_targets'):
+        any_target_ok = any(catalog_visibility(target, cfg, backends)[0] for target in entry['route_targets'])
+        return (True, None) if any_target_ok else (False, 'no target route is currently available')
     if not pool_configured(pool):
         return True, None  # Unconfigured setup still exposes metadata; requests explain missing resources.
     if entry.get('upstream') == 'minara':
         return (True, None) if eligible else (False, 'no enabled Minara account')
+    if entry.get('provider_id'):
+        return (True, None) if eligible else (False, "no enabled '%s' account" % entry['provider_id'])
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])
     if key and any(item.get(key) for item in eligible):
         return True, None
@@ -664,23 +748,27 @@ def desktop_metadata(entry, entries):
     Desktop reads supports_1m, or max_input_tokens >= 1M, as "1M confirmed" and adds a separate 1M
     picker entry, so both follow the verified route input limit and never the model's public window.
     """
-    result = {'display_name': entry['label'], 'description':
-              ('Minara relay: ' if entry.get('upstream') == 'minara' else 'Retool relay: ') + entry['label']}
-    limit = entry.get('route_input_tokens')
+    prefix = (
+        f"{entry['provider_name']}: " if entry.get('provider_name')
+        else 'Minara relay: ' if entry.get('upstream') == 'minara'
+        else 'Retool relay: '
+    )
+    result = {'display_name': entry['label'], 'description': prefix + entry['label']}
+    limit = entry.get('route_input_tokens') or (entry.get('context') if entry.get('provider_id') else None)
     if limit:
         result['max_input_tokens'] = limit
         if limit >= 1000000:
             result['supports_1m'] = True
     if entry['provider'] == 'anthropic':
-        # A Minara Claude (minara/claude-opus-5-5) is of the same family as Retool's. The family has one default, its first
-        # row: Retool's where the relay has both, Minara's in a Minara-only relay.
-        family = entry['id'].removeprefix('minara/').removeprefix('claude-').split('-', 1)[0]
+        # Strip provider prefix (`minara/` or `<provider_id>/`) when grouping Claude family tiers
+        bare_id = entry['id'].split('/')[-1] if '/' in entry['id'] else entry['id']
+        family = bare_id.removeprefix('claude-').split('-', 1)[0]
         if family not in {'opus', 'sonnet', 'haiku', 'fable', 'mythos'}:  # Desktop's documented tier enum
             return result
         result['anthropic_family_tier'] = family
         family_rows = [item for item in entries if item['provider'] == 'anthropic'
-                       and item['id'].removeprefix('minara/').startswith('claude-' + family + '-')]
-        retool_rows = [item for item in family_rows if item.get('upstream') != 'minara']
+                       and (item['id'].split('/')[-1] if '/' in item['id'] else item['id']).startswith('claude-' + family + '-')]
+        retool_rows = [item for item in family_rows if item.get('upstream', 'retool') == 'retool']
         # Retool's catalog is in order, newest first; Minara's is sorted by name, oldest first (Opus 4.1 at $15/$75 was
         # the family default of a Minara-only relay): there the newest version leads.
         first = (retool_rows[0]['id'] if retool_rows else
@@ -797,10 +885,14 @@ def codex_catalog(entries=None, snapshot=None):
         delegation = 'max' in efforts
         if delegation:
             levels.append({'effort': 'ultra', 'description': 'Maximum reasoning with automatic task delegation'})
+        desc_prefix = (
+            f"{entry['provider_name']}: " if entry.get('provider_name')
+            else 'Minara relay: ' if entry.get('upstream') == 'minara'
+            else 'Retool relay: '
+        )
         result.append({
             'slug': entry['id'], 'display_name': entry.get('label', entry['id']),
-            'description': ('Minara relay: ' if entry.get('upstream') == 'minara' else 'Retool relay: ')
-                           + entry.get('label', entry['id']),
+            'description': desc_prefix + entry.get('label', entry['id']),
             'default_reasoning_level': default,
             'supported_reasoning_levels': levels,
             'shell_type': 'unified_exec', 'visibility': 'list', 'supported_in_api': True,
@@ -884,8 +976,11 @@ def _names_a_catalog_model(base, cfg=None):
             if tail.strip().lower() in EFFORT_ORDER:
                 base = head.strip()
             break
+    if universal_entry(base, cfg) is not None:
+        return True
     name = _canonical(base)
-    return minara_entry(name, cfg) is not None or name in _BY_ID or (not name.startswith('minara/') and '/' in name and _canonical(name.split('/', 1)[1]) in _BY_ID)
+    return (universal_entry(name, cfg) is not None or minara_entry(name, cfg) is not None or name in _BY_ID
+            or (not name.startswith('minara/') and '/' in name and _canonical(name.split('/', 1)[1]) in _BY_ID))
 
 
 def parse_model_name(name, cfg=None):
@@ -905,11 +1000,11 @@ def parse_model_name(name, cfg=None):
         # Claude Code's 1M-context marker (minara/claude-fable-5-2[1m], a Desktop row with supports1m): it takes the marker
         # off before an API request, and a client that passes the picker's name on still means the same model.
         original = original[:-len('[1m]')].rstrip()
-    if minara_entry(original, cfg) is not None:
+    if minara_entry(original, cfg) is not None or universal_entry(original, cfg) is not None:
         return ModelName(original, None, None)
     if '#' in original or '@' in original:
         base = original.split('@', 1)[0].split('#', 1)[0]
-        if minara_entry(base, cfg) is not None and ':' in base:
+        if (minara_entry(base, cfg) is not None or universal_entry(base, cfg) is not None) and ':' in base:
             # Shield provider ID colons from the legacy effort delimiter below.
             rest = original[len(base):]
             profile = None
@@ -1128,7 +1223,7 @@ def resolve_tolerant(model, effort=None, *, strict=True, default_model=None, all
     """
     entry, level = _resolve_requested(model, effort, strict=strict, default_model=default_model,
                                       allow_downgrade=allow_downgrade, xhigh_as=xhigh_as, cfg=cfg)
-    served = None if entry.get('upstream') == 'minara' else substitute_for(entry['id'])
+    served = None if entry.get('upstream', 'retool') != 'retool' or entry.get('is_route_alias') else substitute_for(entry['id'])
     if served:
         entry = _BY_ID[served]
         levels = entry.get('reasoning_effort_levels') or []
@@ -1167,15 +1262,29 @@ def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
     parsed = parse_model_name(model or default_model, cfg)
     if effort is None:
         effort = parsed.effort
-    name = _canonical(parsed.base)
-    if not name:
+    raw_base = (parsed.base or '').strip()
+    if not raw_base:
         raise bad_request("'model' is required", param='model')
-    entry = minara_entry(name, cfg) or _BY_ID.get(name)
+    # User-configured route aliases (`routes[]`) and `<provider_id>/<model_id>` resolve BEFORE built-in Retool ALIASES
+    entry = universal_entry(raw_base, cfg)
+    name = _canonical(raw_base)
+    if entry is None:
+        entry = universal_entry(name, cfg) or minara_entry(name, cfg) or _BY_ID.get(name)
     if entry is None and name.lower().startswith("minara/"):
         # "Minara/gpt-6.1-sol" is no vendor prefix either: it is refused, never resolved to Retool's gpt-6.1-sol.
         entry = minara_entry("minara/" + name[len("minara/"):], cfg)
         if entry is None:
             raise not_found(f"unknown Minara model '{name}'; see GET /v1/models (no Minara account serves it)")
+    if entry is None and '/' in raw_base:
+        prov_prefix = raw_base.split('/', 1)[0].lower()
+        if prov_prefix in ((cfg or {}).get('_providers_meta') or {}):
+            if not strict:
+                # Permissive dynamic pass-through on an explicitly named universal provider when strict_models is false
+                from catalog import router as catalog_router
+                meta = cfg['_providers_meta'][prov_prefix]
+                entry = catalog_router.build_single_provider_entry(meta, raw_base.split('/', 1)[1])
+            else:
+                raise not_found(f"unknown model '{raw_base}' on provider '{prov_prefix}'; see GET /v1/models")
     if entry is None and '/' in name:
         stripped = _canonical(name.split('/', 1)[1])
         if stripped in _BY_ID:
@@ -1198,7 +1307,7 @@ def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
             raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
                               param='reasoning_effort')
         if entry.get('reasoning_effort_control') == 'passthrough':
-            # A Minara model that reasons, whose levels were not measured: the level goes to upstream as asked.
+            # A Minara or universal model that reasons, whose levels were not measured: the level goes to upstream as asked.
             if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:
                 return entry, effort.lower()
             raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
@@ -1223,7 +1332,7 @@ def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
 
 
 def provider_resource(cfg, entry):
-    if entry.get('upstream') == 'minara':
+    if entry.get('upstream', 'retool') != 'retool':
         require_route(entry, cfg)
         return None
     key = PROVIDER_RESOURCE_KEY.get(entry['provider'])

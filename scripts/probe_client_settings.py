@@ -311,18 +311,34 @@ def routable_entries(relay_config):
         raise ValueError("relay configuration %s is not valid JSON (%s)" % (relay_config, error)) from None
     if not isinstance(saved, dict):
         raise ValueError("relay configuration %s must contain a JSON object" % relay_config)
-    cfg = {**RELAY_DEFAULTS, **saved}
+    cfg = {**RELAY_DEFAULTS, **saved, '_config_path': str(Path(relay_config).resolve())}
+    if isinstance(saved.get('providers'), list):
+        import copy
+        from drivers import presets as driver_presets
+        pmeta = {}
+        for idx, prov in enumerate(saved['providers']):
+            try:
+                meta, _, _ = driver_presets.expand_provider_to_accounts(copy.deepcopy(prov), f'providers[{idx}]')
+                pmeta[meta['id']] = meta
+            except ValueError:
+                continue
+        cfg['_providers_meta'] = pmeta
     accounts = load_accounts(relay_config)
+    if not accounts and ('providers' in saved or saved.get('accounts') == []):
+        cfg['_empty_pool'] = True
     backends = [SimpleNamespace(cfg=account) for account in accounts]
-    # The models the relay measured or published by itself since its catalogs were made (minara_refresh and
-    # retool_refresh write them beside config.json), as config.load puts them in: without them a model the relay already
-    # served never reached the client's list.
+    # The models the relay measured or published by itself since its catalogs were made (minara_refresh,
+    # retool_refresh and catalog.discovery write them beside config.json), as config.load puts them in: without them
+    # a model the relay already served never reached the client's list.
     import minara_catalog
     import retool_catalog
+    from catalog import router as catalog_router
     minara_catalog.apply_overlay(minara_catalog.overlay_path(relay_config))
     retool_catalog.apply_overlay(retool_catalog.overlay_path(relay_config))
-    # Minara models come from the accounts of this file (minara_models.json and their lists), as the relay builds them.
+    # Minara, universal provider models, and route aliases come from the accounts/providers of this file.
     cfg['_minara_models'] = models.build_minara_catalog(accounts)
+    cfg['_provider_models'] = catalog_router.build_provider_catalog(cfg)
+    cfg['_route_aliases'] = catalog_router.build_route_aliases(cfg, models)
     return [entry for entry in models.catalog(cfg) if models.catalog_routable(entry, cfg, backends)]
 
 

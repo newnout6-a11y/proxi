@@ -72,7 +72,7 @@ export function buildTraces(events) {
       trace = { id: event.turn_id, started: event.ts, ended: null, status: 'running', restored: false, model: null, effort: null,
         task: null, askedEffort: null, outputTokens: null, tokensPerSecond: null, speedDuration: null, speedReason: null,
         transport: null, dialect: null, ttft: null, duration: null, credits: null, creditsSum: null, creditsComplete: false,
-        minaraSum: null,
+        minaraSum: null, costUsdSum: null,
         phase: 'wait', phaseStarted: event.ts, waitStarted: event.ts, waitMs: 0, firstSignal: null,
         thinkingStarted: null, thinking: 0, textStarted: null, textMs: 0, toolOpen: new Map(), toolSpans: [], args: 0,
         execStarted: null, execMs: 0, inputTokens: 0, cacheRead: 0, cacheWrite: 0,
@@ -142,6 +142,10 @@ export function buildTraces(events) {
       if (isPrice(data.minara_credits)) {
         attempt.known = true;
         trace.minaraSum = (trace.minaraSum ?? 0) + data.minara_credits;
+      }
+      if (isPrice(data.cost_usd)) {
+        attempt.known = true;
+        trace.costUsdSum = (trace.costUsdSum ?? 0) + data.cost_usd;
       }
       trace.inputTokens += Number(data.input_tokens) || 0;
       trace.cacheRead += Number(data.cache_read) || 0;
@@ -234,8 +238,9 @@ export function costOf(trace, status = trace.status) {
   const attempts = [...trace.costAttempts.values()];
   const unknown = attempts.filter((attempt) => attempt.observed && !attempt.known).length;
   const minara = trace.minaraSum ?? null;
-  const credits = trace.creditsSum !== null ? trace.creditsSum : ended && !unknown && minara === null ? 0 : null;
-  return { credits, ...(minara !== null ? { minara } : {}), unknown, running, complete: ended && !unknown };
+  const usd = trace.costUsdSum ?? null;
+  const credits = trace.creditsSum !== null ? trace.creditsSum : ended && !unknown && minara === null && usd === null ? 0 : null;
+  return { credits, ...(minara !== null ? { minara } : {}), ...(usd !== null ? { usd } : {}), unknown, running, complete: ended && !unknown };
 }
 
 /** A turn silent for longer than this is not running any more: the relay's own turn timeout is 15 minutes by default. */

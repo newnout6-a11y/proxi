@@ -233,6 +233,7 @@ class Parsed:
         self.output_cap = None
         self.temperature = None
         self.verbosity = None
+        self.provider_options = {}
         self.structured_title = False
         self.structured_output = None
         self.system = ""
@@ -745,6 +746,18 @@ def _finish(data, parsed, dialect, search=False, cfg=None):
         data, parsed.entry, dialect)
     parsed.stop_sequences = generation.stop_sequences(data, dialect)
     parsed.output_cap = generation.output_cap(parsed.entry, parsed.max_tokens)
+    opts = {}
+    for k in ("temperature", "top_p", "top_k", "seed", "presence_penalty", "frequency_penalty",
+              "parallel_tool_calls", "service_tier", "prompt_cache_key", "prompt_cache_retention"):
+        if data.get(k) is not None:
+            opts[k] = data[k]
+    if isinstance(data.get("tool_choice"), dict) and data["tool_choice"].get("disable_parallel_tool_use") is not None:
+        opts["disable_parallel_tool_use"] = data["tool_choice"]["disable_parallel_tool_use"]
+    if isinstance(data.get("thinking"), dict):
+        opts["thinking"] = dict(data["thinking"])
+    if parsed.stop_sequences:
+        opts["stop_sequences"] = list(parsed.stop_sequences)
+    parsed.provider_options = opts
     parsed.declared_ignored += [name for name in parsed.inline_tool_changes if name not in parsed.declared_ignored]
     stream_options = data.get("stream_options")
     if stream_options is None:
@@ -759,8 +772,9 @@ def _finish(data, parsed, dialect, search=False, cfg=None):
     else:
         parsed.wants_usage = True
     parsed.tools = _tools(data, parsed if search else None)
-    if parsed.entry.get("upstream") == "minara" and parsed.tools and not parsed.entry.get("tools", False):
-        raise unprocessable("tools are not enabled for this Minara model", param="tools")
+    if parsed.entry.get("upstream", "retool") != "retool" and parsed.tools and not parsed.entry.get("tools", True):
+        label = "this Minara model" if parsed.entry.get("upstream") == "minara" else f"model '{parsed.entry['id']}'"
+        raise unprocessable(f"tools are not enabled for {label}", param="tools")
     parsed.tool_choice = _tool_choice(data.get("tool_choice"))
     names = [tool["function"]["name"] for tool in parsed.tools]
     if parsed.tool_choice == "required" and not names:
@@ -999,7 +1013,8 @@ def parse_chat(data, cfg):
     parsed.system_messages_normalized = bool(converted)
     parsed.inline_tool_changes = list(dict.fromkeys(ignored))
     parsed.message_fingerprints = _message_fingerprints(messages, lead)
-    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
+    allow_docs = bool(entry.get("pdf") and entry.get("upstream") in ("anthropic-messages", "openai-chat", "openai-responses"))
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead, allow_documents=allow_docs)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = (_opt_int(data, "max_tokens", high=_cap(entry))
                          or _opt_int(data, "max_completion_tokens", high=_cap(entry)))
@@ -1045,7 +1060,8 @@ def parse_responses(data, cfg):
     parsed.system_messages_normalized = bool(converted)
     parsed.inline_tool_changes = list(dict.fromkeys(ignored))
     parsed.message_fingerprints = _message_fingerprints(messages, lead)
-    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
+    allow_docs = bool(entry.get("pdf") and entry.get("upstream") in ("anthropic-messages", "openai-chat", "openai-responses"))
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead, allow_documents=allow_docs)
     parsed.stream = _opt_bool(data, "stream")
     parsed.max_tokens = _opt_int(data, "max_output_tokens", high=_cap(entry))
     parsed.temperature = _opt_float(data, "temperature")
@@ -1077,7 +1093,8 @@ def parse_anthropic(data, cfg):
     parsed.system_messages_normalized = bool(converted)
     parsed.inline_tool_changes = list(dict.fromkeys(ignored))
     parsed.message_fingerprints = _message_fingerprints(messages, lead)
-    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead)
+    allow_docs = bool(entry.get("pdf") and entry.get("upstream") in ("anthropic-messages", "openai-chat", "openai-responses"))
+    parsed.native_messages = native_history.client_messages(messages, _extract_image_data, lead=lead, allow_documents=allow_docs)
     parsed.stream = _opt_bool(data, "stream")
     if data.get("max_tokens") is None:
         raise bad_request("'max_tokens' is required for the Anthropic dialect", param="max_tokens")

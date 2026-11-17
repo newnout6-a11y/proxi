@@ -122,6 +122,8 @@ OUTPUT_CAP_EMULATED_BELOW = 16384
 
 def output_cap(entry, max_tokens):
     """The cap the relay enforces on the reply of a request, or None when the route keeps it or it cannot bind."""
+    if entry.get('upstream', 'retool') != 'retool':
+        return None
     if not max_tokens or max_tokens >= OUTPUT_CAP_EMULATED_BELOW or not models.ignores_output_cap(entry['id']):
         return None
     return max_tokens
@@ -215,17 +217,18 @@ def controls(data, entry, dialect):
     for name in ('previous_response_id', 'audio', 'prompt'):
         if data.get(name) is not None:
             _reject(name)
+    is_universal = entry.get('upstream') in ('openai-chat', 'openai-responses', 'anthropic-messages')
     if data.get('parallel_tool_calls') is not None:
         if type(data['parallel_tool_calls']) is not bool:
             raise unprocessable("'parallel_tool_calls' must be a boolean", param='parallel_tool_calls')
-        if not data['parallel_tool_calls'] and data.get('tools'):
+        if not data['parallel_tool_calls'] and data.get('tools') and not is_universal:
             _reject('parallel_tool_calls')
     choice = data.get('tool_choice')
     if isinstance(choice, dict) and choice.get('disable_parallel_tool_use') is not None:
         value = choice['disable_parallel_tool_use']
         if type(value) is not bool:
             raise unprocessable("'disable_parallel_tool_use' must be a boolean", param='tool_choice.disable_parallel_tool_use')
-        if value and data.get('tools'):
+        if value and data.get('tools') and not is_universal:
             _reject('tool_choice.disable_parallel_tool_use')
     if dialect == 'chat':
         legacy = data.get('function_call')
@@ -238,16 +241,18 @@ def controls(data, entry, dialect):
         if legacy is not None:
             ignored.append('function_call')  # "auto" or "none" with no function to call asks for nothing
             routine.add('function_call')
-    if data.get('service_tier') is not None and data['service_tier'] not in ('auto', 'default'):
+    if data.get('service_tier') is not None and data['service_tier'] not in ('auto', 'default') and not is_universal:
         _reject('service_tier')
     if data.get('prompt_cache_key') is not None:
         if not isinstance(data['prompt_cache_key'], str):
             raise unprocessable("'prompt_cache_key' must be a string", param='prompt_cache_key')
-        ignored.append('prompt_cache_key')
+        if not is_universal:
+            ignored.append('prompt_cache_key')
     if data.get('prompt_cache_retention') is not None:
         if data['prompt_cache_retention'] not in ('in_memory', '24h'):
             raise unprocessable("'prompt_cache_retention' has an invalid value", param='prompt_cache_retention')
-        ignored.append('prompt_cache_retention')
+        if not is_universal:
+            ignored.append('prompt_cache_retention')
     for name in ('prompt_cache_options', 'client_metadata'):
         # Codex sends both with every request; neither reaches Retool.
         if data.get(name) is not None:
@@ -277,13 +282,22 @@ def controls(data, entry, dialect):
         ignored.extend(names)
         routine.update(names)
 
+    forwarded_numeric = (
+        {'temperature', 'top_p', 'top_k'} if entry.get('upstream') == 'anthropic-messages'
+        else {'temperature', 'top_p', 'seed', 'presence_penalty', 'frequency_penalty'}
+        if entry.get('upstream') == 'openai-chat'
+        else {'temperature', 'top_p'}
+        if entry.get('upstream') == 'openai-responses'
+        else set()
+    )
     numeric = (('temperature', 0, 2, False), ('top_p', 0, 1, False), ('top_k', 0, 2**31-1, True),
                ('seed', -(2**63), 2**63-1, True), ('presence_penalty', -2, 2, False),
                ('frequency_penalty', -2, 2, False), ('top_logprobs', 0, 20, True))
     for name, low, high, integer in numeric:
         if data.get(name) is not None:
             _number(data[name], name, low, high, integer=integer)
-            ignored.append(name)
+            if name not in forwarded_numeric:
+                ignored.append(name)
     if data.get('logprobs') is not None:
         if type(data['logprobs']) is not bool:
             raise unprocessable("'logprobs' must be a boolean", param='logprobs')

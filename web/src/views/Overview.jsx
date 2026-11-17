@@ -60,6 +60,7 @@ function Balance({ overview, metrics, windowSec, go }) {
   // Retool's credits and Minara's are two currencies: the big figure is Retool's (its accounts only), Minara has its own
   // line in credits and dollars (account_report.aggregate_balance keeps them apart).
   const minara = balance?.minara || null;
+  const usdPool = balance?.usd || null;
   const retoolAccounts = isNum(balance?.accounts_total) ? balance.accounts_total : summary?.total;
   const partial = partialNote(balance, summary);
   const available = balance?.available;
@@ -131,6 +132,16 @@ function Balance({ overview, metrics, windowSec, go }) {
               {`частично: ${fmtInt(minara.unknown_accounts)} из ${fmtInt(minara.accounts_total)} неизвестны`}
             </Tag>
           )}
+        </div>
+      )}
+      {usdPool && usdPool.accounts_total > 0 && (
+        <div className="minara-balance" aria-label="Баланс API-провайдеров">
+          <span className="instrument-label">
+            API провайдеры · {fmtInt(usdPool.accounts_total)} {plural(usdPool.accounts_total, ['ключ', 'ключа', 'ключей'])}
+          </span>
+          <span className="minara-figure">
+            <b className="num">{isNum(usdPool.available) ? `$${fmtFixed(usdPool.available, 2)}` : '—'}</b> USD
+          </span>
         </div>
       )}
       <div className="instrument-foot">
@@ -206,6 +217,7 @@ function Stat({ label, value, note, tone, title }) {
 
 export default function Overview({ apiKey, overview, overviewError, refreshOverview, onUnauthorized, go }) {
   const [windowSec, setWindowSec] = useState(3600);
+  const [spendUnit, setSpendUnit] = useState(null);
   // Keyed by window: a late answer for the previous window can never overwrite the current one.
   const [metrics, setMetrics] = useState({});
   const [error, setError] = useState('');
@@ -235,6 +247,13 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
   const busy = buckets.filter((b) => (b.credits || 0) > 0).length;
   const unsure = buckets.some((b) => b.credits_complete === false);
   const coverage = coverageOf(current, windowSec);
+  const hasUsdSpend = isNum(totals.cost_usd) && totals.cost_usd > 0;
+  const activeUnit = spendUnit || (hasUsdSpend && !(totals.credits > 0) ? 'usd' : 'credits');
+  const hasUniversalProviders = (overview?.providers?.length || 0) > 0;
+  const hasRetool = overview?.session?.keepalive || (overview?.accounts || []).some((a) => !a.upstream || a.upstream === 'retool');
+  const okLabel = hasUniversalProviders && !hasRetool ? 'Провайдеры отвечают'
+    : hasUniversalProviders && hasRetool ? 'Пул и Retool отвечают'
+      : 'Retool отвечает';
 
   return (
     <Page className="overview">
@@ -245,7 +264,7 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
         </div>
         <div className="head-actions">
           {overview && (
-            <span className="status"><Dot tone={ok ? 'pos' : 'warn'} live={ok} />{ok ? 'Retool отвечает' : 'Состояние требует проверки'}</span>
+            <span className="status"><Dot tone={ok ? 'pos' : 'warn'} live={ok} />{ok ? okLabel : 'Состояние требует проверки'}</span>
           )}
           <Segmented value={windowSec} onChange={setWindowSec} label="Окно метрик" />
           <Button icon={RefreshCw} onClick={() => { refreshOverview(); loadMetrics(); }} aria-label="Обновить сводку">Обновить</Button>
@@ -276,6 +295,10 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
               note={`кредитов · $${fmtFixed(totals.minara_credits / 220, 2)}`}
               title="Расход на моделях minara/* за окно. Minara считает свои кредиты (220 за доллар) отдельной валютой: они не входят в расход кредитов Retool выше." />
           )}
+          {hasUsdSpend && (
+            <Stat label="Расход USD" value={`$${fmtFixed(totals.cost_usd, totals.cost_usd < 0.01 ? 4 : 2)}`}
+              note="по прайсу API / models.dev" />
+          )}
           <Stat label="Запросы" value={fmtInt(totals.requests)}
             note={totals.errors ? `${fmtInt(totals.errors)} ${plural(totals.errors, ['ошибка', 'ошибки', 'ошибок'])}` : 'без ошибок'}
             tone={totals.errors ? 'neg' : undefined} />
@@ -290,20 +313,28 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
       <div className="ov-main">
         <section className="panel chart-panel" aria-label="Расход кредитов">
           <div className="panel-head">
-            <h2>Расход кредитов</h2>
-            <ul className="legend">
-              <li><i className="lg-spend" />за каждые {span || '—'}</li>
-              <li><i className="lg-peak" />пик</li>
-              <li><i className="lg-average" />среднее по активным</li>
-              {unsure && (
-                <li>
-                  <svg className="lg-unsure" width="14" height="4" viewBox="0 0 14 4" aria-hidden="true"><path d="M0 2H14" /></svg>
-                  стоимость сообщена не полностью
-                </li>
+            <h2>{activeUnit === 'usd' ? 'Расход USD' : 'Расход кредитов'}</h2>
+            <div className="head-actions">
+              {hasUsdSpend && (
+                <div className="segmented" role="group" aria-label="Валюта графика расхода">
+                  <button type="button" aria-pressed={activeUnit === 'credits'} onClick={() => setSpendUnit('credits')}>Кредиты</button>
+                  <button type="button" aria-pressed={activeUnit === 'usd'} onClick={() => setSpendUnit('usd')}>USD ($)</button>
+                </div>
               )}
-            </ul>
+              <ul className="legend">
+                <li><i className="lg-spend" />за каждые {span || '—'}</li>
+                <li><i className="lg-peak" />пик</li>
+                <li><i className="lg-average" />среднее по активным</li>
+                {activeUnit === 'credits' && unsure && (
+                  <li>
+                    <svg className="lg-unsure" width="14" height="4" viewBox="0 0 14 4" aria-hidden="true"><path d="M0 2H14" /></svg>
+                    стоимость сообщена не полностью
+                  </li>
+                )}
+              </ul>
+            </div>
           </div>
-          <SpendChart buckets={buckets} windowSec={windowSec} coveredFrom={coverage?.from ?? null} />
+          <SpendChart buckets={buckets} windowSec={windowSec} coveredFrom={coverage?.from ?? null} unit={activeUnit} />
         </section>
         <div className="ov-side">
           <section className="panel" aria-label="Модели">

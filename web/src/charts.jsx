@@ -158,7 +158,12 @@ const areaUnder = (line, points, baseY) => (points.length
 
 const diamond = (x, y, r = 4) => `M${x.toFixed(1)},${(y - r).toFixed(1)}L${(x + r).toFixed(1)},${y.toFixed(1)}L${x.toFixed(1)},${(y + r).toFixed(1)}L${(x - r).toFixed(1)},${y.toFixed(1)}Z`;
 
-const spendRows = (bucket) => {
+const spendRows = (bucket, unit = 'credits') => {
+  if (unit === 'usd') {
+    const usdVal = Number(bucket.cost_usd) || 0;
+    const usdFmt = `$${fmtFixed(usdVal, usdVal > 0 && usdVal < 0.01 ? 4 : 2)}`;
+    return [['USD', usdFmt], ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
+  }
   const credits = bucket.credits_complete === false
     ? bucket.credits > 0 ? [`≥ ${fmtFixed(bucket.credits, 2)}`] : ['—', 'не сообщены'] : [fmtFixed(bucket.credits, 2)];
   // The credits already contain the cache refresh pings: their part is named, never added to the figure
@@ -166,7 +171,8 @@ const spendRows = (bucket) => {
   const unpriced = bucket.credits_unknown > 0 ? [['без цены', fmtInt(bucket.credits_unknown)]] : [];
   // Minara's own credits are a currency of their own: named apart, never added to Retool's figure
   const minara = bucket.minara_credits > 0 ? [['кредиты Minara', fmtFixed(bucket.minara_credits, 2)]] : [];
-  return [['кредиты', ...credits], ...warm, ...minara, ...unpriced, ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
+  const usd = bucket.cost_usd > 0 ? [['USD', `$${fmtFixed(bucket.cost_usd, bucket.cost_usd < 0.01 ? 4 : 2)}`]] : [];
+  return [['кредиты', ...credits], ...warm, ...minara, ...usd, ...unpriced, ['запросы', fmtInt(bucket.requests)], ['ходы', fmtInt(bucket.turns)], ['первый токен', fmtMs(bucket.ttft)]];
 };
 
 const NO_DATA = 'нет данных: журнал начат позже';
@@ -182,8 +188,8 @@ function Uncovered({ x0, x1, y0, y1, labelY = y0 + 16 }) {
   );
 }
 
-/** Credits spent per bucket as a line: it climbs with a heavy turn and falls back with a light one. */
-export function SpendChart({ buckets, windowSec, coveredFrom = null }) {
+/** Credits or USD spent per bucket as a line: it climbs with a heavy turn and falls back with a light one. */
+export function SpendChart({ buckets, windowSec, coveredFrom = null, unit = 'credits' }) {
   const [ref, size] = useSize();
   const n = buckets.length;
   const W = size.w;
@@ -192,18 +198,19 @@ export function SpendChart({ buckets, windowSec, coveredFrom = null }) {
   const plotH = H - PAD.t - PAD.b;
   const [hover, onMove, onLeave, keyboard] = useHover(n, plotW);
   const unseen = uncoveredBuckets(buckets, windowSec, coveredFrom);
+  const isUsd = unit === 'usd';
 
   const model = useMemo(() => {
     // Nothing is known about the periods before the journal began: they are not spend, and not zero either
-    const values = buckets.map((b, i) => (i < unseen ? 0 : Number(b.credits) || 0));
+    const values = buckets.map((b, i) => (i < unseen ? 0 : Number(isUsd ? b.cost_usd : b.credits) || 0));
     // A bucket whose cost was not fully reported holds a lower bound, not a measurement
-    const unsure = buckets.map((b, i) => i >= unseen && b.credits_complete === false);
+    const unsure = buckets.map((b, i) => !isUsd && i >= unseen && b.credits_complete === false);
     const peak = Math.max(0, ...values);
     const total = values.reduce((s, v) => s + v, 0);
     const busy = values.filter((v) => v > 0).length;
     return { values, unsure, unsureCount: unsure.filter(Boolean).length, peak, peakIndex: values.indexOf(peak), total,
       max: niceMax(peak), average: busy ? total / busy : 0 };
-  }, [buckets, unseen]);
+  }, [buckets, unseen, isUsd]);
 
   const empty = !n || !model.total;
   const incomplete = model.unsureCount > 0;
@@ -225,11 +232,11 @@ export function SpendChart({ buckets, windowSec, coveredFrom = null }) {
   const since = unseen > 0 ? fmtShortTime(coveredFrom) : null;
   const emptyText = incomplete ? 'Стоимость не сообщена' : since ? `С ${since} расхода не было` : 'Расхода за окно не было';
   const summary = empty ? emptyText
-    : `Расход кредитов за каждые ${span}: всего ${bound}${fmtFixed(model.total, 2)}, максимум ${bound}${fmtFixed(model.peak, 2)}`
+    : `${isUsd ? 'Расход USD' : 'Расход кредитов'} за каждые ${span}: всего ${bound}${isUsd ? '$' : ''}${fmtFixed(model.total, isUsd && model.total < 0.1 ? 4 : 2)}, максимум ${bound}${isUsd ? '$' : ''}${fmtFixed(model.peak, isUsd && model.peak < 0.1 ? 4 : 2)}`
       + (incomplete ? `. В ${model.unsureCount} ${plural(model.unsureCount, ['периоде', 'периодах', 'периодах'])} стоимость сообщена не полностью` : '')
       + (since ? `. Данные только с ${since}` : '');
   const period = bucket && periodOf(bucket, windowSec, n);
-  const rows = bucket && !blank ? spendRows(bucket) : [];
+  const rows = bucket && !blank ? spendRows(bucket, unit) : [];
 
   return (
     <div className="chart-frame" ref={ref}>

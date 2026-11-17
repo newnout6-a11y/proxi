@@ -294,8 +294,9 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
       min_account_balance: 20, cache_keepwarm_seconds: 240, upstream_empty_retries: 1, turn_timeout: 900 } : {}) };
   const events = empty ? [] : rich ? richJournal() : journal;
   const models = (rich ? [...catalog, ...extraCatalog] : catalog).map(withXhighFlag);
-  const state = { settings: { ...initial }, effective: { ...initial }, requests: [], patches: [], sessions: [],
+    const state = { settings: { ...initial }, effective: { ...initial }, requests: [], patches: [], sessions: [],
     stream: [], streamRequests: 0, cleared: false, accountRequests: [],
+    providers: [], routes: [], clientKeys: [],
     pool: accounts.map((a, i) => ({ ...poolAccount(a.account, i ? 'запасной' : 'основной', i), ...a })) };
   const overview = {
     health: { ok: true, upstream: 'ok', error: null }, uptime_seconds: 5432,
@@ -391,6 +392,59 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
       const applied = Object.keys(body.settings).filter((key) => !schema[key].restart_required);
       for (const key of applied) state.effective[key] = body.settings[key];
       return reply(200, { ...settingsResponse(state.settings, state.effective, schema), saved: true, changed: Object.keys(body.settings), applied });
+    }
+    if (path === '/admin/api/providers' && method === 'GET') {
+      return reply(200, {
+        providers: state.providers,
+        presets: [
+          { id: 'openrouter', name: 'OpenRouter', driver: 'openai-chat', base_url: 'https://openrouter.ai/api/v1', auth_mode: 'bearer', cache_policy: 'auto' },
+          { id: 'anthropic', name: 'Anthropic', driver: 'anthropic-messages', base_url: 'https://api.anthropic.com/v1', auth_mode: 'x-api-key', cache_policy: 'auto' },
+          { id: 'ollama', name: 'Ollama (Local)', driver: 'openai-chat', base_url: 'http://127.0.0.1:11434/v1', auth_mode: 'none', cache_policy: 'auto' },
+        ],
+        drivers: ['openai-chat', 'openai-responses', 'anthropic-messages'],
+        auth_modes: ['bearer', 'x-api-key', 'custom-header', 'none'],
+        routing_strategies: ['fill-first', 'weighted', 'least-inflight'],
+        cache_policies: ['auto', '5m', '1h', 'off'],
+      });
+    }
+    if (path === '/admin/api/providers/test' && method === 'POST') {
+      return reply(200, { ok: true, latency_ms: 42, models_count: 12, models: [{ id: 'deepseek/deepseek-chat-v3' }] });
+    }
+    if (path === '/admin/api/providers' && method === 'POST') {
+      const body = request.postDataJSON();
+      const created = { id: body.id || 'custom', name: body.name || 'Custom', driver: body.driver || 'openai-chat',
+        base_url: body.base_url || '', auth_mode: body.auth_mode || 'bearer', cache_policy: body.cache_policy || 'auto',
+        routing_strategy: body.routing_strategy || 'fill-first', enabled: true, routable: true, published_models_count: 4,
+        credentials_count: 1, turns: 0, cost_usd: 0 };
+      state.providers.push(created);
+      return reply(200, { provider: created, restart_required: false });
+    }
+    if (path === '/admin/api/routes' && method === 'GET') return reply(200, { routes: state.routes, strategies: ['priority', 'weighted', 'least-inflight'] });
+    if (path === '/admin/api/routes' && method === 'POST') {
+      const body = request.postDataJSON();
+      const routeObj = { id: body.id, label: body.label || body.id, targets: body.targets || [], strategy: body.strategy || 'priority',
+        routable: true, target_status: (body.targets || []).map((t) => ({ id: t, known: true, routable: true })) };
+      state.routes.push(routeObj);
+      return reply(200, { route: routeObj });
+    }
+    if (path === '/admin/api/client-keys' && method === 'GET') return reply(200, { client_keys: state.clientKeys });
+    if (path === '/admin/api/client-keys' && method === 'POST') {
+      const body = request.postDataJSON();
+      const ck = { id: 'ck-1', label: body.label, key_preview: 'sk-proxi-…abcd', enabled: true,
+        allowed_models: body.allowed_models || null, rpm_limit: body.rpm_limit ?? null, max_budget_usd: body.max_budget_usd ?? null,
+        requests: 0, spent_usd: 0 };
+      state.clientKeys.push(ck);
+      return reply(200, { client_key: ck, raw_key: 'sk-proxi-e2e-synthetic-test-key-abcd' });
+    }
+    if (path === '/admin/api/models/ping' && method === 'POST') {
+      const body = request.postDataJSON();
+      return reply(200, { ok: true, model: body.model, latency_ms: 85, ttft_ms: 60, reply: 'OK', cost_usd: 0.0002 });
+    }
+    if (path === '/admin/api/catalog/refresh' && method === 'POST') {
+      return reply(200, { ok: true, total_models: models.length });
+    }
+    if (path === '/admin/api/clients/sync-opencode' && method === 'POST') {
+      return reply(200, { ok: true, result: { updated: true } });
     }
     return reply(404, { error: { message: 'Unknown admin endpoint' } });
   });

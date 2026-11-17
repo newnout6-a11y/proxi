@@ -96,7 +96,7 @@ function Shell({ apiKey, onLogout, theme, setTheme }) {
   return (
     <div className="shell">
       <aside className="rail">
-        <div className="brand"><Mark /><strong>Proxi</strong><span className="brand-caption">Retool relay</span></div>
+        <div className="brand"><Mark /><strong>Proxi</strong><span className="brand-caption">{overview?.providers?.length ? 'AI gateway' : 'AI relay'}</span></div>
         <nav aria-label="Разделы">
           {GROUPS.map((group) => (
             <div className="nav-group" key={group}>

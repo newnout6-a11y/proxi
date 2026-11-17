@@ -15,7 +15,9 @@ import uuid
 import weakref
 
 import direct
+import drivers
 import native_history
+import stream_watchdog
 
 import websockets
 
@@ -24,7 +26,7 @@ import conversation_state
 import journal
 import console_log
 import models as model_catalog
-from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled, priority as account_priority
+from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -90,7 +92,7 @@ class Backend:
         self.cfg = cfg
         self._http_post = http_post or self._default_post
         self._ws_connect = ws_connect or websockets.connect
-        self.refresher = (None if cfg.get("upstream") == "minara" else
+        self.refresher = (None if cfg.get("upstream", "retool") != "retool" else
                           refresher if refresher is not None else Refresher(cfg))
 
     # -- HTTP ---------------------------------------------------------------
@@ -425,6 +427,15 @@ class RelaySession:
     async def _maybe_pong(self, raw):
         await _answer_control(self.ws, raw)
 
+    def abort_active_turn(self):
+        """Abort an in-flight direct HTTP stream on watchdog timeout without marking the session cancelled."""
+        abort = getattr(self, "_active_direct_abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:
+                pass
+
     async def aclose(self):
         # Marked before anything is awaited. A session the pool has closed (evicted, released for good, left for another
         # account) is not coming back: no keepwarm cycle starts on it (direct._ensure_keepwarm), and as a child it no
@@ -477,7 +488,9 @@ class RelaySession:
         completed = False
         self._output_started = False
         priced = False
-        turn = self._stream_turn(prompt, model_provider, tool_names)
+        raw_turn = self._stream_turn(prompt, model_provider, tool_names)
+        turn = (stream_watchdog.guard(raw_turn, self.cfg, on_timeout=self.abort_active_turn)
+                if self.cfg.get("transport") == "direct" else raw_turn)
         try:
             async for event in turn:
                 kind = event.get("type")
@@ -505,12 +518,8 @@ class RelaySession:
         """Yield normalised provider events, cleaning its poller on every exit."""
         if self.cfg.get("transport") == "direct":
             args = self._direct or {}
-            if self.cfg.get("upstream") == "minara":
-                import minara
-                transport = minara
-            else:
-                transport = direct
-            async with contextlib.aclosing(transport.iter_events(
+            driver = drivers.get_driver(self.cfg)
+            async with contextlib.aclosing(driver.stream_turn(
                     self.cfg, self, model_provider, prompt, args.get("head"), args.get("tools"),
                     args.get("tool_choice"), args.get("max_tokens"), args.get("chunks"))) as events:
                 async for event in events:
@@ -913,7 +922,7 @@ class SessionPool:
     def __init__(self, backend: Backend, store=None):
         self.backend = backend
         self.cfg = backend.cfg
-        self.backends = [backend]
+        self.backends = [] if self.cfg.get("_empty_pool") else [backend]
         if isinstance(self.cfg.get("accounts"), list) and self.cfg["accounts"]:
             self.backends = []
             custom_post = getattr(backend, "_http_post", None)
@@ -974,12 +983,18 @@ class SessionPool:
         if not isinstance(configs, list):
             # One account without accounts[]: the file has just become a pool of it and this one (admin._append_records).
             # The list holds that first account too, as a copy without "accounts" (never the root cfg, which holds the list).
-            configs = self.cfg["accounts"] = [{key: value for key, value in self.backend.cfg.items() if key != "accounts"}]
+            configs = self.cfg["accounts"] = ([] if self.cfg.get("_empty_pool")
+                                              else [{key: value for key, value in self.backend.cfg.items() if key != "accounts"}])
         if record.get("upstream") == "minara" and not record.get("bearer_token"):
             # config.load resolves bearer_token_env into the record's bearer_token in memory; a record taken from the admin
             # request has only the variable's name, and every request and balance read of the account would answer 401.
             import config  # local: session's imports stay those it starts with
             config.validate_minara_account(record)
+        elif record.get("upstream", "retool") not in ("retool", "minara") and record.get("api_key_env") and not record.get("api_key"):
+            resolved_key = os.environ.get(record["api_key_env"], "").strip()
+            if not resolved_key and record.get("auth_mode", "bearer") != "none":
+                raise apierr.service_unavailable(f"environment variable {record['api_key_env']} holds no API key")
+            record["api_key"] = resolved_key
         base = self.backends[0] if self.backends else self.backend
         custom_post = getattr(base, "_http_post", None)
         if custom_post == getattr(base, "_default_post", None):
@@ -993,8 +1008,12 @@ class SessionPool:
         acc_cfg["_disk_auth"] = (record.get("cookie"), record.get("xsrf"))
         backend = Backend(acc_cfg, http_post=custom_post, ws_connect=custom_ws)
         configs.append(record)
+        was_empty = not self.backends
+        self.cfg["_empty_pool"] = False
         # A new list, not an append: a request choosing an account on the event loop keeps reading the list it started with.
         self.backends = [*self.backends, backend]
+        if was_empty:
+            self.backend = backend
         return backend
 
     def remove_account(self, backend):
@@ -1012,6 +1031,8 @@ class SessionPool:
                 configs.remove(item)
         if self.backend is backend and self.backends:
             self.backend = self.backends[0]
+        if not self.backends:
+            self.cfg["_empty_pool"] = True
         return True
 
     def _persist(self, key, urgent=False):
@@ -1325,14 +1346,19 @@ class SessionPool:
             wait = min(max(0.0, r.get("until_at", 0.0) - time.time()) for r in limited)
             return apierr.accounts_rate_limited(wait, len(limited), len(backends))
         minara = all((getattr(b, "cfg", None) or {}).get("upstream") == "minara" for b in backends)
+        universal = all((getattr(b, "cfg", None) or {}).get("upstream", "retool") not in ("retool", "minara") for b in backends)
         exhausted = [(account_tag(b, UNNAMED), r.get("available"))
                      for b, r in zip(backends, reasons) if r.get("reason") == "exhausted"]
         if exhausted:
             threshold = next(r.get("threshold") for r in reasons if r.get("reason") == "exhausted")
-            return apierr.insufficient_credits(threshold or 0, exhausted, "Minara" if minara else "Retool")
+            unit_label = "Minara" if minara else ("Provider" if universal else "Retool")
+            return apierr.insufficient_credits(threshold or 0, exhausted, unit_label)
         if minara:
             return apierr.service_unavailable("no usable Minara account: their tokens expired or were rejected; "
                                               "add new tokens (admin, Accounts) and restart the relay")
+        if universal:
+            return apierr.service_unavailable("no usable provider credential: API keys were rejected or rate-limited; "
+                                              "check credentials in /admin")
         return apierr.service_unavailable("no usable account: Retool sessions need a new sign-in")
 
     def _on_shared_session(self, isolated=False, context_scope=None):
@@ -1368,6 +1394,31 @@ class SessionPool:
         reserved, awaited or counted. `configured` is refusal_reasons': acquire() always judges the resource.
         An account whose Retool plan refused the model a short while ago refuses it like a route fact (_refusals).
         """
+        if not backends:
+            raise apierr.service_unavailable("no upstream providers or accounts are configured; add a provider in /admin")
+        if isinstance(model_entry, dict) and model_entry.get("route_targets"):
+            fallback_reserve = None
+            fallback_signed_out = None
+            last_error = None
+            for target in model_entry["route_targets"]:
+                try:
+                    kind, found = self._candidates(backends, target, exclude, configured)
+                except apierr.ApiError as err:
+                    if last_error is None or err.status != 404:
+                        last_error = err
+                    continue
+                if kind == "ready":
+                    return "ready", found
+                if kind == "reserve" and fallback_reserve is None:
+                    fallback_reserve = found
+                elif kind == "signed_out" and fallback_signed_out is None:
+                    fallback_signed_out = found
+            if fallback_reserve is not None:
+                return "reserve", fallback_reserve
+            if fallback_signed_out is not None:
+                return "signed_out", fallback_signed_out
+            raise (last_error or apierr.service_unavailable(f"no target in route '{model_entry.get('id')}' is currently usable"))
+
         reasons = self._refusals(model_entry, backends, configured)
         routable = [backend for backend, reason in zip(backends, reasons) if not reason]
         refusals = [reason for reason in reasons if reason]
@@ -1385,11 +1436,11 @@ class SessionPool:
             return "reserve", spare
         # A signed-out account is still better than no account: its 401 makes the
         # refresher re-read config.json, so a fresh sign-in is adopted at once.
-        # A Bearer token (Minara) has no refresher and never changes before a restart: an expired or rejected one would
-        # only be sent to be refused, once per dead account per request.
+        # Static Bearer/API-key accounts (Minara, OpenRouter, Anthropic, etc.) have no browser cookie refresher:
+        # a rejected key would only be sent to fail again.
         signed_out = [backend for backend in routable if backend not in exclude and account_enabled(backend)
                       and (getattr(backend, "unavailable", None) or {}).get("reason") == "auth_dead"
-                      and (getattr(backend, "cfg", None) or {}).get("upstream") != "minara"]
+                      and (getattr(backend, "cfg", None) or {}).get("upstream", "retool") == "retool"]
         if signed_out:
             return "signed_out", signed_out
         raise self._unusable_error(routable)
@@ -1422,23 +1473,24 @@ class SessionPool:
         return None
 
     def _next_backend(self, model_entry=None, exclude=()) -> Backend:
+        from catalog import router as catalog_router
         kind, candidates = self._candidates(self.backends, model_entry, exclude)
         if kind == "reserve":
             # Every account is below the reserve: spend the richest one down to zero.
             return max(candidates, key=lambda b: float("inf") if b.unavailable.get("available") is None
                        else b.unavailable["available"])
         counts = {b: 0 for b in self.backends}
+        inflight_counts = {b: 0 for b in self.backends}
         for s in self._conversations.values():
             if getattr(s, "backend", None) in counts:
                 counts[s.backend] += 1
         for session, _, _, _ in self._active.values():
             if getattr(session, "backend", None) in counts:
                 counts[session.backend] += 2
+                inflight_counts[session.backend] += 1
         idx = getattr(self, "_rr_index", 0)
-        self._rr_index = (idx + 1) % len(self.backends)
-        # Operator priority first (lower wins), then the least loaded, then round-robin.
-        return min(candidates, key=lambda b: (account_priority(b), counts[b],
-                                              (self.backends.index(b) - idx) % len(self.backends)))
+        self._rr_index = (idx + 1) % max(1, len(self.backends))
+        return catalog_router.select_candidate_backend(candidates, self.backends, counts, inflight_counts, idx)
 
     @property
     def mode(self):
@@ -1788,7 +1840,8 @@ class SessionPool:
                         restored = await self._restore_state(key, session)
                         self._conversations[key] = session
                         journal.emit("session.create", "Новый диалог — новый тред %s" % (
-                                         "Minara" if backend.cfg.get("upstream") == "minara" else "Retool"), "info",
+                                         backend.cfg.get("provider_name")
+                                         or ("Minara" if backend.cfg.get("upstream") == "minara" else "Retool")), "info",
                                      conversation=journal.tag(key), thread=journal.tag(session.thread_id),
                                      account=account_tag(backend), pool=len(self._conversations))
                         self._report_restored(restored)

@@ -27,18 +27,26 @@ from redact import redact
 
 def load_accounts(path):
     """Read without load() side effects and without inheriting another tenant's resources."""
+    import copy
+    from drivers import presets as driver_presets
+
     saved = json.loads(Path(path).read_text(encoding='utf-8-sig'))
     result = []
-    for record in saved.get('accounts') or [saved]:
+    raw_accounts = saved.get('accounts')
+    if 'accounts' in saved and not isinstance(raw_accounts, list):
+        raise TypeError('accounts must be a list')
+    records = list(raw_accounts) if isinstance(raw_accounts, list) else ([] if 'providers' in saved else [saved])
+    if isinstance(saved.get('providers'), list):
+        for idx, prov in enumerate(saved['providers']):
+            try:
+                _, expanded, _ = driver_presets.expand_provider_to_accounts(copy.deepcopy(prov), f'providers[{idx}]')
+                records.extend(expanded)
+            except ValueError:
+                continue
+    for record in records:
         if not record.get('enabled', True):
             continue
-        cfg = dict(config.DEFAULTS, **saved)
-        if record.get('base', '').rstrip('/') != saved.get('base', '').rstrip('/'):
-            for key in models.PROVIDER_RESOURCE_KEY.values():
-                cfg.pop(key, None)
-        cfg.update(record)
-        cfg['provider_access'] = record.get('provider_access', {})
-        cfg.pop('accounts', None)
+        cfg = models.account_config(dict(config.DEFAULTS, **saved), record)
         cfg.pop('_config_path', None)
         cfg.update(_persist_auth=False, cache_keepwarm_seconds=0, session_refresh_interval=0,
                    exec_policy='off', project_context=False, upstream_empty_retries=0)

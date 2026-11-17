@@ -125,7 +125,37 @@ def readable_block(block):
         _withheld("document"))
 
 
-def client_messages(messages, image_converter, *, lead=None):
+def _extract_native_document(block):
+    """Extract canonical base64 PDF/document block `{'type': 'document', 'media_type': ..., 'data': ..., 'filename': ...}` or None."""
+    if not isinstance(block, dict):
+        return None
+    kind = block.get("type")
+    if kind == "document":
+        src = block.get("source") if isinstance(block.get("source"), dict) else {}
+        if src.get("type") == "base64" and isinstance(src.get("data"), str) and src["data"]:
+            doc = {
+                "type": "document",
+                "media_type": str(src.get("media_type") or "application/pdf"),
+                "data": "".join(src["data"].split()),
+            }
+            if isinstance(block.get("title"), str) and block["title"]:
+                doc["filename"] = block["title"]
+            return doc
+    elif kind in ("file", "input_file"):
+        spec = block.get("file") if isinstance(block.get("file"), dict) else block
+        data = spec.get("file_data")
+        if isinstance(data, str) and data.startswith("data:") and ";base64," in data:
+            hdr, _, b64 = data.partition(",")
+            mime = hdr[5:].split(";")[0].strip() or "application/pdf"
+            if mime == "application/pdf":
+                doc = {"type": "document", "media_type": mime, "data": "".join(b64.split())}
+                if isinstance(spec.get("filename"), str) and spec["filename"]:
+                    doc["filename"] = spec["filename"]
+                return doc
+    return None
+
+
+def client_messages(messages, image_converter, *, lead=None, allow_documents=False):
     """Canonical client echo for matching, never a source of thinking signatures.
 
     Chat hides signatures; Anthropic and Responses group tool blocks differently.
@@ -170,6 +200,8 @@ def client_messages(messages, image_converter, *, lead=None):
                 # Claude Code's ToolSearch answers with references to the tools it loaded. Upstream has no such block,
                 # and the loaded tools are in the request's tool list already, so the result names them.
                 blocks.append({"type": "text", "text": "Tool loaded: " + block["tool_name"]})
+            elif allow_documents and _extract_native_document(block) is not None:
+                blocks.append(_extract_native_document(block))
             elif readable_block(block) is not None:
                 blocks.append({"type": "text", "text": readable_block(block)})
             else:
