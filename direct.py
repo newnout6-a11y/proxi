@@ -1272,6 +1272,29 @@ def _bounded_put(loop, queue, item, is_cancelled, max_wait=120.0):
     return True
 
 
+class _AttemptQueue(asyncio.Queue):
+    """The queue between the reader thread of one attempt and its consumer.
+
+    Lines of the answer wait for room (_bounded_put): `maxsize` bounds what a slow consumer makes the relay buffer. The
+    attempt's last items (its end, its error, a cancel) never wait and never take a line's place: put_last appends them
+    past the bound. They took the place of the OLDEST line before, so a consumer that lagged by a full queue lost a text
+    delta, a piece of a call or the metadata, and the turn still ended as a clean stop (A03-02)."""
+
+    def __init__(self, maxsize):
+        super().__init__(maxsize)
+        self._last = False
+
+    def full(self):
+        return not self._last and super().full()
+
+    def put_last(self, item):
+        """Append a terminal item whatever the queue holds (on the queue's loop)."""
+        self._last = True
+        try:
+            self.put_nowait(item)
+        finally:
+            self._last = False
+
 # How providers word a refusal of an input past the model's context window (Retool passes the provider's sentence on).
 _CONTEXT_EXCEEDED = re.compile(r"(?i)exceeds? the context window|context[ _]length[ _]exceeded|maximum context length"
                                r"|prompt is too long|input is too long for")
@@ -2575,27 +2598,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
 
     def hand_off_final(item, queue=None):
         """Land a terminal item (sentinel/error/cancel) without blocking. Safe from
-        any thread; sacrifices one buffered data line if the queue is full."""
+        any thread; it never takes the place of a line (_AttemptQueue.put_last)."""
         queue = queue if queue is not None else holder["queue"]
         if queue is None:
             return
-
-        def _put():
-            try:
-                queue.put_nowait(item)
-                return
-            except asyncio.QueueFull:
-                pass
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                queue.put_nowait(item)
-            except asyncio.QueueFull:
-                pass
         try:
-            loop.call_soon_threadsafe(_put)
+            loop.call_soon_threadsafe(queue.put_last, item)
         except RuntimeError:  # a cancelled daemon reader can outlive the loop
             pass
 
@@ -2718,7 +2726,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             held = []
             may_retry = (not service_request and empty_retries < max_empty_retries and budget.remaining > 1)
             yield {"type": "usage_start"}
-            queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
+            queue: asyncio.Queue = _AttemptQueue(maxsize=1024)
             holder["queue"] = queue
             previous_trace = holder.get("trace")
             task = loop.run_in_executor(getattr(loop, "_relay_io_executor", None),
