@@ -617,6 +617,25 @@ test('system role preserves multiline instructions, explicit empty text and rese
   await expect.poll(() => state.settings.relay_system_prompt).toBe(null);
 });
 
+// A14-07 / A14-06: the sync button reported success when a DeepSeek Harness profile failed, and the OpenCode snippet made a
+// provider the relay's sync does not fill.
+test('the client sync says which files it updated and a failed Harness profile is a warning', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  await page.getByText('Готовые конфиги для OpenCode').click();
+  const snippet = page.locator('.snippet-box', { hasText: 'OpenCode (opencode.jsonc)' }).locator('pre');
+  await expect(snippet).toContainText('"retool-relay"');
+  await expect(snippet).toContainText('"model": "retool-relay/claude-opus-5-5"');
+  const sync = page.getByRole('button', { name: 'Синхр. OpenCode и Harness' });
+  await sync.click();
+  await expect(page.getByText('Список моделей обновлён в opencode.jsonc', { exact: true })).toBeVisible();
+  state.syncAnswer = { ok: false, written: true, changed: true,
+    result: { written: true, harness: [{ error: 'no Proxi provider in the profile', settings: 'web/cordis.patch.yml' }] } };
+  await sync.click();
+  await expect(page.getByText('DeepSeek Harness: no Proxi provider in the profile')).toBeVisible();
+});
+
 test('typing during a pending save is preserved as a new draft', async ({ page }) => {
   const state = await mockAdmin(page);
   state.patchDelay = 800;

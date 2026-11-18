@@ -453,6 +453,7 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
       return reply(200, { ok: true, total_models: models.length });
     }
     if (path === '/admin/api/clients/sync-opencode' && method === 'POST') {
+      if (state.syncAnswer) return reply(200, state.syncAnswer);
       return reply(200, { ok: true, result: { updated: true } });
     }
     return reply(404, { error: { message: 'Unknown admin endpoint' } });

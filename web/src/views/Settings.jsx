@@ -193,10 +193,11 @@ function Connection({ apiKey, overview, onUnauthorized }) {
       // The relay writes OpenCode's file and the DeepSeek Harness profiles; ok holds only when every file was synced, and
       // written says whether one was rewritten (a list already current is left alone).
       const harness = (res.result?.harness || []).filter((item) => item && item.error);
+      const files = (res.result?.harness || []).length ? 'opencode.jsonc и профилях DeepSeek Harness' : 'opencode.jsonc';
       toast(res.ok
         ? { tone: 'success', title: 'Клиенты синхронизированы',
-          text: res.written === false ? 'Списки моделей OpenCode и DeepSeek Harness уже актуальны: файлы не менялись'
-            : 'Список моделей обновлён в opencode.jsonc и профилях DeepSeek Harness' }
+          text: res.written === false ? `Список моделей в ${files} уже актуален: файлы не менялись`
+            : `Список моделей обновлён в ${files}` }
         : { tone: 'warn', title: 'Синхронизация клиентов',
           text: res.reason || res.result?.error || (harness.length ? `DeepSeek Harness: ${harness.map((item) => item.error).join(' · ')}` : 'Не удалось обновить файл') });
     } catch (failure) {
