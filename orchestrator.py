@@ -1637,7 +1637,9 @@ class TurnRunner:
                                     if event.get("text"):
                                         final_text = event["text"]
                                 elif event["type"] in ("thinking_status", "thinking_start"):
-                                    if think_started is None:
+                                    # Only a sign the upstream gave starts the thinking span of the journal: a status of the
+                                    # relay's own (source "relay", the Minara timer of 54b1023) said nothing about the model.
+                                    if think_started is None and event.get("source") != "relay":
                                         think_started = time.time()
                                         ms = round((think_started - holder["upstream_started_at"]) * 1000)
                                         log("upstream.thinking_start", "Upstream сообщил начало thinking через %d мс" % ms,

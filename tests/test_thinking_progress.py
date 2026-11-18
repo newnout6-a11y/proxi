@@ -192,6 +192,32 @@ def test_runner_measures_from_live_status_instead_of_buffer_flush(tmp_path, monk
     assert [f["thinking_ms"] for k, f in logs if k == "upstream.thinking_end"] == [280000]
 
 
+def test_a_status_of_the_relays_own_is_not_journaled_as_an_upstream_thinking_start(tmp_path, monkeypatch):
+    # "Upstream сообщил начало thinking" was written for the Minara timer's status too (59 of 63 such events in the
+    # journal came 1450-1600 ms after the request): the journal said the upstream spoke when it had not.
+    backend, pool, runner = setup(tmp_path, transport="direct", cache_keepwarm_seconds=0)
+    logs = []
+    monkeypatch.setattr(journal, "emit", lambda kind, message, level="info", **fields: logs.append((kind, fields)))
+
+    async def script(*args, **kwargs):
+        yield {"type": "thinking_status", "source": "relay"}
+        yield {"type": "thinking_heartbeat", "elapsed": 6.5}
+        yield {"type": "text", "delta": "ok"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(direct, "iter_events", script)
+
+    async def collect():
+        try:
+            return await run(runner, request(FIRST))
+        finally:
+            for session in pool._conversations.values():
+                await session.aclose()
+
+    asyncio.run(collect())
+    assert not [kind for kind, _ in logs if kind in ("upstream.thinking_start", "upstream.thinking_end")]
+
+
 class ResponsesWriter:
     def __init__(self):
         self.events = []
