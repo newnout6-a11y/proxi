@@ -43,8 +43,13 @@ class AttemptBudget:
     def remaining(self):
         left = max(0, MAX_ATTEMPTS - self.step_used)
         if self.total_cap:
-            left = min(left, max(0, self.total_cap - self.used))
+            left = min(left, max(0, self.total_cap - self.charged))
         return left
+
+    @property
+    def charged(self):
+        """The POSTs of the request that count against total_cap: every one that left, less the ones given back."""
+        return self.used - self.refunds
 
     def refund(self):
         """Give back the latest POST: its account refused the request outright and is now out of the request's way.
@@ -53,13 +58,15 @@ class AttemptBudget:
         is generated or billed, and the turn moves to another account. Charged as attempts, they used up the step: with
         claude-opus-5-5 in the plan of 13 of 65 live accounts (2026-11-18), five refusals in a row were common and the
         client got the refusal as a 502 while accounts that serve the model stood idle. At most MAX_REFUNDS a request.
-        True when the POST was given back."""
+
+        Only the budget is given back: `used` still counts every POST that left, for the client's upstream_attempts and the
+        numbers of the attempts in the journal and the diagnostics (audit A09-06: after ten refusals and a failure the client
+        was told 1, and all eleven attempts were numbered 1). True when the POST was given back."""
         with self._lock:
             if self.refunds >= MAX_REFUNDS or self.step_used <= 0:
                 return False
             self.refunds += 1
             self.step_used -= 1
-            self.used = max(0, self.used - 1)
             self.account_streak = 0
             return True
 
@@ -70,7 +77,7 @@ class AttemptBudget:
             self.account_streak = 0
 
     def _limit_error(self):
-        limit = self.total_cap if self.total_cap and self.used >= self.total_cap else MAX_ATTEMPTS
+        limit = self.total_cap if self.total_cap and self.charged >= self.total_cap else MAX_ATTEMPTS
         return self.error("upstream_attempt_limit", "upstream attempt limit reached (%d attempts)" % limit)
 
     def wait(self, delay, cancelled):
@@ -125,6 +132,7 @@ class AttemptBudget:
             error.upstream_status = self.last.get("http_status")
         error.upstream_request_id = self.last.get("upstream_request_id")
         error.upstream_attempts = self.used
+        error.upstream_refunded = self.refunds
         error.stage = "upstream"
         return error
 

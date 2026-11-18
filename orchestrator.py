@@ -2282,8 +2282,12 @@ class TurnRunner:
                 # or None when the error is what the client gets. Only that one is red (_settle_turn).
                 moved = {"outcome": went_on} if err is not None and went_on else {}
                 if err is not None:
+                    # Every POST of the request so far, and how many of them refusals gave back (AttemptBudget.refund).
+                    posts = {name: getattr(err, attr) for name, attr in (("upstream_attempts", "upstream_attempts"),
+                                                                         ("refunded", "upstream_refunded"))
+                             if getattr(err, attr, None)}
                     log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]),
-                        "warn" if moved else "error", status=err.status, code=err.code, **moved)
+                        "warn" if moved else "error", status=err.status, code=err.code, **moved, **posts)
                 log("turn.end", "Ход завершён: %s за %.1f с%s" % (
                         reason, duration / 1000, " · запрос продолжен" if moved else ""),
                     "warn" if moved else "error" if reason == "error"
