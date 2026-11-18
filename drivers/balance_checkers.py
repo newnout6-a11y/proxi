@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+import urllib.parse
 
 import httpx
 
@@ -13,6 +14,31 @@ from drivers import http_pool
 
 CACHE_SECONDS = 30.0
 CNY_TO_USD_FALLBACK = 0.14  # used only when DeepSeek / Moonshot reports CNY without a USD entry
+
+
+def _origin(url) -> tuple | None:
+    """(scheme, host, port) of an http(s) URL; None when it cannot be read."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or "").strip())
+        port = parts.port
+    except ValueError:
+        return None
+    scheme, host = (parts.scheme or "").lower(), (parts.hostname or "").lower().rstrip(".")
+    if scheme not in ("http", "https") or not host:
+        return None
+    return scheme, host, port or (443 if scheme == "https" else 80)
+
+
+def own_balance_endpoint(endpoint, base_url) -> str | None:
+    """`endpoint` when it is on the provider's own origin (the scheme, host and port of its base_url), else None.
+
+    A provider's API key goes to the host of its own base_url and nowhere else. A preset's balance endpoint used to follow a
+    provider whose base_url had been changed to another host (the admin's new-provider form starts on the OpenRouter
+    preset): a Z.ai key went to openrouter.ai/api/v1/key with every balance check, about once a minute (audit A11-01)."""
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        return None
+    own = _origin(base_url)
+    return endpoint.strip() if own is not None and _origin(endpoint) == own else None
 
 
 def _parse_balance_response(preset: str, url: str, payload: dict) -> dict:
@@ -83,7 +109,8 @@ class ProviderBalanceAccount(UnmeteredAccount):
         self.cfg = cfg
         self.backend = backend
         self._fetch = fetch
-        self._endpoint = cfg.get("balance_endpoint")
+        # Only an endpoint on the provider's own origin is ever asked: its API key goes with the request.
+        self._endpoint = own_balance_endpoint(cfg.get("balance_endpoint"), cfg.get("base_url") or cfg.get("base"))
         self.supports_balance = bool(self._endpoint)
         self.keeps_local_debit = bool(self._endpoint)
         self._fetch_lock = threading.Lock()
@@ -104,6 +131,9 @@ class ProviderBalanceAccount(UnmeteredAccount):
 
     def _http_get_balance(self) -> dict:
         url = str(self._endpoint or "").strip()
+        if own_balance_endpoint(url, self.cfg.get("base_url") or self.cfg.get("base")) is None:
+            # Checked again before the key leaves: the account's cfg may have changed since it was built.
+            raise PermissionError("the balance endpoint is not on the provider's own host; its API key is not sent there")
         http_pool.validate_endpoint_url(url, allow_insecure_http=bool(self.cfg.get("allow_insecure_http", False)))
         headers = discovery.build_auth_headers(self.cfg)
         custom_transport = self.cfg.get("_http_transport")
