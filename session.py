@@ -1797,6 +1797,49 @@ class SessionPool:
             return None
         return session
 
+    async def _move(self, key, session, replacement, model_entry):
+        """Move conversation `key` from `session` to a new session on `replacement`, and return that one: the history goes
+        along as account_move_keeps_history says, the children's pins too, and the old session is closed."""
+        self._check_route(replacement, model_entry)
+        old = session
+        session = RelaySession(replacement, await self._new_thread_id(replacement))
+        carried = self._carry_history(key, old, session)
+        # The children that run against this conversation pin it wherever it lives: their releases find the new session by
+        # key (_touch_cache_parents), and it is not evicted while one of them still works for it.
+        for name in ("_cache_dependents", "_cache_dependent_records", "_cache_children"):
+            if hasattr(old, name):
+                setattr(session, name, getattr(old, name))
+        self._conversations[key] = session
+        await old.aclose()
+        # Unless account_move_keeps_history took the signed branches along, the new account's first request is sent
+        # without them: its body differs from the cached one and the prefix is written again.
+        journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
+                     conversation=journal.tag(key),
+                     from_account=account_tag(old.backend), to_account=account_tag(replacement),
+                     reason=self._move_reason(old.backend, model_entry),
+                     **({"carried_branches": carried} if carried else {}))
+        return session
+
+    async def _settle_route(self, key, session, model_entry, exclude):
+        """The session a conversation's request runs on once acquire() has done its waiting: its own, or the one it moves to
+        when the Retool plan of its account refused the model meanwhile.
+
+        acquire() awaits between choosing an account and handing out the lease (the old session's aclose, _restore_state, a
+        new thread). A request of the same wave may get Retool's 402 on that account then, and the hold it leaves turned this
+        request into a settled 404 while attempts and serving accounts were left (2026-11-18 17:08:48-56, design D4 1.7). A
+        hold is no settled fact about this request: it moves again, as acquire() would have a moment earlier, at most once
+        per account of the pool, and when no account is left the pool's own error says why. A refusal of the configuration
+        is still the settled 404."""
+        for _ in range(len(self.backends)):
+            if not self._route_refusal(session.backend, model_entry) or self._plan_hold(session.backend, model_entry) is None:
+                break
+            replacement = self._next_backend(model_entry, (*exclude, session.backend))
+            if replacement is session.backend:
+                break
+            session = await self._move(key, session, replacement, model_entry)
+        self._check_route(session.backend, model_entry)
+        return session
+
     async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None, context_scope=None,
                       exclude=(), parent_key=None) -> SessionLease:
         """Take one slot and return an independently releasable request handle.
@@ -1901,25 +1944,7 @@ class SessionPool:
                         # a lone fallback account is the same backend and is kept as is.
                         replacement = affinity_backend or self._next_backend(model_entry, exclude)
                         if replacement is not session.backend:
-                            self._check_route(replacement, model_entry)
-                            old = session
-                            session = RelaySession(replacement, await self._new_thread_id(replacement))
-                            carried = self._carry_history(key, old, session)
-                            # The children that run against this conversation pin it wherever it lives: their releases
-                            # find the new session by key (_touch_cache_parents), and it is not evicted while one of
-                            # them still works for it.
-                            for name in ("_cache_dependents", "_cache_dependent_records", "_cache_children"):
-                                if hasattr(old, name):
-                                    setattr(session, name, getattr(old, name))
-                            self._conversations[key] = session
-                            await old.aclose()
-                            # Unless account_move_keeps_history took the signed branches along, the new account's first request
-                            # is sent without them: its body differs from the cached one and the prefix is written again.
-                            journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
-                                         conversation=journal.tag(key),
-                                         from_account=account_tag(old.backend), to_account=account_tag(replacement),
-                                         reason=self._move_reason(old.backend, model_entry),
-                                         **({"carried_branches": carried} if carried else {}))
+                            session = await self._move(key, session, replacement, model_entry)
                     if session is None:
                         backend = affinity_backend or self._next_backend(model_entry, exclude)
                         self._check_route(backend, model_entry)
@@ -1935,7 +1960,7 @@ class SessionPool:
                                      account=account_tag(backend), pool=len(self._conversations))
                         self._report_restored(restored)
                     keep = True
-                    self._check_route(session.backend, model_entry)
+                    session = await self._settle_route(key, session, model_entry, exclude)
             else:
                 backend = (affinity_backend if isolated and affinity_backend is not None
                            else self._next_backend(model_entry, exclude))
