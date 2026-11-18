@@ -323,6 +323,12 @@ def _schema(cfg=None):
     return fields
 
 
+def _model_choices(cfg):
+    """The values the two model settings take, from the catalog as it is now (routes and providers included)."""
+    catalog_ids = [entry["id"] for entry in models.catalog(cfg)]
+    return {"model": catalog_ids, "prompt_suggestion_model": list(dict.fromkeys(["auto", "same", *catalog_ids]))}
+
+
 def _role_limit(max_prompt_bytes):
     """Largest relay_system_prompt in UTF-8 bytes under the given max_prompt_bytes (0 = unlimited)."""
     if type(max_prompt_bytes) is int and max_prompt_bytes > 0:
@@ -633,15 +639,26 @@ class Admin:
         except (OSError, ValueError):
             raise apierr.service_unavailable("Cannot read relay settings")
 
+    def _live_schema(self):
+        """The schema with the model lists of the catalog as it is now. They were taken once, when the admin started: a
+        route or a provider added in the admin afterwards was listed in /admin/api/models and refused as the default model
+        ("Unsupported value for 'model'") until a restart (audit A14-04)."""
+        schema = dict(self.schema)
+        for key, choices in _model_choices(self.cfg).items():
+            if key in schema:
+                schema[key] = dict(schema[key], enum=choices)
+        return schema
+
     def _settings(self, saved=None):
         saved = self._saved() if saved is None else saved
-        effective = {key: self.cfg.get(key, config.DEFAULTS.get(key)) for key in self.schema}
-        desired = {key: saved.get(key, effective[key]) for key in self.schema}
+        schema = self._live_schema()
+        effective = {key: self.cfg.get(key, config.DEFAULTS.get(key)) for key in schema}
+        desired = {key: saved.get(key, effective[key]) for key in schema}
         # Environment overrides remain authoritative after restarting.
         if os.environ.get("RELAY_SESSION_MODE"):
             desired["session_mode"] = effective["session_mode"]
-        pending = [key for key in self.schema if desired[key] != effective[key]]
-        return {"settings": desired, "effective": effective, "schema": self.schema,
+        pending = [key for key in schema if desired[key] != effective[key]]
+        return {"settings": desired, "effective": effective, "schema": schema,
                 # default_system_prompt is the relay role alone; the list names every built-in role and its path.
                 "default_system_prompt": DEFAULT_RELAY_SYSTEM_PROMPT, "default_system_prompts": _default_roles(),
                 "pending_restart": pending, "restart_required": bool(pending),
@@ -1358,8 +1375,9 @@ class Admin:
     def _validate(self, changes):
         if not isinstance(changes, dict) or not changes:
             raise apierr.bad_request("'settings' must be a non-empty object")
+        schema = self._live_schema()
         for key, value in changes.items():
-            field = self.schema.get(key)
+            field = schema.get(key)
             if field is None:
                 raise apierr.bad_request("Unknown or protected setting", param=key)
             kind = field["type"]

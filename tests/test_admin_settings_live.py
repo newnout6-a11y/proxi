@@ -128,3 +128,15 @@ def test_a_refresher_still_reading_starts_again_only_after_its_read_ends(pool):
     while refresher.calls == ["stop"] and time.monotonic() < deadline:
         time.sleep(0.02)
     assert refresher.calls == ["stop", ("start", 2)]
+
+
+# A14-04: the model lists of "Модель по умолчанию" and "Модель подсказок ввода" were taken once, when the admin started:
+# a route made in the admin afterwards was listed in /admin/api/models and refused as "Unsupported value for 'model'".
+def test_a_route_made_after_the_start_can_be_the_default_model(pool):
+    route = {"id": "coding-best", "label": "coding-best", "targets": ["claude-opus-5-5"], "strategy": "priority"}
+    assert pool.call("/admin/api/routes", route, method="POST")[0] == 200
+    schema = settings(pool)["schema"]
+    assert "coding-best" in schema["model"]["enum"] and "coding-best" in schema["prompt_suggestion_model"]["enum"]
+    status, body = patch(pool, {"model": "coding-best", "prompt_suggestion_model": "coding-best"})
+    assert status == 200, body
+    assert body["settings"]["model"] == "coding-best"
