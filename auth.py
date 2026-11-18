@@ -368,6 +368,7 @@ class ClientKeyManager:
         self._keys: dict[str, dict] = {}
         self._usage: dict[str, dict] = {}
         self._rpm_stamps: dict[str, collections.deque] = {}
+        self._counted: dict[str, str] = {}  # the last request each key was counted for (enforce_request)
         self.reload(cfg.get("client_keys") or [])
 
     def reload(self, raw_entries: list) -> None:
@@ -422,6 +423,10 @@ class ClientKeyManager:
 
         now_mono = time.monotonic()
         now_wall = time.time()
+        # A client request may check several models (a prompt suggestion tries its candidates after the request's own
+        # check): each took an RPM slot and counted a request, so one suggestion used two slots or more (audit A07-05).
+        import client_context  # imports no project module
+        request_id = (client_context.current() or {}).get("request_id")
         with self._lock:
             live = self._keys.get(kid, profile)
             stats = self._usage.setdefault(
@@ -435,6 +440,8 @@ class ClientKeyManager:
                     "insufficient_credits",
                     f"Client key '{live.get('label') or kid}' has reached its USD budget (${max_budget:.4f})",
                 )
+            if request_id and self._counted.get(kid) == request_id:
+                return  # this request was counted when it was first checked
             rpm = live.get("rpm_limit")
             if rpm is not None and rpm > 0:
                 window = self._rpm_stamps.setdefault(kid, collections.deque())
@@ -449,6 +456,8 @@ class ClientKeyManager:
                 window.append(now_mono)
             stats["requests"] += 1
             stats["last_used_at"] = round(now_wall, 3)
+            if request_id:
+                self._counted[kid] = request_id
 
     def record_usage(self, key_id: str | None, *, input_tokens: int = 0, output_tokens: int = 0, cost_usd: float | None = None) -> None:
         if not key_id or key_id == "master":
