@@ -576,15 +576,24 @@ def universal_entry(name, cfg=None):
     return None
 
 
+def bind_target(entry, target):
+    """`target` of the route alias `entry` as a turn of the alias runs it: the target's own entry (its id, upstream, price,
+    effort levels), which remembers the alias it serves (alias_id)."""
+    bound = dict(target)
+    bound['alias_id'] = entry['id']
+    return bound
+
+
 def bind_entry_for_backend(entry, backend_cfg):
-    """Bind a route-alias `entry` (with `route_targets`) to the concrete target served by `backend_cfg`."""
+    """Bind a route-alias `entry` (with `route_targets`) to the first target `backend_cfg` can serve by its configuration.
+
+    The pool binds a lease to the target it chose the account for (SessionPool._bound_target, lease.bound_entry), which
+    also skips a target held or failed on the account; this is what a turn without such a lease falls back to."""
     if not isinstance(entry, dict) or not entry.get('route_targets') or not isinstance(backend_cfg, dict):
         return entry
     for target in entry['route_targets']:
         if not route_block_reason(target, backend_cfg) and not resource_block_reason(target, backend_cfg):
-            bound = dict(target)
-            bound['alias_id'] = entry['id']
-            return bound
+            return bind_target(entry, target)
     return entry
 
 

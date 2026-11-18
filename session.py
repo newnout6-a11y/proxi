@@ -916,6 +916,22 @@ class _Dependent:
         self.session = None
 
 
+def _route_targets(model_entry):
+    """The targets of a route alias (routes[] in config.json) in the route's order; () for any other model."""
+    targets = model_entry.get("route_targets") if isinstance(model_entry, dict) else None
+    return targets or ()
+
+
+def _excluded_for(exclude, model_id):
+    """The accounts `exclude` takes out of a request for one model.
+
+    An item is an account that failed the request, or an (account, model id) pair: that account failed that target of a
+    route alias and may still serve the alias's other targets (the orchestrator's failover after a failure of the model
+    itself; a route whose fallback is another model of the same provider was never tried: audit A17-01)."""
+    return tuple(item[0] if isinstance(item, tuple) else item for item in exclude
+                 if not isinstance(item, tuple) or item[1] == model_id)
+
+
 class SessionPool:
     """Bounded persistent conversations with one exclusive lease per request."""
 
@@ -1077,7 +1093,7 @@ class SessionPool:
         Without the second half, when every account was in reserve or signed out, a conversation moved to the "richest" or
         least loaded other account on every request (its own session counts as load on its account), and each move dropped
         its signed history and wrote its whole prefix again, more credits than an account in reserve has left."""
-        if self._usable(backend, exclude) and self._routable(backend, model_entry):
+        if self._serves(backend, model_entry, exclude):
             return True
         try:
             kind, candidates = self._candidates(self.backends, model_entry, exclude)
@@ -1105,7 +1121,12 @@ class SessionPool:
             return "account_disabled"
         if getattr(backend, "unavailable", None) is not None and not self._keeps(backend, model_entry, exclude):
             return "account_unavailable"
-        return None if self._routable(backend, model_entry) else "no_route"
+        if not self._routable(backend, model_entry):
+            return "no_route"
+        primary = self._primary(backend, model_entry)
+        if backend in _excluded_for(exclude, (primary or {}).get("id")):
+            return "account_excluded"
+        return None if self._routable(backend, primary) else "no_route"
 
     def _stored_binding(self, keys, model_entry, exclude):
         """(meta, backend, refusal) of the first of `keys` that has a stored state.
@@ -1262,11 +1283,77 @@ class SessionPool:
 
     @staticmethod
     def _plan_hold(backend, model_entry):
-        """The hold AccountDispatcher.mark_plan_refusal keeps on this account for this model ({until_at, pause}), or None."""
+        """The hold AccountDispatcher.mark_plan_refusal keeps on this account for this model ({until_at, pause}), or None.
+
+        A hold is kept under the id of the model the turn ran as, for a route alias the target it was bound to, never the
+        alias (audit A08-01: a hold under "smart-opus" was seen by acquire() and by nothing that picks an account, so the
+        alias got a settled 404 while its Minara target was free). An alias is held on an account only while each target the
+        account can serve by its configuration is held there, and then its hold is the one that ends first."""
         holds = getattr(backend, "refused_models", None)
         if not isinstance(holds, dict) or not holds or model_entry is None:
             return None
-        return holds.get(model_entry.get("id"))
+        if not _route_targets(model_entry):
+            return holds.get(model_entry.get("id"))
+        found = [holds.get(target.get("id")) for target in SessionPool._configured_targets(backend, model_entry)]
+        if not found or not all(found):
+            return None
+        return min(found, key=lambda hold: hold.get("until_at") or 0)
+
+    @staticmethod
+    def _configured_targets(backend, model_entry):
+        """The targets of a route alias this account can serve by its configuration, in the route's order."""
+        cfg = getattr(backend, "cfg", None) or {}
+        return [target for target in _route_targets(model_entry)
+                if not model_catalog.route_block_reason(target, cfg)
+                and not model_catalog.resource_block_reason(target, cfg)]
+
+    @staticmethod
+    def _primary(backend, model_entry):
+        """The model this account serves a request with first: the model itself, or for a route alias the first of its
+        targets the account can serve by its configuration (the alias itself when there is none)."""
+        if not _route_targets(model_entry):
+            return model_entry
+        return next(iter(SessionPool._configured_targets(backend, model_entry)), model_entry)
+
+    @staticmethod
+    def _serves(backend, model_entry, exclude=()):
+        """Whether this account takes the request as it stands: usable, not failed for it, and a route to the model.
+
+        A route alias counts on the first target the account serves (_primary): once that one is held or failed on it, a
+        conversation moves where the route's order takes it, to a later target of the same account only when no account
+        serves an earlier one, instead of quietly changing models where it is."""
+        if not SessionPool._usable(backend, exclude):
+            return False
+        primary = SessionPool._primary(backend, model_entry)
+        return (backend not in _excluded_for(exclude, (primary or {}).get("id"))
+                and SessionPool._routable(backend, primary))
+
+    @staticmethod
+    def _bound_target(backend, model_entry, exclude=()):
+        """The model a request runs as on this account: the model itself, or for a route alias the first of its targets,
+        in the route's order, that the account serves now (its configuration, no hold of its plan, the pair did not fail
+        this request); None when there is none.
+
+        This is the target the pool chose the account for, and the turn is bound to it (lease.bound_entry). Bound by the
+        configuration alone, smart-opus went out as claude-opus-5-5 again to the account whose plan had just refused it, and
+        a later target of the same account or provider was never used (audits A08-02, A12-01, A17-01)."""
+        targets = _route_targets(model_entry)
+        if not targets:
+            return model_entry
+        for target in targets:
+            if backend in _excluded_for(exclude, target.get("id")) or SessionPool._route_refusal(backend, target):
+                continue
+            return model_catalog.bind_target(model_entry, target)
+        return None
+
+    @staticmethod
+    def _binding(backend, model_entry, exclude=()):
+        """What a lease's turn runs as (lease.bound_entry): _bound_target, else, for an account kept by default (in reserve,
+        signed out), its first target by configuration."""
+        bound = SessionPool._bound_target(backend, model_entry, exclude)
+        if bound is None:
+            bound = model_catalog.bind_entry_for_backend(model_entry, getattr(backend, "cfg", None))
+        return bound
 
     @staticmethod
     def _plan_reason(holds):
@@ -1419,6 +1506,8 @@ class SessionPool:
                 return "signed_out", fallback_signed_out
             raise (last_error or apierr.service_unavailable(f"no target in route '{model_entry.get('id')}' is currently usable"))
 
+        # An (account, model id) pair in `exclude` takes that account out for this model alone (_excluded_for).
+        exclude = _excluded_for(exclude, (model_entry or {}).get("id"))
         reasons = self._refusals(model_entry, backends, configured)
         routable = [backend for backend, reason in zip(backends, reasons) if not reason]
         refusals = [reason for reason in reasons if reason]
@@ -1704,7 +1793,7 @@ class SessionPool:
                 return self._stored_view(key, model_entry, exclude)
         else:
             session = None
-        if session is None or not (self._usable(session.backend, exclude) and self._routable(session.backend, model_entry)):
+        if session is None or not self._serves(session.backend, model_entry, exclude):
             return None
         return session
 
@@ -1858,6 +1947,8 @@ class SessionPool:
                 dependent.session = session
             session.begin_request()
             lease = SessionLease(session)
+            # The model the turn runs as: for a route alias, the target the pool chose this account for (_bound_target).
+            lease.bound_entry = self._binding(session.backend, model_entry, exclude)
             lease._cache_parents = parents
             lease._cache_dependent = dependent
             self._active[lease] = (session, key, lock, keep)
