@@ -636,6 +636,17 @@ test('the client sync says which files it updated and a failed Harness profile i
   await expect(page.getByText('DeepSeek Harness: no Proxi provider in the profile')).toBeVisible();
 });
 
+// A14-10: the catalog's "Обновить" re-reads only the providers' /models and models.dev, and its "Каталог обновлён"
+// suggested Retool's and Minara's catalogs were read too.
+test('the catalog refresh says what it re-read', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  await page.getByRole('button', { name: 'Обновить провайдеров' }).click();
+  await expect(page.getByText('Каталог провайдеров обновлён')).toBeVisible();
+  await expect(page.getByText(/модели Retool и Minara relay перечитывает сам/)).toBeVisible();
+});
+
 test('typing during a pending save is preserved as a new draft', async ({ page }) => {
   const state = await mockAdmin(page);
   state.patchDelay = 800;

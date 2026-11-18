@@ -351,8 +351,9 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
             <input type="checkbox" checked={onlyRoutable} onChange={(e) => setOnlyRoutable(e.target.checked)} />
             <span>Только с маршрутом</span>
           </label>
-          <Button icon={RefreshCw} disabled={refreshing} onClick={refreshAllCatalog}>
-            {refreshing ? 'Обновление…' : 'Обновить'}
+          <Button icon={RefreshCw} disabled={refreshing} onClick={refreshAllCatalog}
+            title="Перечитать /models API-провайдеров и models.dev; модели Retool и Minara relay перечитывает сам по расписанию">
+            {refreshing ? 'Обновление…' : 'Обновить провайдеров'}
           </Button>
         </div>
       </div>
