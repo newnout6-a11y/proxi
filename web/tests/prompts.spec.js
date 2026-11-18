@@ -731,7 +731,7 @@ test('protected rules come first and are locked, and turning protection off says
   const { prompts } = await openPrompts(page, {}, 'Правила');
   const locked = page.getByRole('list', { name: 'Встроенные защитные правила' });
   await expect(locked.locator('.rule-title')).toHaveText(['protected: service requests', 'protected: Claude Code compaction']);
-  await expect(locked).toContainText('Назначение: session-title или auto-mode-check или connection-probe или client-service → passthrough');
+  await expect(locked).toContainText('Назначение: session-title или auto-mode-check или connection-probe или prompt-suggestion или client-service → passthrough');
   await expect(locked.getByRole('switch')).toHaveCount(0);
   await expect(locked.getByRole('button')).toHaveCount(0);
   // they stand above the user's rules

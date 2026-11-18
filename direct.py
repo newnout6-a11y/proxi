@@ -2829,7 +2829,11 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             # asking again pays the same cap for the same nothing (two paid attempts, then a 502).
             capped = _hit_the_cap(body, flags)
             cut = bool(flags.get("cut_calls"))
-            if not usable and saw_end and not capped and not service_request:
+            # A prompt suggestion is told to stay silent when the next step is not obvious: its empty reply is the
+            # expected answer, kept out of logs/upstream-400. Any other empty reply, a service request's too, is a
+            # case worth one dump.
+            suggestion = client_context.current().get("request_purpose") == "prompt-suggestion"
+            if not usable and saw_end and not capped and not suggestion:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if (usable or not saw_end or service_request or not budget.remaining
                     or empty_retries >= max_empty_retries or capped):

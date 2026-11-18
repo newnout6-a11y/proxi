@@ -92,7 +92,7 @@ CHANGED_PATHS_LIMIT = 64  # the journal keeps 64 items of a list anyway
 DIALECTS = ("chat", "responses", "anthropic")
 # What a rule may name as `purpose`: client_context.request_kind() and the prompt layer's own client-service (plan 2.1).
 PURPOSES = ("client-tools", "client-text", "generation", "session-title", "auto-mode-check", "connection-probe",
-            "client-service")
+            "prompt-suggestion", "client-service")
 CONDITION_FLAGS = ("tools", "structured", "has_client_system")
 # A sample to show what the built-in structured contract says.
 STRUCTURED_EXAMPLE = {"kind": "json_schema", "name": "example", "schema": {
