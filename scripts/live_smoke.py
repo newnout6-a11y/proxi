@@ -25,6 +25,13 @@ def _urlopen(request, **kwargs):
         request.add_header(name, value)
     return urllib.request.urlopen(request, **kwargs)
 
+def _fail_on_stream_error(chunk):
+    """The relay ends a stream that broke after some text with an error event (proxy._stream_failure)."""
+    if isinstance(chunk, dict) and chunk.get("error"):
+        raise AssertionError("the relay ended the stream with an error: %s"
+                             % json.dumps(chunk["error"], ensure_ascii=False)[:300])
+
+
 def test_models():
     print("\n--- 1. Testing /v1/models ---")
     r = json.loads(_urlopen(f"{BASE}/v1/models").read().decode("utf-8"))
@@ -80,6 +87,7 @@ def test_streaming_openai():
                 continue
             if s.startswith("data: "):
                 chunk = json.loads(s[6:])
+                _fail_on_stream_error(chunk)
                 choices = chunk.get("choices") or []  # the last chunk carries only usage
                 delta = choices[0].get("delta", {}).get("content", "") if choices else ""
                 if delta:
@@ -109,6 +117,7 @@ def test_local_exec_and_context():
                 continue
             if s.startswith("data: "):
                 chunk = json.loads(s[6:])
+                _fail_on_stream_error(chunk)
                 choices = chunk.get("choices") or []  # the last chunk carries only usage
                 delta = choices[0].get("delta", {}).get("content", "") if choices else ""
                 if delta:
