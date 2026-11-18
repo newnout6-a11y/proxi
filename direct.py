@@ -2777,11 +2777,14 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
                 if _refused_for_now(failure) and not flags.get("usage_seen"):
                     possibly_billed = False  # refused before anything was generated: it cost nothing, as an HTTP 429 never does
-                elif (apierr.is_account_quota(failure) and not flags.get("usage_seen")
+                elif (getattr(failure, "in_stream", False) and not flags.get("usage_seen")
                       and not (usable or thinking_seen or spoke or held)):
-                    # The account's hourly limit as an error event inside a 200, before the model gave anything: the same
-                    # refusal as its HTTP 429 form, which costs nothing. Taken for a possible charge, it marked the balance
-                    # unreported, told the client an unknown cost and sent the empty usage event that zeroed the
+                    # An error event that opens the HTTP 200, before the model gave anything and without metadata: a refusal
+                    # made before generating, which costs nothing, as its HTTP form never does. Retool sends the account's
+                    # hourly limit this way, and its provider's refusal of an input past the context window ("Your input
+                    # exceeds the context window", "prompt is too long": probes p21 and p31 of 2026-11-18, both
+                    # isRetryable false and nothing else but end_of_stream). Taken for a possible charge, it marked the
+                    # balance unreported, told the client an unknown cost and sent the empty usage event that zeroed the
                     # conversation's prefix size, so account_rate_limit_wait moved it at once. One that comes after text or
                     # thinking may have been billed, and stays unknown.
                     possibly_billed = False
@@ -3132,7 +3135,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             elif usage:
                 yield {"type": "usage", "usage": normalized}
         elif kind == "error":
-            raise _error_from_event(event)
+            error = _error_from_event(event)
+            error.in_stream = True  # said by upstream inside its answer, not a read that failed
+            raise error
 
 
 def _http_error(status, detail):
