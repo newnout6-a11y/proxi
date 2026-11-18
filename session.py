@@ -932,6 +932,15 @@ def _excluded_for(exclude, model_id):
                  if not isinstance(item, tuple) or item[1] == model_id)
 
 
+def _route_strategy(model_entry):
+    """How a route alias spreads its turns over the accounts of all its targets ("weighted", "least-inflight"), or None for
+    "priority" (its first target that has a usable account) and any other model."""
+    if not _route_targets(model_entry):
+        return None
+    strategy = str(model_entry.get("route_strategy") or "priority").lower()
+    return strategy if strategy in ("weighted", "least-inflight") else None
+
+
 class SessionPool:
     """Bounded persistent conversations with one exclusive lease per request."""
 
@@ -1492,6 +1501,11 @@ class SessionPool:
             fallback_reserve = None
             fallback_signed_out = None
             last_error = None
+            # A route that spreads its turns (strategy weighted or least-inflight, _next_backend) offers the usable accounts
+            # of every target; "priority" those of its first target that has any (audit A16-03: the strategy was saved,
+            # shown and never applied).
+            spread = _route_strategy(model_entry) is not None
+            ready = []
             for target in model_entry["route_targets"]:
                 try:
                     kind, found = self._candidates(backends, target, exclude, configured)
@@ -1499,12 +1513,16 @@ class SessionPool:
                     if last_error is None or err.status != 404:
                         last_error = err
                     continue
-                if kind == "ready":
+                if kind == "ready" and not spread:
                     return "ready", found
-                if kind == "reserve" and fallback_reserve is None:
+                if kind == "ready":
+                    ready.extend(backend for backend in found if backend not in ready)
+                elif kind == "reserve" and fallback_reserve is None:
                     fallback_reserve = found
                 elif kind == "signed_out" and fallback_signed_out is None:
                     fallback_signed_out = found
+            if ready:
+                return "ready", ready
             if fallback_reserve is not None:
                 return "reserve", fallback_reserve
             if fallback_signed_out is not None:
@@ -1584,7 +1602,8 @@ class SessionPool:
                 inflight_counts[session.backend] += 1
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % max(1, len(self.backends))
-        return catalog_router.select_candidate_backend(candidates, self.backends, counts, inflight_counts, idx)
+        return catalog_router.select_candidate_backend(candidates, self.backends, counts, inflight_counts, idx,
+                                                       strategy=_route_strategy(model_entry))
 
     @property
     def mode(self):

@@ -227,8 +227,12 @@ def build_route_aliases(cfg: dict, model_catalog_module) -> dict[str, dict]:
     return aliases
 
 
-def select_candidate_backend(candidates: list, all_backends: list, counts: dict, inflight_counts: dict, rr_index: int):
-    """Select one backend among `candidates` honoring `fill-first`, `weighted`, or `least-inflight` strategy."""
+def select_candidate_backend(candidates: list, all_backends: list, counts: dict, inflight_counts: dict, rr_index: int,
+                             strategy: str | None = None):
+    """Select one backend among `candidates` honoring `fill-first`, `weighted`, or `least-inflight` strategy.
+
+    `strategy` is a route alias's own (routes[].strategy, SessionPool._next_backend); without one the accounts' key-pool
+    strategy (routing_strategy) decides."""
     if len(candidates) == 1:
         return candidates[0]
 
@@ -238,7 +242,8 @@ def select_candidate_backend(candidates: list, all_backends: list, counts: dict,
     if len(top_tier) == 1:
         return top_tier[0]
 
-    strategies = {str((getattr(b, "cfg", None) or {}).get("routing_strategy") or "").lower() for b in top_tier}
+    strategies = ({strategy} if strategy else
+                  {str((getattr(b, "cfg", None) or {}).get("routing_strategy") or "").lower() for b in top_tier})
     if "least-inflight" in strategies:
         return min(
             top_tier,
