@@ -258,6 +258,16 @@ async def _pause(cancelled, seconds):
     return True
 
 
+def _settle_turn(holder, went_on=None):
+    """Write the turn.error and turn.end a failed attempt left pending (TurnRunner._run_once), now that its fate is known.
+
+    `went_on` says what the request did next ("moved" to another account, "retried"): the attempt's error reached no client
+    and is logged at warn with that outcome. None: the error is the request's answer, logged at error as before."""
+    close = holder.pop("_close_turn", None)
+    if close is not None:
+        close(went_on)
+
+
 def _can_exec(cfg, steps: int) -> bool:
     """No limits by default; an explicit max_exec_turns > 0 caps the steps."""
     if cfg["exec_policy"] == "off":
@@ -1037,11 +1047,14 @@ class TurnRunner:
             cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None,
             clock=getattr(getattr(self, "accounts", None), "clock", None))
         while True:
+            # A path below that asks again without saying how leaves the attempt's close pending: it was retried.
+            _settle_turn(holder, "retried")
             relay = _FailoverOut(out)
             holder.pop("session", None)
             try:
                 await self._run_once(parsed, relay, holder, exclude=tuple(exclude))
             except BaseException:
+                _settle_turn(holder)
                 if relay.error is not None:
                     out.put({"type": "error", "error": relay.error})
                 out.put(None)
@@ -1082,6 +1095,7 @@ class TurnRunner:
                             getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), pause))
                         if not await _pause(cancelled, pause):
                             holder["reason"] = "stop"
+                            _settle_turn(holder, "retried")
                             continue
                         retryable = False  # the client went away while the request waited: only the account is told
                     # Hourly managed-key limit: park the account so later requests skip it, then
@@ -1105,6 +1119,7 @@ class TurnRunner:
                     # balances once, so a top-up is used without waiting for the timer.
                     rechecked = True
                     if await _off_loop(accounts.recheck_exhausted, getattr(parsed, "entry", None)):
+                        _settle_turn(holder, "retried")
                         continue
                 minara_refusal = (retryable and backend is not None and backend not in exclude
                                   and (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
@@ -1122,11 +1137,13 @@ class TurnRunner:
                     # With no account left, the next acquire raises a clear 402.
                     exhausted = await _off_loop(accounts.check_balance_now, backend)
             except BaseException:
+                _settle_turn(holder)
                 out.put({"type": "error", "error": error})
                 out.put(None)
                 raise
             if rate_limited:
                 exclude.append(backend)
+                _settle_turn(holder, "moved")
                 # Refused before anything was generated or billed: the move to the next account costs no attempt.
                 holder["_attempt_budget"].refund()
                 journal.emit("account.failover", "Часовой лимит Retool — запрос повторён на другом аккаунте",
@@ -1138,6 +1155,7 @@ class TurnRunner:
                 continue
             if plan_refused:
                 exclude.append(backend)
+                _settle_turn(holder, "moved")
                 holder["_attempt_budget"].refund()
                 journal.emit("account.failover", "Модель не входит в тариф аккаунта Retool — запрос повторён на другом аккаунте",
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
@@ -1148,6 +1166,7 @@ class TurnRunner:
                 continue
             if exhausted:
                 exclude.append(backend)
+                _settle_turn(holder, "moved")
                 if minara_refusal:
                     # Minara said 402/401/403 before generating anything (unbilled). An exhaustion confirmed by a balance
                     # read after some other failure (a 5xx) keeps that failure's attempt charged.
@@ -1171,6 +1190,7 @@ class TurnRunner:
                     parsed.entry, exclude=(*exclude, backend), **acquire_plan(self.cfg, parsed).kwargs
                 ) is None:
                     exclude.append(backend)
+                    _settle_turn(holder, "moved")
                     journal.emit("account.failover", "Сбой апстрима провайдера — запрос переключён на резервный маршрут",
                                  "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                                  error=error.code, reason="provider_failover")
@@ -1182,6 +1202,7 @@ class TurnRunner:
                 # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
                 # the client gets the settled 404 that names the cause rather than a 502 it would only send again.
                 error = self._pool_refusal(parsed, exclude) or error
+            _settle_turn(holder)  # the error, if any, is what the client gets: red
             if error is not None:
                 out.put({"type": "error", "error": error})
             out.put(None)
@@ -2246,12 +2267,7 @@ class TurnRunner:
         finally:
             duration = round((time.monotonic() - turn_started) * 1000)
             err = outcome["error"]
-            if err is not None:
-                log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]), "error",
-                    status=err.status, code=err.code)
-                reason = "error"
-            else:
-                reason = outcome["reason"] or holder.get("reason") or "stop"
+            reason = "error" if err is not None else outcome["reason"] or holder.get("reason") or "stop"
             holder["_speed_reason"] = reason
             # Explicit account-quota and plan refusals are free; retain their latency, but count no generated tokens.
             if err is not None and (apierr.is_account_quota(err) or apierr.is_plan_refusal(err)):
@@ -2260,10 +2276,27 @@ class TurnRunner:
                     request_attempts[(turn_id, number)] = 0
             output_tokens = (sum(output_attempts.values()) if output_attempts
                              and all(value is not None for value in output_attempts.values()) else None)
-            log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
-                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout", "length") else "success",
-                reason=reason, duration_ms=duration, exec_steps=exec_steps,
-                output_tokens=output_tokens, tokens_per_second=None,
-                retries=empty_retries + tool_retries,
-                **({"web_searches": search_uses} if search_uses else {}))
+
+            def close(went_on=None):
+                # went_on: what the request did after this failed attempt ("moved" to another account, "retried" here),
+                # or None when the error is what the client gets. Only that one is red (_settle_turn).
+                moved = {"outcome": went_on} if err is not None and went_on else {}
+                if err is not None:
+                    log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]),
+                        "warn" if moved else "error", status=err.status, code=err.code, **moved)
+                log("turn.end", "Ход завершён: %s за %.1f с%s" % (
+                        reason, duration / 1000, " · запрос продолжен" if moved else ""),
+                    "warn" if moved else "error" if reason == "error"
+                    else "warn" if reason in ("cancelled", "timeout", "length") else "success",
+                    reason=reason, duration_ms=duration, exec_steps=exec_steps,
+                    output_tokens=output_tokens, tokens_per_second=None,
+                    retries=empty_retries + tool_retries,
+                    **({"web_searches": search_uses} if search_uses else {}), **moved)
+
+            if err is None:
+                close()
+            else:
+                # Whether the client gets this error is decided by _run_request (failover, a wait, a recheck): it writes
+                # turn.error and turn.end once it knows (audit A02-06: 304 red events in requests that ended with 200).
+                holder["_close_turn"] = close
             out.put(None)
