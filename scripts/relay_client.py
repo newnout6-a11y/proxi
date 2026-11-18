@@ -95,6 +95,10 @@ def main():
                         continue
                     if s.startswith("data: "):
                         chunk = json.loads(s[6:])
+                        if isinstance(chunk, dict) and chunk.get("error"):
+                            # The relay ends a stream that broke after some text with an error event.
+                            print("\n\n[Stream error]: " + json.dumps(chunk["error"], ensure_ascii=False)[:500])
+                            sys.exit(1)
                         choices = chunk.get("choices") or []
                         if not choices:
                             continue
