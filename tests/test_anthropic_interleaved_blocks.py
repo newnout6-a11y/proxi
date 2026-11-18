@@ -148,6 +148,36 @@ def test_the_reply_that_is_not_streamed_was_complete_all_along():
     assert payload_shape(final) == [("tool_use", "t1", {"p": 1}), ("text", "hi")]
 
 
+@pytest.mark.parametrize("stream", [True, False])
+def test_each_thinking_block_keeps_its_own_signature(stream):
+    # R3-30: a reply may hold several thinking blocks (reasoning, then a progress update before a tool_use), each with
+    # its own signature right before its stop. The second block's text went into the first one and the two signatures
+    # were joined into one string: a block no upstream signed, refused with a 400 when it is sent back.
+    events = [{"type": "thinking_start"}, {"type": "thinking", "delta": "plan"},
+              {"type": "thinking_signature", "signature": "sig-1"}, {"type": "thinking", "delta": "update"},
+              {"type": "thinking_signature", "signature": "sig-2"}, call("t1", '{"p":1}', done=True)]
+    writer, final = run(events, stream=stream)
+    expected = [("thinking", "plan", "sig-1"), ("thinking", "update", "sig-2"), ("tool_use", "t1", {"p": 1})]
+    assert payload_shape(final) == expected
+    if stream:
+        blocks, late, open_ = accumulate(writer)
+        assert late == [] and open_ == set() and shape(blocks) == expected
+        order = [(name, payload["index"], payload.get("delta", {}).get("type")) for name, payload in writer.events
+                 if name.startswith("content_block") and payload["index"] == 0]
+        assert order[-2:] == [("content_block_delta", 0, "signature_delta"), ("content_block_stop", 0, None)]
+
+
+def test_a_signature_that_comes_in_pieces_stays_one_signature():
+    # Retool streams partialSignature, and its own client adds the pieces up: more of a signature is no new block.
+    events = [{"type": "thinking_start"}, {"type": "thinking", "delta": "plan"},
+              {"type": "thinking_signature", "signature": "CAQS"}, {"type": "thinking_signature", "signature": "-rest"},
+              text("answer")]
+    writer, final = run(events, reason="stop")
+    assert payload_shape(final) == [("thinking", "plan", "CAQS-rest"), ("text", "answer")]
+    blocks, late, open_ = accumulate(writer)
+    assert late == [] and open_ == set() and shape(blocks) == payload_shape(final)
+
+
 def random_reply(rng):
     """Events as a provider that interleaves would send them: calls, their pieces, text and thinking, in any order."""
     calls = {name: {"arguments": json.dumps({"k": rng.randint(0, 9), "s": "x" * rng.randint(0, 5)}), "sent": 0}

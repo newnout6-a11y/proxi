@@ -2,17 +2,20 @@
 import json
 import select
 import socket
+import time
 
+# Seconds without a write after which a stream gets its keepalive (the adapter of its dialect says what it is, and may
+# wait longer: adapters.AnthropicAdapter.keepalive_every).
 HEARTBEAT_EVERY = 15.0
 
-
-import time
 
 class StreamWriter:
     def __init__(self, handler):
         self.handler = handler
         self.broken = False
-        self.last_write = time.time()
+        # When the last bytes went to the client, on the monotonic clock: the keepalive counts its interval from it, and
+        # a step of the wall clock (w32time correcting a drift) must neither delay it nor send a burst of them (A01-08).
+        self.last_write = time.monotonic()
 
     def start(self, headers=None):
         self.handler.send_response(200)
@@ -41,7 +44,7 @@ class StreamWriter:
             trace = getattr(self.handler, "_client_trace", None)
             if trace:
                 trace.raw(data)
-            self.last_write = time.time()
+            self.last_write = time.monotonic()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             trace = getattr(self.handler, "_client_trace", None)
             if trace:

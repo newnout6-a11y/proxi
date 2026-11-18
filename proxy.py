@@ -60,7 +60,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RECORD_REQUEST_BYTES = 1024 * 1024
 # What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
 _CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
-                 "dialect", "thinking_placeholder", "virtual_profile", "requested_model", "client_task")
+                 "dialect", "virtual_profile", "requested_model", "client_task")
 
 
 def _carry_compatibility(first, parsed, changes):
@@ -698,12 +698,14 @@ def make_handler(runtime: Runtime):
         def _stream_failure(self, dialect, err):
             """End a stream that failed after it started. Only Responses has a terminal failure event."""
             payload = self._error_payload(dialect, err)
-            if dialect == "responses":
-                self._adapter.fail(err, payload)  # error, then response.failed (see ResponsesAdapter.fail)
-            else:
-                self._writer.event("error", payload)
             # Journal must not report a mid-stream failure as 200/success.
             self._stream_status = err.status
+            if dialect == "responses":
+                # error, then response.failed (see ResponsesAdapter.fail), which ends the stream: no data: [DONE] in
+                # Responses (Codex logged it as "Failed to parse SSE event").
+                self._adapter.fail(err, payload)
+                return
+            self._writer.event("error", payload)
             self._writer.done()
 
         def _log_error(self, err):
@@ -967,7 +969,6 @@ def make_handler(runtime: Runtime):
             # The size of the request as the client sent it, for count_tokens to scale from the real usage of this
             # request (a profile may rewrite the body, which the next count_tokens of the client does not see).
             client_chars = adapters.request_chars(parsed)
-            parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
             runtime.client_keys.enforce_request(
@@ -1480,18 +1481,19 @@ def make_handler(runtime: Runtime):
             fut.cancel()
 
         def _pump(self, fut, events, adapter, holder, writer):
-            """Stream events to the client, sending heartbeats and honouring disconnects."""
-            last_write = time.time()
+            """Stream events to the client, keeping a silent stream alive and honouring disconnects.
+
+            The keepalive is the dialect's own (adapter.keepalive: Responses response.in_progress, Messages ping, Chat
+            a comment) and goes out once nothing was written to the client for its interval, counted on the monotonic
+            clock from the writer's last write. It used to be a comment sent only when the queue had been empty for
+            15 s: Codex and Claude Code drop comments, and events that write nothing (a transport's heartbeat, a reply
+            held for its check) kept it from going out at all (findings 3 №16, A01-01)."""
             reason = "stop"
             while True:
                 try:
                     event = events.get(timeout=0.25)
                 except queue.Empty:
-                    now = time.time()
-                    writer_last = getattr(writer, "last_write", last_write)
-                    if now - writer_last >= sse.HEARTBEAT_EVERY:
-                        writer.comment()
-                        last_write = now
+                    self._keep_alive(adapter, writer)
                     if sse.client_gone(self) or getattr(writer, "broken", False):
                         self._cancel_turn(fut, holder)
                         return "cancelled"
@@ -1513,12 +1515,19 @@ def make_handler(runtime: Runtime):
                 except apierr.ApiError:
                     self._cancel_turn(fut, holder)
                     raise
-                last_write = time.time()
+                self._keep_alive(adapter, writer)
                 # Check for a disconnect on every event, not only when the stream idles.
                 if sse.client_gone(self) or getattr(writer, "broken", False):
                     self._cancel_turn(fut, holder)
                     return "cancelled"
             return holder.get("reason", reason)
+
+        @staticmethod
+        def _keep_alive(adapter, writer):
+            """The dialect's keepalive, when nothing was written to the client for its interval."""
+            last = getattr(writer, "last_write", None)
+            if last is not None and time.monotonic() - last >= adapter.keepalive_every:
+                adapter.keepalive()
 
     return Handler
 

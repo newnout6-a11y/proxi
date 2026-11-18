@@ -189,6 +189,11 @@ class _FailoverOut:
     """Forwards turn events, holding back the error and end sentinel so the
     runner can retry on another account before the client sees anything."""
 
+    # Events that carry nothing the reply is made of: accounting, and the display statuses that say the model reasons
+    # (or that time passes) without a word of it. A refusal after them was not answered yet: it moves like one before
+    # them. Counted as output, a thinking_status made every unbilled refusal after it final (A02-01).
+    NO_OUTPUT = frozenset({"credits", "usage", "usage_start", "thinking_status", "thinking_heartbeat"})
+
     def __init__(self, out):
         self.out = out
         self.error = None
@@ -205,7 +210,7 @@ class _FailoverOut:
         # output yet. Counted as output, it made every failed Minara turn final, a 402 included (audit, 2026-11-10).
         if event.get("type") == "request_sent":
             self.sent = True
-        elif event.get("type") not in ("credits", "usage", "usage_start"):
+        elif event.get("type") not in self.NO_OUTPUT:
             self.started = True
         self.out.put(event)
 
@@ -1632,7 +1637,9 @@ class TurnRunner:
                                     if event.get("text"):
                                         final_text = event["text"]
                                 elif event["type"] in ("thinking_status", "thinking_start"):
-                                    if think_started is None:
+                                    # Only a sign the upstream gave starts the thinking span of the journal: a status of the
+                                    # relay's own (source "relay", the Minara timer of 54b1023) said nothing about the model.
+                                    if think_started is None and event.get("source") != "relay":
                                         think_started = time.time()
                                         ms = round((think_started - holder["upstream_started_at"]) * 1000)
                                         log("upstream.thinking_start", "Upstream сообщил начало thinking через %d мс" % ms,
