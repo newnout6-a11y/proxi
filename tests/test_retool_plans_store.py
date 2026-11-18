@@ -261,7 +261,8 @@ def test_after_a_restart_a_new_conversation_goes_to_the_account_that_serves_with
         await run(retool.runner, turn("conv-1"))
         retool.clock.now += PLAN_REFUSAL_FIRST + 1
         retool.dispatcher.release_plan_refusals()
-        await run(retool.runner, turn("conv-2"))  # acc-a refuses again within the hour: written down
+        # acc-a's plan refuses again within the hour (another client's request): written down.
+        retool.dispatcher.mark_plan_refusal(retool.a, OPUS)
         retool.dispatcher.flush_plans()
         # The relay restarts: a new dispatcher over the same accounts and file.
         restarted = AccountDispatcher(list(retool.pool.backends), retool.runner.cfg, {}, clock=retool.clock,

@@ -482,6 +482,11 @@ def test_after_the_hold_the_account_is_asked_again_and_a_new_refusal_holds_it_ag
         first = retool.a.refused_models[OPUS]["pause"]
         retool.clock.now += first + 1
         assert retool.dispatcher.release_plan_refusals() and retool.a.refused_models == {}
+        # acc-b's plan served the model and acc-a's never did: a new conversation goes to acc-b first, until acc-b carries
+        # more than twice acc-a's load plus one (SessionPool._plan_order, design D4 1.6). It was offered to the refusing
+        # account first, being the least loaded one (audit A03-03). acc-b takes one more conversation here ...
+        await run(retool.runner, turn("conv-x"))
+        # ... and the next one asks acc-a again.
         await run(retool.runner, turn("conv-2"))
         again = retool.a.refused_models[OPUS]["pause"]
         retool.script["acc-a"] = serve_ok  # the plan includes the model now
@@ -492,7 +497,7 @@ def test_after_the_hold_the_account_is_asked_again_and_a_new_refusal_holds_it_ag
 
     # Five minutes, then an hour: the account refused again within the hour after its first hold ended.
     assert asyncio.run(scenario()) == (PLAN_REFUSAL_FIRST, PLAN_REFUSAL_HOLD)
-    assert retool.posts == ["acc-a", "acc-b", "acc-a", "acc-b", "acc-a"]
+    assert retool.posts == ["acc-a", "acc-b", "acc-b", "acc-a", "acc-b", "acc-a"]
     assert retool.pool._conversations["conv-3"].backend is retool.a
     # The conversations that moved stay where their cache is.
     assert retool.pool._conversations["conv-1"].backend is retool.b

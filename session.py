@@ -941,6 +941,28 @@ def _route_strategy(model_entry):
     return strategy if strategy in ("weighted", "least-inflight") else None
 
 
+# Retool models a plan of 250 credits a month does not include as a rule: on 2026-11-18 all 22 such accounts refused
+# claude-opus-5-5 and claude-sonnet-5-5, and the GPT-6 models wherever they were asked (reverse_retool_live 7).
+_FRONTIER = ("claude-opus-", "claude-sonnet-5", "claude-fable-", "gpt-6", "gpt-5.6-luna")
+SMALL_PLAN = 250
+
+
+def _frontier(model):
+    return isinstance(model, str) and model.startswith(_FRONTIER)
+
+
+def _small_plan(backend):
+    """Whether this Retool account's last read balance names a monthly allocation of SMALL_PLAN credits or less."""
+    if (getattr(backend, "cfg", None) or {}).get("upstream", "retool") != "retool":
+        return False
+    snapshot = getattr(getattr(backend, "credits", None), "balance_snapshot", None)
+    try:
+        allocation = console_log.number((snapshot() or {}).get("monthly_allocation")) if snapshot else None
+    except Exception:  # noqa: BLE001 - an order hint must never fail a request
+        return False
+    return allocation is not None and 0 < allocation <= SMALL_PLAN
+
+
 class SessionPool:
     """Bounded persistent conversations with one exclusive lease per request."""
 
@@ -1602,8 +1624,35 @@ class SessionPool:
                 inflight_counts[session.backend] += 1
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % max(1, len(self.backends))
+        candidates = self._plan_order(candidates, model_entry, exclude, counts)
         return catalog_router.select_candidate_backend(candidates, self.backends, counts, inflight_counts, idx,
                                                        strategy=_route_strategy(model_entry))
+
+    def _plan_order(self, candidates, model_entry, exclude, counts):
+        """The accounts a new conversation is offered first (design D4 1.6): those whose Retool plan served its model
+        (AccountDispatcher.mark_plan_served, `served_models`, kept a week), then the others, and last, for a frontier model,
+        those on a plan of 250 credits a month that never served it (all 22 such accounts refused Opus and Sonnet 5.5 on
+        2026-11-18, and "least loaded" sent every new conversation to them first: A03-03).
+
+        A preference, never an exclusion (a plan can change): a lower tier gets the conversation once every account of
+        the tier above carries more than twice the load (conversations, turns in flight twice) of the least loaded
+        account below it, plus one."""
+        tiers = ([], [], [])
+        for backend in candidates:
+            target = self._bound_target(backend, model_entry, exclude) or model_entry
+            model = (target or {}).get("id")
+            if model in (getattr(backend, "served_models", None) or {}):
+                tiers[0].append(backend)
+            elif _frontier(model) and _small_plan(backend):
+                tiers[2].append(backend)
+            else:
+                tiers[1].append(backend)
+        tiers = [tier for tier in tiers if tier]
+        for index, tier in enumerate(tiers):
+            rest = [backend for lower in tiers[index + 1:] for backend in lower]
+            if not rest or min(counts.get(b, 0) for b in tier) <= 2 * min(counts.get(b, 0) for b in rest) + 1:
+                return tier
+        return candidates
 
     @property
     def mode(self):
