@@ -950,7 +950,11 @@ class Admin:
             "accounts": [self._public(account) for account in pool],
             "summary": {"total": len(live), "enabled": sum(account["enabled"] for account in live),
                         "routable": sum(account["routable"] for account in live),
-                        "reserve": sum(account["reserve"] for account in live), "states": states},
+                        "reserve": sum(account["reserve"] for account in live), "states": states,
+                        # The universal providers serve too: the last enabled account is not the last that answers
+                        # when one is enabled (_other_enabled counts them, and so does the accounts page).
+                        "enabled_providers": sum(1 for item in self.cfg.get("providers") or []
+                                                 if isinstance(item, dict) and item.get("enabled", True) is not False)},
             "limits": {key: self.cfg.get(key, config.DEFAULTS.get(key))
                        for key in ("min_account_balance", "account_balance_interval", "account_refresh_parallel")},
             "restart_required": any(account["pending"] for account in pool),

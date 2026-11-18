@@ -455,6 +455,16 @@ def _merge_provider_patch(existing: dict, data: dict) -> dict:
     return merged
 
 
+def _serves_without(admin_obj, saved: dict, pid: str) -> bool:
+    """Whether the relay keeps something to answer with when provider `pid` stops: an enabled account or another enabled
+    provider. The last enabled account cannot be switched off or removed; the last provider of a relay without accounts
+    could, and nothing was left to answer (audit A14-13)."""
+    accounts = [record for record in admin_obj._records(saved) if record.get("enabled", True) is not False]
+    others = [p for p in saved.get("providers") or [] if isinstance(p, dict) and p.get("enabled", True) is not False
+              and str(p.get("id") or "").strip().lower() != pid]
+    return bool(accounts or others)
+
+
 def create_provider(admin_obj, data: dict) -> dict:
     if not isinstance(data, dict):
         raise apierr.bad_request("Request body must be a JSON object")
@@ -518,6 +528,9 @@ def update_provider(admin_obj, provider_id: str, data: dict) -> dict:
         if idx is None:
             raise apierr.not_found(f"Unknown provider '{pid}'")
         existing = copy.deepcopy(prov_list[idx])
+        if (data.get("enabled") is False and existing.get("enabled", True) is not False
+                and not _serves_without(admin_obj, saved, pid)):
+            raise apierr.conflict("The last enabled provider cannot be switched off: nothing else would answer")
         merged = _merge_provider_patch(existing, data)
 
         merged["id"] = pid
@@ -569,6 +582,10 @@ def delete_provider(admin_obj, provider_id: str) -> dict:
         remaining = [p for p in prov_list if not (isinstance(p, dict) and str(p.get("id") or "").strip().lower() == pid)]
         if len(remaining) == len(prov_list):
             raise apierr.not_found(f"Unknown provider '{pid}'")
+        removed = [p for p in prov_list if p not in remaining]
+        if (any(isinstance(p, dict) and p.get("enabled", True) is not False for p in removed)
+                and not _serves_without(admin_obj, saved, pid)):
+            raise apierr.conflict("The last enabled provider cannot be removed: nothing else would answer")
         saved["providers"] = remaining
         admin_obj._write(path, saved)
         admin_obj.cfg["providers"] = copy.deepcopy(remaining)

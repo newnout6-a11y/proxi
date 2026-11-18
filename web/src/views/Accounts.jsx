@@ -267,8 +267,9 @@ export default function Accounts({ apiKey, onUnauthorized, refreshOverview }) {
 
   const accounts = data?.accounts || [];
   const summary = data?.summary;
-  // Only accounts that serve now count: an added one waits for a restart, a removed one is leaving
-  const enabledCount = accounts.filter((a) => a.enabled !== false && !a.pending).length;
+  // Only accounts that serve now count: an added one waits for a restart, a removed one is leaving. An enabled universal
+  // provider serves too: the relay then lets the last account go (admin._other_enabled), and so does this page.
+  const enabledCount = accounts.filter((a) => a.enabled !== false && !a.pending).length + (summary?.enabled_providers || 0);
 
   const action = (account) => (kind) => run(account.account, kind === 'balance' ? 'Баланс не получен' : 'Сессия не продлена',
     () => api(apiKey, `accounts/${account.account}/${kind}`, { method: 'POST', body: {} }),

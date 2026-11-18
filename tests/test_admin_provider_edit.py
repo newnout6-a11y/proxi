@@ -132,3 +132,18 @@ def test_a_provider_named_test_can_be_changed_and_deleted(gateway_admin, mock_up
     assert status == 200 and answer["provider"]["name"] == "Renamed test"
     assert gateway_admin.admin_call("/admin/api/providers/test", method="DELETE")[0] == 200
     assert [p["id"] for p in gateway_admin.admin_call("/admin/api/providers")[1]["providers"]] == ["other"]
+
+
+# A14-13: the only provider of a relay without accounts could be switched off or deleted, leaving nothing to answer;
+# an account cannot (409).
+def test_the_last_provider_that_serves_cannot_be_switched_off_or_deleted(gateway_admin, mock_upstream):
+    create(gateway_admin, mock_upstream)
+    status, answer = patch(gateway_admin, {"enabled": False})
+    assert status == 409, answer
+    assert gateway_admin.admin_call("/admin/api/providers/hub", method="DELETE")[0] == 409
+    create(gateway_admin, mock_upstream, pid="second")
+    assert patch(gateway_admin, {"enabled": False})[0] == 200
+    assert patch(gateway_admin, {"enabled": False}, pid="second")[0] == 409
+    assert gateway_admin.admin_call("/admin/api/providers/hub", method="DELETE")[0] == 200
+    status, accounts = gateway_admin.admin_call("/admin/api/accounts")
+    assert accounts["summary"]["enabled_providers"] == 1
