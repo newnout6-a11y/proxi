@@ -882,7 +882,18 @@ class AnthropicAdapter(_Base):
         # provider reasons silently; the later signature attaches to it.
         if self._wait(self._think_start):
             return
-        self._open("thinking")
+        self._thinking_block()
+
+    def _thinking_block(self):
+        """The thinking block that reasoning goes into: the open one, unless its signature has come.
+
+        A reply may hold several thinking blocks (the reasoning, then a progress update before a tool_use), each signed on
+        its own right before its stop (R3-30). Text or a start of thinking that comes after a signature is the next
+        block: added to the signed one, it made one block of two texts with two signatures joined, which no upstream
+        signed and which is refused when it is sent back."""
+        if self.open_kind == "thinking" and self._blocks[self.index].get("signature"):
+            self._close_blocks()
+        return self._open("thinking")
 
     def _think_status(self):
         # The upstream began a thinking block and shows nothing of it yet (Retool's content_block_start, which the
@@ -895,7 +906,7 @@ class AnthropicAdapter(_Base):
     def _think(self, delta):
         if self._wait(self._think, delta):
             return
-        block = self._open("thinking")
+        block = self._thinking_block()
         block["thinking"] += delta
         self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                            "delta": {"type": "thinking_delta", "thinking": delta}})
@@ -910,6 +921,8 @@ class AnthropicAdapter(_Base):
         if self._wait(self._signature, signature):
             return
         if signature and self.open_kind == "thinking":
+            # More of a signature continues it (Retool's partialSignature is a piece, which its own client adds up);
+            # thinking that comes after it is a block of its own (_thinking_block).
             self._blocks[self.index]["signature"] += signature
             self._emit("content_block_delta", {"type": "content_block_delta", "index": self.index,
                                                "delta": {"type": "signature_delta", "signature": signature}})
