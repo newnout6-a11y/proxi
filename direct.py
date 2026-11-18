@@ -63,6 +63,14 @@ def _int_setting(cfg, key, default):
 # adds before any further POST of a step.
 RATE_LIMIT_WAITS = (1.5, 3.0, 6.0)
 
+# Retool models whose registry entry says supportsFineGrainedStreaming: true (public frontend bundle, 2026-11-18); Retool's
+# own Sandpack agent asks for it on them. With enableFineGrainedStreaming the arguments of a tool call stream in ~18
+# characters every ~50 ms; without it Retool sends the first ~20 characters and holds the rest (16.6 s for a 6 kB Write in
+# probes, minutes on long ones), which the stall watchdog took for a dead stream. It changes nothing in text or thinking.
+FINE_GRAINED_STREAMING_MODELS = frozenset({
+    "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-sonnet-4-6", "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514"})
+
 
 def _refused_for_now(error):
     return (isinstance(error, apierr.ApiError) and error.status == 429 and error.code == "rate_limit_error"
@@ -1210,6 +1218,8 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             (tool_choice or {}).get("function", {}).get("name") if isinstance(tool_choice, dict) else None)
         if choice and choice != "auto":
             body["toolChoice"] = choice
+        if body["model"] in FINE_GRAINED_STREAMING_MODELS:
+            body["enableFineGrainedStreaming"] = True
     if prefix_key:
         body["openAICacheKey"] = prefix_key
     return body

@@ -17,10 +17,11 @@
      "user"
     ],
     "wire": {
-     "sha": "a42c41d46f6ce694",
+     "sha": "e80672fe733d9e46",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -47,10 +48,11 @@
      "user"
     ],
     "wire": {
-     "sha": "28ec5d49bc137634",
+     "sha": "5ecdf751c139f678",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -77,10 +79,11 @@
      "user"
     ],
     "wire": {
-     "sha": "99cc9d8ae79d09b9",
+     "sha": "06a512b9b78d0386",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -107,10 +110,11 @@
      "user"
     ],
     "wire": {
-     "sha": "a42c41d46f6ce694",
+     "sha": "e80672fe733d9e46",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -137,10 +141,11 @@
      "user"
     ],
     "wire": {
-     "sha": "a42c41d46f6ce694",
+     "sha": "e80672fe733d9e46",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -161,10 +166,11 @@
      "user"
     ],
     "wire": {
-     "sha": "ac670afb41310165",
+     "sha": "80fc13cbf482d857",
      "messages": 1,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -190,10 +196,11 @@
      "user"
     ],
     "wire": {
-     "sha": "a42c41d46f6ce694",
+     "sha": "e80672fe733d9e46",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -220,10 +227,11 @@
      "user"
     ],
     "wire": {
-     "sha": "b9f4c9b284395b0c",
+     "sha": "b87467f3fe6676ab",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -250,10 +258,11 @@
      "user"
     ],
     "wire": {
-     "sha": "12eb72f05e73f2e0",
+     "sha": "ada10b9e82983b42",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -282,10 +291,11 @@
      "user"
     ],
     "wire": {
-     "sha": "5367e06b2c42949a",
+     "sha": "d92b328baad319f6",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -312,10 +322,11 @@
      "user"
     ],
     "wire": {
-     "sha": "5367e06b2c42949a",
+     "sha": "d92b328baad319f6",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -342,10 +353,11 @@
      "user"
     ],
     "wire": {
-     "sha": "5367e06b2c42949a",
+     "sha": "d92b328baad319f6",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -366,10 +378,11 @@
      "user"
     ],
     "wire": {
-     "sha": "ac670afb41310165",
+     "sha": "80fc13cbf482d857",
      "messages": 1,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -389,10 +402,11 @@
      "user"
     ],
     "wire": {
-     "sha": "ac670afb41310165",
+     "sha": "80fc13cbf482d857",
      "messages": 1,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -412,10 +426,11 @@
      "user"
     ],
     "wire": {
-     "sha": "ac670afb41310165",
+     "sha": "80fc13cbf482d857",
      "messages": 1,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -441,10 +456,11 @@
      "user"
     ],
     "wire": {
-     "sha": "12eb72f05e73f2e0",
+     "sha": "ada10b9e82983b42",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -471,10 +487,11 @@
      "user"
     ],
     "wire": {
-     "sha": "12eb72f05e73f2e0",
+     "sha": "ada10b9e82983b42",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -501,10 +518,11 @@
      "user"
     ],
     "wire": {
-     "sha": "12eb72f05e73f2e0",
+     "sha": "ada10b9e82983b42",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3192,10 +3210,11 @@
      "user"
     ],
     "wire": {
-     "sha": "e6877289aa91be9d",
+     "sha": "9ce6860104450bff",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3222,10 +3241,11 @@
      "user"
     ],
     "wire": {
-     "sha": "adab698b13e1f1d7",
+     "sha": "295a9e2bfe430cc4",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3252,10 +3272,11 @@
      "user"
     ],
     "wire": {
-     "sha": "048999918cd4eb4b",
+     "sha": "cb304d062bfe38ea",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3282,10 +3303,11 @@
      "user"
     ],
     "wire": {
-     "sha": "e6877289aa91be9d",
+     "sha": "9ce6860104450bff",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3312,10 +3334,11 @@
      "user"
     ],
     "wire": {
-     "sha": "e6877289aa91be9d",
+     "sha": "9ce6860104450bff",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3342,10 +3365,11 @@
      "user"
     ],
     "wire": {
-     "sha": "e9efe5ab8f4b063c",
+     "sha": "3c37ced52932864c",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3372,10 +3396,11 @@
      "user"
     ],
     "wire": {
-     "sha": "e6877289aa91be9d",
+     "sha": "9ce6860104450bff",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3402,10 +3427,11 @@
      "user"
     ],
     "wire": {
-     "sha": "b1a7ece76e942009",
+     "sha": "aeb8862499ff282e",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3432,10 +3458,11 @@
      "user"
     ],
     "wire": {
-     "sha": "3e8f3b1fefa1da44",
+     "sha": "106fd126a27797fe",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -3990,10 +4017,11 @@
      "user"
     ],
     "wire": {
-     "sha": "95c0796ba0ba3267",
+     "sha": "1dc6442102ec9950",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4020,10 +4048,11 @@
      "user"
     ],
     "wire": {
-     "sha": "95c0796ba0ba3267",
+     "sha": "1dc6442102ec9950",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4050,10 +4079,11 @@
      "user"
     ],
     "wire": {
-     "sha": "95c0796ba0ba3267",
+     "sha": "1dc6442102ec9950",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4080,10 +4110,11 @@
      "user"
     ],
     "wire": {
-     "sha": "e9efe5ab8f4b063c",
+     "sha": "3c37ced52932864c",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4110,10 +4141,11 @@
      "user"
     ],
     "wire": {
-     "sha": "e9efe5ab8f4b063c",
+     "sha": "3c37ced52932864c",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4140,10 +4172,11 @@
      "user"
     ],
     "wire": {
-     "sha": "e9efe5ab8f4b063c",
+     "sha": "3c37ced52932864c",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4170,10 +4203,11 @@
      "user"
     ],
     "wire": {
-     "sha": "3e8f3b1fefa1da44",
+     "sha": "106fd126a27797fe",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4200,10 +4234,11 @@
      "user"
     ],
     "wire": {
-     "sha": "3e8f3b1fefa1da44",
+     "sha": "106fd126a27797fe",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4230,10 +4265,11 @@
      "user"
     ],
     "wire": {
-     "sha": "3e8f3b1fefa1da44",
+     "sha": "106fd126a27797fe",
      "messages": 2,
      "tools": 1,
      "keys": [
+      "enableFineGrainedStreaming",
       "messages",
       "metadata",
       "model",
@@ -4280,10 +4316,11 @@
      "user"
     ],
     "wire": {
-     "sha": "cdad19cf26c168ad",
+     "sha": "398768702978f667",
      "messages": 18,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4327,10 +4364,11 @@
      "user"
     ],
     "wire": {
-     "sha": "718c2e69e53fe682",
+     "sha": "3e930d08e65d070c",
      "messages": 18,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4369,10 +4407,11 @@
      "user"
     ],
     "wire": {
-     "sha": "f9386bbb2198bafb",
+     "sha": "9362d6b06a54bd53",
      "messages": 18,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4416,10 +4455,11 @@
      "user"
     ],
     "wire": {
-     "sha": "cdad19cf26c168ad",
+     "sha": "398768702978f667",
      "messages": 18,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4463,10 +4503,11 @@
      "user"
     ],
     "wire": {
-     "sha": "cdad19cf26c168ad",
+     "sha": "398768702978f667",
      "messages": 18,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4499,10 +4540,11 @@
      "user"
     ],
     "wire": {
-     "sha": "3d3414d778b49f28",
+     "sha": "c83bed98cc607644",
      "messages": 17,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4545,10 +4587,11 @@
      "user"
     ],
     "wire": {
-     "sha": "cdad19cf26c168ad",
+     "sha": "398768702978f667",
      "messages": 18,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4592,10 +4635,11 @@
      "user"
     ],
     "wire": {
-     "sha": "47d9abb8a5275971",
+     "sha": "f406e3e45f928657",
      "messages": 18,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4634,10 +4678,11 @@
      "user"
     ],
     "wire": {
-     "sha": "a776e17f69f5ae06",
+     "sha": "5e3a93e13cc90b85",
      "messages": 18,
      "tools": 13,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4676,10 +4721,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "2df2c92e3b2963c1",
+     "sha": "2f1b4b1862147879",
      "messages": 18,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4716,10 +4762,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "74cd1c2425edd6e1",
+     "sha": "6fed846895e909ba",
      "messages": 18,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4747,10 +4794,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "cd78b05b8efe3319",
+     "sha": "fb5f7fe8f78ecf57",
      "messages": 18,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4787,10 +4835,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "2df2c92e3b2963c1",
+     "sha": "2f1b4b1862147879",
      "messages": 18,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4827,10 +4876,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "2df2c92e3b2963c1",
+     "sha": "2f1b4b1862147879",
      "messages": 18,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4852,10 +4902,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "67fd7b1ce5268e9d",
+     "sha": "6879331d213f7262",
      "messages": 17,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4891,10 +4942,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "2df2c92e3b2963c1",
+     "sha": "2f1b4b1862147879",
      "messages": 18,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4931,10 +4983,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "738b846fde6f6cbe",
+     "sha": "9c971b779ce5cfc5",
      "messages": 18,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
@@ -4962,10 +5015,11 @@
      "user×17"
     ],
     "wire": {
-     "sha": "97177aa4b88ecac7",
+     "sha": "25a5db3784f2fdb7",
      "messages": 18,
      "tools": 14,
      "keys": [
+      "enableFineGrainedStreaming",
       "maxCompletionTokens",
       "messages",
       "metadata",
