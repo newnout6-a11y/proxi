@@ -5,6 +5,12 @@ from email.utils import parsedate_to_datetime
 
 # Retool answers 429 with this sentence once an organization has spent its hourly managed-key budget.
 HOURLY_LIMIT = "hourly limit of managed api key usage"
+# Since 2026-11-18 Retool words the same hourly quota differently: "You've reached your hourly limit for Copilot. Please
+# try again in an hour. You can still use other AI features like Ask AI and Agents." (585 client 429s on 11 accounts in one
+# afternoon: taken for a short-lived 429, each turn was retried three times on the spent account and then failed instead
+# of moving). Every known wording, lower-cased with single spaces; the short-lived "Retool models are rate limited right
+# now" names no hourly limit and stays a retry on the same account.
+HOURLY_LIMITS = (HOURLY_LIMIT, "reached your hourly limit")
 # Retool answers 402 "This model is not available for your plan." when the account's plan does not include the model the
 # request names (journal of 2026-11-12/13: three accounts refused every claude-opus-5-5 request, the others served it).
 NOT_IN_PLAN = "model is not available for your plan"
@@ -158,7 +164,8 @@ def too_many_requests(message: str = "relay is busy", retry_after: float = 1.0) 
 
 def is_hourly_limit(text) -> bool:
     """Retool's per-organization managed-key quota, as opposed to a short-lived 429."""
-    return HOURLY_LIMIT in " ".join(str(text or "").lower().split())
+    normal = " ".join(str(text or "").lower().split())
+    return any(phrase in normal for phrase in HOURLY_LIMITS)
 
 
 def account_rate_limited(message: str, retry_after=None) -> ApiError:
