@@ -71,6 +71,8 @@ DEFAULTS = {
     "stream_first_token_timeout": 300,
     "stream_idle_timeout": 120,
     "stream_tool_timeout": 600,
+    # The budget once the upstream said the model is thinking in silence (stream_watchdog.DEFAULT_THINKING_TIMEOUT).
+    "stream_thinking_timeout": 900,
     "upstream_timeout": 120,
     "session_refresh_interval": 900,
     "command_timeout": 300,
@@ -237,7 +239,7 @@ JOURNAL_NUMBERS = ("journal_max_file_bytes", "journal_keep_files")
 # hourly limit: whole numbers of seconds, checked the same way.
 POOL_NUMBERS = ("conversation_wait", "account_rate_limit_wait")
 # Silence timeouts for stream_watchdog (whole seconds, 0 disables, up to 24h).
-STREAM_TIMEOUTS = ("stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout")
+STREAM_TIMEOUTS = ("stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout", "stream_thinking_timeout")
 STREAM_TIMEOUT_MAX = 86400
 
 # Cookie values that are just host names are not secrets.

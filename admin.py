@@ -45,7 +45,7 @@ LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "a
                  "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs", "codex_compaction_cache",
                  "prompt_suggestion_model",
                  "models_dev_sync", "catalog_refresh_hours", "opencode_sync",
-                 "stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout"}
+                 "stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout", "stream_thinking_timeout"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 # A credential the admin masks in its answers is at least this long (an account's id, page or thread at least 5). Retool's
@@ -270,14 +270,20 @@ def _schema(cfg=None):
          "Сколько ждать соединения и ответа на HTTP-запрос к Retool", "с", 1, 3600, None),
         ("recv_timeout", "integer", "Ожидание WebSocket", "limits",
          "Сколько ждать следующего сообщения по WebSocket Retool", "с", 1, 3600, None),
-        ("stream_first_token_timeout", "number", "Таймаут первого токена стрима", "limits",
-         "Сколько секунд ждать первый токен от универсального провайдера до сброса попытки; 0 — без отдельного предела. "
-         "Применяется сразу", "с", 0, 3600, None),
-        ("stream_idle_timeout", "number", "Таймаут тишины в стриме", "limits",
-         "Максимальная пауза между чанками текста/мышления универсального провайдера; 0 — выключено. Применяется сразу",
+        # Whole seconds, as config.load requires (STREAM_TIMEOUTS): a fraction saved here kept the relay from starting.
+        # Every upstream streams through the same watchdog: Retool, Minara and the universal providers.
+        ("stream_first_token_timeout", "integer", "Таймаут первого токена стрима", "limits",
+         "Сколько секунд ждать первый токен от upstream (Retool, Minara, провайдер) до сброса попытки с 504; "
+         "0 — без отдельного предела. Применяется сразу", "с", 0, 3600, None),
+        ("stream_idle_timeout", "integer", "Таймаут тишины в стриме", "limits",
+         "Максимальная пауза между чанками текста или мышления любого upstream; 0 — выключено. Применяется сразу",
          "с", 0, 3600, None),
-        ("stream_tool_timeout", "number", "Таймаут генерации аргументов tool", "limits",
-         "Максимальная пауза при потоковой генерации аргументов инструментов; 0 — выключено. Применяется сразу",
+        ("stream_tool_timeout", "integer", "Таймаут генерации аргументов tool", "limits",
+         "Максимальная пауза, пока upstream передаёт аргументы объявленного вызова инструмента; 0 — выключено. "
+         "Применяется сразу", "с", 0, 3600, None),
+        ("stream_thinking_timeout", "integer", "Таймаут молчаливого мышления", "limits",
+         "Сколько секунд upstream может молчать, после того как прислал настоящий признак мышления модели (начало "
+         "блока thinking, подпись); уже действующий предел этим не сокращается; 0 — выключено. Применяется сразу",
          "с", 0, 3600, None),
         ("max_prompt_bytes", "integer", "Размер промпта", "limits",
          "Отклонять запросы с промптом больше этого размера; 0 — без ограничения", "байт", 0, 1_073_741_824, None),
