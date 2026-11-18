@@ -120,11 +120,11 @@ class _Base:
             if self.parsed.show_thinking:
                 self._think_start()
         elif kind == "thinking_status":
-            if self.parsed.show_thinking:
+            # The upstream began to reason and shows nothing of it yet. A status of the relay's own (source "relay")
+            # says nothing about the model and is not shown; thinking_heartbeat, the relay's clock, never is: the
+            # clients count the time themselves, and a silent stream is kept alive by the dialect's keepalive.
+            if self.parsed.show_thinking and event.get("source") != "relay":
                 self._think_status()
-        elif kind == "thinking_heartbeat":
-            if self.parsed.show_thinking:
-                self._think_heartbeat(event.get("elapsed"))
         elif kind == "thinking_signature":
             if self.parsed.show_thinking:
                 self._signature(event.get("signature", ""))
@@ -229,9 +229,6 @@ class _Base:
     def _think_status(self):
         pass
 
-    def _think_heartbeat(self, elapsed):
-        pass
-
     def _signature(self, signature):
         pass
 
@@ -289,11 +286,14 @@ class _Base:
 
 
 class ChatAdapter(_Base):
+    """Chat Completions. Reasoning is only ever text (delta.reasoning_content): pi-ai and ai-sdk have no empty reasoning
+    container, so a start of reasoning without text shows nothing. 54b1023 wrote "Модель думает…" there instead, and
+    DeepSeek Harness kept it in its history (134 of 827 replies) and sent it back as reasoning."""
+
     def __init__(self, parsed, writer=None):
         super().__init__(parsed, writer)
         self.id = "chatcmpl-" + uuid.uuid4().hex[:20]
         self.created = int(time.time())
-        self._thinking_indicated = False
 
     def _chunk(self, delta, finish=None):
         return {"id": self.id, "object": "chat.completion.chunk", "created": self.created,
@@ -309,21 +309,8 @@ class ChatAdapter(_Base):
             self.writer.data(self._chunk({"content": delta}))
 
     def _think(self, delta):
-        if self.writer:
+        if self.writer and delta:
             self.writer.data(self._chunk({"reasoning_content": delta}))
-
-    def _think_start(self):
-        # Display-only label: it is streamed but never stored in self.thinking.
-        label = getattr(self.parsed, "thinking_placeholder", "")
-        if label and self.writer and not self._thinking_indicated:
-            self.writer.data(self._chunk({"reasoning_content": label}))
-            self._thinking_indicated = True
-
-    def _think_status(self):
-        self._think_start()
-
-    def _usage_boundary(self):
-        self._thinking_indicated = False
 
     def _tool_call(self, index, call, delta, new=False):
         if not self.writer:
@@ -478,7 +465,9 @@ class ResponsesAdapter(_Base):
         self._frozen = {}
         self._bases = {}
         self._text_end = self._thinking_end = 0
-        self._thinking_indicated = False
+        # The reasoning items whose summary part was announced: an item opened by a start of reasoning without text
+        # has none until text comes (and none at all if none does).
+        self._summary_parts = set()
         # Whether the reply ended because the client left or the turn timed out (f3, G2.1).
         self._cut_off = False
         self._tool_definitions = {
@@ -520,6 +509,7 @@ class ResponsesAdapter(_Base):
     def _ensure_item(self, kind, item_id, call=None):
         if item_id in self._indices:
             return self._indices[item_id]
+        self._close_before()
         index = len(self._items)
         self._indices[item_id] = index
         self._items.append((kind, item_id, call))
@@ -529,12 +519,23 @@ class ResponsesAdapter(_Base):
             self._emit("response.content_part.added", {"item_id": item_id, "output_index": index,
                                                        "content_index": 0,
                                                        "part": {"type": "output_text", "text": "", "annotations": []}})
-        elif kind == "reasoning":
-            self._emit("response.reasoning_summary_part.added", {
-                "item_id": item_id, "output_index": index, "summary_index": 0,
-                "part": {"type": "summary_text", "text": ""},
-            })
         return index
+
+    def _close_before(self):
+        """Close the messages and reasoning items that a new item now follows, in output order, up to the first call
+        upstream has not ended.
+
+        Codex files every delta into the item added last (S4 §2.4): reasoning sent into an item before a message went
+        into the message, and its TUI dropped it. So a message or a reasoning item is done once another item begins,
+        as OpenAI streams them, and Codex Desktop's "Thought for N s" ends where the reasoning did. A call is closed only
+        when upstream ends it (_flush_ready), and nothing after it before then: the history keeps the order of the
+        output. A reply that is not streamed is built the same way."""
+        for index, (other, _, _) in enumerate(self._items):
+            if index in self._closed:
+                continue
+            if other not in ("message", "reasoning"):
+                return
+            self._finish_item(index, "completed")
 
     @staticmethod
     def _custom_input(call):
@@ -601,8 +602,11 @@ class ResponsesAdapter(_Base):
         kind, item_id, call = self._items[index]
         status = "in_progress" if started else status
         if kind == "reasoning":
+            # A reasoning item that got no text (the upstream reasoned without showing it) has no summary part at all,
+            # as OpenAI's own such items: an empty summary_text would be a part nothing wrote.
+            text = "" if started else self._text_of(item_id, kind)
             return {"id": item_id, "type": kind, "status": status,
-                    "summary": [] if started else [{"type": "summary_text", "text": self._text_of(item_id, kind)}]}
+                    "summary": [{"type": "summary_text", "text": text}] if text else []}
         if kind == "message":
             return {"id": item_id, "type": kind, "role": "assistant", "status": status,
                     "content": [] if started else [{"type": "output_text", "text": self._text_of(item_id, kind),
@@ -629,39 +633,43 @@ class ResponsesAdapter(_Base):
 
     def _text(self, delta):
         if self._indices.get(self.item_id) in self._closed:
-            # A call that finished after this item closed it: the text that follows is a message of its own.
+            # Another item closed this one (a call, reasoning): the text that follows is a message of its own.
             self.item_id = "msg_" + uuid.uuid4().hex[:20]
             self._bases[self.item_id] = self._text_end
         index = self._ensure_item("message", self.item_id)
         self._emit("response.output_text.delta", {"item_id": self.item_id, "output_index": index,
                                                   "content_index": 0, "delta": delta})
 
-    def _think(self, delta):
+    def _reasoning_index(self):
+        """The output index of the reasoning item that reasoning goes into now: the open one, else a new one."""
         if self._indices.get(self.reasoning_id) in self._closed:
             self.reasoning_id = "rs_" + uuid.uuid4().hex[:20]
             self._bases[self.reasoning_id] = self._thinking_end
-        index = self._ensure_item("reasoning", self.reasoning_id)
+        return self._ensure_item("reasoning", self.reasoning_id)
+
+    def _think(self, delta):
+        index = self._reasoning_index()
+        if not delta:
+            return  # a sign of reasoning without a word of it: the item is open, and it has no summary part yet
+        if self.reasoning_id not in self._summary_parts:
+            self._summary_parts.add(self.reasoning_id)
+            self._emit("response.reasoning_summary_part.added", {
+                "item_id": self.reasoning_id, "output_index": index, "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            })
         self._emit("response.reasoning_summary_text.delta", {"item_id": self.reasoning_id,
                                                              "output_index": index,
                                                              "summary_index": 0, "delta": delta})
 
     def _think_start(self):
-        label = getattr(self.parsed, "thinking_placeholder", "")
-        if label and self.writer and not self._thinking_indicated and not self.thinking:
-            self._think(label)
-            self._thinking_indicated = True
+        # The upstream began to reason: a reasoning item without a summary until its text comes. Codex Desktop shows it
+        # as "Thinking" and "Thought for N s" by its own clock, the TUI keeps "Working (Ns)": no words are needed, and
+        # none are invented. A reply that is not streamed has no progress to show and gets no empty item.
+        if self.writer is not None:
+            self._reasoning_index()
 
     def _think_status(self):
         self._think_start()
-
-    def _think_heartbeat(self, elapsed):
-        label = getattr(self.parsed, "thinking_placeholder", "")
-        if label and self.writer and not self.thinking and type(elapsed) in (int, float) and elapsed >= 4:
-            self._think_start()
-            self._think("⏳ %d с…\n" % int(elapsed))
-
-    def _usage_boundary(self):
-        self._thinking_indicated = False
 
     @staticmethod
     def _streams_arguments(call):
@@ -727,11 +735,12 @@ class ResponsesAdapter(_Base):
         elif kind == "reasoning":
             text = self._frozen[item_id] = self._text_of(item_id, kind)
             self._thinking_end = len(self.thinking)
-            fields["summary_index"] = 0
-            self._emit("response.reasoning_summary_text.done", {**fields, "text": text})
-            self._emit("response.reasoning_summary_part.done", {
-                **fields, "part": {"type": "summary_text", "text": text},
-            })
+            if item_id in self._summary_parts:
+                fields["summary_index"] = 0
+                self._emit("response.reasoning_summary_text.done", {**fields, "text": text})
+                self._emit("response.reasoning_summary_part.done", {
+                    **fields, "part": {"type": "summary_text", "text": text},
+                })
         elif kind == "custom_tool_call":
             final = self._item(index, status=status)["input"]
             sent = self._custom_inputs.get(call["id"], "")
@@ -874,6 +883,14 @@ class AnthropicAdapter(_Base):
         if self._wait(self._think_start):
             return
         self._open("thinking")
+
+    def _think_status(self):
+        # The upstream began a thinking block and shows nothing of it yet (Retool's content_block_start, which the
+        # direct transport passes on at once while it holds the attempt's content back). Claude Code shows "✻ Thinking…"
+        # and counts the seconds itself once the block starts: the block is the whole of the progress. Before, it
+        # started only with the answer (Opus: 10-300 s later). A reply that is not streamed gets no empty block.
+        if self.writer is not None:
+            self._think_start()
 
     def _think(self, delta):
         if self._wait(self._think, delta):

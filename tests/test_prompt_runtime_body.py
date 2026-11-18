@@ -122,7 +122,9 @@ def test_a_profile_without_body_edits_parses_the_body_once_and_never_rewrites_it
 @pytest.mark.parametrize("dialect", DIALECTS)
 def test_pass_2_parses_again_and_the_edited_request_keeps_the_identity_of_the_original(
         prompt_relay, monkeypatch, dialect):
-    relay = fake_relay(prompt_relay, thinking_placeholder="THINKING_LABEL")
+    # thinking_placeholder is no longer part of a request's identity: the relay writes no label of its own into the
+    # reasoning any more (2026-11-19), so nothing of it is set on the first parse or carried over to the second.
+    relay = fake_relay(prompt_relay)
     edited(relay.prompts, edits=True)
     Rewrites(monkeypatch)
     counts, seen = count_parses(monkeypatch), Seen(relay, monkeypatch)
@@ -131,7 +133,7 @@ def test_pass_2_parses_again_and_the_edited_request_keeps_the_identity_of_the_or
     assert status == 200 and counts[dialect] == 2
     (parsed,) = seen.parsed
     assert parsed.conversation_key == "header:dialog-1" and parsed.parent_conversation_key is None
-    assert parsed.request_id and parsed.dialect == dialect and parsed.thinking_placeholder == "THINKING_LABEL"
+    assert parsed.request_id and parsed.dialect == dialect and not hasattr(parsed, "thinking_placeholder")
     assert parsed.request_purpose == "client-tools" and parsed.prompt_purpose == "client-tools"
     assert "header:dialog-1" in relay.runtime.pool._conversations
     # the parse of the rewritten body, not of the original one

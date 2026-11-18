@@ -60,7 +60,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RECORD_REQUEST_BYTES = 1024 * 1024
 # What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
 _CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
-                 "dialect", "thinking_placeholder", "virtual_profile", "requested_model", "client_task")
+                 "dialect", "virtual_profile", "requested_model", "client_task")
 
 
 def _carry_compatibility(first, parsed, changes):
@@ -967,7 +967,6 @@ def make_handler(runtime: Runtime):
             # The size of the request as the client sent it, for count_tokens to scale from the real usage of this
             # request (a profile may rewrite the body, which the next count_tokens of the client does not see).
             client_chars = adapters.request_chars(parsed)
-            parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
             runtime.client_keys.enforce_request(

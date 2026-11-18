@@ -90,9 +90,6 @@ DEFAULTS = {
     "enable_anthropic": True,
     "enable_chat": True,
     "show_thinking": True,
-    # OpenAI-compatible clients open a reasoning view only on non-empty text; Opus 5.5
-    # reasons silently, so this label is shown when thinking starts ("" disables it).
-    "thinking_placeholder": "Модель думает…\n",
     "enable_responses": True,
     "reasoning_effort": "auto",
     "allow_effort_downgrade": False,

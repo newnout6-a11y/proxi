@@ -124,30 +124,72 @@ class Writer:
 
 
 def parsed(show=True, label="Модель думает…\n"):
+    # thinking_placeholder is what a config of before 2026-11-19 put on every request; the adapters never read it now.
     p = validate.Parsed()
     p.model, p.show_thinking, p.thinking_placeholder = "claude-opus-5-5", show, label
     return p
 
 
-def test_chat_displays_early_status_only_once_without_storing_it():
+SILENT = [{"type": "usage_start"}, {"type": "thinking_status", "source": "upstream"},
+          {"type": "thinking_heartbeat", "elapsed": 6.5}, {"type": "thinking_status", "source": "relay"},
+          {"type": "thinking_heartbeat", "elapsed": 11.5}]
+
+
+def test_chat_writes_nothing_until_the_upstream_writes_reasoning():
+    # Chat has no empty reasoning container: pi-ai and ai-sdk show reasoning only as text. The label of 54b1023 went
+    # into DeepSeek Harness's history (134 of 827 replies began with it) and back to the model as reasoning_content.
     writer = Writer()
     adapter = adapters.ChatAdapter(parsed(), writer)
+    for event in SILENT + [{"type": "thinking_start"}, {"type": "thinking_signature", "signature": "opaque"}]:
+        adapter.feed(event)
+    assert writer.events == []
+    adapter.feed({"type": "thinking", "delta": "real reasoning"})
+    adapter.feed({"type": "text", "delta": "42"})
+    assert [p["choices"][0]["delta"] for p in writer.events] == [{"reasoning_content": "real reasoning"},
+                                                                 {"content": "42"}]
+    assert adapter.payload("stop")["choices"][0]["message"]["reasoning_content"] == "real reasoning"
+
+
+class EventWriter:
+    def __init__(self):
+        self.events = []
+
+    def event(self, name, payload):
+        self.events.append((name, payload))
+
+    def done(self):
+        self.events.append(("done", None))
+
+
+def test_anthropic_opens_an_empty_thinking_block_on_the_upstreams_status_and_only_then():
+    # Claude Code shows "✻ Thinking…" and counts the seconds itself once a thinking block starts: the honest progress is
+    # the block, opened when Retool's content_block_start says the model thinks, not when the answer is released.
+    writer = EventWriter()
+    adapter = adapters.AnthropicAdapter(parsed(), writer)
+    adapter.begin()
     adapter.feed({"type": "usage_start"})
+    adapter.feed({"type": "thinking_status", "source": "relay"})
+    adapter.feed({"type": "thinking_heartbeat", "elapsed": 6.5})
+    assert [name for name, _ in writer.events] == ["message_start", "ping"]
     adapter.feed({"type": "thinking_status", "source": "upstream"})
-    assert len(writer.events) == 1
-    adapter.feed({"type": "thinking_start"})
+    assert writer.events[-1] == ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {
+        "type": "thinking", "thinking": "", "signature": ""}})
+    adapter.feed({"type": "thinking_heartbeat", "elapsed": 11.5})
+    adapter.feed({"type": "thinking_start"})  # the held start of the same block, released with its signature
     adapter.feed({"type": "thinking_signature", "signature": "opaque"})
-    assert [p["choices"][0]["delta"] for p in writer.events] == [{"reasoning_content": "Модель думает…\n"}]
-    assert adapter.thinking == ""
-    assert "reasoning_content" not in adapter.payload("stop")["choices"][0]["message"]
+    adapter.feed({"type": "text", "delta": "42"})
+    final = adapter.end("stop")
+    starts = [p["index"] for name, p in writer.events if name == "content_block_start"]
+    assert starts == [0, 1] and adapter.thinking == ""
+    assert final["content"] == [{"type": "thinking", "thinking": "", "signature": "opaque"}, {"type": "text", "text": "42"}]
 
 
-@pytest.mark.parametrize("p", [parsed(show=False), parsed(label="")])
-def test_early_status_respects_display_settings(p):
-    writer = Writer()
-    adapter = adapters.ChatAdapter(p, writer)
-    adapter.feed({"type": "thinking_status", "source": "upstream"})
-    adapter.feed({"type": "thinking_start"})
+@pytest.mark.parametrize("cls", [adapters.ChatAdapter, adapters.AnthropicAdapter, adapters.ResponsesAdapter])
+def test_a_status_shows_nothing_when_the_client_hides_thinking(cls):
+    writer = Writer() if cls is adapters.ChatAdapter else EventWriter()
+    adapter = cls(parsed(show=False), writer)
+    for event in SILENT + [{"type": "thinking_start"}]:
+        adapter.feed(event)
     assert writer.events == []
 
 
@@ -218,27 +260,82 @@ def test_a_status_of_the_relays_own_is_not_journaled_as_an_upstream_thinking_sta
     assert not [kind for kind, _ in logs if kind in ("upstream.thinking_start", "upstream.thinking_end")]
 
 
-class ResponsesWriter:
-    def __init__(self):
-        self.events = []
-
-    def event(self, name, payload):
-        self.events.append((name, payload))
-
-    def done(self):
-        self.events.append(("done", None))
+def names(writer):
+    return [name for name, _ in writer.events if name != "done"]
 
 
-def test_responses_adapter_streams_early_status_and_heartbeats_without_storing_thinking():
-    writer = ResponsesWriter()
+def test_responses_opens_an_empty_reasoning_item_on_the_upstreams_status_and_writes_no_text():
+    # Codex Desktop shows "Thinking" for a reasoning item that has begun and "Thought for N s" once it is done, and the
+    # TUI keeps its own "Working (Ns)": an item without a summary is the whole of the honest progress. 54b1023 wrote
+    # "Модель думает…" and "⏳ N с…" into the summary instead (the TUI made a status header of them, Desktop a summary).
+    writer = EventWriter()
+    adapter = adapters.ResponsesAdapter(parsed(), writer)
+    adapter.begin()
+    for event in SILENT:
+        adapter.feed(event)
+    adapter.feed({"type": "thinking_start"})  # the same reasoning, no second item
+    adapter.feed({"type": "text", "delta": "done"})
+    final = adapter.end("stop")
+    assert names(writer) == [
+        "response.created", "response.output_item.added",
+        # the reasoning item is done before the message begins, as OpenAI streams it: "Thought for N s" ends here
+        "response.output_item.done",
+        "response.output_item.added", "response.content_part.added", "response.output_text.delta",
+        "response.output_text.done", "response.content_part.done", "response.output_item.done", "response.completed"]
+    added = writer.events[1][1]["item"]
+    assert added["type"] == "reasoning" and added["summary"] == [] and added["status"] == "in_progress"
+    assert writer.events[2][1]["item"] == {**added, "status": "completed"}
+    assert [item["type"] for item in final["output"]] == ["reasoning", "message"]
+    assert final["output"][0]["summary"] == [] and adapter.thinking == ""
+    assert final["output_text"] == "done"
+
+
+def test_responses_shows_nothing_for_a_status_of_the_relays_own():
+    writer = EventWriter()
     adapter = adapters.ResponsesAdapter(parsed(), writer)
     adapter.begin()
     adapter.feed({"type": "thinking_status", "source": "relay"})
-    adapter.feed({"type": "thinking_start"})  # must not duplicate the placeholder
     adapter.feed({"type": "thinking_heartbeat", "elapsed": 6.5})
     adapter.feed({"type": "text", "delta": "done"})
     final = adapter.end("stop")
-    deltas = [p["delta"] for name, p in writer.events if name == "response.reasoning_summary_text.delta"]
-    assert deltas == ["Модель думает…\n", "⏳ 6 с…\n"]
-    assert adapter.thinking == ""
-    assert final["output_text"] == "done"
+    assert [item["type"] for item in final["output"]] == ["message"]
+    assert "response.reasoning_summary_text.delta" not in names(writer)
+
+
+def test_responses_real_reasoning_goes_into_the_item_the_status_opened():
+    writer = EventWriter()
+    adapter = adapters.ResponsesAdapter(parsed(), writer)
+    adapter.begin()
+    adapter.feed({"type": "thinking_status", "source": "upstream"})
+    adapter.feed({"type": "thinking_start"})
+    adapter.feed({"type": "thinking", "delta": "**Plan**"})
+    adapter.feed({"type": "thinking", "delta": " count"})
+    adapter.feed({"type": "text", "delta": "4050"})
+    final = adapter.end("stop")
+    reasoning_events = [(name, payload.get("output_index")) for name, payload in writer.events
+                        if name.startswith("response.reasoning") or (name.startswith("response.output_item")
+                                                                      and payload["item"]["type"] == "reasoning")]
+    assert reasoning_events == [
+        ("response.output_item.added", 0), ("response.reasoning_summary_part.added", 0),
+        ("response.reasoning_summary_text.delta", 0), ("response.reasoning_summary_text.delta", 0),
+        ("response.reasoning_summary_text.done", 0), ("response.reasoning_summary_part.done", 0),
+        ("response.output_item.done", 0)]
+    assert final["output"][0]["summary"] == [{"type": "summary_text", "text": "**Plan** count"}]
+    assert [item["type"] for item in final["output"]] == ["reasoning", "message"]
+
+
+def test_responses_reasoning_after_the_answer_began_is_an_item_of_its_own():
+    # Codex files every delta into the item added last: reasoning sent into an item before the message went into the
+    # message, and the TUI dropped it (research S4 §2.4).
+    writer = EventWriter()
+    adapter = adapters.ResponsesAdapter(parsed(), writer)
+    adapter.begin()
+    adapter.feed({"type": "thinking", "delta": "first"})
+    adapter.feed({"type": "text", "delta": "Looking."})
+    adapter.feed({"type": "thinking", "delta": "second"})
+    final = adapter.end("stop")
+    deltas = [(name, payload["output_index"]) for name, payload in writer.events if name.endswith(".delta")]
+    assert deltas == [("response.reasoning_summary_text.delta", 0), ("response.output_text.delta", 1),
+                      ("response.reasoning_summary_text.delta", 2)]
+    assert [(item["type"], (item.get("summary") or item.get("content"))[0]["text"]) for item in final["output"]] == [
+        ("reasoning", "first"), ("message", "Looking."), ("reasoning", "second")]
