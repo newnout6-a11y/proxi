@@ -24,6 +24,9 @@ import validate
 ROUTE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,79}$")
 ROUTE_STRATEGIES = ("priority", "weighted", "least-inflight")
 SECRET_HEADER_NAMES = {"authorization", "x-api-key", "api-key", "proxy-authorization"}
+# A model id a provider lists by hand: no spaces, quotes, braces, brackets or commas. The edit form split an OpenCode models
+# object at its commas, and the pieces ('{"deepseek-chat":{"name":"DeepSeek Chat"', ...) were saved as ids (audit A14-01).
+MODEL_ID_PATTERN = re.compile(r"[^\s\"'{}\[\],]{1,200}")
 
 
 def mask_key_preview(raw_key: str | None) -> str | None:
@@ -333,9 +336,83 @@ def _replace_provider_backends_live(admin_obj, provider_id: str, new_records: li
     return True
 
 
+def _check_models(models_spec) -> None:
+    """Refuse a hand-written model list whose entries cannot be model ids (a list of ids or of {"id": ...} objects, or an
+    OpenCode object keyed by id): a list of pieces of JSON was saved as is, and every model of the provider went 404."""
+    if models_spec is None:
+        return
+    if isinstance(models_spec, dict):
+        ids = list(models_spec)
+        bad = [key for key, value in models_spec.items() if not (value is None or isinstance(value, dict))]
+    elif isinstance(models_spec, list):
+        ids = [item.get("id") if isinstance(item, dict) else item for item in models_spec]
+        bad = []
+    else:
+        raise apierr.bad_request("'models' must be a list of model ids or an object keyed by model id", param="models")
+    bad += [item for item in ids if not (isinstance(item, str) and MODEL_ID_PATTERN.fullmatch(item))]
+    if bad:
+        shown = ", ".join(repr(item)[:60] for item in bad[:3])
+        raise apierr.bad_request("'models' holds entries that are not model ids (no spaces, quotes, braces or commas): "
+                                 + shown, param="models")
+
+
+def _merge_headers(saved, changes):
+    """A PATCH's headers by name over the saved ones (a name is matched whatever its case); null removes one.
+
+    The admin never shows a saved header's value, so the form cannot send the whole set back: the object replaced them all,
+    and adding X-New dropped HTTP-Referer and X-Title (audit A14-03)."""
+    merged = dict(saved) if isinstance(saved, dict) else {}
+    for name, value in changes.items():
+        if isinstance(name, str):
+            for old in [key for key in merged if isinstance(key, str) and key.lower() == name.lower()]:
+                merged.pop(old)
+        if value is not None:
+            merged[name] = value
+    return merged
+
+
+def _merge_provider_patch(existing: dict, data: dict) -> dict:
+    """The saved provider with a PATCH (or a probe of the saved provider) over it.
+
+    An empty api_key keeps the stored credentials; `headers` are merged by name (null removes one, `"headers": null` all
+    of them); any other field replaces the saved value, so `"body_overrides": {}` clears them."""
+    merged = copy.deepcopy(existing)
+    for k, v in data.items():
+        if k in ("id", "discover_now", "provider_id"):
+            continue
+        if k == "api_key" and (v is None or (isinstance(v, str) and not v.strip())):
+            # Empty key on edit preserves existing stored credentials unless switching to keyless
+            continue
+        if k == "headers" and (v is None or isinstance(v, dict)):
+            headers = None if v is None else _merge_headers(existing.get("headers"), v)
+            if headers:
+                merged["headers"] = headers
+            else:
+                merged.pop("headers", None)
+            continue
+        merged[k] = v
+
+    # Mutual exclusivity when switching from api_key_env <-> api_key or credentials
+    if isinstance(data.get("api_key"), str) and data["api_key"].strip():
+        merged.pop("api_key_env", None)
+        merged.pop("bearer_token_env", None)
+        merged.pop("credentials", None)
+    elif isinstance(data.get("api_key_env"), str) and data["api_key_env"].strip():
+        merged.pop("api_key", None)
+        merged.pop("bearer_token", None)
+        merged.pop("credentials", None)
+    elif isinstance(data.get("credentials"), list) and data["credentials"]:
+        merged.pop("api_key", None)
+        merged.pop("bearer_token", None)
+        merged.pop("api_key_env", None)
+        merged.pop("bearer_token_env", None)
+    return merged
+
+
 def create_provider(admin_obj, data: dict) -> dict:
     if not isinstance(data, dict):
         raise apierr.bad_request("Request body must be a JSON object")
+    _check_models(data.get("models"))
     discover_now = bool(data.get("discover_now", data.get("auto_discover", True)))
     try:
         meta, records, secrets_found = presets.expand_provider_to_accounts(copy.deepcopy(data), "provider")
@@ -386,6 +463,8 @@ def update_provider(admin_obj, provider_id: str, data: dict) -> dict:
         raise apierr.bad_request("Expected provider fields to update")
     pid = provider_id.strip().lower()
     discover_requested = data.get("discover_now")
+    if "models" in data:
+        _check_models(data["models"])
 
     with admin_obj._transaction() as (path, saved):
         prov_list = saved.get("providers") if isinstance(saved.get("providers"), list) else []
@@ -393,30 +472,7 @@ def update_provider(admin_obj, provider_id: str, data: dict) -> dict:
         if idx is None:
             raise apierr.not_found(f"Unknown provider '{pid}'")
         existing = copy.deepcopy(prov_list[idx])
-        merged = copy.deepcopy(existing)
-
-        for k, v in data.items():
-            if k in ("id", "discover_now"):
-                continue
-            if k == "api_key" and (v is None or (isinstance(v, str) and not v.strip())):
-                # Empty key on edit preserves existing stored credentials unless switching to keyless
-                continue
-            merged[k] = v
-
-        # Mutual exclusivity when switching from api_key_env <-> api_key or credentials
-        if isinstance(data.get("api_key"), str) and data["api_key"].strip():
-            merged.pop("api_key_env", None)
-            merged.pop("bearer_token_env", None)
-            merged.pop("credentials", None)
-        elif isinstance(data.get("api_key_env"), str) and data["api_key_env"].strip():
-            merged.pop("api_key", None)
-            merged.pop("bearer_token", None)
-            merged.pop("credentials", None)
-        elif isinstance(data.get("credentials"), list) and data["credentials"]:
-            merged.pop("api_key", None)
-            merged.pop("bearer_token", None)
-            merged.pop("api_key_env", None)
-            merged.pop("bearer_token_env", None)
+        merged = _merge_provider_patch(existing, data)
 
         merged["id"] = pid
         try:
@@ -490,20 +546,20 @@ def test_provider_connection(admin_obj, data: dict) -> dict:
     if not isinstance(data, dict):
         raise apierr.bad_request("Request body must be a JSON object")
     candidate = copy.deepcopy(data)
-    existing_id = str(candidate.pop("provider_id", "") or candidate.get("id") or "").strip().lower()
-    if existing_id and not (candidate.get("api_key") or candidate.get("api_key_env") or candidate.get("credentials")):
+    editing_id = str(candidate.pop("provider_id", "") or "").strip().lower()
+    existing_id = editing_id or str(candidate.get("id") or "").strip().lower()
+    # The saved provider is the base of a probe of it, whatever key field the form sends: with api_key_env in the form it
+    # was left out, and the check ran without its base_url, headers and flags (audit A14-03). A new provider's form that
+    # only shares an id with a saved one is merged when it brings no key of its own, as before.
+    if existing_id and (editing_id or not (candidate.get("api_key") or candidate.get("api_key_env")
+                                           or candidate.get("credentials"))):
         saved = admin_obj._saved() if admin_obj.cfg.get("_config_path") else {}
         found_saved = next(
             (p for p in (saved.get("providers") or []) if isinstance(p, dict) and str(p.get("id") or "").strip().lower() == existing_id),
             None,
         )
         if found_saved:
-            base_copy = copy.deepcopy(found_saved)
-            for k, v in candidate.items():
-                if k == "api_key" and not str(v or "").strip():
-                    continue
-                base_copy[k] = v
-            candidate = base_copy
+            candidate = _merge_provider_patch(found_saved, candidate)
 
     candidate.setdefault("id", existing_id or "probe")
     try:
