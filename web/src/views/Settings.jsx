@@ -6,6 +6,7 @@ import { usePolling } from '../useJournal.js';
 import { Dot, Page, ease } from '../motion.jsx';
 import { Button, CopyButton, Tag, Toggle, useToast } from '../ui.jsx';
 import { fmtInt, fmtTokens, isNum } from '../format.js';
+import { pingModelOf } from '../catalog.js';
 
 // Each group answers one question an operator actually has.
 export const GROUPS = [
@@ -291,7 +292,7 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
 
   const all = data?.data || [];
   const routableList = all.filter((m) => m.routable);
-  const activePingModel = pingTarget || data?.default_model || routableList[0]?.id || '';
+  const activePingModel = pingModelOf(data, pingTarget);
   const items = all.filter((model) => (!onlyRoutable || model.routable)
     && (!query || `${model.id} ${model.label} ${model.provider}`.toLowerCase().includes(query.toLowerCase())));
   // The default model leads; a long catalog is folded unless searched or expanded.

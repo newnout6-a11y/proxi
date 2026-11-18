@@ -43,3 +43,15 @@ export const ACCOUNT_STATE = {
   rate_limited: { label: 'пауза: часовой лимит', tone: 'warn' },
   pending: { label: 'не подключён', tone: 'muted' },
 };
+
+/**
+ * The model the catalog's quick test pings: the one picked, else the default model when it has a route, else the first
+ * model with a route. The select lists only models with a route, and the default model without one was pinged while
+ * the select showed another model (audit A14-11).
+ */
+export function pingModelOf(data, picked) {
+  const routable = (data?.data || []).filter((model) => model.routable).map((model) => model.id);
+  if (picked && routable.includes(picked)) return picked;
+  if (routable.includes(data?.default_model)) return data.default_model;
+  return routable[0] || '';
+}
