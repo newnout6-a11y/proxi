@@ -72,16 +72,17 @@ def test_the_empty_turn_502_names_a_classifier_refusal_as_a_possible_cause():
 
 
 def test_minara_credits_are_the_dollar_cost_at_220_per_dollar():
-    # Minara debits its own list at 220 credits a dollar; the turn carries provider_cost in USD.
-    usage = {"provider_cost": 0.5274504, "provider_cost_currency": "USD"}
+    # Minara debits its own list at 220 credits a dollar; the turn carries provider_cost in USD. Its usage names the path
+    # that answered (channel_path): a universal provider's dollars, which carry none, are not Minara credits (A07-02).
+    usage = {"provider_cost": 0.5274504, "provider_cost_currency": "USD", "channel_path": "chat"}
     assert credits.minara_credits(usage) == pytest.approx(116.0391, abs=1e-3)
-    assert credits.minara_credits({"provider_cost": 159.0}) == pytest.approx(34980.0, abs=1e-6)
+    assert credits.minara_credits({"provider_cost": 159.0, "channel_path": "messages"}) == pytest.approx(34980.0, abs=1e-6)
 
 
 def test_minara_credits_are_none_without_a_usable_usd_cost():
     for usage in ({}, {"provider_cost": None}, {"provider_cost": True}, {"provider_cost": float("nan")},
                   {"provider_cost": -1.0}, {"provider_cost": 1.0, "provider_cost_currency": "EUR"}):
-        assert credits.minara_credits(usage) is None, usage
+        assert credits.minara_credits(dict(usage, channel_path="chat")) is None, usage
 
 
 def test_a_write_is_priced_alone_and_never_mixed_into_the_turn_total():
