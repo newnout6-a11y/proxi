@@ -1208,7 +1208,10 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     body = {"model": model_provider.get("model"),
             "messages": messages,
             "rit": make_rit(messages, tools),
-            "metadata": {"sandpackAgent": True}}
+            # The App Builder marker goes as Retool's own frontend sends it: every one of its requests that carries the
+            # marker also says requestOrigin "Browser" (R2's helpers; its AI monitoring sorts credits by the origin).
+            # Neither rit nor the cache key covers metadata.
+            "metadata": {"sandpackAgent": True, "requestOrigin": "Browser"}}
     resource = model_provider.get("providerResourceName")
     if resource:
         body["providerResourceName"] = resource
