@@ -1806,9 +1806,9 @@ class Admin:
                 return admin_ops.create_provider(self, _body())
             raise apierr.method_not_allowed()
 
-        if path == "/admin/api/providers/test":
-            if cmd != "POST":
-                raise apierr.method_not_allowed()
+        if path == "/admin/api/providers/test" and cmd == "POST":
+            # The probe answers POST only; any other method of this path is the provider named "test" (an id the
+            # presets accept): matched first for every method, that provider could be neither changed nor deleted (A07-06).
             return admin_ops.test_provider_connection(self, _body())
 
         prov_match = PROVIDER_PATH.fullmatch(path)

@@ -121,3 +121,14 @@ def test_a_client_key_set_by_hand_is_shown_by_its_last_four_characters_at_most(g
     shown = next(item for item in gateway_admin.admin_call("/admin/api/client-keys")[1]["client_keys"]
                  if item["label"] == "Generated")["key_preview"]
     assert shown == "sk-proxi-…" + raw[-4:]  # the relay's own prefix is public
+
+
+# A07-06: the probe route /admin/api/providers/test was matched before the provider routes, so a provider named "test"
+# could be created and then neither changed nor deleted (405).
+def test_a_provider_named_test_can_be_changed_and_deleted(gateway_admin, mock_upstream):
+    create(gateway_admin, mock_upstream, pid="test")
+    create(gateway_admin, mock_upstream, pid="other")
+    status, answer = patch(gateway_admin, {"name": "Renamed test"}, pid="test")
+    assert status == 200 and answer["provider"]["name"] == "Renamed test"
+    assert gateway_admin.admin_call("/admin/api/providers/test", method="DELETE")[0] == 200
+    assert [p["id"] for p in gateway_admin.admin_call("/admin/api/providers")[1]["providers"]] == ["other"]
