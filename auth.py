@@ -331,6 +331,16 @@ def validate_client_key_entry(entry: dict, where: str = "client_keys") -> dict:
         if type(budget) not in (int, float) or isinstance(budget, bool) or not math.isfinite(budget) or budget < 0:
             raise ValueError(f"{where} ({kid}): 'max_budget_usd' must be a non-negative number (or null)")
         budget = round(float(budget), 6)
+    # The cost guard's ceilings of this key, in Minara credits (cost_guard): one request, and the key's day.
+    minara_limits = {}
+    for name in ("max_request_minara", "max_day_minara"):
+        value = entry.get(name)
+        if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+            raise ValueError(f"{where} ({kid}): '{name}' must be a non-negative number (or null)")
+        minara_limits[name] = None if value is None else round(float(value), 4)
+    confirm = entry.get("allow_cost_confirm", False)
+    if type(confirm) is not bool:
+        raise ValueError(f"{where} ({kid}): 'allow_cost_confirm' must be a boolean")
     return {
         "id": kid,
         "label": label,
@@ -339,6 +349,8 @@ def validate_client_key_entry(entry: dict, where: str = "client_keys") -> dict:
         "allowed_models": allowed,
         "rpm_limit": rpm,
         "max_budget_usd": budget,
+        **minara_limits,
+        "allow_cost_confirm": confirm,
     }
 
 
@@ -478,6 +490,9 @@ class ClientKeyManager:
                     "allowed_models": entry["allowed_models"],
                     "rpm_limit": entry["rpm_limit"],
                     "max_budget_usd": entry["max_budget_usd"],
+                    "max_request_minara": entry.get("max_request_minara"),
+                    "max_day_minara": entry.get("max_day_minara"),
+                    "allow_cost_confirm": entry.get("allow_cost_confirm", False),
                     "requests": stats.get("requests", 0),
                     "input_tokens": stats.get("input_tokens", 0),
                     "output_tokens": stats.get("output_tokens", 0),

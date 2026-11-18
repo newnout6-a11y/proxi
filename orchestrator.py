@@ -17,6 +17,7 @@ import uuid
 
 import apierr
 import adapters
+import cost_guard
 import executor
 import credits
 import journal
@@ -510,6 +511,8 @@ class TurnRunner:
         self.prompts = None
         # (profile, client) pairs whose dropped system prompt the journal has already named (_warn_dropped_client_system).
         self._dropped_noted = set()
+        # What Minara spent, by the hour, by client key and by dialog: the cost guard's ceilings are kept against it.
+        self.cost_guard = cost_guard.Guard(cost_guard.state_path(cfg))
 
     def _can_exec(self, steps: int) -> bool:
         return _can_exec(self.cfg, steps)
@@ -949,6 +952,54 @@ class TurnRunner:
             if message.get("senderRole") == "sandpack" and content.get("type") in ("text", "tool_call"):
                 return None
         return None
+
+    def _guard_cost(self, parsed, holder, session, entry, model_provider, log):
+        """Price a Minara request before anything is sent and raise the cost guard's refusal when it is above a ceiling.
+
+        The estimate (cost_guard.estimate) prices the request with the formula of its debit; the dialog's cache counts as
+        warm when the relay has seen a priced turn of it (the guard's memory, or the prefix the session keeps on disk), so a
+        running session is never priced as a first contact. The client gets a final 400 cost_limit_exceeded (or 429 for
+        the hourly ceiling) that names the estimate, the journal cost.blocked, the console a [cost] line."""
+        if self.cfg.get("cost_guard", "block") == "off":
+            return
+        request_tag = getattr(parsed, "request_id", None) or "req"
+        try:
+            chars = getattr(parsed, "client_chars", None) or adapters.request_chars(parsed)
+            anchor = getattr(session, "_count_anchor", None)
+            anchor = anchor[:2] if isinstance(anchor, tuple) and len(anchor) == 3 and anchor[2] == parsed.model else None
+            tokens, basis = adapters.count_input_tokens(chars, anchor)
+            account = account_tag(getattr(session, "backend", None))
+            key = getattr(parsed, "conversation_key", None)
+            prefix = self.cost_guard.warm_prefix(
+                key if isinstance(key, (str, tuple)) else None, model=parsed.model, account=account,
+                shared=cost_guard.shared_cache(entry), session_prefix=getattr(session, "_last_prefix_tokens", 0))
+            estimate = cost_guard.estimate(entry, prompt_tokens=tokens, basis=basis, warm_prefix=prefix,
+                                           max_tokens=getattr(parsed, "max_tokens", None),
+                                           effort=model_provider.get("reasoningEffort"))
+            if estimate is None:
+                return
+            error, warn = self.cost_guard.check(self.cfg, estimate, entry=entry, account=account,
+                                                key=getattr(parsed, "client_key", None),
+                                                confirm=getattr(parsed, "cost_confirm", None))
+        except Exception as exc:  # noqa: BLE001 - a guard that fails must not fail the request it guards
+            log("cost.estimate_failed", "Оценка цены запроса не удалась, запрос идёт без проверки: %s" % (
+                type(exc).__name__), "warn")
+            return
+        holder["_cost_estimate"] = estimate
+        holder.pop("_cost_actual", None)
+        fields = dict(estimate._asdict(), model=entry.get("id"))
+        how = cost_guard.explain(estimate, entry, account)
+        if error is not None:
+            log("cost.blocked", "Запрос остановлен защитой по цене: оценка %s кредитов Minara (%s)" % (
+                estimate.credits, error.code), "warn", code=error.code, status=error.status, **fields)
+            console_log.write("[%s] [cost] blocked: estimated %s Minara credits (~$%.2f): %s" % (
+                request_tag, estimate.credits, estimate.usd, how))
+            raise error
+        log("cost.estimate", "Оценка цены запроса: %s кредитов Minara (кэш %s)" % (
+            estimate.credits, "тёплый" if estimate.warm else "холодный"), "warn" if warn else "debug", **fields)
+        if warn:
+            console_log.write("[%s] [cost] estimated %s Minara credits (~$%.2f): %s" % (
+                request_tag, estimate.credits, estimate.usd, how))
 
     def _limit_pause(self, error, session):
         """Seconds to wait on an account at its hourly limit before its conversation moves, or None to move it now.
@@ -1494,6 +1545,9 @@ class TurnRunner:
                     target._minara_effort = model_provider.get("reasoningEffort")
                     target._minara_effort_model = parsed.model
                     target._minara_effort_set = True
+                if actual_upstream == "minara":
+                    # Priced before anything leaves: a refusal costs nothing (cost_guard).
+                    self._guard_cost(parsed, holder, acquired, bound_entry, model_provider, log)
                 # How many turns the pool has in flight, on this account and in all, this one included: the load this turn met.
                 counted = getattr(self.pool, "inflight", None)
                 load = ({} if counted is None else dict(zip(("inflight_account", "inflight_total"),
@@ -1832,6 +1886,14 @@ class TurnRunner:
                                         minara_spent = round(max(0.0, minara_credits - before), 4)
                                         holder['_attempt_minara'] = minara_credits
                                         event = dict(event, minara_credits=minara_spent)
+                                        holder['_cost_actual'] = minara_credits  # the attempt's, against its estimate
+                                        # What the cost guard keeps its hour, a key's day and the dialog's cache against.
+                                        conversation = getattr(parsed, 'conversation_key', None)
+                                        self.cost_guard.spent(
+                                            minara_spent, key_id=holder.get('_client_key_id'),
+                                            conversation=conversation if isinstance(conversation, (str, tuple)) else None,
+                                            account=trace.get('account'), model=parsed.model,
+                                            prompt_tokens=breakdown['prompt_tokens'] or None)
                                     if usd_spent is not None:
                                         event = dict(event, cost_usd=usd_spent)
                                     ck_id = holder.get('_client_key_id')
@@ -2300,6 +2362,12 @@ class TurnRunner:
                     request_attempts[(turn_id, number)] = 0
             output_tokens = (sum(output_attempts.values()) if output_attempts
                              and all(value is not None for value in output_attempts.values()) else None)
+            estimate, actual = holder.pop("_cost_estimate", None), holder.pop("_cost_actual", None)
+            if estimate is not None and actual is not None:
+                # How far the cost guard's estimate was from the debit: what its rules are calibrated by.
+                log("cost.estimate_vs_actual", "Оценка цены %s, списано %s кредитов Minara" % (estimate.credits, actual),
+                    "debug", estimate=estimate.credits, actual=actual, warm=estimate.warm,
+                    ratio=round(actual / estimate.credits, 3) if estimate.credits else None)
 
             def close(went_on=None):
                 # went_on: what the request did after this failed attempt ("moved" to another account, "retried" here),

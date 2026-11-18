@@ -61,6 +61,9 @@ probes/chunks/
 /retool_models.auto.json
 /provider_models.auto.json
 /models_dev.cache.json
+# What a client key spent on Minara today (cost_guard)
+/cost_guard.auto.json
+/cost_guard.auto.json.tmp
 .minara-catalog-*.tmp
 .retool-catalog-*.tmp
 .prov_models_*.tmp

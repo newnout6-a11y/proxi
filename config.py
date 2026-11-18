@@ -120,6 +120,15 @@ DEFAULTS = {
     # minara/claude-haiku-4-5, gpt-5-nano, zai-org/GLM-5.3-Flash that the catalog has and an account can take now, else the
     # chat's model; "same" keeps the chat's own model; a model id takes that one (proxy.Handler._optimize_prompt_suggestion).
     "prompt_suggestion_model": "auto",
+    # The cost guard (cost_guard.py): a Minara request is priced before it is sent, with the formula of its debit. "block"
+    # refuses one above a ceiling (400 cost_limit_exceeded, 429 for the hour), "warn" only says so, "off" prices nothing.
+    # Ceilings in Minara credits (220 per dollar), 0 for none: one request (the owner's dearest was 1,195; three agent forks
+    # cost 1,925 to 3,533), a sliding hour over all Minara accounts (a guard against loops: the owner's busiest hour was
+    # 6,373), and the estimate from which a request is named in the console and the journal (the owner's p99 is 250).
+    "cost_guard": "block",
+    "cost_guard_request_minara": 1500,
+    "cost_guard_hour_minara": 12000,
+    "cost_guard_warn_minara": 300,
     # true: /codex/models lists GPT models only (Retool's and Minara's), so Codex's picker shows no Claude, GLM or Gemini
     # route (the owner's config sets it, 2026-11-10).
     "codex_catalog_gpt_only": False,
@@ -827,6 +836,12 @@ def _load(path):
         raise service_unavailable("compaction_keep_effort must be a boolean")
     if type(cfg["codex_memory_jobs"]) is not bool:
         raise service_unavailable("codex_memory_jobs must be a boolean")
+    if cfg["cost_guard"] not in ("off", "warn", "block"):
+        raise service_unavailable('cost_guard must be "off", "warn" or "block"')
+    for key in ("cost_guard_request_minara", "cost_guard_hour_minara", "cost_guard_warn_minara"):
+        value = cfg[key]
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 10_000_000:
+            raise service_unavailable("%s must be a number of Minara credits from 0 to 10000000 (0: no ceiling)" % key)
     if type(cfg["codex_catalog_gpt_only"]) is not bool:
         raise service_unavailable("codex_catalog_gpt_only must be a boolean")
     if type(cfg["codex_compaction_cache"]) is not bool:

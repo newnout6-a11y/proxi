@@ -27,6 +27,7 @@ import compaction_tools
 import config as config_module
 import conversation_infer
 import conversation_state
+import cost_guard
 import drivers
 from drivers import http_pool
 import forced_choice
@@ -60,7 +61,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RECORD_REQUEST_BYTES = 1024 * 1024
 # What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
 _CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
-                 "dialect", "thinking_placeholder", "virtual_profile", "requested_model", "client_task")
+                 "dialect", "thinking_placeholder", "virtual_profile", "requested_model", "client_task",
+                 "client_key", "cost_confirm")
 
 
 def _carry_compatibility(first, parsed, changes):
@@ -973,6 +975,12 @@ def make_handler(runtime: Runtime):
             runtime.client_keys.enforce_request(
                 getattr(self, "_client_key_profile", None), parsed.model, parsed.requested_model
             )
+            # The cost guard's inputs (cost_guard): the client key's own ceilings, and a sum the client allows one request
+            # to cost, which only the master key and a key with allow_cost_confirm may name.
+            key_profile = getattr(self, "_client_key_profile", None)
+            parsed.client_key = key_profile if key_profile and not key_profile.get("master") else None
+            parsed.cost_confirm = (self.headers.get(cost_guard.CONFIRM_HEADER)
+                                   if not parsed.client_key or parsed.client_key.get("allow_cost_confirm") else None)
             substituted = model_catalog.substitute_for(parsed.requested_model)
             if substituted != parsed.model:
                 substituted = None
