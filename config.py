@@ -1014,6 +1014,7 @@ def _load(path):
     cfg['_minara_models'] = models.build_minara_catalog(accounts if accounts is not None else [cfg])
     cfg['_provider_models'] = catalog_router.build_provider_catalog(cfg)
     cfg['_route_aliases'] = catalog_router.build_route_aliases(cfg, models)
+    warnings.extend(cfg.get('_route_warnings') or [])  # routes[] targets that are no known model (A08-04)
     if 'model' not in saved and not any(
         isinstance(a, dict) and a.get('upstream', 'retool') == 'retool'
         for a in (accounts if isinstance(accounts, list) else ([] if cfg.get('_empty_pool') else [cfg]))

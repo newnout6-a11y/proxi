@@ -7,6 +7,7 @@ import copy
 import datetime
 import fnmatch
 import re
+import sys
 import console_log
 import minara_catalog as minara_routes
 
@@ -553,10 +554,14 @@ def provider_catalog(cfg=None):
 
 
 def route_alias_catalog(cfg=None):
-    """User-configured model aliases & fallback groups (`<route_id>` -> entry) attached to `cfg`."""
+    """User-configured model aliases & fallback groups (`<route_id>` -> entry) attached to `cfg`, built again when a
+    catalog their targets come from changed (catalog.router.refresh_route_aliases)."""
     if not isinstance(cfg, dict):
         return {}
-    return cfg.get('_route_aliases') or {}
+    if not cfg.get('_route_sources'):
+        return cfg.get('_route_aliases') or {}
+    from catalog import router as catalog_router  # local: the router imports the account module, which imports this one
+    return catalog_router.refresh_route_aliases(cfg, sys.modules[__name__])
 
 
 def universal_entry(name, cfg=None):
