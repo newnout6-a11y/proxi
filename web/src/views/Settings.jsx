@@ -198,9 +198,15 @@ function Connection({ apiKey, overview, onUnauthorized }) {
     setSyncing(true);
     try {
       const res = await api(apiKey, 'clients/sync-opencode', { method: 'POST', body: {} });
+      // The relay writes OpenCode's file and the DeepSeek Harness profiles; ok holds only when every file was synced, and
+      // written says whether one was rewritten (a list already current is left alone).
+      const harness = (res.result?.harness || []).filter((item) => item && item.error);
       toast(res.ok
-        ? { tone: 'success', title: 'OpenCode синхронизирован', text: 'Список моделей обновлён в opencode.jsonc' }
-        : { tone: 'warn', title: 'Синхронизация OpenCode', text: res.reason || res.result?.error || 'Не удалось обновить файл' });
+        ? { tone: 'success', title: 'Клиенты синхронизированы',
+          text: res.written === false ? 'Списки моделей OpenCode и DeepSeek Harness уже актуальны: файлы не менялись'
+            : 'Список моделей обновлён в opencode.jsonc и профилях DeepSeek Harness' }
+        : { tone: 'warn', title: 'Синхронизация клиентов',
+          text: res.reason || res.result?.error || (harness.length ? `DeepSeek Harness: ${harness.map((item) => item.error).join(' · ')}` : 'Не удалось обновить файл') });
     } catch (failure) {
       if (failure.status === 401) onUnauthorized();
       else toast({ tone: 'error', title: 'Ошибка синхронизации', text: failure.message });
@@ -215,8 +221,9 @@ function Connection({ apiKey, overview, onUnauthorized }) {
         <h2>Подключение IDE</h2>
         <div className="head-actions">
           <span className="status" title={session.title}><Dot tone={session.tone} />{session.text}</span>
-          <Button icon={RefreshCw} disabled={syncing} onClick={syncOpenCode}>
-            {syncing ? 'Синхронизация…' : 'Синхр. OpenCode'}
+          <Button icon={RefreshCw} disabled={syncing} onClick={syncOpenCode}
+            title="Переписывает список моделей relay в opencode.jsonc и в профилях DeepSeek Harness (с резервной копией)">
+            {syncing ? 'Синхронизация…' : 'Синхр. OpenCode и Harness'}
           </Button>
         </div>
       </div>

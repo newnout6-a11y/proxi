@@ -998,6 +998,13 @@ def delete_client_key(admin_obj, key_id: str) -> dict:
 # -- OpenCode 1-click Sync ----------------------------------------------------
 
 def sync_opencode_now(admin_obj) -> dict:
+    """Write the relay's models into OpenCode's settings file and the DeepSeek Harness profiles now (the relay does it
+    after each catalog look by itself), and say what was done.
+
+    The button ran a sync with a lock of its own beside the relay's, so both could write OpenCode's file at once, and its
+    "ok" read OpenCode's summary alone: a failed Harness profile, or a list already current (nothing written), was
+    reported as "Список моделей обновлён" (audit A14-07). It now waits for the relay's own sync under way, its answer is
+    ok only when every file was synced, and `written` / `changed` say whether a file was rewritten."""
     path = client_sync.settings_path(admin_obj.cfg)
     if path is None or not path.is_file():
         return {"ok": False, "reason": "Файл настроек OpenCode (opencode.jsonc / opencode.json) не найден"}
@@ -1005,9 +1012,17 @@ def sync_opencode_now(admin_obj) -> dict:
     runner = getattr(syncer, "_run", None)
     forced_cfg = {**admin_obj.cfg, "opencode_sync": True}
     manual_sync = client_sync.OpenCodeSync(forced_cfg, runner=runner)
+    shared_lock = getattr(syncer, "_lock", None)
+    if shared_lock is not None:
+        manual_sync._lock = shared_lock  # one write at a time with the relay's own sync after a catalog look
     res = manual_sync("admin")
     if syncer is not None:
         syncer.last = manual_sync.last
+        syncer.last_harness = manual_sync.last_harness
     if not res:
         return {"ok": False, "reason": "Синхронизация не выполнена (нет записываемого config.json)"}
-    return admin_obj._safe({"ok": not bool(res.get("error")), "result": res})
+    harness = [item for item in res.get("harness") or [] if isinstance(item, dict)]
+    failed = bool(res.get("error")) or any(item.get("error") for item in harness)
+    written = bool(res.get("written")) or any(item.get("written") for item in harness)
+    changed = bool(res.get("changed")) or any(item.get("changed") for item in harness)
+    return admin_obj._safe({"ok": not failed, "written": written, "changed": changed, "result": res})
