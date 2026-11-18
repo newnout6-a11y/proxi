@@ -46,7 +46,9 @@ def test_a_cut_custom_call_closes_as_an_incomplete_item(reason, stream):
         done = next(p for kind, p in writer.events if kind == "response.custom_tool_call_input.done")
         assert done["input"] == ""
         assert [p["item"] for kind, p in writer.events if kind == "response.output_item.done"] == final["output"]
-        assert kinds[-2:] == ["response.incomplete" if reason == "timeout" else "response.completed", "done"]
+        # No data: [DONE] in Responses: the stream ends with its terminal event.
+        assert kinds[-1] == ("response.incomplete" if reason == "timeout" else "response.completed")
+        assert "done" not in kinds
 
 
 @pytest.mark.parametrize("stream", [False, True])

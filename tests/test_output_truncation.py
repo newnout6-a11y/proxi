@@ -232,7 +232,9 @@ def test_responses_says_incomplete_with_the_reason_and_never_completed():
     feed_cut_call(adapter)
     final = adapter.end("length")
     names = [kind for kind, _ in writer.events]
-    assert names[-2:] == ["response.incomplete", "done"] and "response.completed" not in names
+    # No data: [DONE] in Responses: the stream ends with its terminal event (the spec has no [DONE]; Codex logged
+    # "Failed to parse SSE event" for it, research S4 §2.1).
+    assert names[-1] == "response.incomplete" and "response.completed" not in names and "done" not in names
     assert final["status"] == "incomplete" and final["incomplete_details"] == {"reason": "max_output_tokens"}
     assert [item["status"] for item in final["output"]] == ["completed", "incomplete"]
     assert "response.function_call_arguments.done" not in names  # the arguments of a cut call are not final

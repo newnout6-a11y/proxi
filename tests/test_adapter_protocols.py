@@ -67,7 +67,9 @@ def test_responses_reasoning_and_message_items_have_complete_distinct_lifecycles
     assert kinds.index("response.reasoning_summary_part.added") < kinds.index("response.reasoning_summary_text.delta")
     assert kinds.index("response.reasoning_summary_text.done") < kinds.index("response.reasoning_summary_part.done")
     assert kinds.index("response.output_text.done") < kinds.index("response.content_part.done")
-    assert kinds[-2:] == ["response.completed", "done"]
+    # No data: [DONE] in Responses: the stream ends with its terminal event (the spec has no [DONE]; Codex logged
+    # "Failed to parse SSE event" for it, research S4 §2.1).
+    assert kinds[-1] == "response.completed" and "done" not in kinds
     sequences = [p["sequence_number"] for _, p in writer.events if p and "sequence_number" in p]
     assert sequences == list(range(1, len(sequences) + 1))
 

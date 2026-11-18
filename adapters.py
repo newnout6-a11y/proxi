@@ -785,9 +785,9 @@ class ResponsesAdapter(_Base):
         cut = self._cut = reason in CUT_REASONS
         self._finish_through(len(self._items) - 1, self._statuses(reason))
         final = self.payload(reason, prompt_text)
+        # The terminal event ends a Responses stream: the spec has no data: [DONE] (OpenAI's SDK reads it only for
+        # compatibility), and Codex logged every one as "Failed to parse SSE event" (research S4 §2.1).
         self._emit("response.incomplete" if cut else "response.completed", {"response": final})
-        if self.writer:
-            self.writer.done()
         return final
 
     def payload(self, reason, prompt_text=None):
