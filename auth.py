@@ -31,6 +31,19 @@ def set_client_version(version) -> bool:
     return True
 
 
+def cloudflare_challenge(status, headers) -> bool:
+    """True for Cloudflare's challenge in front of Retool: a 403 with `cf-mitigated: challenge`, as Retool's frontend tells
+    it from a refusal of the session (isCloudflareChallenge, CloudflareChallengeError). It concerns the connection (its
+    address, its client), not the account's cookies."""
+    if status != 403 or not headers:
+        return False
+    try:
+        items = headers.items()
+    except AttributeError:
+        return False
+    return any(str(name).lower() == "cf-mitigated" and str(value).strip().lower() == "challenge" for name, value in items)
+
+
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/131.0.0.0 Safari/537.36")
 _CHROME_MAJOR = re.compile(r"\bChrome/(\d+)")

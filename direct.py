@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 
 import apierr
+import auth
 import conversation_state
 import credits
 import forced_choice
@@ -2740,6 +2741,19 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                                      diagnostic_id=diagnostic, model=body.get("model"),
                                      effort=body.get("reasoningEffort"),
                                      upstream_request_id=exc.headers.get("request-id") or exc.headers.get("x-request-id"))
+                    if auth.cloudflare_challenge(exc.code, exc.headers):
+                        # Cloudflare's challenge in front of Retool: the connection was taken for a bot. The session is
+                        # not the cause, and a renewal would meet the same challenge (and count as a failed sign-in).
+                        journal.emit("upstream.cloudflare_challenge",
+                                     "Retool ответил проверкой Cloudflare (HTTP 403, cf-mitigated: challenge): сессия не "
+                                     "продлевается, это проверка соединения, а не отказ авторизации", "warn",
+                                     model=body.get("model"), account=account_tag(getattr(session, "backend", None)))
+                        error = apierr.upstream_error(
+                            "Retool answered with a Cloudflare challenge (HTTP 403, cf-mitigated: challenge): the relay's "
+                            "connection was taken for a bot; the session is not at fault and was not renewed")
+                        error.upstream_status = exc.code
+                        error.cloudflare_challenge = True
+                        raise error
                     if exc.code in (401, 403) and attempt == 0:
                         attempt = 1
                         # The 401 may come from a header snapshot taken just before
