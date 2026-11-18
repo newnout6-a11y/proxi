@@ -296,7 +296,7 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
   const models = (rich ? [...catalog, ...extraCatalog] : catalog).map(withXhighFlag);
     const state = { settings: { ...initial }, effective: { ...initial }, requests: [], patches: [], sessions: [],
     stream: [], streamRequests: 0, cleared: false, accountRequests: [],
-    providers: [], routes: [], clientKeys: [],
+    providers: [], providerPatches: [], routes: [], clientKeys: [],
     pool: accounts.map((a, i) => ({ ...poolAccount(a.account, i ? 'запасной' : 'основной', i), ...a })) };
   const overview = {
     health: { ok: true, upstream: 'ok', error: null }, uptime_seconds: 5432,
@@ -409,6 +409,15 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     }
     if (path === '/admin/api/providers/test' && method === 'POST') {
       return reply(200, { ok: true, latency_ms: 42, models_count: 12, models: [{ id: 'deepseek/deepseek-chat-v3' }] });
+    }
+    const providerPatch = method === 'PATCH' && path.match(/^\/admin\/api\/providers\/([^/]+)$/);
+    if (providerPatch) {
+      const body = request.postDataJSON();
+      state.providerPatches.push({ id: providerPatch[1], body });
+      const index = state.providers.findIndex((p) => p.id === providerPatch[1]);
+      if (index < 0) return reply(404, { error: { message: 'Unknown provider' } });
+      state.providers[index] = { ...state.providers[index], ...body };
+      return reply(200, { provider: state.providers[index], restart_required: false, discovery: null });
     }
     if (path === '/admin/api/providers' && method === 'POST') {
       const body = request.postDataJSON();

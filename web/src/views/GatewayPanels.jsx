@@ -670,7 +670,7 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
                   onChange={(e) => setKeyDraft((d) => ({ ...d, rpm_limit: e.target.value }))} placeholder="60" />
               </label>
               <label className="field">
-                <span>Бюджет в USD (необязательно)</span>
+                <span>Бюджет в USD (необязательно): ходы Minara и API-провайдеров с запуска relay, ходы Retool не входят</span>
                 <input type="number" min="0" step="0.01" value={keyDraft.max_budget_usd}
                   onChange={(e) => setKeyDraft((d) => ({ ...d, max_budget_usd: e.target.value }))} placeholder="10.00" />
               </label>
@@ -695,10 +695,11 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
                   </div>
                 </div>
                 <div className="gw-meta mono">
-                  <span>
+                  <span title="Счётчики с запуска relay. В долларах — ходы Minara и API-провайдеров; ходы Retool (его кредиты) в расход и бюджет ключа не входят">
                     запросов: <b>{fmtInt(ck.requests)}</b> · потрачено: <b>${fmtFixed(ck.spent_usd, 4)}</b>
                     {isNum(ck.max_budget_usd) && ` из $${fmtFixed(ck.max_budget_usd, 2)}`}
                     {isNum(ck.rpm_limit) && ` · лимит ${fmtInt(ck.rpm_limit)} RPM`}
+                    {' · с запуска relay, без Retool'}
                   </span>
                   {ck.allowed_models?.length > 0 && <span>модели: {ck.allowed_models.join(', ')}</span>}
                 </div>
