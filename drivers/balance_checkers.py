@@ -41,6 +41,16 @@ def own_balance_endpoint(endpoint, base_url) -> str | None:
     return endpoint.strip() if own is not None and _origin(endpoint) == own else None
 
 
+def _in_dollars(amount: float, url: str) -> dict:
+    """A balance figure of Moonshot or SiliconFlow in dollars: their China hosts (.cn) answer in yuan, which were read as
+    dollars, about seven times too much (audit A11-16)."""
+    host = (urllib.parse.urlsplit(url or "").hostname or "").lower().rstrip(".")
+    if host.endswith(".cn"):
+        return {"available": round(amount * CNY_TO_USD_FALLBACK, 4), "monthly_allocation": None, "unit": "usd",
+                "raw_currency": "CNY"}
+    return {"available": round(amount, 4), "monthly_allocation": None, "unit": "usd"}
+
+
 def _parse_balance_response(preset: str, url: str, payload: dict) -> dict:
     """Parse provider-specific JSON balance responses into `{available, monthly_allocation, currency, unit}`."""
     low_url = (url or "").lower()
@@ -80,17 +90,19 @@ def _parse_balance_response(preset: str, url: str, payload: dict) -> dict:
                 return {"available": round(usd_val, 4), "monthly_allocation": None, "unit": "usd", "raw_currency": cur}
 
     # 3. Moonshot (Kimi): GET https://api.moonshot.ai/v1/users/me/balance -> {"data": {"available_balance": 19.5}}
+    #    api.moonshot.cn answers the same shape in yuan.
     if low_preset == "moonshot" or "moonshot." in low_url:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         if data.get("available_balance") is not None:
-            return {"available": round(float(data["available_balance"]), 4), "monthly_allocation": None, "unit": "usd"}
+            return _in_dollars(float(data["available_balance"]), url)
 
     # 4. SiliconFlow: GET https://api.siliconflow.com/v1/user/info -> {"data": {"totalBalance": "15.20"}}
+    #    api.siliconflow.cn answers the same shape in yuan.
     if low_preset == "siliconflow" or "siliconflow." in low_url:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         bal = data.get("totalBalance") if data.get("totalBalance") is not None else data.get("balance")
         if bal is not None:
-            return {"available": round(float(bal), 4), "monthly_allocation": None, "unit": "usd"}
+            return _in_dollars(float(bal), url)
 
     # 5. Generic JSON convention (`{"available": ...}` or `{"balance": ...}` or `{"credits": ...}`)
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
@@ -120,14 +132,14 @@ class ProviderBalanceAccount(UnmeteredAccount):
         self.last_error: str | None = None
         self._spent_since_fetch = 0.0
 
-    def record_provider_usage(self, *args, **kwargs):
-        before = self._currencies.get("USD", 0.0)
-        super().record_provider_usage(*args, **kwargs)
-        after = self._currencies.get("USD", 0.0)
-        delta = max(0.0, after - before)
-        if delta > 0:
-            with self._lock:
-                self._spent_since_fetch += delta
+    def _account(self, row, sign=1):
+        """The local debit follows the dollar ledger in the same step, under the same lock (record_provider_usage holds
+        it). It was the ledger's difference before and after a record, read outside the lock: two records at once each
+        counted the other's cost too, and the balance shown fell faster than the money (audit A07-10)."""
+        super()._account(row, sign)
+        cost = row.get("provider_cost")
+        if row.get("provider_cost_currency") == "USD" and type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
+            self._spent_since_fetch += sign * cost
 
     def _http_get_balance(self) -> dict:
         url = str(self._endpoint or "").strip()
@@ -226,6 +238,11 @@ class ProviderBalanceAccount(UnmeteredAccount):
             now = time.monotonic()
             if not force_refresh and self._cached_info is not None and (now - self._fetched_at) < CACHE_SECONDS:
                 return self.balance_snapshot()
+            with self._lock:
+                # What was spent until now; costs recorded while the read is under way stay on the local debit (the
+                # provider may answer before it counts them: OpenRouter counts usage with a delay). Zeroing it all made the
+                # balance shown go up after every read (audit A11-16), as MinaraAccount._fetch_balance already avoids.
+                spent_before = self._spent_since_fetch
             try:
                 parsed = self._fetch(self.cfg) if callable(self._fetch) else self._http_get_balance()
             except Exception as exc:  # noqa: BLE001
@@ -237,6 +254,6 @@ class ProviderBalanceAccount(UnmeteredAccount):
             with self._lock:
                 self._cached_info = dict(parsed)
                 self._fetched_at = time.monotonic()
-                self._spent_since_fetch = 0.0
+                self._spent_since_fetch = max(0.0, self._spent_since_fetch - spent_before)
                 self.last_error = None
             return self.balance_snapshot()
