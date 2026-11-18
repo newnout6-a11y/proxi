@@ -142,8 +142,9 @@ export function buildTraces(events) {
       if (isPrice(data.minara_credits)) {
         attempt.known = true;
         trace.minaraSum = (trace.minaraSum ?? 0) + data.minara_credits;
-      }
-      if (isPrice(data.cost_usd)) {
+      } else if (isPrice(data.cost_usd)) {
+        // A universal provider's price. A Minara reply carries its dollars too (cost_usd), but they are the same money
+        // as its Minara credits: read as a second price, every Minara turn was counted in both (journal._usage_prices).
         attempt.known = true;
         trace.costUsdSum = (trace.costUsdSum ?? 0) + data.cost_usd;
       }
@@ -242,6 +243,12 @@ export function costOf(trace, status = trace.status) {
   const credits = trace.creditsSum !== null ? trace.creditsSum : ended && !unknown && minara === null && usd === null ? 0 : null;
   return { credits, ...(minara !== null ? { minara } : {}), ...(usd !== null ? { usd } : {}), unknown, running, complete: ended && !unknown };
 }
+
+/** A turn priced in US dollars alone: a universal provider's (`usd`), with neither Minara's nor Retool's credits. */
+export const isUsdOnly = (cost) => cost.usd !== undefined && cost.minara === undefined && cost.credits === null;
+
+/** The figure the turn list shows: Minara's credits, else the dollars of a dollar-only turn, else Retool's credits. */
+export const shownCost = (cost) => (cost.minara !== undefined ? cost.minara : isUsdOnly(cost) ? cost.usd : cost.credits);
 
 /** A turn silent for longer than this is not running any more: the relay's own turn timeout is 15 minutes by default. */
 export const STALE_AFTER = 20 * 60;

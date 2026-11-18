@@ -45,7 +45,7 @@ LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "a
                  "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs", "codex_compaction_cache",
                  "prompt_suggestion_model",
                  "models_dev_sync", "catalog_refresh_hours", "opencode_sync",
-                 "stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout"}
+                 "stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout", "stream_thinking_timeout"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 # A credential the admin masks in its answers is at least this long (an account's id, page or thread at least 5). Retool's
@@ -270,14 +270,20 @@ def _schema(cfg=None):
          "Сколько ждать соединения и ответа на HTTP-запрос к Retool", "с", 1, 3600, None),
         ("recv_timeout", "integer", "Ожидание WebSocket", "limits",
          "Сколько ждать следующего сообщения по WebSocket Retool", "с", 1, 3600, None),
-        ("stream_first_token_timeout", "number", "Таймаут первого токена стрима", "limits",
-         "Сколько секунд ждать первый токен от универсального провайдера до сброса попытки; 0 — без отдельного предела. "
-         "Применяется сразу", "с", 0, 3600, None),
-        ("stream_idle_timeout", "number", "Таймаут тишины в стриме", "limits",
-         "Максимальная пауза между чанками текста/мышления универсального провайдера; 0 — выключено. Применяется сразу",
+        # Whole seconds, as config.load requires (STREAM_TIMEOUTS): a fraction saved here kept the relay from starting.
+        # Every upstream streams through the same watchdog: Retool, Minara and the universal providers.
+        ("stream_first_token_timeout", "integer", "Таймаут первого токена стрима", "limits",
+         "Сколько секунд ждать первый токен от upstream (Retool, Minara, провайдер) до сброса попытки с 504; "
+         "0 — без отдельного предела. Применяется сразу", "с", 0, 3600, None),
+        ("stream_idle_timeout", "integer", "Таймаут тишины в стриме", "limits",
+         "Максимальная пауза между чанками текста или мышления любого upstream; 0 — выключено. Применяется сразу",
          "с", 0, 3600, None),
-        ("stream_tool_timeout", "number", "Таймаут генерации аргументов tool", "limits",
-         "Максимальная пауза при потоковой генерации аргументов инструментов; 0 — выключено. Применяется сразу",
+        ("stream_tool_timeout", "integer", "Таймаут генерации аргументов tool", "limits",
+         "Максимальная пауза, пока upstream передаёт аргументы объявленного вызова инструмента; 0 — выключено. "
+         "Применяется сразу", "с", 0, 3600, None),
+        ("stream_thinking_timeout", "integer", "Таймаут молчаливого мышления", "limits",
+         "Сколько секунд upstream может молчать, после того как прислал настоящий признак мышления модели (начало "
+         "блока thinking, подпись); уже действующий предел этим не сокращается; 0 — выключено. Применяется сразу",
          "с", 0, 3600, None),
         ("max_prompt_bytes", "integer", "Размер промпта", "limits",
          "Отклонять запросы с промптом больше этого размера; 0 — без ограничения", "байт", 0, 1_073_741_824, None),
@@ -315,6 +321,12 @@ def _schema(cfg=None):
     fields['relay_system_prompt']['nullable'] = True
     fields['relay_system_prompt'].update(max_bytes=ROLE_MAX_BYTES, max_prompt_share=ROLE_PROMPT_SHARE)
     return fields
+
+
+def _model_choices(cfg):
+    """The values the two model settings take, from the catalog as it is now (routes and providers included)."""
+    catalog_ids = [entry["id"] for entry in models.catalog(cfg)]
+    return {"model": catalog_ids, "prompt_suggestion_model": list(dict.fromkeys(["auto", "same", *catalog_ids]))}
 
 
 def _role_limit(max_prompt_bytes):
@@ -627,15 +639,26 @@ class Admin:
         except (OSError, ValueError):
             raise apierr.service_unavailable("Cannot read relay settings")
 
+    def _live_schema(self):
+        """The schema with the model lists of the catalog as it is now. They were taken once, when the admin started: a
+        route or a provider added in the admin afterwards was listed in /admin/api/models and refused as the default model
+        ("Unsupported value for 'model'") until a restart (audit A14-04)."""
+        schema = dict(self.schema)
+        for key, choices in _model_choices(self.cfg).items():
+            if key in schema:
+                schema[key] = dict(schema[key], enum=choices)
+        return schema
+
     def _settings(self, saved=None):
         saved = self._saved() if saved is None else saved
-        effective = {key: self.cfg.get(key, config.DEFAULTS.get(key)) for key in self.schema}
-        desired = {key: saved.get(key, effective[key]) for key in self.schema}
+        schema = self._live_schema()
+        effective = {key: self.cfg.get(key, config.DEFAULTS.get(key)) for key in schema}
+        desired = {key: saved.get(key, effective[key]) for key in schema}
         # Environment overrides remain authoritative after restarting.
         if os.environ.get("RELAY_SESSION_MODE"):
             desired["session_mode"] = effective["session_mode"]
-        pending = [key for key in self.schema if desired[key] != effective[key]]
-        return {"settings": desired, "effective": effective, "schema": self.schema,
+        pending = [key for key in schema if desired[key] != effective[key]]
+        return {"settings": desired, "effective": effective, "schema": schema,
                 # default_system_prompt is the relay role alone; the list names every built-in role and its path.
                 "default_system_prompt": DEFAULT_RELAY_SYSTEM_PROMPT, "default_system_prompts": _default_roles(),
                 "pending_restart": pending, "restart_required": bool(pending),
@@ -927,7 +950,11 @@ class Admin:
             "accounts": [self._public(account) for account in pool],
             "summary": {"total": len(live), "enabled": sum(account["enabled"] for account in live),
                         "routable": sum(account["routable"] for account in live),
-                        "reserve": sum(account["reserve"] for account in live), "states": states},
+                        "reserve": sum(account["reserve"] for account in live), "states": states,
+                        # The universal providers serve too: the last enabled account is not the last that answers
+                        # when one is enabled (_other_enabled counts them, and so does the accounts page).
+                        "enabled_providers": sum(1 for item in self.cfg.get("providers") or []
+                                                 if isinstance(item, dict) and item.get("enabled", True) is not False)},
             "limits": {key: self.cfg.get(key, config.DEFAULTS.get(key))
                        for key in ("min_account_balance", "account_balance_interval", "account_refresh_parallel")},
             "restart_required": any(account["pending"] for account in pool),
@@ -1352,8 +1379,9 @@ class Admin:
     def _validate(self, changes):
         if not isinstance(changes, dict) or not changes:
             raise apierr.bad_request("'settings' must be a non-empty object")
+        schema = self._live_schema()
         for key, value in changes.items():
-            field = self.schema.get(key)
+            field = schema.get(key)
             if field is None:
                 raise apierr.bad_request("Unknown or protected setting", param=key)
             kind = field["type"]
@@ -1466,6 +1494,7 @@ class Admin:
                     limiter.rate = self.cfg["rate_limit_rps"]
                     limiter.burst = self.cfg["rate_limit_burst"]
                     limiter.tokens = min(limiter.tokens, limiter.burst)
+                self._apply_to_accounts({key: changes[key] for key in applied})
                 dispatcher = self.runtime.accounts
                 if {"min_account_balance", "account_balance_interval"} & set(applied):
                     with dispatcher._lock:
@@ -1475,7 +1504,40 @@ class Admin:
                         now = dispatcher.clock()
                         for state in dispatcher.state.values():
                             state["next_balance"] = min(state["next_balance"], now)
-            return {**self._settings(saved), "saved": True, "changed": changed, "applied": applied}
+            answer = {**self._settings(saved), "saved": True, "changed": changed, "applied": applied}
+        if "catalog_refresh_hours" in changed and "catalog_refresh_hours" in applied:
+            self._restart_provider_catalog()  # outside the lock: stopping waits up to 2 s for the refresher's loop
+        return answer
+
+    def _apply_to_accounts(self, changes):
+        """A live setting reaches every account as a restart would give it: each account's session reads its own copy of
+        the configuration (models.account_config), so the stream timeouts changed in the root only stayed 300/120 s on
+        every account until a restart (audit A07-03). A value the account's own record names stays the account's."""
+        for backend in self._live_backends():
+            cfg = getattr(backend, "cfg", None)
+            if not isinstance(cfg, dict) or cfg is self.cfg:
+                continue
+            record = cfg.get("_account_ref")
+            for key, value in changes.items():
+                if not (isinstance(record, dict) and record is not cfg and key in record):
+                    cfg[key] = value
+
+    def _restart_provider_catalog(self):
+        """The provider catalog's refresher takes catalog_refresh_hours when its loop starts: a new interval needs a new
+        loop. A loop still reading /models ends by itself once stopped; a new one started beside it would clear the stop
+        and leave both running, so then the new one starts when the old one is done."""
+        refresher = getattr(self.runtime, "provider_catalog", None)
+        if not (callable(getattr(refresher, "stop", None)) and callable(getattr(refresher, "start", None))):
+            return
+        running = getattr(refresher, "_thread", None)
+        refresher.stop()
+        if isinstance(running, threading.Thread) and running.is_alive():
+            def start_after():
+                running.join()
+                refresher.start()
+            threading.Thread(target=start_after, name="provider-catalog-restart", daemon=True).start()
+        else:
+            refresher.start()
 
     def _mutation_guard(self, handler):
         if handler.headers.get("x-admin-request") != "1":
@@ -1748,9 +1810,9 @@ class Admin:
                 return admin_ops.create_provider(self, _body())
             raise apierr.method_not_allowed()
 
-        if path == "/admin/api/providers/test":
-            if cmd != "POST":
-                raise apierr.method_not_allowed()
+        if path == "/admin/api/providers/test" and cmd == "POST":
+            # The probe answers POST only; any other method of this path is the provider named "test" (an id the
+            # presets accept): matched first for every method, that provider could be neither changed nor deleted (A07-06).
             return admin_ops.test_provider_connection(self, _body())
 
         prov_match = PROVIDER_PATH.fullmatch(path)

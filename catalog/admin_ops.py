@@ -9,6 +9,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.parse
 
 import account_report
 import apierr
@@ -24,15 +25,61 @@ import validate
 ROUTE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,79}$")
 ROUTE_STRATEGIES = ("priority", "weighted", "least-inflight")
 SECRET_HEADER_NAMES = {"authorization", "x-api-key", "api-key", "proxy-authorization"}
+# A model id a provider lists by hand: no spaces, quotes, braces, brackets or commas. The edit form split an OpenCode models
+# object at its commas, and the pieces ('{"deepseek-chat":{"name":"DeepSeek Chat"', ...) were saved as ids (audit A14-01).
+MODEL_ID_PATTERN = re.compile(r"[^\s\"'{}\[\],]{1,200}")
+# What a key preview shows: a mask, and the last four characters of a key long enough that they say nothing of the rest.
+KEY_MASK = "••••••••"
+PREVIEW_MIN_CHARS = 24
+CLIENT_KEY_PREFIX = "sk-proxi-"  # auth.generate_client_key: the relay's own prefix is public
+# The userinfo of a proxy_url in an answer: a stand-in, which a PATCH that sends it back unchanged leaves alone.
+PROXY_USERINFO_MASK = "•••"
+# How long the admin waits for a catalog refresh before it answers "still running" (a refresh reads /models of every
+# provider in turn, and models.dev).
+DISCOVERY_WAIT = 25.0
+_DISCOVERY_LOCK = threading.Lock()
 
 
 def mask_key_preview(raw_key: str | None) -> str | None:
+    """A key as the admin API shows it: at most its last four characters, and only for a key of PREVIEW_MIN_CHARS or more.
+
+    The preview showed the first six and the last four characters of any key longer than 12: ten of a thirteen-character
+    key (audits A07-09, A14-12)."""
     if not isinstance(raw_key, str) or not raw_key.strip():
         return None
     val = raw_key.strip()
-    if len(val) > 12:
-        return f"{val[:6]}…{val[-4:]}"
-    return "••••••••"
+    return "…" + val[-4:] if len(val) >= PREVIEW_MIN_CHARS else KEY_MASK
+
+
+def client_key_preview(raw_key: str | None) -> str | None:
+    """A client key as the admin shows it: a key the relay made keeps its public prefix (sk-proxi-) and its last four
+    characters; one set by hand is shown like a provider's key. auth.list_public showed the first nine and the last four
+    characters of any key over 16: thirteen of a seventeen-character key set by hand."""
+    if isinstance(raw_key, str) and raw_key.startswith(CLIENT_KEY_PREFIX) and len(raw_key) >= PREVIEW_MIN_CHARS:
+        return CLIENT_KEY_PREFIX + "…" + raw_key[-4:]
+    return mask_key_preview(raw_key)
+
+
+def public_proxy_url(url):
+    """A proxy_url without its user name and password: http_pool accepts socks5://user:pass@host:port, and the admin API
+    returned it as it was (audits A07-09, A11-19)."""
+    if not isinstance(url, str) or "@" not in url:
+        return url
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return PROXY_USERINFO_MASK
+    if parts.username is None and parts.password is None:
+        return url
+    return urllib.parse.urlunsplit((parts.scheme, PROXY_USERINFO_MASK + "@" + parts.netloc.rpartition("@")[2],
+                                    parts.path, parts.query, parts.fragment))
+
+
+def _proxy_password(url):
+    try:
+        return urllib.parse.urlsplit(url).password if isinstance(url, str) and "@" in url else None
+    except ValueError:
+        return None
 
 
 def collect_extra_secrets(saved: dict | None) -> list[str]:
@@ -52,6 +99,7 @@ def collect_extra_secrets(saved: dict | None) -> list[str]:
             continue
         _add(prov.get("api_key"))
         _add(prov.get("bearer_token"))
+        _add(_proxy_password(prov.get("proxy_url")))
         opts = prov.get("options") if isinstance(prov.get("options"), dict) else {}
         _add(opts.get("apiKey"))
         env_name = prov.get("api_key_env") or prov.get("bearer_token_env")
@@ -68,6 +116,7 @@ def collect_extra_secrets(saved: dict | None) -> list[str]:
             if isinstance(cred, dict):
                 _add(cred.get("api_key"))
                 _add(cred.get("bearer_token"))
+                _add(_proxy_password(cred.get("proxy_url")))
                 c_env = cred.get("api_key_env") or cred.get("bearer_token_env")
                 if isinstance(c_env, str) and c_env:
                     _add(os.environ.get(c_env))
@@ -182,7 +231,7 @@ def _public_provider(raw: dict, meta: dict, admin_obj, entries_by_pid: dict, usa
                 "enabled": c.get("enabled", True) is not False,
                 "priority": c.get("priority", 0),
                 "weight": c.get("weight", 1),
-                "proxy_url": c.get("proxy_url"),
+                "proxy_url": public_proxy_url(c.get("proxy_url")),
             })
     else:
         top_key = raw.get("api_key") or raw.get("bearer_token") or ((raw.get("options") or {}).get("apiKey") if isinstance(raw.get("options"), dict) else None)
@@ -197,7 +246,7 @@ def _public_provider(raw: dict, meta: dict, admin_obj, entries_by_pid: dict, usa
                 "enabled": meta.get("enabled", True) is not False,
                 "priority": raw.get("priority", 0),
                 "weight": raw.get("weight", 1),
-                "proxy_url": meta.get("proxy_url"),
+                "proxy_url": public_proxy_url(meta.get("proxy_url")),
             })
 
     refresher = getattr(admin_obj.runtime, "provider_catalog", None)
@@ -217,7 +266,7 @@ def _public_provider(raw: dict, meta: dict, admin_obj, entries_by_pid: dict, usa
         "priority": raw.get("priority", 0) if type(raw.get("priority")) is int else 0,
         "allow_insecure_http": bool(meta.get("allow_insecure_http", False)),
         "auto_discover": bool(meta.get("auto_discover", True)),
-        "proxy_url": meta.get("proxy_url"),
+        "proxy_url": public_proxy_url(meta.get("proxy_url")),
         "headers_keys": sorted((meta.get("headers") or {}).keys()),
         "body_overrides": meta.get("body_overrides") or {},
         "models": meta.get("models") or [],
@@ -333,9 +382,97 @@ def _replace_provider_backends_live(admin_obj, provider_id: str, new_records: li
     return True
 
 
+def _check_models(models_spec) -> None:
+    """Refuse a hand-written model list whose entries cannot be model ids (a list of ids or of {"id": ...} objects, or an
+    OpenCode object keyed by id): a list of pieces of JSON was saved as is, and every model of the provider went 404."""
+    if models_spec is None:
+        return
+    if isinstance(models_spec, dict):
+        ids = list(models_spec)
+        bad = [key for key, value in models_spec.items() if not (value is None or isinstance(value, dict))]
+    elif isinstance(models_spec, list):
+        ids = [item.get("id") if isinstance(item, dict) else item for item in models_spec]
+        bad = []
+    else:
+        raise apierr.bad_request("'models' must be a list of model ids or an object keyed by model id", param="models")
+    bad += [item for item in ids if not (isinstance(item, str) and MODEL_ID_PATTERN.fullmatch(item))]
+    if bad:
+        shown = ", ".join(repr(item)[:60] for item in bad[:3])
+        raise apierr.bad_request("'models' holds entries that are not model ids (no spaces, quotes, braces or commas): "
+                                 + shown, param="models")
+
+
+def _merge_headers(saved, changes):
+    """A PATCH's headers by name over the saved ones (a name is matched whatever its case); null removes one.
+
+    The admin never shows a saved header's value, so the form cannot send the whole set back: the object replaced them all,
+    and adding X-New dropped HTTP-Referer and X-Title (audit A14-03)."""
+    merged = dict(saved) if isinstance(saved, dict) else {}
+    for name, value in changes.items():
+        if isinstance(name, str):
+            for old in [key for key in merged if isinstance(key, str) and key.lower() == name.lower()]:
+                merged.pop(old)
+        if value is not None:
+            merged[name] = value
+    return merged
+
+
+def _merge_provider_patch(existing: dict, data: dict) -> dict:
+    """The saved provider with a PATCH (or a probe of the saved provider) over it.
+
+    An empty api_key keeps the stored credentials; `headers` are merged by name (null removes one, `"headers": null` all
+    of them); a proxy_url sent back as the admin showed it (its user name and password masked) keeps the saved one; any
+    other field replaces the saved value, so `"body_overrides": {}` clears them."""
+    merged = copy.deepcopy(existing)
+    for k, v in data.items():
+        if k in ("id", "discover_now", "provider_id"):
+            continue
+        if k == "api_key" and (v is None or (isinstance(v, str) and not v.strip())):
+            # Empty key on edit preserves existing stored credentials unless switching to keyless
+            continue
+        if k == "headers" and (v is None or isinstance(v, dict)):
+            headers = None if v is None else _merge_headers(existing.get("headers"), v)
+            if headers:
+                merged["headers"] = headers
+            else:
+                merged.pop("headers", None)
+            continue
+        if (k == "proxy_url" and isinstance(v, str) and v != existing.get("proxy_url")
+                and v == public_proxy_url(existing.get("proxy_url"))):
+            continue
+        merged[k] = v
+
+    # Mutual exclusivity when switching from api_key_env <-> api_key or credentials
+    if isinstance(data.get("api_key"), str) and data["api_key"].strip():
+        merged.pop("api_key_env", None)
+        merged.pop("bearer_token_env", None)
+        merged.pop("credentials", None)
+    elif isinstance(data.get("api_key_env"), str) and data["api_key_env"].strip():
+        merged.pop("api_key", None)
+        merged.pop("bearer_token", None)
+        merged.pop("credentials", None)
+    elif isinstance(data.get("credentials"), list) and data["credentials"]:
+        merged.pop("api_key", None)
+        merged.pop("bearer_token", None)
+        merged.pop("api_key_env", None)
+        merged.pop("bearer_token_env", None)
+    return merged
+
+
+def _serves_without(admin_obj, saved: dict, pid: str) -> bool:
+    """Whether the relay keeps something to answer with when provider `pid` stops: an enabled account or another enabled
+    provider. The last enabled account cannot be switched off or removed; the last provider of a relay without accounts
+    could, and nothing was left to answer (audit A14-13)."""
+    accounts = [record for record in admin_obj._records(saved) if record.get("enabled", True) is not False]
+    others = [p for p in saved.get("providers") or [] if isinstance(p, dict) and p.get("enabled", True) is not False
+              and str(p.get("id") or "").strip().lower() != pid]
+    return bool(accounts or others)
+
+
 def create_provider(admin_obj, data: dict) -> dict:
     if not isinstance(data, dict):
         raise apierr.bad_request("Request body must be a JSON object")
+    _check_models(data.get("models"))
     discover_now = bool(data.get("discover_now", data.get("auto_discover", True)))
     try:
         meta, records, secrets_found = presets.expand_provider_to_accounts(copy.deepcopy(data), "provider")
@@ -386,6 +523,8 @@ def update_provider(admin_obj, provider_id: str, data: dict) -> dict:
         raise apierr.bad_request("Expected provider fields to update")
     pid = provider_id.strip().lower()
     discover_requested = data.get("discover_now")
+    if "models" in data:
+        _check_models(data["models"])
 
     with admin_obj._transaction() as (path, saved):
         prov_list = saved.get("providers") if isinstance(saved.get("providers"), list) else []
@@ -393,30 +532,10 @@ def update_provider(admin_obj, provider_id: str, data: dict) -> dict:
         if idx is None:
             raise apierr.not_found(f"Unknown provider '{pid}'")
         existing = copy.deepcopy(prov_list[idx])
-        merged = copy.deepcopy(existing)
-
-        for k, v in data.items():
-            if k in ("id", "discover_now"):
-                continue
-            if k == "api_key" and (v is None or (isinstance(v, str) and not v.strip())):
-                # Empty key on edit preserves existing stored credentials unless switching to keyless
-                continue
-            merged[k] = v
-
-        # Mutual exclusivity when switching from api_key_env <-> api_key or credentials
-        if isinstance(data.get("api_key"), str) and data["api_key"].strip():
-            merged.pop("api_key_env", None)
-            merged.pop("bearer_token_env", None)
-            merged.pop("credentials", None)
-        elif isinstance(data.get("api_key_env"), str) and data["api_key_env"].strip():
-            merged.pop("api_key", None)
-            merged.pop("bearer_token", None)
-            merged.pop("credentials", None)
-        elif isinstance(data.get("credentials"), list) and data["credentials"]:
-            merged.pop("api_key", None)
-            merged.pop("bearer_token", None)
-            merged.pop("api_key_env", None)
-            merged.pop("bearer_token_env", None)
+        if (data.get("enabled") is False and existing.get("enabled", True) is not False
+                and not _serves_without(admin_obj, saved, pid)):
+            raise apierr.conflict("The last enabled provider cannot be switched off: nothing else would answer")
+        merged = _merge_provider_patch(existing, data)
 
         merged["id"] = pid
         try:
@@ -467,6 +586,10 @@ def delete_provider(admin_obj, provider_id: str) -> dict:
         remaining = [p for p in prov_list if not (isinstance(p, dict) and str(p.get("id") or "").strip().lower() == pid)]
         if len(remaining) == len(prov_list):
             raise apierr.not_found(f"Unknown provider '{pid}'")
+        removed = [p for p in prov_list if p not in remaining]
+        if (any(isinstance(p, dict) and p.get("enabled", True) is not False for p in removed)
+                and not _serves_without(admin_obj, saved, pid)):
+            raise apierr.conflict("The last enabled provider cannot be removed: nothing else would answer")
         saved["providers"] = remaining
         admin_obj._write(path, saved)
         admin_obj.cfg["providers"] = copy.deepcopy(remaining)
@@ -490,20 +613,20 @@ def test_provider_connection(admin_obj, data: dict) -> dict:
     if not isinstance(data, dict):
         raise apierr.bad_request("Request body must be a JSON object")
     candidate = copy.deepcopy(data)
-    existing_id = str(candidate.pop("provider_id", "") or candidate.get("id") or "").strip().lower()
-    if existing_id and not (candidate.get("api_key") or candidate.get("api_key_env") or candidate.get("credentials")):
+    editing_id = str(candidate.pop("provider_id", "") or "").strip().lower()
+    existing_id = editing_id or str(candidate.get("id") or "").strip().lower()
+    # The saved provider is the base of a probe of it, whatever key field the form sends: with api_key_env in the form it
+    # was left out, and the check ran without its base_url, headers and flags (audit A14-03). A new provider's form that
+    # only shares an id with a saved one is merged when it brings no key of its own, as before.
+    if existing_id and (editing_id or not (candidate.get("api_key") or candidate.get("api_key_env")
+                                           or candidate.get("credentials"))):
         saved = admin_obj._saved() if admin_obj.cfg.get("_config_path") else {}
         found_saved = next(
             (p for p in (saved.get("providers") or []) if isinstance(p, dict) and str(p.get("id") or "").strip().lower() == existing_id),
             None,
         )
         if found_saved:
-            base_copy = copy.deepcopy(found_saved)
-            for k, v in candidate.items():
-                if k == "api_key" and not str(v or "").strip():
-                    continue
-                base_copy[k] = v
-            candidate = base_copy
+            candidate = _merge_provider_patch(found_saved, candidate)
 
     candidate.setdefault("id", existing_id or "probe")
     try:
@@ -542,11 +665,33 @@ def test_provider_connection(admin_obj, data: dict) -> dict:
 
 
 def discover_provider(admin_obj, provider_id: str | None = None) -> dict:
+    """Read /models again (one provider, or every provider and models.dev); at most DISCOVERY_WAIT seconds.
+
+    A refresh still running then is answered `pending`: it goes on and fills the catalog, and a second one is not started
+    beside it. A bare TimeoutError used to come out of here: a 500 and a red http.exception, while the refresh went on and
+    the next click started another (audit A07-07)."""
     refresher = getattr(admin_obj.runtime, "provider_catalog", None)
     if refresher is None:
         raise apierr.service_unavailable("Provider catalog refresher is unavailable")
     pid = provider_id.strip().lower() if provider_id else None
-    res = refresher.refresh_now(pid, timeout=25.0)
+    runtime = admin_obj.runtime
+    if getattr(runtime, "loop", None) is None or not callable(getattr(runtime, "submit", None)):
+        res = refresher.refresh_now(pid, timeout=DISCOVERY_WAIT)
+        return admin_obj._safe({"ok": True, **res})
+    with _DISCOVERY_LOCK:
+        running = getattr(admin_obj, "_catalog_refresh", None)
+        if running is not None and not running.done():
+            return {"ok": False, "pending": True,
+                    "error": "Обновление каталога ещё идёт: его результат появится в каталоге сам"}
+        running = admin_obj._catalog_refresh = runtime.submit(refresher.refresh_async(pid))
+    try:
+        res = running.result(timeout=DISCOVERY_WAIT)
+    except TimeoutError:
+        return {"ok": False, "pending": True,
+                "error": "Обновление каталога идёт дольше %d с: оно продолжается, результат появится в каталоге сам"
+                         % DISCOVERY_WAIT}
+    except Exception as exc:  # noqa: BLE001 - a failed refresh is an answer, not a server error
+        return admin_obj._safe({"ok": False, "error": (str(exc) or type(exc).__name__)[:240]})
     return admin_obj._safe({"ok": True, **res})
 
 
@@ -742,10 +887,17 @@ def _slug_key_id(label: str) -> str:
     return f"{slug}-{suffix}" if slug else f"key-{suffix}"
 
 
+def _public_client_keys(admin_obj, items: list[dict]) -> list[dict]:
+    """The client keys as the admin shows them, each preview made from the key itself (client_key_preview)."""
+    raw = {str(entry.get("id")): entry.get("key") for entry in admin_obj.cfg.get("client_keys") or []
+           if isinstance(entry, dict)}
+    return [dict(item, key_preview=client_key_preview(raw.get(str(item.get("id"))))) for item in items]
+
+
 def list_client_keys(admin_obj) -> dict:
     mgr = getattr(admin_obj.runtime, "client_keys", None)
     items = mgr.list_public() if mgr is not None else []
-    return admin_obj._safe({"client_keys": items})
+    return admin_obj._safe({"client_keys": _public_client_keys(admin_obj, items)})
 
 
 def create_client_key(admin_obj, data: dict) -> dict:
@@ -782,7 +934,8 @@ def create_client_key(admin_obj, data: dict) -> dict:
 
     admin_obj._mask_tokens([raw_key])
     admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
-    public = next((item for item in admin_obj.runtime.client_keys.list_public() if item["id"] == clean["id"]), None)
+    public = next((item for item in _public_client_keys(admin_obj, admin_obj.runtime.client_keys.list_public())
+                   if item["id"] == clean["id"]), None)
     journal.emit("admin.client_key", f"Создан клиентский ключ {clean['label']} ({clean['id']})", "success", key_id=clean["id"])
     # Return `raw_key` ONCE (outside _safe) so the operator can copy it on creation!
     resp = admin_obj._safe({"client_key": public})
@@ -818,7 +971,8 @@ def update_client_key(admin_obj, key_id: str, data: dict) -> dict:
     if rotated_raw:
         admin_obj._mask_tokens([rotated_raw])
     admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
-    public = next((item for item in admin_obj.runtime.client_keys.list_public() if item["id"] == key_id), None)
+    public = next((item for item in _public_client_keys(admin_obj, admin_obj.runtime.client_keys.list_public())
+                   if item["id"] == key_id), None)
     journal.emit("admin.client_key", f"Обновлён клиентский ключ {clean['label']} ({key_id})", "info", key_id=key_id)
     resp = admin_obj._safe({"client_key": public})
     if rotated_raw:
@@ -844,6 +998,13 @@ def delete_client_key(admin_obj, key_id: str) -> dict:
 # -- OpenCode 1-click Sync ----------------------------------------------------
 
 def sync_opencode_now(admin_obj) -> dict:
+    """Write the relay's models into OpenCode's settings file and the DeepSeek Harness profiles now (the relay does it
+    after each catalog look by itself), and say what was done.
+
+    The button ran a sync with a lock of its own beside the relay's, so both could write OpenCode's file at once, and its
+    "ok" read OpenCode's summary alone: a failed Harness profile, or a list already current (nothing written), was
+    reported as "Список моделей обновлён" (audit A14-07). It now waits for the relay's own sync under way, its answer is
+    ok only when every file was synced, and `written` / `changed` say whether a file was rewritten."""
     path = client_sync.settings_path(admin_obj.cfg)
     if path is None or not path.is_file():
         return {"ok": False, "reason": "Файл настроек OpenCode (opencode.jsonc / opencode.json) не найден"}
@@ -851,9 +1012,17 @@ def sync_opencode_now(admin_obj) -> dict:
     runner = getattr(syncer, "_run", None)
     forced_cfg = {**admin_obj.cfg, "opencode_sync": True}
     manual_sync = client_sync.OpenCodeSync(forced_cfg, runner=runner)
+    shared_lock = getattr(syncer, "_lock", None)
+    if shared_lock is not None:
+        manual_sync._lock = shared_lock  # one write at a time with the relay's own sync after a catalog look
     res = manual_sync("admin")
     if syncer is not None:
         syncer.last = manual_sync.last
+        syncer.last_harness = manual_sync.last_harness
     if not res:
         return {"ok": False, "reason": "Синхронизация не выполнена (нет записываемого config.json)"}
-    return admin_obj._safe({"ok": not bool(res.get("error")), "result": res})
+    harness = [item for item in res.get("harness") or [] if isinstance(item, dict)]
+    failed = bool(res.get("error")) or any(item.get("error") for item in harness)
+    written = bool(res.get("written")) or any(item.get("written") for item in harness)
+    changed = bool(res.get("changed")) or any(item.get("changed") for item in harness)
+    return admin_obj._safe({"ok": not failed, "written": written, "changed": changed, "result": res})

@@ -118,7 +118,10 @@ def test_pool_lists_every_account_with_its_controls_and_no_secrets(pool):
     first = body["accounts"][0]
     assert (first["label"], first["enabled"], first["priority"], first["pending"]) == ("", True, 0, None)
     assert (first["available"], first["state"], first["routable"]) == (100.0, "active", True)
-    assert body["summary"] == {"total": 2, "enabled": 2, "routable": 2, "reserve": 0, "states": {"active": 2}}
+    # enabled_providers: the universal providers that serve beside the accounts (none here), so the page knows the last
+    # enabled account is not the last backend that answers (audit A14-13).
+    assert body["summary"] == {"total": 2, "enabled": 2, "routable": 2, "reserve": 0, "states": {"active": 2},
+                               "enabled_providers": 0}
     assert body["limits"] == {"min_account_balance": 20.0, "account_balance_interval": 300,
                               "account_refresh_parallel": 3}
     assert body["restart_required"] is False

@@ -357,7 +357,16 @@ def test_provider_crud_live_adopt_ping_routes_and_client_keys(gateway_admin, moc
     # Delete client key & route & provider
     assert gateway_admin.admin_call(f"/admin/api/client-keys/{ck_id}", method="DELETE")[0] == 200
     assert gateway_admin.admin_call("/admin/api/routes/coding-best", method="DELETE")[0] == 200
+    # The provider is the only backend of this relay: it is not removed while nothing else would answer (audit A14-13, as
+    # for the last enabled account); beside a second one it is.
+    assert gateway_admin.admin_call("/admin/api/providers/myhub", method="DELETE")[0] == 409
+    st, _ = gateway_admin.admin_call(
+        "/admin/api/providers",
+        {"id": "spare", "driver": "openai-chat", "base_url": mock_upstream, "api_key": secret_key, "discover_now": False},
+        method="POST",
+    )
+    assert st == 200
     assert gateway_admin.admin_call("/admin/api/providers/myhub", method="DELETE")[0] == 200
 
     st, provs_end = gateway_admin.admin_call("/admin/api/providers")
-    assert st == 200 and provs_end["providers"] == []
+    assert st == 200 and [p["id"] for p in provs_end["providers"]] == ["spare"]

@@ -121,6 +121,17 @@ def _price(value):
     return number if number is not None and number >= 0 else None
 
 
+def _usage_prices(data):
+    """(Retool credits, Minara credits, US dollars) of one upstream.usage event, each None when it carries none.
+
+    A Minara reply carries its price twice: in Minara's credits and, since the USD ledger, the same money in dollars
+    (cost_usd). Counted in both, the overview showed it in "Minara за окно" and again in "Расход USD" (audit A07-02):
+    the dollars of an event priced in Minara credits are not a spend of their own. Only cost_usd is a dollar spend: an
+    event's provider_cost is its attempt's running total in the upstream's currency, so it is never read as one."""
+    minara = _price(data.get("minara_credits"))
+    return _price(data.get("credits")), minara, _price(data.get("cost_usd")) if minara is None else None
+
+
 def _whole(value):
     try:
         return int(value or 0)
@@ -535,11 +546,7 @@ class _Rollup:
             self.turn(key, ts, restored).start(_attempt_number(data), index)
         elif kind == "upstream.usage":
             fine = self.fine_slot(index)
-            price = _price(data.get("credits"))
-            minara = _price(data.get("minara_credits"))
-            usd = _price(data.get("cost_usd"))
-            if usd is None and "cost_usd" not in data:
-                usd = _price(data.get("provider_cost"))
+            price, minara, usd = _usage_prices(data)
             attempt, change = self.turn(key, ts, restored).usage(_attempt_number(data), price, index, minara, usd)
             if price is not None:
                 fine.credits += price
@@ -979,11 +986,8 @@ class Journal:
             elif kind == "upstream.usage_start":
                 costs[turn_id].start(_attempt_number(data), None)
             elif kind == "upstream.usage":
-                usd_val = _price(data.get("cost_usd"))
-                if usd_val is None and "cost_usd" not in data:
-                    usd_val = _price(data.get("provider_cost"))
-                costs[turn_id].usage(_attempt_number(data), _price(data.get("credits")), None,
-                                     _price(data.get("minara_credits")), usd_val)
+                price, minara, usd = _usage_prices(data)
+                costs[turn_id].usage(_attempt_number(data), price, None, minara, usd)
                 trace["cache_read"] += _whole(data.get("cache_read"))
                 trace["cache_write"] += _whole(data.get("cache_write"))
             elif kind == "tool.call":
