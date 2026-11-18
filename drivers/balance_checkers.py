@@ -8,7 +8,7 @@ import urllib.parse
 
 import httpx
 
-from accounts import UnmeteredAccount
+from accounts import UnmeteredAccount, usd_floor
 from catalog import discovery
 from drivers import http_pool
 
@@ -202,7 +202,7 @@ class ProviderBalanceAccount(UnmeteredAccount):
         avail = cached.get("available")
         if isinstance(avail, (int, float)) and math.isfinite(avail):
             avail = round(avail - spent, 4)
-        min_usd = float(self.cfg.get("min_balance_usd") or 0.0)
+        min_usd = usd_floor(self.cfg)
         return {
             **base_out,
             **cached,

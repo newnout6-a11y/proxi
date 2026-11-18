@@ -99,6 +99,20 @@ def account_tag(backend, default=None):
     return cfg_tag(getattr(backend, "cfg", None), default)
 
 
+def priced_in_dollars(cfg):
+    """A universal provider's credential: its balance and costs are US dollars, neither Retool's nor Minara's credits."""
+    return (cfg or {}).get("upstream", "retool") not in ("retool", "minara")
+
+
+def usd_floor(cfg):
+    """The dollar balance below which a universal provider's credential takes no new turn: min_balance_usd, else 0.
+
+    min_account_balance is a figure in Retool credits (20 by default): a provider with $15 left was judged against it,
+    left the pool as "exhausted" and served only as a reserve (audit A07-04)."""
+    value = (cfg or {}).get("min_balance_usd")
+    return float(value) if type(value) in (int, float) and math.isfinite(value) and value >= 0 else 0.0
+
+
 def idle_block(backend):
     """Why background traffic, such as idle cache warmups, must skip this account; None when it may run.
 
@@ -472,8 +486,11 @@ class AccountDispatcher:
 
     def threshold_of(self, backend):
         """The balance below which this account takes no new turn, in its own unit."""
-        if (getattr(backend, "cfg", None) or {}).get("upstream") == "minara":
+        cfg = getattr(backend, "cfg", None) or {}
+        if cfg.get("upstream") == "minara":
             return self.minara_threshold
+        if priced_in_dollars(cfg):
+            return usd_floor(cfg)
         return self.threshold
 
     # -- lifecycle -----------------------------------------------------------
@@ -625,7 +642,8 @@ class AccountDispatcher:
             return  # mark_rate_limited says it itself, with the time the account comes back
         elif reason["reason"] == "exhausted":
             threshold = self.threshold_of(backend)
-            unit = " кредитов Minara" if (getattr(backend, "cfg", None) or {}).get("upstream") == "minara" else ""
+            cfg = getattr(backend, "cfg", None) or {}
+            unit = (" кредитов Minara" if cfg.get("upstream") == "minara" else " USD" if priced_in_dollars(cfg) else "")
             text = "[account] %s исключён: баланс %s < %s%s" % (
                 label, console_log.amount(reason.get("available"), signed=True), console_log.amount(threshold), unit)
             journal.emit("account.exhausted", text, "warn", account=tag, available=reason.get("available"),

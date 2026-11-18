@@ -1,9 +1,11 @@
 """Balances of universal providers: where their API key may go, in which unit they are judged, and the local debit."""
 from __future__ import annotations
 
+
 import httpx
 import pytest
 
+import accounts
 from drivers import balance_checkers, presets
 
 
@@ -64,3 +66,55 @@ def test_a_preset_balance_endpoint_on_the_providers_own_host_is_still_read():
 ])
 def test_only_an_endpoint_on_the_same_scheme_host_and_port_is_the_providers_own(endpoint, base, own):
     assert (balance_checkers.own_balance_endpoint(endpoint, base) is not None) is own
+
+
+def _openrouter(handler, **extra):
+    return _provider_account({"id": "openrouter", "preset": "openrouter", "api_key": "sk-or-v1-FAKE-0123456789abcdef"},
+                             handler, **extra)[1]
+
+
+def _answering(remaining, limit=50.0):
+    def handler(request):
+        return httpx.Response(200, json={"data": {"usage": limit - remaining, "limit": limit,
+                                                  "limit_remaining": remaining}})
+    return handler
+
+
+class _Backend:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+
+def _dispatched(account, **settings):
+    backend = _Backend(account.cfg)
+    dispatcher = accounts.AccountDispatcher([backend], dict({"min_account_balance": 20}, **settings), {backend: account})
+    return backend, dispatcher
+
+
+# A07-04 / A11-03: min_account_balance (20) is a figure in Retool credits. A provider with $15 left was judged against it,
+# announced "исключён: баланс 15.0000 < 20.0000", served only as a reserve, and skipped as a route's first target.
+def test_a_dollar_balance_is_judged_against_a_dollar_floor_not_against_retool_credits(capsys):
+    account = _openrouter(_answering(15.0))
+    backend, dispatcher = _dispatched(account)
+    assert dispatcher.threshold_of(backend) == 0.0
+    assert dispatcher.check_balance(backend) is False
+    assert backend.unavailable is None
+    assert "исключён" not in capsys.readouterr().out
+
+
+def test_a_provider_out_of_dollars_leaves_with_a_message_in_dollars(capsys):
+    account = _openrouter(_answering(0.0))
+    backend, dispatcher = _dispatched(account)
+    assert dispatcher.check_balance(backend) is True
+    assert backend.unavailable["reason"] == "exhausted" and backend.unavailable["threshold"] == 0.0
+    assert "USD" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("floor, expected", [(5, 5.0), (2.5, 2.5), (-1, 0.0), ("lots", 0.0), (True, 0.0),
+                                             (float("nan"), 0.0), (None, 0.0)])
+def test_a_dollar_floor_of_the_configuration_is_read_safely(floor, expected):
+    account = _openrouter(_answering(4.0), min_balance_usd=floor)
+    backend, dispatcher = _dispatched(account)
+    assert dispatcher.threshold_of(backend) == expected
+    assert dispatcher.check_balance(backend) is (4.0 < expected)
+    assert account.balance_snapshot()["is_low"] is (4.0 <= expected)
