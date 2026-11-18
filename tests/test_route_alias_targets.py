@@ -231,3 +231,113 @@ def test_a_route_to_another_model_of_the_same_provider_reaches_it(monkeypatch, t
     assert body["choices"][0]["message"]["content"] == "B_OK"
     # model-a is asked once on each key, then the route's next model of the same provider answers.
     assert calls == ["model-a"] * keys + ["model-b"]
+
+
+# -- the bound target's price, Minara fields and effort --------------------------------------------------------------------
+@pytest.mark.parametrize("effort", [None, "none", "minimal", "low", "high", "xhigh", "max"])
+def test_an_alias_takes_a_level_one_target_takes_and_each_target_serves_it_as_a_request_of_its_own(
+        tmp_path, monkeypatch, effort):
+    cfg, _, alias = alias_pool(tmp_path, monkeypatch, [OPUS, MINARA_OPUS])
+    retool_target, minara_target = (models.bind_target(alias, target) for target in alias["route_targets"])
+
+    def sent(name, entry=None, downgrade=False):
+        """The effort a request is sent with: resolved as the relay resolves it, then effective_effort."""
+        found, level = models.resolve_tolerant(name, effort, strict=True, allow_downgrade=downgrade, xhigh_as="high",
+                                               cfg=cfg)
+        return level if entry is None else models.bound_effort(entry, level, "auto", "high")
+
+    def direct(name, downgrade=False):
+        found, level = models.resolve_tolerant(name, effort, strict=True, allow_downgrade=downgrade, xhigh_as="high",
+                                               cfg=cfg)
+        return models.effective_effort(found, level, "auto", "high")
+
+    # The alias accepts what its Minara target accepts (it was a 400 for none and minimal: A08-03) ...
+    sent("smart-opus")
+    # ... and a turn bound to the Minara target is sent what a request of that target gets: nothing for "auto", xhigh
+    # as xhigh (it was medium and high).
+    assert sent("smart-opus", minara_target) == direct(MINARA_OPUS)
+    # Bound to the Retool target it gets what that target serves: xhigh as the configured replacement, a level it lacks
+    # as its nearest one (what allow_effort_downgrade gives a request of the target itself).
+    assert sent("smart-opus", retool_target) == direct(OPUS, downgrade=True)
+
+
+def test_bind_provider_gives_an_alias_turn_its_targets_fields_and_drops_the_first_targets(tmp_path, monkeypatch):
+    cfg, _, alias = alias_pool(tmp_path, monkeypatch, [OPUS, MINARA_OPUS])
+    retool_target, minara_target = (models.bind_target(alias, target) for target in alias["route_targets"])
+    provider = {"model": "anthropic/claude-opus-5.5", "reasoningEffort": "medium"}
+    assert models.bind_provider(provider, minara_target, None, {"reasoning_effort": "auto"}) is None
+    assert provider == {"model": "anthropic/claude-opus-5.5", "route_model": MINARA_OPUS,
+                        "pricing": minara_target["pricing"], "refuses_forced_tool_choice": True}
+    provider = {"model": OPUS, "route_model": "x", "pricing": {"prompt": 1}, "refuses_forced_tool_choice": True}
+    assert models.bind_provider(provider, retool_target, "xhigh", {"claude_xhigh_effort": "max"}) == "max"
+    assert provider == {"model": OPUS, "reasoningEffort": "max"}
+    # An effort the compaction keeps for the dialog stays.
+    provider = {"model": OPUS, "reasoningEffort": "high"}
+    assert models.bind_provider(provider, retool_target, "low", {}, kept="high") == "high"
+    assert provider["reasoningEffort"] == "high"
+
+
+@pytest.fixture
+def minara_alias_relay(tmp_path, monkeypatch):
+    """The real relay with one Minara account and a route [claude-opus-5-5, minara/claude-opus-5-5]; minara.iter_events
+    records what each turn sends and answers with a priced usage."""
+    import threading
+
+    import minara
+    import proxy
+
+    prior = dict(models._MINARA_MODELS)
+    for key in ("RETOOL_BASE", "RETOOL_COOKIE", "RETOOL_XSRF", "RETOOL_PAGE_UUID", "RELAY_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "accounts": [{"account_id": "minara-1", "upstream": "minara", "bearer_token": "synthetic-bearer-1"}],
+        "routes": [{"id": "smart-opus", "targets": [OPUS, MINARA_OPUS]}],
+        "relay_api_key": "alias-relay-key-0123456789", "workspace_root": str(tmp_path), "project_context": False,
+        "exec_policy": "off", "conversation_state": False, "cache_keepwarm_seconds": 0, "session_refresh_interval": 0,
+        "account_balance_interval": 0, "minara_channel_retry_delays": [], "reasoning_effort": "auto",
+        "journal_path": str(tmp_path / "journal.jsonl"), "prompts_file": str(tmp_path / "absent.json")}),
+        encoding="utf-8")
+    runtime = proxy.Runtime(config_module.load(str(path)))
+    seen = []
+
+    async def iter_events(cfg, session, model_provider, *args, **kwargs):
+        seen.append(dict(model_provider))
+        yield {"type": "text", "delta": "OK"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(minara, "iter_events", iter_events)
+    server = proxy.BoundedServer(("127.0.0.1", 0), proxy.make_handler(runtime), threading.BoundedSemaphore(4))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def ask(model, **fields):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+        connection.request("POST", "/v1/chat/completions", json.dumps(dict(
+            {"model": model, "messages": [{"role": "user", "content": "hi"}]}, **fields)),
+            {"Authorization": "Bearer alias-relay-key-0123456789", "Content-Type": "application/json"})
+        reply = connection.getresponse()
+        body = json.loads(reply.read().decode())
+        connection.close()
+        return reply.status, body
+
+    yield SimpleNamespace(ask=ask, seen=seen)
+    server.shutdown()
+    server.server_close()
+    runtime.close()
+    models._MINARA_MODELS.clear()
+    models._MINARA_MODELS.update(prior)
+
+
+@pytest.mark.parametrize("effort", [None, "xhigh", "none"])
+def test_an_alias_turn_served_by_minara_is_sent_as_a_request_of_the_minara_target(minara_alias_relay, effort):
+    fields = {} if effort is None else {"reasoning_effort": effort}
+    for model in ("smart-opus", MINARA_OPUS):
+        status, body = minara_alias_relay.ask(model, **fields)
+        assert status == 200, body
+    via_alias, direct = minara_alias_relay.seen
+    keys = ("model", "route_model", "pricing", "refuses_forced_tool_choice", "messages_levels", "reasoningEffort")
+    # Minara's list price prices the turn (it was OpenRouter's cost: +60 %, A12-03), tool_choice "required" is emulated,
+    # and the effort is the Minara target's: nothing for "auto", xhigh as xhigh, none as none.
+    assert via_alias["pricing"] and via_alias["refuses_forced_tool_choice"] is True
+    assert {key: via_alias.get(key) for key in keys} == {key: direct.get(key) for key in keys}

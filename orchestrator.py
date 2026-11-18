@@ -1550,6 +1550,10 @@ class TurnRunner:
                 acquired._provider_options = dict(getattr(parsed, "provider_options", None) or {})
                 acquired._structured_output = getattr(parsed, "structured_output", None)
                 model_provider["model"] = bound_entry.get("upstream_model") or bound_entry["id"]
+                if isinstance(bound_entry, dict) and bound_entry.get("alias_id"):
+                    # The bound target's price, Minara fields and effort, not those of the alias's first target (A12-03).
+                    model_catalog.bind_provider(model_provider, bound_entry, getattr(parsed, "effort", None), self.cfg,
+                                                kept=holder.get("kept_effort"))
                 resource = model_catalog.provider_resource(acc_cfg, bound_entry)
                 if resource:
                     model_provider["providerResourceName"] = resource

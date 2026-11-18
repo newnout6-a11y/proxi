@@ -1247,7 +1247,9 @@ def _resolve_requested(model, effort, *, strict, default_model, allow_downgrade,
     base_name = parsed.base
     if xhigh_as and isinstance(extracted_effort, str) and extracted_effort.lower() == 'xhigh':
         entry, _ = resolve(base_name, None, strict=strict, default_model=default_model, cfg=cfg)
-        extracted_effort = xhigh_replacement(entry, xhigh_as) or extracted_effort
+        if not (entry.get('route_targets') and _takes_level(entry, 'xhigh')):
+            # A route alias one of whose targets takes xhigh keeps it: each target replaces it when bound (bound_effort).
+            extracted_effort = xhigh_replacement(entry, xhigh_as) or extracted_effort
     try:
         return resolve(base_name, extracted_effort, strict=strict, default_model=default_model, cfg=cfg)
     except ApiError as error:
@@ -1305,39 +1307,115 @@ def resolve(model, effort=None, *, strict=True, default_model=None, cfg=None):
         entry = {'id': name, 'provider': 'anthropic', 'reasoning': True, 'label': name,
                  'context': 200000, 'max_output': 128000}
     if effort is not None:
-        if not entry.get('reasoning', True) and isinstance(effort, str) and effort.lower() == 'none':
-            return entry, None  # An explicit disabled control is harmless; never forward it.
-        if entry.get('reasoning_effort_control') == 'mapped':
-            # A Minara model whose levels the effort study grouped into tiers: every level is accepted and sent as the
-            # level of its tier (None: nothing is sent), so a client that sends one level to every model never fails.
-            level = effort.lower() if isinstance(effort, str) else None
-            if level in EFFORT_ORDER:
-                return entry, (entry.get('effort_map') or {}).get(level)
-            raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
-                              param='reasoning_effort')
-        if entry.get('reasoning_effort_control') == 'passthrough':
-            # A Minara or universal model that reasons, whose levels were not measured: the level goes to upstream as asked.
-            if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:
-                return entry, effort.lower()
-            raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
-                              param='reasoning_effort')
-        if entry.get('reasoning_effort_control') == 'accepted-ignored':
-            # The route takes any level some provider defines and changes nothing: accept it, forward nothing.
-            if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:
-                return entry, None
-            raise bad_request(
-                f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)}); the route ignores it",
-                param='reasoning_effort')
-        allowed = entry.get('reasoning_effort_levels', EFFORTS_BY_PROVIDER.get(entry['provider'], ()))
-        if not isinstance(effort, str) or effort.lower() not in allowed:
-            raise bad_request(
-                f"reasoning effort for {name} must be one of {', '.join(allowed) or 'no supported levels'}"
-                + _setting_hint(effort, allowed),
-                param='reasoning_effort')
-        effort = effort.lower()
-        if not entry.get('reasoning', True):
-            effort = None
+        if entry.get('route_targets'):
+            return entry, _route_effort(entry, effort, name)
+        return entry, _entry_effort(entry, effort, name)
     return entry, effort
+
+
+def _entry_effort(entry, effort, name):
+    """The level a request for `effort` (not None) is served at on `entry` (None: nothing is sent), or the 400 when the
+    route does not take it."""
+    if not entry.get('reasoning', True) and isinstance(effort, str) and effort.lower() == 'none':
+        return None  # An explicit disabled control is harmless; never forward it.
+    if entry.get('reasoning_effort_control') == 'mapped':
+        # A Minara model whose levels the effort study grouped into tiers: every level is accepted and sent as the
+        # level of its tier (None: nothing is sent), so a client that sends one level to every model never fails.
+        level = effort.lower() if isinstance(effort, str) else None
+        if level in EFFORT_ORDER:
+            return (entry.get('effort_map') or {}).get(level)
+        raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
+                          param='reasoning_effort')
+    if entry.get('reasoning_effort_control') == 'passthrough':
+        # A Minara or universal model that reasons, whose levels were not measured: the level goes to upstream as asked.
+        if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:
+            return effort.lower()
+        raise bad_request(f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)})",
+                          param='reasoning_effort')
+    if entry.get('reasoning_effort_control') == 'accepted-ignored':
+        # The route takes any level some provider defines and changes nothing: accept it, forward nothing.
+        if isinstance(effort, str) and effort.lower() in EFFORT_ORDER:
+            return None
+        raise bad_request(
+            f"reasoning effort for {name} must be a known level ({', '.join(EFFORT_ORDER)}); the route ignores it",
+            param='reasoning_effort')
+    allowed = entry.get('reasoning_effort_levels', EFFORTS_BY_PROVIDER.get(entry['provider'], ()))
+    if not isinstance(effort, str) or effort.lower() not in allowed:
+        raise bad_request(
+            f"reasoning effort for {name} must be one of {', '.join(allowed) or 'no supported levels'}"
+            + _setting_hint(effort, allowed),
+            param='reasoning_effort')
+    return effort.lower() if entry.get('reasoning', True) else None
+
+
+def _route_effort(entry, effort, name):
+    """The level a request of the route alias `entry` asked for, as the client named it: a level one of its targets takes
+    (the turn is served at it once it is bound to a target: bound_effort). A level none of them takes is the first
+    target's 400.
+
+    The alias is a copy of its first target, and its level used to be checked and mapped by that target alone: smart-opus
+    bound to its Minara target sent medium for "auto", high for xhigh, and answered none or minimal with a 400 (A08-03)."""
+    errors = []
+    for target in entry['route_targets']:
+        try:
+            _entry_effort(target, effort, name)
+        except ApiError as error:
+            errors.append(error)
+            continue
+        return effort.lower() if isinstance(effort, str) else effort
+    raise errors[0] if errors else bad_request(f"route {name} has no targets", param='model')
+
+
+def _takes_level(entry, level):
+    """Whether one of the targets of the route alias `entry` takes `level` as it is."""
+    try:
+        _route_effort(entry, level, entry.get('id'))
+    except ApiError:
+        return False
+    return True
+
+
+def bound_effort(entry, effort=None, configured=None, xhigh_as=None):
+    """The effort a turn of a route alias is sent with once it is bound to `entry`, one of its targets: the level the
+    client asked for (_route_effort) as this target serves it, its nearest level when it lacks it, or, without a level,
+    the target's own default under `configured` (effective_effort) - what a request of the target itself would get."""
+    if effort is not None:
+        level = effort.lower() if isinstance(effort, str) else effort
+        if level == 'xhigh':
+            level = xhigh_replacement(entry, xhigh_as) or level
+        try:
+            effort = _entry_effort(entry, level, entry.get('id'))
+        except ApiError:
+            levels = entry.get('reasoning_effort_levels') or []
+            effort = nearest_effort(levels, level) if levels and entry.get('reasoning', True) else None
+    return effective_effort(entry, effort, configured, xhigh_as)
+
+
+def bind_provider(model_provider, entry, effort=None, cfg=None, kept=None):
+    """Make the upstream fields of a route alias's turn those of the target it was bound to (`entry`, alias_id set):
+    Minara's route model, price, forced tool choice and the levels it sends through /v1/messages, and the effort
+    (bound_effort; `kept`, an effort the compaction keeps, stays). The orchestrator sets them from the request's entry,
+    that is the alias, a copy of its first target: a turn served by a Minara target went unpriced or at OpenRouter's
+    cost (+60 % on 2026-11-18, audits A16-01, A12-03), with tool_choice "required" that Minara answers with a 400."""
+    cfg = cfg or {}
+    for key in ('route_model', 'pricing', 'refuses_forced_tool_choice', 'messages_levels'):
+        model_provider.pop(key, None)
+    if entry.get('upstream') == 'minara':
+        model_provider['route_model'] = entry['id']
+        if entry.get('pricing'):
+            model_provider['pricing'] = entry['pricing']
+        if entry.get('forced_tool_choice') is False:
+            model_provider['refuses_forced_tool_choice'] = True
+        if entry.get('messages_levels'):
+            model_provider['messages_levels'] = list(entry['messages_levels'])
+    if kept:
+        return kept
+    level = bound_effort(entry, effort, cfg.get('reasoning_effort'), cfg.get('claude_xhigh_effort', 'high'))
+    if level is None:
+        model_provider.pop('reasoningEffort', None)
+    else:
+        model_provider['reasoningEffort'] = level
+    return level
 
 
 def provider_resource(cfg, entry):
