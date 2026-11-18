@@ -1526,7 +1526,7 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   `cache_keepwarm_idle`.
   Остановка пишется в журнал событием `cache.keepwarm_stop`: `reason` (`idle_limit`,
   `subagent_done`, `account_unavailable`, `evicted`, `failures`, `last_turn_failed`,
-  `cache_expired`, `cache_rewritten`, `compacted`, `too_small`; `closed` — сессию закрыли
+  `cache_expired`, `cache_rewritten`, `compacted`, `too_small`, `account_rate_limited`; `closed` — сессию закрыли
   после уже отправленных пингов), `pings` и `idle_pings` цикла, `credits` — списанное этими
   пингами (известная часть), `idle_seconds` с последнего настоящего запроса, применённый
   `limit`, `subagent`, `account` и названия диалога. У `account_unavailable` есть
@@ -1541,6 +1541,11 @@ response.completed». Официальный `openai` SDK (2.41.0 и 3.46.0) п�
   диалога: тело запроса сжатия не греется, а прежний префикс больше не продолжится.
   `too_small` — префикс меньше 1024 токенов (есть `prefix_tokens`): провайдер такой не кэширует,
   греть нечего; так было с запросами заголовков OpenCode на его `small_model`, по 618 токенов.
+  `account_rate_limited` (уровень `info`, есть `retry_after`) — пинг получил часовой лимит Retool (HTTP 429 «You've
+  reached your hourly limit for Copilot» или то же событием внутри 200): аккаунт откладывается, как после такого же
+  отказа хода (`account.rate_limited`), и цикл кончается сразу, без повторов на том же аккаунте и без красной строки
+  `[err]`. Пинг, который оборвала отмена хода клиента (Esc, обрыв соединения клиента), сбоем не считается: событие
+  `cache.keepwarm` уровня `debug`, в счёт пяти неудачных пингов он не идёт.
   `cache_rewritten`, `last_turn_failed` и `compacted` держатся на сессии: новый цикл
   прогрева, в том числе по запросу дочернего диалога, начинается только после следующего
   удачного хода этого диалога. Событие `cache.keepwarm` каждого

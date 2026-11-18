@@ -1481,11 +1481,25 @@ def _wire_json(body):
         return json.dumps(_without_inf(body), ensure_ascii=True).encode("utf-8")
 
 
+class PingCancelled(InterruptedError):
+    """A keepwarm ping cut by the cancel of the turn on its session, or by the session's close: no failure of the cache."""
+
+
+def _dispatcher(session):
+    """The dispatcher of the session's account: AccountDispatcher names itself the keepalive owner of the refresher of
+    every account it runs. None outside a pool."""
+    return getattr(getattr(getattr(session, "backend", None), "refresher", None), "keepalive_owner", None)
+
+
 def _ping(session, body):
     """Cheap request that re-reads the cached prefix so its TTL does not lapse.
 
     Returns the credits Retool actually billed for the ping (from the usage
-    metadata event), or None when the stream ended without reporting them."""
+    metadata event), or None when the stream ended without reporting them.
+
+    A refusal with an HTTP status is read and let go at once and raised as what it says (_api_error: the account's hourly
+    limit, a plan refusal): an HTTPError holds its socket until the garbage collector comes. A ping that the cancel or the
+    close of its session cuts (RelaySession.cancel aborts it with the turn) raises PingCancelled."""
     payload = ping_body(body)
     # Effort can be part of the provider cache scope. Preserve the exact request
     # settings rather than replacing max with low during a cache refresh.
@@ -1494,38 +1508,68 @@ def _ping(session, body):
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                      data=_wire_json(payload),
                                      headers=headers, method="POST")
-    response = urllib.request.urlopen(request, timeout=120)
-    abort = lambda: _force_close_response(response)
+    try:
+        response = urllib.request.urlopen(request, timeout=120)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read(16384).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - the status alone still says enough
+            detail = ""
+        finally:
+            exc.close()
+        error = _api_error(exc.code, detail, exc.headers)
+        error.upstream_status = exc.code
+        raise error from None
+    aborted = threading.Event()
+
+    def abort():
+        aborted.set()
+        _force_close_response(response)
     session._active_warm_abort = abort
     actual_credits = None
     complete = False
+    # Whether the model began an answer: an error event before it is a refusal made before generating, which costs
+    # nothing (as in _stream_body).
+    began = False
+    refused = False
     billing_id = "keepwarm:" + uuid.uuid4().hex
     warm_usage = {}
     try:
-        for raw in response:
-            if getattr(session, "_cancelled", False):
-                raise InterruptedError("cache refresh cancelled")
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
-            warm_usage.update(usage)
-            if usage.get("creditsUsed") is not None:
-                reported = console_log.number(usage["creditsUsed"])
-                if reported is not None:
-                    actual_credits = reported
-            if event.get("event") == "error":
-                # Preserve any billed usage attached to the error, without claiming a refreshed TTL.
-                raise _error_from_event(event)
-            if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
-                complete = True
-                break
+        try:
+            for raw in response:
+                if getattr(session, "_cancelled", False):
+                    raise PingCancelled("cache refresh cancelled")
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+                warm_usage.update(usage)
+                if usage.get("creditsUsed") is not None:
+                    reported = console_log.number(usage["creditsUsed"])
+                    if reported is not None:
+                        actual_credits = reported
+                if event.get("event") == "error":
+                    # Preserve any billed usage attached to the error, without claiming a refreshed TTL.
+                    refused = not began and not warm_usage
+                    error = _error_from_event(event)
+                    error.in_stream = True
+                    raise error
+                began = began or event.get("event") in ("content_block_start", "content_block_delta")
+                if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
+                    complete = True
+                    break
+        except PingCancelled:
+            raise
+        except Exception as exc:
+            if aborted.is_set():
+                raise PingCancelled("cache refresh cut by the cancel of its session") from exc
+            raise
     finally:
         if getattr(session, "_active_warm_abort", None) is abort:
             session._active_warm_abort = None
@@ -1540,7 +1584,7 @@ def _ping(session, body):
                 session._keepwarm_cost = getattr(session, "_keepwarm_cost", 0.0) + actual_credits
                 if manager is not None:
                     manager.record_turn(billing_id, actual_credits)
-            else:
+            elif not refused:
                 mark_unknown = getattr(manager, "mark_usage_unknown", None)
                 if mark_unknown:
                     mark_unknown()
@@ -1607,6 +1651,7 @@ _STOP_TEXT = {
     "cache_rewritten": "Прогрев остановлен: пинг перезаписал префикс вместо чтения из кэша",
     "compacted": "Прогрев остановлен: клиент сжал историю диалога и больше не продолжит прежний префикс",
     "too_small": "Прогрев не нужен: префикс меньше 1024 токенов, провайдер его не кэширует",
+    "account_rate_limited": "Прогрев остановлен: у аккаунта кончился часовой лимит Retool, аккаунт отложен",
 }
 
 
@@ -1797,6 +1842,7 @@ async def _keepwarm(session, cfg):
     try:
         while True:
             busy, seq, touch_at = False, None, None
+            owner = sent_at = None
             context_token = client_context.bind({})
             try:
                 await asyncio.sleep(0.05)
@@ -1865,6 +1911,10 @@ async def _keepwarm(session, cfg):
                 # snapshotting before to_thread so a following turn cannot relabel it.
                 client_context.bind(identity)
                 ping_started = now
+                owner = _dispatcher(session)
+                # When the ping left, on the dispatcher's own clock: a limit it reports is old news for an account that
+                # came back after that (AccountDispatcher.mark_rate_limited).
+                sent_at = owner.clock() if callable(getattr(owner, "clock", None)) else None
                 cycle.pings += 1
                 cycle.idle_pings += 0 if busy else 1
                 loop = asyncio.get_running_loop()
@@ -1916,9 +1966,31 @@ async def _keepwarm(session, cfg):
             except asyncio.CancelledError:
                 cycle.cancelled()
                 return
+            except PingCancelled:
+                # The client cancelled the turn of this session (or the pool closed it) while the ping was out, and the
+                # abort cut the ping with the turn. That is no failure of the cache: neither counted among the five nor
+                # red. Its result is unknown, so it touched nothing; the next look decides (a cancelled turn stops the
+                # cycle as last_turn_failed).
+                if busy and getattr(session, "_turn_seq", 0) == seq:
+                    session._turn_pinged = True
+                retry_at = next_turn_ping = time.time() + PING_RETRY
+                journal.emit("cache.keepwarm", "Пинг прогрева прерван вместе с ходом клиента", "debug", account=account)
             except Exception as exc:
                 if busy and getattr(session, "_turn_seq", 0) == seq:
                     session._turn_pinged = True
+                if apierr.is_account_quota(exc):
+                    # The account's hourly limit: Retool refuses every request on it for a while, a ping as well, and the
+                    # cache window closes long before it lifts. Asked again on the same account 10 and 20 s later, with a
+                    # red line each time, the account was never parked (A03-07). The dispatcher parks it now, as for a
+                    # turn, and the cycle ends: there is nothing to keep warm on it.
+                    if owner is not None and hasattr(owner, "mark_rate_limited"):
+                        try:
+                            owner.mark_rate_limited(session.backend, retry_after=getattr(exc, "retry_after", None),
+                                                    sent_at=sent_at)
+                        except Exception:  # noqa: BLE001 - the cycle ends all the same
+                            pass
+                    cycle.stop("account_rate_limited", retry_after=getattr(exc, "retry_after", None))
+                    return
                 failures = getattr(session, "_warm_failures", 0) + 1
                 session._warm_failures = failures
                 if failures >= 5:
