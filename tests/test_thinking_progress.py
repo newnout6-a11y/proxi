@@ -1,7 +1,11 @@
-"""Early display status must not expose thinking from a discarded attempt."""
+"""Thinking progress the client sees comes from the upstream only: a real start of reasoning, real reasoning text.
+
+The relay invents nothing: no timer status, no "Модель думает…" label, no "⏳ N с…" ticks, no empty summary part. Early
+display status must not expose thinking from a discarded attempt either."""
 import asyncio
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,10 +13,43 @@ import pytest
 import adapters
 import direct
 import journal
+import minara
 import orchestrator
 import validate
 from test_native_context_reuse import FIRST, request, run, setup
 from test_review_fixes_pr19 import END, THINKING, signature, stream_direct, text
+
+
+class SilentMinaraResponse:
+    """Minara sends its first byte only after a silence longer than the old relay timer's 1.5 s, as a channel that
+    reasons without showing it does (GPT through resp_, Gemini through chatcmpl-: 19-23 s in the probes)."""
+    status_code = 200
+    headers = {"content-type": "text/event-stream"}
+
+    def __init__(self, silence):
+        self.silence = silence
+
+    def iter_content(self, chunk_size):
+        time.sleep(self.silence)
+        frame = {"choices": [{"index": 0, "delta": {"content": "OK"}, "finish_reason": "stop"}]}
+        yield ("data: " + json.dumps(frame) + "\n\ndata: [DONE]\n\n").encode()
+
+    def close(self):
+        pass
+
+
+def test_a_silent_minara_upstream_gets_no_thinking_status_from_a_relay_timer():
+    # 54b1023 sent {"type": "thinking_status", "source": "relay"} after 1.5 s of silence, and a heartbeat every 5 s,
+    # to every Minara turn whose level was not "none" (a turn without any level as well): the client printed
+    # "Модель думает…" with no signal from the backend, and the orchestrator took the turn for started (no failover).
+    session = SimpleNamespace(backend=SimpleNamespace(_minara_post=lambda *a, **kw: SilentMinaraResponse(1.8)),
+                              _cancelled=False)
+
+    async def collect():
+        return [event async for event in minara.iter_events(
+            {"bearer_token": "secret"}, session, {"model": "minara/openai/x"}, "hi", "", None, None, 10)]
+
+    assert [event["type"] for event in asyncio.run(collect())] == ["usage_start", "text", "end"]
 
 
 def test_thinking_status_arrives_while_the_answer_is_still_blocked(tmp_path, monkeypatch):
