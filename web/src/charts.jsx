@@ -2,6 +2,7 @@ import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { isNum, fmtShortTime, fmtTokens, fmtFixed, fmtInt, fmtMs, plural } from './format.js';
 import { uncoveredBuckets } from './coverage.js';
 import { PHASES, phasesOf } from './turns.js';
+import { spendAxisLabel } from './spend.js';
 
 function useSize() {
   const ref = useRef(null);
@@ -247,7 +248,7 @@ export function SpendChart({ buckets, windowSec, coveredFrom = null, unit = 'cre
         {ticks.map((v) => (
           <g key={v}>
             <line className="c-grid" x1={PAD.l} x2={W - PAD.r} y1={Math.round(yAt(v)) + 0.5} y2={Math.round(yAt(v)) + 0.5} />
-            <text className="c-label" x={PAD.l - 8} y={yAt(v) + 4} textAnchor="end">{fmtFixed(v, v < 1 ? 2 : 1)}</text>
+            <text className="c-label" x={PAD.l - 8} y={yAt(v) + 4} textAnchor="end">{spendAxisLabel(v, unit)}</text>
           </g>
         ))}
         <text className="c-label" x={PAD.l - 8} y={baseY + 4} textAnchor="end">0</text>
