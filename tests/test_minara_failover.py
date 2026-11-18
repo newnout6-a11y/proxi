@@ -160,6 +160,38 @@ def test_request_sent_is_no_output_for_the_failover():
     assert out.started is True
 
 
+@pytest.mark.parametrize('status', [{'type': 'thinking_status', 'source': 'upstream'},
+                                    {'type': 'thinking_status', 'source': 'relay'},
+                                    {'type': 'thinking_heartbeat', 'elapsed': 6.5}])
+def test_a_display_status_is_no_output_for_the_failover(status):
+    # A02-01: a status says that the model reasons (or that time passes), and it carries nothing the reply is made of.
+    # Counted as output, it made every unbilled refusal that came after it final: Retool's hourly limit inside a 200
+    # after its thinking start, and every Minara 402/401/403 later than the relay's 1.5 s timer (16 of 26 live ones).
+    out = orchestrator._FailoverOut(types.SimpleNamespace(put=lambda event: None))
+    out.put({'type': 'usage_start'})
+    out.put(status)
+    assert out.started is False
+    out.put({'type': 'thinking_start'})  # reasoning content follows: the client has the block it opens
+    assert out.started is True
+
+
+def test_a_402_that_comes_after_a_silence_still_moves_the_request(relay):
+    # The refusal comes later than the 1.5 s after which 54b1023's timer took the turn for started (A02-01).
+    def slow(post):
+        def wrapper(url, **kwargs):
+            import time
+            time.sleep(1.7)
+            return post(url, **kwargs)
+        return wrapper
+
+    for backend in relay.runtime.accounts.backends:
+        backend._minara_post = slow(backend._minara_post)
+    status, body = relay.ask('conv-slow-402')
+    assert status == 200, body
+    assert body['choices'][0]['message']['content'] == 'FAILOVER_OK'
+    assert len(relay.state.posts) == 2 and relay.state.first.unavailable['reason'] == 'exhausted'
+
+
 def manager(balance):
     return accounts.MinaraAccount({'bearer_token': 't'}, fetch=lambda: {'creditBalanceBreakdown': dict(balance)})
 
