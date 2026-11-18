@@ -11,6 +11,9 @@ import weakref
 import web_search
 INSTRUCTION_ROLES = ("system", "developer")
 INLINE_TOOL_BLOCKS = ("tool_addition", "tool_removal")
+# The blocks of a reply that hold the model's own state, which only upstream reads (Retool's isModelStateBlock): signed
+# thinking, encrypted reasoning, and Retool's opaque contents. They go back in their place and are never shown to a client.
+MODEL_STATE_BLOCKS = ("thinking", "redacted_thinking", "redacted_retool_contents")
 _TEXT_BLOCKS = ("text", "input_text", "output_text", "summary_text")
 _REMINDER_OPEN, _REMINDER_CLOSE = "<system-reminder>", "</system-reminder>"
 
@@ -412,6 +415,14 @@ class ReplyCapture:
                 self.current = {"type": "redacted_thinking", "data": event["data"]}
                 if event.get("responseItemId"):
                     self.current["responseItemId"] = event["responseItemId"]
+            elif (block_type == "redacted_retool_contents" and isinstance(event.get("data"), str)
+                  and isinstance(event.get("responseItemId"), str)):
+                # Retool's own opaque state of the turn: data and responseItemId, both required by its schema
+                # (RedactedRetoolContentsContentBlockSchema), and sent back by its frontend as they came. Unknown here,
+                # it made the whole reply unkeepable and the next request went cold. Without its id it is no block
+                # Retool takes back, and the reply is not kept.
+                self.current = {"type": "redacted_retool_contents", "data": event["data"],
+                                "responseItemId": event["responseItemId"]}
             else:
                 self.valid = False
                 return
@@ -571,7 +582,7 @@ class History:
                     or not _complete_turns(tail[len(calls):], set(calls))):
                 continue
             raw = {b["toolCallId"]: b for b in snapshot.assistant if b.get("type") == "tool_call"}
-            given = ([b for b in snapshot.assistant if b.get("type") in ("thinking", "redacted_thinking")]
+            given = ([b for b in snapshot.assistant if b.get("type") in MODEL_STATE_BLOCKS]
                      + ([{"type": "text", "text": text}] if text else []) + [raw[call_id] for call_id in calls])
             return snapshot, snapshot.messages + [{"role": "assistant", "content": given}] + tail
         return None, None

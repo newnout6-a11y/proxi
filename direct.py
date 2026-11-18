@@ -2011,7 +2011,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
         console_log.write("[%s] [history] native continuation %s thinking=%d tool_calls=%d" % (
             req_id, "forked from the last request" if forked else "restored",
-            sum(b["type"] in ("thinking", "redacted_thinking") for b in replayed),
+            sum(b["type"] in native_history.MODEL_STATE_BLOCKS for b in replayed),
             sum(b["type"] == "tool_call" for b in replayed)))
     else:
         # A one-shot job continues nothing of the session it runs on, so it changes nothing of it either: Codex can run
