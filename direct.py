@@ -34,6 +34,7 @@ import client_context
 import console_log
 import native_history
 import models as model_catalog
+import retool_catalog
 import summary_guard
 import upstream_diagnostics
 from accounts import account_tag, idle_block
@@ -74,9 +75,17 @@ RETRYABLE_WAITS = (0.25, 0.5, 1.0)
 # own Sandpack agent asks for it on them. With enableFineGrainedStreaming the arguments of a tool call stream in ~18
 # characters every ~50 ms; without it Retool sends the first ~20 characters and holds the rest (16.6 s for a 6 kB Write in
 # probes, minutes on long ones), which the stall watchdog took for a dead stream. It changes nothing in text or thinking.
+# The registry the catalog look last read decides (retool_catalog.FINE_GRAINED); this list serves until one has been read.
 FINE_GRAINED_STREAMING_MODELS = frozenset({
     "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
     "claude-sonnet-4-6", "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514"})
+
+
+def fine_grained_streaming(model):
+    """Whether a request of this model with tools asks Retool for fine-grained tool streaming: the models whose entry in
+    Retool's registry says supportsFineGrainedStreaming, as the catalog look last read it."""
+    known = retool_catalog.FINE_GRAINED
+    return model in (FINE_GRAINED_STREAMING_MODELS if known is None else known)
 
 
 def _refused_for_now(error):
@@ -1228,7 +1237,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             (tool_choice or {}).get("function", {}).get("name") if isinstance(tool_choice, dict) else None)
         if choice and choice != "auto":
             body["toolChoice"] = choice
-        if body["model"] in FINE_GRAINED_STREAMING_MODELS:
+        if fine_grained_streaming(body["model"]):
             body["enableFineGrainedStreaming"] = True
     if prefix_key:
         body["openAICacheKey"] = prefix_key
