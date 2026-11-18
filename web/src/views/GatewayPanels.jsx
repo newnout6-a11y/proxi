@@ -424,7 +424,12 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
               <Button icon={RefreshCw} disabled={!!busy.refreshAll}
                 onClick={() => withBusy('refreshAll', async () => {
                   const res = await api(apiKey, 'catalog/refresh', { method: 'POST', body: {} });
-                  toast({ tone: 'success', title: 'Каталог обновлён', text: `Всего моделей провайдеров: ${fmtInt(res.total_models)}` });
+                  const failed = Object.entries(res.providers || {}).filter(([, info]) => info && info.ok === false);
+                  toast(!res.ok
+                    ? { tone: 'warn', title: 'Каталог обновляется', text: res.error || 'Обновление ещё идёт' }
+                    : failed.length
+                      ? { tone: 'warn', title: 'Каталог обновлён не полностью', text: failed.map(([pid, info]) => `${pid}: ${info.error || 'ошибка'}`).join(' · ') }
+                      : { tone: 'success', title: 'Каталог обновлён', text: `Всего моделей провайдеров: ${fmtInt(res.total_models)}` });
                 })}>
                 Обновить /models
               </Button>
@@ -480,13 +485,14 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
                     disabled={!!busy[`prov:${prov.id}`]}
                     onChange={(enabled) => withBusy(`prov:${prov.id}`, () => api(apiKey, `providers/${prov.id}`, { method: 'PATCH', body: { enabled } }))}
                   />
-                  <Button icon={RefreshCw} disabled={!!busy[`disc:${prov.id}`]}
+                  <Button icon={RefreshCw} disabled={!!busy[`disc:${prov.id}`] || prov.enabled === false}
+                    title={prov.enabled === false ? 'Провайдер выключен: его /models не читается' : undefined}
                     onClick={() => withBusy(`disc:${prov.id}`, async () => {
                       const res = await api(apiKey, `providers/${prov.id}/discover`, { method: 'POST', body: {} });
                       const info = res.providers?.[prov.id];
                       toast(info?.ok
                         ? { tone: 'success', title: `${prov.name}: /models обновлён`, text: `Найдено моделей: ${fmtInt(info.count)}` }
-                        : { tone: 'warn', title: `${prov.name}: не удалось обновить`, text: info?.error || 'Ошибка запроса' });
+                        : { tone: 'warn', title: `${prov.name}: не удалось обновить`, text: info?.error || res.error || 'Ошибка запроса' });
                     })}>
                     Модели
                   </Button>

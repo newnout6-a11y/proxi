@@ -2,10 +2,14 @@
 provider, the provider named "test", a slow catalog refresh and the last provider that serves."""
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
 
 import pytest
 
+from catalog import admin_ops
 from test_stage5_admin_api import gateway_admin, mock_upstream  # noqa: F401 - bootstrap relay and upstream fixtures
 
 KEY = "sk-live-secret-provider-key-9999"
@@ -147,3 +151,38 @@ def test_the_last_provider_that_serves_cannot_be_switched_off_or_deleted(gateway
     assert gateway_admin.admin_call("/admin/api/providers/hub", method="DELETE")[0] == 200
     status, accounts = gateway_admin.admin_call("/admin/api/accounts")
     assert accounts["summary"]["enabled_providers"] == 1
+
+
+class SlowRefresher:
+    def __init__(self, release):
+        self.release, self.started = release, 0
+
+    async def refresh_async(self, provider_id=None):
+        self.started += 1
+        while not self.release.is_set():
+            await asyncio.sleep(0.02)
+        return {"providers": {}, "changed": False, "total_models": 0}
+
+
+# A07-07: a catalog refresh longer than 25 s raised a bare TimeoutError: a 500 and a red http.exception, while the refresh
+# went on in the background and the next click started a second one beside it.
+def test_a_slow_catalog_refresh_answers_pending_and_is_not_started_twice(gateway_admin, monkeypatch):
+    release = threading.Event()
+    refresher = SlowRefresher(release)
+    monkeypatch.setattr(gateway_admin.runtime, "provider_catalog", refresher)
+    monkeypatch.setattr(admin_ops, "DISCOVERY_WAIT", 0.2)
+    try:
+        status, first = gateway_admin.admin_call("/admin/api/catalog/refresh", {}, method="POST")
+        assert status == 200 and first["ok"] is False and first["pending"] is True, first
+        status, second = gateway_admin.admin_call("/admin/api/catalog/refresh", {}, method="POST")
+        assert status == 200 and second["pending"] is True
+        assert refresher.started == 1
+    finally:
+        release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        status, third = gateway_admin.admin_call("/admin/api/catalog/refresh", {}, method="POST")
+        if third.get("ok"):
+            break
+        time.sleep(0.05)
+    assert third["ok"] is True and refresher.started == 2

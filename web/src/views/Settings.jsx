@@ -301,9 +301,16 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
   async function refreshAllCatalog() {
     setRefreshing(true);
     try {
-      await api(apiKey, 'catalog/refresh', { method: 'POST', body: {} });
+      // The relay re-reads /models of the universal providers and models.dev here; Retool's and Minara's catalogs it
+      // reads on its own schedule (retool_catalog_refresh_hours, minara_catalog_refresh_hours), not on this button.
+      const res = await api(apiKey, 'catalog/refresh', { method: 'POST', body: {} });
       await loadCatalog();
-      toast({ tone: 'success', title: 'Каталог обновлён' });
+      const failed = Object.entries(res?.providers || {}).filter(([, info]) => info && info.ok === false);
+      toast(res && res.ok === false
+        ? { tone: 'warn', title: 'Каталог обновляется', text: res.error || 'Обновление ещё идёт' }
+        : failed.length
+          ? { tone: 'warn', title: 'Каталог провайдеров обновлён не полностью', text: failed.map(([pid, info]) => `${pid}: ${info.error || 'ошибка'}`).join(' · ') }
+          : { tone: 'success', title: 'Каталог провайдеров обновлён', text: 'Перечитаны /models API-провайдеров и models.dev; модели Retool и Minara relay перечитывает сам по расписанию' });
     } catch (failure) {
       if (failure.status === 401) onUnauthorized();
       else toast({ tone: 'error', title: 'Не удалось обновить каталог', text: failure.message });

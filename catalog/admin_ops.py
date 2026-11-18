@@ -34,6 +34,10 @@ PREVIEW_MIN_CHARS = 24
 CLIENT_KEY_PREFIX = "sk-proxi-"  # auth.generate_client_key: the relay's own prefix is public
 # The userinfo of a proxy_url in an answer: a stand-in, which a PATCH that sends it back unchanged leaves alone.
 PROXY_USERINFO_MASK = "•••"
+# How long the admin waits for a catalog refresh before it answers "still running" (a refresh reads /models of every
+# provider in turn, and models.dev).
+DISCOVERY_WAIT = 25.0
+_DISCOVERY_LOCK = threading.Lock()
 
 
 def mask_key_preview(raw_key: str | None) -> str | None:
@@ -661,11 +665,33 @@ def test_provider_connection(admin_obj, data: dict) -> dict:
 
 
 def discover_provider(admin_obj, provider_id: str | None = None) -> dict:
+    """Read /models again (one provider, or every provider and models.dev); at most DISCOVERY_WAIT seconds.
+
+    A refresh still running then is answered `pending`: it goes on and fills the catalog, and a second one is not started
+    beside it. A bare TimeoutError used to come out of here: a 500 and a red http.exception, while the refresh went on and
+    the next click started another (audit A07-07)."""
     refresher = getattr(admin_obj.runtime, "provider_catalog", None)
     if refresher is None:
         raise apierr.service_unavailable("Provider catalog refresher is unavailable")
     pid = provider_id.strip().lower() if provider_id else None
-    res = refresher.refresh_now(pid, timeout=25.0)
+    runtime = admin_obj.runtime
+    if getattr(runtime, "loop", None) is None or not callable(getattr(runtime, "submit", None)):
+        res = refresher.refresh_now(pid, timeout=DISCOVERY_WAIT)
+        return admin_obj._safe({"ok": True, **res})
+    with _DISCOVERY_LOCK:
+        running = getattr(admin_obj, "_catalog_refresh", None)
+        if running is not None and not running.done():
+            return {"ok": False, "pending": True,
+                    "error": "Обновление каталога ещё идёт: его результат появится в каталоге сам"}
+        running = admin_obj._catalog_refresh = runtime.submit(refresher.refresh_async(pid))
+    try:
+        res = running.result(timeout=DISCOVERY_WAIT)
+    except TimeoutError:
+        return {"ok": False, "pending": True,
+                "error": "Обновление каталога идёт дольше %d с: оно продолжается, результат появится в каталоге сам"
+                         % DISCOVERY_WAIT}
+    except Exception as exc:  # noqa: BLE001 - a failed refresh is an answer, not a server error
+        return admin_obj._safe({"ok": False, "error": (str(exc) or type(exc).__name__)[:240]})
     return admin_obj._safe({"ok": True, **res})
 
 
