@@ -699,14 +699,12 @@ def make_handler(runtime: Runtime):
         def _stream_failure(self, dialect, err):
             """End a stream that failed after it started. Only Responses has a terminal failure event."""
             payload = self._error_payload(dialect, err)
+            if dialect == "responses":
+                self._adapter.fail(err, payload)  # error, then response.failed (see ResponsesAdapter.fail)
+            else:
+                self._writer.event("error", payload)
             # Journal must not report a mid-stream failure as 200/success.
             self._stream_status = err.status
-            if dialect == "responses":
-                # error, then response.failed (see ResponsesAdapter.fail), which ends the stream: no data: [DONE] in
-                # Responses (Codex logged it as "Failed to parse SSE event").
-                self._adapter.fail(err, payload)
-                return
-            self._writer.event("error", payload)
             self._writer.done()
 
         def _log_error(self, err):

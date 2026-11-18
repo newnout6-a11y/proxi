@@ -56,7 +56,7 @@ def test_the_first_call_is_closed_before_the_next_one_is_written():
         writer, "response.output_item.added", output_index=1)
     final = adapter.end("tool_calls")
     assert done_indexes(writer) == [0, 1] and [item["status"] for item in final["output"]] == ["completed"] * 2
-    assert names(writer)[-1] == "response.completed" and "done" not in names(writer)  # no [DONE] in Responses
+    assert names(writer)[-2:] == ["response.completed", "done"]
 
 
 def test_the_items_before_a_call_are_closed_first_so_that_the_history_keeps_the_order_of_the_output():
@@ -152,7 +152,7 @@ def test_after_a_timeout_a_finished_call_stays_completed_and_only_what_was_cut_i
     assert [item["status"] for item in final["output"]] == ["completed", "completed", "incomplete"]
     assert [p["item"]["status"] for kind, p in writer.events if kind == "response.output_item.done"] == [
         "completed", "completed", "incomplete"]
-    assert names(writer)[-1] == "response.incomplete" and "done" not in names(writer)  # no [DONE] in Responses
+    assert names(writer)[-2:] == ["response.incomplete", "done"]
 
 
 def test_a_custom_call_is_closed_with_its_whole_input_when_upstream_ends_it():
@@ -195,7 +195,7 @@ def test_a_reply_of_text_only_has_the_events_it_always_had():
         "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
         "response.reasoning_summary_part.done", "response.output_item.done", "response.output_item.added",
         "response.content_part.added", "response.output_text.delta", "response.output_text.done",
-        "response.content_part.done", "response.output_item.done", "response.completed"]  # no [DONE] in Responses
+        "response.content_part.done", "response.output_item.done", "response.completed", "done"]
     assert [item["type"] for item in final["output"]] == ["reasoning", "message"]
 
 

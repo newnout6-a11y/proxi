@@ -219,9 +219,7 @@ def test_http_a_failure_after_the_start_ends_with_response_failed_and_the_mapped
     assert status == 200
     names = [name for name, _ in events]
     assert names[0] == 'response.created' and names[-2:] == ['error', 'response.failed']
-    # response.failed is the end of a Responses stream: no data: [DONE] after it (the spec has none, and Codex
-    # logged "Failed to parse SSE event" for it, research S4 §2.1).
-    assert raw.rstrip().endswith('}') and '[DONE]' not in raw
+    assert raw.rstrip().endswith('data: [DONE]')
     named = dict(events)
     failed, created = named['response.failed']['response'], named['response.created']['response']
     assert failed['id'] == created['id'] and failed['status'] == 'failed' and failed['error']['code'] == code
