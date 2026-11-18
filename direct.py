@@ -65,6 +65,9 @@ def _int_setting(cfg, key, default):
 # These are the pauses before the 1st, 2nd and 3rd retry, on top of the 0.5, 1 and 2 seconds that AttemptBudget.take
 # adds before any further POST of a step.
 RATE_LIMIT_WAITS = (1.5, 3.0, 6.0)
+# An error event that Retool marks isRetryable, before the model gave anything: Retool's own frontend asks the same request
+# again up to three times, 250 ms * 2^n apart (streamWithRetry); so does the relay, on the same account.
+RETRYABLE_WAITS = (0.25, 0.5, 1.0)
 
 # Retool models whose registry entry says supportsFineGrainedStreaming: true (public frontend bundle, 2026-11-18); Retool's
 # own Sandpack agent asks for it on them. With enableFineGrainedStreaming the arguments of a tool call stream in ~18
@@ -1301,6 +1304,22 @@ _CONTEXT_EXCEEDED = re.compile(r"(?i)exceeds? the context window|context[ _]leng
 
 
 def _error_from_event(event):
+    """The relay's error for an error event of Retool's stream.
+
+    The event's isRetryable (Retool's schema requires it) is kept as error.retryable: Retool's own frontend asks the same
+    request again only when it is true (_stream_body does so, before anything reached the client). A final error that
+    would go out as a 5xx says so to the SDK clients that resend a 5xx (x-should-retry: false): the same request meets the
+    same refusal."""
+    error = _error_of_event(event)
+    retryable = event.get("isRetryable")
+    if isinstance(retryable, bool):
+        error.retryable = retryable
+        if not retryable and error.status >= 500:
+            error.headers["x-should-retry"] = "false"
+    return error
+
+
+def _error_of_event(event):
     message = event.get("error")
     if isinstance(message, dict):
         message = message.get("message")
@@ -2789,6 +2808,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         empty_retries = 0
         max_limit_retries = _int_setting(cfg, "upstream_rate_limit_retries", 3)
         limit_retries = 0
+        retryable_retries = 0
         while True:
             usable = False
             thinking_seen = False
@@ -2803,7 +2823,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             previous_trace = holder.get("trace")
             task = loop.run_in_executor(getattr(loop, "_relay_io_executor", None),
                                         contextvars.copy_context().run, worker, queue)
-            flags = {"budget": budget}
+            flags = {"budget": budget, "model": body.get("model")}
             failure = None
             try:
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
@@ -2890,6 +2910,29 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                              "Retool ограничил частоту запросов к моделям (429): повтор на том же аккаунте через %.1f с "
                              "(%d из %d)" % (wait, limit_retries, max_limit_retries), "warn", model=body.get("model"),
                              attempt=budget.used, wait=round(wait, 2), retry=limit_retries, retries=max_limit_retries,
+                             account=account_tag(getattr(session, "backend", None)),
+                             thread=journal.tag(getattr(session, "thread_id", None)))
+                if not await _pause(wait, is_cancelled):
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                text.clear()
+                thinking.clear()
+                holder["response"] = None
+                continue
+            if (getattr(failure, "retryable", None) is True and getattr(failure, "in_stream", False) and not spoke
+                    and not usable and failure.status != 429 and retryable_retries < len(RETRYABLE_WAITS)
+                    and budget.remaining and not is_cancelled()):
+                # Retool said that asking again may well work (isRetryable), and the client has been given nothing of
+                # this attempt: asked again on the same account, as Retool's own frontend does, instead of a 502 the
+                # client would send again in full. A 429 has its own ways: the account's hourly limit moves the turn,
+                # a limit of the moment waits above (RATE_LIMIT_WAITS).
+                wait = RETRYABLE_WAITS[retryable_retries]
+                retryable_retries += 1
+                journal.emit("upstream.retryable_error",
+                             "Retool сообщил о временной ошибке (isRetryable): повтор на том же аккаунте через %.2f с "
+                             "(%d из %d): %s" % (wait, retryable_retries, len(RETRYABLE_WAITS),
+                                                 str(failure.message or "")[:160]),
+                             "warn", model=body.get("model"), attempt=budget.used, wait=wait, retry=retryable_retries,
                              account=account_tag(getattr(session, "backend", None)),
                              thread=journal.tag(getattr(session, "thread_id", None)))
                 if not await _pause(wait, is_cancelled):
@@ -3174,6 +3217,15 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             current = stack[-1] if stack else None
         elif kind == "metadata":
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            served, asked = event.get("model"), flags.get("model")
+            if (isinstance(served, str) and served and isinstance(asked, str) and asked and served != asked
+                    and not served.startswith(asked) and not asked.startswith(served)
+                    and not flags.get("substitution_told")):
+                # The metadata names the model that answered (Retool's schema requires it). Retool can serve another one
+                # than asked (its Ask AI answers every model with gpt-5-nano); a dated name of the same model is no other.
+                flags["substitution_told"] = True
+                journal.emit("upstream.model_substituted", "Retool ответил моделью %s вместо запрошенной %s" % (
+                    served, asked), "warn", requested=asked, served=served, thread=journal.tag(req_id))
             if usage:
                 flags["usage_seen"] = True
                 flags.setdefault("last_usage", {}).update(usage)
