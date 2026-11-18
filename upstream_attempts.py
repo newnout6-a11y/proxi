@@ -5,6 +5,9 @@ import time
 import apierr
 
 MAX_ATTEMPTS = 5  # Initial POST plus at most four further POSTs per step, never five retries.
+# How many POSTs one request may get back (AttemptBudget.refund) for accounts that refused it outright and were taken out
+# of its way: a pool that keeps refusing still ends, after at most this many accounts.
+MAX_REFUNDS = 64
 
 
 class AttemptBudget:
@@ -34,6 +37,7 @@ class AttemptBudget:
         self.sent_at = None
         self._clock = clock
         self._lock = threading.Lock()
+        self.refunds = 0
 
     @property
     def remaining(self):
@@ -41,6 +45,23 @@ class AttemptBudget:
         if self.total_cap:
             left = min(left, max(0, self.total_cap - self.used))
         return left
+
+    def refund(self):
+        """Give back the latest POST: its account refused the request outright and is now out of the request's way.
+
+        Retool's 402 for a model the account's plan lacks, its hourly limit and a spent balance come back before anything
+        is generated or billed, and the turn moves to another account. Charged as attempts, they used up the step: with
+        claude-opus-5-5 in the plan of 13 of 65 live accounts (2026-11-18), five refusals in a row were common and the
+        client got the refusal as a 502 while accounts that serve the model stood idle. At most MAX_REFUNDS a request.
+        True when the POST was given back."""
+        with self._lock:
+            if self.refunds >= MAX_REFUNDS or self.step_used <= 0:
+                return False
+            self.refunds += 1
+            self.step_used -= 1
+            self.used = max(0, self.used - 1)
+            self.account_streak = 0
+            return True
 
     def new_step(self):
         """A successful local exec follow-up is a new step with a fresh retry counter."""

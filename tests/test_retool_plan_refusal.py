@@ -312,6 +312,39 @@ def test_two_refusing_accounts_and_a_third_that_serves(retool, tmp_path):
     assert set(retool.a.refused_models) == set(retool.b.refused_models) == {OPUS} and third.refused_models == {}
 
 
+def test_more_refusing_accounts_than_attempts_still_reach_the_account_that_serves(retool, tmp_path, monkeypatch):
+    # Live pool of 2026-11-18: claude-opus-5-5 is in the plan of 13 of 65 accounts. Each refusal used to cost one of the
+    # five attempts, so a turn that met five refusing accounts in a row got the refusal as a 502. A refusal is instant and
+    # unbilled: it gives its attempt back.
+    monkeypatch.setattr(upstream_attempts, "MAX_ATTEMPTS", 2)
+    added = []
+    for name in ("acc-c", "acc-d"):
+        backend = Backend(tmp_path, base="https://%s.invalid" % name, account_id=name, transport="direct")
+        backend.headers = lambda: {}
+        retool.pool.backends.append(backend)
+        retool.dispatcher.add_account(backend, None)
+        added.append(backend)
+    retool.script["acc-a"] = retool.script["acc-b"] = retool.script["acc-c"] = refused
+    holder = {}
+    events = asyncio.run(run(retool.runner, turn(), holder))
+    assert retool.posts == ["acc-a", "acc-b", "acc-c", "acc-d"]
+    assert texts(events) == [{"type": "text", "delta": "OK"}] and errors(events) == []
+    assert retool.pool._conversations["conv-1"].backend is added[1]
+    assert holder["_attempt_budget"].refunds == 3
+
+
+def test_a_request_gets_back_at_most_max_refunds_attempts(monkeypatch):
+    monkeypatch.setattr(upstream_attempts, "MAX_REFUNDS", 2)
+    budget = upstream_attempts.AttemptBudget()
+    assert budget.refund() is False  # nothing taken yet: nothing to give back
+    for _ in range(2):
+        budget.take(lambda: False)
+        assert budget.refund() is True and budget.remaining == upstream_attempts.MAX_ATTEMPTS
+    budget.take(lambda: False)
+    assert budget.refund() is False and budget.remaining == upstream_attempts.MAX_ATTEMPTS - 1
+    assert (budget.used, budget.refunds) == (1, 2)
+
+
 def test_a_bound_conversation_of_that_model_moves_at_its_next_request(retool):
     async def scenario():
         await run(retool.runner, turn())

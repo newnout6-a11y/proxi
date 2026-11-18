@@ -1127,6 +1127,8 @@ class TurnRunner:
                 raise
             if rate_limited:
                 exclude.append(backend)
+                # Refused before anything was generated or billed: the move to the next account costs no attempt.
+                holder["_attempt_budget"].refund()
                 journal.emit("account.failover", "Часовой лимит Retool — запрос повторён на другом аккаунте",
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code, reason="rate_limited")
@@ -1136,6 +1138,7 @@ class TurnRunner:
                 continue
             if plan_refused:
                 exclude.append(backend)
+                holder["_attempt_budget"].refund()
                 journal.emit("account.failover", "Модель не входит в тариф аккаунта Retool — запрос повторён на другом аккаунте",
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code, reason="plan_refused", model=_model_id(parsed))
@@ -1145,6 +1148,10 @@ class TurnRunner:
                 continue
             if exhausted:
                 exclude.append(backend)
+                if minara_refusal:
+                    # Minara said 402/401/403 before generating anything (unbilled). An exhaustion confirmed by a balance
+                    # read after some other failure (a 5xx) keeps that failure's attempt charged.
+                    holder["_attempt_budget"].refund()
                 rejected = error.code == "upstream_auth_error"
                 journal.emit("account.failover", "Токен аккаунта отклонён — запрос повторён на другом" if rejected else
                              "Баланс аккаунта закончился — запрос повторён на другом",
