@@ -45,6 +45,9 @@ MIN_OUTPUT_TOKENS = 16
 _LIVE_EVENTS = frozenset({"credits", "usage", "thinking_heartbeat", "end"})
 # What an attempt that produced only reasoning looks like on the event stream (thinking_only, not content).
 _THINKING_EVENTS = frozenset({"thinking", "thinking_start", "thinking_signature", "thinking_heartbeat"})
+# Retool's blocks of reasoning that come whole and encrypted, without a delta: GPT's reasoning items (redacted_thinking with
+# its responseItemId) and Retool's own opaque state (redacted_retool_contents). Each is a sign that the model reasons.
+_ENCRYPTED_REASONING = frozenset({"redacted_thinking", "redacted_retool_contents"})
 _EMPTY_DUMPED = set()  # (request_purpose, model) pairs whose empty answer is already saved this run
 
 
@@ -2894,6 +2897,9 @@ def _delta_target(event, current):
 async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None, *, cache_scope=None):
     started = loop_now()
     think_started = None
+    # Whether the client has been told of the reasoning under way since the model last wrote text or began a call: GPT's
+    # reasoning comes as a run of encrypted blocks, and one status stands for the whole run.
+    reasoning_told = False
     flags = {} if flags is None else flags
     """Consume one attempt's NDJSON lines, yielding normalised events.
 
@@ -2993,12 +2999,31 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 # Opus 5.5 streams no thinking text, only this early start and a final
                 # signature; surfacing the start replaces silence with "thinking".
                 think_started = loop_now()
+                reasoning_told = True
                 console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start")
                 journal.emit("upstream.thinking_signal", "Upstream сообщил начало блока thinking", "info",
                              source="upstream", signal="content_block_start", thread=journal.tag(req_id))
                 yield {"type": "thinking_start"}
+            elif event.get("type") in _ENCRYPTED_REASONING:
+                # GPT on Retool streams no reasoning text: each reasoning item comes whole, as one encrypted block, one
+                # every 3.5-12 s (5-10 of them before the first word, 13-70 s in the probes of 2026-11-18), and nothing
+                # else comes meanwhile. The first block of a run is the real sign that the model reasons, as the start of a
+                # thinking block is for Claude: one status for the run, and no text (the data is encrypted; it goes back
+                # upstream with the history, ReplyCapture). Dropped, it left the client without a sign for up to 70 s
+                # and the stall watchdog on its first-token budget.
+                if think_started is None:
+                    think_started = loop_now()
+                if not reasoning_told:
+                    reasoning_told = True
+                    console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start "
+                                      f"block={event.get('type')}")
+                    journal.emit("upstream.thinking_signal", "Upstream начал рассуждение: зашифрованный блок без текста",
+                                 "info", source="upstream", signal="content_block_start", block=event.get("type"),
+                                 thread=journal.tag(req_id))
+                    yield {"type": "thinking_start"}
             elif event.get("type") == "tool_call":
                 think_started = None
+                reasoning_told = False
                 if event.get("toolCallId"):
                     current = event["toolCallId"]
                 else:
@@ -3021,6 +3046,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                     console_log.write("[ttft] %.2fs" % (time.time() - started))
                 if piece:
                     text.append(piece)
+                    reasoning_told = False
                     yield {"type": "text", "delta": piece}
             elif block == "thinking":
                 if think_started is None:
