@@ -1360,9 +1360,14 @@ class SessionPool:
         """What a request is told about the accounts whose Retool plan refused its model: one text for all of them (the 404
         names it once), with how many there are and when the relay tries the first of them again."""
         first = min(hold.get("until_at") or 0 for hold in holds)
+        if all(hold.get("persisted") for hold in holds):
+            # Facts of the plans (retool_plans.auto.json): a background probe asks them again, not a client's request.
+            when = "the relay re-checks %s in the background from %s" % (
+                "it" if len(holds) == 1 else "them", time.strftime("%H:%M %d.%m", time.localtime(first)))
+        else:
+            when = "the relay tries again at %s" % time.strftime("%H:%M", time.localtime(first))
         return ('the Retool plan of %d account%s does not include it (HTTP 402 "This model is not available for your '
-                'plan."); the relay tries again at %s' % (len(holds), "" if len(holds) == 1 else "s",
-                                                          time.strftime("%H:%M", time.localtime(first))))
+                'plan."); %s' % (len(holds), "" if len(holds) == 1 else "s", when))
 
     @staticmethod
     def _refusals(model_entry, backends, configured=True):

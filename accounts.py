@@ -23,6 +23,7 @@ import apierr
 import console_log
 import journal
 import minara_accounts
+import retool_plans
 from minara_catalog import CREDITS_PER_USD
 from io_workers import DaemonIOExecutor
 
@@ -43,6 +44,23 @@ RATE_LIMIT_CEILING = 1200.0  # ... up to twenty minutes, or the cooldown itself 
 EXPIRY_WARN_EVERY = 86400.0  # a token about to expire is announced at most once a day per account
 PLAN_REFUSAL_FIRST = 300.0   # the first refusal of a model by an account's Retool plan holds that pair for five minutes,
 PLAN_REFUSAL_HOLD = 3600.0   # one within an hour after the pair's last hold ended holds it for an hour
+# With a plans file (retool_plans.auto.json, beside config.json) such a repeated refusal is a fact of the plan: it is written
+# down and holds the pair until a background probe asks it again (retool_plan_recheck_hours, 12 h by default), never a
+# client's request; each refusal the probe meets doubles the wait, up to PLAN_RECHECK_MAX.
+PLAN_RECHECK = 12 * 3600.0
+PLAN_RECHECK_MAX = 24 * 3600.0
+PLAN_PROBE_WAIT = 3600.0         # a pair whose probe is due, or could not tell (429, network, 5xx), stays held this long
+PLAN_PROBE_UNAVAILABLE = 6 * 3600.0  # ... and six hours when Retool had the model "not available right now" for everyone
+PLAN_PROBES = 30                 # probes an hour at most (retool_plan_probes; 0 switches them off)
+# A wave: within PLAN_WAVE_WINDOW at least PLAN_WAVE_ACCOUNTS accounts that served the model in the last
+# PLAN_SERVED_RECENT refuse it. Five 3000-credit accounts refused Opus in the same second six times on 2026-11-14/15 and
+# served it 972-1462 turns each afterwards: a fault of Retool's, not of their plans. Such pairs keep the short hold and
+# are never written down.
+PLAN_WAVE_WINDOW = 120.0
+PLAN_WAVE_ACCOUNTS = 3
+PLAN_SERVED_RECENT = 86400.0
+PLAN_SERVED_KEEP = 7 * 86400.0   # how long a pair that served counts as one (the pool asks such accounts first)
+PLAN_SERVED_WRITE = 3600.0       # a pair that served is written at most this often
 
 
 def _local_time(epoch):
@@ -399,8 +417,38 @@ class MinaraAccount(UnmeteredAccount):
             self._spent_since += sign * cost * CREDITS_PER_USD
 
 
+def _plan_state():
+    """An account's plan facts in the dispatcher's state: holds and when they ended (mark_plan_refusal), when each model
+    last served (mark_plan_served), the probes due (release_plan_refusals) and the pairs a wave of refusals touched."""
+    return {"plan_refusals": {}, "plan_released": {}, "plan_served": {}, "plan_probe_due": set(), "plan_wave": set()}
+
+
+def _hours(value, default):
+    """retool_plan_recheck_hours in seconds: 1 to 168 hours, the default for anything else."""
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(hours, 1.0), 168.0) * 3600.0 if math.isfinite(hours) else default
+
+
+def _integer(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _probe_plan(backend, entry):
+    """The background probe of a pair: one short question on the relay's own route (retool_refresh.probe)."""
+    import retool_refresh  # local: it imports the transport, which the dispatcher does not need otherwise
+
+    return retool_refresh.probe(backend, entry)
+
+
 class AccountDispatcher:
-    def __init__(self, backends, cfg, managers, *, clock=time.monotonic, rng=None, wall=time.time):
+    def __init__(self, backends, cfg, managers, *, clock=time.monotonic, rng=None, wall=time.time, plans=None,
+                 plan_probe=None):
         self.backends = list(backends)
         self.managers = dict(managers)
         self.interval = float(cfg.get("session_refresh_interval", 900) or 0)
@@ -414,6 +462,16 @@ class AccountDispatcher:
                                            1.0), RATE_LIMIT_MAX)
         self.plan_refusal_first = PLAN_REFUSAL_FIRST
         self.plan_refusal_hold = PLAN_REFUSAL_HOLD
+        # What the Retool plans include, kept beside config.json (retool_plans): none for a config without a file.
+        path = retool_plans.overlay_path(cfg.get("_config_path"))
+        self.plans = plans if plans is not None else (retool_plans.PlanStore(path) if path else None)
+        self.plan_recheck = _hours(cfg.get("retool_plan_recheck_hours"), PLAN_RECHECK)
+        self.plan_probes = max(0, _integer(cfg.get("retool_plan_probes"), PLAN_PROBES))
+        self.plan_probe = plan_probe or _probe_plan
+        self._plan_pending = {}  # what is to be written to the plans file, by account identity (flush_plans)
+        self._plan_probe_starts = collections.deque()  # when the probes of the last hour started
+        self._plan_refusals_seen = {}  # model -> recent refusals [(wall, backend)], for the waves
+        self._plan_waves = {}  # model -> wall time until which a wave of refusals of it is on
         self.parallel = max(1, int(cfg.get("account_refresh_parallel", 3) or 1))
         self.clock = clock
         self.wall = wall  # token expiry is a moment in epoch seconds, not on the monotonic clock
@@ -427,25 +485,29 @@ class AccountDispatcher:
         self.pause_until = float("-inf")
         now = clock()
         self.state = {}
+        stored = self.plans.read() if self.plans is not None else {}
         for index, backend in enumerate(self.backends):
             offset = min(index * STARTUP_SPREAD, 60.0)
             self.state[backend] = {"next_refresh": now + offset, "next_balance": now + offset + 1.0,
                                    "auth_failures": 0, "soft_failures": 0, "running": set(), "reasons": {},
                                    "last_forced": float("-inf"), "forced": None, "available": None,
-                                   "expiry_warned": None, "plan_refusals": {}, "plan_released": {}}
+                                   "expiry_warned": None, **_plan_state()}
             backend.unavailable = None
             backend.refused_models = {}
+            backend.served_models = {}
             if self.managers.get(backend) is not None:
                 backend.credits = self.managers[backend]
             refresher = getattr(backend, "refresher", None)
             if refresher is not None:
                 refresher.keepalive_owner = self
+            self._seed_plans(backend, stored)
 
     def add_account(self, backend, manager):
         """Take one account into the live routing pool, its state built exactly as __init__ builds the rest.
 
         Its first check is due at once (a balance read, or the expiry its token names), so a wrong sign-in or an empty
         account shows on the status page within seconds instead of after a restart."""
+        stored = self.plans.read() if self.plans is not None else {}
         with self._lock:
             if backend in self.state:
                 return
@@ -453,15 +515,17 @@ class AccountDispatcher:
             self.state[backend] = {"next_refresh": now, "next_balance": now, "auth_failures": 0,
                                    "soft_failures": 0, "running": set(), "reasons": {},
                                    "last_forced": float("-inf"), "forced": None, "available": None,
-                                   "expiry_warned": None, "plan_refusals": {}, "plan_released": {}}
+                                   "expiry_warned": None, **_plan_state()}
             backend.unavailable = None
             backend.refused_models = {}
+            backend.served_models = {}
             if manager is not None:
                 self.managers[backend] = manager
                 backend.credits = manager
             refresher = getattr(backend, "refresher", None)
             if refresher is not None:
                 refresher.keepalive_owner = self
+            self._seed_plans(backend, stored)
             # A new list: reports read it without the lock (account_report.account_managers).
             self.backends = [*self.backends, backend]
 
@@ -518,6 +582,10 @@ class AccountDispatcher:
             self._thread.join(timeout=5)
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            self.flush_plans()  # what the last seconds learned of the plans
+        except Exception:  # noqa: BLE001 - a stop never fails on a file
+            pass
 
     def _loop(self):
         while not self._stop.is_set():
@@ -537,6 +605,7 @@ class AccountDispatcher:
                     self._unclaim(backend, kind)
                     journal.emit("account.dispatcher", "Не удалось запустить проверку: %s" % type(exc).__name__,
                                  "warn")
+            self.flush_plans()
         except Exception as exc:  # noqa: BLE001 - the scheduler must outlive one bad tick
             journal.emit("account.dispatcher", "Ошибка планировщика аккаунтов: %s" % type(exc).__name__, "error")
 
@@ -588,6 +657,10 @@ class AccountDispatcher:
                     # POST /api/refreshtoken a minute, past the backoff of the renewals above. Its balance is checked
                     # again as soon as a renewal brings it back (next_balance is in the past by then).
                     kind = "balance"
+                elif state["plan_probe_due"] and backend.unavailable is None and self._probe_slot(now):
+                    # A pair whose plan refused a model is asked again here, never by a client's request; an account out
+                    # of the pool (hourly limit, no balance, signed out) waits, and so does every probe past the budget.
+                    kind = "plan_probe"
                 else:
                     continue
                 state["running"].add(kind)
@@ -599,12 +672,14 @@ class AccountDispatcher:
         try:
             if kind == "refresh":
                 self.refresh(backend)
+            elif kind == "plan_probe":
+                self.probe_plan(backend)
             else:
                 self.check_balance(backend)
         except Exception as exc:  # noqa: BLE001 - one account must not stop the others
             with self._lock:
                 state = self.state.get(backend)
-                if state is not None:
+                if state is not None and kind != "plan_probe":
                     state["next_refresh" if kind == "refresh" else "next_balance"] = self.clock() + 60.0
             if state is not None:  # an account removed while its check ran has nothing left to report
                 journal.emit("account.dispatcher", "Проверка аккаунта не удалась: %s" % type(exc).__name__, "warn",
@@ -838,15 +913,18 @@ class AccountDispatcher:
         the pool for anything else. The pool reads the holds from `backend.refused_models` (SessionPool._plan_hold): a
         conversation of this model bound to the account moves at its next request, and when every account that serves the
         model is held, the request gets the pool's settled 404. Turns that fail together share one hold and one journal
-        line. The hold ends by itself (release_plan_refusals, every tick): the next request of the model asks the account
-        again. Its length is a ladder of two steps: `plan_refusal_first` for a pair (account, model), and
-        `plan_refusal_hold` for a refusal that comes within that long a time after the pair's last hold ended, and for each
-        one after it. A fault of Retool's that refuses every account for a few minutes so holds the pool for five minutes,
-        not an hour. Nothing of it outlives a restart.
+        line. Its length is a ladder: `plan_refusal_first` for a pair (account, model), and `plan_refusal_hold` for a
+        refusal that comes within that long a time after the pair's last hold ended; such a hold ends by itself
+        (release_plan_refusals) and the next request of the model asks the account again.
+
+        With a plans file (retool_plans.auto.json, `self.plans`) the repeated refusal is a fact of the plan: it is written
+        down, outlives a restart and holds the pair for `plan_recheck` (12 h by default), after which a background probe
+        asks the pair, not a client's request (probe_plan). A refusal that served pairs share with others in a wave
+        (_note_wave) is a fault of Retool's: its pairs keep the short hold and are never written down.
         """
         if not isinstance(model, str) or not model:
             return None
-        now = self.clock()
+        now, wall = self.clock(), self.wall()
         with self._lock:
             state = self.state.get(backend)  # read under the lock: the admin may remove the account meanwhile
             if state is None:
@@ -858,27 +936,119 @@ class AccountDispatcher:
             # When the pair's last hold ended: one the scheduler has not released yet still ended at its own deadline.
             ended = hold["until"] if hold is not None else ended_at.get(model)
             repeated = ended is not None and now - ended <= self.plan_refusal_hold
-            pause = self.plan_refusal_hold if repeated else self.plan_refusal_first
-            until_at = time.time() + pause
+            wave = self._note_wave(backend, model, wall)
+            persisted = repeated and self.plans is not None and model not in state["plan_wave"]
+            pause = (self.plan_recheck if persisted else self.plan_refusal_first
+                     if model in state["plan_wave"] or not repeated else self.plan_refusal_hold)
+            until_at = wall + pause
             ended_at.pop(model, None)
-            holds[model] = {"until": now + pause, "until_at": until_at, "pause": pause, "repeated": repeated}
+            record = None
+            if persisted:
+                prior = (hold or {}).get("record") or {}
+                record = {"state": "refused", "at": retool_plans.stamp(wall), "source": "chat",
+                          "first_refused_at": prior.get("first_refused_at") or retool_plans.stamp(wall),
+                          "last_refused_at": retool_plans.stamp(wall), "refusals": _integer(prior.get("refusals"), 0) + 1,
+                          "recheck_at": retool_plans.stamp(until_at), "recheck_seconds": pause,
+                          "checks": _integer(prior.get("checks"), 0)}
+                self._queue_plan(backend, model, record)
+            holds[model] = {"until": now + pause, "until_at": until_at, "pause": pause, "repeated": repeated,
+                            **({"persisted": True, "record": record} if persisted else {})}
             self._publish_plan_refusals(backend)
-        text = "[account] %s исключён для %s: модель не входит в тариф Retool (402) до %s (пауза %s%s)" % (
-            self._tag(backend), model, time.strftime("%H:%M:%S", time.localtime(until_at)), apierr.wait_text(pause),
-            ", повторный отказ подряд" if repeated else "")
+        if wave:
+            self._announce_wave(model, wave)
+        if persisted:
+            text = ("[account] %s исключён для %s: модель не входит в тариф Retool (402, подтверждено повторно) до %s — "
+                    "записано, следующая проверка в фоне" % (
+                        self._tag(backend), model, time.strftime("%H:%M %d.%m", time.localtime(until_at))))
+        else:
+            text = "[account] %s исключён для %s: модель не входит в тариф Retool (402) до %s (пауза %s%s)" % (
+                self._tag(backend), model, time.strftime("%H:%M:%S", time.localtime(until_at)),
+                apierr.wait_text(pause), ", повторный отказ подряд" if repeated else "")
         journal.emit("account.model_refused", text, "warn", account=account_tag(backend), model=model,
-                     until=round(until_at, 3), retry_in=pause, repeated=repeated,
+                     until=round(until_at, 3), retry_in=pause, repeated=repeated, persisted=persisted,
+                     **({"wave": True} if model in self.state.get(backend, {}).get("plan_wave", ()) else {}),
                      **({"request_id": request_id} if request_id else {}))
         console_log.write(text)
         return until_at
+
+    def _note_wave(self, backend, model, wall):
+        """Caller holds the lock. Count this refusal of `model` towards a wave: the number of accounts that served the
+        model in the last PLAN_SERVED_RECENT and refused it within PLAN_WAVE_WINDOW, when they are PLAN_WAVE_ACCOUNTS or more
+        and the wave is new (to be announced), else 0.
+
+        Every pair refused in the window is marked (`plan_wave`): it keeps the short hold, and a refusal that was written
+        down a moment before the wave showed itself is taken back (its hold is short again, the file gets a newer record
+        that says nothing)."""
+        seen = self._plan_refusals_seen.setdefault(model, collections.deque())
+        seen.append((wall, backend))
+        while seen and wall - seen[0][0] > PLAN_WAVE_WINDOW:
+            seen.popleft()
+        serving = {item for _, item in seen
+                   if wall - (self.state.get(item) or {}).get("plan_served", {}).get(model, float("-inf"))
+                   <= PLAN_SERVED_RECENT}
+        if len(serving) < PLAN_WAVE_ACCOUNTS and self._plan_waves.get(model, float("-inf")) < wall:
+            return 0
+        new = self._plan_waves.get(model, float("-inf")) < wall
+        self._plan_waves[model] = wall + PLAN_WAVE_WINDOW
+        for _, item in seen:
+            state = self.state.get(item)
+            if state is None:
+                continue
+            state["plan_wave"].add(model)
+            hold = state["plan_refusals"].get(model)
+            if hold is not None and hold.get("persisted"):
+                now = self.clock()
+                hold.update(until=min(hold["until"], now + self.plan_refusal_first), pause=self.plan_refusal_first,
+                            until_at=min(hold["until_at"], wall + self.plan_refusal_first), persisted=False, record=None)
+                self._queue_plan(item, model, {"state": "wave", "at": retool_plans.stamp(wall)})
+                self._publish_plan_refusals(item)
+        return len(serving) if new else 0
+
+    def _announce_wave(self, model, accounts):
+        text = ("[account] Волна отказов тарифа Retool для %s: %d аккаунтов, которые обслуживали модель, отказали за %d с — "
+                "похоже на сбой Retool, отказы не записываются" % (model, accounts, PLAN_WAVE_WINDOW))
+        journal.emit("account.model_refused_wave", text, "warn", model=model, accounts=accounts,
+                     window=PLAN_WAVE_WINDOW)
+        console_log.write(text)
+
+    def mark_plan_served(self, backend, model):
+        """A turn of `model` on this Retool account was answered: its plan includes the model.
+
+        The pool asks the accounts that served a model before the others (SessionPool._next_backend, `served_models`), a
+        wave counts only refusals of such accounts, and the fact is written down at most once an hour per pair. A hold the
+        pair still had ends, and the pair's next refusal starts the ladder from its first step."""
+        cfg = getattr(backend, "cfg", None) or {}
+        if not isinstance(model, str) or not model or cfg.get("upstream", "retool") != "retool":
+            return
+        wall = self.wall()
+        with self._lock:
+            state = self.state.get(backend)
+            if state is None:
+                return
+            last = state["plan_served"].get(model)
+            state["plan_served"][model] = wall
+            state["plan_wave"].discard(model)
+            state["plan_probe_due"].discard(model)
+            state["plan_released"].pop(model, None)
+            dropped = state["plan_refusals"].pop(model, None)
+            fresh = last is None or wall - last >= PLAN_SERVED_WRITE
+            if fresh or dropped is not None:
+                self._queue_plan(backend, model, {"state": "served", "at": retool_plans.stamp(wall),
+                                                  "served_at": retool_plans.stamp(wall), "source": "chat"})
+                self._publish_plan_refusals(backend)
+        if dropped is not None:
+            journal.emit("account.model_served", "[account] %s: %s обслужен — тариф Retool включает модель" % (
+                self._tag(backend), model), "info", account=account_tag(backend), model=model, source="chat")
 
     def release_plan_refusals(self, now=None):
         """End the holds whose time is over, so that the next request of the model asks the account again; the scheduler
         calls this every tick. True when a hold ended.
 
         When a hold ended stays in memory (`plan_released`, one entry per pair) for as long as a refusal then counts as a
-        repeated one (mark_plan_refusal), and no longer."""
+        repeated one (mark_plan_refusal), and no longer. A hold the plans file keeps is not handed back to a client's
+        request: the pair waits for its probe (`plan_probe_due`, PLAN_PROBE_WAIT at a time) unless the probes are off."""
         now = self.clock() if now is None else now
+        wall = self.wall()
         released = []
         with self._lock:
             for backend in self.backends:
@@ -886,10 +1056,17 @@ class AccountDispatcher:
                 holds, ended_at = state["plan_refusals"], state["plan_released"]
                 ended = [model for model, hold in holds.items() if now >= hold["until"]]
                 for model in ended:
+                    hold = holds[model]
+                    if hold.get("persisted") and self.plan_probes > 0:
+                        hold.update(until=now + PLAN_PROBE_WAIT, until_at=wall + PLAN_PROBE_WAIT, pause=PLAN_PROBE_WAIT)
+                        state["plan_probe_due"].add(model)
+                        continue
                     ended_at[model] = holds.pop(model)["until"]
                     released.append((backend, model))
                 for model in [model for model, at in ended_at.items() if now - at > self.plan_refusal_hold]:
                     del ended_at[model]
+                    if model not in holds:
+                        state["plan_wave"].discard(model)
                 if ended:
                     self._publish_plan_refusals(backend)
         for backend, model in released:
@@ -898,10 +1075,181 @@ class AccountDispatcher:
                              self._tag(backend), model), "info", account=account_tag(backend), model=model)
         return bool(released)
 
+    def _probe_slot(self, now):
+        """Caller holds the lock. Whether one more probe fits into the last hour's budget (retool_plan_probes); it is
+        counted when it does."""
+        starts = self._plan_probe_starts
+        while starts and now - starts[0] >= 3600.0:
+            starts.popleft()
+        if len(starts) >= self.plan_probes:
+            return False
+        starts.append(now)
+        return True
+
+    def probe_plan(self, backend):
+        """Ask one pair of this account whose plan refused a model, once its hold ended (kind "plan_probe", the scheduler's
+        workers): one short question on the relay's own route (retool_refresh.probe). The answer decides: it served (the
+        hold ends, served), Retool's 402 again (held twice as long, up to a day), anything else (429, network, 5xx, the
+        model "not available right now" for everyone) holds the pair a while longer as it was. The outcome, or None."""
+        import models  # local: the catalog is not this module's concern otherwise
+
+        with self._lock:
+            state = self.state.get(backend)
+            if state is None or not state["plan_probe_due"]:
+                return None
+            model = min(state["plan_probe_due"])
+            state["plan_probe_due"].discard(model)
+            hold = state["plan_refusals"].get(model)
+        if hold is None:
+            return None  # the pair served meanwhile
+        entry = models._BY_ID.get(model)
+        cfg = getattr(backend, "cfg", None) or {}
+        if entry is None or models.route_block_reason(entry, cfg) or models.resource_block_reason(entry, cfg):
+            # The catalog or the account's configuration refuses the model now: no probe; the hold ends like one of memory.
+            with self._lock:
+                if self.state.get(backend) is not None:
+                    hold.update(persisted=False, record=None)
+            return None
+        try:
+            row = self.plan_probe(backend, entry)
+        except Exception as exc:  # noqa: BLE001 - a probe that broke tells nothing about the plan
+            row = {"ok": False, "http": None, "error": type(exc).__name__}
+        return self._plan_probed(backend, model, row if isinstance(row, dict) else {})
+
+    def _plan_probed(self, backend, model, row):
+        now, wall = self.clock(), self.wall()
+        with self._lock:
+            state = self.state.get(backend)
+            if state is None:
+                return None
+            hold = state["plan_refusals"].get(model)
+            if row.get("ok"):
+                outcome = "served"
+                state["plan_refusals"].pop(model, None)
+                state["plan_released"].pop(model, None)
+                state["plan_served"][model] = wall
+                self._queue_plan(backend, model, {"state": "served", "at": retool_plans.stamp(wall),
+                                                  "served_at": retool_plans.stamp(wall), "source": "probe"})
+            elif row.get("http") == 402 and apierr.is_not_in_plan(row.get("error")):
+                outcome = "refused"
+                prior = (hold or {}).get("record") or {}
+                last = float(prior.get("recheck_seconds") or self.plan_recheck)
+                pause = min(max(last, self.plan_recheck) * 2, max(PLAN_RECHECK_MAX, self.plan_recheck))
+                record = {**prior, "state": "refused", "at": retool_plans.stamp(wall), "source": "probe",
+                          "first_refused_at": prior.get("first_refused_at") or retool_plans.stamp(wall),
+                          "last_refused_at": retool_plans.stamp(wall),
+                          "refusals": _integer(prior.get("refusals"), 0) + 1,
+                          "checks": _integer(prior.get("checks"), 0) + 1,
+                          "recheck_at": retool_plans.stamp(wall + pause), "recheck_seconds": pause}
+                state["plan_refusals"][model] = {"until": now + pause, "until_at": wall + pause, "pause": pause,
+                                                 "repeated": True, "persisted": True, "record": record}
+                self._queue_plan(backend, model, record)
+            else:
+                everyone = row.get("http") == 400 and "not available right now" in str(row.get("error") or "").lower()
+                outcome = "unavailable" if everyone else "unknown"
+                wait = PLAN_PROBE_UNAVAILABLE if everyone else PLAN_PROBE_WAIT
+                if hold is not None:
+                    hold.update(until=now + wait, until_at=wall + wait, pause=wait)
+            self._publish_plan_refusals(backend)
+            until_at = (state["plan_refusals"].get(model) or {}).get("until_at")
+        when = time.strftime("%H:%M %d.%m", time.localtime(until_at)) if until_at else None
+        text = {"served": "[account] %s: %s теперь в тарифе Retool (проба) — аккаунт снова обслуживает модель",
+                "refused": "[account] %s: %s по-прежнему вне тарифа Retool (402, проба), следующая проверка " + str(when),
+                "unavailable": "[account] %s: %s сейчас недоступна в Retool никому (проба), следующая проверка " + str(when),
+                "unknown": "[account] %s: проба %s не дала ответа (" + str(row.get("http") or row.get("error") or "?")
+                           + "), следующая проверка " + str(when)}[outcome] % (self._tag(backend), model)
+        journal.emit("account.plan_probe", text, "warn" if outcome == "unknown" else "info",
+                     account=account_tag(backend), model=model, outcome=outcome, http=row.get("http"),
+                     seconds=row.get("seconds"), credits=row.get("credits"),
+                     **({"until": round(until_at, 3)} if until_at else {}))
+        console_log.write(text)
+        if outcome == "served":
+            journal.emit("account.model_served", text, "info", account=account_tag(backend), model=model, source="probe")
+        return outcome
+
+    def _seed_plans(self, backend, stored):
+        """Caller holds the lock, or is __init__. What the plans file knows of this Retool account: a refusal holds the pair
+        until its recheck (one whose recheck is past waits for its probe, PLAN_PROBE_WAIT), so the pool chooses without a
+        single request; a pair that served counts as one."""
+        cfg = getattr(backend, "cfg", None) or {}
+        row = stored.get(cfg_identity(cfg)) if cfg.get("upstream", "retool") == "retool" else None
+        if not row:
+            return
+        now, wall = self.clock(), self.wall()
+        state = self.state[backend]
+        for model, record in row["models"].items():
+            if not isinstance(model, str) or not isinstance(record, dict):
+                continue
+            if record.get("state") == "served":
+                served = retool_plans.epoch(record.get("served_at"))
+                if served is not None:
+                    state["plan_served"][model] = min(served, wall)
+            elif record.get("state") == "refused":
+                remaining = (retool_plans.epoch(record.get("recheck_at")) or wall) - wall
+                if remaining <= 0:
+                    if not self.plan_probes:
+                        continue  # no probes: the next request asks the account, as without a file
+                    remaining = PLAN_PROBE_WAIT
+                    state["plan_probe_due"].add(model)
+                remaining = min(remaining, max(PLAN_RECHECK_MAX, self.plan_recheck))
+                state["plan_refusals"][model] = {"until": now + remaining, "until_at": wall + remaining,
+                                                 "pause": remaining, "repeated": True, "persisted": True,
+                                                 "record": record}
+        self._publish_plan_refusals(backend)
+
+    def _queue_plan(self, backend, model, record):
+        """Caller holds the lock. Keep a record for the plans file (flush_plans writes it from the scheduler's thread)."""
+        cfg = getattr(backend, "cfg", None) or {}
+        identity = cfg_identity(cfg)
+        if self.plans is None or not identity:
+            return
+        row = self._plan_pending.setdefault(identity, {"tag": cfg_tag(cfg), "models": {}})
+        row["models"][model] = record
+
+    def flush_plans(self):
+        """Write what was learned of the plans since the last call. The scheduler calls it every tick: a client's request,
+        whose event loop must not wait for a file, only queues its records. A write that fails is tried again next tick."""
+        if self.plans is None:
+            return False
+        with self._lock:
+            pending, self._plan_pending = self._plan_pending, {}
+            if not pending:
+                return False
+            known = {cfg_identity(getattr(item, "cfg", None) or {}) for item in self.backends}
+            managers = {cfg_identity(getattr(item, "cfg", None) or {}): self.managers.get(item) for item in self.backends}
+        for identity, row in pending.items():
+            snapshot = getattr(managers.get(identity), "balance_snapshot", None)
+            try:
+                limit = console_log.number((snapshot() or {}).get("monthly_allocation")) if snapshot else None
+            except Exception:  # noqa: BLE001 - the plan's size is a hint for the reader only
+                limit = None
+            if limit is not None:
+                row["limit"] = limit
+        try:
+            self.plans.merge(pending, known=known, now=self.wall())
+        except Exception as exc:  # noqa: BLE001 - the facts stay in memory and are written at the next tick
+            with self._lock:
+                for identity, row in pending.items():
+                    kept = self._plan_pending.setdefault(identity, {"tag": row.get("tag"), "models": {}})
+                    for model, record in row["models"].items():
+                        kept["models"].setdefault(model, record)
+            if not getattr(self, "_plan_write_failed", False):
+                journal.emit("account.plans_write_failed", "Не удалось записать файл тарифов Retool: %s" % (
+                    type(exc).__name__,), "warn")
+            self._plan_write_failed = True
+            return False
+        self._plan_write_failed = False
+        return True
+
     def _publish_plan_refusals(self, backend):
         """Caller holds the lock. The pool and the admin read a new dict each time, never one that changes under them."""
-        backend.refused_models = {model: {"until_at": hold["until_at"], "pause": hold["pause"]}
-                                  for model, hold in self.state[backend]["plan_refusals"].items()}
+        state = self.state[backend]
+        backend.refused_models = {model: {"until_at": hold["until_at"], "pause": hold["pause"],
+                                          **({"persisted": True} if hold.get("persisted") else {})}
+                                  for model, hold in state["plan_refusals"].items()}
+        wall = self.wall()
+        backend.served_models = {model: at for model, at in state["plan_served"].items()
+                                 if wall - at <= PLAN_SERVED_KEEP}
 
     def confirm_minara_token(self, backend):
         """A chat request of this Minara account was answered 401/403: read /auth/me now (check_balance marks the account

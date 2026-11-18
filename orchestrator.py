@@ -1297,6 +1297,9 @@ class TurnRunner:
                 # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
                 # the client gets the settled 404 that names the cause rather than a 502 it would only send again.
                 error = self._pool_refusal(parsed, exclude) or error
+            if error is None and relay.started and backend is not None and hasattr(accounts, "mark_plan_served"):
+                # The account's Retool plan includes the model: the pool asks such accounts first (retool_plans).
+                accounts.mark_plan_served(backend, _model_id(parsed, lease))
             _settle_turn(holder)  # the error, if any, is what the client gets: red
             if error is not None:
                 out.put({"type": "error", "error": error})
