@@ -9,6 +9,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.parse
 
 import account_report
 import apierr
@@ -27,15 +28,54 @@ SECRET_HEADER_NAMES = {"authorization", "x-api-key", "api-key", "proxy-authoriza
 # A model id a provider lists by hand: no spaces, quotes, braces, brackets or commas. The edit form split an OpenCode models
 # object at its commas, and the pieces ('{"deepseek-chat":{"name":"DeepSeek Chat"', ...) were saved as ids (audit A14-01).
 MODEL_ID_PATTERN = re.compile(r"[^\s\"'{}\[\],]{1,200}")
+# What a key preview shows: a mask, and the last four characters of a key long enough that they say nothing of the rest.
+KEY_MASK = "••••••••"
+PREVIEW_MIN_CHARS = 24
+CLIENT_KEY_PREFIX = "sk-proxi-"  # auth.generate_client_key: the relay's own prefix is public
+# The userinfo of a proxy_url in an answer: a stand-in, which a PATCH that sends it back unchanged leaves alone.
+PROXY_USERINFO_MASK = "•••"
 
 
 def mask_key_preview(raw_key: str | None) -> str | None:
+    """A key as the admin API shows it: at most its last four characters, and only for a key of PREVIEW_MIN_CHARS or more.
+
+    The preview showed the first six and the last four characters of any key longer than 12: ten of a thirteen-character
+    key (audits A07-09, A14-12)."""
     if not isinstance(raw_key, str) or not raw_key.strip():
         return None
     val = raw_key.strip()
-    if len(val) > 12:
-        return f"{val[:6]}…{val[-4:]}"
-    return "••••••••"
+    return "…" + val[-4:] if len(val) >= PREVIEW_MIN_CHARS else KEY_MASK
+
+
+def client_key_preview(raw_key: str | None) -> str | None:
+    """A client key as the admin shows it: a key the relay made keeps its public prefix (sk-proxi-) and its last four
+    characters; one set by hand is shown like a provider's key. auth.list_public showed the first nine and the last four
+    characters of any key over 16: thirteen of a seventeen-character key set by hand."""
+    if isinstance(raw_key, str) and raw_key.startswith(CLIENT_KEY_PREFIX) and len(raw_key) >= PREVIEW_MIN_CHARS:
+        return CLIENT_KEY_PREFIX + "…" + raw_key[-4:]
+    return mask_key_preview(raw_key)
+
+
+def public_proxy_url(url):
+    """A proxy_url without its user name and password: http_pool accepts socks5://user:pass@host:port, and the admin API
+    returned it as it was (audits A07-09, A11-19)."""
+    if not isinstance(url, str) or "@" not in url:
+        return url
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return PROXY_USERINFO_MASK
+    if parts.username is None and parts.password is None:
+        return url
+    return urllib.parse.urlunsplit((parts.scheme, PROXY_USERINFO_MASK + "@" + parts.netloc.rpartition("@")[2],
+                                    parts.path, parts.query, parts.fragment))
+
+
+def _proxy_password(url):
+    try:
+        return urllib.parse.urlsplit(url).password if isinstance(url, str) and "@" in url else None
+    except ValueError:
+        return None
 
 
 def collect_extra_secrets(saved: dict | None) -> list[str]:
@@ -55,6 +95,7 @@ def collect_extra_secrets(saved: dict | None) -> list[str]:
             continue
         _add(prov.get("api_key"))
         _add(prov.get("bearer_token"))
+        _add(_proxy_password(prov.get("proxy_url")))
         opts = prov.get("options") if isinstance(prov.get("options"), dict) else {}
         _add(opts.get("apiKey"))
         env_name = prov.get("api_key_env") or prov.get("bearer_token_env")
@@ -71,6 +112,7 @@ def collect_extra_secrets(saved: dict | None) -> list[str]:
             if isinstance(cred, dict):
                 _add(cred.get("api_key"))
                 _add(cred.get("bearer_token"))
+                _add(_proxy_password(cred.get("proxy_url")))
                 c_env = cred.get("api_key_env") or cred.get("bearer_token_env")
                 if isinstance(c_env, str) and c_env:
                     _add(os.environ.get(c_env))
@@ -185,7 +227,7 @@ def _public_provider(raw: dict, meta: dict, admin_obj, entries_by_pid: dict, usa
                 "enabled": c.get("enabled", True) is not False,
                 "priority": c.get("priority", 0),
                 "weight": c.get("weight", 1),
-                "proxy_url": c.get("proxy_url"),
+                "proxy_url": public_proxy_url(c.get("proxy_url")),
             })
     else:
         top_key = raw.get("api_key") or raw.get("bearer_token") or ((raw.get("options") or {}).get("apiKey") if isinstance(raw.get("options"), dict) else None)
@@ -200,7 +242,7 @@ def _public_provider(raw: dict, meta: dict, admin_obj, entries_by_pid: dict, usa
                 "enabled": meta.get("enabled", True) is not False,
                 "priority": raw.get("priority", 0),
                 "weight": raw.get("weight", 1),
-                "proxy_url": meta.get("proxy_url"),
+                "proxy_url": public_proxy_url(meta.get("proxy_url")),
             })
 
     refresher = getattr(admin_obj.runtime, "provider_catalog", None)
@@ -220,7 +262,7 @@ def _public_provider(raw: dict, meta: dict, admin_obj, entries_by_pid: dict, usa
         "priority": raw.get("priority", 0) if type(raw.get("priority")) is int else 0,
         "allow_insecure_http": bool(meta.get("allow_insecure_http", False)),
         "auto_discover": bool(meta.get("auto_discover", True)),
-        "proxy_url": meta.get("proxy_url"),
+        "proxy_url": public_proxy_url(meta.get("proxy_url")),
         "headers_keys": sorted((meta.get("headers") or {}).keys()),
         "body_overrides": meta.get("body_overrides") or {},
         "models": meta.get("models") or [],
@@ -375,7 +417,8 @@ def _merge_provider_patch(existing: dict, data: dict) -> dict:
     """The saved provider with a PATCH (or a probe of the saved provider) over it.
 
     An empty api_key keeps the stored credentials; `headers` are merged by name (null removes one, `"headers": null` all
-    of them); any other field replaces the saved value, so `"body_overrides": {}` clears them."""
+    of them); a proxy_url sent back as the admin showed it (its user name and password masked) keeps the saved one; any
+    other field replaces the saved value, so `"body_overrides": {}` clears them."""
     merged = copy.deepcopy(existing)
     for k, v in data.items():
         if k in ("id", "discover_now", "provider_id"):
@@ -389,6 +432,9 @@ def _merge_provider_patch(existing: dict, data: dict) -> dict:
                 merged["headers"] = headers
             else:
                 merged.pop("headers", None)
+            continue
+        if (k == "proxy_url" and isinstance(v, str) and v != existing.get("proxy_url")
+                and v == public_proxy_url(existing.get("proxy_url"))):
             continue
         merged[k] = v
 
@@ -798,10 +844,17 @@ def _slug_key_id(label: str) -> str:
     return f"{slug}-{suffix}" if slug else f"key-{suffix}"
 
 
+def _public_client_keys(admin_obj, items: list[dict]) -> list[dict]:
+    """The client keys as the admin shows them, each preview made from the key itself (client_key_preview)."""
+    raw = {str(entry.get("id")): entry.get("key") for entry in admin_obj.cfg.get("client_keys") or []
+           if isinstance(entry, dict)}
+    return [dict(item, key_preview=client_key_preview(raw.get(str(item.get("id"))))) for item in items]
+
+
 def list_client_keys(admin_obj) -> dict:
     mgr = getattr(admin_obj.runtime, "client_keys", None)
     items = mgr.list_public() if mgr is not None else []
-    return admin_obj._safe({"client_keys": items})
+    return admin_obj._safe({"client_keys": _public_client_keys(admin_obj, items)})
 
 
 def create_client_key(admin_obj, data: dict) -> dict:
@@ -838,7 +891,8 @@ def create_client_key(admin_obj, data: dict) -> dict:
 
     admin_obj._mask_tokens([raw_key])
     admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
-    public = next((item for item in admin_obj.runtime.client_keys.list_public() if item["id"] == clean["id"]), None)
+    public = next((item for item in _public_client_keys(admin_obj, admin_obj.runtime.client_keys.list_public())
+                   if item["id"] == clean["id"]), None)
     journal.emit("admin.client_key", f"Создан клиентский ключ {clean['label']} ({clean['id']})", "success", key_id=clean["id"])
     # Return `raw_key` ONCE (outside _safe) so the operator can copy it on creation!
     resp = admin_obj._safe({"client_key": public})
@@ -874,7 +928,8 @@ def update_client_key(admin_obj, key_id: str, data: dict) -> dict:
     if rotated_raw:
         admin_obj._mask_tokens([rotated_raw])
     admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
-    public = next((item for item in admin_obj.runtime.client_keys.list_public() if item["id"] == key_id), None)
+    public = next((item for item in _public_client_keys(admin_obj, admin_obj.runtime.client_keys.list_public())
+                   if item["id"] == key_id), None)
     journal.emit("admin.client_key", f"Обновлён клиентский ключ {clean['label']} ({key_id})", "info", key_id=key_id)
     resp = admin_obj._safe({"client_key": public})
     if rotated_raw:

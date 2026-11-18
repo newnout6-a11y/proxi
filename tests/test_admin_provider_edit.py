@@ -85,3 +85,39 @@ def test_the_probe_of_a_saved_provider_always_starts_from_what_is_saved(gateway_
                                              {"provider_id": "hub", "api_key_env": "HUB_TEST_KEY"}, method="POST")
     assert status == 200 and probe["ok"] is True, probe
     assert probe["models_count"] == 2
+
+
+# A07-09 / A14-12 / A11-19: a key preview showed 10 of a 13-character key, and a proxy_url came back with its password.
+def test_the_admin_api_shows_at_most_the_last_four_characters_of_a_key_and_no_proxy_password(gateway_admin,
+                                                                                              mock_upstream):
+    short = "sk-short-123"  # 12 characters: nothing of it is shown
+    create(gateway_admin, mock_upstream, pid="short", api_key=short)
+    create(gateway_admin, mock_upstream, pid="proxied", proxy_url="socks5://alice:Pr0xyPassw0rd@127.0.0.1:9",
+           auto_discover=False)
+    status, listing = gateway_admin.admin_call("/admin/api/providers")
+    assert status == 200
+    text = json.dumps(listing)
+    assert "Pr0xyPassw0rd" not in text and "alice" not in text
+    by_id = {item["id"]: item for item in listing["providers"]}
+    assert by_id["short"]["credentials"][0]["api_key_preview"] == "••••••••"
+    long_preview = by_id["proxied"]["credentials"][0]["api_key_preview"]
+    assert long_preview == "…" + KEY[-4:]
+    shown_proxy = by_id["proxied"]["proxy_url"]
+    assert shown_proxy.startswith("socks5://") and shown_proxy.endswith("@127.0.0.1:9")
+    # The form sends the shown value back unchanged: the saved proxy keeps its password.
+    assert patch(gateway_admin, {"name": "Proxied", "proxy_url": shown_proxy}, pid="proxied")[0] == 200
+    assert saved_provider(gateway_admin, "proxied")["proxy_url"] == "socks5://alice:Pr0xyPassw0rd@127.0.0.1:9"
+
+
+def test_a_client_key_set_by_hand_is_shown_by_its_last_four_characters_at_most(gateway_admin):
+    status, created = gateway_admin.admin_call("/admin/api/client-keys", {"label": "Hand", "key": "hand-made-key-1234X"},
+                                               method="POST")
+    assert status == 200, created
+    status, listing = gateway_admin.admin_call("/admin/api/client-keys")
+    preview = listing["client_keys"][0]["key_preview"]
+    assert "hand-made" not in preview and len(preview.replace("…", "").replace("•", "")) <= 4
+    status, generated = gateway_admin.admin_call("/admin/api/client-keys", {"label": "Generated"}, method="POST")
+    raw = generated["raw_key"]
+    shown = next(item for item in gateway_admin.admin_call("/admin/api/client-keys")[1]["client_keys"]
+                 if item["label"] == "Generated")["key_preview"]
+    assert shown == "sk-proxi-…" + raw[-4:]  # the relay's own prefix is public
