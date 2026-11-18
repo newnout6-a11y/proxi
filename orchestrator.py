@@ -1582,8 +1582,10 @@ class TurnRunner:
                             final_choice,
                             getattr(parsed, "max_tokens", None),
                             chunks)
+                        # An empty list is no history: a transport that builds from it (Minara, the universal drivers) sent
+                        # the head alone, without the chunks of the conversation (audit A15-03).
                         direct_target._native_client_messages = (
-                            getattr(parsed, "native_messages", None)
+                            getattr(parsed, "native_messages", None) or None
                             if native_tools or actual_upstream != "retool"
                             else None
                         )
@@ -2000,7 +2002,9 @@ class TurnRunner:
                         return
                     # A provider refusal is terminal even when it carries no visible text.
                     # Never execute a filtered partial command or server-tool call.
-                    if holder.get("reason") in ("timeout", "length", "content_filter"):
+                    # A prompt suggestion cut by its small cap still has its words: they go to the client below.
+                    if (holder.get("reason") in ("timeout", "length", "content_filter")
+                            and not (purpose == "prompt-suggestion" and holder.get("reason") == "length")):
                         out.put({"type": "end", "reason": holder["reason"]})
                         return
 

@@ -115,8 +115,10 @@ DEFAULTS = {
     # (client_task "background"), about 5 credits each on gpt-6.1-terra. False answers them with a 400 before anything is
     # spent, so Codex makes no memories until they are switched on again; a switch in the admin, applied at once.
     "codex_memory_jobs": True,
-    # Claude Desktop / Claude Code [SUGGESTION MODE: ...] side requests: "auto" picks the fastest routable light model
-    # (Haiku / Flash) on an isolated session with slimmed history; "same" keeps the chat's own model.
+    # Claude Desktop / Claude Code [SUGGESTION MODE: ...] side requests, run alone (a background job: no tools, no thinking,
+    # the conversation's tail) on the lowest level of their model: "auto" takes the first of claude-haiku-4-5-20251001,
+    # minara/claude-haiku-4-5, gpt-5-nano, zai-org/GLM-5.3-Flash that the catalog has and an account can take now, else the
+    # chat's model; "same" keeps the chat's own model; a model id takes that one (proxy.Handler._optimize_prompt_suggestion).
     "prompt_suggestion_model": "auto",
     # true: /codex/models lists GPT models only (Retool's and Minara's), so Codex's picker shows no Claude, GLM or Gemini
     # route (the owner's config sets it, 2026-11-10).
