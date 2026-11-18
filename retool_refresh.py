@@ -91,48 +91,56 @@ def probe(backend, entry, timeout=90.0, effort=None):
     body = direct.build_body(cfg, provider, head, "Reply now with the word.", [], None, 2048)
     headers = auth.upstream_headers(cfg)
     headers["content-type"] = "application/json"
-    request = urllib.request.Request(str(cfg["base"]).rstrip("/") + direct.ROUTE,
-                                     data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
     row = {"ok": False, "http": None, "error": None, "credits": None, "thinking": 0, "accepted": False,
            "seconds": None}
     text, ended, started = [], False, time.monotonic()
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            row["http"] = response.status
-            for index, raw in enumerate(response):
-                if index >= 20000 or time.monotonic() - started > timeout:
-                    row["error"] = "the answer took too long"
-                    break
-                try:
-                    event = json.loads(raw)
-                except ValueError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                kind = str(event.get("event") or "")
-                block = str(event.get("type") or "")
-                if kind == "content_block_delta" and block == "text":
-                    text.append(str(event.get("partialText") or ""))
-                    row["accepted"] = row["accepted"] or not row["error"]
-                elif kind == "content_block_delta" and block == "thinking":
-                    row["thinking"] += 1
-                    row["accepted"] = row["accepted"] or not row["error"]
-                elif kind == "metadata" and isinstance(event.get("usage"), dict):
-                    used = console_log.number(event["usage"].get("creditsUsed"))
-                    row["credits"] = used if used is not None else row["credits"]
-                elif kind == "error":
-                    row["error"] = str(event.get("message") or event.get("error") or "upstream error")[:300]
-                elif kind == "end_of_stream" or block == "end_of_stream":
-                    ended = True
-                    break
-                if effort is not None and row["accepted"]:
-                    break  # the route took the level: the model is answering at it
-    except urllib.error.HTTPError as error:
-        row["http"] = error.code
-        row["error"] = error.read(2000).decode("utf-8", "replace")[:300]
-        error.close()
-    except (OSError, ValueError) as error:
-        row["error"] = type(error).__name__
+    # The body carries the App Builder marker, and a model of Assist's list (context copilot of Retool's registry: gpt-4o,
+    # gpt-4o-mini, gpt-4.1-mini, o3) is "not available right now" on that route. The transport asks such a model again
+    # without the marker (direct.iter_events); so does the probe, once. Without it these models failed every look.
+    for sent in (body, direct._unmarked(body)):
+        request = urllib.request.Request(str(cfg["base"]).rstrip("/") + direct.ROUTE,
+                                         data=json.dumps(sent).encode("utf-8"), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                row.update(http=response.status, error=None)
+                for index, raw in enumerate(response):
+                    if index >= 20000 or time.monotonic() - started > timeout:
+                        row["error"] = "the answer took too long"
+                        break
+                    try:
+                        event = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    kind = str(event.get("event") or "")
+                    block = str(event.get("type") or "")
+                    if kind == "content_block_delta" and block == "text":
+                        text.append(str(event.get("partialText") or ""))
+                        row["accepted"] = row["accepted"] or not row["error"]
+                    elif kind == "content_block_delta" and block == "thinking":
+                        row["thinking"] += 1
+                        row["accepted"] = row["accepted"] or not row["error"]
+                    elif kind == "metadata" and isinstance(event.get("usage"), dict):
+                        used = console_log.number(event["usage"].get("creditsUsed"))
+                        row["credits"] = used if used is not None else row["credits"]
+                    elif kind == "error":
+                        row["error"] = str(event.get("message") or event.get("error") or "upstream error")[:300]
+                    elif kind == "end_of_stream" or block == "end_of_stream":
+                        ended = True
+                        break
+                    if effort is not None and row["accepted"]:
+                        break  # the route took the level: the model is answering at it
+        except urllib.error.HTTPError as error:
+            row["http"] = error.code
+            row["error"] = error.read(2000).decode("utf-8", "replace")[:300]
+            error.close()
+            if (sent is body and "metadata" in body and error.code == 400
+                    and "not available right now" in row["error"].lower()):
+                continue
+        except (OSError, ValueError) as error:
+            row["error"] = type(error).__name__
+        break
     row["seconds"] = round(time.monotonic() - started, 2)
     row["accepted"] = bool(row["accepted"] and row["http"] == 200)
     answer = "".join(text).strip()
@@ -224,10 +232,17 @@ class CatalogRefresher:
                 continue
             entry = found[1]
             summary["entry_script"] = entry
-            if entry == state.get("entry_script") and isinstance(state.get("registry"), dict):
+            # An entry script already read is not read again, unless it was read before the relay kept its version and
+            # the registry's flags of fine-grained tool streaming.
+            if (entry == state.get("entry_script") and isinstance(state.get("registry"), dict)
+                    and "client_version" in state and "fine_grained_streaming" in state):
                 summary.pop("error", None)
                 return state["registry"]
             script = self._fetch(EDGE + entry, SCRIPT_BYTES)
+            # The version the frontend sends as X-Retool-Client-Version; None when the script no longer names it.
+            state["client_version"] = retool_catalog.client_version(script)
+            if state["client_version"]:
+                summary["client_version"] = state["client_version"]
             chunks = list(dict.fromkeys(_CHUNK.findall(script)))
             if state.get("registry_chunk") in chunks:
                 chunks.remove(state["registry_chunk"])
@@ -237,6 +252,7 @@ class CatalogRefresher:
                 registry = retool_catalog.parse_registry(text)
                 if registry is not None:
                     state.update(entry_script=entry, registry_chunk=chunk, registry=retool_catalog.chat_models(registry),
+                                 fine_grained_streaming=retool_catalog.fine_grained_models(registry),
                                  registry_read_at=summary["at"])
                     summary.pop("error", None)
                     return state["registry"]

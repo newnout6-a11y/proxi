@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 
 from accounts import cfg_tag
-from auth import merge_set_cookie, upstream_headers
+from auth import cloudflare_challenge, merge_set_cookie, upstream_headers
 from config import _account_record, persist_auth, reload_auth, renewal_lock
 import journal
 from redact import redact
@@ -114,8 +114,12 @@ class Refresher:
             try:
                 headers = self._http_refresh()
             except urllib.error.HTTPError as exc:
-                self.last_error = f"session renewal failed: HTTP {exc.code}"
-                self.last_failure_kind = "auth" if exc.code in (401, 403) else "upstream"
+                challenged = cloudflare_challenge(exc.code, exc.headers)
+                self.last_error = ("session renewal met a Cloudflare challenge (HTTP 403)" if challenged
+                                   else f"session renewal failed: HTTP {exc.code}")
+                # Cloudflare's challenge concerns the connection, the same for every account: not this account's sign-in.
+                self.last_failure_kind = ("network" if challenged else
+                                          "auth" if exc.code in (401, 403) else "upstream")
                 self._last_result = False
                 exc.close()
                 journal.emit("auth.refresh", "Продление сессии Retool не удалось: HTTP %s" % exc.code, "error",

@@ -13,6 +13,7 @@ import os
 import pathlib
 import re
 
+import auth
 import models
 
 AUTO_NAME = "retool_models.auto.json"
@@ -21,6 +22,35 @@ VERSION = 1
 PROVIDERS = {"anthropic": "anthropic", "openAI": "openai", "retoolFast": "retool-fast", "google": "google"}
 REGISTRY_MARK = "JSON.parse('{\"anthropic\":"
 _JS_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+# The version Retool's frontend names itself by, in its entry script (main-*.js): `const RETOOL_VERSION="4.99.0"` and
+# RETOOL_VERSION_STRING=`${RETOOL_VERSION}-dd22f13 (Build 424025)`, which it sends as X-Retool-Client-Version.
+_VERSION = re.compile(r'\bRETOOL_VERSION="(\d+\.\d+\.\d+)"')
+_VERSION_STRING = re.compile(r"\bRETOOL_VERSION_STRING=`\$\{RETOOL_VERSION\}(-[0-9a-f]{4,40} \(Build \d+\))`")
+
+
+def client_version(script):
+    """The X-Retool-Client-Version of the frontend whose entry script this is ("4.99.0-dd22f13 (Build 424025)"); None when
+    the script names none."""
+    version, suffix = _VERSION.search(script or ""), _VERSION_STRING.search(script or "")
+    return version[1] + suffix[1] if version and suffix else None
+
+
+# The models whose registry entry says supportsFineGrainedStreaming, as the last look read them (state
+# "fine_grained_streaming", set by apply_overlay); None until an overlay that holds them is applied
+# (direct.fine_grained_streaming then keeps its own list).
+FINE_GRAINED = None
+
+
+def fine_grained_models(registry):
+    """The ids of every model of the registry document whose capabilities say supportsFineGrainedStreaming, deprecated
+    ones included (a client may still route one): Retool's frontend asks for fine-grained tool streaming on them."""
+    found = set()
+    for block in registry.values() if isinstance(registry, dict) else ():
+        for ident, model in ((block or {}).get("models") or {}).items() if isinstance(block, dict) else ():
+            capabilities = model.get("capabilities") if isinstance(model, dict) else None
+            if isinstance(ident, str) and isinstance(capabilities, dict) and capabilities.get("supportsFineGrainedStreaming") is True:
+                found.add(ident)
+    return sorted(found)
 
 
 def overlay_path(config_path):
@@ -42,8 +72,15 @@ def read(path):
 def apply_overlay(path):
     """Publish the overlay's models (retool_refresh writes them) into models.CATALOG, in place, and give every model the
     effort levels a probe saw its route take (state "levels"); the ids added or changed. An audited entry of the same id
-    wins over a published one; an unreadable overlay changes nothing."""
+    wins over a published one; an unreadable overlay changes nothing. The frontend version the last look read becomes
+    the X-Retool-Client-Version of every request (auth.set_client_version)."""
     state = read(path)
+    if state.get("client_version"):
+        auth.set_client_version(state["client_version"])
+    global FINE_GRAINED
+    flags = state.get("fine_grained_streaming")
+    if isinstance(flags, list):
+        FINE_GRAINED = frozenset(ident for ident in flags if isinstance(ident, str))
     entries = [entry for entry in (state.get("models") or {}).values() if isinstance(entry, dict)]
     changed = models.add_discovered(entries)
     verified = {ident: record.get("verified") for ident, record in (state.get("levels") or {}).items()
@@ -109,6 +146,8 @@ def chat_models(registry):
                 "reasoning": bool(levels) or bool(capabilities.get("supportsAdaptiveThinking")),
                 "tools": capabilities.get("functionCalling", True) is not False,
                 "vision": bool(capabilities.get("multimodal")),
+                # Whether Retool's frontend asks for fine-grained tool streaming on it (fine_grained_models).
+                "fine_grained_streaming": capabilities.get("supportsFineGrainedStreaming") is True,
             }
     return found
 

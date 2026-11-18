@@ -6,6 +6,7 @@ import types
 
 import pytest
 
+import auth
 import config
 import journal
 import models
@@ -50,12 +51,16 @@ def chunk_text(document):
 @pytest.fixture(autouse=True)
 def isolated_catalog():
     catalog, by_id, aliases = list(models.CATALOG), dict(models._BY_ID), dict(models.ALIASES)
+    # A look also sets what the relay takes from Retool's frontend for every request: the registry's models of fine-grained
+    # tool streaming and the client version. Left behind, a test's registry changed the bodies of the tests after it.
+    fine_grained, version = retool_catalog.FINE_GRAINED, auth.CLIENT_VERSION
     yield
     models.CATALOG[:] = catalog
     models._BY_ID.clear()
     models._BY_ID.update(by_id)
     models.ALIASES.clear()
     models.ALIASES.update(aliases)
+    retool_catalog.FINE_GRAINED, auth.CLIENT_VERSION = fine_grained, version
 
 
 def test_the_registry_is_read_from_its_frontend_chunk_with_javascript_escapes():

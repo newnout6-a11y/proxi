@@ -107,7 +107,9 @@ def test_head_becomes_a_cached_system_block_with_a_stable_key():
     assert body["messages"][0]["content"][0]["cache"] is True
     assert body["messages"][1] == {"role": "user", "content": "tail"}
     assert body["openAICacheKey"] == direct.cache_key_for(head, "m", None)
-    assert body["metadata"] == {"sandpackAgent": True}
+    # Retool's own frontend sends the marker with requestOrigin "Browser" in every request that carries it
+    # (test_retool_request_origin): the marker alone was a body no browser sends.
+    assert body["metadata"] == {"sandpackAgent": True, "requestOrigin": "Browser"}
     assert body["reasoningEffort"] == "low"
     assert body["maxCompletionTokens"] == 32
 
