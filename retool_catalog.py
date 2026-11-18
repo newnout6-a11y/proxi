@@ -13,6 +13,7 @@ import os
 import pathlib
 import re
 
+import auth
 import models
 
 AUTO_NAME = "retool_models.auto.json"
@@ -21,6 +22,17 @@ VERSION = 1
 PROVIDERS = {"anthropic": "anthropic", "openAI": "openai", "retoolFast": "retool-fast", "google": "google"}
 REGISTRY_MARK = "JSON.parse('{\"anthropic\":"
 _JS_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+# The version Retool's frontend names itself by, in its entry script (main-*.js): `const RETOOL_VERSION="4.99.0"` and
+# RETOOL_VERSION_STRING=`${RETOOL_VERSION}-dd22f13 (Build 424025)`, which it sends as X-Retool-Client-Version.
+_VERSION = re.compile(r'\bRETOOL_VERSION="(\d+\.\d+\.\d+)"')
+_VERSION_STRING = re.compile(r"\bRETOOL_VERSION_STRING=`\$\{RETOOL_VERSION\}(-[0-9a-f]{4,40} \(Build \d+\))`")
+
+
+def client_version(script):
+    """The X-Retool-Client-Version of the frontend whose entry script this is ("4.99.0-dd22f13 (Build 424025)"); None when
+    the script names none."""
+    version, suffix = _VERSION.search(script or ""), _VERSION_STRING.search(script or "")
+    return version[1] + suffix[1] if version and suffix else None
 
 
 def overlay_path(config_path):
@@ -42,8 +54,11 @@ def read(path):
 def apply_overlay(path):
     """Publish the overlay's models (retool_refresh writes them) into models.CATALOG, in place, and give every model the
     effort levels a probe saw its route take (state "levels"); the ids added or changed. An audited entry of the same id
-    wins over a published one; an unreadable overlay changes nothing."""
+    wins over a published one; an unreadable overlay changes nothing. The frontend version the last look read becomes
+    the X-Retool-Client-Version of every request (auth.set_client_version)."""
     state = read(path)
+    if state.get("client_version"):
+        auth.set_client_version(state["client_version"])
     entries = [entry for entry in (state.get("models") or {}).values() if isinstance(entry, dict)]
     changed = models.add_discovered(entries)
     verified = {ident: record.get("verified") for ident, record in (state.get("levels") or {}).items()

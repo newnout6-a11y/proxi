@@ -14,7 +14,23 @@ import time
 import apierr
 from apierr import unauthorized
 
-CLIENT_VERSION = "4.84.0-16f3123 (Build 409813)"
+# What Retool's frontend sends as X-Retool-Client-Version: RETOOL_VERSION_STRING of its entry script (4.99.0-dd22f13, Build
+# 424025, in the public bundle of 2026-11-18; live answers name the same in x-retool-api-version). The relay sent
+# 4.84.0-16f3123 until then, fifteen minor versions behind every browser. The catalog look reads the version of the
+# current frontend (retool_catalog.client_version) and set_client_version puts it here; this one serves until then.
+CLIENT_VERSION = "4.99.0-dd22f13 (Build 424025)"
+_CLIENT_VERSION_SHAPE = re.compile(r"\d+\.\d+\.\d+-[0-9a-f]{4,40} \(Build \d+\)")
+
+
+def set_client_version(version) -> bool:
+    """Send `version` as X-Retool-Client-Version from now on, if it has the shape Retool's frontend gives it."""
+    global CLIENT_VERSION
+    if not isinstance(version, str) or not _CLIENT_VERSION_SHAPE.fullmatch(version):
+        return False
+    CLIENT_VERSION = version
+    return True
+
+
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/131.0.0.0 Safari/537.36")
 _CHROME_MAJOR = re.compile(r"\bChrome/(\d+)")
