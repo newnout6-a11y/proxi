@@ -17,6 +17,7 @@ import uuid
 
 import apierr
 import adapters
+import cost_guard
 import executor
 import credits
 import journal
@@ -250,6 +251,17 @@ def _may_be_balance_related(error):
 # A conversation moved to another account writes its prefix there again; below this many prompt tokens that costs next
 # to nothing, and waiting for the limited account (account_rate_limit_wait) is only a delay.
 LIMIT_WAIT_MIN_PREFIX = 8000
+# How long a universal provider that answered 429 without a Retry-After is left out of the pool: a provider's limit is per
+# minute (OpenRouter, OpenAI, Anthropic), not Retool's sliding hour, so account_rate_limit_cooldown (900 s) never fits it.
+PROVIDER_RATE_LIMIT_PAUSE = 60
+
+
+def _provider_label(backend):
+    """The name of the universal provider behind this account (OpenRouter, Anthropic, ...), None for Retool and Minara."""
+    cfg = getattr(backend, "cfg", None) or {}
+    if cfg.get("upstream", "retool") in ("retool", "minara"):
+        return None
+    return str(cfg.get("provider_name") or cfg.get("provider_id") or account_tag(backend) or cfg.get("upstream"))
 
 
 async def _pause(cancelled, seconds):
@@ -261,6 +273,16 @@ async def _pause(cancelled, seconds):
             return False
         await asyncio.sleep(min(0.25, left))
     return True
+
+
+def _settle_turn(holder, went_on=None):
+    """Write the turn.error and turn.end a failed attempt left pending (TurnRunner._run_once), now that its fate is known.
+
+    `went_on` says what the request did next ("moved" to another account, "retried"): the attempt's error reached no client
+    and is logged at warn with that outcome. None: the error is the request's answer, logged at error as before."""
+    close = holder.pop("_close_turn", None)
+    if close is not None:
+        close(went_on)
 
 
 def _can_exec(cfg, steps: int) -> bool:
@@ -494,6 +516,8 @@ class TurnRunner:
         self.prompts = None
         # (profile, client) pairs whose dropped system prompt the journal has already named (_warn_dropped_client_system).
         self._dropped_noted = set()
+        # What Minara spent, by the hour, by client key and by dialog: the cost guard's ceilings are kept against it.
+        self.cost_guard = cost_guard.Guard(cost_guard.state_path(cfg))
 
     def _can_exec(self, steps: int) -> bool:
         return _can_exec(self.cfg, steps)
@@ -934,6 +958,54 @@ class TurnRunner:
                 return None
         return None
 
+    def _guard_cost(self, parsed, holder, session, entry, model_provider, log):
+        """Price a Minara request before anything is sent and raise the cost guard's refusal when it is above a ceiling.
+
+        The estimate (cost_guard.estimate) prices the request with the formula of its debit; the dialog's cache counts as
+        warm when the relay has seen a priced turn of it (the guard's memory, or the prefix the session keeps on disk), so a
+        running session is never priced as a first contact. The client gets a final 400 cost_limit_exceeded (or 429 for
+        the hourly ceiling) that names the estimate, the journal cost.blocked, the console a [cost] line."""
+        if self.cfg.get("cost_guard", "block") == "off":
+            return
+        request_tag = getattr(parsed, "request_id", None) or "req"
+        try:
+            chars = getattr(parsed, "client_chars", None) or adapters.request_chars(parsed)
+            anchor = getattr(session, "_count_anchor", None)
+            anchor = anchor[:2] if isinstance(anchor, tuple) and len(anchor) == 3 and anchor[2] == parsed.model else None
+            tokens, basis = adapters.count_input_tokens(chars, anchor)
+            account = account_tag(getattr(session, "backend", None))
+            key = getattr(parsed, "conversation_key", None)
+            prefix = self.cost_guard.warm_prefix(
+                key if isinstance(key, (str, tuple)) else None, model=parsed.model, account=account,
+                shared=cost_guard.shared_cache(entry), session_prefix=getattr(session, "_last_prefix_tokens", 0))
+            estimate = cost_guard.estimate(entry, prompt_tokens=tokens, basis=basis, warm_prefix=prefix,
+                                           max_tokens=getattr(parsed, "max_tokens", None),
+                                           effort=model_provider.get("reasoningEffort"))
+            if estimate is None:
+                return
+            error, warn = self.cost_guard.check(self.cfg, estimate, entry=entry, account=account,
+                                                key=getattr(parsed, "client_key", None),
+                                                confirm=getattr(parsed, "cost_confirm", None))
+        except Exception as exc:  # noqa: BLE001 - a guard that fails must not fail the request it guards
+            log("cost.estimate_failed", "Оценка цены запроса не удалась, запрос идёт без проверки: %s" % (
+                type(exc).__name__), "warn")
+            return
+        holder["_cost_estimate"] = estimate
+        holder.pop("_cost_actual", None)
+        fields = dict(estimate._asdict(), model=entry.get("id"))
+        how = cost_guard.explain(estimate, entry, account)
+        if error is not None:
+            log("cost.blocked", "Запрос остановлен защитой по цене: оценка %s кредитов Minara (%s)" % (
+                estimate.credits, error.code), "warn", code=error.code, status=error.status, **fields)
+            console_log.write("[%s] [cost] blocked: estimated %s Minara credits (~$%.2f): %s" % (
+                request_tag, estimate.credits, estimate.usd, how))
+            raise error
+        log("cost.estimate", "Оценка цены запроса: %s кредитов Minara (кэш %s)" % (
+            estimate.credits, "тёплый" if estimate.warm else "холодный"), "warn" if warn else "debug", **fields)
+        if warn:
+            console_log.write("[%s] [cost] estimated %s Minara credits (~$%.2f): %s" % (
+                request_tag, estimate.credits, estimate.usd, how))
+
     def _limit_pause(self, error, session):
         """Seconds to wait on an account at its hourly limit before its conversation moves, or None to move it now.
 
@@ -1042,11 +1114,14 @@ class TurnRunner:
             cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None,
             clock=getattr(getattr(self, "accounts", None), "clock", None))
         while True:
+            # A path below that asks again without saying how leaves the attempt's close pending: it was retried.
+            _settle_turn(holder, "retried")
             relay = _FailoverOut(out)
             holder.pop("session", None)
             try:
                 await self._run_once(parsed, relay, holder, exclude=tuple(exclude))
             except BaseException:
+                _settle_turn(holder)
                 if relay.error is not None:
                     out.put({"type": "error", "error": relay.error})
                 out.put(None)
@@ -1070,10 +1145,13 @@ class TurnRunner:
                          and (not relay.sent or getattr(error, "unbilled", False)))
             exhausted = False
             rate_limited = plan_refused = False
+            # A universal provider's 429 is a rate limit of its own (drivers/sse_utils marks it an account quota so that the
+            # turn moves), not Retool's hourly managed-key limit: no wait on it, no hourly cooldown or ladder (A02-08).
+            provider = _provider_label(backend)
             try:
                 if error is not None and backend is not None and apierr.is_account_quota(error):
                     pause = (self._limit_pause(error, getattr(lease, "session", lease))
-                             if retryable and backend not in exclude and not waited
+                             if retryable and backend not in exclude and not waited and provider is None
                              and holder["_attempt_budget"].remaining > 1 else None)
                     if pause is not None:
                         # The account is not parked and not excluded: the retry goes to it with the conversation's
@@ -1087,13 +1165,18 @@ class TurnRunner:
                             getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), pause))
                         if not await _pause(cancelled, pause):
                             holder["reason"] = "stop"
+                            _settle_turn(holder, "retried")
                             continue
                         retryable = False  # the client went away while the request waited: only the account is told
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):
-                        # A limit that a request sent before the account's last return reports is old news.
-                        accounts.mark_rate_limited(backend, retry_after=getattr(error, "retry_after", None),
+                        # A limit that a request sent before the account's last return reports is old news. A provider is
+                        # parked for its Retry-After or a short pause: a hint never climbs the hourly ladder.
+                        hint = getattr(error, "retry_after", None)
+                        if provider is not None and not hint:
+                            hint = PROVIDER_RATE_LIMIT_PAUSE
+                        accounts.mark_rate_limited(backend, retry_after=hint,
                                                    request_id=getattr(parsed, "request_id", None),
                                                    sent_at=holder["_attempt_budget"].sent_at)
                     rate_limited = retryable and backend not in exclude
@@ -1110,6 +1193,7 @@ class TurnRunner:
                     # balances once, so a top-up is used without waiting for the timer.
                     rechecked = True
                     if await _off_loop(accounts.recheck_exhausted, getattr(parsed, "entry", None)):
+                        _settle_turn(holder, "retried")
                         continue
                 minara_refusal = (retryable and backend is not None and backend not in exclude
                                   and (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
@@ -1127,22 +1211,27 @@ class TurnRunner:
                     # With no account left, the next acquire raises a clear 402.
                     exhausted = await _off_loop(accounts.check_balance_now, backend)
             except BaseException:
+                _settle_turn(holder)
                 out.put({"type": "error", "error": error})
                 out.put(None)
                 raise
             if rate_limited:
                 exclude.append(backend)
+                _settle_turn(holder, "moved")
                 # Refused before anything was generated or billed: the move to the next account costs no attempt.
                 holder["_attempt_budget"].refund()
-                journal.emit("account.failover", "Часовой лимит Retool — запрос повторён на другом аккаунте",
+                limit = ("часовой лимит Retool" if provider is None
+                         else "лимит частоты провайдера %s" % provider)
+                journal.emit("account.failover", "%s — запрос повторён на другом аккаунте" % (limit[0].upper() + limit[1:]),
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code, reason="rate_limited")
-                console_log.write("[%s] [account] %s: часовой лимит Retool, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
+                console_log.write("[%s] [account] %s: %s, повтор на другом аккаунте" % (
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), limit))
                 holder["reason"] = "stop"
                 continue
             if plan_refused:
                 exclude.append(backend)
+                _settle_turn(holder, "moved")
                 holder["_attempt_budget"].refund()
                 journal.emit("account.failover", "Модель не входит в тариф аккаунта Retool — запрос повторён на другом аккаунте",
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
@@ -1153,6 +1242,7 @@ class TurnRunner:
                 continue
             if exhausted:
                 exclude.append(backend)
+                _settle_turn(holder, "moved")
                 if minara_refusal:
                     # Minara said 402/401/403 before generating anything (unbilled). An exhaustion confirmed by a balance
                     # read after some other failure (a 5xx) keeps that failure's attempt charged.
@@ -1176,6 +1266,7 @@ class TurnRunner:
                     parsed.entry, exclude=(*exclude, backend), **acquire_plan(self.cfg, parsed).kwargs
                 ) is None:
                     exclude.append(backend)
+                    _settle_turn(holder, "moved")
                     journal.emit("account.failover", "Сбой апстрима провайдера — запрос переключён на резервный маршрут",
                                  "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                                  error=error.code, reason="provider_failover")
@@ -1187,6 +1278,7 @@ class TurnRunner:
                 # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
                 # the client gets the settled 404 that names the cause rather than a 502 it would only send again.
                 error = self._pool_refusal(parsed, exclude) or error
+            _settle_turn(holder)  # the error, if any, is what the client gets: red
             if error is not None:
                 out.put({"type": "error", "error": error})
             out.put(None)
@@ -1458,6 +1550,9 @@ class TurnRunner:
                     target._minara_effort = model_provider.get("reasoningEffort")
                     target._minara_effort_model = parsed.model
                     target._minara_effort_set = True
+                if actual_upstream == "minara":
+                    # Priced before anything leaves: a refusal costs nothing (cost_guard).
+                    self._guard_cost(parsed, holder, acquired, bound_entry, model_provider, log)
                 # How many turns the pool has in flight, on this account and in all, this one included: the load this turn met.
                 counted = getattr(self.pool, "inflight", None)
                 load = ({} if counted is None else dict(zip(("inflight_account", "inflight_total"),
@@ -1546,8 +1641,10 @@ class TurnRunner:
                             final_choice,
                             getattr(parsed, "max_tokens", None),
                             chunks)
+                        # An empty list is no history: a transport that builds from it (Minara, the universal drivers) sent
+                        # the head alone, without the chunks of the conversation (audit A15-03).
                         direct_target._native_client_messages = (
-                            getattr(parsed, "native_messages", None)
+                            getattr(parsed, "native_messages", None) or None
                             if native_tools or actual_upstream != "retool"
                             else None
                         )
@@ -1796,6 +1893,14 @@ class TurnRunner:
                                         minara_spent = round(max(0.0, minara_credits - before), 4)
                                         holder['_attempt_minara'] = minara_credits
                                         event = dict(event, minara_credits=minara_spent)
+                                        holder['_cost_actual'] = minara_credits  # the attempt's, against its estimate
+                                        # What the cost guard keeps its hour, a key's day and the dialog's cache against.
+                                        conversation = getattr(parsed, 'conversation_key', None)
+                                        self.cost_guard.spent(
+                                            minara_spent, key_id=holder.get('_client_key_id'),
+                                            conversation=conversation if isinstance(conversation, (str, tuple)) else None,
+                                            account=trace.get('account'), model=parsed.model,
+                                            prompt_tokens=breakdown['prompt_tokens'] or None)
                                     if usd_spent is not None:
                                         event = dict(event, cost_usd=usd_spent)
                                     ck_id = holder.get('_client_key_id')
@@ -1966,7 +2071,9 @@ class TurnRunner:
                         return
                     # A provider refusal is terminal even when it carries no visible text.
                     # Never execute a filtered partial command or server-tool call.
-                    if holder.get("reason") in ("timeout", "length", "content_filter"):
+                    # A prompt suggestion cut by its small cap still has its words: they go to the client below.
+                    if (holder.get("reason") in ("timeout", "length", "content_filter")
+                            and not (purpose == "prompt-suggestion" and holder.get("reason") == "length")):
                         out.put({"type": "end", "reason": holder["reason"]})
                         return
 
@@ -2253,12 +2360,7 @@ class TurnRunner:
         finally:
             duration = round((time.monotonic() - turn_started) * 1000)
             err = outcome["error"]
-            if err is not None:
-                log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]), "error",
-                    status=err.status, code=err.code)
-                reason = "error"
-            else:
-                reason = outcome["reason"] or holder.get("reason") or "stop"
+            reason = "error" if err is not None else outcome["reason"] or holder.get("reason") or "stop"
             holder["_speed_reason"] = reason
             # Explicit account-quota and plan refusals are free; retain their latency, but count no generated tokens.
             if err is not None and (apierr.is_account_quota(err) or apierr.is_plan_refusal(err)):
@@ -2267,10 +2369,37 @@ class TurnRunner:
                     request_attempts[(turn_id, number)] = 0
             output_tokens = (sum(output_attempts.values()) if output_attempts
                              and all(value is not None for value in output_attempts.values()) else None)
-            log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
-                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout", "length") else "success",
-                reason=reason, duration_ms=duration, exec_steps=exec_steps,
-                output_tokens=output_tokens, tokens_per_second=None,
-                retries=empty_retries + tool_retries,
-                **({"web_searches": search_uses} if search_uses else {}))
+            estimate, actual = holder.pop("_cost_estimate", None), holder.pop("_cost_actual", None)
+            if estimate is not None and actual is not None:
+                # How far the cost guard's estimate was from the debit: what its rules are calibrated by.
+                log("cost.estimate_vs_actual", "Оценка цены %s, списано %s кредитов Minara" % (estimate.credits, actual),
+                    "debug", estimate=estimate.credits, actual=actual, warm=estimate.warm,
+                    ratio=round(actual / estimate.credits, 3) if estimate.credits else None)
+
+            def close(went_on=None):
+                # went_on: what the request did after this failed attempt ("moved" to another account, "retried" here),
+                # or None when the error is what the client gets. Only that one is red (_settle_turn).
+                moved = {"outcome": went_on} if err is not None and went_on else {}
+                if err is not None:
+                    # Every POST of the request so far, and how many of them refusals gave back (AttemptBudget.refund).
+                    posts = {name: getattr(err, attr) for name, attr in (("upstream_attempts", "upstream_attempts"),
+                                                                         ("refunded", "upstream_refunded"))
+                             if getattr(err, attr, None)}
+                    log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]),
+                        "warn" if moved else "error", status=err.status, code=err.code, **moved, **posts)
+                log("turn.end", "Ход завершён: %s за %.1f с%s" % (
+                        reason, duration / 1000, " · запрос продолжен" if moved else ""),
+                    "warn" if moved else "error" if reason == "error"
+                    else "warn" if reason in ("cancelled", "timeout", "length") else "success",
+                    reason=reason, duration_ms=duration, exec_steps=exec_steps,
+                    output_tokens=output_tokens, tokens_per_second=None,
+                    retries=empty_retries + tool_retries,
+                    **({"web_searches": search_uses} if search_uses else {}), **moved)
+
+            if err is None:
+                close()
+            else:
+                # Whether the client gets this error is decided by _run_request (failover, a wait, a recheck): it writes
+                # turn.error and turn.end once it knows (audit A02-06: 304 red events in requests that ended with 200).
+                holder["_close_turn"] = close
             out.put(None)

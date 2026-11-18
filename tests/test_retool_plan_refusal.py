@@ -342,7 +342,56 @@ def test_a_request_gets_back_at_most_max_refunds_attempts(monkeypatch):
         assert budget.refund() is True and budget.remaining == upstream_attempts.MAX_ATTEMPTS
     budget.take(lambda: False)
     assert budget.refund() is False and budget.remaining == upstream_attempts.MAX_ATTEMPTS - 1
-    assert (budget.used, budget.refunds) == (1, 2)
+    # A refund gives back the step's attempt, not the POST: `used` counts every POST that left (audit A09-06: after ten
+    # refusals and a failure the client was told upstream_attempts=1 and every attempt was numbered 1). It was (1, 2).
+    assert (budget.used, budget.refunds) == (3, 2)
+
+
+def test_the_error_counts_every_post_and_says_how_many_were_given_back():
+    budget = upstream_attempts.AttemptBudget()
+    numbers = []
+    for _ in range(3):
+        numbers.append(budget.take(lambda: False))
+        budget.refund()
+    numbers.append(budget.take(lambda: False))
+    assert numbers == [1, 2, 3, 4]  # each POST has a number of its own (diagnostic ids, "attempt%d")
+    assert (budget.step_used, budget.remaining) == (1, upstream_attempts.MAX_ATTEMPTS - 1)
+    error = budget.attach(apierr.upstream_error("down"))
+    assert (error.upstream_attempts, error.upstream_refunded) == (4, 3)
+
+
+def test_a_refunded_post_does_not_count_against_the_requests_hard_cap():
+    budget = upstream_attempts.AttemptBudget(total_cap=2)
+    for _ in range(3):
+        budget.take(lambda: False)
+        assert budget.refund() is True
+    budget.take(lambda: False)
+    assert budget.remaining == 1 and budget.used == 4
+    budget.take(lambda: False)
+    assert budget.remaining == 0
+    with pytest.raises(apierr.ApiError) as caught:
+        budget.take(lambda: False)
+    assert caught.value.code == "upstream_attempt_limit" and "(2 attempts)" in caught.value.message
+
+
+def test_the_client_is_told_every_post_of_a_request_that_met_refusals(retool, tmp_path):
+    third = Backend(tmp_path, base="https://acc-c.invalid", account_id="acc-c", transport="direct")
+    third.headers = lambda: {}
+    retool.pool.backends.append(third)
+    retool.dispatcher.add_account(third, None)
+
+    def bad(request_):
+        raise urllib.error.HTTPError(request_.full_url, 400, "x", Message(), io.BytesIO(b'{"message": "bad request"}'))
+
+    retool.script["acc-a"] = retool.script["acc-b"] = refused
+    retool.script["acc-c"] = bad
+    events = asyncio.run(run(retool.runner, turn()))
+    assert retool.posts == ["acc-a", "acc-b", "acc-c"]
+    error = errors(events)[0]
+    assert (error.upstream_attempts, error.upstream_refunded) == (3, 2)
+    logged = [event for event in journal.JOURNAL.query(limit=5000) if event["kind"] == "turn.error"
+              and event.get("request_id") == "req-conv-1"]
+    assert [(event["data"].get("upstream_attempts"), event["data"].get("refunded")) for event in logged][-1] == (3, 2)
 
 
 def test_a_bound_conversation_of_that_model_moves_at_its_next_request(retool):

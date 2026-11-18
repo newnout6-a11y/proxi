@@ -29,6 +29,8 @@ _ANTHROPIC_TYPES = {
     "context_length_exceeded": "invalid_request_error",
     "rate_limit_error": "rate_limit_error", "insufficient_credits": "billing_error",
     "service_unavailable": "overloaded_error", "upstream_timeout": "timeout_error",
+    # The relay's cost guard refused a request it estimated above a ceiling: final, the client must not ask again.
+    "cost_limit_exceeded": "invalid_request_error",
     # The relay's own upstream, not the client's key: a 502 the client can only retry or report.
     "upstream_error": "api_error", "upstream_auth_error": "api_error", "upstream_invalid_output": "api_error",
     "upstream_empty_turn": "api_error", "upstream_attempt_limit": "api_error",
@@ -62,6 +64,8 @@ RESPONSES_ERROR_CODES = {
     # The relay has already spent its own attempts on these.
     "upstream_invalid_output": "invalid_prompt", "upstream_empty_turn": "invalid_prompt",
     "upstream_attempt_limit": "invalid_prompt", "upstream_tool_choice_ignored": "invalid_prompt",
+    # The cost guard refused the request before anything was sent: asked again, it is refused again (cost_guard).
+    "cost_limit_exceeded": "invalid_prompt",
     "insufficient_credits": "insufficient_quota",
     # Codex's own code for an input past the context window: it stops, without a retry, and says so in its words.
     "context_length_exceeded": "context_length_exceeded",
@@ -136,6 +140,14 @@ def context_length_exceeded(message: str) -> ApiError:
     """The provider refused an input longer than the model's context window: final, and named so that a client
     stops instead of sending the same input again (Codex retried a 502 five times, 3 MB each)."""
     return ApiError(400, "context_length_exceeded", message)
+
+
+def cost_limit_exceeded(message: str, estimate=None) -> ApiError:
+    """The cost guard refused a request whose estimated cost is above a ceiling (cost_guard): nothing was sent, and the
+    same request is refused again, so every dialect gets a final code (x-should-retry: false)."""
+    error = ApiError(400, "cost_limit_exceeded", message, headers={"x-should-retry": "false"})
+    error.cost_estimate = estimate
+    return error
 
 
 def unprocessable(message: str, param=None) -> ApiError:

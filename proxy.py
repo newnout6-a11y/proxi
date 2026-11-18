@@ -27,6 +27,7 @@ import compaction_tools
 import config as config_module
 import conversation_infer
 import conversation_state
+import cost_guard
 import drivers
 from drivers import http_pool
 import forced_choice
@@ -60,7 +61,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RECORD_REQUEST_BYTES = 1024 * 1024
 # What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
 _CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
-                 "dialect", "virtual_profile", "requested_model", "client_task")
+                 "dialect", "virtual_profile", "requested_model", "client_task", "client_key", "cost_confirm")
 
 
 def _carry_compatibility(first, parsed, changes):
@@ -974,6 +975,12 @@ def make_handler(runtime: Runtime):
             runtime.client_keys.enforce_request(
                 getattr(self, "_client_key_profile", None), parsed.model, parsed.requested_model
             )
+            # The cost guard's inputs (cost_guard): the client key's own ceilings, and a sum the client allows one request
+            # to cost, which only the master key and a key with allow_cost_confirm may name.
+            key_profile = getattr(self, "_client_key_profile", None)
+            parsed.client_key = key_profile if key_profile and not key_profile.get("master") else None
+            parsed.cost_confirm = (self.headers.get(cost_guard.CONFIRM_HEADER)
+                                   if not parsed.client_key or parsed.client_key.get("allow_cost_confirm") else None)
             substituted = model_catalog.substitute_for(parsed.requested_model)
             if substituted != parsed.model:
                 substituted = None
@@ -988,8 +995,10 @@ def make_handler(runtime: Runtime):
             if parsed.request_purpose == "prompt-suggestion":
                 substituted = self._optimize_prompt_suggestion(parsed, substituted)
             # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
-            # identity, so that every event of the request, the transport's included, says what it is.
-            parsed.client_task = client_context.client_task(parsed)
+            # identity, so that every event of the request, the transport's included, says what it is. A suggestion is
+            # already a background job (_optimize_prompt_suggestion): that mark was wiped here (audit A15-05), so its
+            # one-off session was kept warm and the tail of its prompt was written to a cache nothing continues.
+            parsed.client_task = getattr(parsed, "client_task", None) or client_context.client_task(parsed)
             if (not parsed.client_task and parsed.request_purpose == "generation" and parsed.structured_output
                     and prompt_policy.prompt_client(client_context.current(), self.headers) == "codex"):
                 # A tool-less request of Codex for a strict schema is one of its own one-shot jobs: the memory
@@ -1198,58 +1207,100 @@ def make_handler(runtime: Runtime):
                 parsed.tools = merged
                 parsed.carried_tools = frozenset(carried)
 
+        # The models a prompt suggestion runs on with prompt_suggestion_model "auto", fastest first (design_routing_errors.md
+        # section 5.1). Each serves only when the live catalog has it (a Minara model needs a Minara account) and an account
+        # can take it now. Claude Haiku 4.5 on Retool answered all 8 suggestions of the live journal (TTFT 1.1 s); Minara's
+        # Haiku 4.5 writes without reasoning first; gpt-5-nano and GLM-5.3-Flash reason, on their lowest level. When none
+        # can, the chat model serves the suggestion on its lowest level. The chain of 54b1023 had fast-auto, a model no
+        # catalog has, and gpt-5.6-luna and gpt-5.5, reasoning models outside the plan of part of the pool.
+        SUGGESTION_MODELS = ("claude-haiku-4-5-20251001", "minara/claude-haiku-4-5", "gpt-5-nano", "zai-org/GLM-5.3-Flash")
+        # The conversation a suggestion reads: the latest messages and the suggestion request, each cut to a few lines.
+        SUGGESTION_TAIL = 6
+        SUGGESTION_CHUNK_CHARS = 1200
+
+        @staticmethod
+        def _chunk_text(chunk):
+            """A message chunk as text: a list of blocks (an image, a marked block) gives its texts, [image] for an image and
+            [<type>] for any other block, never the Python repr of the list (an image's base64 in the prompt)."""
+            if isinstance(chunk, str):
+                return chunk
+            if isinstance(chunk, dict):
+                if isinstance(chunk.get("text"), str):
+                    return chunk["text"]
+                if chunk.get("type") in ("image", "image_url", "input_image") or "imageData" in chunk:
+                    return "[image]"
+                if "content" in chunk:
+                    return Handler._chunk_text(chunk["content"])
+                return "[%s]" % (chunk.get("type") or "block")
+            if isinstance(chunk, list):
+                return "\n".join(text for text in (Handler._chunk_text(block) for block in chunk) if text)
+            return ""
+
         def _optimize_prompt_suggestion(self, parsed, substituted):
-            """Run [SUGGESTION MODE: ...] side requests on a fast light model with slimmed context and no tools."""
+            """Run a [SUGGESTION MODE: ...] side request on a fast light model, alone: the conversation's tail, no tools, no thinking.
+
+            The model is the first of prompt_suggestion_model's chain ("auto": SUGGESTION_MODELS, a model id: that one) the
+            catalog has, the client's key may use and an account can take now, else the chat model ("same", or nothing left).
+            It runs on its lowest level. The client's key was charged for the request once already (_completion): a candidate is
+            checked against the key's models only, a second enforce_request took a second RPM slot (audit A02-12)."""
             pref = str(cfg.get("prompt_suggestion_model") or "auto").strip()
-            if pref and pref != "same":
-                candidates = (pref,) if pref != "auto" else (
-                    "claude-haiku-4-5-20251001",
-                    "gpt-5.6-luna",
-                    "gpt-5.5",
-                    "minara/claude-haiku-5-5",
-                    "fast-auto",
-                )
-                profile = getattr(self, "_client_key_profile", None)
-                for candidate in candidates:
-                    try:
-                        cand_entry, _ = model_catalog.resolve(candidate, cfg=cfg)
-                        runtime.client_keys.enforce_request(profile, cand_entry["id"], candidate)
-                    except apierr.ApiError:
-                        continue
-                    if runtime.pool.model_refusal(cand_entry, isolated=True) is None:
-                        if cand_entry["id"] != parsed.model:
-                            parsed.entry = cand_entry
-                            parsed.model = cand_entry["id"]
-                            self._model = parsed.model
-                            substituted = parsed.model if parsed.model != parsed.requested_model else substituted
-                        break
-            levels = parsed.entry.get("reasoning_effort_levels") or ()
-            parsed.effort = next((lvl for lvl in ("none", "minimal", "low") if lvl in levels), None)
+            profile = getattr(self, "_client_key_profile", None)
+            candidates = () if pref == "same" else self.SUGGESTION_MODELS if pref == "auto" else (pref,)
+            for candidate in candidates:
+                try:
+                    cand_entry, _ = model_catalog.resolve(candidate, cfg=cfg)
+                except apierr.ApiError:
+                    continue  # not in the live catalog: a Minara model without a Minara account, a retired id
+                if not auth.model_allowed_for_profile(profile, cand_entry["id"], candidate):
+                    continue
+                # Served at all is not enough: every account of the model may be at its hourly limit or out of credits now.
+                if runtime.pool.unavailable_error(cand_entry, **acquire_plan(cfg, parsed).kwargs) is not None:
+                    continue
+                if cand_entry["id"] != parsed.model:
+                    parsed.entry = cand_entry
+                    parsed.model = cand_entry["id"]
+                    self._model = parsed.model
+                    substituted = parsed.model if parsed.model != parsed.requested_model else substituted
+                break
+            # The lowest level the model has: a model whose levels start at medium or offer only max was sent its default.
+            levels = [level for level in parsed.entry.get("reasoning_effort_levels") or () if level in models.EFFORT_ORDER]
+            parsed.effort = min(levels, key=models.EFFORT_ORDER.index) if levels else None
+            parsed.verbosity = "low" if "low" in (parsed.entry.get("verbosity_levels") or ()) else None
             parsed.tools = []
             parsed.tool_choice = "auto"
             parsed.web_search = None
+            parsed.structured_output = None
             parsed.show_thinking = False
             parsed.thinking_placeholder = ""
-            parsed.max_tokens = max(16, min(parsed.max_tokens or 64, 64))
+            # The client's thinking switch reaches a universal provider through provider_options: none for a suggestion.
+            parsed.provider_options = {key: value for key, value in (getattr(parsed, "provider_options", None) or {}).items()
+                                       if key not in ("thinking", "parallel_tool_calls", "disable_parallel_tool_use")}
+            # A model that reasons before its text can spend 64 tokens on that and end on its cap with no word written.
+            reasons = bool(parsed.entry.get("reasoning")) and parsed.entry.get("thinking") != "none"
+            parsed.max_tokens = 1024 if reasons else max(16, min(parsed.max_tokens or 64, 64))
+            parsed.output_cap = generation.output_cap(parsed.entry, parsed.max_tokens)
             parsed.client_task = client_context.BACKGROUND
             parsed.system = (
                 "Reply with ONLY a natural 2-12 word next user message in the user's language, with no quotes or meta-text."
             )
-            chunks = list(getattr(parsed, "message_chunks", None) or ())
-            if len(chunks) > 1 or len(getattr(parsed, "prompt", "") or "") > 12000:
-                last_chunk = str(chunks[-1]) if chunks else str(getattr(parsed, "prompt", "") or "")
-                prior = [str(c) for c in chunks[:-1] if str(c).strip()]
-                kept = []
-                if prior and prior[0].startswith("User: ") and len(prior) > 6:
-                    kept.append(prior[0][:1200])
-                for item in prior[-6:]:
-                    trimmed = item[:1200]
-                    if not kept or kept[-1] != trimmed:
-                        kept.append(trimmed)
-                kept.append(last_chunk)
-                parsed.message_chunks = kept
-                parsed.prompt = "\n\n".join(kept)
-            parsed.native_messages = []
+            chunks = [self._chunk_text(chunk) for chunk in getattr(parsed, "message_chunks", None) or ()]
+            if not chunks and (getattr(parsed, "prompt", "") or ""):
+                chunks = [parsed.prompt]
+            prior = [chunk for chunk in chunks[:-1] if chunk.strip()]
+            kept = []
+            if len(prior) > self.SUGGESTION_TAIL and prior[0].startswith("User: "):
+                kept.append(prior[0][:self.SUGGESTION_CHUNK_CHARS])  # what the conversation is about
+            for item in prior[-self.SUGGESTION_TAIL:]:
+                trimmed = item[:self.SUGGESTION_CHUNK_CHARS]
+                if not kept or kept[-1] != trimmed:
+                    kept.append(trimmed)
+            if chunks:
+                kept.append(chunks[-1])
+            parsed.message_chunks = kept
+            parsed.prompt = "\n\n".join(kept)
+            # None, not []: a transport that builds from native messages (Minara, the universal drivers) took an empty list
+            # for the whole conversation and sent the instruction alone (audit A15-03). It builds from the chunks above.
+            parsed.native_messages = None
             return substituted
 
         def _stabilize_prompt(self, parsed):
