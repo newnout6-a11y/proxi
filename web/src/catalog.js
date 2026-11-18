@@ -55,3 +55,26 @@ export function pingModelOf(data, picked) {
   if (routable.includes(data?.default_model)) return data.default_model;
   return routable[0] || '';
 }
+
+// The provider the relay keeps OpenCode's model list in (scripts/sync_opencode_catalog.py: PROVIDER).
+export const OPENCODE_PROVIDER = 'retool-relay';
+
+/**
+ * The OpenCode settings the "Подключение IDE" panel offers: the provider the relay's sync fills in, with the default model
+ * to start from. A provider of another name ("proxi") without models showed no models in OpenCode, and the relay's sync,
+ * which updates only "retool-relay", failed on it (audit A14-06).
+ */
+export function opencodeSnippet(baseUrl, defaultModel) {
+  return JSON.stringify({
+    provider: {
+      [OPENCODE_PROVIDER]: {
+        npm: '@ai-sdk/openai-compatible',
+        name: 'Proxi relay',
+        options: { baseURL: baseUrl, apiKey: '{env:PROXI_API_KEY}' },
+        // The relay's sync ("Синхр. OpenCode и Harness" or its own after each catalog look) writes every model here.
+        models: { [defaultModel]: { name: defaultModel } },
+      },
+    },
+    model: `${OPENCODE_PROVIDER}/${defaultModel}`,
+  }, null, 2);
+}

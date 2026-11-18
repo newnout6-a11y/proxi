@@ -6,7 +6,7 @@ import { usePolling } from '../useJournal.js';
 import { Dot, Page, ease } from '../motion.jsx';
 import { Button, CopyButton, Tag, Toggle, useToast } from '../ui.jsx';
 import { fmtInt, fmtTokens, isNum } from '../format.js';
-import { pingModelOf } from '../catalog.js';
+import { opencodeSnippet, pingModelOf } from '../catalog.js';
 
 // Each group answers one question an operator actually has.
 export const GROUPS = [
@@ -182,15 +182,7 @@ function Connection({ apiKey, overview, onUnauthorized }) {
   const defaultModel = overview?.models?.default || 'claude-opus-5-5';
   const rows = [['OpenAI-совместимый адрес', overview?.connection?.openai_base_url], ['Anthropic-совместимый адрес', overview?.connection?.anthropic_base_url]];
   const session = sessionStatus(overview);
-  const opencodeSnippet = JSON.stringify({
-    provider: {
-      proxi: {
-        npm: '@ai-sdk/openai-compatible',
-        name: 'Proxi Gateway',
-        options: { baseURL: openaiUrl, apiKey: '{env:PROXI_API_KEY}' },
-      },
-    },
-  }, null, 2);
+  const opencodeConfig = opencodeSnippet(openaiUrl, defaultModel);
   const claudeSnippet = `ANTHROPIC_BASE_URL=${anthropicUrl}\nANTHROPIC_AUTH_TOKEN=<ваш_ключ_relay_или_AccessKey>`;
   const codexSnippet = `OPENAI_BASE_URL=${openaiUrl}\nOPENAI_API_KEY=<ваш_ключ_relay_или_AccessKey>\n# модель по умолчанию: ${defaultModel}`;
 
@@ -239,8 +231,8 @@ function Connection({ apiKey, overview, onUnauthorized }) {
         <summary>Готовые конфиги для OpenCode, Claude Code и Codex CLI</summary>
         <div className="snippet-grid">
           <div className="snippet-box">
-            <div className="snippet-head"><strong>OpenCode (opencode.jsonc)</strong><CopyButton value={opencodeSnippet} label="Копировать конфиг OpenCode" /></div>
-            <pre>{opencodeSnippet}</pre>
+            <div className="snippet-head"><strong>OpenCode (opencode.jsonc)</strong><CopyButton value={opencodeConfig} label="Копировать конфиг OpenCode" /></div>
+            <pre>{opencodeConfig}</pre>
           </div>
           <div className="snippet-box">
             <div className="snippet-head"><strong>Claude Code (.env / settings)</strong><CopyButton value={claudeSnippet} label="Копировать конфиг Claude Code" /></div>

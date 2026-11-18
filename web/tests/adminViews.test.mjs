@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { pingModelOf } from '../src/catalog.js';
+import { opencodeSnippet, pingModelOf } from '../src/catalog.js';
 import { spendAxisLabel, spendUnitOf } from '../src/spend.js';
 
 // A14-09: the unit picked with the "Кредиты / USD" switch stayed USD after the dollars left the window, and the switch is
@@ -36,4 +36,18 @@ test('the model test pings the model the select shows', () => {
   assert.equal(pingModelOf(data, 'claude-opus-5-5'), 'gpt-6.1-sol');
   assert.equal(pingModelOf({ default_model: 'x', data: [] }, ''), '');
   assert.equal(pingModelOf(null, ''), '');
+});
+
+// A14-06: the "Подключение IDE" snippet made an OpenCode provider "proxi" without models. The relay's own sync
+// (scripts/sync_opencode_catalog.py, PROVIDER = 'retool-relay') fills only "retool-relay" and fails without it, so OpenCode
+// set up from the snippet showed no models and "Синхр. OpenCode" answered with an error.
+test('the OpenCode snippet sets up the provider the relay keeps in sync, with the default model', () => {
+  const snippet = JSON.parse(opencodeSnippet('http://127.0.0.1:8787/v1', 'claude-opus-5-5'));
+  assert.deepEqual(Object.keys(snippet.provider), ['retool-relay']);
+  const provider = snippet.provider['retool-relay'];
+  assert.equal(provider.npm, '@ai-sdk/openai-compatible');
+  assert.equal(provider.options.baseURL, 'http://127.0.0.1:8787/v1');
+  assert.equal(provider.options.apiKey, '{env:PROXI_API_KEY}');
+  assert.deepEqual(Object.keys(provider.models), ['claude-opus-5-5']);
+  assert.equal(snippet.model, 'retool-relay/claude-opus-5-5');
 });
