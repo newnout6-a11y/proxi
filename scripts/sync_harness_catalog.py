@@ -22,6 +22,7 @@ import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import models
 from scripts import sync_virtual_models
 from scripts.probe_client_settings import routable_entries
 from scripts.sync_opencode_catalog import (MASK, UNKNOWN_CONTEXT, UNKNOWN_OUTPUT, is_environment_list, is_secret_flag,
@@ -32,8 +33,13 @@ STR = 'tag:yaml.org,2002:str'
 HARNESS_THINKING_LEVELS = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
 
 
-def _harness_efforts(entry):
-    """Map Proxi effort levels to Harness reasoningEfforts, or False when no thinking level beyond 'off' is offered."""
+def _harness_efforts(entry, default=None):
+    """Map Proxi effort levels to Harness reasoningEfforts, or False when no thinking level beyond 'off' is offered.
+
+    `default` is the provider's own `reasoning` level. DeepSeek Harness asks a model for it when no effort is picked
+    ("Provider default", subagents) and refuses a model whose reasoningEfforts lack it before any request
+    (UNSUPPORTED_REASONING_EFFORT in dsh-llm-pi-ai): so it is offered too, sent as the model's nearest real level
+    (models.nearest_effort, the level the relay itself serves for it)."""
     if not entry.get('reasoning'):
         return False
     levels = entry.get('reasoning_effort_levels') or []
@@ -45,6 +51,10 @@ def _harness_efforts(entry):
     # dsh-llm-pi-ai strict validation rejects reasoningEfforts with only 'off' ("offers no level beyond 'off'").
     if not any(key != 'off' for key in mapped):
         return False
+    thinking = [level for level in levels if level != 'none']
+    if isinstance(default, str) and default not in ('off', 'none') and default in HARNESS_THINKING_LEVELS \
+            and default not in mapped and thinking:
+        mapped[default] = models.nearest_effort(thinking, default)
     return mapped
 
 
@@ -118,7 +128,7 @@ def update_document(document, entries):
                         contextWindow=entry['context'] or UNKNOWN_CONTEXT,
                         maxTokens=entry['max_output'] or UNKNOWN_OUTPUT,
                         input=['text', 'image'] if entry.get('vision') else ['text'])
-            item['reasoningEfforts'] = _harness_efforts(entry)
+            item['reasoningEfforts'] = _harness_efforts(entry, provider.get('reasoning'))
             updated.append(item)
         return updated
 

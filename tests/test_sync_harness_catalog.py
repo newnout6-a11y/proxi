@@ -559,3 +559,30 @@ def test_models_with_only_none_effort_route_to_retool_text_for_strict_dsh_hmr():
     assert [m['id'] for m in providers['retool']['models']] == ['gpt-6-sol']
     assert [m['id'] for m in providers['retool-text']['models']] == ['minara/deepseek-v4-flash']
     assert providers['retool-text']['models'][0]['reasoningEfforts'] is False
+
+
+def test_a_model_without_the_providers_default_level_still_takes_a_request_without_an_effort():
+    # The Proxi provider's default is reasoning: medium. With no effort picked ("Provider default") or for a subagent,
+    # DeepSeek Harness asks the model for that level and refuses a model whose reasoningEfforts lack it before any
+    # request (UNSUPPORTED_REASONING_EFFORT, dsh-llm-pi-ai): 9 of 76 live models (GLM-5.3 Prime, DeepSeek V4 Pro, ...).
+    # The default is offered too, sent as the model's nearest real level, the one the relay would serve.
+    entries = [
+        models.resolve('gpt-6-sol')[0],
+        {'id': 'minara/glm-5.3-prime', 'label': 'GLM-5.3 Prime', 'context': 202752, 'max_output': 131072,
+         'vision': False, 'reasoning': True, 'reasoning_effort_levels': ['none', 'high', 'max']},
+    ]
+    result = update_document(source(), entries)
+    glm = next(m for m in result[1]['config']['providers']['retool']['models'] if m['id'] == 'minara/glm-5.3-prime')
+    assert glm['reasoningEfforts'] == {'off': 'none', 'high': 'high', 'max': 'max', 'medium': 'high'}
+    # A model that has the default level keeps exactly its own levels.
+    sol = next(m for m in result[1]['config']['providers']['retool']['models'] if m['id'] == 'gpt-6-sol')
+    assert 'medium' not in sol['reasoningEfforts'] or sol['reasoningEfforts']['medium'] == 'medium'
+
+
+def test_a_provider_without_a_default_level_adds_none():
+    document = source()
+    del document[1]['config']['providers']['retool']['reasoning']
+    entries = [{'id': 'minara/glm-5.3-prime', 'label': 'GLM-5.3 Prime', 'context': 202752, 'max_output': 131072,
+                'vision': False, 'reasoning': True, 'reasoning_effort_levels': ['none', 'high', 'max']}]
+    glm = update_document(document, entries)[1]['config']['providers']['retool']['models'][0]
+    assert glm['reasoningEfforts'] == {'off': 'none', 'high': 'high', 'max': 'max'}
