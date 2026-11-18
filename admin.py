@@ -1472,6 +1472,7 @@ class Admin:
                     limiter.rate = self.cfg["rate_limit_rps"]
                     limiter.burst = self.cfg["rate_limit_burst"]
                     limiter.tokens = min(limiter.tokens, limiter.burst)
+                self._apply_to_accounts({key: changes[key] for key in applied})
                 dispatcher = self.runtime.accounts
                 if {"min_account_balance", "account_balance_interval"} & set(applied):
                     with dispatcher._lock:
@@ -1481,7 +1482,40 @@ class Admin:
                         now = dispatcher.clock()
                         for state in dispatcher.state.values():
                             state["next_balance"] = min(state["next_balance"], now)
-            return {**self._settings(saved), "saved": True, "changed": changed, "applied": applied}
+            answer = {**self._settings(saved), "saved": True, "changed": changed, "applied": applied}
+        if "catalog_refresh_hours" in changed and "catalog_refresh_hours" in applied:
+            self._restart_provider_catalog()  # outside the lock: stopping waits up to 2 s for the refresher's loop
+        return answer
+
+    def _apply_to_accounts(self, changes):
+        """A live setting reaches every account as a restart would give it: each account's session reads its own copy of
+        the configuration (models.account_config), so the stream timeouts changed in the root only stayed 300/120 s on
+        every account until a restart (audit A07-03). A value the account's own record names stays the account's."""
+        for backend in self._live_backends():
+            cfg = getattr(backend, "cfg", None)
+            if not isinstance(cfg, dict) or cfg is self.cfg:
+                continue
+            record = cfg.get("_account_ref")
+            for key, value in changes.items():
+                if not (isinstance(record, dict) and record is not cfg and key in record):
+                    cfg[key] = value
+
+    def _restart_provider_catalog(self):
+        """The provider catalog's refresher takes catalog_refresh_hours when its loop starts: a new interval needs a new
+        loop. A loop still reading /models ends by itself once stopped; a new one started beside it would clear the stop
+        and leave both running, so then the new one starts when the old one is done."""
+        refresher = getattr(self.runtime, "provider_catalog", None)
+        if not (callable(getattr(refresher, "stop", None)) and callable(getattr(refresher, "start", None))):
+            return
+        running = getattr(refresher, "_thread", None)
+        refresher.stop()
+        if isinstance(running, threading.Thread) and running.is_alive():
+            def start_after():
+                running.join()
+                refresher.start()
+            threading.Thread(target=start_after, name="provider-catalog-restart", daemon=True).start()
+        else:
+            refresher.start()
 
     def _mutation_guard(self, handler):
         if handler.headers.get("x-admin-request") != "1":
