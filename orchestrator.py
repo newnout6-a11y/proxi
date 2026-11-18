@@ -245,6 +245,17 @@ def _may_be_balance_related(error):
 # A conversation moved to another account writes its prefix there again; below this many prompt tokens that costs next
 # to nothing, and waiting for the limited account (account_rate_limit_wait) is only a delay.
 LIMIT_WAIT_MIN_PREFIX = 8000
+# How long a universal provider that answered 429 without a Retry-After is left out of the pool: a provider's limit is per
+# minute (OpenRouter, OpenAI, Anthropic), not Retool's sliding hour, so account_rate_limit_cooldown (900 s) never fits it.
+PROVIDER_RATE_LIMIT_PAUSE = 60
+
+
+def _provider_label(backend):
+    """The name of the universal provider behind this account (OpenRouter, Anthropic, ...), None for Retool and Minara."""
+    cfg = getattr(backend, "cfg", None) or {}
+    if cfg.get("upstream", "retool") in ("retool", "minara"):
+        return None
+    return str(cfg.get("provider_name") or cfg.get("provider_id") or account_tag(backend) or cfg.get("upstream"))
 
 
 async def _pause(cancelled, seconds):
@@ -1078,10 +1089,13 @@ class TurnRunner:
                          and (not relay.sent or getattr(error, "unbilled", False)))
             exhausted = False
             rate_limited = plan_refused = False
+            # A universal provider's 429 is a rate limit of its own (drivers/sse_utils marks it an account quota so that the
+            # turn moves), not Retool's hourly managed-key limit: no wait on it, no hourly cooldown or ladder (A02-08).
+            provider = _provider_label(backend)
             try:
                 if error is not None and backend is not None and apierr.is_account_quota(error):
                     pause = (self._limit_pause(error, getattr(lease, "session", lease))
-                             if retryable and backend not in exclude and not waited
+                             if retryable and backend not in exclude and not waited and provider is None
                              and holder["_attempt_budget"].remaining > 1 else None)
                     if pause is not None:
                         # The account is not parked and not excluded: the retry goes to it with the conversation's
@@ -1101,8 +1115,12 @@ class TurnRunner:
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):
-                        # A limit that a request sent before the account's last return reports is old news.
-                        accounts.mark_rate_limited(backend, retry_after=getattr(error, "retry_after", None),
+                        # A limit that a request sent before the account's last return reports is old news. A provider is
+                        # parked for its Retry-After or a short pause: a hint never climbs the hourly ladder.
+                        hint = getattr(error, "retry_after", None)
+                        if provider is not None and not hint:
+                            hint = PROVIDER_RATE_LIMIT_PAUSE
+                        accounts.mark_rate_limited(backend, retry_after=hint,
                                                    request_id=getattr(parsed, "request_id", None),
                                                    sent_at=holder["_attempt_budget"].sent_at)
                     rate_limited = retryable and backend not in exclude
@@ -1146,11 +1164,13 @@ class TurnRunner:
                 _settle_turn(holder, "moved")
                 # Refused before anything was generated or billed: the move to the next account costs no attempt.
                 holder["_attempt_budget"].refund()
-                journal.emit("account.failover", "Часовой лимит Retool — запрос повторён на другом аккаунте",
+                limit = ("часовой лимит Retool" if provider is None
+                         else "лимит частоты провайдера %s" % provider)
+                journal.emit("account.failover", "%s — запрос повторён на другом аккаунте" % (limit[0].upper() + limit[1:]),
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code, reason="rate_limited")
-                console_log.write("[%s] [account] %s: часовой лимит Retool, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
+                console_log.write("[%s] [account] %s: %s, повтор на другом аккаунте" % (
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), limit))
                 holder["reason"] = "stop"
                 continue
             if plan_refused:
