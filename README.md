@@ -345,6 +345,20 @@ Codex Desktop, «Working (N s)» в Codex CLI). Когда upstream начал �
 `thinking_placeholder` удалён; если он остался в `config.json`, relay его не читает.
 Подробности по каждому диалекту — в [docs/reasoning-visibility.md](docs/reasoning-visibility.md).
 
+Пока upstream молчит, поток держит пульс своего диалекта. Он уходит, когда клиенту ничего
+не писали дольше интервала; отсчёт идёт по монотонным часам от последней записи в сокет:
+- Responses (Codex) — событие `response.in_progress` с `sequence_number` и объектом ответа
+  в статусе `in_progress`, раз в 15 с. Codex сбрасывает свой таймер тишины (300 с) только
+  событием с `data:`, комментарии его парсер отбрасывает;
+- Messages (Claude Code, Desktop) — `event: ping`, раз в 25 с. Claude Code засчитывает не
+  больше 30 пингов подряд: 30 × 25 с + его 300 с больше 900 с хода relay. Красное «Waiting for
+  API response» он показывает через 45 с без байтов;
+- Chat — комментарий `: keep-alive` раз в 15 с. OpenCode считает байты, и этого ему хватает.
+  DeepSeek Harness сбрасывает таймер только содержимым, а честно подделать содержимое нечем.
+
+Пульс не содержит ни текста, ни рассуждения. События, которые клиенту ничего не пишут
+(тиканье транспорта, ответ, удержанный до проверки), его больше не глушат.
+
 Уровень меняется настоящим полем Retool `modelProvider.reasoningEffort`:
 `reasoning_effort` в Chat, `reasoning.effort` в Responses,
 `thinking.type=adaptive` + `output_config.effort` в Anthropic.

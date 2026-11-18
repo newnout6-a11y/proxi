@@ -7,6 +7,7 @@ import uuid
 
 import apierr
 import journal
+import sse
 import structured
 from credits import token_counter as _token_counter, provider_cost_summary
 from native_history import loads_finite
@@ -278,6 +279,19 @@ class _Base:
     def payload(self, reason, prompt_text=None):
         raise NotImplementedError
 
+    @property
+    def keepalive_every(self):
+        """Seconds without a write after which the stream gets its keepalive (read at each check: tests shorten it)."""
+        return sse.HEARTBEAT_EVERY
+
+    def keepalive(self):
+        """Keep a silent stream alive the way its client counts it, with nothing of the reply in it.
+
+        The SSE comment is all Chat has: OpenCode counts the bytes of it; DeepSeek Harness (pi-ai) resets its idle timer
+        only on content, which nothing honest can stand in for. Responses and Messages send an event of their own."""
+        if self.writer is not None:
+            self.writer.comment()
+
     def begin(self):
         raise NotImplementedError
 
@@ -487,6 +501,14 @@ class ResponsesAdapter(_Base):
         self._emit("response.created", {"response": {"id": self.id, "object": "response",
                                                      "created_at": self.created, "model": self.parsed.model,
                                                      "status": "in_progress", "output": []}})
+
+    def keepalive(self):
+        # Codex resets stream_idle_timeout_ms (300 s) only on an event with data; its SSE parser drops comments. A
+        # documented event that it reads and ignores says what is true: the response is in progress.
+        if self.writer is not None and self._begun:
+            self._emit("response.in_progress", {"response": {"id": self.id, "object": "response",
+                                                             "created_at": self.created, "model": self.parsed.model,
+                                                             "status": "in_progress", "output": []}})
 
     def fail(self, error, extra=None):
         """End a stream that failed after it started: an `error` event, then the terminal response.failed.
@@ -854,6 +876,14 @@ class AnthropicAdapter(_Base):
             "usage": {"input_tokens": self.usage()[0], "output_tokens": 0}}})
         self._emit("ping", {"type": "ping"})
 
+    # Claude Code resets its idle timer (300 s) on every event, but on at most 30 pings in a row. Every 25 s that is
+    # 30 x 25 + 300 = 1050 s of silence, more than the relay's own turn (900 s), and still well inside the 45 s after
+    # which it shows "Waiting for API response" for a stream without bytes.
+    keepalive_every = 25.0
+
+    def keepalive(self):
+        self._emit("ping", {"type": "ping"})
+
     def _close_blocks(self):
         for index in sorted(self._open_indices):
             self._emit("content_block_stop", {"type": "content_block_stop", "index": index})
@@ -1047,6 +1077,15 @@ class StructuredOutputAdapter:
 
     def fail(self, error, extra=None):
         self.adapter.fail(error, extra)
+
+    @property
+    def keepalive_every(self):
+        return self.adapter.keepalive_every
+
+    def keepalive(self):
+        # While the reply is held for its check, the stream is as silent as one whose upstream is: it gets the same
+        # keepalive, with nothing of the held text in it.
+        self.adapter.keepalive()
 
     def _release(self):
         self.released = True
