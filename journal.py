@@ -24,6 +24,7 @@ import time
 
 import client_context
 import console_clock
+import console_records
 import redact as redact_module
 from redact import redact
 
@@ -52,6 +53,25 @@ COOKIE_SECRET_CHARS = 8
 def _cookie_secrets(values):
     return [value for value in values or () if isinstance(value, str) and len(value) >= COOKIE_SECRET_CHARS]
 _TOP_LEVEL = ("turn_id", "request_id", "conversation")
+# The terminal feed is a projection of the journal's operational events, not of its payloads and debug metadata.
+_CONSOLE_PHASES = {
+    "http.error": ("status", "code", "stage", "upstream_status", "expected"),
+    "turn.begin": ("transport", "requested_effort", "effort_source"),
+    "route.bound": ("child", "provider"),
+    "session.acquire": ("thread", "isolated", "mode", "wait_ms"),
+    "upstream.first_token": ("attempt", "ttft_ms", "first", "warn_ms"),
+    "upstream.text_start": ("attempt", "ms"),
+    "upstream.usage": ("attempt", "input_tokens", "output_tokens", "cache_read", "cache_write", "cost_usd",
+                       "minara_credits", "provider_cost", "provider_cost_currency",
+                       "provider_cost_estimated", "channel", "channel_path", "provider"),
+    "upstream.channel_retry": ("status", "attempt", "delay"),
+    "upstream.model_substituted": ("requested", "served"),
+    "account.failover": ("status", "reason", "error"),
+    "cache.tail_unwritten": ("attempt", "input_tokens", "minara_credits"),
+    "turn.error": ("status", "code", "outcome"),
+    "turn.end": ("reason", "outcome", "duration_ms", "output_tokens", "retries"),
+    "request.speed": ("reason", "duration_ms", "output_tokens", "tokens_per_second"),
+}
 # Rollups: numeric counters per FINE seconds (the smallest chart bucket), distributions per
 # COARSE seconds (window-wide figures only), both kept for the longest window plus a margin.
 FINE = 10
@@ -862,11 +882,15 @@ class Journal:
                 # on itself, so use stderr.
                 # Do not re-enter console_log/journal.scrub here: this is the journal's own failure path. Raw exception
                 # text can contain a path or credential; the safe error class is enough to diagnose the failure category.
-                try:
-                    print(console_clock.timestamp() + "[journal] rotation failed: %s" % type(exc).__name__,
-                          file=sys.stderr, flush=True)
-                except (OSError, ValueError):
-                    pass
+                if console_records.enabled():
+                    console_records.write("journal.rotation_failed", "warn", {"error": type(exc).__name__},
+                                          file=sys.stderr)
+                else:
+                    try:
+                        print(console_clock.timestamp() + "[journal] rotation failed: %s" % type(exc).__name__,
+                              file=sys.stderr, flush=True)
+                    except (OSError, ValueError):
+                        pass
 
     # -- reading -----------------------------------------------------------
     @property
@@ -1136,4 +1160,17 @@ def redact_whole(text):
 
 
 def emit(kind, message="", level="info", **fields):
-    return JOURNAL.emit(kind, message, level, **fields)
+    event = JOURNAL.emit(kind, message, level, **fields)
+    if event and kind in _CONSOLE_PHASES and console_records.enabled():
+        data = event["data"]
+        record = {key: data.get(key) for key in (*console_records.IDENTITY, *_CONSOLE_PHASES[kind])}
+        record.update((key, event[key]) for key in _TOP_LEVEL if key in event)
+        record["client_session"] = tag(data.get("client_session_id"))
+        if kind == "upstream.usage":
+            snapshot = data.get("usage_snapshot")
+            record["retool_credits"] = data.get("credits") if data.get("upstream") == "retool" else None
+            if isinstance(snapshot, dict):
+                for key in ("provider_cost_currency", "channel", "channel_path", "provider"):
+                    record[key] = snapshot.get(key)
+        console_records.write(kind, event["level"], record, when=event["ts"])
+    return event

@@ -954,6 +954,21 @@ ANSI-кодов; просмотрщик раскрашивает файл при
 Windows PowerShell 5.1 через `*>>`, могут быть в UTF-16 или смешанными: `watch_relay`
 вырезает из них NUL, но кириллица в таких файлах может быть повреждена.
 
+Для разбора логов программой задайте `$env:RELAY_LOG_FORMAT = 'jsonl'` перед запуском
+`proxy.py` или `scripts/run_relay.ps1`. Новые строки консоли и `relay.log` будут
+JSON-объектами с `ts`, `kind` и `level`. Для файла целиком в JSONL используйте
+пустой каталог `-StateDir`: старые текстовые строки сохраняются.
+`request_id` связывает HTTP, маршрут, сессию, первый токен и usage. `turn_id` и
+`attempt` различают повторы. Известные аккаунт, клиент и чат указываются отдельно;
+идентификаторы диалога и сессии отображаются короткими метками. `http_status` —
+код в HTTP, `status` учитывает и ошибку, пришедшую после открытия SSE с 200.
+`upstream.first_token.ttft_ms` отсчитывается от начала шага upstream. Поле `first`
+различает текст, thinking и вызов инструмента; ожидание не считается ответом.
+В `upstream.usage` счётчики токенов и списания даются приращениями, с отдельными
+`retool_credits`, `minara_credits` и `cost_usd`. `provider_cost` с
+`provider_cost_currency` — накопленная цена попытки, её не суммируют с приращениями.
+Неизвестные значения опускаются. `journal.jsonl` и его схема остаются отдельными.
+
 ## Конфигурация
 
 Все ключи с дефолтами — в config.example.json. Важное:
@@ -1937,7 +1952,7 @@ relay с этим делает. 429 приходит до начала гене�
 | Ответ клиенту | `adapters.py` (Chat, Responses, Messages), `structured.py`, `forced_choice.py`, `generation.py`, `web_search.py` |
 | Клиенты и системный промпт | `client_context.py`, `context.py`, `prompt_policy.py` (профили и правила `prompts.json`), `prompt_body.py` (правки истории и tools), `prompt_stabilizer.py`, `tool_names.py`, `tool_union.py`, `tool_search_policy.py` |
 | Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей), `catalog/` (`models.dev` метаданные и цены, автодискавери `/models`, маршруты/алиасы `routes[]`), `minara_accounts.py` (токены Minara и их срок), `minara_catalog.py` (опубликованные модели Minara), `minara_refresh.py` (каталог Minara обновляется сам), `minara_probe.py` (замеры моделей Minara), `retool_catalog.py` (реестр моделей Retool), `retool_refresh.py` (каталог Retool обновляется сам), `retool_plans.py` (отказы тарифа Retool переживают перезапуск: `retool_plans.auto.json`), `client_sync.py` (список моделей OpenCode обновляется сам) |
-| Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `console_clock.py` (время в строках консоли), `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
+| Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `console_clock.py` (время в строках консоли), `console_records.py` (JSONL), `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
 
 Путь запроса: proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
 (контекст, exec-цикл) -> session.py (диалоги, ретраи, отмена) -> direct.py

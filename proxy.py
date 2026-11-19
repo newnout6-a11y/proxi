@@ -481,10 +481,11 @@ def make_handler(runtime: Runtime):
             expected = getattr(self, "_expected", False) and 400 <= status < 500
             if expected:
                 note = " ".join(part for part in ("[expected]", note) if part)
-            took = (time.time() - self._started) * 1000
+            took = (time.monotonic() - self._started) * 1000
             model = getattr(self, "_model", "-")
             # A compaction can run on the dialog's effort instead of the one its client asked for (orchestrator).
-            effort = (getattr(self, "_holder", None) or {}).get("kept_effort") or getattr(self, "_effort_str", "")
+            holder = getattr(self, "_holder", None) or {}
+            effort = holder.get("kept_effort") or getattr(self, "_effort_str", "")
             effort_tag = f" [{effort}]" if effort and model != "-" else ""
             route = getattr(self, "_log_route", None)
             local_note = {"count_tokens": "[local-token-count]", "models": "[local-model-catalog]"}.get(route, "")
@@ -492,9 +493,23 @@ def make_handler(runtime: Runtime):
             # It is not part of duration_ms, which starts when the request is handled.
             slot_wait = getattr(self, "_slot_wait", 0.0) or 0.0
             queued = "[queued %.1fs for a max_workers slot]" % slot_wait if slot_wait >= SLOT_WAIT_NOTE else ""
+            # A stream can commit HTTP 200 before it fails. Keep the wire status and the effective status distinct.
+            streaming = bool(getattr(self, "_streaming", False))
+            http_status = 200 if streaming and getattr(self, "_response_started", False) else getattr(self, "_status", 0)
+            error = getattr(self, "_error_code", None)
+            disconnected = getattr(self, "_client_left", False) or error == "client_disconnected"
+            slow_admin = took >= SLOW_ADMIN_MS and self.path != "/admin/api/events/stream"
+            level = ("info" if expected or disconnected else "error" if status >= 500 or status == 0 else
+                     "warn" if status >= 400 or (route == "admin" and slow_admin) else "success")
+            fields = dict(method=self.command, path=self.path, route=route, status=status, http_status=http_status or None,
+                          duration_ms=round(took), slot_wait_ms=round(slot_wait * 1000),
+                          model=None if model == "-" else model, stream=streaming, error=error,
+                          expected=True if expected else None, disconnected=True if disconnected else None)
+            fields.update(holder.get("_console_route") or {})
             console_log.write("relay %s %s %s %s %s%s %.0fms %s" % (
                 self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
-                " ".join(part for part in (client_context.label(), local_note, queued, note) if part)))
+                " ".join(part for part in (client_context.label(), local_note, queued, note) if part)),
+                kind="http.request", level=level, request_id=self.request_id, message=None, **fields)
             if route in ("chat", "responses", "anthropic") and getattr(self, "_model_called", False):
                 backend, manager = self._serving_account()
                 snapshot = getattr(manager, "balance_snapshot", None)
@@ -503,15 +518,20 @@ def make_handler(runtime: Runtime):
                     # A Minara account's balance is in Minara credits: so is what this request spent there.
                     minara = (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
                     spent = getattr(self, "_minara_used", None) if minara else self._credits_used
-                    console_log.write(console_log.balance_line(self.request_id, snapshot(), spent, account=tag))
+                    balance = snapshot()
+                    upstream = (getattr(backend, "cfg", None) or {}).get("upstream", "retool") if backend else None
+                    console_log.write(console_log.balance_line(self.request_id, balance, spent, account=tag),
+                                      kind="account.balance", account=account_tag(backend), upstream=upstream,
+                                      available=console_log.number(balance.get("available"), signed=True),
+                                      unit=balance.get("unit") or ("retool_credits" if upstream == "retool" else None),
+                                      stale=balance.get("stale"), estimated=balance.get("estimated"),
+                                      unreported_usage=balance.get("unreported_usage"), message=None,
+                                      text_only=backend is None)
             # Admin polling and live streams would drown the journal in its own traffic. A slow answer is journaled all the
             # same (the live journal stream excepted, which lasts by design): a page that took seconds to open left no
             # trace anywhere but the console (2026-11-13).
-            slow_admin = took >= SLOW_ADMIN_MS and self.path.split("?", 1)[0] != "/admin/api/events/stream"
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400 and not slow_admin:
                 return
-            level = ("error" if status >= 500 or status == 0 else "info" if expected else "warn" if status >= 400
-                     or (route == "admin" and slow_admin) else "success")
             message = "%s %s → %s" % (self.command, self.path, status or "—")
             if route == "admin" and slow_admin:
                 message += " за %.1f с" % (took / 1000)
@@ -519,9 +539,10 @@ def make_handler(runtime: Runtime):
                          request_id=self.request_id, method=self.command, path=self.path, route=route,
                          status=status, duration_ms=round(took), slot_wait_ms=round(slot_wait * 1000),
                          model=None if model == "-" else model,
-                         stream=bool(getattr(self, "_streaming", False)),
+                         stream=streaming, http_status=http_status or None,
                          user_agent=self.headers.get("user-agent", "")[:120] if self.headers else "",
-                         error=getattr(self, "_error_code", None), **({"expected": True} if expected else {}),
+                         error=error, **({"expected": True} if expected else {}),
+                         **({"disconnected": True} if disconnected else {}),
                          **self._account_fields())
 
         def _serving_account(self):
@@ -543,8 +564,8 @@ def make_handler(runtime: Runtime):
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
             context_token = client_context.bind({"request_id": self.request_id})
-            self._started = time.time()
-            self._request_started_monotonic = time.monotonic() - max(0.0, getattr(self, "_slot_wait", 0.0) or 0.0)
+            self._started = time.monotonic()
+            self._request_started_monotonic = self._started - max(0.0, getattr(self, "_slot_wait", 0.0) or 0.0)
             # Keep-alive reuses the handler: a stale status from the previous
             # request (e.g. a 404 probe) must not leak into this log line.
             self._status = 0
@@ -650,7 +671,8 @@ def make_handler(runtime: Runtime):
                 self._close_if_body_unread()
                 self._log_error(err)
                 if err.status >= 400 and not self._expected:
-                    console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
+                    console_log.write("[err] %s %s %s" % (err.status, err.code,
+                                      journal.redact_whole(err.message or '')[:160]), text_only=True)
                 if getattr(self, "_streaming", False):
                     self._stream_failure(dialect, err)
                 else:
@@ -664,7 +686,8 @@ def make_handler(runtime: Runtime):
                              "info", request_id=self.request_id, path=self.path)
             except Exception as exc:  # never leak a bare traceback
                 self._close_if_body_unread()
-                console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]))
+                console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__,
+                                  journal.redact_whole(str(exc))[:200]), kind="http.exception", level="error")
                 self._error_code = "internal_error"
                 journal.emit("http.exception", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "error",
                              request_id=self.request_id, path=self.path)
@@ -724,7 +747,8 @@ def make_handler(runtime: Runtime):
         def _log_error(self, err):
             journal.emit("http.error", err.message, "debug" if getattr(err, "expected", False)
                          else "error" if err.status >= 500 else "warn",
-                         status=err.status, code=err.code, param=err.param, model=self._model,
+                         status=err.status, code=err.code, param=err.param, model=self._model, route=self._log_route,
+                         expected=True if getattr(err, "expected", False) else None,
                          effort=self._effort_str or None,
                          stage=getattr(err, "stage", "upstream" if hasattr(err, "upstream_status") else "relay"),
                          upstream_status=getattr(err, "upstream_status", None),
@@ -981,6 +1005,8 @@ def make_handler(runtime: Runtime):
             parsed.credential_scope = self._credential_scope
             self._infer_conversation(parsed)
             parsed.request_id = self.request_id
+            client_context.bind({**client_context.current(), "conversation": journal.tag(parsed.conversation_key),
+                                 "route": self._log_route})
             # The size of the request as the client sent it, for count_tokens to scale from the real usage of this
             # request (a profile may rewrite the body, which the next count_tokens of the client does not see).
             client_chars = adapters.request_chars(parsed)
@@ -1085,7 +1111,9 @@ def make_handler(runtime: Runtime):
                                          effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
             task_note = " | TASK: " + parsed.client_task if parsed.client_task else ""
-            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}{task_note}")
+            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}{task_note}",
+                              kind="request.validated", model=parsed.model, requested_effort=self._effort_str or None,
+                              method=self.command, path=self.path, stream=parsed.stream, message=None)
 
             wait = runtime.limiter.take()
             if wait:
@@ -1468,7 +1496,8 @@ def make_handler(runtime: Runtime):
             text = redact(str(exc)).replace("\n", " ")[:160]
             journal.emit("prompt.runtime_error", "Слой промптов дал сбой (%s), запрос идёт прежним путём: %s: %s" % (
                 stage, type(exc).__name__, text), "error", request_id=self.request_id, stage=stage)
-            console_log.write("[err] prompt layer failed (%s): %s; legacy path" % (stage, type(exc).__name__))
+            console_log.write("[err] prompt layer failed (%s): %s; legacy path" % (stage, type(exc).__name__),
+                              kind="prompt.runtime_error", level="warn", stage=stage)
 
         def _pool_unavailable(self, entry, scope):
             """acquire()'s error for this request if it were asked now, after the one balance recheck a 402 gets."""
@@ -1804,7 +1833,7 @@ def main(argv=None):
                {"pending": "reading %d account%s in the background; the relay already serves" % (
                    reading, "" if reading == 1 else "s")})
     for line in banner_lines(cfg, pending, warnings):
-        console_log.write(line)
+        console_log.write(line, kind="relay.startup")
     first_round = threading.Thread(target=startup_round, args=(runtime,), name="startup-balances", daemon=True)
     first_round.start()
 
@@ -1814,7 +1843,7 @@ def main(argv=None):
         if stop_requested.is_set():
             return
         stop_requested.set()
-        console_log.write("shutting down…")
+        console_log.write("shutting down…", kind="relay.shutdown")
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1824,7 +1853,8 @@ def main(argv=None):
             pass
 
     def _thread_crash(args):
-        console_log.write("thread crash: %s %s" % (args.exc_type.__name__, args.exc_value))
+        console_log.write("thread crash: %s %s" % (args.exc_type.__name__, args.exc_value),
+                          kind="relay.thread_crash", level="error")
 
     threading.excepthook = _thread_crash
 
@@ -1836,7 +1866,7 @@ def main(argv=None):
             except Exception as exc:  # never lose the listener on a stray error
                 if stop_requested.is_set():
                     break
-                console_log.write("serve_forever crashed: %s" % exc)
+                console_log.write("serve_forever crashed: %s" % exc, kind="relay.listener_error", level="error")
                 time.sleep(0.5)
     finally:
         try:

@@ -2,6 +2,7 @@
 import datetime
 import asyncio
 import io
+import json
 import re
 import sys
 from types import SimpleNamespace
@@ -69,6 +70,23 @@ def test_whole_multiline_literal_secret_is_masked_before_lines_are_stamped(monke
     stream = io.StringIO()
     console_log.write("key: first-half\nsecond-half", file=stream)
     assert "first-half" not in stream.getvalue() and "second-half" not in stream.getvalue()
+
+
+def test_jsonl_keeps_one_record_per_message_and_masks_values_before_encoding(monkeypatch):
+    instance = journal.Journal()
+    instance.configure({"relay_api_key": "first-half\nsecond-half", "_extra_secrets": ["message"]})
+    monkeypatch.setattr(journal, "JOURNAL", instance)
+    monkeypatch.setenv("RELAY_LOG_FORMAT", "jsonl")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    stream = io.StringIO()
+    console_log.write("first-half\nsecond-half\n\x1b[31msecond\u2028line", file=stream,
+                      kind="test.diagnostic", level="warn", hint="first-half\nsecond-half", ts="spoof")
+    only, = stream.getvalue().splitlines()
+    row = json.loads(only)
+    assert datetime.datetime.fromisoformat(row["ts"]).tzinfo is not None
+    assert row["kind"] == "test.diagnostic" and row["level"] == "warn"
+    assert row["message"] == "[redacted]\nsecond\u2028line" and row["hint"] == "[redacted]"
+    assert "\\u001b" not in only and "first-half" not in only and "second-half" not in only
 
 
 def test_rotation_error_is_timestamped_without_reentering_journal_or_leaking_exception(tmp_path, monkeypatch, capsys):

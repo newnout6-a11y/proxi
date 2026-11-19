@@ -2019,7 +2019,8 @@ async def _keepwarm(session, cfg):
                 session._warm_failures = failures
                 if failures >= 5:
                     journal.emit("cache.keepwarm", _STOP_TEXT["failures"], "warn", account=account)
-                    console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire")
+                    console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire",
+                                      kind="cache.keepwarm_stopped", level="warn", account=account)
                     cycle.stop("failures", failures=failures)
                     return
                 failed_at = time.time()
@@ -2039,7 +2040,9 @@ async def _keepwarm(session, cfg):
                              if fits else
                              "Прогрев не удался; повтор не успевает до истечения кэша: %s" % str(exc)[:200],
                              "warn", account=account)
-                console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" % str(exc)[:200])
+                console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" %
+                                  journal.redact_whole(str(exc))[:200], kind="cache.keepwarm_failed", level="warn",
+                                  account=account)
                 if not fits:
                     cycle.stop("cache_expired", touch_age_seconds=round(failed_at - touch_at), limit=PING_DEADLINE,
                                during_turn=busy, after_failure=True, failures=failures)
@@ -3097,7 +3100,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         except asyncio.TimeoutError:
             if think_started is not None and not text and not stack and not calls:
                 elapsed = loop_now() - think_started
-                console_log.write(f"[{req_id}] Waiting for upstream reasoning output... ({round(elapsed)}s elapsed)")
+                console_log.write(f"[{req_id}] Waiting for upstream reasoning output... ({round(elapsed)}s elapsed)",
+                                  kind="upstream.thinking_heartbeat", level="debug", elapsed_ms=round(elapsed * 1000),
+                                  message=None)
                 journal.emit("upstream.thinking_heartbeat",
                              f"Ожидаем ответ upstream после начала thinking ({round(elapsed)} с)",
                              "debug", elapsed=round(elapsed, 1), thread=journal.tag(req_id))
@@ -3112,7 +3117,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             raise item
 
         if cfg.get("direct_raw"):
-            console_log.write("[raw] " + str(item)[:200])
+            console_log.write("[raw] " + journal.redact_whole(str(item))[:200],
+                              kind="upstream.raw_diagnostic", level="debug")
         try:
             event = json.loads(item)
         except Exception:
@@ -3147,7 +3153,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 # signature; surfacing the start replaces silence with "thinking".
                 think_started = loop_now()
                 reasoning_told = True
-                console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start")
+                console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start",
+                                  kind="upstream.thinking_signal", signal="content_block_start", message=None)
                 journal.emit("upstream.thinking_signal", "Upstream сообщил начало блока thinking", "info",
                              source="upstream", signal="content_block_start", thread=journal.tag(req_id))
                 yield {"type": "thinking_start"}
@@ -3163,7 +3170,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 if not reasoning_told:
                     reasoning_told = True
                     console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start "
-                                      f"block={event.get('type')}")
+                                      f"block={event.get('type')}", kind="upstream.thinking_signal",
+                                      signal="content_block_start", block=event.get("type"), message=None)
                     journal.emit("upstream.thinking_signal", "Upstream начал рассуждение: зашифрованный блок без текста",
                                  "info", source="upstream", signal="content_block_start", block=event.get("type"),
                                  thread=journal.tag(req_id))
@@ -3190,7 +3198,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             if block == "text":
                 piece = event.get("partialText") or ""
                 if piece and cfg.get("direct_debug") and not text:
-                    console_log.write("[ttft] %.2fs" % (time.time() - started))
+                    console_log.write("[ttft] %.2fs" % (time.time() - started), text_only=True)
                 if piece:
                     text.append(piece)
                     reasoning_told = False
@@ -3252,7 +3260,7 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 flags.setdefault("last_usage", {}).update(usage)
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
-                                  (" " + client_context.label() if client_context.label() else ""))
+                                  (" " + client_context.label() if client_context.label() else ""), kind="cache.summary")
             credits_value = console_log.number(usage.get("creditsUsed"))
             normalized = {target: usage[source] for source, target in (
                 ('inputTokens', 'input_tokens'), ('outputTokens', 'output_tokens'),

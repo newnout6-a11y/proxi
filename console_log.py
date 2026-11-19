@@ -1,10 +1,12 @@
-"""Terminal-only presentation; redirected logs stay readable without ANSI."""
+"""Human-readable console output and redacted JSONL diagnostics."""
 import math
 import os
 import re
 import sys
 import threading
 
+import client_context
+import console_records
 import credits
 import journal
 from console_clock import timestamp
@@ -110,10 +112,26 @@ def render(line, *, color=None):
     return prefix + line
 
 
-def write(line, *, file=None, with_time=True):
+def write(line, *, file=None, with_time=True, kind="relay.diagnostic", level="info", text_only=False, **fields):
     """Best effort, as the journal is: a console that cannot be written (the supervisor that read the relay's stdout was
     killed without /T, and the pipe is gone) used to raise OSError out of request handling, so every completion and every
     error ended with no response at all, and the journal lost the event too."""
+    if with_time and console_records.enabled():
+        if not text_only:
+            identity = client_context.current()
+            context = {key: identity[key] for key in console_records.IDENTITY if identity.get(key)}
+            context["client_session"] = journal.tag(identity.get("client_session_id"))
+            # Redact before removing escapes or serializing; a literal secret can span physical lines.
+            raw = {"message": str(line), **context, **fields}
+            try:
+                # Keep the schema's fixed field names even when one matches a configured secret.
+                data = dict(zip(raw, journal.scrub(tuple(raw.values()))))
+                if isinstance(data["message"], str):
+                    data["message"] = _ANSI.sub("", data["message"]).replace("\x1b", "")
+                console_records.write(kind, level, data, file=file)
+            except (OSError, TypeError, ValueError):
+                pass
+        return
     with _LOCK:
         try:
             # New messages always get actual event time, even if upstream payload text looks like an old timestamp.

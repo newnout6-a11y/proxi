@@ -16,7 +16,7 @@ from test_native_context_reuse import PARSE_CFG, run, setup
 
 
 class Clock:
-    """orchestrator's `time`, with the wall clock moved on while the upstream is thinking."""
+    """orchestrator's monotonic clock, advanced while the upstream is thinking."""
 
     def __init__(self):
         self.shift = 0.0
@@ -24,8 +24,8 @@ class Clock:
     def __getattr__(self, name):
         return getattr(time, name)
 
-    def time(self):
-        return time.time() + self.shift
+    def monotonic(self):
+        return time.monotonic() + self.shift
 
 
 def first_token(tmp_path, monkeypatch, effort, seconds):

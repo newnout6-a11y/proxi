@@ -16,7 +16,7 @@ import journal
 import validate
 from test_client_contracts import CFG, _body
 from test_error_envelopes import BUDGET_CODES, codes_written_in_the_relay
-from test_structured_output import body as structured_body, parse as structured_parse, post, sse_events
+from test_structured_output import body as structured_body, parse as structured_parse, post, sse_events, wait_for
 
 # Codex ends the turn at once, without a retry, for these codes (responses_error.rs:44-102, error.rs:413-441);
 # server_is_overloaded does too unless the error carries a Retry-After.
@@ -286,8 +286,14 @@ def test_http_chat_and_messages_streams_keep_their_error_event_alone(relay, dial
 
 def test_the_journal_still_records_a_failed_responses_stream_as_an_error(relay):
     relay.fake.script = [apierr.upstream_error('boom')]
-    post(relay, 'responses', dict(_body('responses'), stream=True))
-    failed = [e for e in journal.JOURNAL.query() if e['kind'] == 'http.request'
-              and e['data']['path'] == '/v1/responses' and e['data'].get('status') == 502]
-    assert failed and all(e['level'] == 'error' for e in failed)
+    status, headers, _ = post(relay, 'responses', dict(_body('responses'), stream=True))
+
+    def requests():
+        return [e for e in journal.JOURNAL.query() if e['kind'] == 'http.request'
+                and e.get('request_id') == headers['x-request-id']]
+
+    wait_for(requests)
+    failed, = requests()
+    assert status == failed['data']['http_status'] == 200
+    assert failed['data']['status'] == 502 and failed['level'] == 'error'
     assert any(e['kind'] == 'http.error' and e['data']['code'] == 'upstream_error' for e in journal.JOURNAL.query())

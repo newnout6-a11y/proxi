@@ -828,7 +828,8 @@ class TurnRunner:
             text = redact(str(exc)).replace("\n", " ")[:160]
             log("prompt.runtime_error", "Слой промптов не собрал head, запрос идёт прежним путём: %s: %s" % (
                 type(exc).__name__, text), "error", stage="compose")
-            console_log.write("[err] prompt layer failed (compose): %s; legacy head" % type(exc).__name__)
+            console_log.write("[err] prompt layer failed (compose): %s; legacy head" % type(exc).__name__,
+                              kind="prompt.runtime_error", level="warn")
             return None
         return head, parts, warnings
 
@@ -978,7 +979,7 @@ class TurnRunner:
             data = await backend.get_messages(session.thread_id)
         except Exception as exc:
             if not quiet:
-                console_log.write("[explain] fetch failed: %s" % exc)
+                console_log.write("[explain] fetch failed: %s" % exc, kind="upstream.explain_failed", level="warn")
             return None
         # Retool returns messages newest-first.
         for message in data.get("messages", []):
@@ -1359,6 +1360,7 @@ class TurnRunner:
     async def _run_once(self, parsed, out, holder, exclude=()):
         turn_id = str(uuid.uuid4())
         holder["turn_id"] = turn_id
+        holder.pop("_console_route", None)
         # Loop detection is per client turn, never shared by concurrent chats.
         recent = []
         cancelled = holder.setdefault("cancel_event", threading.Event())
@@ -1374,7 +1376,7 @@ class TurnRunner:
         output_attempts = {}
         request_attempts = holder.setdefault("_speed_attempts", {})
         outcome = {"reason": None, "error": None, "first": False}
-        trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None),
+        trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None), "model": parsed.model,
                  "conversation": journal.tag(getattr(parsed, "conversation_key", None))}
 
         def log(kind, message, level="info", **fields):
@@ -1387,7 +1389,7 @@ class TurnRunner:
                 if count is not None:
                     output_attempts[fields["attempt"]] = count
                     request_attempts[(turn_id, fields["attempt"])] = count
-            journal.emit(kind, message, level, **trace, **fields)
+            journal.emit(kind, message, level, **{**trace, **fields})
 
         try:
             native_tools = getattr(parsed, "tools", None) or []
@@ -1570,10 +1572,6 @@ class TurnRunner:
                 acquired = session.session if isinstance(session, SessionLease) else session
                 # Every later event of this turn, errors included, names the account serving it.
                 trace["account"] = account_tag(getattr(acquired, "backend", None))
-                if trace["account"]:
-                    # Events that other modules emit for this turn (the transport, native history) get the
-                    # tag through the context: they know no more than the session they run on.
-                    account_context = client_context.bind({**client_context.current(), "account": trace["account"]})
                 # Debit the account that actually served the turn.
                 account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
                 acquired._credits_manager = account_credits
@@ -1603,14 +1601,20 @@ class TurnRunner:
                     # __managed__: omit the field entirely (never send null).
                     model_provider.pop("providerResourceName", None)
                 actual_upstream = acc_cfg.get("upstream", "retool")
+                bound_route = {"upstream": actual_upstream, "upstream_model": model_provider.get("model"),
+                               "effective_effort": model_provider.get("reasoningEffort"),
+                               "account": trace["account"], "turn_id": turn_id}
+                holder["_console_route"] = bound_route
+                trace.update(bound_route)
+                # The transport's own events and the runner's events refer to the same serving attempt.
+                account_context = client_context.bind({**client_context.current(), **trace})
                 console_log.write(console_log.route_line(
                     getattr(parsed, "request_id", None) or "req", upstream=actual_upstream,
                     account=account_tag(getattr(acquired, "backend", None)), model=parsed.model,
                     upstream_model=model_provider.get("model"), effort=model_provider.get("reasoningEffort"),
-                    child=bool(parent_key)))
+                    child=bool(parent_key)), text_only=True)
                 log("route.bound", "Выбран фактический маршрут %s" % actual_upstream,
-                    upstream=actual_upstream, model=parsed.model, upstream_model=model_provider.get("model"),
-                    effective_effort=model_provider.get("reasoningEffort"), child=bool(parent_key))
+                    child=bool(parent_key), provider=_provider_label(getattr(acquired, "backend", None)))
                 if actual_upstream != "retool" and getattr(parsed, "client_task", "") not in client_context.SIDE_TASKS:
                     # What the dialog's turns go with: its compaction keeps it (_minara_dialog_effort).
                     target = acquired.session if isinstance(acquired, SessionLease) else acquired
@@ -1654,6 +1658,7 @@ class TurnRunner:
                     upstream_text = ""
                     visible_text = ""
                     holder["upstream_started_at"] = time.time()
+                    upstream_started = time.monotonic()
                     streamed_tool_call = False
                     dropped_calls = []
                     upstream_completed = False
@@ -1767,13 +1772,15 @@ class TurnRunner:
                                 if event["type"] == "request_sent":
                                     out.put(event)
                                     continue
-                                if not first_token and event["type"] in ("text", "thinking", "tool_call"):
+                                if (not first_token and event.get("source") != "relay"
+                                        and event["type"] in ("text", "thinking", "tool_call")):
                                     first_token = True
-                                    ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                    ttft = round((time.monotonic() - upstream_started) * 1000)
                                     sent_effort = model_provider.get("reasoningEffort")
                                     log("upstream.first_token", "Первый токен через %d мс" % ttft,
                                         first_token_level(ttft, sent_effort), ttft_ms=ttft, first=event["type"],
-                                        effort=sent_effort, warn_ms=first_token_warn_ms(sent_effort))
+                                        effort=sent_effort, warn_ms=first_token_warn_ms(sent_effort),
+                                        attempt=journal_attempt)
                                 if event["type"] in ("thinking_status", "thinking_start", "thinking", "thinking_signature",
                                                      "tool_call"):
                                     text_open = False
@@ -1781,9 +1788,9 @@ class TurnRunner:
                                     if not text_open and event["delta"]:
                                         # Every text segment (text, thinking, text) opens its own answer span.
                                         text_open = True
-                                        ms = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                        ms = round((time.monotonic() - upstream_started) * 1000)
                                         log("upstream.text_start", "Модель начала писать текст через %d мс" % ms,
-                                            "debug", ms=ms)
+                                            "debug", ms=ms, attempt=journal_attempt)
                                     final_text += event["delta"]
                                     upstream_text += event["delta"]
                                     # Tool envelopes are parsed only after the complete
@@ -2025,7 +2032,8 @@ class TurnRunner:
                                                 credits=minara_credits, write_cost=write_cost,
                                                 channel=usage.get('channel') or '?', path=usage.get('channel_path'),
                                                 provider=usage.get('provider') or '?')
-                                                + (" " + client_context.label() if client_context.label() else ""))
+                                                + (" " + client_context.label() if client_context.label() else ""),
+                                                kind="cache.summary")
                                     if write_cost is not None and write_cost >= credits.WRITE_WARN:
                                         # A warning only: by the time the usage arrives the turn is paid for. The
                                         # console shows it as a [WRITE COSTLY …] marker inside the [cache] line.
