@@ -630,6 +630,9 @@ def test_the_account_returns_after_the_pause_and_new_conversations_use_it_again(
 
 def test_the_first_real_request_after_the_pause_parks_the_account_again_for_longer(retool):
     retool.script["acc-a"] = hourly
+    # acc-a's plan served the model before its limit (as an account that hits it has): a new conversation is offered to
+    # the least loaded of the accounts that served the model (SessionPool._plan_order), acc-a once it is back.
+    retool.dispatcher.mark_plan_served(retool.a, "claude-opus-5-5")
 
     async def scenario():
         await run(retool.runner, turn("conv-1"))
@@ -665,6 +668,9 @@ def test_a_limit_reported_by_a_request_that_left_before_the_pause_is_not_a_secon
 
 def test_a_limit_from_a_request_that_left_after_the_return_parks_the_account_again(retool):
     retool.script["acc-a"] = hourly
+    # acc-a's plan served the model before its limit (as an account that hits it has): a new conversation is offered to
+    # the least loaded of the accounts that served the model (SessionPool._plan_order), acc-a once it is back.
+    retool.dispatcher.mark_plan_served(retool.a, "claude-opus-5-5")
 
     async def scenario():
         await run(retool.runner, turn("conv-1"))

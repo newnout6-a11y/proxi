@@ -234,9 +234,23 @@ def _minara_refusal(error):
     return getattr(error, "status", 0) == 402 or getattr(error, "code", None) == "upstream_auth_error"
 
 
-def _model_id(parsed):
-    """The catalog id of the model a request runs on: what the pool and an account's plan refusals are keyed by."""
-    return (getattr(parsed, "entry", None) or {}).get("id") or getattr(parsed, "model", None)
+def _model_id(parsed, lease=None):
+    """The catalog id of the model a request runs on: what the pool and an account's plan refusals are keyed by. A route
+    alias runs as the target its lease was bound to (SessionPool._bound_target), and a refusal is that target's: one kept
+    under the alias's id was seen by no account choice (audit A08-01)."""
+    entry = getattr(parsed, "entry", None) or {}
+    bound = getattr(lease, "bound_entry", None) if lease is not None else None
+    if isinstance(bound, dict) and bound.get("alias_id") and bound.get("alias_id") == entry.get("id"):
+        return bound.get("id")
+    return entry.get("id") or getattr(parsed, "model", None)
+
+
+def _failed_pair(parsed, lease, backend):
+    """What a failure of the model takes out of a request's failover: the account, or for a route alias the pair (account,
+    target the turn ran as), so that the alias's other targets of that account are still tried (audit A17-01)."""
+    model = _model_id(parsed, lease)
+    entry = getattr(parsed, "entry", None) or {}
+    return (backend, model) if entry.get("route_targets") and model != entry.get("id") else backend
 
 
 def _may_be_balance_related(error):
@@ -254,6 +268,9 @@ LIMIT_WAIT_MIN_PREFIX = 8000
 # How long a universal provider that answered 429 without a Retry-After is left out of the pool: a provider's limit is per
 # minute (OpenRouter, OpenAI, Anthropic), not Retool's sliding hour, so account_rate_limit_cooldown (900 s) never fits it.
 PROVIDER_RATE_LIMIT_PAUSE = 60
+# How many times a request chooses its account again after acquire() met a Retool plan hold that landed while it waited
+# (SessionPool marks such a 404 plan_hold; design D4 1.7). Each time a 402 of another request must land within one wait.
+PLAN_HOLD_RACES = 3
 
 
 def _provider_label(backend):
@@ -1185,7 +1202,8 @@ class TurnRunner:
                     # account is held back from this model alone (never from the others), whether or not this turn can
                     # still move, and the turn moves while the client has seen nothing. No balance is read for it.
                     if hasattr(accounts, "mark_plan_refusal"):
-                        accounts.mark_plan_refusal(backend, _model_id(parsed), request_id=getattr(parsed, "request_id", None))
+                        accounts.mark_plan_refusal(backend, _model_id(parsed, lease),
+                                                   request_id=getattr(parsed, "request_id", None))
                     plan_refused = retryable and backend not in exclude
                 if (retryable and backend is None and error.code == "insufficient_credits"
                         and not rechecked and hasattr(accounts, "recheck_exhausted")):
@@ -1230,14 +1248,14 @@ class TurnRunner:
                 holder["reason"] = "stop"
                 continue
             if plan_refused:
-                exclude.append(backend)
+                exclude.append(_failed_pair(parsed, lease, backend))
                 _settle_turn(holder, "moved")
                 holder["_attempt_budget"].refund()
                 journal.emit("account.failover", "Модель не входит в тариф аккаунта Retool — запрос повторён на другом аккаунте",
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
-                             error=error.code, reason="plan_refused", model=_model_id(parsed))
+                             error=error.code, reason="plan_refused", model=_model_id(parsed, lease))
                 console_log.write("[%s] [account] %s: %s не входит в тариф Retool, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), _model_id(parsed)))
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), _model_id(parsed, lease)))
                 holder["reason"] = "stop"
                 continue
             if exhausted:
@@ -1262,10 +1280,14 @@ class TurnRunner:
                     and error.code in ("upstream_error", "service_unavailable", "upstream_timeout",
                                        "upstream_auth_error", "insufficient_credits", "rate_limit_error")):
                 check_next = getattr(self.pool, "unavailable_error", None)
+                # A failure of the model takes out the pair (account, target) of a route alias: the next target of the same
+                # provider is still tried on this key (A17-01). A failure of the key itself (401, quota, 429) takes the key.
+                failed = (_failed_pair(parsed, lease, backend)
+                          if error.code in ("upstream_error", "service_unavailable", "upstream_timeout") else backend)
                 if check_next is not None and check_next(
-                    parsed.entry, exclude=(*exclude, backend), **acquire_plan(self.cfg, parsed).kwargs
+                    parsed.entry, exclude=(*exclude, failed), **acquire_plan(self.cfg, parsed).kwargs
                 ) is None:
-                    exclude.append(backend)
+                    exclude.append(failed)
                     _settle_turn(holder, "moved")
                     journal.emit("account.failover", "Сбой апстрима провайдера — запрос переключён на резервный маршрут",
                                  "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
@@ -1274,10 +1296,25 @@ class TurnRunner:
                         getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), error.code))
                     holder["reason"] = "stop"
                     continue
+            if (retryable and backend is None and getattr(error, "plan_hold", False)
+                    and holder.get("_plan_hold_races", 0) < PLAN_HOLD_RACES and self._pool_refusal(parsed, exclude) is None):
+                # The pool's 404 named only a Retool plan hold that a neighbour's 402 left on the account acquire() had
+                # chosen while it waited (design D4 1.7, SessionPool._check_route): another account serves the model now,
+                # so the request chooses again, as it would have a moment earlier, instead of a settled 404.
+                holder["_plan_hold_races"] = holder.get("_plan_hold_races", 0) + 1
+                _settle_turn(holder, "moved")
+                journal.emit("account.failover", "Тариф аккаунта отказал в модели, пока запрос ждал, — аккаунт выбран заново",
+                             "warn", request_id=getattr(parsed, "request_id", None), error=error.code,
+                             reason="plan_hold_race", model=_model_id(parsed))
+                holder["reason"] = "stop"
+                continue
             if error is not None and apierr.is_plan_refusal(error):
                 # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
                 # the client gets the settled 404 that names the cause rather than a 502 it would only send again.
                 error = self._pool_refusal(parsed, exclude) or error
+            if error is None and relay.started and backend is not None and hasattr(accounts, "mark_plan_served"):
+                # The account's Retool plan includes the model: the pool asks such accounts first (retool_plans).
+                accounts.mark_plan_served(backend, _model_id(parsed, lease))
             _settle_turn(holder)  # the error, if any, is what the client gets: red
             if error is not None:
                 out.put({"type": "error", "error": error})
@@ -1524,11 +1561,17 @@ class TurnRunner:
                 # must come from the backend cfg the turn actually runs on, not the
                 # global config (accounts[] can span tenants).
                 acc_cfg = getattr(getattr(acquired, "backend", None), "cfg", None) or self.cfg
-                bound_entry = model_catalog.bind_entry_for_backend(parsed.entry, acc_cfg)
+                # A route alias runs as the target the pool chose the account for (lease.bound_entry, A08-02).
+                bound_entry = (getattr(session, "bound_entry", None)
+                               or model_catalog.bind_entry_for_backend(parsed.entry, acc_cfg))
                 acquired._bound_entry = bound_entry
                 acquired._provider_options = dict(getattr(parsed, "provider_options", None) or {})
                 acquired._structured_output = getattr(parsed, "structured_output", None)
                 model_provider["model"] = bound_entry.get("upstream_model") or bound_entry["id"]
+                if isinstance(bound_entry, dict) and bound_entry.get("alias_id"):
+                    # The bound target's price, Minara fields and effort, not those of the alias's first target (A12-03).
+                    model_catalog.bind_provider(model_provider, bound_entry, getattr(parsed, "effort", None), self.cfg,
+                                                kept=holder.get("kept_effort"))
                 resource = model_catalog.provider_resource(acc_cfg, bound_entry)
                 if resource:
                     model_provider["providerResourceName"] = resource

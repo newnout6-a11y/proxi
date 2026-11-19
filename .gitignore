@@ -59,6 +59,8 @@ probes/chunks/
 # What the relay measured of Minara (minara_refresh), Retool (retool_refresh) and universal providers (catalog.discovery)
 /minara_models.auto.json
 /retool_models.auto.json
+/retool_plans.auto.json
+/retool_plans.auto.json.bad
 /provider_models.auto.json
 /models_dev.cache.json
 # What a client key spent on Minara today (cost_guard)
@@ -66,5 +68,6 @@ probes/chunks/
 /cost_guard.auto.json.tmp
 .minara-catalog-*.tmp
 .retool-catalog-*.tmp
+.retool-plans-*.tmp
 .prov_models_*.tmp
 .models_dev_*.tmp

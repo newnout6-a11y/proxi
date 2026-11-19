@@ -26,7 +26,7 @@ import conversation_state
 import journal
 import console_log
 import models as model_catalog
-from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled
+from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled, priority as account_priority
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -916,6 +916,53 @@ class _Dependent:
         self.session = None
 
 
+def _route_targets(model_entry):
+    """The targets of a route alias (routes[] in config.json) in the route's order; () for any other model."""
+    targets = model_entry.get("route_targets") if isinstance(model_entry, dict) else None
+    return targets or ()
+
+
+def _excluded_for(exclude, model_id):
+    """The accounts `exclude` takes out of a request for one model.
+
+    An item is an account that failed the request, or an (account, model id) pair: that account failed that target of a
+    route alias and may still serve the alias's other targets (the orchestrator's failover after a failure of the model
+    itself; a route whose fallback is another model of the same provider was never tried: audit A17-01)."""
+    return tuple(item[0] if isinstance(item, tuple) else item for item in exclude
+                 if not isinstance(item, tuple) or item[1] == model_id)
+
+
+def _route_strategy(model_entry):
+    """How a route alias spreads its turns over the accounts of all its targets ("weighted", "least-inflight"), or None for
+    "priority" (its first target that has a usable account) and any other model."""
+    if not _route_targets(model_entry):
+        return None
+    strategy = str(model_entry.get("route_strategy") or "priority").lower()
+    return strategy if strategy in ("weighted", "least-inflight") else None
+
+
+# Retool models a plan of 250 credits a month does not include as a rule: on 2026-11-18 all 22 such accounts refused
+# claude-opus-5-5 and claude-sonnet-5-5, and the GPT-6 models wherever they were asked (reverse_retool_live 7).
+_FRONTIER = ("claude-opus-", "claude-sonnet-5", "claude-fable-", "gpt-6", "gpt-5.6-luna")
+SMALL_PLAN = 250
+
+
+def _frontier(model):
+    return isinstance(model, str) and model.startswith(_FRONTIER)
+
+
+def _small_plan(backend):
+    """Whether this Retool account's last read balance names a monthly allocation of SMALL_PLAN credits or less."""
+    if (getattr(backend, "cfg", None) or {}).get("upstream", "retool") != "retool":
+        return False
+    snapshot = getattr(getattr(backend, "credits", None), "balance_snapshot", None)
+    try:
+        allocation = console_log.number((snapshot() or {}).get("monthly_allocation")) if snapshot else None
+    except Exception:  # noqa: BLE001 - an order hint must never fail a request
+        return False
+    return allocation is not None and 0 < allocation <= SMALL_PLAN
+
+
 class SessionPool:
     """Bounded persistent conversations with one exclusive lease per request."""
 
@@ -1076,14 +1123,20 @@ class SessionPool:
 
         Without the second half, when every account was in reserve or signed out, a conversation moved to the "richest" or
         least loaded other account on every request (its own session counts as load on its account), and each move dropped
-        its signed history and wrote its whole prefix again, more credits than an account in reserve has left."""
-        if self._usable(backend, exclude) and self._routable(backend, model_entry):
+        its signed history and wrote its whole prefix again, more credits than an account in reserve has left.
+
+        A route alias whose earlier targets no account serves now stays on an account that serves the target the route's
+        order takes (it is among the ready accounts): moved instead, its conversation went to the least loaded of those
+        accounts on every request, back and forth, and each move wrote its whole prefix again."""
+        if self._serves(backend, model_entry, exclude):
             return True
         try:
             kind, candidates = self._candidates(self.backends, model_entry, exclude)
         except apierr.ApiError:
             return False
-        return kind != "ready" and backend in candidates
+        if kind == "ready":
+            return bool(_route_targets(model_entry)) and backend in candidates
+        return backend in candidates
 
     def _move_reason(self, backend, model_entry):
         """Why a conversation leaves this account (account.migrate): why the account is out of the pool, its Retool plan
@@ -1103,9 +1156,14 @@ class SessionPool:
             return "account_excluded"
         if not account_enabled(backend):
             return "account_disabled"
-        if getattr(backend, "unavailable", None) is not None and not self._keeps(backend, model_entry, exclude):
+        if self._keeps(backend, model_entry, exclude):
+            return None  # as a live conversation of it stays there
+        if getattr(backend, "unavailable", None) is not None:
             return "account_unavailable"
-        return None if self._routable(backend, model_entry) else "no_route"
+        if not self._routable(backend, model_entry):
+            return "no_route"
+        primary = self._primary(backend, model_entry)
+        return "account_excluded" if backend in _excluded_for(exclude, (primary or {}).get("id")) else "no_route"
 
     def _stored_binding(self, keys, model_entry, exclude):
         """(meta, backend, refusal) of the first of `keys` that has a stored state.
@@ -1262,20 +1320,91 @@ class SessionPool:
 
     @staticmethod
     def _plan_hold(backend, model_entry):
-        """The hold AccountDispatcher.mark_plan_refusal keeps on this account for this model ({until_at, pause}), or None."""
+        """The hold AccountDispatcher.mark_plan_refusal keeps on this account for this model ({until_at, pause}), or None.
+
+        A hold is kept under the id of the model the turn ran as, for a route alias the target it was bound to, never the
+        alias (audit A08-01: a hold under "smart-opus" was seen by acquire() and by nothing that picks an account, so the
+        alias got a settled 404 while its Minara target was free). An alias is held on an account only while each target the
+        account can serve by its configuration is held there, and then its hold is the one that ends first."""
         holds = getattr(backend, "refused_models", None)
         if not isinstance(holds, dict) or not holds or model_entry is None:
             return None
-        return holds.get(model_entry.get("id"))
+        if not _route_targets(model_entry):
+            return holds.get(model_entry.get("id"))
+        found = [holds.get(target.get("id")) for target in SessionPool._configured_targets(backend, model_entry)]
+        if not found or not all(found):
+            return None
+        return min(found, key=lambda hold: hold.get("until_at") or 0)
+
+    @staticmethod
+    def _configured_targets(backend, model_entry):
+        """The targets of a route alias this account can serve by its configuration, in the route's order."""
+        cfg = getattr(backend, "cfg", None) or {}
+        return [target for target in _route_targets(model_entry)
+                if not model_catalog.route_block_reason(target, cfg)
+                and not model_catalog.resource_block_reason(target, cfg)]
+
+    @staticmethod
+    def _primary(backend, model_entry):
+        """The model this account serves a request with first: the model itself, or for a route alias the first of its
+        targets the account can serve by its configuration (the alias itself when there is none)."""
+        if not _route_targets(model_entry):
+            return model_entry
+        return next(iter(SessionPool._configured_targets(backend, model_entry)), model_entry)
+
+    @staticmethod
+    def _serves(backend, model_entry, exclude=()):
+        """Whether this account takes the request as it stands: usable, not failed for it, and a route to the model.
+
+        A route alias counts on the first target the account serves (_primary): once that one is held or failed on it, a
+        conversation moves where the route's order takes it, and stays on a later target of the same account only when no
+        account serves an earlier one (_keeps), instead of quietly changing models where it is."""
+        if not SessionPool._usable(backend, exclude):
+            return False
+        primary = SessionPool._primary(backend, model_entry)
+        return (backend not in _excluded_for(exclude, (primary or {}).get("id"))
+                and SessionPool._routable(backend, primary))
+
+    @staticmethod
+    def _bound_target(backend, model_entry, exclude=()):
+        """The model a request runs as on this account: the model itself, or for a route alias the first of its targets,
+        in the route's order, that the account serves now (its configuration, no hold of its plan, the pair did not fail
+        this request); None when there is none.
+
+        This is the target the pool chose the account for, and the turn is bound to it (lease.bound_entry). Bound by the
+        configuration alone, smart-opus went out as claude-opus-5-5 again to the account whose plan had just refused it, and
+        a later target of the same account or provider was never used (audits A08-02, A12-01, A17-01)."""
+        targets = _route_targets(model_entry)
+        if not targets:
+            return model_entry
+        for target in targets:
+            if backend in _excluded_for(exclude, target.get("id")) or SessionPool._route_refusal(backend, target):
+                continue
+            return model_catalog.bind_target(model_entry, target)
+        return None
+
+    @staticmethod
+    def _binding(backend, model_entry, exclude=()):
+        """What a lease's turn runs as (lease.bound_entry): _bound_target, else, for an account kept by default (in reserve,
+        signed out), its first target by configuration."""
+        bound = SessionPool._bound_target(backend, model_entry, exclude)
+        if bound is None:
+            bound = model_catalog.bind_entry_for_backend(model_entry, getattr(backend, "cfg", None))
+        return bound
 
     @staticmethod
     def _plan_reason(holds):
         """What a request is told about the accounts whose Retool plan refused its model: one text for all of them (the 404
         names it once), with how many there are and when the relay tries the first of them again."""
         first = min(hold.get("until_at") or 0 for hold in holds)
+        if all(hold.get("persisted") for hold in holds):
+            # Facts of the plans (retool_plans.auto.json): a background probe asks them again, not a client's request.
+            when = "the relay re-checks %s in the background from %s" % (
+                "it" if len(holds) == 1 else "them", time.strftime("%H:%M %d.%m", time.localtime(first)))
+        else:
+            when = "the relay tries again at %s" % time.strftime("%H:%M", time.localtime(first))
         return ('the Retool plan of %d account%s does not include it (HTTP 402 "This model is not available for your '
-                'plan."); the relay tries again at %s' % (len(holds), "" if len(holds) == 1 else "s",
-                                                          time.strftime("%H:%M", time.localtime(first))))
+                'plan."); %s' % (len(holds), "" if len(holds) == 1 else "s", when))
 
     @staticmethod
     def _refusals(model_entry, backends, configured=True):
@@ -1303,7 +1432,12 @@ class SessionPool:
     def _check_route(backend, model_entry):
         reason = SessionPool._route_refusal(backend, model_entry)
         if reason:
-            raise model_catalog.model_unavailable(model_entry, [reason])
+            error = model_catalog.model_unavailable(model_entry, [reason])
+            if not model_catalog.refusal_reasons(model_entry, [backend.cfg])[0]:
+                # Only a hold of the account's Retool plan refuses it: a fact about that account, not about the request
+                # (TurnRunner._run_request chooses again while another account serves the model, design D4 1.7).
+                error.plan_hold = True
+            raise error
 
     @staticmethod
     def _routable(backend, model_entry):
@@ -1400,6 +1534,11 @@ class SessionPool:
             fallback_reserve = None
             fallback_signed_out = None
             last_error = None
+            # A route that spreads its turns (strategy weighted or least-inflight, _next_backend) offers the usable accounts
+            # of every target; "priority" those of its first target that has any (audit A16-03: the strategy was saved,
+            # shown and never applied).
+            spread = _route_strategy(model_entry) is not None
+            ready = []
             for target in model_entry["route_targets"]:
                 try:
                     kind, found = self._candidates(backends, target, exclude, configured)
@@ -1407,18 +1546,24 @@ class SessionPool:
                     if last_error is None or err.status != 404:
                         last_error = err
                     continue
-                if kind == "ready":
+                if kind == "ready" and not spread:
                     return "ready", found
-                if kind == "reserve" and fallback_reserve is None:
+                if kind == "ready":
+                    ready.extend(backend for backend in found if backend not in ready)
+                elif kind == "reserve" and fallback_reserve is None:
                     fallback_reserve = found
                 elif kind == "signed_out" and fallback_signed_out is None:
                     fallback_signed_out = found
+            if ready:
+                return "ready", ready
             if fallback_reserve is not None:
                 return "reserve", fallback_reserve
             if fallback_signed_out is not None:
                 return "signed_out", fallback_signed_out
             raise (last_error or apierr.service_unavailable(f"no target in route '{model_entry.get('id')}' is currently usable"))
 
+        # An (account, model id) pair in `exclude` takes that account out for this model alone (_excluded_for).
+        exclude = _excluded_for(exclude, (model_entry or {}).get("id"))
         reasons = self._refusals(model_entry, backends, configured)
         routable = [backend for backend, reason in zip(backends, reasons) if not reason]
         refusals = [reason for reason in reasons if reason]
@@ -1490,7 +1635,48 @@ class SessionPool:
                 inflight_counts[session.backend] += 1
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % max(1, len(self.backends))
-        return catalog_router.select_candidate_backend(candidates, self.backends, counts, inflight_counts, idx)
+        # The operator's account priority comes first (backups at priority 10 serve only when no priority-0 account can),
+        # then what the plans served (_plan_order), then the route's strategy or the accounts' routing_strategy.
+        top = min(account_priority(backend) for backend in candidates)
+        candidates = self._plan_order([backend for backend in candidates if account_priority(backend) == top],
+                                      model_entry, exclude, counts)
+        return catalog_router.select_candidate_backend(candidates, self.backends, counts, inflight_counts, idx,
+                                                       strategy=_route_strategy(model_entry))
+
+    def _plan_order(self, candidates, model_entry, exclude, counts):
+        """The accounts of one priority a new conversation is offered first (design D4 1.6): those whose Retool plan served
+        its model (AccountDispatcher.mark_plan_served, `served_models`, kept a week), then the others, and last, for a
+        frontier model, those on a plan of 250 credits a month that never served it (all 22 such accounts refused Opus and
+        Sonnet 5.5 on 2026-11-18, and "least loaded" sent every new conversation to them first: A03-03).
+
+        A preference, never an exclusion (a plan can change): a lower tier gets the conversation once every account of
+        the tier above carries more than twice the load (conversations, turns in flight twice) of the least loaded
+        account below it, plus one. It orders the accounts of one model: a route alias that spreads its turns over several
+        targets (weighted, least-inflight) has the accounts of each target ordered on their own, and its strategy chooses
+        among what each offers, never the one Retool account that served once (Minara and the providers learn no plan)."""
+        groups = {}
+        for backend in candidates:
+            target = self._bound_target(backend, model_entry, exclude) or model_entry
+            groups.setdefault((target or {}).get("id"), []).append(backend)
+        return [backend for model, group in groups.items() for backend in self._plan_tier(group, model, counts)]
+
+    @staticmethod
+    def _plan_tier(backends, model, counts):
+        """_plan_order over the accounts of one model: the tier a new conversation of it goes to."""
+        tiers = ([], [], [])
+        for backend in backends:
+            if model in (getattr(backend, "served_models", None) or {}):
+                tiers[0].append(backend)
+            elif _frontier(model) and _small_plan(backend):
+                tiers[2].append(backend)
+            else:
+                tiers[1].append(backend)
+        tiers = [tier for tier in tiers if tier]
+        for index, tier in enumerate(tiers):
+            rest = [backend for lower in tiers[index + 1:] for backend in lower]
+            if not rest or min(counts.get(b, 0) for b in tier) <= 2 * min(counts.get(b, 0) for b in rest) + 1:
+                return tier
+        return backends
 
     @property
     def mode(self):
@@ -1704,8 +1890,58 @@ class SessionPool:
                 return self._stored_view(key, model_entry, exclude)
         else:
             session = None
-        if session is None or not (self._usable(session.backend, exclude) and self._routable(session.backend, model_entry)):
+        if session is None:
             return None
+        # A route alias may stay on a later target of its account (_keeps); any other model only where it is served.
+        stays = (self._keeps(session.backend, model_entry, exclude) if _route_targets(model_entry)
+                 else self._serves(session.backend, model_entry, exclude))
+        return session if stays else None
+
+    async def _move(self, key, session, replacement, model_entry):
+        """Move conversation `key` from `session` to a new session on `replacement`, and return that one: the history goes
+        along as account_move_keeps_history says, the children's pins too, and the old session is closed."""
+        self._check_route(replacement, model_entry)
+        old = session
+        session = RelaySession(replacement, await self._new_thread_id(replacement))
+        carried = self._carry_history(key, old, session)
+        # The children that run against this conversation pin it wherever it lives: their releases find the new session by
+        # key (_touch_cache_parents), and it is not evicted while one of them still works for it.
+        for name in ("_cache_dependents", "_cache_dependent_records", "_cache_children"):
+            if hasattr(old, name):
+                setattr(session, name, getattr(old, name))
+        self._conversations[key] = session
+        await old.aclose()
+        # Unless account_move_keeps_history took the signed branches along, the new account's first request is sent
+        # without them: its body differs from the cached one and the prefix is written again.
+        journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
+                     conversation=journal.tag(key),
+                     from_account=account_tag(old.backend), to_account=account_tag(replacement),
+                     reason=self._move_reason(old.backend, model_entry),
+                     **({"carried_branches": carried} if carried else {}))
+        return session
+
+    async def _settle_route(self, key, session, model_entry, exclude):
+        """The session a conversation's request runs on once acquire() has done its waiting: its own, or the one it moves to
+        when the Retool plan of its account refused the model meanwhile (for a route alias, the target the account would
+        serve it with first) and the account can no longer keep it (_keeps).
+
+        acquire() awaits between choosing an account and handing out the lease (the old session's aclose, _restore_state, a
+        new thread). A request of the same wave may get Retool's 402 on that account then, and the hold it leaves turned this
+        request into a settled 404 while attempts and serving accounts were left (2026-11-18 17:08:48-56, design D4 1.7), or
+        bound an alias's turn to its next target where it was while another account served the first one. A hold is no
+        settled fact about this request: it moves again, as acquire() would have a moment earlier, at most once per account
+        of the pool, and when no account is left the pool's own error says why. A refusal of the configuration is still the
+        settled 404."""
+        for _ in range(len(self.backends)):
+            backend = session.backend
+            if (self._keeps(backend, model_entry, exclude)
+                    or self._plan_hold(backend, self._primary(backend, model_entry)) is None):
+                break
+            replacement = self._next_backend(model_entry, exclude)
+            if replacement is backend:
+                break
+            session = await self._move(key, session, replacement, model_entry)
+        self._check_route(session.backend, model_entry)
         return session
 
     async def acquire(self, conversation_key=None, *, isolated=False, model_entry=None, context_scope=None,
@@ -1772,6 +2008,13 @@ class SessionPool:
                         await asyncio.wait_for(gate.wait(), conversation_state.RESTORE_TIMEOUT + 5)
                     except asyncio.TimeoutError:
                         pass
+                if affinity_backend is not None and not self._keeps(affinity_backend, model_entry, exclude):
+                    # The waits above let other requests run: a neighbour's 402 may have held the account chosen before
+                    # them (the conversation's own, or the one a stored state belongs to), or it left the pool. Chosen
+                    # again, as a moment earlier, instead of a settled 404 from _check_route while another account serves
+                    # the model (design D4 1.7: a parallel request of a busy conversation, the first request after a
+                    # restart).
+                    affinity_backend = None
                 if lock.locked() and (getattr(self._conversations.get(key), "_direct", None)
                                       or getattr(self._conversations.get(key), "_cached_head", None)
                                       or self.cfg.get("transport") == "direct"
@@ -1812,25 +2055,7 @@ class SessionPool:
                         # a lone fallback account is the same backend and is kept as is.
                         replacement = affinity_backend or self._next_backend(model_entry, exclude)
                         if replacement is not session.backend:
-                            self._check_route(replacement, model_entry)
-                            old = session
-                            session = RelaySession(replacement, await self._new_thread_id(replacement))
-                            carried = self._carry_history(key, old, session)
-                            # The children that run against this conversation pin it wherever it lives: their releases
-                            # find the new session by key (_touch_cache_parents), and it is not evicted while one of
-                            # them still works for it.
-                            for name in ("_cache_dependents", "_cache_dependent_records", "_cache_children"):
-                                if hasattr(old, name):
-                                    setattr(session, name, getattr(old, name))
-                            self._conversations[key] = session
-                            await old.aclose()
-                            # Unless account_move_keeps_history took the signed branches along, the new account's first request
-                            # is sent without them: its body differs from the cached one and the prefix is written again.
-                            journal.emit("account.migrate", "Диалог перенесён на другой аккаунт", "warn",
-                                         conversation=journal.tag(key),
-                                         from_account=account_tag(old.backend), to_account=account_tag(replacement),
-                                         reason=self._move_reason(old.backend, model_entry),
-                                         **({"carried_branches": carried} if carried else {}))
+                            session = await self._move(key, session, replacement, model_entry)
                     if session is None:
                         backend = affinity_backend or self._next_backend(model_entry, exclude)
                         self._check_route(backend, model_entry)
@@ -1846,7 +2071,7 @@ class SessionPool:
                                      account=account_tag(backend), pool=len(self._conversations))
                         self._report_restored(restored)
                     keep = True
-                    self._check_route(session.backend, model_entry)
+                    session = await self._settle_route(key, session, model_entry, exclude)
             else:
                 backend = (affinity_backend if isolated and affinity_backend is not None
                            else self._next_backend(model_entry, exclude))
@@ -1858,6 +2083,8 @@ class SessionPool:
                 dependent.session = session
             session.begin_request()
             lease = SessionLease(session)
+            # The model the turn runs as: for a route alias, the target the pool chose this account for (_bound_target).
+            lease.bound_entry = self._binding(session.backend, model_entry, exclude)
             lease._cache_parents = parents
             lease._cache_dependent = dependent
             self._active[lease] = (session, key, lock, keep)
