@@ -1678,14 +1678,15 @@ _STOP_TEXT = {
 }
 
 
-def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen):
-    """The class of one finished upstream attempt: cancelled, error, truncated, content, thinking_only or empty.
+def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen, timed_out=False):
+    """The class of one finished upstream attempt: timeout, cancelled, error, truncated, content, thinking_only or empty.
 
     One definition for the attempt trace (_stream_body) and for the verdict on a whole turn (iter_events).
     Only `content`, a non-blank text or a finished tool call delivered by a stream that reached its end, is an
-    answer; every other class is a paid attempt that gave the client nothing."""
-    return ("cancelled" if cancelled else "error" if failed else "truncated" if not ended else
-            "content" if usable else "thinking_only" if thinking_seen else "empty")
+    answer; every other class is a paid attempt that gave the client nothing. `timeout` is an attempt the silence
+    watchdog cut (RelaySession.abort_active_turn): its abort lands as a CancelledError, which is not a client that left."""
+    return ("timeout" if timed_out else "cancelled" if cancelled else "error" if failed else
+            "truncated" if not ended else "content" if usable else "thinking_only" if thinking_seen else "empty")
 
 
 def _hit_the_cap(body, flags):
@@ -2707,6 +2708,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         hand_off_final(asyncio.CancelledError())
 
     session._active_direct_abort = abort_direct
+    session._abort_reason = None  # "timeout" once the watchdog aborts this stream (RelaySession.abort_active_turn)
 
     def worker(queue):
         try:
@@ -2910,9 +2912,11 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     pass
                 trace = holder.get("trace")
                 if trace is not None:
+                    # The client's cancel wins over the watchdog's mark: an attempt both ended is a client that left.
                     outcome = attempt_outcome(
                         cancelled=is_cancelled() or isinstance(failure, asyncio.CancelledError),
-                        failed=bool(failure), ended=flags.get("end"), usable=usable, thinking_seen=thinking_seen)
+                        failed=bool(failure), ended=flags.get("end"), usable=usable, thinking_seen=thinking_seen,
+                        timed_out=getattr(session, "_abort_reason", None) == "timeout" and not is_cancelled())
                     trace.finish(outcome)
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)

@@ -312,6 +312,7 @@ class RelaySession:
         self._warm_task = None
         self._last_request_at = time.time()
         self._active_direct_abort = None
+        self._abort_reason = None  # "timeout" while the watchdog aborts the stream (abort_active_turn)
         self._active_warm_abort = None
         self._cached_turn_ends = []
         self._native_history = native_history.History()
@@ -428,9 +429,13 @@ class RelaySession:
         await _answer_control(self.ws, raw)
 
     def abort_active_turn(self):
-        """Abort an in-flight direct HTTP stream on watchdog timeout without marking the session cancelled."""
+        """Abort an in-flight direct HTTP stream on watchdog timeout without marking the session cancelled.
+
+        The abort lands in the attempt as a CancelledError: the mark makes its summary a timeout, not a client that left
+        (the next stream clears it, direct._stream_body)."""
         abort = getattr(self, "_active_direct_abort", None)
         if callable(abort):
+            self._abort_reason = "timeout"
             try:
                 abort()
             except Exception:

@@ -363,14 +363,17 @@ class AttemptTrace:
             self._text = None
         self.summary = summary
         summary["diagnostic_saved"] = False
-        if outcome != "content":
-            # A successful attempt is not an incident: no summary file per exec step.
+        # A successful attempt is not an incident: no summary file per exec step. Neither is one the client cancelled (Esc
+        # mid-answer, a step Codex Desktop restarts): its file took one of the upstream_attempt_summaries_max places from a
+        # real failure (audit A09-03). An error that later points at such an attempt still saves it (AttemptBudget.attach).
+        if outcome not in ("content", "cancelled"):
             self.save()
         if self.attempt >= self.budget.last.get("attempt", 0):
             self.budget.last = summary
             self.budget.last_trace = self
         journal.emit("upstream.attempt", "Попытка %d/%d: %s" % (self.step_attempt, MAX_ATTEMPTS, outcome),
-                     "debug" if outcome == "content" else "warn", account=cfg_tag(self.cfg), **summary)
+                     "debug" if outcome == "content" else "info" if outcome == "cancelled" else "warn",
+                     account=cfg_tag(self.cfg), **summary)
         return summary
 
     def save(self):
