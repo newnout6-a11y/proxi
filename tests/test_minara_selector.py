@@ -232,7 +232,8 @@ async def collect(cfg, session, provider, tools=None, choice=None):
 
 def test_a_channel_failure_is_asked_again_before_anything_is_generated():
     answers = [Response(500, b'{"error":{"code":"channel_selection_error","message":"Unable to route model x"}}'),
-               Response(503, b''), Response(200, lines=stream_chunks({'content': 'OK'}))]
+               Response(503, b'{"error":{"code":"no_enabled_channel"}}'),
+               Response(200, lines=stream_chunks({'content': 'OK'}))]
     posts = []
 
     def post(*args, **kwargs):
@@ -241,6 +242,36 @@ def test_a_channel_failure_is_asked_again_before_anything_is_generated():
     session = types.SimpleNamespace(backend=types.SimpleNamespace(_minara_post=post), _cancelled=False)
     events = asyncio.run(collect({'minara_channel_retry_delays': [0, 0]}, session, {'model': 'openai/x'}))
     assert [e['delta'] for e in events if e['type'] == 'text'] == ['OK'] and len(posts) == 3
+
+
+@pytest.mark.parametrize("status,body,code,http", [
+    (524, b"", "upstream_timeout", 504),
+    (524, b"<html>Gateway timeout</html>", "upstream_timeout", 504),
+    (504, b"", "upstream_timeout", 504),
+    (503, b"", "service_unavailable", 503),
+])
+def test_an_ambiguous_minara_http_error_never_starts_a_second_generation(status, body, code, http):
+    answers = [Response(status, body), Response(200, lines=stream_chunks({"content": "should not run"}))]
+
+    def post(*args, **kwargs):
+        return answers.pop(0)
+
+    session = types.SimpleNamespace(backend=types.SimpleNamespace(_minara_post=post), _cancelled=False)
+    with pytest.raises(apierr.ApiError) as raised:
+        asyncio.run(collect({"minara_channel_retry_delays": [0]}, session, {"model": "openai/x"}))
+    assert raised.value.code == code and raised.value.status == http
+    assert raised.value.upstream_status == status and raised.value.unbilled is False
+    assert len(answers) == 1
+
+
+def test_the_first_sse_error_is_explained_without_reposting_a_paid_request():
+    failure = json.dumps({"error": {"message": "provider connection closed after accepting the request"}})
+    answers = [Response(200, lines=[failure]), Response(200, lines=stream_chunks({"content": "should not run"}))]
+    session = types.SimpleNamespace(backend=types.SimpleNamespace(_minara_post=lambda *a, **kw: answers.pop(0)),
+                                    _cancelled=False)
+    with pytest.raises(apierr.ApiError, match="provider connection closed"):
+        asyncio.run(collect({"minara_channel_retry_delays": [0]}, session, {"model": "openai/x"}))
+    assert len(answers) == 1
 
 
 def test_a_lasting_channel_failure_is_a_503_with_retry_after_and_a_real_refusal_stays_400():

@@ -133,8 +133,9 @@ async def test_http_error_does_not_leak_body_or_retry(status, code):
     assert 'secret' not in raised.value.message
     assert response.closed
     if status == 500:
-        # An empty 500 is one of Minara's channel windows: unbilled, retried shortly, then a 503 with Retry-After.
+        # A blank 500 is reported as a temporary problem, but does not prove the turn never started.
         assert raised.value.retry_after == minara.CHANNEL_RETRY_AFTER
+        assert raised.value.unbilled is False
 
 
 @pytest.mark.asyncio

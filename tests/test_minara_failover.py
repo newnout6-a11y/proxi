@@ -394,7 +394,7 @@ def test_minaras_refusal_is_logged_as_upstreams_with_its_words_and_a_request_wit
 def test_a_channel_retry_is_journaled(tmp_path):
     import asyncio
     import minara
-    answers = [Response(503, b''), Response(200, ok_stream('AFTER'))]
+    answers = [Response(503, b'{"error":{"code":"no_enabled_channel"}}'), Response(200, ok_stream('AFTER'))]
     session = types.SimpleNamespace(backend=types.SimpleNamespace(_minara_post=lambda *a, **kw: answers.pop(0)),
                                     _cancelled=False)
     before = journal.JOURNAL.last_seq
@@ -416,17 +416,20 @@ class CutResponse(Response):
         yield b''
 
 
-def test_a_request_cut_after_it_left_is_not_sent_again_on_another_account(relay):
+@pytest.mark.parametrize("failure", ["cut", "gateway_timeout"])
+def test_a_request_cut_after_it_left_is_not_sent_again_on_another_account(relay, failure):
     relay.state.refusal = None
     relay.state.balance = {'plan': '-5', 'extra': '0'}  # the first account reads as spent: it would have failed over
     posts = []
     for backend in relay.runtime.accounts.backends:
         def post(url, _label=backend.cfg['label'], **kwargs):
             posts.append(_label)
-            return CutResponse(200)
+            return CutResponse(200) if failure == "cut" else Response(524, b"Gateway timed out")
         backend._minara_post = post
     status, body = relay.ask('conv-cut')
     assert status >= 500 and len(posts) == 1  # one billed attempt, never a second on another account
+    if failure == "gateway_timeout":
+        assert status == 504 and body["error"]["code"] == "upstream_timeout"
 
 
 def test_a_403_whose_token_auth_me_accepts_moves_nothing(relay):
