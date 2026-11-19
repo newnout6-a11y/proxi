@@ -10,6 +10,26 @@
 первый текст пришёл за 1545 мс. Это подтверждает рабочий путь тестового relay,
 но пока не закрывает матрицу остальных форматов или IDE.
 
+## R2: завершение SSE
+
+Сверены документированные признаки конца: [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)
+использует `finish_reason` и маркер `[DONE]`; [Responses](https://developers.openai.com/api/reference/resources/responses/streaming-events)
+использует именованные события результата; [Anthropic Messages](https://platform.claude.com/docs/en/build-with-claude/streaming)
+заканчивается `message_stop`. На синтетическом upstream каждый из трёх драйверов
+ранее выдавал 200 после обрыва. После исправления такой поток возвращает ошибку,
+не записывает частичный ответ в историю и не выдаёт накопленный вызов инструмента.
+
+| Живой путь клиента через Minara | HTTP | До первого текста | Всего | Конец |
+|---|---:|---:|---:|---|
+| Responses | 200 | 1835 мс | 1837 мс | `response.completed` |
+| Anthropic Messages | 200 | 1331 мс | 1332 мс | `message_stop` |
+
+Оба запроса к `minara/deepseek-v4-flash` дали ожидаемый ответ. По журналу они
+израсходовали 0,003 кредита Minara. Это живые проверки преобразования клиентских
+протоколов, а исправление прямых универсальных драйверов подтверждено на заглушках.
+На Python 3.14 прошли 70 целевых тестов протоколов и маршрутизации и полный набор:
+11 023 прошли, 2 пропущены. Ruff и `git diff --check` прошли.
+
 | Пункт | Ближайшая проверка |
 |---|---|
 | R2 | Отдельно подтвердить исходные форматы OpenAI Chat/Responses, Anthropic Messages и Minara. Различать корректное завершение, обрыв и тишину; keepalive считать транспортным событием. |

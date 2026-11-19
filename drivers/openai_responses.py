@@ -351,6 +351,7 @@ class OpenAIResponsesDriver(UpstreamDriver):
                 call_order: list[str] = []
                 latest_usage: dict | None = None
                 finish_reason = "stop"
+                saw_terminal = False
 
                 async for ev_name, data_str in sse_utils.aiter_sse_events(resp.aiter_bytes(), label=cfg.get("provider_name") or "OpenAI Responses"):
                     if getattr(session, "_cancelled", False):
@@ -436,13 +437,20 @@ class OpenAIResponsesDriver(UpstreamDriver):
                                 slot["arguments"] = out_item["arguments"]
 
                     elif kind in ("response.completed", "response.incomplete"):
+                        saw_terminal = True
                         resp_obj = item.get("response") if isinstance(item.get("response"), dict) else {}
                         if isinstance(resp_obj.get("usage"), dict):
                             latest_usage = normalize_responses_usage(resp_obj["usage"], bound_entry)
                         if kind == "response.incomplete":
                             inc_reason = (resp_obj.get("incomplete_details") or {}).get("reason")
                             finish_reason = "content_filter" if inc_reason == "content_filter" else "length"
+                        break  # The terminal event is sufficient; no need to wait for EOF or a Chat-style [DONE].
 
+                if getattr(session, "_cancelled", False):
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                if not saw_terminal:
+                    raise apierr.upstream_error("Upstream Responses stream ended before its terminal event")
                 reply_blocks: list[dict] = []
                 full_thinking = "".join(thinking_chunks)
                 if encrypted_reasoning_items:
