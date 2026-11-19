@@ -4,6 +4,7 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -22,6 +23,21 @@ def _sse_bytes(frames: list[tuple[str | None, dict | str]]) -> bytes:
         data = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
         chunks.append(f"data: {data}\n\n")
     return "".join(chunks).encode("utf-8")
+
+
+@pytest.mark.parametrize("hint", [None, "operator-cache-hint"])
+def test_openrouter_claude_cache_key_never_groups_different_conversations(hint):
+    def cache_key(conversation):
+        body = {"messages": [{"role": "system", "content": "same system text"}]}
+        cache_engine.apply_openai_cache_hints(body, {"preset": "openrouter"},
+                                              SimpleNamespace(_native_conversation_key=conversation),
+                                              "anthropic/claude-sonnet", {"prompt_cache_key": hint})
+        return body.get("prompt_cache_key")
+
+    first = cache_key("chat-1")
+    assert first.startswith("proxi-") and first == cache_key("chat-1")
+    assert first != cache_key("chat-2")
+    assert cache_key(None) is None
 
 
 @pytest.mark.parametrize("preset,model,frames,expected", [

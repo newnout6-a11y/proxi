@@ -530,6 +530,10 @@ def acquire_plan(cfg, parsed):
     isolated = (not native_tools and not persistent_text
                 and (direct_mode or purpose in client_context.CLIENT_TEXT_KINDS or (key and not can_exec)))
     child_scope = ("subagent", key) if parent_key and key and mode == "shared" else None
+    credential_scope = getattr(parsed, "credential_scope", None)
+    if credential_scope and mode == "shared":
+        # The operator may share their legacy root session. A client key must never enter it.
+        child_scope = ("credential", credential_scope, key or getattr(parsed, "request_id", None) or id(parsed))
     if persistent_text:
         # Ordinary text chats retain idle keepwarm, with state separate from native
         # tools even when their conversation ID is the same.

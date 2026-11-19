@@ -121,7 +121,7 @@ def client_names(tool):
     return (namespace + "." + name, name) if isinstance(namespace, str) and namespace else (name,)
 
 
-def client_key(family, headers, parsed):
+def client_key(family, headers, parsed, *, namespace=None):
     """(family, originator, model, which kind of agent, project, profile, its tool edits, agent role) for a request, or
     None when it has no tools of its own.
 
@@ -140,8 +140,11 @@ def client_key(family, headers, parsed):
     if family in _KINDS_BY_SYSTEM:
         opening = _opening(getattr(parsed, "system", ""))
         role = hashlib.sha256(opening.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    project = project_of(parsed)
+    if namespace:
+        project = "credential:" + namespace + ":" + (project or "")
     return (family, str(lowered.get("originator") or "").strip().lower(), getattr(parsed, "model", "") or "",
-            "sub" if sub else "root", project_of(parsed), getattr(plan, "profile", None) or "",
+            "sub" if sub else "root", project, getattr(plan, "profile", None) or "",
             _tool_edits(plan), role)
 
 

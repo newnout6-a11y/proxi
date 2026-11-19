@@ -61,7 +61,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RECORD_REQUEST_BYTES = 1024 * 1024
 # What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
 _CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
-                 "dialect", "virtual_profile", "requested_model", "client_task", "client_key", "cost_confirm")
+                 "dialect", "virtual_profile", "requested_model", "client_task", "client_key", "cost_confirm",
+                 "credential_scope")
 
 
 def _carry_compatibility(first, parsed, changes):
@@ -562,6 +563,7 @@ def make_handler(runtime: Runtime):
             self._adapter = None
             self._body_read = False
             self._client_left = False
+            self._credential_scope = None
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -599,6 +601,7 @@ def make_handler(runtime: Runtime):
                     if route in ("balance", "usage") and not self._client_key_profile.get("master"):
                         # These reports describe the entire account pool, not the caller's own client key.
                         raise apierr.ApiError(403, "forbidden", "relay master key is required for account reports")
+                    self._credential_scope = auth.conversation_namespace(self._client_key_profile, cfg["relay_api_key"])
                 if route == "chat":
                     if not cfg["enable_chat"]:
                         raise apierr.not_found("chat API disabled")
@@ -776,7 +779,8 @@ def make_handler(runtime: Runtime):
             parsed = validate.parse_anthropic(data, cfg)
             # The conversation's last real count scales the answer; chars/4 said two thirds of the real size.
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
-                data, self.headers, client_context.current())
+                data, self.headers, client_context.current(), namespace=self._credential_scope)
+            parsed.credential_scope = self._credential_scope
             anchor = runtime.pool.count_anchor(parsed.conversation_key, parsed.model,
                                                **acquire_plan(cfg, parsed).kwargs)
             tokens, basis = adapters.count_input_tokens(adapters.request_chars(parsed), anchor)
@@ -897,7 +901,7 @@ def make_handler(runtime: Runtime):
             identity = client_context.current()
             if chats is None or prompt_policy.prompt_client(identity, self.headers) != "codex":
                 return data
-            key, _ = validate.conversation_affinity(data, self.headers, identity)
+            key, _ = validate.conversation_affinity(data, self.headers, identity, namespace=self._credential_scope)
             if not key:
                 return data
             if data.get("tools"):
@@ -973,7 +977,8 @@ def make_handler(runtime: Runtime):
                 else:
                     parsed = validate.parse_chat(data, cfg)
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
-                data, self.headers, client_context.current())
+                data, self.headers, client_context.current(), namespace=self._credential_scope)
+            parsed.credential_scope = self._credential_scope
             self._infer_conversation(parsed)
             parsed.request_id = self.request_id
             # The size of the request as the client sent it, for count_tokens to scale from the real usage of this
@@ -1076,7 +1081,7 @@ def make_handler(runtime: Runtime):
                 # The authenticated profile holds the original credential. It isn't a property of the wire request.
                 self._client_trace.event("validated_request",
                                          parsed={key: value for key, value in vars(parsed).items()
-                                                  if key != "client_key" and not key.startswith("prompt_")},
+                                                  if key not in ("client_key", "credential_scope") and not key.startswith("prompt_")},
                                          effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
             task_note = " | TASK: " + parsed.client_task if parsed.client_task else ""
@@ -1157,7 +1162,7 @@ def make_handler(runtime: Runtime):
             if not (version and version >= tool_search_policy.MIN_VERSION):
                 return
             where = tool_search_policy.deferral(data)
-            conversation = (identity.get("client_session_id") or "", identity.get("agent") or "")
+            conversation = (self._credential_scope or "", identity.get("client_session_id") or "", identity.get("agent") or "")
             if where is None:
                 runtime.tool_search_guard.forgive(conversation)  # the client fell back: no loop
                 return
@@ -1191,7 +1196,7 @@ def make_handler(runtime: Runtime):
             family = prompt_policy.prompt_client(client_context.current(), self.headers)
             if family not in families:
                 return
-            key = tool_union.client_key(family, self.headers, parsed)
+            key = tool_union.client_key(family, self.headers, parsed, namespace=self._credential_scope)
             if key is None:
                 return
             merged, carried = union.apply(key, parsed.tools, getattr(parsed, "conversation_key", None))
@@ -1343,7 +1348,8 @@ def make_handler(runtime: Runtime):
             if not parsed.tools or not digests:
                 return
             stored = getattr(runtime.pool, "has_stored", None)
-            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests, stored)
+            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests, stored,
+                                                          namespace=getattr(parsed, "credential_scope", None))
             if how == "stored":
                 journal.emit("conversation.inferred",
                              "Запрос без идентификатора диалога: продолжен сохранённый диалог (после перезапуска relay)",

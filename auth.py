@@ -400,6 +400,14 @@ def model_allowed_for_profile(profile: dict | None, *model_names: str | None) ->
     return False
 
 
+def conversation_namespace(profile, master_key):
+    """Internal partition for a non-master credential. Reusing its label or ID does not inherit old state."""
+    if not profile or profile.get("master"):
+        return None
+    value = json.dumps(["proxi-dialog-v1", profile["id"], profile["key"]]).encode("utf-8")
+    return hmac.new(master_key.encode("utf-8"), value, "sha256").hexdigest()[:32]
+
+
 class ClientKeyManager:
     """Runtimeauthenticator, RPM rate limiter, USD budget enforcer, and usage tracker for `client_keys[]`."""
 

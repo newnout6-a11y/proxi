@@ -911,7 +911,11 @@ def _tool_choice(value):
     raise unprocessable("'tool_choice' must be a string or function object", param="tool_choice")
 
 
-def conversation_affinity(data, headers, identity=None):
+def scope_conversation(key, namespace):
+    return "credential:" + namespace + ":" + key if key and namespace else key
+
+
+def conversation_affinity(data, headers, identity=None, *, namespace=None):
     """Use the calling session's ID before a shared parent affinity header."""
     headers = {str(k).lower(): v.strip() for k, v in headers.items() if isinstance(v, str) and v.strip()}
     explicit = (headers.get("x-proxi-session-id") or headers.get("x-opencode-session-id")
@@ -936,7 +940,7 @@ def conversation_affinity(data, headers, identity=None):
         parent = parent or key
         digest = hashlib.sha256(json.dumps([key, "codex-thread", headers["thread-id"]]).encode()).hexdigest()
         key = "agent:" + digest
-    return key, parent if parent != key else None
+    return scope_conversation(key, namespace), scope_conversation(parent if parent != key else None, namespace)
 
 
 def conversation_key(data, header_value=None, allow_content_fallback=False):

@@ -300,17 +300,16 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         # a hash, so nothing of the client's identifiers goes upstream.
         body["prompt_cache_key"] = "proxi-" + hashlib.sha256(
             json.dumps(conversation, default=str).encode("utf-8")).hexdigest()[:32]
-    elif model.startswith("anthropic/"):
+    elif model.startswith("anthropic/") and conversation:
         # OpenRouter spreads some Claude models over providers with caches of their own (Fable 5.2: Anthropic, Google
         # Vertex, Azure): without a key a follow-up read the head in 3 of 5 requests and each new provider wrote it again
         # (12.8 credits a 5.8k head), with one all 6 went to one provider and every follow-up read it (2026-11-10). The key
-        # is the head's (model, instructions, tools), not the conversation's: a client's conversations and subagents share
-        # their head, so they share the provider that holds it too, and a level change keeps it.
+        # follows this conversation's head. Identical heads from different chats must not use the same key; changes
+        # to instructions/tools still change the key, while an effort change in the same chat keeps it.
         head_part = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
-        seed = [model, head_part, body.get("tools")] if head_part else [model, conversation]
-        if head_part or conversation:
-            body["prompt_cache_key"] = "proxi-" + hashlib.sha256(json.dumps(
-                seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+        seed = [model, conversation, head_part, body.get("tools")]
+        body["prompt_cache_key"] = "proxi-" + hashlib.sha256(json.dumps(
+            seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass")).hexdigest()[:32]
     return body
 
 
