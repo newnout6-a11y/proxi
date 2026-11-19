@@ -475,6 +475,11 @@ def make_handler(runtime: Runtime):
 
         def _log(self, note=""):
             status = getattr(self, "_status", 0) or getattr(self, "_stream_status", 0)
+            # A refusal the client answers by itself (tool search of Claude Code, a switched-off Codex memory job) is how the
+            # exchange is meant to go: neither a warning in the journal nor a red status in the console (audit A01-06).
+            expected = getattr(self, "_expected", False) and 400 <= status < 500
+            if expected:
+                note = " ".join(part for part in ("[expected]", note) if part)
             took = (time.time() - self._started) * 1000
             model = getattr(self, "_model", "-")
             # A compaction can run on the dialog's effort instead of the one its client asked for (orchestrator).
@@ -504,7 +509,7 @@ def make_handler(runtime: Runtime):
             slow_admin = took >= SLOW_ADMIN_MS and self.path.split("?", 1)[0] != "/admin/api/events/stream"
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400 and not slow_admin:
                 return
-            level = ("error" if status >= 500 or status == 0 else "warn" if status >= 400
+            level = ("error" if status >= 500 or status == 0 else "info" if expected else "warn" if status >= 400
                      or (route == "admin" and slow_admin) else "success")
             message = "%s %s → %s" % (self.command, self.path, status or "—")
             if route == "admin" and slow_admin:
@@ -515,7 +520,8 @@ def make_handler(runtime: Runtime):
                          model=None if model == "-" else model,
                          stream=bool(getattr(self, "_streaming", False)),
                          user_agent=self.headers.get("user-agent", "")[:120] if self.headers else "",
-                         error=getattr(self, "_error_code", None), **self._account_fields())
+                         error=getattr(self, "_error_code", None), **({"expected": True} if expected else {}),
+                         **self._account_fields())
 
         def _serving_account(self):
             """The account that answered this request, else the primary one."""
@@ -550,6 +556,7 @@ def make_handler(runtime: Runtime):
             self._model_called = False
             self._holder = None
             self._error_code = None
+            self._expected = False
             self._response_started = False
             self._client_trace = None
             self._adapter = None
@@ -633,9 +640,10 @@ def make_handler(runtime: Runtime):
                     self._health()
             except apierr.ApiError as err:
                 self._error_code = err.code
+                self._expected = bool(getattr(err, "expected", False))
                 self._close_if_body_unread()
                 self._log_error(err)
-                if err.status >= 400 and not getattr(err, "expected", False):
+                if err.status >= 400 and not self._expected:
                     console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
                 if getattr(self, "_streaming", False):
                     self._stream_failure(dialect, err)

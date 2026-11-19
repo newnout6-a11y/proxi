@@ -103,7 +103,9 @@ def render(line, *, color=None):
     match = re.match(r"(relay \S+ \S+ \S+ )(\d+)(.*)", line)
     if match:
         status = int(match[2])
-        role = "alert" if status >= 400 or status == 0 else "success"
+        # An expected refusal (proxy marks it [expected]) is a step the client takes on its own, not a failure.
+        role = ("muted" if "[expected]" in match[3] and 400 <= status < 500
+                else "alert" if status >= 400 or status == 0 else "success")
         line = match[1] + _paint(match[2], role, True) + match[3]
     return prefix + line
 
