@@ -799,6 +799,9 @@ class Journal:
                 level = "info"
             identity = client_context.current()
             fields = {**identity, **fields}
+            wire_client = fields.pop("wire_client", None)
+            if wire_client:
+                fields.setdefault("client", wire_client)
             caption = client_context.label(identity)
             if caption:
                 message = "[%s] %s" % (caption, message or kind)

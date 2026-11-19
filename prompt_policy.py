@@ -65,6 +65,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import apierr
+import client_context
 import journal
 import models
 import structured
@@ -244,7 +245,7 @@ def prompt_client(identity: dict, headers: dict) -> str:
 
     It never changes identity["client"] or client_context.request_kind (plan I1). The first signal that names a family wins:
     1. an explicit x-proxi-client header (a family name, or a spelling of one: "Claude Code", "codex_cli_rs", "dsh");
-    2. the client client_context.describe() recognised (OpenCode, Claude Code, Claude Desktop);
+    2. the client client_context.describe() recognised;
     3. Codex, by what codex-rs sends (rust-v0.164.0): the `originator` header (codex_cli_rs, codex-tui, codex_exec,
        codex_vscode, codex_desktop, codex_sdk_ts, "Codex Desktop", ...: every first-party value starts with "codex"), a
        User-Agent that begins with that originator (`codex_cli_rs/0.164.0 (Windows 10.0; x86_64) ...`) or any x-codex-*
@@ -260,14 +261,7 @@ def prompt_client(identity: dict, headers: dict) -> str:
     client = _family((identity or {}).get("client"))
     if client:
         return client
-    originator = str(headers.get("originator") or "").strip().lower()
-    agent = str(headers.get("user-agent") or "").strip().lower()
-    if originator.startswith("codex") or agent.startswith("codex") or any(
-            name.startswith("x-codex-") for name in headers):
-        return "codex"
-    if agent.startswith("deepseek-harness/"):
-        return "harness"
-    return "unknown"
+    return client_context.transport_family(headers) or "unknown"
 
 
 @dataclass(frozen=True)

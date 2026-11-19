@@ -120,6 +120,7 @@ def write(line, *, file=None, with_time=True, kind="relay.diagnostic", level="in
         if not text_only:
             identity = client_context.current()
             context = {key: identity[key] for key in console_records.IDENTITY if identity.get(key)}
+            context["client"] = client_context.log_client(identity)
             context["client_session"] = journal.tag(identity.get("client_session_id"))
             # Redact before removing escapes or serializing; a literal secret can span physical lines.
             raw = {"message": str(line), **context, **fields}
