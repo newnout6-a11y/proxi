@@ -115,6 +115,64 @@ def test_a_failed_target_of_an_account_leaves_its_other_targets_to_the_request(t
     assert pool.unavailable_error(alias, exclude=(*failed, (retool_account, "claude-opus-5"))) is not None
 
 
+RETOOL2 = dict(RETOOL, base="https://t2.retool.invalid", page_uuid="p2")
+
+
+def two_retool_pool(tmp_path, monkeypatch, **second):
+    cfg = load(tmp_path, monkeypatch, [RETOOL, dict(RETOOL2, **second)],
+               [{"id": "smart-opus", "targets": [OPUS, "claude-opus-5"], "strategy": "priority"}])
+    pool = SessionPool(Backend(cfg))
+    for backend in pool.backends:
+        backend.unavailable, backend.refused_models = None, {}
+    return pool, models.resolve("smart-opus", cfg=cfg)[0]
+
+
+def test_a_conversation_stays_on_its_account_while_no_account_serves_the_first_target(tmp_path, monkeypatch):
+    """Every plan refuses claude-opus-5-5: the alias runs as claude-opus-5 on any account. The conversation moved on each
+    request to the least loaded account serving it, back and forth, each move writing its whole prefix again (review of
+    impl/routing-pool)."""
+    pool, alias = two_retool_pool(tmp_path, monkeypatch)
+    one, two = pool.backends
+    for backend in pool.backends:
+        backend.refused_models = {OPUS: {"until_at": 2e9, "pause": 300.0}}
+
+    async def scenario():
+        where = []
+        for _ in range(4):
+            lease = await pool.acquire("conv", model_entry=alias)
+            where.append((lease.session.backend, lease.bound_entry["id"]))
+            await pool.release(lease)
+        return where
+
+    where = asyncio.run(scenario())
+    assert len({backend for backend, _ in where}) == 1 and {model for _, model in where} == {"claude-opus-5"}
+    assert pool.peek("conv", model_entry=alias) is pool._conversations["conv"]
+    # Once an account serves the first target again, the conversation goes to it.
+    two.refused_models = {}
+    if where[0][0] is two:
+        one.refused_models, two.refused_models = {}, {OPUS: {"until_at": 2e9, "pause": 300.0}}
+    lease = acquired(pool, alias, "conv")
+    assert lease.session.backend is not where[0][0] and lease.bound_entry["id"] == OPUS
+
+
+def test_a_first_target_held_while_acquire_waits_moves_the_conversation_to_an_account_that_serves_it(
+        tmp_path, monkeypatch):
+    """The hold lands on the conversation's account during _restore_state: the turn was bound to claude-opus-5 there,
+    silently, while the other account served claude-opus-5-5 (review of impl/routing-pool)."""
+    pool, alias = two_retool_pool(tmp_path, monkeypatch, priority=1)
+    one, two = pool.backends
+    original = pool._restore_state
+
+    async def restore(key, session):
+        session.backend.refused_models = {OPUS: {"until_at": 2e9, "pause": 300.0}}  # a neighbour's 402 meanwhile
+        await asyncio.sleep(0)
+        return await original(key, session)
+
+    monkeypatch.setattr(pool, "_restore_state", restore)
+    lease = acquired(pool, alias, "conv")
+    assert lease.session.backend is two and lease.bound_entry["id"] == OPUS
+
+
 # -- end to end: the turn moves to the alias's next target ------------------------------------------------------------------
 def alias_turn(runner, targets, conversation="conv-1"):
     runner.cfg["routes"] = [{"id": "smart", "targets": targets}]
@@ -143,8 +201,9 @@ def test_an_alias_whose_first_target_no_plan_includes_is_served_by_its_next_targ
 
     first, posts, second = asyncio.run(scenario())
     assert texts(first) == [{"type": "text", "delta": "OK"}] and errors(first) == []
-    # Each account refused the first target once; the turn then ran as the second target on an account of the pool.
-    assert posts == ["acc-a", "acc-b", "acc-a"] and sent[:3] == [OPUS, OPUS, SONNET]
+    # Each account refused the first target once; the turn then ran as the second target where the conversation was: no
+    # account serves the first one, and moved on, it changed accounts on every request (SessionPool._keeps).
+    assert posts == ["acc-a", "acc-b", "acc-b"] and sent[:3] == [OPUS, OPUS, SONNET]
     assert set(retool.a.refused_models) == set(retool.b.refused_models) == {OPUS}
     held = _events("account.model_refused", before)
     assert [event["data"]["model"] for event in held] == [OPUS, OPUS]

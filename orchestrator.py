@@ -268,6 +268,9 @@ LIMIT_WAIT_MIN_PREFIX = 8000
 # How long a universal provider that answered 429 without a Retry-After is left out of the pool: a provider's limit is per
 # minute (OpenRouter, OpenAI, Anthropic), not Retool's sliding hour, so account_rate_limit_cooldown (900 s) never fits it.
 PROVIDER_RATE_LIMIT_PAUSE = 60
+# How many times a request chooses its account again after acquire() met a Retool plan hold that landed while it waited
+# (SessionPool marks such a 404 plan_hold; design D4 1.7). Each time a 402 of another request must land within one wait.
+PLAN_HOLD_RACES = 3
 
 
 def _provider_label(backend):
@@ -1293,6 +1296,18 @@ class TurnRunner:
                         getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), error.code))
                     holder["reason"] = "stop"
                     continue
+            if (retryable and backend is None and getattr(error, "plan_hold", False)
+                    and holder.get("_plan_hold_races", 0) < PLAN_HOLD_RACES and self._pool_refusal(parsed, exclude) is None):
+                # The pool's 404 named only a Retool plan hold that a neighbour's 402 left on the account acquire() had
+                # chosen while it waited (design D4 1.7, SessionPool._check_route): another account serves the model now,
+                # so the request chooses again, as it would have a moment earlier, instead of a settled 404.
+                holder["_plan_hold_races"] = holder.get("_plan_hold_races", 0) + 1
+                _settle_turn(holder, "moved")
+                journal.emit("account.failover", "Тариф аккаунта отказал в модели, пока запрос ждал, — аккаунт выбран заново",
+                             "warn", request_id=getattr(parsed, "request_id", None), error=error.code,
+                             reason="plan_hold_race", model=_model_id(parsed))
+                holder["reason"] = "stop"
+                continue
             if error is not None and apierr.is_plan_refusal(error):
                 # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
                 # the client gets the settled 404 that names the cause rather than a 502 it would only send again.

@@ -1123,14 +1123,20 @@ class SessionPool:
 
         Without the second half, when every account was in reserve or signed out, a conversation moved to the "richest" or
         least loaded other account on every request (its own session counts as load on its account), and each move dropped
-        its signed history and wrote its whole prefix again, more credits than an account in reserve has left."""
+        its signed history and wrote its whole prefix again, more credits than an account in reserve has left.
+
+        A route alias whose earlier targets no account serves now stays on an account that serves the target the route's
+        order takes (it is among the ready accounts): moved instead, its conversation went to the least loaded of those
+        accounts on every request, back and forth, and each move wrote its whole prefix again."""
         if self._serves(backend, model_entry, exclude):
             return True
         try:
             kind, candidates = self._candidates(self.backends, model_entry, exclude)
         except apierr.ApiError:
             return False
-        return kind != "ready" and backend in candidates
+        if kind == "ready":
+            return bool(_route_targets(model_entry)) and backend in candidates
+        return backend in candidates
 
     def _move_reason(self, backend, model_entry):
         """Why a conversation leaves this account (account.migrate): why the account is out of the pool, its Retool plan
@@ -1150,14 +1156,14 @@ class SessionPool:
             return "account_excluded"
         if not account_enabled(backend):
             return "account_disabled"
-        if getattr(backend, "unavailable", None) is not None and not self._keeps(backend, model_entry, exclude):
+        if self._keeps(backend, model_entry, exclude):
+            return None  # as a live conversation of it stays there
+        if getattr(backend, "unavailable", None) is not None:
             return "account_unavailable"
         if not self._routable(backend, model_entry):
             return "no_route"
         primary = self._primary(backend, model_entry)
-        if backend in _excluded_for(exclude, (primary or {}).get("id")):
-            return "account_excluded"
-        return None if self._routable(backend, primary) else "no_route"
+        return "account_excluded" if backend in _excluded_for(exclude, (primary or {}).get("id")) else "no_route"
 
     def _stored_binding(self, keys, model_entry, exclude):
         """(meta, backend, refusal) of the first of `keys` that has a stored state.
@@ -1351,8 +1357,8 @@ class SessionPool:
         """Whether this account takes the request as it stands: usable, not failed for it, and a route to the model.
 
         A route alias counts on the first target the account serves (_primary): once that one is held or failed on it, a
-        conversation moves where the route's order takes it, to a later target of the same account only when no account
-        serves an earlier one, instead of quietly changing models where it is."""
+        conversation moves where the route's order takes it, and stays on a later target of the same account only when no
+        account serves an earlier one (_keeps), instead of quietly changing models where it is."""
         if not SessionPool._usable(backend, exclude):
             return False
         primary = SessionPool._primary(backend, model_entry)
@@ -1426,7 +1432,12 @@ class SessionPool:
     def _check_route(backend, model_entry):
         reason = SessionPool._route_refusal(backend, model_entry)
         if reason:
-            raise model_catalog.model_unavailable(model_entry, [reason])
+            error = model_catalog.model_unavailable(model_entry, [reason])
+            if not model_catalog.refusal_reasons(model_entry, [backend.cfg])[0]:
+                # Only a hold of the account's Retool plan refuses it: a fact about that account, not about the request
+                # (TurnRunner._run_request chooses again while another account serves the model, design D4 1.7).
+                error.plan_hold = True
+            raise error
 
     @staticmethod
     def _routable(backend, model_entry):
@@ -1866,9 +1877,12 @@ class SessionPool:
                 return self._stored_view(key, model_entry, exclude)
         else:
             session = None
-        if session is None or not self._serves(session.backend, model_entry, exclude):
+        if session is None:
             return None
-        return session
+        # A route alias may stay on a later target of its account (_keeps); any other model only where it is served.
+        stays = (self._keeps(session.backend, model_entry, exclude) if _route_targets(model_entry)
+                 else self._serves(session.backend, model_entry, exclude))
+        return session if stays else None
 
     async def _move(self, key, session, replacement, model_entry):
         """Move conversation `key` from `session` to a new session on `replacement`, and return that one: the history goes
@@ -1895,19 +1909,23 @@ class SessionPool:
 
     async def _settle_route(self, key, session, model_entry, exclude):
         """The session a conversation's request runs on once acquire() has done its waiting: its own, or the one it moves to
-        when the Retool plan of its account refused the model meanwhile.
+        when the Retool plan of its account refused the model meanwhile (for a route alias, the target the account would
+        serve it with first) and the account can no longer keep it (_keeps).
 
         acquire() awaits between choosing an account and handing out the lease (the old session's aclose, _restore_state, a
         new thread). A request of the same wave may get Retool's 402 on that account then, and the hold it leaves turned this
-        request into a settled 404 while attempts and serving accounts were left (2026-11-18 17:08:48-56, design D4 1.7). A
-        hold is no settled fact about this request: it moves again, as acquire() would have a moment earlier, at most once
-        per account of the pool, and when no account is left the pool's own error says why. A refusal of the configuration
-        is still the settled 404."""
+        request into a settled 404 while attempts and serving accounts were left (2026-11-18 17:08:48-56, design D4 1.7), or
+        bound an alias's turn to its next target where it was while another account served the first one. A hold is no
+        settled fact about this request: it moves again, as acquire() would have a moment earlier, at most once per account
+        of the pool, and when no account is left the pool's own error says why. A refusal of the configuration is still the
+        settled 404."""
         for _ in range(len(self.backends)):
-            if not self._route_refusal(session.backend, model_entry) or self._plan_hold(session.backend, model_entry) is None:
+            backend = session.backend
+            if (self._keeps(backend, model_entry, exclude)
+                    or self._plan_hold(backend, self._primary(backend, model_entry)) is None):
                 break
-            replacement = self._next_backend(model_entry, (*exclude, session.backend))
-            if replacement is session.backend:
+            replacement = self._next_backend(model_entry, exclude)
+            if replacement is backend:
                 break
             session = await self._move(key, session, replacement, model_entry)
         self._check_route(session.backend, model_entry)
@@ -1977,6 +1995,13 @@ class SessionPool:
                         await asyncio.wait_for(gate.wait(), conversation_state.RESTORE_TIMEOUT + 5)
                     except asyncio.TimeoutError:
                         pass
+                if affinity_backend is not None and not self._keeps(affinity_backend, model_entry, exclude):
+                    # The waits above let other requests run: a neighbour's 402 may have held the account chosen before
+                    # them (the conversation's own, or the one a stored state belongs to), or it left the pool. Chosen
+                    # again, as a moment earlier, instead of a settled 404 from _check_route while another account serves
+                    # the model (design D4 1.7: a parallel request of a busy conversation, the first request after a
+                    # restart).
+                    affinity_backend = None
                 if lock.locked() and (getattr(self._conversations.get(key), "_direct", None)
                                       or getattr(self._conversations.get(key), "_cached_head", None)
                                       or self.cfg.get("transport") == "direct"
