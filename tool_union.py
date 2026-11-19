@@ -20,6 +20,7 @@ even when the server has come up since) and declares the tool from the next requ
 declared stays what it was: not passed on, and journaled (tool.call_dropped).
 """
 import collections
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -265,12 +266,22 @@ class ToolUnion:
                 self._saved_at = now
                 document = {"version": 1, "clients": [[list(key), [[name, entry[0], entry[1]] for name, entry in table.items()]]
                                                       for key, table in self._clients.items()]}
+            temporary = "%s.%d.tmp" % (self._path, os.getpid())
             try:
-                temporary = "%s.%d.tmp" % (self._path, os.getpid())
-                with open(temporary, "w", encoding="utf-8") as handle:
-                    json.dump(document, handle, ensure_ascii=False)
+                text = json.dumps(document, ensure_ascii=False)
+                try:
+                    data = text.encode("utf-8")
+                except UnicodeEncodeError:
+                    # Half of a surrogate pair (a JS client cut a description inside an emoji): as UTF-8 it raised, and no
+                    # table of any client was saved again while that tool was in the union (audit A05-02). The file keeps
+                    # it as a JSON escape, which json.load reads back as it came, as SkillLocations._write does.
+                    data = json.dumps(document).encode("ascii")
+                with open(temporary, "wb") as handle:
+                    handle.write(data)
                 os.replace(temporary, self._path)
             except (OSError, TypeError, ValueError) as exc:
+                with contextlib.suppress(OSError):
+                    os.remove(temporary)
                 if not self._warned:
                     self._warned = True
                     journal.emit("tools.union_save_failed", "Объединение инструментов клиентов не сохранено на диск: %s"

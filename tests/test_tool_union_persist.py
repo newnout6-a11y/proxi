@@ -70,6 +70,32 @@ def test_a_table_whose_only_change_is_the_time_is_written_at_most_every_minute(t
     assert json.loads(path.read_text(encoding="utf-8"))["clients"] != [] and written
 
 
+def test_half_of_a_surrogate_pair_in_a_description_does_not_stop_the_saves_of_every_client(tmp_path):
+    """A JS client that cuts a description inside an emoji sends "\\ud83d". Written as UTF-8 it raised UnicodeEncodeError:
+    no table of any client was saved again while that tool was in the union, and a temporary file was left (audit A05-02)."""
+    path = str(tmp_path / tool_union.FILE_NAME)
+    union = ToolUnion(path=path)
+    cut = tool("mcp__demo__ping")
+    cut["function"]["description"] = "Ping \ud83d"
+    union.apply(KEY, [tool("a"), cut])
+    other = KEY[:4] + ("c:\\work\\other",) + KEY[5:]
+    union.apply(other, [tool("b"), tool("late")])   # another client, after the cut tool
+    assert [item.name for item in tmp_path.iterdir()] == [tool_union.FILE_NAME]
+    merged, carried = ToolUnion(path=path).apply(other, [tool("b")])   # the relay started again
+    assert names(merged) == ["b", "late"] and carried == ["late"]
+    merged, carried = ToolUnion(path=path).apply(KEY, [tool("a")])
+    assert carried == ["mcp__demo__ping"] and merged[1]["function"]["description"] == "Ping \ud83d"
+
+
+def test_a_save_that_fails_leaves_no_temporary_file(tmp_path, monkeypatch):
+    def locked(*_args):
+        raise PermissionError("the file is held by another process")
+
+    monkeypatch.setattr(tool_union.os, "replace", locked)
+    ToolUnion(path=str(tmp_path / tool_union.FILE_NAME)).apply(KEY, [tool("a")])
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_claude_code_names_its_folder_in_a_bullet_of_its_environment_block():
     environment = ("<env>\nYou have been invoked in the following environment:\n - Primary working directory: C:\\Work\\Proj\n"
                    " - Is a git repository: true\n</env>")
