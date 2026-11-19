@@ -282,6 +282,7 @@ class MinaraAccount(UnmeteredAccount):
         # One read at a time; a failed read is answered from memory for CACHE_SECONDS, as CreditsManager does. Without
         # them every caller read /auth/me again, and an account whose read failed was asked on every call.
         self._fetch_lock = threading.Lock()
+        self._balance_revision = 0
         self._failed_at = float("-inf")
         self._failure = None
         self._token_read = None  # the token whose expiry _expiry holds: read again only when the token changes
@@ -343,13 +344,14 @@ class MinaraAccount(UnmeteredAccount):
                 return self._stamped(dict(self._balance))
             if not force_refresh and asked_at - self._failed_at < self.CACHE_SECONDS and self._failure:
                 return self._failed(self._failure, stamp=False)
+            revision = self._balance_revision
         with self._fetch_lock:
             with self._lock:
-                # Another caller read it while this one waited: its answer is this one's too.
-                if self._fetched >= asked_at and self._balance is not None:
+                # Reuse a read that finished while we waited. Two sequential reads may have the same clock tick.
+                if self._balance_revision != revision:
+                    if self._failure:
+                        return self._failed(self._failure, stamp=False)
                     return self._stamped(dict(self._balance))
-                if self._failed_at >= asked_at and self._failure:
-                    return self._failed(self._failure, stamp=False)
             return self._fetch_balance()
 
     def _fetch_balance(self):
@@ -385,6 +387,8 @@ class MinaraAccount(UnmeteredAccount):
                              "refused": self._refused_at is not None,
                              "stale": False, "unreported_usage": False}
             self._fetched = time.monotonic()
+            self._balance_revision += 1
+            self._failure = None
             self._spent_since = max(0.0, self._spent_since - spent_before)
             self.last_fetched_at = time.time()
             self.last_error = None
@@ -394,6 +398,7 @@ class MinaraAccount(UnmeteredAccount):
         with self._lock:
             if stamp:
                 self._failed_at, self._failure = time.monotonic(), reason
+                self._balance_revision += 1
             self.last_error = reason
             snapshot = dict(self._balance) if self._balance else {
                 "available": None, "unit": "minara_credits", "balance_supported": True, "session_used": None,

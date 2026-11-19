@@ -584,6 +584,22 @@ class _Secrets(list):
     cookies = False
 
 
+def configured_secret_values(cfg):
+    """Credentials and private routing IDs that should be masked even when echoed as plain text."""
+    fields = ("relay_api_key", "cookie", "xsrf", "thread_id", "page_uuid", "bearer_token", "api_key")
+    values = [cfg.get(key) for key in fields]
+    values += _cookie_secrets(cfg.get("cookie_values"))
+    for account in cfg.get("accounts") or ():
+        if isinstance(account, dict):
+            values += [account.get(key) for key in fields]
+            values += _cookie_secrets(account.get("cookie_values"))
+    values.extend(cfg.get("_extra_secrets") or ())
+    values.extend(profile.get("key") for profile in cfg.get("client_keys") or () if isinstance(profile, dict))
+    # A client's tool call can contain the search key even though it lives only in the environment.
+    values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))
+    return [value for value in values if isinstance(value, str) and len(value) >= 4]
+
+
 class Journal:
     def __init__(self, capacity=CAPACITY, clock=None):
         self._cond = threading.Condition()
@@ -692,16 +708,7 @@ class Journal:
     # -- redaction ---------------------------------------------------------
     def _secrets(self):
         cfg = self._cfg or {}
-        values = [cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf", "thread_id", "page_uuid")]
-        values += _cookie_secrets(cfg.get("cookie_values"))
-        for account in cfg.get("accounts") or []:
-            if isinstance(account, dict):
-                values += [account.get(key) for key in ("cookie", "xsrf", "thread_id", "page_uuid")]
-                values += _cookie_secrets(account.get("cookie_values"))
-        # The search provider's key lives in the environment, never in the config, and it still turned up in the journal:
-        # a client's tool call that set it (a shell command) was journaled with its arguments (v3 run of 2026-11-07).
-        values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))
-        found = _Secrets(value for value in values if isinstance(value, str) and len(value) >= 4)
+        found = _Secrets(configured_secret_values(cfg))
         found.pattern = self._pattern_of(found)
         # redact() masks the cookie values with a pattern of its own: looked up once per event here, not for every string
         # of it (a tuple of 1,027 values hashed a million times was 10 s of the restore at startup).
@@ -1071,6 +1078,19 @@ JOURNAL = Journal()
 def scrub(value):
     """Apply the journal's configured secret redaction to console diagnostics."""
     return JOURNAL._clean(value, JOURNAL._secrets())
+
+
+def trace_secret_values(cfg):
+    """A per-attempt config may contain only the serving account; also mask known secrets from the live config."""
+    shared = JOURNAL._cfg
+    values = configured_secret_values(cfg)
+    # A transport or an offline diagnostic can construct its own per-account config without normalizing the cookie.
+    if isinstance(cfg.get("cookie"), str) and not cfg.get("cookie_values"):
+        values.extend(value for segment in cfg["cookie"].split(";")
+                      if len(value := segment.partition("=")[2].strip()) >= 4)
+    if shared and shared is not cfg:
+        values.extend(configured_secret_values(shared))
+    return tuple(sorted(set(values)))
 
 
 _SECRET_NAME = re.compile(r"(?i)api[_-]?key|secret|password|passwd|token|authorization|cookie|credential")

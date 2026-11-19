@@ -94,6 +94,24 @@ def test_only_a_failed_attempt_is_a_warning_and_a_summary_on_disk(tmp_path, outc
     assert summary["diagnostic_saved"] is saved and bool(list(tmp_path.iterdir())) is saved
 
 
+def test_attempt_summary_masks_global_credentials_before_clipping_metadata(tmp_path, monkeypatch):
+    secret = "opaque-virtual-" + "AB2846" * 50
+    private_journal = journal.Journal()
+    private_journal.configure({"client_keys": [{"id": "test", "key": secret}]})
+    monkeypatch.setattr(journal, "JOURNAL", private_journal)
+    budget = AttemptBudget()
+    budget.take(lambda: False)
+    trace = AttemptTrace({"upstream_error_dir": str(tmp_path)}, budget, "req", "model", b"{}")
+    trace.response(SimpleNamespace(headers={"request-id": "upstream-" + secret}), status=503)
+    trace.observe(json.dumps({"event": secret, secret: True}).encode())
+    summary = trace.finish("error")
+    [file] = tmp_path.iterdir()
+    saved = file.read_text(encoding="utf-8")
+    assert summary["upstream_request_id"] == "upstream-[redacted]"
+    assert summary["observed_field_sets"] == [["[redacted]", "event"]]
+    assert secret[:24] not in saved and json.loads(saved)["http_status"] == 503
+
+
 class Silent:
     """An upstream answer that sends nothing until it is closed."""
     status = 200

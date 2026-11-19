@@ -24,6 +24,7 @@
 
 | Дата | Документ | О чём |
 |---|---|---|
+| 2026-11-19 | [r1-code-security-audit-2026-11-19.md](reports/r1-code-security-audit-2026-11-19.md) | Проверка ночного пакета R1, аудит движка промптов, доступ к отчётам и защита диагностических записей |
 | 2026-11-08 | [minara-integration-2026-11-08.md](reports/minara-integration-2026-11-08.md) | Minara Bearer, смешанный пул, многоэтапные проверки, реальные клиенты и live-приёмка |
 | 2026-10-29…11-05 | [model-catalog-audit.md](reports/model-catalog-audit.md) | Аудит каталога моделей `models.py` и источники его данных |
 | 2026-10-31 | [direct-inference-audit.md](reports/direct-inference-audit.md) | Исследование backend Retool, с которого начался прямой транспорт |

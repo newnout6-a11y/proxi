@@ -596,6 +596,9 @@ def make_handler(runtime: Runtime):
                         if exc.message == "invalid relay API key":
                             self._throttle_auth_failure()
                         raise
+                    if route in ("balance", "usage") and not self._client_key_profile.get("master"):
+                        # These reports describe the entire account pool, not the caller's own client key.
+                        raise apierr.ApiError(403, "forbidden", "relay master key is required for account reports")
                 if route == "chat":
                     if not cfg["enable_chat"]:
                         raise apierr.not_found("chat API disabled")
@@ -1070,10 +1073,10 @@ def make_handler(runtime: Runtime):
                              request_id=self.request_id, control='mid_conversation_system',
                              handling='inline_user_text')
             if self._client_trace:
-                # The prompt layer's own attributes (prompt_*) are not part of what the client validated.
+                # The authenticated profile holds the original credential. It isn't a property of the wire request.
                 self._client_trace.event("validated_request",
                                          parsed={key: value for key, value in vars(parsed).items()
-                                                 if not key.startswith("prompt_")},
+                                                  if key != "client_key" and not key.startswith("prompt_")},
                                          effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
             task_note = " | TASK: " + parsed.client_task if parsed.client_task else ""

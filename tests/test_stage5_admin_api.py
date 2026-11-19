@@ -168,6 +168,19 @@ def gateway_admin(tmp_path, monkeypatch):
     runtime.close()
 
 
+@pytest.mark.parametrize("path, master_status", [("/v1/balance", 503), ("/v1/usage", 200)])
+def test_global_account_reports_require_the_master_key(gateway_admin, path, master_status):
+    status, created = gateway_admin.admin_call("/admin/api/client-keys", {"label": "reports"}, method="POST")
+    assert status == 200
+    key = created["raw_key"]
+    assert gateway_admin.api_call("/v1/models", key=key)[0] == 200
+    assert gateway_admin.api_call(path, key="")[0] == 401
+    status, body = gateway_admin.api_call(path, key=key)
+    assert status == 403
+    assert body["error"]["code"] == "forbidden"
+    assert gateway_admin.api_call(path)[0] == master_status
+
+
 def test_empty_bootstrap_admin_endpoints_work_cleanly(gateway_admin):
     st, ov = gateway_admin.admin_call("/admin/api/overview")
     assert st == 200

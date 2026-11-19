@@ -315,6 +315,24 @@ def test_an_unreadable_balance_is_unknown_not_zero():
     assert info['available'] is None and info['error'] == 'ConnectionError'
 
 
+def test_sequential_forced_balance_reads_work_on_the_same_clock_tick(monkeypatch):
+    # Windows Python 3.12's monotonic clock commonly gives the same value to all three reads.
+    monkeypatch.setattr(accounts, "time", types.SimpleNamespace(monotonic=lambda: 100, time=lambda: 1000))
+    results = iter([ConnectionError("down"), 210, 220])
+
+    def fetch():
+        value = next(results)
+        if isinstance(value, Exception):
+            raise value
+        return {"creditBalanceBreakdown": {"plan": value}}
+
+    manager = accounts.MinaraAccount({"bearer_token": "fake"}, fetch=fetch)
+    assert manager.get_balance()["error"] == "ConnectionError"
+    assert manager.get_balance(force_refresh=True)["available"] == 210
+    assert manager.get_balance(force_refresh=True)["available"] == 220
+    assert manager.get_balance()["available"] == 220
+
+
 class Backend:
     def __init__(self, cfg):
         self.cfg = cfg

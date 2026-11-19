@@ -1785,17 +1785,18 @@ class _Compiler:
             _err(path, "must name a regular file")
         if info.st_size > MAX_TEXT_BYTES:
             _err(path, "a text is limited to %d KiB" % (MAX_TEXT_BYTES // 1024))
-        self._grow(info.st_size, path)
         try:
             with open(target, "rb") as handle:
                 data = handle.read(MAX_TEXT_BYTES + 1)
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            _err(path, "the file is not valid UTF-8")
         except OSError as exc:
             self._unreadable(key, path, exc, replace=True)
         if len(data) > MAX_TEXT_BYTES:
             _err(path, "a text is limited to %d KiB" % (MAX_TEXT_BYTES // 1024))
+        self._grow(len(data), path)
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            _err(path, "the file is not valid UTF-8")
         if text.startswith("\ufeff"):
             text = text[1:]
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -3040,10 +3041,17 @@ class PromptStore:
         signature = (info.st_mtime_ns, info.st_size)
         if not stat.S_ISREG(info.st_mode):
             raise self._unreadable("the prompts file is not a regular file", signature)
-        if info.st_size > MAX_DOCUMENT_BYTES:
+        try:
+            if info.st_size > MAX_DOCUMENT_BYTES:
+                raise _TooLarge()
+            # This watch is on the request path. A temporary sharing violation is retried on the next look.
+            with self.path.open("rb") as handle:
+                data = handle.read(MAX_DOCUMENT_BYTES + 1)
+            if len(data) > MAX_DOCUMENT_BYTES:
+                raise _TooLarge()
+        except _TooLarge:
             raise self._unreadable("the prompts file is larger than %d MiB" % (MAX_DOCUMENT_BYTES // (1024 * 1024)),
-                                   signature)
-        data = self.path.read_bytes()
+                                   signature) from None
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:

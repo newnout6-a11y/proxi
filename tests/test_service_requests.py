@@ -422,9 +422,11 @@ def test_prompt_suggestion_strips_meta_silence_markers(tmp_path, monkeypatch):
     assert events[-1] == {"type": "end", "reason": "stop"}
 
 
-def test_prompt_suggestion_silent_upstream_turn_returns_200_without_retry(tmp_path, monkeypatch):
-    _, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[])
+@pytest.mark.parametrize("transport, refusal", [("direct", False), ("agent", False), ("agent", True)])
+def test_prompt_suggestion_distinguishes_silence_from_a_saved_upstream_error(tmp_path, monkeypatch, transport, refusal):
+    _, pool, runner = setup(tmp_path, transport=transport, project_context=False, cookie_values=[])
     calls = 0
+    diagnoses = []
 
     async def silent_stream(session, prompt, provider, tool_names=None):
         nonlocal calls
@@ -434,12 +436,24 @@ def test_prompt_suggestion_silent_upstream_turn_returns_200_without_retry(tmp_pa
         yield {"type": "end", "reason": "stop"}
 
     monkeypatch.setattr(RelaySession, "stream", silent_stream)
+
+    async def get_messages(thread_id):
+        diagnoses.append(thread_id)
+        return {"messages": [{"senderRole": "sandpack", "createdAt": "2099-01-01T00:00:00Z",
+                              "content": {"type": "error", "error": "AI credits exhausted"}}] if refusal else []}
+
+    monkeypatch.setattr(pool.backend, "get_messages", get_messages, raising=False)
     parsed = request([{"role": "user", "content": SUGGESTION_PROMPT}], tools=[], system="")
     parsed.request_purpose = "prompt-suggestion"
     events = asyncio.run(run(runner, parsed))
     assert calls == 1
-    assert not any(e["type"] == "error" for e in events)
-    assert events[-1] == {"type": "end", "reason": "stop"}
+    assert len(diagnoses) == int(transport == "agent")
+    if refusal:
+        assert events[-1]["type"] == "error"
+        assert events[-1]["error"].status == 402 and events[-1]["error"].code == "insufficient_credits"
+    else:
+        assert not any(e["type"] == "error" for e in events)
+        assert events[-1] == {"type": "end", "reason": "stop"}
 
 
 def test_ptc_mode_wraps_undeclared_tool_call_into_run_code(tmp_path, monkeypatch):

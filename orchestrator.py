@@ -962,7 +962,7 @@ class TurnRunner:
             "tools=" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         )
 
-    async def _explain_empty(self, holder):
+    async def _explain_empty(self, holder, *, quiet=False):
         """Silent turns are usually a persisted upstream error (e.g. out of credits)."""
         session = holder.get("session")
         if session is None:
@@ -973,7 +973,8 @@ class TurnRunner:
                 backend = self.pool.backend
             data = await backend.get_messages(session.thread_id)
         except Exception as exc:
-            console_log.write("[explain] fetch failed: %s" % exc)
+            if not quiet:
+                console_log.write("[explain] fetch failed: %s" % exc)
             return None
         # Retool returns messages newest-first.
         for message in data.get("messages", []):
@@ -2281,29 +2282,13 @@ class TurnRunner:
                         return
 
                     if not direct_mode and not command and not final_text.strip():
-                        # Silent turns are explained via persisted sandpack messages,
-                        # which the direct transport never writes.
-                        explained = await self._explain_empty(holder)
+                        # The agent transport can persist a real refusal without sending it on the stream.
+                        explained = await self._explain_empty(holder, quiet=purpose == "prompt-suggestion")
                         if explained is not None:
                             raise explained
 
-                    if (not direct_mode and not command and not final_text.strip() and empty_retries < 1 and not client_text
-                            and holder["_attempt_budget"].remaining):
-                        # The agent transport needs a textual continuation. Direct
-                        # retries are handled in the transport with the same body.
-                        empty_retries += 1
-                        log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
-                        if not direct_mode:
-                            native_context = None  # Retry prompts are not part of the client history in agent mode.
-                        retry_instruction = ("Use the supplied native client tools for tool calls; "
-                                             "otherwise return a short text answer." if native_tools else
-                                             "If a local command is needed, output <exec_command>...</exec_command>; "
-                                             "otherwise return a short text answer.")
-                        prompt = (base_prompt + "\n\n[RETRY] The previous attempt returned an empty answer. "
-                                  + retry_instruction)
-                        continue
-
                     if purpose == "prompt-suggestion":
+                        # Silence by itself is a successful suggestion, with no generation retry or incident.
                         cleaned = final_text.strip().strip("\"'«»").strip()
                         meta_silent = (
                             not cleaned
@@ -2320,6 +2305,21 @@ class TurnRunner:
                             out.put({"type": "text", "delta": cleaned})
                         out.put({"type": "end", "reason": holder.get("reason", "stop")})
                         return
+
+                    if (not direct_mode and not command and not final_text.strip() and empty_retries < 1 and not client_text
+                            and holder["_attempt_budget"].remaining):
+                        # The agent transport needs a textual continuation. Direct
+                        # retries are handled in the transport with the same body.
+                        empty_retries += 1
+                        log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
+                        native_context = None  # Retry prompts are not part of the client history in agent mode.
+                        retry_instruction = ("Use the supplied native client tools for tool calls; "
+                                             "otherwise return a short text answer." if native_tools else
+                                             "If a local command is needed, output <exec_command>...</exec_command>; "
+                                             "otherwise return a short text answer.")
+                        prompt = (base_prompt + "\n\n[RETRY] The previous attempt returned an empty answer. "
+                                  + retry_instruction)
+                        continue
 
                     if not command and not final_text.strip():
                         if dropped_calls:
