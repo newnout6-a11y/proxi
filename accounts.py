@@ -54,8 +54,8 @@ PLAN_PROBE_UNAVAILABLE = 6 * 3600.0  # ... and six hours when Retool had the mod
 PLAN_PROBES = 30                 # probes an hour at most (retool_plan_probes; 0 switches them off)
 # A wave: within PLAN_WAVE_WINDOW at least PLAN_WAVE_ACCOUNTS accounts that served the model in the last
 # PLAN_SERVED_RECENT refuse it. Five 3000-credit accounts refused Opus in the same second six times on 2026-11-14/15 and
-# served it 972-1462 turns each afterwards: a fault of Retool's, not of their plans. Such pairs keep the short hold and
-# are never written down.
+# served it 972-1462 turns each afterwards: a fault of Retool's, not of their plans. The wave lasts PLAN_WAVE_WINDOW after
+# the last such refusal; while it is on, no refusal is written down (each pair keeps the short hold).
 PLAN_WAVE_WINDOW = 120.0
 PLAN_WAVE_ACCOUNTS = 3
 PLAN_SERVED_RECENT = 86400.0
@@ -419,8 +419,9 @@ class MinaraAccount(UnmeteredAccount):
 
 def _plan_state():
     """An account's plan facts in the dispatcher's state: holds and when they ended (mark_plan_refusal), when each model
-    last served (mark_plan_served), the probes due (release_plan_refusals) and the pairs a wave of refusals touched."""
-    return {"plan_refusals": {}, "plan_released": {}, "plan_served": {}, "plan_probe_due": set(), "plan_wave": set()}
+    last served and when that was last written down (mark_plan_served), and the probes due (release_plan_refusals)."""
+    return {"plan_refusals": {}, "plan_released": {}, "plan_served": {}, "plan_served_written": {},
+            "plan_probe_due": set()}
 
 
 def _hours(value, default):
@@ -470,7 +471,7 @@ class AccountDispatcher:
         self.plan_probe = plan_probe or _probe_plan
         self._plan_pending = {}  # what is to be written to the plans file, by account identity (flush_plans)
         self._plan_probe_starts = collections.deque()  # when the probes of the last hour started
-        self._plan_refusals_seen = {}  # model -> recent refusals [(wall, backend)], for the waves
+        self._plan_refusals_seen = {}  # model -> refusals of the last PLAN_WAVE_WINDOW [(wall, backend, it served)]
         self._plan_waves = {}  # model -> wall time until which a wave of refusals of it is on
         self.parallel = max(1, int(cfg.get("account_refresh_parallel", 3) or 1))
         self.clock = clock
@@ -919,8 +920,9 @@ class AccountDispatcher:
 
         With a plans file (retool_plans.auto.json, `self.plans`) the repeated refusal is a fact of the plan: it is written
         down, outlives a restart and holds the pair for `plan_recheck` (12 h by default), after which a background probe
-        asks the pair, not a client's request (probe_plan). A refusal that served pairs share with others in a wave
-        (_note_wave) is a fault of Retool's: its pairs keep the short hold and are never written down.
+        asks the pair, not a client's request (probe_plan). While a wave of refusals of the model is on (_note_wave), a
+        fault of Retool's, no refusal is written down and each holds its pair `plan_refusal_first`; after it the ladder is
+        the usual one.
         """
         if not isinstance(model, str) or not model:
             return None
@@ -936,10 +938,10 @@ class AccountDispatcher:
             # When the pair's last hold ended: one the scheduler has not released yet still ended at its own deadline.
             ended = hold["until"] if hold is not None else ended_at.get(model)
             repeated = ended is not None and now - ended <= self.plan_refusal_hold
-            wave = self._note_wave(backend, model, wall)
-            persisted = repeated and self.plans is not None and model not in state["plan_wave"]
+            wave, announce = self._note_wave(backend, model, wall)
+            persisted = repeated and self.plans is not None and not wave
             pause = (self.plan_recheck if persisted else self.plan_refusal_first
-                     if model in state["plan_wave"] or not repeated else self.plan_refusal_hold)
+                     if wave or not repeated else self.plan_refusal_hold)
             until_at = wall + pause
             ended_at.pop(model, None)
             record = None
@@ -954,8 +956,8 @@ class AccountDispatcher:
             holds[model] = {"until": now + pause, "until_at": until_at, "pause": pause, "repeated": repeated,
                             **({"persisted": True, "record": record} if persisted else {})}
             self._publish_plan_refusals(backend)
-        if wave:
-            self._announce_wave(model, wave)
+        if announce:
+            self._announce_wave(model, announce)
         if persisted:
             text = ("[account] %s исключён для %s: модель не входит в тариф Retool (402, подтверждено повторно) до %s — "
                     "записано, следующая проверка в фоне" % (
@@ -963,46 +965,55 @@ class AccountDispatcher:
         else:
             text = "[account] %s исключён для %s: модель не входит в тариф Retool (402) до %s (пауза %s%s)" % (
                 self._tag(backend), model, time.strftime("%H:%M:%S", time.localtime(until_at)),
-                apierr.wait_text(pause), ", повторный отказ подряд" if repeated else "")
+                apierr.wait_text(pause), ", волна отказов" if wave else ", повторный отказ подряд" if repeated else "")
         journal.emit("account.model_refused", text, "warn", account=account_tag(backend), model=model,
                      until=round(until_at, 3), retry_in=pause, repeated=repeated, persisted=persisted,
-                     **({"wave": True} if model in self.state.get(backend, {}).get("plan_wave", ()) else {}),
+                     **({"wave": True} if wave else {}),
                      **({"request_id": request_id} if request_id else {}))
         console_log.write(text)
         return until_at
 
     def _note_wave(self, backend, model, wall):
-        """Caller holds the lock. Count this refusal of `model` towards a wave: the number of accounts that served the
-        model in the last PLAN_SERVED_RECENT and refused it within PLAN_WAVE_WINDOW, when they are PLAN_WAVE_ACCOUNTS or more
-        and the wave is new (to be announced), else 0.
+        """Caller holds the lock. Count this refusal of `model` towards a wave, a fault of Retool's rather than of the
+        plans: PLAN_WAVE_ACCOUNTS or more accounts that served the model in the last PLAN_SERVED_RECENT refused it within
+        PLAN_WAVE_WINDOW. Returns (on, accounts): whether a wave of the model is on now, and how many serving accounts made
+        it when it has just shown itself (to be announced), else 0.
 
-        Every pair refused in the window is marked (`plan_wave`): it keeps the short hold, and a refusal that was written
-        down a moment before the wave showed itself is taken back (its hold is short again, the file gets a newer record
-        that says nothing)."""
+        Only a refusal of an account that served the model makes a wave and keeps it on, for PLAN_WAVE_WINDOW after the
+        last one that kept the count: one minute's refusal of an account whose plan lacks the model kept a wave on for
+        hours, and such pairs were asked every five minutes and never written down. No refusal is written down while it is
+        on, and when it shows itself the refusals of its window that were written a moment before are taken back (the hold
+        is short again; the file gets the pair's served record back, or one that says nothing). Afterwards the ladder is
+        the usual one: a pair refused in the wave that refuses again within the hour after its hold is written down
+        (design D4 1.10: a real change of three plans at once looks like a wave)."""
+        state = self.state.get(backend) or {}
+        served = state.get("plan_served", {}).get(model)
+        serving = served is not None and wall - served <= PLAN_SERVED_RECENT
         seen = self._plan_refusals_seen.setdefault(model, collections.deque())
-        seen.append((wall, backend))
+        seen.append((wall, backend, serving))
         while seen and wall - seen[0][0] > PLAN_WAVE_WINDOW:
             seen.popleft()
-        serving = {item for _, item in seen
-                   if wall - (self.state.get(item) or {}).get("plan_served", {}).get(model, float("-inf"))
-                   <= PLAN_SERVED_RECENT}
-        if len(serving) < PLAN_WAVE_ACCOUNTS and self._plan_waves.get(model, float("-inf")) < wall:
-            return 0
-        new = self._plan_waves.get(model, float("-inf")) < wall
+        on = self._plan_waves.get(model, float("-inf")) >= wall
+        accounts = {item for _, item, flag in seen if flag}
+        if not serving or len(accounts) < PLAN_WAVE_ACCOUNTS:
+            return on, 0
         self._plan_waves[model] = wall + PLAN_WAVE_WINDOW
-        for _, item in seen:
-            state = self.state.get(item)
-            if state is None:
+        if on:
+            return True, 0
+        now = self.clock()
+        for _, item, _ in seen:
+            item_state = self.state.get(item)
+            hold = item_state["plan_refusals"].get(model) if item_state is not None else None
+            if hold is None or not hold.get("persisted"):
                 continue
-            state["plan_wave"].add(model)
-            hold = state["plan_refusals"].get(model)
-            if hold is not None and hold.get("persisted"):
-                now = self.clock()
-                hold.update(until=min(hold["until"], now + self.plan_refusal_first), pause=self.plan_refusal_first,
-                            until_at=min(hold["until_at"], wall + self.plan_refusal_first), persisted=False, record=None)
-                self._queue_plan(item, model, {"state": "wave", "at": retool_plans.stamp(wall)})
-                self._publish_plan_refusals(item)
-        return len(serving) if new else 0
+            hold.update(until=min(hold["until"], now + self.plan_refusal_first), pause=self.plan_refusal_first,
+                        until_at=min(hold["until_at"], wall + self.plan_refusal_first), persisted=False, record=None)
+            served_at = item_state["plan_served"].get(model)
+            self._queue_plan(item, model, {"state": "served", "at": retool_plans.stamp(wall),
+                                           "served_at": retool_plans.stamp(served_at), "source": "chat"}
+                             if served_at is not None else {"state": "wave", "at": retool_plans.stamp(wall)})
+            self._publish_plan_refusals(item)
+        return True, len(accounts)
 
     def _announce_wave(self, model, accounts):
         text = ("[account] Волна отказов тарифа Retool для %s: %d аккаунтов, которые обслуживали модель, отказали за %d с — "
@@ -1015,8 +1026,10 @@ class AccountDispatcher:
         """A turn of `model` on this Retool account was answered: its plan includes the model.
 
         The pool asks the accounts that served a model before the others (SessionPool._next_backend, `served_models`), a
-        wave counts only refusals of such accounts, and the fact is written down at most once an hour per pair. A hold the
-        pair still had ends, and the pair's next refusal starts the ladder from its first step."""
+        wave counts only refusals of such accounts, and the fact is written down at most once an hour per pair: an hour
+        after the pair's last record, not after an hour without turns (a pair that served all the time kept the record of
+        its first turn, and after a restart did not count as serving). A hold the pair still had ends, and the pair's next
+        refusal starts the ladder from its first step."""
         cfg = getattr(backend, "cfg", None) or {}
         if not isinstance(model, str) or not model or cfg.get("upstream", "retool") != "retool":
             return
@@ -1025,14 +1038,13 @@ class AccountDispatcher:
             state = self.state.get(backend)
             if state is None:
                 return
-            last = state["plan_served"].get(model)
+            written = state["plan_served_written"].get(model)
             state["plan_served"][model] = wall
-            state["plan_wave"].discard(model)
             state["plan_probe_due"].discard(model)
             state["plan_released"].pop(model, None)
             dropped = state["plan_refusals"].pop(model, None)
-            fresh = last is None or wall - last >= PLAN_SERVED_WRITE
-            if fresh or dropped is not None:
+            if written is None or wall - written >= PLAN_SERVED_WRITE or dropped is not None:
+                state["plan_served_written"][model] = wall
                 self._queue_plan(backend, model, {"state": "served", "at": retool_plans.stamp(wall),
                                                   "served_at": retool_plans.stamp(wall), "source": "chat"})
                 self._publish_plan_refusals(backend)
@@ -1065,8 +1077,6 @@ class AccountDispatcher:
                     released.append((backend, model))
                 for model in [model for model, at in ended_at.items() if now - at > self.plan_refusal_hold]:
                     del ended_at[model]
-                    if model not in holds:
-                        state["plan_wave"].discard(model)
                 if ended:
                     self._publish_plan_refusals(backend)
         for backend, model in released:
@@ -1088,9 +1098,10 @@ class AccountDispatcher:
 
     def probe_plan(self, backend):
         """Ask one pair of this account whose plan refused a model, once its hold ended (kind "plan_probe", the scheduler's
-        workers): one short question on the relay's own route (retool_refresh.probe). The answer decides: it served (the
-        hold ends, served), Retool's 402 again (held twice as long, up to a day), anything else (429, network, 5xx, the
-        model "not available right now" for everyone) holds the pair a while longer as it was. The outcome, or None."""
+        workers): one short question on the relay's own route (retool_refresh.probe). The answer decides: it served or
+        began to answer (the hold ends, served), Retool's 402 again (held twice as long, up to a day), anything else (429,
+        network, 5xx, the model "not available right now" for everyone) holds the pair a while longer as it was. The
+        outcome, or None."""
         import models  # local: the catalog is not this module's concern otherwise
 
         with self._lock:
@@ -1123,11 +1134,13 @@ class AccountDispatcher:
             if state is None:
                 return None
             hold = state["plan_refusals"].get(model)
-            if row.get("ok"):
+            if row.get("ok") or row.get("accepted"):
+                # The model answered, or began to on HTTP 200 (it thought through the probe's output limit): a plan that
+                # lacks it answers 402 before any of it. Held as unknown, the pair was asked again every hour, each billed.
                 outcome = "served"
                 state["plan_refusals"].pop(model, None)
                 state["plan_released"].pop(model, None)
-                state["plan_served"][model] = wall
+                state["plan_served"][model] = state["plan_served_written"][model] = wall
                 self._queue_plan(backend, model, {"state": "served", "at": retool_plans.stamp(wall),
                                                   "served_at": retool_plans.stamp(wall), "source": "probe"})
             elif row.get("http") == 402 and apierr.is_not_in_plan(row.get("error")):
@@ -1183,7 +1196,8 @@ class AccountDispatcher:
             if record.get("state") == "served":
                 served = retool_plans.epoch(record.get("served_at"))
                 if served is not None:
-                    state["plan_served"][model] = min(served, wall)
+                    # Written at most an hour after the turn it names: the next turn writes it again after the hour.
+                    state["plan_served"][model] = state["plan_served_written"][model] = min(served, wall)
             elif record.get("state") == "refused":
                 remaining = (retool_plans.epoch(record.get("recheck_at")) or wall) - wall
                 if remaining <= 0:

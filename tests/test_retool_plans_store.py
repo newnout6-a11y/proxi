@@ -277,3 +277,150 @@ def test_after_a_restart_a_new_conversation_goes_to_the_account_that_serves_with
     accounts = on_disk(tmp_path)["accounts"]
     assert accounts["acc-a"]["models"][OPUS]["state"] == "refused"
     assert accounts["acc-b"]["models"][OPUS]["state"] == "served"
+
+
+# -- review of impl/routing-pool -------------------------------------------------------------------------------------------
+def step(clock, wall, seconds):
+    clock.now += seconds
+    wall.now += seconds
+
+
+def test_a_wave_ends_two_minutes_after_its_last_serving_refusal_and_the_plans_that_lack_the_model_are_written_down(
+        tmp_path):
+    """Three accounts that served Opus refuse it together once (a fault of Retool's); afterwards the clients' requests meet
+    the six accounts whose plans lack Opus, one refusal a minute. Their refusals kept the wave on for hours: each was
+    asked every 5 minutes (36 refusals in 3 h) and none was written down; without the fault each is asked twice."""
+    servers = [Account("s%d" % index) for index in range(3)]
+    refusers = [Account("r%d" % index) for index in range(6)]
+    value, clock, wall = plans_dispatcher(tmp_path, servers + refusers)
+    for account in servers:
+        value.mark_plan_served(account, OPUS)
+    for account in servers:
+        value.mark_plan_refusal(account, OPUS)
+    asked = {account.cfg["account_id"]: [] for account in refusers}
+    for _ in range(180):
+        step(clock, wall, 60)
+        value.release_plan_refusals()
+        free = [account for account in refusers if OPUS not in account.refused_models]
+        if free:
+            value.mark_plan_refusal(free[0], OPUS)
+            asked[free[0].cfg["account_id"]].append(free[0].refused_models[OPUS].get("persisted", False))
+    assert all(items == [False, True] for items in asked.values()), asked
+    assert value._plan_waves[OPUS] < wall.now
+
+
+def test_a_pair_refused_in_a_wave_is_written_down_at_its_next_refusal_after_it(tmp_path):
+    """Design D4 1.10: a real change of three plans at once looks like a wave; the first refusal after it is written."""
+    servers = [Account("s%d" % index) for index in range(3)]
+    refuser = Account("r")
+    value, clock, wall = plans_dispatcher(tmp_path, servers + [refuser])
+    for account in servers:
+        value.mark_plan_served(account, OPUS)
+    for account in [*servers, refuser]:
+        value.mark_plan_refusal(account, OPUS)  # the wave, and the refuser asked in the same minute
+    assert {account.refused_models[OPUS]["pause"] for account in [*servers, refuser]} == {PLAN_REFUSAL_FIRST}
+    step(clock, wall, PLAN_REFUSAL_FIRST + 600)  # the wave is long over, the holds ended 10 minutes ago
+    value.release_plan_refusals()
+    for account in [refuser, servers[0]]:
+        value.mark_plan_refusal(account, OPUS)
+        assert account.refused_models[OPUS]["persisted"] is True
+
+
+def test_a_refusal_written_a_moment_before_the_wave_showed_itself_is_taken_back_and_the_pair_stays_served(tmp_path):
+    servers = [Account("s%d" % index) for index in range(3)]
+    value, clock, wall = plans_dispatcher(tmp_path, servers)
+    for account in servers:
+        value.mark_plan_served(account, OPUS)
+        value.mark_plan_refusal(account, OPUS)  # a first wave
+    value.flush_plans()
+    step(clock, wall, PLAN_REFUSAL_FIRST + 60)
+    value.release_plan_refusals()
+    value.mark_plan_refusal(servers[0], OPUS)  # the fault again: alone, a repeated refusal, written down ...
+    assert servers[0].refused_models[OPUS]["persisted"] is True
+    value.flush_plans()
+    assert on_disk(tmp_path)["accounts"]["s0"]["models"][OPUS]["state"] == "refused"
+    for account in servers[1:]:
+        value.mark_plan_refusal(account, OPUS)  # ... until the two others show the wave
+    assert {account.refused_models[OPUS]["pause"] for account in servers} == {PLAN_REFUSAL_FIRST}
+    assert not any(account.refused_models[OPUS].get("persisted") for account in servers)
+    value.flush_plans()
+    record = on_disk(tmp_path)["accounts"]["s0"]["models"][OPUS]
+    assert record["state"] == "served" and retool_plans.epoch(record["served_at"]) == pytest.approx(wall.now - 360)
+
+
+def test_a_pair_that_serves_all_the_time_is_written_down_again_every_hour(tmp_path):
+    """The record was written again only after an hour without a turn: after 6 h of turns every 30 minutes it was 6 h
+    old, and after a restart such accounts did not count as serving (the wave rule asks for a turn within a day)."""
+    account = Account("a")
+    value, clock, wall = plans_dispatcher(tmp_path, [account])
+    for _ in range(12):
+        value.mark_plan_served(account, OPUS)
+        value.flush_plans()
+        step(clock, wall, 1800)
+    record = on_disk(tmp_path)["accounts"]["a"]["models"][OPUS]
+    assert wall.now - retool_plans.epoch(record["served_at"]) <= 3600 + 1800
+
+
+def test_after_a_restart_the_accounts_that_served_still_make_a_wave_and_are_not_written_down(tmp_path):
+    servers = [Account("s%d" % index) for index in range(3)]
+    value, clock, wall = plans_dispatcher(tmp_path, servers)
+    for _ in range(2 * 24 * 6):  # two days of turns every 10 minutes
+        for account in servers:
+            value.mark_plan_served(account, OPUS)
+        value.flush_plans()
+        step(clock, wall, 600)
+    clock = Clock()  # the relay restarts
+    restarted = AccountDispatcher(servers, {"session_refresh_interval": 0, "_config_path": str(tmp_path / "config.json")},
+                                  {}, clock=clock, wall=wall)
+    for _ in range(2):  # a fault of Retool's refuses Opus on all three, twice, six minutes apart
+        for account in servers:
+            restarted.mark_plan_refusal(account, OPUS)
+        assert {account.refused_models[OPUS]["pause"] for account in servers} == {PLAN_REFUSAL_FIRST}
+        step(clock, wall, PLAN_REFUSAL_FIRST + 60)
+        restarted.release_plan_refusals()
+    restarted.flush_plans()
+    assert {row["models"][OPUS]["state"] for row in on_disk(tmp_path)["accounts"].values()} == {"served"}
+
+
+def test_a_probe_the_model_began_to_answer_proves_the_plan_includes_it(tmp_path):
+    """HTTP 200 and the model answering (it thought through the probe's output limit, no word): a plan without the model
+    answers 402 before any of it. It held the pair and asked again every hour, each probe billed."""
+    account = Account("a")
+    value, clock, wall = plans_dispatcher(tmp_path, [account])
+    value.plan_probe = lambda backend, model_entry: {"ok": False, "http": 200, "error": "no answer", "accepted": True,
+                                                     "credits": 0.4}
+    refuse_twice(value, clock, account)
+    clock.now += PLAN_RECHECK + 1
+    value.release_plan_refusals()
+    assert value.probe_plan(account) == "served"
+    assert account.refused_models == {} and OPUS in account.served_models
+
+
+def test_a_file_another_process_has_open_for_a_moment_keeps_every_record(tmp_path, monkeypatch):
+    """A sharing violation (an antivirus, the other relay) when merge read the file: read() took it for a damaged file,
+    set it aside as .bad and wrote back only what was being merged."""
+    plans = store(tmp_path)
+    plans.merge({"acc-%d" % index: {"models": {OPUS: {"state": "refused", "at": retool_plans.stamp(1_800_000_000)}}}
+                 for index in range(5)}, now=1_800_000_000)
+    real_open = open
+    failures = {"left": 1}
+
+    def flaky_open(path, mode="r", *args, **kwargs):
+        if str(path).endswith(retool_plans.AUTO_NAME) and "r" in mode and failures["left"]:
+            failures["left"] -= 1
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", flaky_open)
+    plans.merge({"acc-new": {"models": {OPUS: {"state": "served", "at": retool_plans.stamp(1_800_000_001)}}}},
+                now=1_800_000_001)
+    monkeypatch.setattr("builtins.open", real_open)
+    assert len(on_disk(tmp_path)["accounts"]) == 6 and not (tmp_path / (retool_plans.AUTO_NAME + ".bad")).exists()
+    # One that stays shut is no damage either: merge fails (flush_plans keeps the records for the next tick).
+    failures["left"] = 99
+    monkeypatch.setattr("builtins.open", flaky_open)
+    with pytest.raises(OSError):
+        plans.merge({"acc-x": {"models": {OPUS: {"state": "served", "at": retool_plans.stamp(1_800_000_002)}}}})
+    assert plans.read() == {}  # a reader that cannot open it goes on without it, and sets nothing aside
+    monkeypatch.setattr("builtins.open", real_open)
+    assert len(on_disk(tmp_path)["accounts"]) == 6 and not (tmp_path / (retool_plans.AUTO_NAME + ".bad")).exists()

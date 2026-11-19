@@ -10,7 +10,8 @@ A turn that a pair served is written too (at most once an hour per pair): the po
 The file holds no secret: an account is named by accounts.cfg_identity (its account_id or page UUID, what the stored
 conversations name it by) and a tag for the reader. Writes are atomic (a temporary file in the same folder, then
 os.replace) and merge with what is on disk under the file's lock: two relays on one config.json keep each other's facts,
-and per pair the newer record wins. A damaged file is set aside as .bad and the relay starts as if it had none.
+and per pair the newer record wins. A damaged file is set aside as .bad and the relay starts as if it had none; one that
+another process has open for a moment is read again and never set aside.
 """
 import datetime
 import json
@@ -24,6 +25,8 @@ import journal
 VERSION = 1
 AUTO_NAME = "retool_plans.auto.json"
 FORGET_ACCOUNT = 7 * 86400.0  # what is known of an account that left config.json is kept a week, then dropped
+READ_TRIES = 3  # a file another process has open for a moment (Windows: a sharing violation) is read again ...
+READ_PAUSE = 0.05  # ... this long after each failure
 
 
 def overlay_path(config_path):
@@ -60,18 +63,36 @@ class PlanStore:
     def __init__(self, path):
         self.path = os.fspath(path)
 
-    def read(self):
+    def read(self, strict=False):
         """{identity: {"tag", "limit", "models": {model: record}}}; {} when there is no file. A file that cannot be read as
-        one is renamed to .bad (journal warn) and the relay goes on without it."""
+        one is renamed to .bad (journal warn) and the relay goes on without it.
+
+        A file that cannot be opened now is no damage: another process has it open for a moment (an antivirus, the other
+        relay on this config.json). It is opened again READ_TRIES times; then the reader goes on without it ({}), and
+        `strict` (merge) raises the OSError instead, so that nothing is written over it (flush_plans keeps its records for
+        the next tick). Taken for damage, it was set aside and the merge wrote back only what it was merging."""
+        for attempt in range(READ_TRIES):
+            try:
+                with open(self.path, "rb") as stream:
+                    raw = stream.read()
+                break
+            except FileNotFoundError:
+                return {}
+            except OSError as error:
+                if attempt + 1 < READ_TRIES:
+                    time.sleep(READ_PAUSE)
+                    continue
+                if strict:
+                    raise
+                journal.emit("account.plans_unreadable", "Файл тарифов Retool сейчас не открывается (%s) — relay идёт "
+                             "без него, файл не тронут" % type(error).__name__, "warn", path=os.path.basename(self.path))
+                return {}
         try:
-            with open(self.path, "r", encoding="utf-8") as stream:
-                data = json.load(stream)
+            data = json.loads(raw.decode("utf-8"))
             accounts = data.get("accounts") if isinstance(data, dict) else None
             if not isinstance(accounts, dict):
                 raise ValueError("no accounts")
-        except FileNotFoundError:
-            return {}
-        except (OSError, ValueError) as error:
+        except ValueError as error:
             self._set_aside(error)
             return {}
         return {identity: row for identity, row in accounts.items()
@@ -94,7 +115,7 @@ class PlanStore:
 
         now = time.time() if now is None else now
         with config.storage_lock(self.path, timeout=10, best_effort=True):
-            accounts = self.read()
+            accounts = self.read(strict=True)
             for identity, row in updates.items():
                 kept = accounts.setdefault(identity, {"models": {}})
                 for key in ("tag", "limit"):
