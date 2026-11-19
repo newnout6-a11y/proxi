@@ -12,7 +12,9 @@ Four independent silence budgets run on elapsed time since the last meaningful m
 Setting a budget to 0 or None disables it. Non-content events (request_sent, usage_start, usage, credits,
 thinking_heartbeat, the relay's own thinking_status timer, and duplicate empty tool-call announcements) never reset any
 silence timer; a real thinking sign (thinking_start, an empty thinking delta, thinking_signature, or thinking_status from
-the upstream) switches to the thinking budget, never to a shorter one.
+the upstream) switches to the thinking budget, never to a shorter one. So does reasoning text (a non-empty thinking
+delta) until the answer starts: a model may stream a reasoning summary and then reason in silence for minutes before it
+writes; text and tool-call progress go back to the idle and tool budgets.
 """
 from __future__ import annotations
 
@@ -96,6 +98,11 @@ def stream_timeout_error(phase: str, seconds: float) -> apierr.ApiError:
 
 def _call_key(event: dict):
     return event.get("id") or event.get("index") or event.get("name")
+
+
+def _outlasts(budget, other) -> bool:
+    """True when `budget` is longer than `other`; a disabled budget (None) is the longest of all."""
+    return other is not None and (budget is None or budget > other)
 
 
 def opens_tool_call(event, calls: dict) -> bool:
@@ -236,7 +243,15 @@ async def watch(
                         # ~20 characters of the arguments and holds the rest for tens of seconds (the idle budget cut
                         # six Claude Code turns at a Write on 2026-11-18).
                         announced.discard(_call_key(event))
-                    phase, limit = (TOOL, tool) if announced else (IDLE, idle)
+                    if announced:
+                        phase, limit = TOOL, tool
+                    elif event.get("type") == "thinking" and _outlasts(thinking, idle):
+                        # Reasoning text is no answer yet: the model may reason in silence again before it writes.
+                        # gpt-6.2-sol at max streamed its reasoning summary for 59-64 s, then thought for over 120 s
+                        # without a word, and the idle budget cut it with a 504 (2026-11-19).
+                        phase, limit = THINKING, thinking
+                    else:
+                        phase, limit = IDLE, idle
                     deadline = None if limit is None else now + limit
                 elif opens_tool_call(event, calls):
                     announced.add(_call_key(event))
