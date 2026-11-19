@@ -265,6 +265,25 @@ def _may_be_balance_related(error):
 # A conversation moved to another account writes its prefix there again; below this many prompt tokens that costs next
 # to nothing, and waiting for the limited account (account_rate_limit_wait) is only a delay.
 LIMIT_WAIT_MIN_PREFIX = 8000
+# From how many milliseconds the first token of an attempt is journaled as warn, by the effort sent upstream. The model
+# reasons before its first token, and a reasoning that is not streamed is silence: one 8 s for every level made a warning of
+# 65% of the xhigh turns and 39% of the max turns in the live journal (19.4k first tokens, 2026-11-19). Each figure sits at
+# about the 95th-98th percentile of its levels there: low, medium and high p95 15-17 s (2-4% above 20 s), xhigh p95 37 s
+# and max p95 33 s (2-3% above 45 s). Without reasoning (none, minimal) or with no effort sent the old 8 s stays (none:
+# p99 3.3 s).
+FIRST_TOKEN_WARN_MS = {"low": 20_000, "medium": 20_000, "high": 20_000, "xhigh": 45_000, "max": 45_000}
+FIRST_TOKEN_WARN_DEFAULT_MS = 8_000
+
+
+def first_token_warn_ms(effort):
+    """The first-token time from which upstream.first_token is a warning for this effort."""
+    return FIRST_TOKEN_WARN_MS.get(str(effort or "").strip().lower(), FIRST_TOKEN_WARN_DEFAULT_MS)
+
+
+def first_token_level(ttft_ms, effort):
+    return "success" if ttft_ms < first_token_warn_ms(effort) else "warn"
+
+
 # How long a universal provider that answered 429 without a Retry-After is left out of the pool: a provider's limit is per
 # minute (OpenRouter, OpenAI, Anthropic), not Retool's sliding hour, so account_rate_limit_cooldown (900 s) never fits it.
 PROVIDER_RATE_LIMIT_PAUSE = 60
@@ -1746,8 +1765,10 @@ class TurnRunner:
                                 if not first_token and event["type"] in ("text", "thinking", "tool_call"):
                                     first_token = True
                                     ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                    sent_effort = model_provider.get("reasoningEffort")
                                     log("upstream.first_token", "Первый токен через %d мс" % ttft,
-                                        "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
+                                        first_token_level(ttft, sent_effort), ttft_ms=ttft, first=event["type"],
+                                        effort=sent_effort, warn_ms=first_token_warn_ms(sent_effort))
                                 if event["type"] in ("thinking_status", "thinking_start", "thinking", "thinking_signature",
                                                      "tool_call"):
                                     text_open = False
