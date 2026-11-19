@@ -53,3 +53,19 @@ def test_a_small_plan_that_never_served_a_frontier_model_is_offered_it_last():
     assert picks(pool, HAIKU) == {"a", "b"}  # not a frontier model: every plan has it
     busy(pool, b, 2)
     assert picks(pool, OPUS) == {"a"}
+
+
+def test_the_operators_account_priority_comes_before_what_the_plans_served():
+    """A backup account (priority 10) that served Opus once, during an outage of the main ones, took every new Opus
+    conversation from the priority-0 accounts afterwards: the served tier was applied before the priority (review of
+    impl/routing-pool)."""
+    pool = SessionPool(PoolBackend(pool_config([acct("main", provider_resource_name=M),
+                                                acct("backup", provider_resource_name=M, priority=10)])))
+    main, backup = pool.backends
+    dispatcher = AccountDispatcher(pool.backends, {"session_refresh_interval": 0}, {}, clock=Clock())
+    dispatcher.mark_plan_served(backup, OPUS)
+    assert picks(pool, OPUS) == {"main"}
+    # The tiers still order the accounts of the top priority.
+    pool, dispatcher = pool_of("a", "b")
+    dispatcher.mark_plan_served(pool.backends[1], OPUS)
+    assert picks(pool, OPUS) == {"b"}

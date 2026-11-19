@@ -26,7 +26,7 @@ import conversation_state
 import journal
 import console_log
 import models as model_catalog
-from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled
+from accounts import UNNAMED, account_tag, cfg_identity, enabled as account_enabled, priority as account_priority
 from auth import upstream_headers
 from upstream_refresh import Refresher
 
@@ -1635,23 +1635,36 @@ class SessionPool:
                 inflight_counts[session.backend] += 1
         idx = getattr(self, "_rr_index", 0)
         self._rr_index = (idx + 1) % max(1, len(self.backends))
-        candidates = self._plan_order(candidates, model_entry, exclude, counts)
+        # The operator's account priority comes first (backups at priority 10 serve only when no priority-0 account can),
+        # then what the plans served (_plan_order), then the route's strategy or the accounts' routing_strategy.
+        top = min(account_priority(backend) for backend in candidates)
+        candidates = self._plan_order([backend for backend in candidates if account_priority(backend) == top],
+                                      model_entry, exclude, counts)
         return catalog_router.select_candidate_backend(candidates, self.backends, counts, inflight_counts, idx,
                                                        strategy=_route_strategy(model_entry))
 
     def _plan_order(self, candidates, model_entry, exclude, counts):
-        """The accounts a new conversation is offered first (design D4 1.6): those whose Retool plan served its model
-        (AccountDispatcher.mark_plan_served, `served_models`, kept a week), then the others, and last, for a frontier model,
-        those on a plan of 250 credits a month that never served it (all 22 such accounts refused Opus and Sonnet 5.5 on
-        2026-11-18, and "least loaded" sent every new conversation to them first: A03-03).
+        """The accounts of one priority a new conversation is offered first (design D4 1.6): those whose Retool plan served
+        its model (AccountDispatcher.mark_plan_served, `served_models`, kept a week), then the others, and last, for a
+        frontier model, those on a plan of 250 credits a month that never served it (all 22 such accounts refused Opus and
+        Sonnet 5.5 on 2026-11-18, and "least loaded" sent every new conversation to them first: A03-03).
 
         A preference, never an exclusion (a plan can change): a lower tier gets the conversation once every account of
         the tier above carries more than twice the load (conversations, turns in flight twice) of the least loaded
-        account below it, plus one."""
-        tiers = ([], [], [])
+        account below it, plus one. It orders the accounts of one model: a route alias that spreads its turns over several
+        targets (weighted, least-inflight) has the accounts of each target ordered on their own, and its strategy chooses
+        among what each offers, never the one Retool account that served once (Minara and the providers learn no plan)."""
+        groups = {}
         for backend in candidates:
             target = self._bound_target(backend, model_entry, exclude) or model_entry
-            model = (target or {}).get("id")
+            groups.setdefault((target or {}).get("id"), []).append(backend)
+        return [backend for model, group in groups.items() for backend in self._plan_tier(group, model, counts)]
+
+    @staticmethod
+    def _plan_tier(backends, model, counts):
+        """_plan_order over the accounts of one model: the tier a new conversation of it goes to."""
+        tiers = ([], [], [])
+        for backend in backends:
             if model in (getattr(backend, "served_models", None) or {}):
                 tiers[0].append(backend)
             elif _frontier(model) and _small_plan(backend):
@@ -1663,7 +1676,7 @@ class SessionPool:
             rest = [backend for lower in tiers[index + 1:] for backend in lower]
             if not rest or min(counts.get(b, 0) for b in tier) <= 2 * min(counts.get(b, 0) for b in rest) + 1:
                 return tier
-        return candidates
+        return backends
 
     @property
     def mode(self):
