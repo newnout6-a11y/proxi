@@ -225,7 +225,8 @@ def minara_relay(tmp_path, monkeypatch):
 
 
 def test_a_refused_request_never_reaches_minara(minara_relay):
-    ask, posts = minara_relay(cost_guard_request_minara=1)
+    # The default is "warn" until the estimate is calibrated; "block" is the operator's choice.
+    ask, posts = minara_relay(cost_guard="block", cost_guard_request_minara=1)
     before = journal.JOURNAL.last_seq
     status, body = ask()
     assert status == 400 and body["error"]["code"] == "cost_limit_exceeded" and posts == []

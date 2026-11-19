@@ -124,7 +124,10 @@ DEFAULTS = {
     # Ceilings in Minara credits (220 per dollar), 0 for none: one request (the owner's dearest was 1,195; three agent forks
     # cost 1,925 to 3,533), a sliding hour over all Minara accounts (a guard against loops: the owner's busiest hour was
     # 6,373), and the estimate from which a request is named in the console and the journal (the owner's p99 is 250).
-    "cost_guard": "block",
+    # Default "warn" until the estimate is calibrated on live traffic (journal cost.estimate_vs_actual): the review of
+    # 2026-11-19 found it priced a moved conversation cold (non-Claude cache is shared across Minara accounts) and a prompt
+    # suggestion by the whole dialog, so "block" could refuse a real session of the owner.
+    "cost_guard": "warn",
     "cost_guard_request_minara": 1500,
     "cost_guard_hour_minara": 12000,
     "cost_guard_warn_minara": 300,
