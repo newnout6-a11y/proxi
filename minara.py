@@ -19,6 +19,7 @@ import zoneinfo
 
 import apierr
 import client_context
+from drivers import curl_pool, http_pool
 import forced_choice
 import journal
 
@@ -174,6 +175,14 @@ def _messages(history):
         yield {'role': 'user', 'content': images}
 
 
+_NO_CACHE_TTL_RE = re.compile(r"^anthropic/claude-(?:3\b|(?:opus|sonnet|haiku)-4(?:[.-](?:0|1)|$))")
+
+
+def _cache_ttl_supported(model):
+    """Legacy Claude 3 / 4.0 / 4.1 models reject `cache_control.ttl` with HTTP 400."""
+    return not _NO_CACHE_TTL_RE.match(str(model or ""))
+
+
 def _mark(message, ttl):
     """Put a cache breakpoint on the last part of a message; False when the message has nothing to carry one."""
     content = message.get("content")
@@ -264,6 +273,8 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     # one of them continues a tool call without them. Kept, they cost memory and a larger body on every request.
     if model.startswith("anthropic/") and cfg.get("direct_cache", True):
         ttl = cfg.get("minara_cache_ttl", "1h")
+        if not _cache_ttl_supported(model):
+            ttl = None
         # An hour costs Minara's accounts nothing more than five minutes (it bills every write at its list price), and a
         # subagent that waits on a long command still reads its own history when it comes back.
         _cache_marks(messages, ttl if ttl in ("1h", "5m") else None, mark_tail)
@@ -402,7 +413,7 @@ def normalize_usage(value, pricing=None):
     # to 0.0002 credits (end-to-end runs of 2026-11-10). So the list prices every reply it can read; what upstream reported
     # stays as upstream_cost, for diagnosis.
     estimate = (estimated_cost(pricing, dict(result, **_modalities(value)))
-                if pricing is not None and 'input_tokens' in result else None)
+                if pricing is not None and ('input_tokens' in result or 'output_tokens' in result) else None)
     if estimate is not None:
         result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
         if reported is not None:
@@ -923,7 +934,7 @@ class EventParser:
         if not isinstance(item, dict):
             raise apierr.upstream_error("Minara returned a stream error")
         if "error" in item or item.get("type") == "error":
-            raise _sse_error(item)
+            raise _sse_error(item, pre_output=not (self.text or self.calls or self.thinking))
         failed = _upstream_failure(item)
         if failed:
             raise apierr.upstream_error("Minara's upstream failed: " + failed)
@@ -1058,14 +1069,55 @@ def _http_error(status, headers, text=b""):
 def _status_error(status, headers, text=b""):
     if status in (504, 524):
         return apierr.upstream_timeout("Minara gateway timed out (upstream HTTP %s)" % status)
-    if status in (401, 403):
+    if status == 401:
         # The code is the one every account path knows (auth_dead, failover); the words are Minara's, not Retool's.
-        error = apierr.ApiError(502, "upstream_auth_error", "Minara rejected the account's token (HTTP %s): it expired or "
-                                "was revoked; the request moves to another account, the account needs a new token" % status)
+        error = apierr.ApiError(502, "upstream_auth_error", "Minara rejected the account's token (HTTP 401): it expired or "
+                                "was revoked; the request moves to another account, the account needs a new token")
+        error.upstream_status = status
+        return error
+    if status == 403:
+        import auth
+
+        raw_text = text.decode("utf-8", "replace") if isinstance(text, bytes) else str(text or "")
+        low_raw = raw_text[:1500].lower()
+        if auth.cloudflare_challenge(status, headers) or (
+            "<html" in low_raw[:400] and any(k in low_raw for k in ("cloudflare", "attention required", "just a moment"))
+        ):
+            return apierr.upstream_error("Minara gateway blocked by Cloudflare challenge (HTTP 403)")
+        detail = _upstream_message(text)
+        low = detail.lower()
+        auth_hint = any(k in low for k in (
+            "unauthorized", "invalid api key", "invalid_api_key", "invalid token", "token",
+            "expired", "revoked", "authentication", "bad credentials",
+        ))
+        err_type = ""
+        has_upstream_meta = False
+        try:
+            parsed_err = json.loads(raw_text).get("error") if raw_text.strip() else None
+            if isinstance(parsed_err, dict):
+                err_type = str(parsed_err.get("type") or "").lower()
+                meta = parsed_err.get("metadata") if isinstance(parsed_err.get("metadata"), dict) else {}
+                has_upstream_meta = "previous_errors" in meta or "provider_name" in meta
+        except (ValueError, AttributeError, TypeError, RecursionError):
+            pass
+        if _channel_trouble(403, text) or (
+            bool(low) and not auth_hint and (
+                err_type == "upstream_error" or has_upstream_meta
+                or any(k in low for k in (
+                    "is banned", "banned", "moderation", "flagged", "region", "country",
+                    "unsupported", "unavailable", "not available", "not allowed", "blocked", "violates",
+                ))
+            )
+        ):
+            return apierr.upstream_error(
+                "Minara upstream rejected request (HTTP 403)" + (": " + detail if detail else "")
+            )
+        error = apierr.ApiError(502, "upstream_auth_error", "Minara rejected the account's token (HTTP 403): it expired or "
+                                "was revoked; the request moves to another account, the account needs a new token")
         error.upstream_status = status
         return error
     if status == 429:
-        return apierr.too_many_requests("Minara rate limit", apierr.retry_after_seconds(headers.get("retry-after")) or 2)
+        return apierr.account_rate_limited("Minara rate limit", apierr.retry_after_seconds(headers.get("retry-after")) or 2)
     if status == 402:
         return apierr.ApiError(402, "insufficient_credits", "Minara account has insufficient balance")
     if _channel_trouble(status, text):
@@ -1126,9 +1178,25 @@ def _upstream_message(text, limit=400):
     return message
 
 
-def _sse_error(item):
-    detail = _upstream_message(json.dumps({"error": item.get("error"), "message": item.get("message")}))
-    return apierr.upstream_error("Minara returned a stream error" + (": " + detail if detail else ""))
+def _sse_error(item, *, pre_output=False):
+    raw = item.get("error")
+    code = raw.get("code") if isinstance(raw, dict) else item.get("code")
+    etype = str(raw.get("type") or "").lower() if isinstance(raw, dict) else ""
+    detail = _upstream_message(json.dumps({"error": raw, "message": item.get("message")}))
+    low = detail.lower()
+    suffix = ": " + detail if detail else ""
+    if code == 429 or etype in ("rate_limit_error", "rate_limited") or "rate-limit" in low or "rate limit" in low or "too many requests" in low:
+        error = (apierr.account_rate_limited("Minara returned a stream error" + suffix, 5)
+                 if pre_output else apierr.too_many_requests("Minara returned a stream error" + suffix, 5))
+        error.upstream_status = 429
+        error.unbilled = bool(pre_output)
+        return error
+    if code == 402 or ("insufficient" in low and ("credit" in low or "balance" in low or "quota" in low)):
+        error = apierr.ApiError(402, "insufficient_credits", "Minara returned a stream error" + suffix)
+        error.upstream_status = 402
+        error.unbilled = bool(pre_output)
+        return error
+    return apierr.upstream_error("Minara returned a stream error" + suffix)
 
 
 def _forced_requirement(model_provider, tools, tool_choice):
@@ -1490,9 +1558,20 @@ def normalize_messages_usage(value, pricing=None, channel=None):
         provider = provider_of(channel)  # nothing in an Anthropic-shaped reply names OpenRouter's provider
         if provider:
             result["provider"] = provider
-    estimate = estimated_cost(pricing, result) if pricing is not None and "input_tokens" in result else None
+    estimate = (estimated_cost(pricing, dict(result, **_modalities(value)))
+                if pricing is not None and ("input_tokens" in result or "output_tokens" in result) else None)
     if estimate is not None:
         result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
+    else:
+        cost = value.get("cost")
+        reported = cost if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0 else None
+        if reported is not None and not (reported == 0 and result.get("output_tokens")):
+            result["provider_cost"] = reported
+            currency = value.get("currency")
+            if isinstance(currency, str) and 1 <= len(currency) <= 16 and currency.isascii() and currency.isalpha():
+                result["provider_cost_currency"] = currency.upper()
+            else:
+                result["provider_cost_currency"] = "USD"
     return result
 
 
@@ -1544,7 +1623,7 @@ class MessagesParser:
         kind = item.get("type")
         events = []
         if kind == "error":
-            raise _sse_error(item)
+            raise _sse_error(item, pre_output=not (self.text or self.calls or self.thinking))
         if kind == "message_start":
             message = item.get("message") if isinstance(item.get("message"), dict) else {}
             self.reply_id = str(message.get("id") or "")
@@ -1785,36 +1864,59 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     request_sent = getattr(session, "_provider_request_sent", None)
 
     def worker():
+        lease = None
+        stream_clean = False
         try:
-            from curl_cffi import requests
             from curl_cffi.requests.exceptions import Timeout as CurlTimeout
             if stopped.is_set():
                 return
             if time.monotonic() >= deadline:
                 raise apierr.upstream_timeout("Minara turn expired before upstream request")
-            post = getattr(session.backend, "_minara_post", None) or requests.post
+            custom_post = getattr(session.backend, "_minara_post", None)
+            if custom_post is None:
+                lease = curl_pool.POOL.acquire(cfg)
+                post = lease.session.post
+            else:
+                post = custom_post
             if request_sent is not None:
                 request_sent()
                 put({"type": "request_sent"})
             delays = list(cfg.get("minara_channel_retry_delays", (3, 8)))  # numbers: config.load checked them
             base = cfg.get("base", BASE).rstrip("/")
+            profile = curl_pool.resolve_profile(cfg)
+            proxy_url = http_pool.validate_proxy_url(cfg.get("proxy_url")) if custom_post is not None else None
             while True:
+                extra_headers = {"Authorization": "Bearer " + token}
                 if route["messages"]:
                     url, payload = base + "/messages", messages_body(body)
-                    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                               "Accept": "text/event-stream", "anthropic-version": ANTHROPIC_VERSION}
+                    extra_headers["anthropic-version"] = ANTHROPIC_VERSION
                 else:
                     url, payload = base + "/chat/completions", body
-                    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                               "Accept": "text/event-stream"}
-                response = post(url, headers=headers, json=payload, impersonate="chrome131", stream=True,
-                                allow_redirects=False,
-                                # (connect, read): curl_cffi makes a lone number on a stream its low-speed window too,
-                                # and cut a reply silent for 120 s (a model that reasons before it writes anything: Opus
-                                # at max took up to 292 s to its first event on Retool). curl adds the two: silence is
-                                # allowed for SILENCE_LIMIT, never past the turn's deadline, so a cancelled silent request
-                                # gives its worker slot back within that.
-                                timeout=_read_timeout(cfg, deadline))
+                headers = curl_pool.minara_headers(
+                    cfg,
+                    accept="text/event-stream",
+                    content_type="application/json",
+                    extra=extra_headers,
+                )
+                post_kwargs = {
+                    "headers": headers,
+                    "json": payload,
+                    "impersonate": profile,
+                    "default_headers": False,
+                    "discard_cookies": True,
+                    "accept_encoding": curl_pool.DEFAULT_ACCEPT_ENCODING,
+                    "stream": True,
+                    "allow_redirects": False,
+                    # (connect, read): curl_cffi makes a lone number on a stream its low-speed window too,
+                    # and cut a reply silent for 120 s (a model that reasons before it writes anything: Opus
+                    # at max took up to 292 s to its first event on Retool). curl adds the two: silence is
+                    # allowed for SILENCE_LIMIT, never past the turn's deadline, so a cancelled silent request
+                    # gives its worker slot back within that.
+                    "timeout": _read_timeout(cfg, deadline),
+                }
+                if proxy_url:
+                    post_kwargs["proxy"] = proxy_url
+                response = post(url, **post_kwargs)
                 holder["response"] = response
                 if stopped.is_set():
                     return
@@ -1822,10 +1924,11 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                     content_type = response.headers.get("content-type", "").lower()
                     if "text/event-stream" not in content_type:
                         raise apierr.upstream_error("Minara did not return an SSE stream")
-                    for data in sse_data(response.iter_content(chunk_size=16384)):
+                    for data in sse_data(response.iter_content(chunk_size=None)):
                         if stopped.is_set():
                             return
                         put(data)
+                    stream_clean = not stopped.is_set()
                     break
                 text = _error_body(response)
                 if (route["messages"] and not route["measured"] and response.status_code in (400, 404, 422)
@@ -1848,6 +1951,7 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                         refused()  # the balance check that follows marks the account exhausted
                 if not (delays and error.unbilled and _channel_trouble(response.status_code, text)
                         and time.monotonic() + delays[0] < deadline):
+                    stream_clean = True
                     raise error
                 # Said, so a slow answer can be told from Minara's own retries (one took 17 s on an image).
                 journal.emit("upstream.channel_retry", "Minara: нет рабочего канала (HTTP %s), повтор через %g с" % (
@@ -1871,6 +1975,8 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 apierr.upstream_error("Minara connection or stream read failed"))
         finally:
             close_response()
+            if lease is not None:
+                lease.release(reusable=stream_clean)
             slots.release()
             put(None)
 

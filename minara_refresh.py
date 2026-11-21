@@ -92,7 +92,7 @@ class CatalogRefresher:
         self._stop = threading.Event()
         self._thread = None
         self._file_lock = threading.Lock()
-        self._factory = client_factory or (lambda token: minara_probe.Client(token, wait=self._stop.wait))
+        self._factory = client_factory
         self._published = published  # OpenRouter's public list (windows, output ceilings, levels); fetched when None
         self._published_given = published  # a list given (tests) is the one every look reads
         self.last = None
@@ -195,7 +195,9 @@ class CatalogRefresher:
                 best, credits = backend, value
         if best is None:
             return None, None
-        client = self._factory(minara.token_of(best.cfg))
+        token = minara.token_of(best.cfg)
+        client = (self._factory(token) if self._factory is not None
+                  else minara_probe.Client(token, wait=self._stop.wait, cfg=best.cfg))
         base = str(best.cfg.get("base") or "").rstrip("/")
         if base.endswith("/v1"):
             client.base = base[:-3]
@@ -204,6 +206,14 @@ class CatalogRefresher:
     def run_once(self):
         """One look at Minara's list; a summary of what changed (also kept as self.last)."""
         backend, client = self._account()
+        try:
+            return self._run_once_with_client(backend, client)
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
+    def _run_once_with_client(self, backend, client):
         summary = {"at": _now(), "listed": 0, "added": [], "repriced": [], "releveled": [], "gone": [], "failed": [],
                    "skipped": [],
                    "skipped_reasons": {}, "price_unreadable": [], "unpriced": {}, "spent_credits": 0.0}

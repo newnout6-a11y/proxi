@@ -1190,10 +1190,11 @@ class TurnRunner:
             # A universal provider's 429 is a rate limit of its own (drivers/sse_utils marks it an account quota so that the
             # turn moves), not Retool's hourly managed-key limit: no wait on it, no hourly cooldown or ladder (A02-08).
             provider = _provider_label(backend)
+            is_minara = (getattr(backend, "cfg", None) or {}).get("upstream", "retool") == "minara"
             try:
                 if error is not None and backend is not None and apierr.is_account_quota(error):
                     pause = (self._limit_pause(error, getattr(lease, "session", lease))
-                             if retryable and backend not in exclude and not waited and provider is None
+                             if retryable and backend not in exclude and not waited and provider is None and not is_minara
                              and holder["_attempt_budget"].remaining > 1 else None)
                     if pause is not None:
                         # The account is not parked and not excluded: the retry goes to it with the conversation's
@@ -1213,10 +1214,10 @@ class TurnRunner:
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):
-                        # A limit that a request sent before the account's last return reports is old news. A provider is
-                        # parked for its Retry-After or a short pause: a hint never climbs the hourly ladder.
+                        # A limit that a request sent before the account's last return reports is old news. A provider
+                        # (or Minara upstream channel) is parked briefly instead of climbing Retool's hourly ladder.
                         hint = getattr(error, "retry_after", None)
-                        if provider is not None and not hint:
+                        if (provider is not None or is_minara) and not hint:
                             hint = PROVIDER_RATE_LIMIT_PAUSE
                         accounts.mark_rate_limited(backend, retry_after=hint,
                                                    request_id=getattr(parsed, "request_id", None),
@@ -1263,7 +1264,8 @@ class TurnRunner:
                 _settle_turn(holder, "moved")
                 # Refused before anything was generated or billed: the move to the next account costs no attempt.
                 holder["_attempt_budget"].refund()
-                limit = ("часовой лимит Retool" if provider is None
+                limit = ("лимит частоты Minara" if is_minara
+                         else "часовой лимит Retool" if provider is None
                          else "лимит частоты провайдера %s" % provider)
                 journal.emit("account.failover", "%s — запрос повторён на другом аккаунте" % (limit[0].upper() + limit[1:]),
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),

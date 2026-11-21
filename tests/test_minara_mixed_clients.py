@@ -89,7 +89,8 @@ def mixed(tmp_path, monkeypatch):
         assert url == 'https://api.minara.ai/v1/chat/completions'
         assert kwargs['headers']['Authorization'] == 'Bearer synthetic-minara-bearer'
         assert 'Cookie' not in kwargs['headers'] and 'x-xsrf-token' not in kwargs['headers']
-        assert kwargs['impersonate'] == 'chrome131' and kwargs['stream'] is True
+        assert kwargs['impersonate'] == 'chrome152' and kwargs['stream'] is True
+        assert kwargs['default_headers'] is False and kwargs['discard_cookies'] is True
         assert kwargs['allow_redirects'] is False
         payload = kwargs['json']
         assert payload['model'] == 'openai/mixed-test'

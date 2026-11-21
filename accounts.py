@@ -21,6 +21,7 @@ import time
 
 import apierr
 import console_log
+from drivers import curl_pool, http_pool
 import journal
 import minara_accounts
 import retool_plans
@@ -254,6 +255,9 @@ def _minara_network_get(url, **kwargs):
     return requests.get(url, **kwargs)
 
 
+_ORIG_MINARA_GET = _minara_network_get
+
+
 class MinaraAccount(UnmeteredAccount):
     """A Minara account's credits, read from GET /auth/me (creditBalanceBreakdown: plan + extra).
 
@@ -324,9 +328,28 @@ class MinaraAccount(UnmeteredAccount):
             return self._fetch()
         # config._check_upstream resolves bearer_token_env into bearer_token in memory.
         token = self.cfg.get("bearer_token") or ""
-        get = getattr(self.backend, "_minara_get", None) or _minara_network_get
-        response = get(self._origin() + "/auth/me", impersonate="chrome131", timeout=30, allow_redirects=False,
-                       headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+        profile = curl_pool.resolve_profile(self.cfg)
+        headers = curl_pool.minara_headers(self.cfg, accept="application/json", extra={"Authorization": "Bearer " + token})
+        kwargs = {
+            "impersonate": profile,
+            "default_headers": False,
+            "discard_cookies": True,
+            "accept_encoding": curl_pool.DEFAULT_ACCEPT_ENCODING,
+            "timeout": 30,
+            "allow_redirects": False,
+            "headers": headers,
+        }
+        custom_get = getattr(self.backend, "_minara_get", None)
+        if custom_get is not None:
+            response = custom_get(self._origin() + "/auth/me", **kwargs)
+        elif _minara_network_get is not _ORIG_MINARA_GET:
+            proxy_url = http_pool.validate_proxy_url(self.cfg.get("proxy_url"))
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+            response = _minara_network_get(self._origin() + "/auth/me", **kwargs)
+        else:
+            with curl_pool.POOL.checkout(self.cfg) as lease:
+                response = lease.session.get(self._origin() + "/auth/me", **kwargs)
         if response.status_code in (401, 403):
             raise apierr.upstream_auth_failed("Minara rejected the account token")
         if response.status_code != 200:

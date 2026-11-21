@@ -102,20 +102,78 @@ class Client:
     """Minara's API with one account's bearer token. `requests` is curl_cffi's module unless given (tests pass a fake);
     `wait(seconds)` sleeps between retries and returns True when the caller wants to stop (the relay shutting down)."""
 
-    def __init__(self, token, requests=None, base=BASE, wait=None):
+    def __init__(self, token, requests=None, base=BASE, wait=None, cfg=None):
+        self._owns_session = False
+        self._cfg = dict(cfg or {})
+        self._cfg.setdefault("bearer_token", token)
         if requests is None:
-            from curl_cffi import requests
-        self.requests = requests
+            from curl_cffi import CurlShare, requests as curl_requests
+            from drivers import curl_pool, http_pool
+
+            profile = curl_pool.resolve_profile(self._cfg)
+            proxy_url = http_pool.validate_proxy_url(self._cfg.get("proxy_url"))
+            trust_env = bool(self._cfg.get("use_system_proxy", True)) and not proxy_url
+            self._share = CurlShare(connect=True, dns=True, ssl_session=True)
+            self._session = curl_requests.Session(
+                impersonate=profile,
+                default_headers=False,
+                discard_cookies=True,
+                use_thread_local_curl=False,
+                curl_share=self._share,
+                proxy=proxy_url or None,
+                verify=bool(self._cfg.get("verify_tls", True)),
+                trust_env=trust_env,
+                allow_redirects=False,
+            )
+            self.requests = self._session
+            self._owns_session = True
+            self._impersonate = profile
+        else:
+            from drivers import curl_pool
+
+            self.requests = requests
+            self._share = None
+            self._session = None
+            self._impersonate = curl_pool.resolve_profile(self._cfg)
         self.token = token
         self.base = base.rstrip("/")
         self.wait = wait or (lambda seconds: time.sleep(seconds) or False)
 
-    def headers(self, accept="application/json"):
-        return {"Authorization": "Bearer " + self.token, "Content-Type": "application/json", "Accept": accept}
+    def close(self):
+        if self._owns_session:
+            self._owns_session = False
+            try:
+                if self._session is not None:
+                    self._session.close()
+            except Exception:
+                pass
+            try:
+                if self._share is not None:
+                    self._share.close()
+            except Exception:
+                pass
+
+    def headers(self, accept="application/json", content_type="application/json", extra=None):
+        from drivers import curl_pool
+
+        merged_extra = {"Authorization": "Bearer " + self.token}
+        if extra:
+            merged_extra.update(extra)
+        return curl_pool.minara_headers(self._cfg, accept=accept, content_type=content_type, extra=merged_extra)
 
     def get(self, path):
-        return self.requests.get(self.base + path, headers=self.headers(), impersonate="chrome131", timeout=60,
-                                 allow_redirects=False)
+        from drivers import curl_pool
+
+        return self.requests.get(
+            self.base + path,
+            headers=self.headers(content_type=None),
+            impersonate=self._impersonate,
+            default_headers=False,
+            discard_cookies=True,
+            accept_encoding=curl_pool.DEFAULT_ACCEPT_ENCODING,
+            timeout=60,
+            allow_redirects=False,
+        )
 
     def credits(self):
         data = self.get("/auth/me").json()
@@ -123,12 +181,22 @@ class Client:
         return float(part.get("plan", 0)) + float(part.get("extra", 0))
 
     def chat(self, body, stream=False, timeout=240):
+        from drivers import curl_pool
+
         for attempt in range(4):
             # (connect, read) on a stream: curl_cffi makes a lone number its low-speed window too (a silent 120 s cut)
-            response = self.requests.post(self.base + "/v1/chat/completions", json=body, impersonate="chrome131",
-                                          timeout=(30, timeout) if stream else timeout, stream=stream,
-                                          allow_redirects=False,
-                                          headers=self.headers("text/event-stream" if stream else "application/json"))
+            response = self.requests.post(
+                self.base + "/v1/chat/completions",
+                json=body,
+                impersonate=self._impersonate,
+                default_headers=False,
+                discard_cookies=True,
+                accept_encoding=curl_pool.DEFAULT_ACCEPT_ENCODING,
+                timeout=(30, timeout) if stream else timeout,
+                stream=stream,
+                allow_redirects=False,
+                headers=self.headers("text/event-stream" if stream else "application/json"),
+            )
             if response.status_code in (500, 502, 503, 524) and attempt < 3:
                 text = response.text if not stream else b"".join(response.iter_content()).decode("utf-8", "replace")
                 if _channel_trouble(text) or not text.strip() or response.status_code == 524:
@@ -143,11 +211,22 @@ class Client:
 
     def messages(self, body, timeout=600):
         """One streamed /v1/messages request (Anthropic's shape), retried like chat() on Minara's empty 5xx."""
-        headers = dict(self.headers("text/event-stream"), **{"anthropic-version": "2023-06-01"})
+        from drivers import curl_pool
+
+        headers = self.headers("text/event-stream", extra={"anthropic-version": "2023-06-01"})
         for attempt in range(4):
-            response = self.requests.post(self.base + "/v1/messages", json=dict(body, stream=True),
-                                          impersonate="chrome131", timeout=(30, timeout), stream=True,
-                                          allow_redirects=False, headers=headers)
+            response = self.requests.post(
+                self.base + "/v1/messages",
+                json=dict(body, stream=True),
+                impersonate=self._impersonate,
+                default_headers=False,
+                discard_cookies=True,
+                accept_encoding=curl_pool.DEFAULT_ACCEPT_ENCODING,
+                timeout=(30, timeout),
+                stream=True,
+                allow_redirects=False,
+                headers=headers,
+            )
             if response.status_code in (500, 502, 503, 524) and attempt < 3:
                 text = b"".join(response.iter_content()).decode("utf-8", "replace")
                 if _channel_trouble(text) or not text.strip() or response.status_code == 524:
