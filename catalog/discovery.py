@@ -102,6 +102,10 @@ def build_auth_headers(cfg: dict) -> dict[str, str]:
     if isinstance(extra, dict):
         for k, v in extra.items():
             if isinstance(k, str) and isinstance(v, str):
+                lowered = k.lower()
+                for existing in list(headers):
+                    if existing.lower() == lowered:
+                        del headers[existing]
                 headers[k] = v
     return headers
 

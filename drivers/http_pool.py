@@ -35,6 +35,7 @@ _CLOUD_METADATA_V6 = ipaddress.ip_network("fd00:ec2::254/128")
 _LOOP_CLIENTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple, httpx.AsyncClient]] = (
     weakref.WeakKeyDictionary()
 )
+_BG_TASKS: set[asyncio.Task] = set()
 
 
 class _NoResponseCookies(DefaultCookiePolicy):
@@ -113,7 +114,7 @@ def validate_proxy_url(proxy_url: str | None) -> str | None:
     cleaned = proxy_url.strip()
     if not cleaned:
         return None
-    if len(cleaned) > 1024 or any(ord(ch) < 33 or ord(ch) == 127 for ch in cleaned):
+    if len(cleaned) > 1024 or any(ord(ch) < 33 or ord(ch) >= 127 for ch in cleaned):
         raise ValueError("proxy_url contains invalid characters")
     try:
         parts = urllib.parse.urlsplit(cleaned)
@@ -205,21 +206,45 @@ async def _close_stream_response(resp) -> None:
         await resp.aclose()
 
 
+def _schedule_bg(loop: asyncio.AbstractEventLoop, coro_fn) -> None:
+    if loop.is_closed():
+        return
+
+    def _spawn():
+        task = loop.create_task(coro_fn())
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+
+    with contextlib.suppress(RuntimeError):
+        loop.call_soon_threadsafe(_spawn)
+
+
 def make_stream_abort(session, active_resp_holder: dict, loop: asyncio.AbstractEventLoop | None = None):
     """Build a thread-safe abort callback that closes an in-flight httpx stream immediately."""
     active_loop = loop or asyncio.get_running_loop()
+    active_resp_holder["loop"] = active_loop
+    active_resp_holder["aborted"] = False
 
     def abort():
+        active_resp_holder["aborted"] = True
         resp = active_resp_holder.get("resp")
-        if resp is None or active_loop.is_closed():
+        if resp is None:
             return
-        with contextlib.suppress(RuntimeError):
-            active_loop.call_soon_threadsafe(lambda r=resp: asyncio.create_task(_close_stream_response(r)))
+        _schedule_bg(active_loop, lambda r=resp: _close_stream_response(r))
 
     if session is not None:
         session._direct_reply = None
         session._active_direct_abort = abort
     return abort
+
+
+def bind_stream_response(active_resp_holder: dict, resp) -> None:
+    """Attach the opened httpx stream response and close it immediately if abort raced ahead."""
+    active_resp_holder["resp"] = resp
+    if active_resp_holder.get("aborted"):
+        loop = active_resp_holder.get("loop")
+        if loop is not None:
+            _schedule_bg(loop, lambda r=resp: _close_stream_response(r))
 
 
 def clear_stream_abort(session, abort) -> None:
@@ -241,8 +266,7 @@ def close_account_clients(account_id: str | None) -> None:
                 clients.append(client)
         if clients and not loop.is_closed():
             for client in clients:
-                with contextlib.suppress(RuntimeError):
-                    loop.call_soon_threadsafe(lambda c=client: asyncio.create_task(c.aclose()))
+                _schedule_bg(loop, client.aclose)
 
 
 async def close_loop_clients():

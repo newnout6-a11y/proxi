@@ -913,7 +913,9 @@ class Admin:
                          "priority": account_priority(backend),
                          "last_balance_at": getattr(entry["manager"], "last_fetched_at", None),
                          "pending": "removed" if removed else None, "_backend": backend})
-            proxy_val = backend.cfg.get("proxy_url")
+            proxy_val = (backend.cfg.get("_account_ref") or {}).get("proxy_url") or (
+                backend.cfg.get("proxy_url") if single and "proxy_url" in (saved or {}) else None
+            )
             if proxy_val:
                 pool[-1]["proxy_url"] = admin_ops.public_proxy_url(proxy_val)
             imp_val = (backend.cfg.get("_account_ref") or {}).get("impersonate") or (
@@ -1035,6 +1037,7 @@ class Admin:
         proxy_secret = None
         with self._transaction(refreshers=()) as (path, saved):
             record = self._saved_record(saved, account)
+            is_single = record is saved
             if changes.get("enabled") is False and backend is not None and account_enabled(backend):
                 if not self._other_enabled(saved, backend):
                     raise apierr.conflict("The last enabled account cannot be switched off")
@@ -1057,7 +1060,7 @@ class Admin:
                         proxy_secret = admin_ops._proxy_password(clean_proxy)
                     else:
                         record.pop("proxy_url", None)
-                        live_changes["proxy_url"] = self.cfg.get("proxy_url", "")
+                        live_changes["proxy_url"] = "" if is_single else self.cfg.get("proxy_url", "")
                     changed_transport = clean_proxy != (existing_proxy or None)
             if "impersonate" in changes:
                 try:
@@ -1070,7 +1073,11 @@ class Admin:
                     live_changes["impersonate"] = clean_imp
                 else:
                     record.pop("impersonate", None)
-                    live_changes["impersonate"] = self.cfg.get("impersonate", curl_pool.DEFAULT_IMPERSONATE)
+                    live_changes["impersonate"] = (
+                        curl_pool.DEFAULT_IMPERSONATE
+                        if is_single
+                        else self.cfg.get("impersonate", curl_pool.DEFAULT_IMPERSONATE)
+                    )
                 changed_transport = changed_transport or (clean_imp != (existing_imp or None))
             for key in ("enabled", "priority", "label"):
                 if key in changes:
@@ -1346,6 +1353,7 @@ class Admin:
         backend = next((item for item in self._live_backends() if self._same_account(record, item.cfg)), None)
         if backend is None:
             return False
+        curl_pool.close_account(backend.cfg)
         self._apply_live(backend, {"bearer_token": record["bearer_token"]})
         dispatcher = getattr(self.runtime, "accounts", None)
         if dispatcher is not None and hasattr(dispatcher, "check_soon"):

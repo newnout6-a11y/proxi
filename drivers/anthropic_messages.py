@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import urllib.parse
 
 import httpx
 
@@ -408,7 +409,12 @@ class AnthropicMessagesDriver(UpstreamDriver):
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream"
         betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
-        is_anthropic_host = (cfg.get("preset") == "anthropic" or "anthropic.com" in base.lower())
+        base_host = (urllib.parse.urlsplit(base).hostname or "").lower()
+        is_anthropic_host = (
+            cfg.get("preset") == "anthropic"
+            or base_host == "anthropic.com"
+            or base_host.endswith(".anthropic.com")
+        )
         if is_anthropic_host:
             for beta in client_context.anthropic_betas():
                 if beta in SAFE_ANTHROPIC_BETAS and beta not in betas:
@@ -438,7 +444,7 @@ class AnthropicMessagesDriver(UpstreamDriver):
                 yield {"type": "request_sent"}
 
             async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as resp:
-                active_resp_holder["resp"] = resp
+                http_pool.bind_stream_response(active_resp_holder, resp)
                 if resp.status_code >= 400:
                     err_bytes = await resp.aread()
                     err_text = err_bytes.decode("utf-8", errors="replace")

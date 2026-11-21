@@ -142,11 +142,17 @@ class Client:
     def close(self):
         if self._owns_session:
             self._owns_session = False
+            executor = getattr(self._session, "_executor", None)
             try:
                 if self._session is not None:
                     self._session.close()
             except Exception:
                 pass
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    pass
             try:
                 if self._share is not None:
                     self._share.close()
@@ -868,7 +874,15 @@ def _limits(info):
 def fetch_published():
     """OpenRouter's public model list: no key, no cost."""
     from curl_cffi import requests
-    response = requests.get("https://openrouter.ai/api/v1/models", impersonate="chrome131", timeout=60)
+    from drivers import curl_pool
+
+    response = requests.get(
+        "https://openrouter.ai/api/v1/models",
+        impersonate=curl_pool.DEFAULT_IMPERSONATE,
+        accept_encoding=curl_pool.DEFAULT_ACCEPT_ENCODING,
+        allow_redirects=False,
+        timeout=60,
+    )
     response.raise_for_status()
     return {item["id"]: item for item in response.json().get("data", []) if isinstance(item, dict) and item.get("id")}
 

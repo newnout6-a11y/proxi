@@ -17,7 +17,7 @@ import auth
 import client_context
 import client_sync
 from catalog import discovery, router
-from drivers import presets
+from drivers import http_pool, presets
 import journal
 import models
 import validate
@@ -359,6 +359,7 @@ def _replace_provider_backends_live(admin_obj, provider_id: str, new_records: li
     existing = [b for b in list(getattr(pool, "backends", None) or []) if (getattr(b, "cfg", None) or {}).get("provider_id") == provider_id]
     for b in existing:
         b.cfg["enabled"] = False
+        http_pool.close_account_clients(b.cfg.get("account_id"))
         try:
             pool.remove_account(b)
         except Exception:

@@ -386,7 +386,7 @@ class OpenAIChatDriver(UpstreamDriver):
                 yield {"type": "request_sent"}
 
             async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as resp:
-                active_resp_holder["resp"] = resp
+                http_pool.bind_stream_response(active_resp_holder, resp)
                 if resp.status_code >= 400:
                     err_bytes = await resp.aread()
                     err_text = err_bytes.decode("utf-8", errors="replace")

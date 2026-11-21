@@ -26,6 +26,7 @@ DEFAULT_IMPERSONATE = "chrome152"
 DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br, zstd"
 MAX_SLOTS_PER_BUCKET = 8
 MAX_ERROR_BYTES = 64 * 1024
+_ABORTED = object()
 
 _ORIG_URLOPEN = urllib.request.urlopen
 _CHROME_MAJOR_RE = re.compile(r"\bChrome/(\d+)")
@@ -218,8 +219,12 @@ class _Slot:
         if self.closed:
             return
         self.closed = True
+        executor = getattr(self.session, "_executor", None)
         with contextlib.suppress(Exception):
             self.session.close()
+        if executor is not None:
+            with contextlib.suppress(Exception):
+                executor.shutdown(wait=False)
         with contextlib.suppress(Exception):
             self.share.close()
 
@@ -441,6 +446,9 @@ class _StreamResponse:
         self._close_lock = threading.Lock()
 
     def _fill_chunk(self) -> bool:
+        if self._aborted:
+            self._errored = True
+            raise OSError("upstream stream aborted")
         if self._eof:
             return False
         if self._queue is not None:
@@ -452,6 +460,9 @@ class _StreamResponse:
                 self._errored = True
                 self.abort()
                 raise TimeoutError("upstream stream read timed out") from None
+            if chunk is _ABORTED or self._aborted:
+                self._errored = True
+                raise OSError("upstream stream aborted")
             if chunk is STREAM_END:
                 self._eof = True
                 return False
@@ -511,6 +522,9 @@ class _StreamResponse:
         quit_now = self.quit_now
         if quit_now is not None:
             quit_now.set()
+        if self._queue is not None:
+            with contextlib.suppress(Exception):
+                self._queue.put_nowait(_ABORTED)
 
     def close(self) -> None:
         with self._close_lock:

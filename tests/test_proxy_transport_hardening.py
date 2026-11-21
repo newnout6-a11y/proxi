@@ -344,6 +344,35 @@ def test_anthropic_driver_forwards_only_allowlisted_betas():
     assert "oauth-2025-04-20" not in beta
     assert "claude-code-20250219" not in beta
 
+    # Substring-spoofed hostnames must never receive forwarded client anthropic-beta flags.
+    seen_headers.clear()
+    spoof_cfg = {
+        "account_id": "anth-spoof-test",
+        "driver": "anthropic-messages",
+        "base_url": "https://anthropic.com.evil.example/v1",
+        "api_key": "sk-spoof-test",
+        "cache_policy": "off",
+        "_http_transport": httpx.MockTransport(handler),
+    }
+    tok2 = client_context.bind_anthropic_betas({"anthropic-beta": "fine-grained-tool-streaming-2025-05-14"})
+
+    async def spoof_scenario():
+        try:
+            sess = SimpleNamespace(_cancelled=False)
+            evs = [e async for e in anthropic_messages.AnthropicMessagesDriver().stream_turn(
+                spoof_cfg, sess, {"upstream_model": "claude-sonnet-4-6"}, "hi", "", None, None, 32
+            )]
+            assert any(e.get("type") == "end" for e in evs)
+        finally:
+            await http_pool.close_loop_clients()
+
+    try:
+        asyncio.run(spoof_scenario())
+    finally:
+        client_context.reset_anthropic_betas(tok2)
+
+    assert "anthropic-beta" not in seen_headers[0]
+
 
 def test_config_and_admin_validate_mask_and_invalidate_proxy_and_impersonate(pool, tmp_path):
     # Config rejects SSRF/metadata proxy_url and invalid impersonate profiles, masks proxy passwords.
@@ -548,3 +577,188 @@ def test_minara_sse_rate_limit_fails_over_cleanly_and_output_only_usage_prices(t
         runtime.close()
         models._MINARA_MODELS.clear()
         models._MINARA_MODELS.update(prior)
+
+
+def test_curl_pool_silent_stream_abort_unblocks_immediately_and_shuts_down_executor():
+    release = threading.Event()
+
+    class SilentHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"6\r\nhello\n\r\n")
+            self.wfile.flush()
+            release.wait(3.0)
+            self.close_connection = True
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except OSError:
+                pass
+
+        def log_message(self, *_args):
+            pass
+
+    server, thread = _start_server(SilentHandler)
+    cfg = {"account_id": "silent-abort-test", "impersonate": "chrome152"}
+    try:
+        resp = curl_pool.retool_open(cfg, f"http://127.0.0.1:{server.server_port}/hang", stream=True, timeout=10.0)
+        slot_executor = getattr(resp._lease.slot.session, "_executor", None)
+        it = iter(resp)
+        assert next(it) == b"hello\n"
+
+        def trigger_abort():
+            time.sleep(0.05)
+            resp.abort()
+            resp.close()
+
+        threading.Thread(target=trigger_abort, daemon=True).start()
+        t0 = time.monotonic()
+        with pytest.raises(OSError, match="aborted"):
+            next(it)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.8, f"silent stream abort hung for {elapsed:.2f}s"
+    finally:
+        release.set()
+        _stop_server(server, thread)
+        curl_pool.close_account("silent-abort-test")
+    # Once the detached stream_task finishes, _Slot.close() shuts down the Session ThreadPoolExecutor.
+    deadline = time.monotonic() + 2.0
+    while slot_executor is not None and not getattr(slot_executor, "_shutdown", False) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if slot_executor is not None:
+        assert slot_executor._shutdown is True
+
+
+def test_single_account_patch_clear_root_proxy_isolation_and_provider_proxy_masking(tmp_path, monkeypatch):
+    import admin as admin_module
+    from catalog import admin_ops
+    import minara_probe
+
+    # Masked proxy placeholder must never pass validate_proxy_url.
+    with pytest.raises(ValueError, match="invalid characters"):
+        http_pool.validate_proxy_url("socks5h://•••@127.0.0.1:1080")
+
+    # Config with BOTH accounts[] and providers[] must mask provider proxy passwords at load.
+    mixed_cfg = tmp_path / "mixed_proxy.json"
+    mixed_cfg.write_text(json.dumps({
+        "relay_api_key": "test-relay-key-long-enough-123456",
+        "workspace_root": str(tmp_path),
+        "accounts": [
+            {"account_id": "m1", "upstream": "minara", "bearer_token": "tok-m1",
+             "minara_models": [{"id": "openai/x"}]},
+        ],
+        "providers": [
+            {
+                "id": "prov-proxy",
+                "driver": "openai-chat",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "sk-prov-secret-12345678",
+                "proxy_url": "socks5h://u:ProvProxySecret99@127.0.0.1:1080",
+            }
+        ],
+    }), encoding="utf-8")
+    loaded_mixed = config_module.load(str(mixed_cfg))
+    assert "ProvProxySecret99" in loaded_mixed["_extra_secrets"]
+
+    # Root proxy_url must NOT leak onto accounts[] entries in Admin _pool(), and single-account PATCH clear
+    # must reset live backend.cfg (where backend.cfg is self.cfg).
+    for env_name in ("RETOOL_BASE", "RETOOL_COOKIE", "RETOOL_XSRF", "RETOOL_PAGE_UUID", "RELAY_API_KEY"):
+        monkeypatch.delenv(env_name, raising=False)
+    single_path = tmp_path / "single.json"
+    single_path.write_text(json.dumps({
+        "upstream": "minara",
+        "bearer_token": "tok-single-1",
+        "minara_models": [{"id": "openai/x"}],
+        "proxy_url": "socks5h://u:SingleSecret123@127.0.0.1:1080",
+        "impersonate": "chrome150",
+        "relay_api_key": "single-relay-key-long-enough-12345",
+        "workspace_root": str(tmp_path),
+        "project_context": False,
+        "exec_policy": "off",
+        "conversation_state": False,
+        "cache_keepwarm_seconds": 0,
+        "session_refresh_interval": 0,
+        "account_balance_interval": 0,
+        "journal_path": str(tmp_path / "single-journal.jsonl"),
+        "prompts_file": str(tmp_path / "absent.json"),
+    }), encoding="utf-8")
+    single_rt = proxy.Runtime(config_module.load(str(single_path)))
+    try:
+        adm = admin_module.Admin(single_rt)
+        pool_before = adm._pool()
+        assert len(pool_before) == 1
+        tag = pool_before[0]["account"]
+        assert pool_before[0]["proxy_url"] == "socks5h://•••@127.0.0.1:1080"
+        assert pool_before[0]["impersonate"] == "chrome150"
+
+        res = adm._patch_account(tag, {"proxy_url": "", "impersonate": ""})
+        assert "proxy_url" not in res["account"]
+        assert "impersonate" not in res["account"]
+        assert single_rt.backend.cfg["proxy_url"] == ""
+        assert single_rt.backend.cfg["impersonate"] == curl_pool.DEFAULT_IMPERSONATE
+        saved_after = json.loads(single_path.read_text(encoding="utf-8"))
+        assert "proxy_url" not in saved_after and "impersonate" not in saved_after
+    finally:
+        single_rt.close()
+
+    # Pool mode: root proxy_url must not appear on an account that has no account-level proxy_url.
+    pool_path = tmp_path / "pool_root_proxy.json"
+    pool_path.write_text(json.dumps({
+        "proxy_url": "socks5h://u:RootProxyPass123@127.0.0.1:1080",
+        "accounts": [
+            {"account_id": "p1", "upstream": "minara", "bearer_token": "tok-p1",
+             "minara_models": [{"id": "openai/x"}]},
+        ],
+        "relay_api_key": "pool-relay-key-long-enough-123456",
+        "workspace_root": str(tmp_path),
+        "project_context": False,
+        "exec_policy": "off",
+        "conversation_state": False,
+        "cache_keepwarm_seconds": 0,
+        "session_refresh_interval": 0,
+        "account_balance_interval": 0,
+        "journal_path": str(tmp_path / "pool-journal.jsonl"),
+        "prompts_file": str(tmp_path / "absent.json"),
+    }), encoding="utf-8")
+    pool_rt = proxy.Runtime(config_module.load(str(pool_path)))
+    try:
+        adm_p = admin_module.Admin(pool_rt)
+        items = adm_p._pool()
+        assert len(items) == 1
+        assert "proxy_url" not in items[0]
+        assert admin_ops.public_proxy_url(pool_rt.backend.cfg["proxy_url"]) == "socks5h://•••@127.0.0.1:1080"
+    finally:
+        pool_rt.close()
+
+    # discovery.build_auth_headers deduplicates case-variants when custom headers override defaults.
+    hdrs = discovery.build_auth_headers({"api_key": "k", "headers": {"user-agent": "CustomUA/1.0"}})
+    assert [k for k in hdrs if k.lower() == "user-agent"] == ["user-agent"]
+    assert hdrs["user-agent"] == "CustomUA/1.0"
+
+    # minara_probe.fetch_published uses DEFAULT_IMPERSONATE (chrome152), not chrome131.
+    captured = {}
+
+    class FakePubResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [{"id": "openai/test"}]}
+
+    import curl_cffi.requests as cf_requests
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return FakePubResp()
+
+    monkeypatch.setattr(cf_requests, "get", fake_get)
+    published = minara_probe.fetch_published()
+    assert "openai/test" in published
+    assert captured["kwargs"]["impersonate"] == curl_pool.DEFAULT_IMPERSONATE
+    assert captured["kwargs"]["allow_redirects"] is False
