@@ -12,6 +12,7 @@ import unicodedata
 from urllib.parse import unquote
 
 _CURRENT = contextvars.ContextVar("proxi_client", default=None)
+_ANTHROPIC_BETAS = contextvars.ContextVar("proxi_anthropic_betas", default=())
 _CACHE = collections.OrderedDict()
 _CACHE_MAX = 1024
 _USER_ID_LIMIT = 4096
@@ -355,6 +356,25 @@ def bind(identity):
 
 def reset(token):
     _CURRENT.reset(token)
+
+
+def bind_anthropic_betas(headers):
+    raw = ""
+    if headers:
+        for k, v in headers.items():
+            if str(k).lower() == "anthropic-beta" and isinstance(v, str):
+                raw = v
+                break
+    items = tuple(part.strip() for part in raw.split(",") if part.strip())[:32]
+    return _ANTHROPIC_BETAS.set(items)
+
+
+def reset_anthropic_betas(token):
+    _ANTHROPIC_BETAS.reset(token)
+
+
+def anthropic_betas():
+    return _ANTHROPIC_BETAS.get() or ()
 
 
 def label(identity=None):

@@ -320,6 +320,8 @@ class OpenAIResponsesDriver(UpstreamDriver):
         head_marked = False
         client = http_pool.get_async_client(cfg)
         timeout = http_pool.make_timeout(cfg)
+        active_resp_holder: dict = {"resp": None}
+        abort = http_pool.make_stream_abort(session, active_resp_holder)
         request_sent_cb = getattr(session, "_provider_request_sent", None)
 
         yield {"type": "usage_start"}
@@ -332,6 +334,7 @@ class OpenAIResponsesDriver(UpstreamDriver):
                 yield {"type": "request_sent"}
 
             async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as resp:
+                active_resp_holder["resp"] = resp
                 if resp.status_code >= 400:
                     err_bytes = await resp.aread()
                     err_text = err_bytes.decode("utf-8", errors="replace")
@@ -507,6 +510,7 @@ class OpenAIResponsesDriver(UpstreamDriver):
             raise apierr.upstream_error(f"{cfg.get('provider_name') or 'Upstream'} Responses connection error: {type(exc).__name__}") from None
         finally:
             cache_engine.release_head(head_key, head_role, head_gate, head_marked)
+            http_pool.clear_stream_abort(session, abort)
 
 
 register_driver(OpenAIResponsesDriver())

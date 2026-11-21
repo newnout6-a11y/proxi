@@ -17,6 +17,13 @@ import models as model_catalog
 import native_history
 
 DEFAULT_MAX_TOKENS = 32000
+SAFE_ANTHROPIC_BETAS = frozenset({
+    "extended-cache-ttl-2025-04-11",
+    "fine-grained-tool-streaming-2025-05-14",
+    "interleaved-thinking-2025-05-14",
+    "context-1m-2025-08-07",
+    "effort-2025-11-24",
+})
 
 _STOP_REASONS = {
     "end_turn": "stop",
@@ -400,11 +407,15 @@ class AnthropicMessagesDriver(UpstreamDriver):
         headers = discovery.build_auth_headers(cfg)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream"
-        if mark_spec and mark_spec.get("ttl") == "1h":
-            existing_beta = headers.get("anthropic-beta", "")
-            betas = [b.strip() for b in existing_beta.split(",") if b.strip()]
-            if "extended-cache-ttl-2025-04-11" not in betas:
-                betas.append("extended-cache-ttl-2025-04-11")
+        betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
+        is_anthropic_host = (cfg.get("preset") == "anthropic" or "anthropic.com" in base.lower())
+        if is_anthropic_host:
+            for beta in client_context.anthropic_betas():
+                if beta in SAFE_ANTHROPIC_BETAS and beta not in betas:
+                    betas.append(beta)
+        if mark_spec and mark_spec.get("ttl") == "1h" and "extended-cache-ttl-2025-04-11" not in betas:
+            betas.append("extended-cache-ttl-2025-04-11")
+        if betas:
             headers["anthropic-beta"] = ",".join(betas)
 
         head_key, head_role, head_gate = cache_engine.claim_universal_head(
@@ -413,6 +424,8 @@ class AnthropicMessagesDriver(UpstreamDriver):
         head_marked = False
         client = http_pool.get_async_client(cfg)
         timeout = http_pool.make_timeout(cfg)
+        active_resp_holder: dict = {"resp": None}
+        abort = http_pool.make_stream_abort(session, active_resp_holder)
         request_sent_cb = getattr(session, "_provider_request_sent", None)
 
         yield {"type": "usage_start"}
@@ -425,6 +438,7 @@ class AnthropicMessagesDriver(UpstreamDriver):
                 yield {"type": "request_sent"}
 
             async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as resp:
+                active_resp_holder["resp"] = resp
                 if resp.status_code >= 400:
                     err_bytes = await resp.aread()
                     err_text = err_bytes.decode("utf-8", errors="replace")
@@ -606,6 +620,7 @@ class AnthropicMessagesDriver(UpstreamDriver):
             raise apierr.upstream_error(f"{cfg.get('provider_name') or 'Anthropic'} connection error: {type(exc).__name__}") from None
         finally:
             cache_engine.release_head(head_key, head_role, head_gate, head_marked)
+            http_pool.clear_stream_abort(session, abort)
 
 
 register_driver(AnthropicMessagesDriver())

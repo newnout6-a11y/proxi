@@ -373,19 +373,7 @@ class OpenAIChatDriver(UpstreamDriver):
         client = http_pool.get_async_client(cfg)
         timeout = http_pool.make_timeout(cfg)
         active_resp_holder: dict = {"resp": None}
-
-        def abort():
-            resp = active_resp_holder.get("resp")
-            if resp is not None:
-                try:
-                    # Closing underlying stream wakes pending async reads cleanly
-                    resp.extensions.get("network_stream")
-                except Exception:
-                    pass
-
-        if session is not None:
-            session._direct_reply = None
-            session._active_direct_abort = abort
+        abort = http_pool.make_stream_abort(session, active_resp_holder)
 
         request_sent_cb = getattr(session, "_provider_request_sent", None)
         yield {"type": "usage_start"}
@@ -582,8 +570,7 @@ class OpenAIChatDriver(UpstreamDriver):
             raise apierr.upstream_error(f"{cfg.get('provider_name') or 'Upstream'} connection error: {type(exc).__name__}") from None
         finally:
             cache_engine.release_head(head_key, head_role, head_gate, head_marked)
-            if session is not None and getattr(session, "_active_direct_abort", None) is abort:
-                session._active_direct_abort = None
+            http_pool.clear_stream_abort(session, abort)
 
     def _events_from_non_stream_json(self, payload, bound_entry, session, scope, client_echo, canonical_msgs, tools, parent_snapshot):
         choices = payload.get("choices") if isinstance(payload, dict) else None
