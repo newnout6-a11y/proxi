@@ -4,7 +4,9 @@ import json
 import math
 import threading
 import time
-import urllib.request
+import urllib.request  # noqa: F401 - tests patch credits.urllib.request.urlopen
+
+from drivers import curl_pool
 
 CACHE_TTL = 30.0
 HISTORY_MAX = 200
@@ -146,10 +148,11 @@ def write_cost(usage, model=None, pricing=None):
 
 
 class CreditsManager:
-    def __init__(self, base_url, headers_fn, refresher=None):
+    def __init__(self, base_url, headers_fn, refresher=None, cfg=None):
         self.base_url = base_url
         self.headers_fn = headers_fn
         self.refresher = refresher
+        self._cfg = cfg if cfg is not None else getattr(refresher, "cfg", None)
         self._lock = threading.RLock()
         self._fetch_lock = threading.Lock()
         self._balance = None
@@ -182,9 +185,14 @@ class CreditsManager:
                                 **({"stale_error": self.last_error} if self.last_error else {}))
                 return {"available": None, "error": self.last_error, "session_used": self.session_used}
         def fetch():
-            req = urllib.request.Request(self.base_url + "/api/credits/balance",
-                                         headers=self.headers_fn(), method="GET")
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with curl_pool.retool_open(
+                self._cfg,
+                self.base_url + "/api/credits/balance",
+                headers=self.headers_fn(),
+                method="GET",
+                timeout=10,
+                stream=False,
+            ) as resp:
                 return json.loads(resp.read().decode("utf-8", "replace"))
 
         try:

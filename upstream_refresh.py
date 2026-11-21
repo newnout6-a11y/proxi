@@ -9,6 +9,7 @@ import urllib.request
 from accounts import cfg_tag
 from auth import cloudflare_challenge, merge_set_cookie, upstream_headers
 from config import _account_record, persist_auth, reload_auth, renewal_lock
+from drivers import curl_pool
 import journal
 from redact import redact
 
@@ -37,9 +38,15 @@ class Refresher:
         self.keepalive_owner = None
 
     def _default(self):
-        req = urllib.request.Request(self.cfg["base"] + "/api/refreshtoken",
-                                     data=b"{}", headers=upstream_headers(self.cfg), method="POST")
-        with urllib.request.urlopen(req, timeout=min(self.cfg["upstream_timeout"], 15)) as resp:
+        with curl_pool.retool_open(
+            self.cfg,
+            self.cfg["base"] + "/api/refreshtoken",
+            data=b"{}",
+            headers=upstream_headers(self.cfg),
+            method="POST",
+            timeout=min(self.cfg["upstream_timeout"], 15),
+            stream=False,
+        ) as resp:
             # PROTOCOL.md specifies an empty body: an empty or non-JSON reply is a
             # successful renewal, and its Set-Cookie headers must not be lost to a
             # strict parser.

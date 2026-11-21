@@ -45,7 +45,7 @@ def cloudflare_challenge(status, headers) -> bool:
 
 
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/131.0.0.0 Safari/537.36")
+              "Chrome/152.0.0.0 Safari/537.36")
 _CHROME_MAJOR = re.compile(r"\bChrome/(\d+)")
 # Checked in this order: an Android user agent names Linux too, and Chrome OS names X11.
 _PLATFORMS = (("Windows", '"Windows"'), ("Android", '"Android"'), ("CrOS", '"Chrome OS"'),
@@ -214,7 +214,7 @@ def upstream_headers(cfg) -> dict:
     """Retool session headers. Cookie/xsrf stay the source of upstream auth."""
     cfg = dict(cfg)  # read cookie and xsrf from the same credential snapshot
     ua = cfg.get("ua") or DEFAULT_UA
-    return {
+    headers = {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
         "origin": cfg["base"],
@@ -229,8 +229,10 @@ def upstream_headers(cfg) -> dict:
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "accept-language": "en-US,en;q=0.9",
-        "priority": "u=1, i",
     }
+    if cfg.get("retool_http_backend") != "urllib":
+        headers["priority"] = "u=1, i"
+    return headers
 
 
 # Cookie values that are just host names (lastSubdomain=tenant.retool.com) are not secrets: masking them hides the tenant.

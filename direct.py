@@ -28,6 +28,7 @@ import apierr
 import auth
 import conversation_state
 import credits
+from drivers import curl_pool
 import forced_choice
 import journal
 import client_context
@@ -183,7 +184,7 @@ def _owning_socket(resp):
     return None
 
 
-def _force_close_response(resp):
+def _force_close_response(resp, async_close=False):
     """Instantaneously unblock threads waiting in WinSock recv() or HTTPResponse read().
 
     Windows needs a real closesocket() to abort a blocked recv(); shutdown() alone
@@ -192,6 +193,19 @@ def _force_close_response(resp):
     reference survives resp.fp = None) can never close the number a second time
     after it has been reused by an unrelated connection."""
     if resp is None:
+        return
+    if hasattr(resp, "abort") and hasattr(resp, "quit_now"):
+        try:
+            resp.abort()
+        except Exception:
+            pass
+        if async_close:
+            threading.Thread(target=resp.close, name="retool-close", daemon=True).start()
+        else:
+            try:
+                resp.close()
+            except Exception:
+                pass
         return
     owner = None
     try:
@@ -1528,11 +1542,16 @@ def _ping(session, body):
     # settings rather than replacing max with low during a cache refresh.
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
-    request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
-                                     data=_wire_json(payload),
-                                     headers=headers, method="POST")
     try:
-        response = urllib.request.urlopen(request, timeout=120)
+        response = curl_pool.retool_open(
+            session.backend.cfg,
+            session.backend.cfg["base"] + ROUTE,
+            data=_wire_json(payload),
+            headers=headers,
+            method="POST",
+            timeout=120,
+            stream=True,
+        )
     except urllib.error.HTTPError as exc:
         try:
             detail = exc.read(16384).decode("utf-8", "replace")
@@ -1547,7 +1566,7 @@ def _ping(session, body):
 
     def abort():
         aborted.set()
-        _force_close_response(response)
+        _force_close_response(response, async_close=True)
     session._active_warm_abort = abort
     actual_credits = None
     complete = False
@@ -2707,7 +2726,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             pass
 
     def abort_direct():
-        _force_close_response(holder.get("response"))
+        _force_close_response(holder.get("response"), async_close=True)
         hand_off_final(asyncio.CancelledError())
 
     session._active_direct_abort = abort_direct
@@ -2722,11 +2741,17 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 budget.take(is_cancelled, session.backend)
                 trace = AttemptTrace(cfg, budget, request_id, body.get("model"), payload)
                 holder["trace"] = trace
-                request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
-                                                 data=payload, headers=headers, method="POST")
                 trace.wire.request(headers)
                 try:
-                    response = urllib.request.urlopen(request, timeout=timeout)
+                    response = curl_pool.retool_open(
+                        session.backend.cfg,
+                        session.backend.cfg["base"] + ROUTE,
+                        data=payload,
+                        headers=headers,
+                        method="POST",
+                        timeout=timeout,
+                        stream=True,
+                    )
                     break
                 except urllib.error.HTTPError as exc:
                     trace.response(exc, exc.code)

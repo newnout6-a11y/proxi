@@ -16,6 +16,7 @@ import weakref
 
 import direct
 import drivers
+from drivers import curl_pool
 import native_history
 import stream_watchdog
 
@@ -108,9 +109,15 @@ class Backend:
 
     def _default_post(self, path, payload, timeout):
         data = json.dumps(payload, ensure_ascii=True).encode("ascii")
-        req = urllib.request.Request(self.cfg["base"] + path, data=data,
-                                     headers=upstream_headers(self.cfg), method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with curl_pool.retool_open(
+            self.cfg,
+            self.cfg["base"] + path,
+            data=data,
+            headers=upstream_headers(self.cfg),
+            method="POST",
+            timeout=timeout,
+            stream=False,
+        ) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     async def _call(self, path, payload, *, attempts=3, timeout=None):
@@ -154,9 +161,15 @@ class Backend:
         path = f"/api/pages/{self.cfg['page_uuid']}/sandpack/threads/{thread_id}/messages"
 
         def call():
-            req = urllib.request.Request(self.cfg["base"] + path, headers=upstream_headers(self.cfg), method="GET")
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with curl_pool.retool_open(
+                    self.cfg,
+                    self.cfg["base"] + path,
+                    headers=upstream_headers(self.cfg),
+                    method="GET",
+                    timeout=30,
+                    stream=False,
+                ) as resp:
                     return json.loads(resp.read().decode("utf-8", "replace"))
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
