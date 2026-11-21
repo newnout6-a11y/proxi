@@ -125,6 +125,11 @@ def collect_extra_secrets(saved: dict | None) -> list[str]:
         if isinstance(ck, dict):
             _add(ck.get("key"))
 
+    _add(_proxy_password(saved.get("proxy_url")))
+    for acc in saved.get("accounts") or []:
+        if isinstance(acc, dict):
+            _add(_proxy_password(acc.get("proxy_url")))
+
     return found
 
 

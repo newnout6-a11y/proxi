@@ -114,7 +114,7 @@ def apply_renewals(results):
     return stored
 
 
-def plan(records, tokens, *, now, label=None, base=None, minara_models=None):
+def plan(records, tokens, *, now, label=None, base=None, minara_models=None, proxy_url=None, impersonate=None):
     """What adding these tokens to the account `records` of config.json would do; nothing is changed.
 
     Returns (results, new_records). There is a result per token, in order, naming the token by its position (1-based),
@@ -144,6 +144,10 @@ def plan(records, tokens, *, now, label=None, base=None, minara_models=None):
     template = {"upstream": "minara", "base": DEFAULT_BASE if base is None else base}
     if minara_models not in (None, []):
         template["minara_models"] = copy.deepcopy(minara_models)
+    if proxy_url:
+        template["proxy_url"] = proxy_url
+    if impersonate:
+        template["impersonate"] = impersonate
     checked = dict(copy.deepcopy(template), bearer_token="placeholder")
     try:
         config.validate_minara_account(checked, "new accounts")

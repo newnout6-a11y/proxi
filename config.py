@@ -12,11 +12,12 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 from apierr import service_unavailable
 import auth
 import console_log
-from drivers import presets as driver_presets
+from drivers import curl_pool, http_pool, presets as driver_presets
 import minara_catalog
 import models
 import retool_catalog
@@ -164,6 +165,10 @@ DEFAULTS = {
     # "direct" = plain copilotStreamGPT POST with cached context (fast), "agent" = sandbox WebSocket.
     "transport": "direct",
     "direct_cache": True,
+    "impersonate": curl_pool.DEFAULT_IMPERSONATE,
+    "proxy_url": "",
+    "http2": True,
+    "retool_http_backend": "curl_cffi",
     "upstream_trace_dir": "",  # explicit private raw request/response traces; disabled by default
     "upstream_empty_retries": 1,           # extra identical POSTs after an empty/thinking-only answer (paid)
     # Retool answers "models are rate limited right now, try again shortly" (429) before it generates anything: the same body is
@@ -685,13 +690,33 @@ def validate_minara_account(record, name='account'):
 
 
 def _check_pool_fields(record, name):
-    """Admin pool controls: enabled (bool), priority (0..99, lower first), label (short text)."""
+    """Admin pool controls: enabled (bool), priority (0..99, lower first), label (short text), proxy_url, impersonate."""
     if "enabled" in record and type(record["enabled"]) is not bool:
         raise service_unavailable(f"{name}: 'enabled' must be a boolean")
     if "priority" in record and (type(record["priority"]) is not int or not 0 <= record["priority"] <= 99):
         raise service_unavailable(f"{name}: 'priority' must be an integer from 0 to 99")
     if "label" in record and (not isinstance(record["label"], str) or len(record["label"]) > 40):
         raise service_unavailable(f"{name}: 'label' must be text of at most 40 characters")
+    if "proxy_url" in record:
+        try:
+            proxy = http_pool.validate_proxy_url(record.get("proxy_url"))
+        except ValueError as exc:
+            raise service_unavailable(f"{name}: {exc}") from None
+        if proxy:
+            record["proxy_url"] = proxy
+        else:
+            record.pop("proxy_url", None)
+    if "impersonate" in record:
+        try:
+            profile = curl_pool.validate_impersonate(record.get("impersonate"))
+        except ValueError as exc:
+            raise service_unavailable(f"{name}: {exc}") from None
+        if profile:
+            record["impersonate"] = profile
+        else:
+            record.pop("impersonate", None)
+    if "http2" in record and type(record["http2"]) is not bool:
+        raise service_unavailable(f"{name}: 'http2' must be a boolean")
     _check_provider_access(record.get('provider_access', {}), name)
 
 
@@ -790,6 +815,18 @@ def _load(path):
         except (TypeError, ValueError):
             raise service_unavailable(f"config value '{num_key}' must be an integer")
 
+    if type(cfg.get("http2")) is not bool:
+        raise service_unavailable("http2 must be a boolean")
+    if cfg.get("retool_http_backend") not in ("curl_cffi", "urllib"):
+        raise service_unavailable("retool_http_backend must be 'curl_cffi' or 'urllib'")
+    try:
+        cfg["proxy_url"] = http_pool.validate_proxy_url(cfg.get("proxy_url")) or ""
+    except ValueError as exc:
+        raise service_unavailable(str(exc)) from None
+    try:
+        cfg["impersonate"] = curl_pool.validate_impersonate(cfg.get("impersonate")) or curl_pool.DEFAULT_IMPERSONATE
+    except ValueError as exc:
+        raise service_unavailable(str(exc)) from None
     if cfg["session_refresh_interval"] < 0:
         raise service_unavailable("session_refresh_interval must be non-negative (0 disables keepalive)")
     try:
@@ -1064,7 +1101,18 @@ def _load(path):
         cookie_vals.append(search_key)  # masked wherever the relay redacts secrets, should it ever show up in a message
     # The secrets that are no cookie: a renewal or a new sign-in rebuilds cookie_values and keeps these (auth.secret_values).
     tokens = [r.get("bearer_token") for r in (accounts if accounts is not None else [cfg]) if r.get("upstream") == "minara"]
-    all_non_cookie_secrets = ([search_key] if search_key else []) + [t for t in tokens if t] + provider_secrets
+    proxy_passwords = []
+    for raw_proxy in [cfg.get("proxy_url")] + [
+        r.get("proxy_url") for r in (accounts if accounts is not None else []) if isinstance(r, dict)
+    ]:
+        if isinstance(raw_proxy, str) and "@" in raw_proxy:
+            try:
+                pw = urllib.parse.urlsplit(raw_proxy).password
+            except ValueError:
+                pw = None
+            if pw:
+                proxy_passwords.append(pw)
+    all_non_cookie_secrets = ([search_key] if search_key else []) + [t for t in tokens if t] + provider_secrets + proxy_passwords
     cfg["_extra_secrets"] = list(dict.fromkeys(all_non_cookie_secrets))
     for secret in cfg["_extra_secrets"]:
         if secret and secret not in cookie_vals:

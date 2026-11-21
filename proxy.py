@@ -29,7 +29,7 @@ import conversation_infer
 import conversation_state
 import cost_guard
 import drivers
-from drivers import http_pool
+from drivers import curl_pool, http_pool
 import forced_choice
 import generation
 import minara_refresh
@@ -286,6 +286,7 @@ class Runtime:
             future.cancel()
             journal.emit("relay.shutdown", "Истекло время завершения задач relay", "warn")
         finally:
+            curl_pool.close_all()
             # The writer finishes what is queued (bounded), so a normal stop loses nothing it was handed.
             self.pool.close_store()
             # The conversation pins of prompts.json go to disk with the state they keep usable.
@@ -564,6 +565,7 @@ def make_handler(runtime: Runtime):
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
             context_token = client_context.bind({"request_id": self.request_id})
+            beta_token = client_context.bind_anthropic_betas(self.headers)
             self._started = time.monotonic()
             self._request_started_monotonic = self._started - max(0.0, getattr(self, "_slot_wait", 0.0) or 0.0)
             # Keep-alive reuses the handler: a stale status from the previous
@@ -711,6 +713,7 @@ def make_handler(runtime: Runtime):
                         if trace.failed:
                             journal.emit("client.trace_failed", "Не удалось сохранить подробную трассу клиента",
                                          "warn", request_id=self.request_id)
+                    client_context.reset_anthropic_betas(beta_token)
                     client_context.reset(context_token)
                     # The writer holds its handler, and the adapter and the holder reach the whole parsed request (every message
                     # of the conversation, as text and as parsed JSON): left on the handler they are a cycle that only the garbage
