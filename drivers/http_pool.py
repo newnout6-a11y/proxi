@@ -13,6 +13,7 @@ Key safety invariants:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 import ipaddress
 import urllib.parse
@@ -28,6 +29,7 @@ DEFAULT_POOL_TIMEOUT = 15.0
 MAX_CONNECTIONS = 128
 MAX_KEEPALIVE_CONNECTIONS = 64
 KEEPALIVE_EXPIRY = 60.0
+_PER_ACCOUNT_KEEPALIVE = 32
 
 _CLOUD_METADATA_V6 = ipaddress.ip_network("fd00:ec2::254/128")
 _LOOP_CLIENTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple, httpx.AsyncClient]] = (
@@ -137,8 +139,16 @@ def make_timeout(cfg: dict, *, read_timeout: float | None = None) -> httpx.Timeo
     )
 
 
+def _account_scope(cfg: dict) -> str:
+    """Stable per-account/provider pool key so distinct API keys do not share TCP/TLS/H2 sockets."""
+    explicit = cfg.get("account_id") or cfg.get("provider_id")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    return ""
+
+
 def get_async_client(cfg: dict | None = None) -> httpx.AsyncClient:
-    """Return a shared, persistent httpx.AsyncClient bound to the current asyncio loop."""
+    """Return a persistent httpx.AsyncClient bound to the current asyncio loop and account scope."""
     cfg = cfg or {}
     custom_transport = cfg.get("_http_transport")
     loop = asyncio.get_running_loop()
@@ -149,17 +159,22 @@ def get_async_client(cfg: dict | None = None) -> httpx.AsyncClient:
 
     proxy_url = validate_proxy_url(cfg.get("proxy_url"))
     verify_tls = bool(cfg.get("verify_tls", True))
-    http2 = bool(cfg.get("http2", False))
+    http2 = bool(cfg.get("http2", True))
     trust_env = bool(cfg.get("use_system_proxy", False)) and not proxy_url and custom_transport is None
-    key = ("transport", id(custom_transport)) if custom_transport is not None else (proxy_url, verify_tls, http2, trust_env)
+    scope = _account_scope(cfg)
+    key = (
+        ("transport", id(custom_transport))
+        if custom_transport is not None
+        else (scope, proxy_url, verify_tls, http2, trust_env)
+    )
 
     client = table.get(key)
     if client is not None and not client.is_closed:
         return client
 
     limits = httpx.Limits(
-        max_connections=max(16, int(cfg.get("max_workers", 32)) * 2),
-        max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+        max_connections=max(16, int(cfg.get("max_workers", 32)) * (1 if scope else 2)),
+        max_keepalive_connections=_PER_ACCOUNT_KEEPALIVE if scope else MAX_KEEPALIVE_CONNECTIONS,
         keepalive_expiry=KEEPALIVE_EXPIRY,
     )
     kwargs: dict = {
@@ -179,6 +194,55 @@ def get_async_client(cfg: dict | None = None) -> httpx.AsyncClient:
     client = httpx.AsyncClient(**kwargs)
     table[key] = client
     return client
+
+
+async def _close_stream_response(resp) -> None:
+    with contextlib.suppress(Exception):
+        ns = resp.extensions.get("network_stream")
+        if ns is not None:
+            await ns.aclose()
+    with contextlib.suppress(Exception):
+        await resp.aclose()
+
+
+def make_stream_abort(session, active_resp_holder: dict, loop: asyncio.AbstractEventLoop | None = None):
+    """Build a thread-safe abort callback that closes an in-flight httpx stream immediately."""
+    active_loop = loop or asyncio.get_running_loop()
+
+    def abort():
+        resp = active_resp_holder.get("resp")
+        if resp is None or active_loop.is_closed():
+            return
+        with contextlib.suppress(RuntimeError):
+            active_loop.call_soon_threadsafe(lambda r=resp: asyncio.create_task(_close_stream_response(r)))
+
+    if session is not None:
+        session._direct_reply = None
+        session._active_direct_abort = abort
+    return abort
+
+
+def clear_stream_abort(session, abort) -> None:
+    if session is not None and getattr(session, "_active_direct_abort", None) is abort:
+        session._active_direct_abort = None
+
+
+def close_account_clients(account_id: str | None) -> None:
+    """Close pooled httpx.AsyncClient instances belonging to `account_id` across active loops."""
+    if not isinstance(account_id, str) or not account_id.strip():
+        return
+    scope = account_id.strip()
+    for loop, table in list(_LOOP_CLIENTS.items()):
+        keys = [k for k in list(table) if len(k) >= 5 and k[0] == scope]
+        clients = []
+        for k in keys:
+            client = table.pop(k, None)
+            if client is not None and not client.is_closed:
+                clients.append(client)
+        if clients and not loop.is_closed():
+            for client in clients:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(lambda c=client: asyncio.create_task(c.aclose()))
 
 
 async def close_loop_clients():

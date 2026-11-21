@@ -173,6 +173,7 @@ class ProviderBalanceAccount(UnmeteredAccount):
             if proxy_url:
                 kwargs["proxy"] = proxy_url
             kwargs["verify"] = bool(self.cfg.get("verify_tls", True))
+            kwargs["http2"] = bool(self.cfg.get("http2", True))
             with httpx.Client(**kwargs) as client:
                 resp = client.get(url, headers=headers)
 

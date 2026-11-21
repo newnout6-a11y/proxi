@@ -76,9 +76,14 @@ def save_overlay(path: str | os.PathLike | None, providers_map: dict[str, list[d
         return False
 
 
+DEFAULT_USER_AGENT = "Proxi-Gateway/2.0"
+
+
 def build_auth_headers(cfg: dict) -> dict[str, str]:
     """Build HTTP headers for upstream requests (discovery, turns, balance) from normalized account/provider cfg."""
     headers: dict[str, str] = {"Accept": "application/json"}
+    ua = cfg.get("user_agent")
+    headers["User-Agent"] = str(ua).strip() if isinstance(ua, str) and ua.strip() else DEFAULT_USER_AGENT
     auth_mode = str(cfg.get("auth_mode") or "bearer").lower()
     token = str(cfg.get("api_key") or cfg.get("bearer_token") or "").strip()
     driver = str(cfg.get("driver") or cfg.get("upstream") or "openai-chat")
