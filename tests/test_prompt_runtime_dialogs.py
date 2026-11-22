@@ -61,8 +61,7 @@ def test_a_conversation_on_a_profile_continues_its_signed_history_and_keeps_one_
     head = "RULES_ONE\n\n" + SYSTEM
     assert [head_of(body) for body in (first, second, third)] == [head] * 3
     keys = {body["openAICacheKey"] for body in (first, second, third)}
-    assert keys == {direct.cache_key_for(head, "claude-opus-5-5", first["tools"],
-                                         conversation_key="header:" + dialog.key)}
+    assert keys == {direct.cache_key_for(head, "claude-opus-5-5", first["tools"])}
     for earlier, later, expected in ((first, second, ["opaque-one"]), (second, third, ["opaque-one", "opaque-two"])):
         assert strip_cache(later["messages"][:len(earlier["messages"])]) == strip_cache(earlier["messages"])
         assert signatures(later) == expected

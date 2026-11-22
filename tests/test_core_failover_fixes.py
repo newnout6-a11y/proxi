@@ -615,21 +615,27 @@ def test_orchestrator_uses_bound_entry_for_switch_to_messages_and_unpriced(tmp_p
 # 7. R4 openAICacheKey scoping & TTL _ASSIST_ONLY isolation (direct.py)
 # ---------------------------------------------------------------------------
 
-def test_retool_cache_key_isolates_conversations_and_credentials():
+def test_retool_cache_key_isolates_credentials_and_shares_threads():
     head = "stable head " * 20
     tools = [{"name": "read", "description": "r", "params": {}}]
     s_a1 = SimpleNamespace(_native_conversation_key="conv-1", _credential_scope="cred-A")
     s_a2 = SimpleNamespace(_native_conversation_key="conv-2", _credential_scope="cred-A")
     s_b1 = SimpleNamespace(_native_conversation_key="conv-1", _credential_scope="cred-B")
+    s_none = SimpleNamespace(_native_conversation_key="conv-1", _credential_scope=None)
     body_a1 = direct.build_body({}, {"model": "claude-opus-5-5"}, head, "hi", tools, "auto", 100, session=s_a1)
     body_a2 = direct.build_body({}, {"model": "claude-opus-5-5"}, head, "hi", tools, "auto", 100, session=s_a2)
     body_b1 = direct.build_body({}, {"model": "claude-opus-5-5"}, head, "hi", tools, "auto", 100, session=s_b1)
-    assert body_a1["openAICacheKey"] != body_a2["openAICacheKey"]
+    body_none = direct.build_body({}, {"model": "claude-opus-5-5"}, head, "hi", tools, "auto", 100, session=s_none)
+    # Different credentials are strictly isolated:
     assert body_a1["openAICacheKey"] != body_b1["openAICacheKey"]
+    # Different threads under the same credential share the warm prefix (ToolUnion & subagent reuse):
+    assert body_a1["openAICacheKey"] == body_a2["openAICacheKey"]
+    # credential_scope=None matches legacy 3-arg cache_key_for(head, model, tools):
+    assert body_none["openAICacheKey"] == direct.cache_key_for(head, "claude-opus-5-5", tools)
     # Explicit kwarg matching resumed history keeps identical cache key:
     body_resumed = direct.build_body(
         {}, {"model": "claude-opus-5-5"}, head, "", tools, "auto", 100,
-        session=None, conversation_key="conv-1", credential_scope="cred-A",
+        session=None, credential_scope="cred-A",
     )
     assert body_resumed["openAICacheKey"] == body_a1["openAICacheKey"]
 

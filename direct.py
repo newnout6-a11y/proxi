@@ -1071,16 +1071,13 @@ def _is_tool_result_chunk(chunk):
             or "[tool result" in lowered or "[tool_result" in lowered or "[command result" in lowered)
 
 
-def _cache_scope(session, conversation_key=None, credential_scope=None):
-    conv = conversation_key if conversation_key is not None else (
-        getattr(session, "_native_conversation_key", None) if session is not None else None)
-    cred = credential_scope if credential_scope is not None else (
+def _cache_scope(session, credential_scope=None):
+    return credential_scope if credential_scope is not None else (
         getattr(session, "_credential_scope", None) if session is not None else None)
-    return conv, cred
 
 
-def cache_key_for(head, model="", tools=None, *, conversation_key=None, credential_scope=None):
-    """Prefix cache key. Model, toolset, conversation, and credential scope isolate prefixes."""
+def cache_key_for(head, model="", tools=None, *, credential_scope=None):
+    """Prefix cache key. Model, toolset, and credential scope isolate prefixes."""
     digest = hashlib.sha256()
     digest.update((model or "").encode("utf-8"))
     digest.update(b"\x00")
@@ -1088,11 +1085,9 @@ def cache_key_for(head, model="", tools=None, *, conversation_key=None, credenti
         digest.update(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     digest.update(b"\x00")
     digest.update((head or "").encode("utf-8"))
-    if conversation_key or credential_scope:
+    if credential_scope:
         digest.update(b"\x00")
-        digest.update((credential_scope or "").encode("utf-8", "surrogatepass"))
-        digest.update(b"\x00")
-        digest.update(str(conversation_key or "").encode("utf-8", "surrogatepass"))
+        digest.update(str(credential_scope).encode("utf-8", "surrogatepass"))
     return digest.hexdigest()[:24]
 
 
@@ -1121,7 +1116,7 @@ def _forced_alone(tools, tool_choice):
 
 
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None,
-               mark_tail=True, *, conversation_key=None, credential_scope=None):
+               mark_tail=True, *, credential_scope=None):
     """Assemble the request body.
 
     The stable head becomes a cached system block and the history is sent as one
@@ -1134,9 +1129,9 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     messages = []
     tools, tool_choice = _forced_alone(tools, tool_choice)
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
-    conv_key, cred_scope = _cache_scope(session, conversation_key, credential_scope)
+    cred_scope = _cache_scope(session, credential_scope)
     prefix_key = (cache_key_for(head, model_provider.get("model"), tools,
-                                conversation_key=conv_key, credential_scope=cred_scope)
+                                credential_scope=cred_scope)
                   if cache and head else None)
     if head:
         block = {"type": "text", "text": head}
@@ -2197,7 +2192,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     pruned_parent = bool(parent is not None and not forked and parent in getattr(history, "pruned", ()))
     if messages is not None:
         body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens,
-                          conversation_key=conv_key, credential_scope=cred_scope)
+                          credential_scope=cred_scope)
         body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools,
                                                          mark_tail=not side_request, tool_results=hint_results)
         if _has_tool_result_hint(body["messages"]):
@@ -2232,7 +2227,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                          why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
         body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks,
                           session=None if background else session, mark_tail=not side_request,
-                          conversation_key=conv_key, credential_scope=cred_scope)
+                          credential_scope=cred_scope)
         cold = (native_history.unsigned_tool_transcript(
                     client, without_results=_cold_from_the_start(model_provider.get("model")))
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
@@ -2385,7 +2380,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         # two tries with tools went without it, the route refused this third one ("not available right now") and the
         # compaction failed after two paid tries. It goes the way the request goes, as the retry below sends it too.
         sent = build_body(cfg, model_provider, head, prompt, None, "none", max_tokens, chunks, session=None,
-                          mark_tail=False, conversation_key=conv_key, credential_scope=cred_scope)
+                          mark_tail=False, credential_scope=cred_scope)
         return sent if "metadata" in body else _unmarked(sent)
 
     def open_stream(sent):
