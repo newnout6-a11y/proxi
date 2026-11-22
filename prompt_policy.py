@@ -280,6 +280,7 @@ class PlanInput:
     structured: bool
     has_client_system: bool
     conversation_key: str | None
+    client_task: str = ""
 
     @classmethod
     def from_request(cls, parsed, identity: dict, headers: dict, dialect: str | None = None) -> "PlanInput":
@@ -309,6 +310,7 @@ class PlanInput:
             structured=bool(getattr(parsed, "structured_output", None)),
             has_client_system=bool((getattr(parsed, "system", "") or "").strip()),
             conversation_key=getattr(parsed, "conversation_key", None) or None,
+            client_task=str(getattr(parsed, "client_task", None) or identity.get("client_task") or ""),
         )
 
 
@@ -1046,9 +1048,13 @@ class Deadline:
         time is left, or when the call used all of it."""
         self.charge(size)
         started = time.perf_counter()
+        left = self.left
         try:
-            return call(min(self.per_operation, self.left))
+            return call(min(self.per_operation, left))
         except TimeoutError:
+            # Shared call budget exhaustion must raise RegexTimeout (uncached), never OperationTimeout (cached in _EDIT_MEMO).
+            if left < self.per_operation:
+                raise RegexTimeout("the shared regular expression budget ran out of time") from None
             raise OperationTimeout("a regular expression ran out of time") from None
         finally:
             self.left -= time.perf_counter() - started
@@ -2675,6 +2681,17 @@ def structured_contract(snapshot: Snapshot | None, output_spec: dict | None, *, 
 _PROTECTED_CACHE = [None, ()]
 
 
+class _TaskRule:
+    """Built-in protected rule matching an internal client_task outside user-configurable CONDITIONS."""
+    __slots__ = ("name", "task", "use", "override_protected")
+
+    def __init__(self, name, task, use):
+        self.name, self.task, self.use, self.override_protected = name, task, use, False
+
+    def matches(self, inp):
+        return inp.client_task == self.task
+
+
 def _protected_rules():
     """The built-in rules compiled; recompiled if PROTECTED_RULES is replaced."""
     if _PROTECTED_CACHE[0] is not PROTECTED_RULES:
@@ -2688,6 +2705,7 @@ def _protected_rules():
                 else:
                     conditions.append((key, False, tuple(_glob_regex(pattern) for pattern in patterns)))
             compiled.append(_Rule(rule["name"], tuple(conditions), rule["use"]))
+        compiled.append(_TaskRule("protected: client compaction", client_context.COMPACTION, "passthrough"))
         _PROTECTED_CACHE[:] = [PROTECTED_RULES, tuple(compiled)]
     return _PROTECTED_CACHE[1]
 
@@ -2697,12 +2715,14 @@ class _Pin:
 
     `print` is the fingerprint of the revision (None for the legacy pin, and while nothing is persisted), `digest` the
     (key digest, tag) it is stored under, `disk` what the pins file last said about it, (print, profile), and `disk_touched`
-    when that was, in clock units; `restored` says the pin came back from the pins file after a restart."""
-    __slots__ = ("rev", "created", "touched", "profile", "print", "digest", "disk", "disk_touched", "restored")
+    when that was, in clock units; `restored` says the pin came back from the pins file after a restart.
+    `revs` tracks pinned revision numbers per model inside this (conversation_key, purpose) pin."""
+    __slots__ = ("rev", "created", "touched", "profile", "print", "digest", "disk", "disk_touched", "restored", "revs")
 
     def __init__(self, rev, now, print_=None):
         self.rev, self.created, self.touched, self.profile = rev, now, now, None
         self.print, self.digest, self.disk, self.disk_touched, self.restored = print_, None, None, None, False
+        self.revs = {}
 
 
 class _Dormant:
@@ -3300,6 +3320,7 @@ class PromptStore:
         """
         now = self.clock()
         key = (inp.conversation_key, inp.purpose) if inp.conversation_key else None
+        req_model = str(inp.model or "")
         if key is not None and self._dormant and key not in self._pins:
             self._wake(key, now)
         with self._lock:
@@ -3312,20 +3333,30 @@ class PromptStore:
                     self._dirty = True
                     pin = None
                 if pin is not None:
-                    if pin.rev == LEGACY_REV:
+                    if req_model and req_model in pin.revs:
+                        target_rev = pin.revs[req_model]
+                        model_pinned = True
+                    elif req_model and pin.revs:
+                        # Unseen model in an active conversation evaluates current instead of another model's old rev.
+                        target_rev = current.rev if current is not None else LEGACY_REV
+                        model_pinned = False
+                    else:
+                        target_rev = pin.rev
+                        model_pinned = True
+                    if not model_pinned:
+                        chosen = current
+                        pinned = current is not None and pin.rev == current.rev
+                    elif target_rev == LEGACY_REV:
                         chosen, pinned = None, True
-                    elif current is not None and pin.rev == current.rev:
+                    elif current is not None and target_rev == current.rev:
                         chosen, pinned = current, True
-                    elif pin.rev in self._history:
-                        chosen, pinned = self._history[pin.rev], True
+                    elif target_rev in self._history:
+                        chosen, pinned = self._history[target_rev], True
+                    elif req_model and req_model in pin.revs and len(pin.revs) > 1:
+                        chosen, pinned = current, False
                     else:
                         pin = None
-                if pin is None:
-                    pin = _Pin(current.rev if current is not None else LEGACY_REV, now, self._print_of(current))
-                    self._pins[key] = pin
-                    self._trim_pins(now)
-                pin.touched = now
-                self._pins.move_to_end(key)
+            created_new = key is not None and pin is None
         if chosen is None and current is not None and inp.virtual_profile:
             chosen, pinned = current, False
         try:
@@ -3335,14 +3366,43 @@ class PromptStore:
                 raise
             plan = self._select(current, inp, False)
             chosen, pinned = current, False
-        if plan.snapshot is not None and chosen is not None and key is not None and pin.rev != chosen.rev:
-            with self._lock:
-                pin.rev = chosen.rev
-                pin.print = self._print_of(chosen)
         if key is not None:
-            pin.profile = plan.profile
-            if self._pins_path is not None:
-                self._note(pin, now)
+            resolved_snapshot = chosen if plan.snapshot is not None and chosen is not None else None
+            chosen_rev = resolved_snapshot.rev if resolved_snapshot is not None else LEGACY_REV
+            chosen_print = self._print_of(resolved_snapshot)
+            explicit_override = bool(inp.virtual_profile or inp.header_profile)
+            with self._lock:
+                live = self._pins.get(key)
+                if live is not None and now - live.touched > PIN_IDLE_SECONDS:
+                    del self._pins[key]
+                    self._dirty = True
+                    live = None
+                if live is None:
+                    if not created_new:
+                        return plan  # unpin() removed the active pin concurrently; do not resurrect it
+                    live = _Pin(chosen_rev, now, chosen_print)
+                    live.profile = plan.profile
+                    if req_model:
+                        live.revs[req_model] = live.rev
+                    self._pins[key] = live
+                    self._trim_pins(now)
+                else:
+                    other_models = bool(req_model and live.revs and (set(live.revs) - {req_model}))
+                    live.touched = now
+                    self._pins.move_to_end(key)
+                    if explicit_override and (other_models or (live.restored and live.rev == LEGACY_REV and not live.revs)):
+                        # A single cross-model or restored-legacy @profile / x-proxi-profile turn must not upgrade the pin rev.
+                        if req_model and req_model not in live.revs and resolved_snapshot is not None:
+                            live.revs[req_model] = chosen_rev
+                    else:
+                        if resolved_snapshot is not None and live.rev != chosen_rev:
+                            live.rev = chosen_rev
+                            live.print = chosen_print
+                        live.profile = plan.profile
+                        if req_model:
+                            live.revs[req_model] = chosen_rev
+                if self._pins_path is not None:
+                    self._note(live, now)
         return plan
 
     def _print_of(self, snapshot):
@@ -3352,14 +3412,15 @@ class PromptStore:
     def _note(self, pin, now):
         """Say that the pins file is out of date when what it holds about this pin is not what the pin is now.
 
-        The touch is rough on purpose: the file hears of it when the stored one is PIN_TOUCH_INTERVAL old. A pin on a revision
-        that has no fingerprint is never written (see _write_pins): only its move there is news for the file, which then
-        drops the row the pin had. Its touches were news too, and the file was rewritten once a second (with an fsync and two
-        folder scans, on the request thread) for as long as the conversation went on."""
+        Must be called with self._lock held. The touch is rough on purpose: the file hears of it when the stored one is
+        PIN_TOUCH_INTERVAL old. A pin on a revision that has no fingerprint is never written (see _write_pins): only its
+        move there is news for the file, which then drops the row the pin had. Its touches were news too, and the file
+        was rewritten once a second (with an fsync and two folder scans, on the request thread) for as long as the
+        conversation went on."""
         disk = pin.disk
         named = pin.print is not None or pin.rev == LEGACY_REV
         if (disk is None or disk[0] != pin.print or disk[1] != pin.profile
-                or (named and now - pin.disk_touched >= PIN_TOUCH_INTERVAL)):
+                or (named and (pin.disk_touched is None or now - pin.disk_touched >= PIN_TOUCH_INTERVAL))):
             self._dirty = True
 
     def _trim_pins(self, now):
@@ -3408,6 +3469,14 @@ class PromptStore:
             % (_clip(inp.requested_model or inp.model, 80), _clip(inp.virtual_profile, 80),
                _clip(inp.virtual_profile, 80), where), param="model")
 
+    @staticmethod
+    def _virtual_rejected(inp, snapshot):
+        return apierr.ApiError(
+            404, "not_found_error",
+            "model '%s@%s' cannot use profile '%s' (restricted by publish_as_model, revision %s)"
+            % (_clip(inp.requested_model or inp.model, 80), _clip(inp.virtual_profile, 80),
+               _clip(inp.virtual_profile, 80), snapshot.rev), param="model")
+
     def _use(self, snapshot, use, rule_name, inp, pinned, protected):
         if use == "$legacy":
             return Plan(rev=snapshot.rev, rule=rule_name, pinned=pinned, snapshot=snapshot)
@@ -3426,6 +3495,11 @@ class PromptStore:
                 return None
             if name not in snapshot._data.profiles:
                 raise self._unknown_virtual(inp, snapshot)
+            profile = snapshot._data.profiles[name]
+            if isinstance(profile.publish, (list, tuple)) and profile.publish:
+                candidates = tuple(dict.fromkeys(m for m in (inp.model, inp.requested_model) if m))
+                if not candidates or not any(models._publishes(profile.publish, str(m)) for m in candidates):
+                    raise self._virtual_rejected(inp, snapshot)
             return self._plan(snapshot, name, rule_name, inp, pinned, protected)
         return self._plan(snapshot, use, rule_name, inp, pinned, protected)
 
@@ -3869,6 +3943,9 @@ class PromptStore:
         parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(data, headers, identity)
         parsed.request_purpose = client_context.request_kind(parsed, identity)
         parsed.prompt_purpose = _prompt_purpose(parsed, identity)
+        parsed.client_task = client_context.client_task(parsed, identity)
+        if parsed.client_task and not identity.get("client_task"):
+            identity = {**identity, "client_task": parsed.client_task}
         inp = PlanInput.from_request(parsed, identity, headers, dialect)
         plan = self._select(snapshot, inp, False)
         if plan.legacy:
@@ -3924,7 +4001,11 @@ class PromptStore:
         if stabilizer is None or not getattr(parsed, "system", None):
             return []
         try:
-            system, done = stabilizer.look(parsed.system)
+            system, done = stabilizer.look(
+                parsed.system,
+                credential_scope=getattr(parsed, "credential_scope", None),
+                conversation=getattr(parsed, "conversation_key", None),
+            )
         except Exception:  # noqa: BLE001 - the preview then shows the system as the client sent it, as before
             return []
         if not done:

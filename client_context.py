@@ -177,7 +177,9 @@ def is_sdk_title_system(system):
 def keeps_client_prompt(purpose, identity=None):
     """True when relay prompt policy must leave the client's system prompt alone."""
     info = current() if identity is None else identity
-    return purpose in SERVICE_KINDS or info.get("request_class") in OWN_PROMPT_CLASSES
+    return (purpose in SERVICE_KINDS
+            or info.get("request_class") in OWN_PROMPT_CLASSES
+            or info.get("client_task") == COMPACTION)
 
 
 def is_prompt_suggestion(parsed):

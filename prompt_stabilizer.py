@@ -60,14 +60,23 @@ class SkillLocations:
         self._warned = False
         self._load()
 
-    def stabilize(self, system, remember=True):
+    def stabilize(self, system, remember=True, scope="", conversation=None):
         """(system text with the remembered locations, names of the skills whose location was replaced).
 
+        Scoped by `scope` (credential namespace) and either non-empty `folder` or `conversation`; anonymous requests
+        lacking both Working directory and conversation identity are left untouched so callers cannot cross-contaminate.
         remember=False only looks (the admin's preview): nothing is learned, touched or written."""
         if "<available_skills>" not in system:
             return system, []
         folder = _FOLDER.search(system)
         folder = folder.group(1) if folder else ""
+        cred = str(scope or "")
+        if folder:
+            scope_key = cred
+        elif conversation:
+            scope_key = "%s\nconv:%s" % (cred, conversation)
+        else:
+            return system, []
         replaced = []
 
         def skill(match):
@@ -83,7 +92,7 @@ class SkillLocations:
             # escape) made encode raise, and the whole prompt of every request of that client went unstabilized
             digest = hashlib.sha256((description.group(1).strip() if description else "").encode(
                 "utf-8", "surrogatepass")).hexdigest()[:16]
-            key = (folder, name.group(1).strip(), digest)
+            key = (folder, name.group(1).strip(), digest, scope_key)
             chosen = self._choose(key, seen) if remember else self._peek(key, seen)
             if chosen == seen:
                 return match.group(0)
@@ -139,9 +148,14 @@ class SkillLocations:
             with open(self._path, encoding="utf-8") as handle:
                 document = json.load(handle)
             now = self._clock()
-            for folder, name, digest, location, seen in document["skills"]:
-                if all(isinstance(item, str) for item in (folder, name, digest, location)) and now - seen < self._ttl:
-                    self._memory[(folder, name, digest)] = [location, float(seen)]
+            for row in document["skills"]:
+                if not isinstance(row, (list, tuple)) or len(row) not in (5, 6):
+                    raise ValueError("invalid skill row")
+                folder, name, digest, location, seen = row[:5]
+                scope_key = row[5] if len(row) == 6 else ""
+                if (all(isinstance(item, str) for item in (folder, name, digest, location, scope_key))
+                        and (folder or scope_key) and now - seen < self._ttl):
+                    self._memory[(folder, name, digest, scope_key)] = [location, float(seen)]
         except Exception:  # noqa: BLE001 - any file it cannot use (a hand edit, another layout, AttributeError, RecursionError,
             # OverflowError) is no reason to keep the relay from starting: it is overwritten by the next save
             self._memory.clear()  # nothing to go on: the next prompt seen is the first
@@ -165,7 +179,14 @@ class SkillLocations:
                     return
                 self._dirty = self._touched = False
                 self._saved_at = now
-                document = {"version": 1, "skills": [[*key, value[0], value[1]] for key, value in self._memory.items()]}
+                document = {
+                    "version": 1,
+                    "skills": [
+                        ([folder, name, digest, value[0], value[1]] if not scope_key
+                         else [folder, name, digest, value[0], value[1], scope_key])
+                        for (folder, name, digest, scope_key), value in self._memory.items()
+                    ],
+                }
             if not self._write(document):
                 with self._lock:
                     self._dirty = True  # the next request tries again
@@ -232,11 +253,11 @@ class Stabilizer:
         ttl = max(int(cfg.get("conversation_idle_timeout", 900) or 900), 900) + 300
         self.dates = PinnedDate(ttl) if cfg.get("stable_prompt_date", False) else None
 
-    def apply(self, system, conversation):
+    def apply(self, system, conversation, credential_scope=None):
         """(the system text, [what was done]) for a request of `conversation`."""
         done = []
         if self.skills is not None:
-            system, names = self.skills.stabilize(system)
+            system, names = self.skills.stabilize(system, scope=credential_scope or "", conversation=conversation)
             if names:
                 done.append("skill_locations:" + ",".join(dict.fromkeys(names)))
         if self.dates is not None:
@@ -245,12 +266,13 @@ class Stabilizer:
                 done.append("date")
         return system, done
 
-    def look(self, system):
+    def look(self, system, credential_scope=None, conversation=None):
         """What apply makes of `system` for a new conversation, without remembering anything: the admin's preview.
 
         The preview showed the client's system as the client sent it, so for OpenCode it named another skill location (and
         another head sha8) than the model got. A new conversation has no pinned date, so only the locations apply."""
         if self.skills is None:
             return system, []
-        system, names = self.skills.stabilize(system, remember=False)
+        system, names = self.skills.stabilize(
+            system, remember=False, scope=credential_scope or "", conversation=conversation)
         return system, (["skill_locations:" + ",".join(dict.fromkeys(names))] if names else [])

@@ -41,7 +41,7 @@ _DIALECTS = ("chat", "responses", "anthropic")
 _EDITABLE_PARTS = ("text", "input_text", "output_text")
 _INSTRUCTION_PARTS = ("text", "input_text", "output_text", "summary_text")
 _RESULT_ITEMS = ("function_call_output", "custom_tool_call_output", "tool_result")
-_CALL_ITEMS = ("function_call", "custom_tool_call", "reasoning")
+_CALL_ITEMS = ("function_call", "custom_tool_call")
 # The keys validate reads from a system message besides its text: the effort and the structured
 # output format (output_config) and the unsupported turn lifetime (clear_at, a 422 today).
 _CONTROL_KEYS = ("output_config", "clear_at")
@@ -626,10 +626,18 @@ def _instruction_text(content):
     return "\n".join(part for part in parts if part)
 
 
+def _is_standalone_reasoning(message, dialect):
+    """True for Responses reasoning items lacking a role, which parse_responses strips before history building."""
+    return (dialect == "responses" and isinstance(message, dict)
+            and message.get("type") == "reasoning" and "role" not in message)
+
+
 def _visible_kind(message, dialect):
-    """What a message is in the conversation: None for the blank system entries that leave no trace."""
+    """What a message is in the conversation: None for blank system entries or stripped Responses reasoning items."""
     if not isinstance(message, dict):
         return "U"
+    if _is_standalone_reasoning(message, dialect):
+        return None
     kind = _kind(message, dialect)
     if kind == "S":
         text = _instruction_text(message.get("content"))
@@ -637,18 +645,32 @@ def _visible_kind(message, dialect):
     return "U" if kind == "X" else kind
 
 
-def _map_content(value, fn, tool_results):
+def _carry_cache_control(out, dropped_part):
+    """Transfer cache_control from an emptied block to the nearest prior kept dict block that has none."""
+    if not (isinstance(dropped_part, dict) and "cache_control" in dropped_part):
+        return False
+    for idx in range(len(out) - 1, -1, -1):
+        prev = out[idx]
+        if isinstance(prev, dict):
+            if "cache_control" not in prev:
+                out[idx] = dict(prev, cache_control=copy.deepcopy(dropped_part["cache_control"]))
+            return True
+    return False
+
+
+def _map_content(value, fn, tool_results, _carry=False):
     """Apply fn to the editable text of a content value: None when nothing changes, else
     (new value, removed, added, empty). A text part that ends up blank leaves the list; a tool_result
     block (Messages) is edited inside and never leaves."""
     if isinstance(value, str):
         res = fn(value)
         if res is None:
-            return None
-        return res[0], res[1], res[2], not res[0].strip()
+            return (None, None) if _carry else None
+        result = (res[0], res[1], res[2], not res[0].strip())
+        return (result, None) if _carry else result
     if not isinstance(value, list):
-        return None
-    out, removed, added = None, 0, 0
+        return (None, None) if _carry else None
+    out, removed, added, unplaced_cc = None, 0, 0, None
     for position, part in enumerate(value):
         replacement = _KEEP
         if isinstance(part, str):
@@ -664,9 +686,11 @@ def _map_content(value, fn, tool_results):
                     replacement = dict(part, text=res[0]) if res[0].strip() else _DROP
                     removed, added = removed + res[1], added + res[2]
             elif kind == "tool_result" and tool_results:
-                inner = _map_content(part.get("content"), fn, False)
+                inner, inner_cc = _map_content(part.get("content"), fn, False, _carry=True)
                 if inner is not None:
                     replacement = dict(part, content=inner[0] if not inner[3] else "")
+                    if inner_cc is not None and "cache_control" not in replacement:
+                        replacement["cache_control"] = inner_cc
                     removed, added = removed + inner[1], added + inner[2]
         if replacement is _KEEP:
             if out is not None:
@@ -674,11 +698,15 @@ def _map_content(value, fn, tool_results):
             continue
         if out is None:
             out = list(value[:position])
-        if replacement is not _DROP:
+        if replacement is _DROP:
+            if not _carry_cache_control(out, part) and isinstance(part, dict) and "cache_control" in part:
+                unplaced_cc = copy.deepcopy(part["cache_control"])
+        else:
             out.append(replacement)
     if out is None:
-        return None
-    return out, removed, added, not out
+        return (None, None) if _carry else None
+    result = (out, removed, added, not out)
+    return (result, unplaced_cc if not out else None) if _carry else result
 
 
 def _render_reminder(template, text):
@@ -733,6 +761,9 @@ class _Walk:
             if index < self.lead or not isinstance(message, dict):
                 self.keep(message, None if index < self.lead else "U", index)
                 continue
+            if _is_standalone_reasoning(message, self.dialect):
+                self.keep(message, None, index)
+                continue
             kind = _kind(message, self.dialect)
             if kind == "S":
                 message = self.system(index, message)
@@ -768,7 +799,10 @@ class _Walk:
             return "would end the conversation with an assistant message"
         if before == "A" and after == "A":
             return "would put two assistant messages next to each other"
-        following = self.messages[index + 1] if index + 1 < size else None
+        next_index = index + 1
+        while next_index < size and _is_standalone_reasoning(self.messages[next_index], self.dialect):
+            next_index += 1
+        following = self.messages[next_index] if next_index < size else None
         # Judged by what is kept, not by the position: when two leading user messages both go, the second is no longer at
         # self.lead, and the later system message used to be pulled into the head anyway.
         if before is None and isinstance(following, dict) and _kind(following, self.dialect) == "S":
