@@ -103,6 +103,7 @@
 .p-profile-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
 .p-profile-head h2 { font-size: var(--text-lg); overflow-wrap: anywhere; }
 .p-rename { display: grid; gap: var(--space-3); padding: var(--space-3); border-radius: var(--radius-control); background: var(--raised); max-width: 28rem; }
+.p-usage-block { display: grid; gap: var(--space-1); }
 .p-usage { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); font-size: var(--text-sm); color: var(--ink-2); }
 .p-head-editor { display: grid; gap: var(--space-3); }
 .p-palette { display: flex; flex-wrap: wrap; gap: var(--space-2); }

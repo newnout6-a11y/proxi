@@ -53,11 +53,71 @@ function globRegex(glob) {
   return new RegExp(`^${source}$`, 's');
 }
 
+/** Non-empty model globs configured in `profile.publish_as_model`, or `[]` when off / `"*"` (`true`). */
+export function publishMasksOf(profile) {
+  return Array.isArray(profile?.publish_as_model)
+    ? profile.publish_as_model.filter((glob) => typeof glob === 'string' && glob.trim())
+    : [];
+}
+
+/** True when the profile is exposed as virtual `<model>@<profile>` entries in `/v1/models`. */
+export function hasPublishAsModel(profile) {
+  return profile?.publish_as_model === true || publishMasksOf(profile).length > 0;
+}
+
+/** True when `value` matches any case-insensitive fnmatch glob in `globs`. */
+export function matchesGlobs(globs, value) {
+  if (value === undefined || value === null || value === '') return false;
+  const list = Array.isArray(globs) ? globs : [globs];
+  const target = String(value).toLowerCase();
+  return list.some((glob) => {
+    if (typeof glob !== 'string' || !glob) return false;
+    try { return globRegex(glob.toLowerCase()).test(target); } catch { return false; }
+  });
+}
+
+/**
+ * Summarize which models can reach `profileName` in production (via `default_profile`, `rules`, or `publish_as_model`).
+ * Used both to pick a representative preview sample and to warn when forced preview hits a different model.
+ */
+export function profileModelScope(doc, profileName) {
+  const profile = doc?.profiles?.[profileName] || {};
+  const publishMasks = publishMasksOf(profile);
+  const publishedAll = profile.publish_as_model === true;
+  const isDefault = doc?.default_profile === profileName;
+  const rules = (Array.isArray(doc?.rules) ? doc.rules : []).filter(
+    (rule) => rule?.enabled !== false && rule?.use === profileName,
+  );
+  const openRule = rules.some((rule) => {
+    const modelCond = rule?.if?.model;
+    return modelCond === undefined || modelCond === null || modelCond === '' || (Array.isArray(modelCond) && !modelCond.length);
+  });
+  const ruleModelMasks = rules.flatMap((rule) => {
+    const modelCond = rule?.if?.model;
+    return Array.isArray(modelCond) ? modelCond : modelCond ? [String(modelCond)] : [];
+  }).filter((glob) => typeof glob === 'string' && glob.trim());
+  const modelMasks = [...new Set([...publishMasks, ...ruleModelMasks])];
+  const unrestricted = isDefault || publishedAll || openRule;
+  return {
+    isDefault,
+    publishedAll,
+    publishMasks,
+    rules,
+    modelMasks,
+    unrestricted,
+    /** True if unrestricted or `modelId` matches `modelMasks`; false if restricted elsewhere; null if no scope is defined yet. */
+    matchesModel(modelId) {
+      if (unrestricted) return true;
+      if (!modelMasks.length) return null;
+      return matchesGlobs(modelMasks, modelId);
+    },
+  };
+}
+
 /** The ids of `catalog` (routable model ids) that `setting` (false | true | glob list) publishes; null while the catalog is unknown. */
 export function publishedModels(setting, catalog) {
   if (!Array.isArray(catalog)) return null;
   if (setting === true) return catalog;
   const globs = Array.isArray(setting) ? setting.filter((glob) => typeof glob === 'string' && glob) : [];
-  const patterns = globs.map((glob) => { try { return globRegex(glob.toLowerCase()); } catch { return null; } }).filter(Boolean);
-  return catalog.filter((id) => patterns.some((pattern) => pattern.test(id.toLowerCase())));
+  return catalog.filter((id) => matchesGlobs(globs, id));
 }

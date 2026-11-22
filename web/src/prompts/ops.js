@@ -36,8 +36,8 @@ export const SYSTEM_OPS = {
 
 export const USER_BLOCK_OPS = {
   drop_tag: { label: 'Убрать блок тега', hint: 'Блок <тег>…</тег> в сообщениях пользователя и результатах инструментов',
-    fields: [tag, { key: 'contains', label: 'Только если содержит', hint: 'Необязательно' },
-      { key: 'pattern', label: 'Или подходит под выражение', mono: true, hint: 'Необязательно' }] },
+    fields: [tag, { key: 'contains', label: 'Только если содержит', hint: 'Необязательно; нельзя вместе с выражением' },
+      { key: 'pattern', label: 'Или подходит под выражение', mono: true, hint: 'Необязательно; нельзя вместе с «Только если содержит»' }, flags] },
   remove_regex: { label: 'Убрать по выражению', hint: 'Из текста сообщений', fields: [pattern, flags] },
   replace_text: { label: 'Заменить текст', hint: 'Точная замена подстроки в сообщениях', fields: [find, replacement, all] },
 };
@@ -156,6 +156,8 @@ export function setEditField(edit, key, value) {
   const empty = value === '' || value === undefined || value === null || (Array.isArray(value) && !value.length);
   if (empty && !(value === '' && WRITTEN_EMPTY.has(key))) delete next[key];
   else next[key] = value;
+  // drop_tag rejects `flags` when `pattern` is omitted
+  if (next.op === 'drop_tag' && key === 'pattern' && !next.pattern) delete next.flags;
   return next;
 }
 
@@ -164,6 +166,10 @@ export function switchOp(scope, edit, op) {
   const fresh = newEdit(scope, op);
   const spec = SCOPES[scope]?.ops[op];
   for (const field of spec?.fields || []) if (edit[field.key] !== undefined) fresh[field.key] = edit[field.key];
+  if (scope === 'user_blocks' && op === 'drop_tag') {
+    if (!fresh.pattern) delete fresh.flags;
+    if (fresh.contains && (fresh.pattern || fresh.flags)) { delete fresh.pattern; delete fresh.flags; }
+  }
   if (scope === 'tools' && edit.tool !== undefined) fresh.tool = edit.tool;
   return fresh;
 }

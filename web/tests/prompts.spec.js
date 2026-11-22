@@ -611,8 +611,11 @@ test('the live preview applies the profile under edit to the chosen sample and s
   await expect(panel.locator('.diff-same', { hasText: 'Tool usage policy' })).toBeVisible();
   await expect(panel.getByText('512 байт · ≈ 128 токенов')).toBeVisible();
 
-  // the facts of a forced profile leave out the rule and the revision
-  await expect(panel.locator('.p-facts dt')).toHaveText(['Назначение', 'Клиент', 'Модель', 'Размер head']);
+  // the facts of a forced profile keep routing explicit so simulation cannot be mistaken for live routing
+  await expect(panel.locator('.p-live-sim')).toContainText('Принудительная симуляция профиля mine-first');
+  await expect(panel.locator('.p-facts dt')).toHaveText(['Профиль', 'Правило', 'Ревизия', 'Назначение', 'Клиент', 'Модель', 'Размер head']);
+  await expect(panel.locator('.p-facts')).toContainText('mine-first (симуляция)');
+  await expect(panel.locator('.p-facts')).toContainText('отключены (принудительный профиль)');
 
   // the edits of the client's system of the profile under edit are reported one by one under the diff
   const edited = panel.getByRole('region', { name: 'Как сработали правки system клиента' });
@@ -2207,6 +2210,128 @@ test('the session ending while the screen is open signs out, as in the other sec
   await page.route('**/admin/api/prompts**', (route) => route.fulfill({ status: 401, json: { error: { message: 'invalid relay API key' } } }));
   await rail(page, 'Промпты').click();
   await expect(page.getByLabel('Relay key')).toBeVisible();
+});
+
+test('a published-only profile shows virtual-model usage, pre-populates rule model masks, keeps catch-all warning while empty, and commits unblurred tokens on save', async ({ page }) => {
+  const { prompts } = await openPrompts(page);
+  await page.getByRole('button', { name: 'Новый профиль' }).click();
+  await page.getByLabel('Имя профиля').fill('gpt5-only');
+  await page.getByRole('button', { name: 'Создать профиль' }).click();
+  const publish = section(page, 'Публикация как модель');
+  await publish.locator('summary').click();
+  await publish.getByRole('radio', { name: 'Только для моделей по маске' }).check();
+  await publish.getByRole('button', { name: 'Убрать значение claude-*' }).click();
+  const maskInput = publish.getByLabel('Маски моделей: добавить значение');
+  await maskInput.fill('gpt-5*');
+  await maskInput.press('Enter');
+  await maskInput.fill('o3-*');
+  await maskInput.press('Enter');
+
+  await expect(page.locator('.p-usage')).toContainText('виртуальная модель: gpt-5*, o3-*');
+  await expect(page.getByText('Ни одно правило не использует этот профиль')).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await expect(tab(page, 'Правила')).toHaveAttribute('aria-selected', 'true');
+  const rule = userRule(page, 3);
+  await expect(rule).toContainText('Модель: gpt-5* или o3-* → gpt5-only');
+  const modelGroup = rule.getByRole('group', { name: 'Модель' });
+  await expect(modelGroup.locator('.p-token')).toHaveText(['gpt-5*', 'o3-*']);
+
+  await modelGroup.getByRole('button', { name: 'Убрать значение gpt-5*' }).click();
+  await modelGroup.getByRole('button', { name: 'Убрать значение o3-*' }).click();
+  await expect(rule.locator('.p-conditions')).toContainText('Условий нет: правило сработает на любой запрос');
+
+  await modelGroup.getByLabel('Модель: добавить значение').fill('gpt-5.4');
+  // Click Save programmatically without triggering input blur to verify unblurred token flush before save.
+  await saveButton(page).evaluate((button) => button.click());
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  expect(prompts.saves[0].body.document.rules[3].if).toEqual({ model: 'gpt-5.4' });
+});
+
+test('live preview prefers a model-matching sample and warns loudly when forced onto another model', async ({ page }) => {
+  await openPrompts(page);
+  await expect(live(page).locator('.p-live-sim')).toContainText('Принудительная симуляция профиля mine-first');
+  await expect(live(page).locator('.tone-warn.p-live-sim')).toHaveCount(0);
+
+  await profileBar(page).getByRole('button', { name: 'exact-opus' }).click();
+  await expect(live(page).locator('.p-facts')).toContainText('exact-opus (симуляция)');
+  await expect(live(page).locator('.p-facts')).toContainText('claude-opus-5-5');
+  await expect(live(page).locator('.tone-warn.p-live-sim')).toHaveCount(0);
+
+  await live(page).locator('.p-disclosure > summary').click();
+  await live(page).getByLabel('Запрос', { exact: true }).selectOption('req-open-2');
+  const warn = live(page).locator('.tone-warn.p-live-sim');
+  await expect(warn).toContainText('claude-sonnet-5-5');
+  await expect(warn).toContainText('claude-opus-*');
+});
+
+test('Codex base masks preserve rows and text through empty/duplicate edits and block saving duplicates', async ({ page }) => {
+  const { prompts } = await openPrompts(page, {}, 'Тексты');
+  const codex = page.getByRole('article', { name: 'Базовые инструкции Codex' });
+  await codex.getByRole('button', { name: 'Изменить' }).click();
+  await codex.getByRole('button', { name: 'Разделить по маскам моделей' }).click();
+  await codex.getByLabel('Инструкции для *').fill('База 1');
+
+  await codex.getByRole('button', { name: 'Добавить маску' }).click();
+  await codex.getByRole('button', { name: 'Добавить маску' }).click();
+  await expect(codex.locator('.p-codex-row')).toHaveCount(3);
+
+  await codex.getByRole('button', { name: 'Убрать маску 3', exact: true }).click();
+  await expect(codex.locator('.p-codex-row')).toHaveCount(2);
+  await codex.locator('.p-codex-row').nth(1).getByLabel(/Инструкции для/).fill('База 2');
+  await codex.getByLabel('Маска модели').nth(1).fill('*');
+  await expect(codex.locator('.p-codex-row')).toHaveCount(2);
+  await expect(codex.locator('.p-codex-row').nth(0).getByLabel(/Инструкции для/)).toHaveValue('База 1');
+  await expect(codex.locator('.p-codex-row').nth(1).getByLabel(/Инструкции для/)).toHaveValue('База 2');
+  await expect(codex).toContainText('Такая маска уже есть');
+
+  await saveButton(page).click();
+  await expect(page.locator('.p-save-error')).toContainText('повторяется');
+  expect(prompts.saves).toHaveLength(0);
+
+  await codex.getByLabel('Маска модели').nth(1).fill('gpt-5*');
+  await expect(codex.getByText('Такая маска уже есть')).toHaveCount(0);
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  expect(prompts.saves[0].body.document.relay_texts.codex_base).toEqual({ '*': 'База 1', 'gpt-5*': 'База 2' });
+});
+
+test('drop_tag supports regex flags and enforces mutual exclusion between contains and pattern', async ({ page }) => {
+  const { prompts } = await openPrompts(page);
+  const history = section(page, 'История диалога');
+  const row = history.locator('.p-edit').first();
+  const contains = row.getByLabel('Только если содержит');
+  const pattern = row.getByLabel('Или подходит под выражение');
+  const flagI = row.getByRole('checkbox', { name: /i ·/ });
+  const flagS = row.getByRole('checkbox', { name: /s ·/ });
+
+  await expect(pattern).toBeDisabled();
+  await expect(flagI).toBeDisabled();
+
+  await contains.fill('');
+  await expect(pattern).toBeEnabled();
+  await expect(flagI).toBeDisabled();
+
+  await pattern.fill('plan.*mode');
+  await expect(contains).toBeDisabled();
+  await expect(flagI).toBeEnabled();
+  await flagI.check();
+  await flagS.check();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(1);
+  expect(prompts.saves[0].body.document.profiles['mine-first'].history.user_blocks[0]).toEqual({
+    op: 'drop_tag', tag: 'system-reminder', pattern: 'plan.*mode', flags: 'is',
+  });
+
+  await pattern.fill('');
+  await expect(contains).toBeEnabled();
+  await expect(flagI).not.toBeChecked();
+  await expect(flagI).toBeDisabled();
+  await saveButton(page).click();
+  await expect.poll(() => prompts.saves.length).toBe(2);
+  expect(prompts.saves[1].body.document.profiles['mine-first'].history.user_blocks[0]).toEqual({
+    op: 'drop_tag', tag: 'system-reminder',
+  });
 });
 
 // --- design ----------------------------------------------------------------------------------------------------------

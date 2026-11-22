@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
 import { Button, Tag } from '../ui.jsx';
 import { Notice } from './controls.jsx';
-import { addProfile, profileUsage, profilesOf, removeProfile, renameProfile, starterProfile, uniqueName } from './draft.js';
+import { addProfile, profileUsage, profilesOf, removeProfile, renameProfile, selectedProfileName, starterProfile, uniqueName } from './draft.js';
 import { useFocusLater } from './hooks.js';
 import LivePreview from './LivePreview.jsx';
 import NewProfile from './NewProfile.jsx';
@@ -14,7 +14,7 @@ export default function ProfilesTab({ apiKey, doc, setDoc, builtin, selected, se
   const focusLater = useFocusLater();
   const names = Object.keys(profilesOf(doc));
   const builtinNames = builtin.profiles.length ? builtin.profiles : ['passthrough'];
-  const current = names.includes(selected) ? selected : builtinNames.includes(selected) ? selected : names[0] || null;
+  const current = selectedProfileName(doc, builtin, selected);
   const textNames = Object.keys(doc.texts || {});
   const isBuiltin = !!current && builtinNames.includes(current);
 

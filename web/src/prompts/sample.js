@@ -1,6 +1,7 @@
 // The sample request a preview is made for: one of the recent requests the relay still holds, or a body the user pastes.
 import { fmtShortTime } from '../format.js';
 import { detectDialect, parseBody, parseHeaders } from './api.js';
+import { matchesGlobs, profileModelScope } from './publish.js';
 
 export const DIALECTS = [
   { value: 'chat', label: 'Chat Completions' },
@@ -39,3 +40,37 @@ export function resolveSample(state, recent = []) {
  * A title or a compaction goes through the protective rules unchanged, so it shows nothing of the profiles under edit.
  */
 export const newestSample = (recent) => recent.find((entry) => entry.has_request && !entry.protected) || null;
+
+/**
+ * Picks the most representative recent sample for previewing `profileName`:
+ * first a non-protected sample matching `publish_as_model` masks, then one matching an enabled rule using the profile
+ * (against known summary fields), then one matching combined rule/publish model masks, else `newestSample`.
+ */
+export function preferredSample(recent, doc = null, profileName = null) {
+  const usable = (Array.isArray(recent) ? recent : []).filter((entry) => entry.has_request && !entry.protected);
+  if (!usable.length) return null;
+  if (!doc || !profileName) return usable[0];
+
+  const scope = profileModelScope(doc, profileName);
+  if (scope.publishMasks.length) {
+    const byPublish = usable.find((entry) => matchesGlobs(scope.publishMasks, entry.model));
+    if (byPublish) return byPublish;
+  }
+  if (scope.rules.length) {
+    const byRule = usable.find((entry) => scope.rules.some((rule) => {
+      const conds = rule?.if || {};
+      const checks = [['model', entry.model], ['client', entry.client], ['agent', entry.agent], ['purpose', entry.purpose]];
+      return checks.every(([key, actual]) => {
+        const wanted = conds[key];
+        if (wanted === undefined || wanted === null || wanted === '' || (Array.isArray(wanted) && !wanted.length)) return true;
+        return matchesGlobs(wanted, actual);
+      });
+    }));
+    if (byRule) return byRule;
+  }
+  if (scope.modelMasks.length) {
+    const byModel = usable.find((entry) => matchesGlobs(scope.modelMasks, entry.model));
+    if (byModel) return byModel;
+  }
+  return usable[0];
+}
