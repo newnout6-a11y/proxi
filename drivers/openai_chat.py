@@ -55,7 +55,32 @@ def _convert_content_blocks(blocks):
     return result
 
 
-def _canonical_to_chat_messages(canonical: list[dict], *, preset: str = "") -> list[dict]:
+def _fold_reasoning_details(parts: list, details_by_idx: dict[int, dict], max_bytes: int) -> str:
+    """Fold OpenRouter `reasoning_details` fragments by index and return concatenated visible text."""
+    visible: list[str] = []
+    for pos, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+        raw_idx = part.get("index", pos)
+        index = raw_idx if type(raw_idx) is int and 0 <= raw_idx < 64 else pos
+        item = details_by_idx.setdefault(index, {})
+        for key, value in part.items():
+            if key == "index" or value is None:
+                continue
+            if key in ("text", "summary", "data") and isinstance(value, str):
+                item[key] = item.get(key, "") + value
+                if key in ("text", "summary"):
+                    visible.append(value)
+            elif key == "signature" and isinstance(value, str):
+                item[key] = item.get(key, "") + value
+            else:
+                item[key] = value
+            if sum(len(str(v)) for v in item.values()) > max_bytes:
+                raise apierr.upstream_error("OpenAI reasoning details exceeded size limit")
+    return "".join(visible)
+
+
+def _canonical_to_chat_messages(canonical: list[dict], *, preset: str = "", is_openrouter: bool = False) -> list[dict]:
     """Convert canonical history to OpenAI chat messages, replaying active-turn `reasoning_content` / `thought_signature`."""
     last_plain_user_idx = max(
         (i for i, m in enumerate(canonical) if m.get("role") == "user"),
@@ -138,7 +163,7 @@ def _canonical_to_chat_messages(canonical: list[dict], *, preset: str = "") -> l
             # Replay reasoning_content inside active tool-call loops (required by DeepSeek R1/V3.2 & Kimi K2.5),
             # while stripping it from older completed turns before `last_plain_user_idx` to preserve prefix cache!
             if in_active_tool_loop and calls:
-                if preset == "openrouter" and or_details:
+                if (is_openrouter or preset == "openrouter") and or_details:
                     entry["reasoning_details"] = or_details
                 elif thinking_texts and preset in ("deepseek", "moonshot", "siliconflow", "vllm", "ollama", "custom", ""):
                     entry["reasoning_content"] = "".join(thinking_texts)
@@ -301,13 +326,15 @@ class OpenAIChatDriver(UpstreamDriver):
                 session, scope, tools, chunks, prompt
             )
 
+        base = str(cfg.get("base_url") or cfg.get("base") or "").rstrip("/")
+        is_openrouter = preset == "openrouter" or "openrouter.ai" in base.lower()
+
         chat_messages: list[dict] = []
         if clean_head:
             chat_messages.append({"role": "system", "content": clean_head})
-        chat_messages.extend(_canonical_to_chat_messages(canonical_msgs, preset=preset))
+        chat_messages.extend(_canonical_to_chat_messages(canonical_msgs, preset=preset, is_openrouter=is_openrouter))
 
         side_task = client_context.current().get("client_task") in client_context.SIDE_TASKS
-        is_openrouter = preset == "openrouter" or "openrouter.ai" in str(cfg.get("base") or "").lower()
         if is_openrouter and model.lower().startswith(("anthropic/", "google/")):
             mark_spec = cache_engine.cache_control_spec(cfg, self.driver_id, is_openrouter=True)
             cache_engine.apply_chat_cache_breakpoints(chat_messages, mark_spec, mark_tail=not side_task)
@@ -356,11 +383,10 @@ class OpenAIChatDriver(UpstreamDriver):
             body["stop"] = list(provider_opts["stop_sequences"])
 
         cache_engine.apply_openai_cache_hints(
-            body, cfg, session, model, provider_opts, include_retention=(preset == "openai")
+            body, cfg, session, model, provider_opts, include_retention=(preset == "openai"), head=clean_head, tools=cleaned_tools
         )
         body = sse_utils.apply_body_overrides(body, cfg.get("body_overrides"))
 
-        base = str(cfg.get("base_url") or cfg.get("base") or "").rstrip("/")
         url = http_pool.validate_endpoint_url(f"{base}/chat/completions", allow_insecure_http=bool(cfg.get("allow_insecure_http", False)))
         headers = discovery.build_auth_headers(cfg)
         headers["Content-Type"] = "application/json"
@@ -385,8 +411,15 @@ class OpenAIChatDriver(UpstreamDriver):
                 request_sent_cb()
                 yield {"type": "request_sent"}
 
-            async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as resp:
-                http_pool.bind_stream_response(active_resp_holder, resp)
+            async with http_pool.abortable_stream(
+                client,
+                "POST",
+                url,
+                active_resp_holder=active_resp_holder,
+                headers=headers,
+                json=body,
+                timeout=timeout,
+            ) as resp:
                 if resp.status_code >= 400:
                     err_bytes = await resp.aread()
                     err_text = err_bytes.decode("utf-8", errors="replace")
@@ -403,20 +436,34 @@ class OpenAIChatDriver(UpstreamDriver):
                     # Non-streaming JSON fallback from custom OpenAI-compatible servers
                     raw_bytes = await resp.aread()
                     payload = sse_utils.bounded_json(raw_bytes.decode("utf-8", errors="replace"))
-                    for ev in self._events_from_non_stream_json(payload, bound_entry, session, scope, client_echo, canonical_msgs, tools, parent_snapshot):
+                    for ev in self._events_from_non_stream_json(
+                        payload,
+                        bound_entry,
+                        session,
+                        scope,
+                        client_echo,
+                        canonical_msgs,
+                        tools,
+                        parent_snapshot,
+                        text_only=text_only,
+                    ):
                         yield ev
                     return
 
                 thinking_started = False
+                has_output = False
                 thinking_chunks: list[str] = []
-                reasoning_details_acc: list[dict] = []
+                reasoning_details_by_idx: dict[int, dict] = {}
                 text_chunks: list[str] = []
                 tool_calls_by_idx: dict[int, dict] = {}
                 finish_reason: str | None = None
                 latest_usage: dict | None = None
                 saw_done = False
 
-                async for _ev_name, data_str in sse_utils.aiter_sse_events(resp.aiter_bytes(), label=cfg.get("provider_name") or "OpenAI"):
+                async for _ev_name, data_str in sse_utils.aiter_sse_events(
+                    http_pool.iter_abortable_bytes(resp, active_resp_holder),
+                    label=cfg.get("provider_name") or "OpenAI",
+                ):
                     if getattr(session, "_cancelled", False):
                         yield {"type": "end", "reason": "cancelled"}
                         return
@@ -430,7 +477,7 @@ class OpenAIChatDriver(UpstreamDriver):
                     if not isinstance(chunk, dict):
                         continue
                     if isinstance(chunk.get("error"), dict):
-                        raise sse_utils.map_http_error(502, resp.headers, data_str, cfg, unbilled=False)
+                        raise sse_utils.map_sse_error(data_str, resp.headers, cfg, pre_output=not has_output)
 
                     if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
                         latest_usage = normalize_chat_usage(chunk["usage"], bound_entry)
@@ -446,12 +493,13 @@ class OpenAIChatDriver(UpstreamDriver):
                     if not isinstance(r_delta, str) or not r_delta:
                         r_delta = delta.get("reasoning") if isinstance(delta.get("reasoning"), str) else ""
                     if isinstance(delta.get("reasoning_details"), list):
-                        for rd in delta["reasoning_details"]:
-                            if isinstance(rd, dict):
-                                reasoning_details_acc.append(rd)
-                                if not r_delta and isinstance(rd.get("text"), str):
-                                    r_delta += rd["text"]
+                        rd_text = _fold_reasoning_details(
+                            delta["reasoning_details"], reasoning_details_by_idx, sse_utils.MAX_EVENT_BYTES
+                        )
+                        if not r_delta and rd_text:
+                            r_delta = rd_text
                     if r_delta:
+                        has_output = True
                         if not thinking_started:
                             thinking_started = True
                             yield {"type": "thinking_start"}
@@ -461,6 +509,7 @@ class OpenAIChatDriver(UpstreamDriver):
                     # 2. Text delta
                     t_delta = delta.get("content")
                     if isinstance(t_delta, str) and t_delta:
+                        has_output = True
                         text_chunks.append(t_delta)
                         yield {"type": "text", "delta": t_delta}
 
@@ -490,10 +539,12 @@ class OpenAIChatDriver(UpstreamDriver):
                                 slot["extra_content"] = copy.deepcopy(tc["extra_content"])
                             arg_piece = fn.get("arguments")
                             if isinstance(arg_piece, str) and arg_piece:
+                                has_output = True
                                 slot["arguments"] += arg_piece
                                 if len(slot["arguments"].encode("utf-8")) > sse_utils.MAX_EVENT_BYTES:
                                     raise apierr.upstream_error("Tool call arguments exceeded size limit")
                             if slot["name"]:
+                                has_output = True
                                 yield {
                                     "type": "tool_call",
                                     "id": slot["id"],
@@ -515,6 +566,7 @@ class OpenAIChatDriver(UpstreamDriver):
 
                 reply_blocks: list[dict] = []
                 full_thinking = "".join(thinking_chunks)
+                reasoning_details_acc = [reasoning_details_by_idx[k] for k in sorted(reasoning_details_by_idx)]
                 if full_thinking or reasoning_details_acc:
                     t_block: dict = {
                         "type": "thinking",
@@ -564,25 +616,49 @@ class OpenAIChatDriver(UpstreamDriver):
                         session, scope, client_echo, canonical_msgs, _rb, tools, parent_snapshot
                     )
                 yield {"type": "end", "reason": effective_finish}
-        except httpx.TimeoutException:
-            raise apierr.upstream_timeout(f"{cfg.get('provider_name') or 'Upstream'} request timed out") from None
-        except httpx.HTTPError as exc:
-            raise apierr.upstream_error(f"{cfg.get('provider_name') or 'Upstream'} connection error: {type(exc).__name__}") from None
+        except (httpx.TimeoutException, httpx.HTTPError) as exc:
+            raise http_pool.map_transport_error(exc, cfg.get("provider_name") or "Upstream") from None
         finally:
             cache_engine.release_head(head_key, head_role, head_gate, head_marked)
             http_pool.clear_stream_abort(session, abort)
 
-    def _events_from_non_stream_json(self, payload, bound_entry, session, scope, client_echo, canonical_msgs, tools, parent_snapshot):
+    def _events_from_non_stream_json(
+        self,
+        payload,
+        bound_entry,
+        session,
+        scope,
+        client_echo,
+        canonical_msgs,
+        tools,
+        parent_snapshot,
+        *,
+        text_only: bool = False,
+    ):
         choices = payload.get("choices") if isinstance(payload, dict) else None
         msg = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
         msg = msg if isinstance(msg, dict) else {}
         reply_blocks: list[dict] = []
 
-        r_text = msg.get("reasoning_content") or msg.get("reasoning")
-        if isinstance(r_text, str) and r_text:
-            yield {"type": "thinking_start"}
-            yield {"type": "thinking", "delta": r_text}
-            reply_blocks.append({"type": "thinking", "thinking": r_text, "signature": "unsigned:reasoning_content"})
+        rd_acc: dict[int, dict] = {}
+        rd_text = ""
+        if isinstance(msg.get("reasoning_details"), list):
+            rd_text = _fold_reasoning_details(msg["reasoning_details"], rd_acc, sse_utils.MAX_EVENT_BYTES)
+        r_text = msg.get("reasoning_content") or msg.get("reasoning") or rd_text
+        rd_list = [rd_acc[k] for k in sorted(rd_acc)]
+        if (isinstance(r_text, str) and r_text) or rd_list:
+            r_str = r_text if isinstance(r_text, str) else ""
+            if r_str:
+                yield {"type": "thinking_start"}
+                yield {"type": "thinking", "delta": r_str}
+            t_block: dict = {
+                "type": "thinking",
+                "thinking": r_str,
+                "signature": "openrouter:reasoning_details" if rd_list else "unsigned:reasoning_content",
+            }
+            if rd_list:
+                t_block["reasoning_details"] = rd_list
+            reply_blocks.append(t_block)
 
         text = msg.get("content")
         if isinstance(text, str) and text:
@@ -614,8 +690,10 @@ class OpenAIChatDriver(UpstreamDriver):
             yield {"type": "usage", "usage": normalize_chat_usage(payload["usage"], bound_entry)}
         fr = choices[0].get("finish_reason") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
         reason = _FINISH_MAP.get(fr, "tool_calls" if tcs else "stop")
-        if reason in ("stop", "tool_calls"):
-            cache_engine.record_canonical_reply(session, scope, client_echo, canonical_msgs, reply_blocks, tools, parent_snapshot)
+        if not text_only and reason in ("stop", "tool_calls") and session is not None:
+            session._pending_history_commit = lambda _rb=reply_blocks: cache_engine.record_canonical_reply(
+                session, scope, client_echo, canonical_msgs, _rb, tools, parent_snapshot
+            )
         yield {"type": "end", "reason": reason}
 
 

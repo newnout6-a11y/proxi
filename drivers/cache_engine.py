@@ -162,15 +162,19 @@ def apply_openai_cache_hints(
     provider_options: dict | None = None,
     *,
     include_retention: bool = False,
+    head: str | None = None,
+    tools: list | None = None,
 ) -> None:
-    """Attach deterministic `prompt_cache_key` (and optional `prompt_cache_retention`) for OpenAI / OpenRouter / xAI."""
+    """Attach deterministic `prompt_cache_key` (and optional `prompt_cache_retention`) for OpenAI / OpenRouter."""
     if not cfg.get("direct_cache", True) or str(cfg.get("cache_policy") or "auto").lower() == "off":
         return
     opts = provider_options or {}
     preset = str(cfg.get("preset") or "").lower()
+    if preset in ("xai", "deepseek"):
+        return
     low_model = (model or "").lower()
 
-    supports_cache_key = preset in ("openai", "openai-responses", "openrouter", "xai", "deepseek") or low_model.startswith(
+    supports_cache_key = preset in ("openai", "openai-responses", "openrouter") or low_model.startswith(
         ("gpt-", "o1", "o3", "o4", "openai/", "anthropic/", "google/")
     )
     if not supports_cache_key:
@@ -178,7 +182,19 @@ def apply_openai_cache_hints(
 
     conv_key = getattr(session, "_native_conversation_key", None) if session is not None else None
     if conv_key:
-        seed = [cfg.get("provider_id") or preset, model, conv_key]
+        if head is not None:
+            head_part = head
+        elif body.get("instructions") is not None:
+            head_part = body.get("instructions")
+        else:
+            msgs = body.get("messages") or []
+            head_part = (
+                msgs[0].get("content")
+                if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") in ("system", "developer")
+                else None
+            )
+        tools_part = tools if tools is not None else body.get("tools")
+        seed = [cfg.get("provider_id") or preset, model, conv_key, head_part, tools_part]
         # An administrator's hint can select a group within a conversation, but never share the key between chats.
         explicit_key = opts.get("prompt_cache_key")
         if isinstance(explicit_key, str) and explicit_key.strip():
@@ -450,13 +466,26 @@ async def run_guarded_turn(
         return
 
     # 2. Forced tool-choice gate when thinking + forced tool_choice collide (e.g. Anthropic Messages API)
-    effort_active = bool(
+    raw_effort = (
         model_provider.get("reasoningEffort")
         or model_provider.get("reasoning_effort")
-        or ((getattr(session, "_provider_options", None) or {}).get("thinking") or {}).get("type") in ("enabled", "adaptive")
+        or model_provider.get("effort")
+    )
+    eff = None if raw_effort == "auto" else raw_effort
+    provider_opts = getattr(session, "_provider_options", None) or {}
+    raw_thinking_opt = provider_opts.get("thinking") if isinstance(provider_opts.get("thinking"), dict) else {}
+    t_type = str(raw_thinking_opt.get("type") or "").lower()
+    supports_reasoning = bool(bound_entry.get("reasoning", True))
+    effort_active = supports_reasoning and eff != "none" and t_type != "disabled" and bool(
+        eff
+        or raw_thinking_opt.get("budget_tokens")
+        or t_type in ("enabled", "adaptive")
+        or (raw_thinking_opt and bound_entry.get("reasoning", False))
     )
     needs_word_forced_choice = not bound_entry.get("forced_tool_choice", True) and (
-        driver_id != "anthropic-messages" or effort_active or bound_entry.get("reasoning", False)
+        driver_id != "anthropic-messages"
+        or effort_active
+        or (bound_entry.get("reasoning", False) and eff != "none" and t_type != "disabled")
     )
     required = (
         forced_choice.requirement(model_provider.get("model"), tools, tool_choice, entry=bound_entry)

@@ -197,11 +197,21 @@ def get_async_client(cfg: dict | None = None) -> httpx.AsyncClient:
     return client
 
 
+def _is_http2_response(resp) -> bool:
+    """True when `resp` shares a multiplexed HTTP/2 transport stream."""
+    if getattr(resp, "http_version", None) == "HTTP/2":
+        return True
+    ext = getattr(resp, "extensions", None)
+    return isinstance(ext, dict) and (ext.get("http_version") == b"HTTP/2" or "stream_id" in ext)
+
+
 async def _close_stream_response(resp) -> None:
-    with contextlib.suppress(Exception):
-        ns = resp.extensions.get("network_stream")
-        if ns is not None:
-            await ns.aclose()
+    if not _is_http2_response(resp):
+        with contextlib.suppress(Exception):
+            ext = getattr(resp, "extensions", None)
+            ns = ext.get("network_stream") if isinstance(ext, dict) else None
+            if ns is not None:
+                await ns.aclose()
     with contextlib.suppress(Exception):
         await resp.aclose()
 
@@ -224,9 +234,14 @@ def make_stream_abort(session, active_resp_holder: dict, loop: asyncio.AbstractE
     active_loop = loop or asyncio.get_running_loop()
     active_resp_holder["loop"] = active_loop
     active_resp_holder["aborted"] = False
+    active_resp_holder["abort_event"] = asyncio.Event()
 
     def abort():
         active_resp_holder["aborted"] = True
+        abort_event = active_resp_holder.get("abort_event")
+        if abort_event is not None and not active_loop.is_closed():
+            with contextlib.suppress(RuntimeError):
+                active_loop.call_soon_threadsafe(abort_event.set)
         resp = active_resp_holder.get("resp")
         if resp is None:
             return
@@ -250,6 +265,100 @@ def bind_stream_response(active_resp_holder: dict, resp) -> None:
 def clear_stream_abort(session, abort) -> None:
     if session is not None and getattr(session, "_active_direct_abort", None) is abort:
         session._active_direct_abort = None
+
+
+@contextlib.asynccontextmanager
+async def abortable_stream(client: httpx.AsyncClient, method: str, url: str, *, active_resp_holder: dict, **kwargs):
+    """Open an `httpx` stream that cancels promptly on `abort` without closing shared HTTP/2 sockets."""
+    abort_event = active_resp_holder.get("abort_event")
+    ctx = client.stream(method, url, **kwargs)
+    if abort_event is None:
+        async with ctx as resp:
+            bind_stream_response(active_resp_holder, resp)
+            yield resp
+        return
+    if abort_event.is_set() or active_resp_holder.get("aborted"):
+        raise httpx.ConnectError("Upstream stream aborted before connect")
+    enter_task = asyncio.ensure_future(ctx.__aenter__())
+    abort_task = asyncio.ensure_future(abort_event.wait())
+    entered = False
+    try:
+        try:
+            done, _ = await asyncio.wait((enter_task, abort_task), return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            abort_task.cancel()
+            enter_task.cancel()
+            await asyncio.gather(enter_task, abort_task, return_exceptions=True)
+            if enter_task.done() and not enter_task.cancelled() and enter_task.exception() is None:
+                entered = True
+            raise
+        if abort_task in done and (abort_event.is_set() or active_resp_holder.get("aborted")):
+            enter_task.cancel()
+            await asyncio.gather(enter_task, return_exceptions=True)
+            if enter_task.done() and not enter_task.cancelled() and enter_task.exception() is None:
+                entered = True
+            raise httpx.ReadError("Upstream stream aborted")
+        abort_task.cancel()
+        await asyncio.gather(abort_task, return_exceptions=True)
+        resp = enter_task.result()
+        entered = True
+        bind_stream_response(active_resp_holder, resp)
+        if abort_event.is_set() or active_resp_holder.get("aborted"):
+            raise httpx.ReadError("Upstream stream aborted")
+        yield resp
+    except BaseException as exc:
+        if entered:
+            await ctx.__aexit__(type(exc), exc, exc.__traceback__)
+        raise
+    else:
+        await ctx.__aexit__(None, None, None)
+
+
+async def iter_abortable_bytes(resp, active_resp_holder: dict):
+    """Yield response byte chunks while waking immediately when `abort` sets `abort_event`."""
+    abort_event = active_resp_holder.get("abort_event")
+    if abort_event is None:
+        async for chunk in resp.aiter_bytes():
+            yield chunk
+        return
+    it = resp.aiter_bytes().__aiter__()
+    while True:
+        if abort_event.is_set() or active_resp_holder.get("aborted"):
+            raise httpx.ReadError("Upstream stream aborted")
+        chunk_task = asyncio.ensure_future(it.__anext__())
+        abort_task = asyncio.ensure_future(abort_event.wait())
+        try:
+            done, _ = await asyncio.wait((chunk_task, abort_task), return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            chunk_task.cancel()
+            abort_task.cancel()
+            await asyncio.gather(chunk_task, abort_task, return_exceptions=True)
+            raise
+        if abort_task in done and (abort_event.is_set() or active_resp_holder.get("aborted")):
+            chunk_task.cancel()
+            await asyncio.gather(chunk_task, return_exceptions=True)
+            raise httpx.ReadError("Upstream stream aborted")
+        abort_task.cancel()
+        await asyncio.gather(abort_task, return_exceptions=True)
+        try:
+            yield chunk_task.result()
+        except StopAsyncIteration:
+            break
+
+
+def is_presend_httpx_error(exc: BaseException) -> bool:
+    """True only for httpx errors that provably occurred before sending the request."""
+    return isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError, httpx.ProxyError))
+
+
+def map_transport_error(exc: BaseException, label: str) -> apierr.ApiError:
+    """Map httpx transport timeouts/errors to `ApiError` with conservative `unbilled` marking."""
+    if isinstance(exc, httpx.TimeoutException):
+        err = apierr.upstream_timeout(f"{label} request timed out")
+    else:
+        err = apierr.upstream_error(f"{label} connection error: {type(exc).__name__}")
+    err.unbilled = is_presend_httpx_error(exc)
+    return err
 
 
 def close_account_clients(account_id: str | None) -> None:

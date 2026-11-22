@@ -408,13 +408,17 @@ class AnthropicMessagesDriver(UpstreamDriver):
         headers = discovery.build_auth_headers(cfg)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream"
-        betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
+        betas: list[str] = []
+        for k in list(headers):
+            if k.lower() == "anthropic-beta":
+                raw_val = headers.pop(k)
+                if isinstance(raw_val, str):
+                    for b in raw_val.split(","):
+                        bs = b.strip()
+                        if bs and bs not in betas:
+                            betas.append(bs)
         base_host = (urllib.parse.urlsplit(base).hostname or "").lower()
-        is_anthropic_host = (
-            cfg.get("preset") == "anthropic"
-            or base_host == "anthropic.com"
-            or base_host.endswith(".anthropic.com")
-        )
+        is_anthropic_host = base_host == "anthropic.com" or base_host.endswith(".anthropic.com")
         if is_anthropic_host:
             for beta in client_context.anthropic_betas():
                 if beta in SAFE_ANTHROPIC_BETAS and beta not in betas:
@@ -443,8 +447,15 @@ class AnthropicMessagesDriver(UpstreamDriver):
                 request_sent_cb()
                 yield {"type": "request_sent"}
 
-            async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as resp:
-                http_pool.bind_stream_response(active_resp_holder, resp)
+            async with http_pool.abortable_stream(
+                client,
+                "POST",
+                url,
+                active_resp_holder=active_resp_holder,
+                headers=headers,
+                json=body,
+                timeout=timeout,
+            ) as resp:
                 if resp.status_code >= 400:
                     err_bytes = await resp.aread()
                     err_text = err_bytes.decode("utf-8", errors="replace")
@@ -459,12 +470,16 @@ class AnthropicMessagesDriver(UpstreamDriver):
                 blocks_by_idx: dict[int, dict] = {}
                 calls_by_idx: dict[int, dict] = {}
                 thinking_started = False
+                has_output = False
                 emitted_sig = False
                 raw_usage: dict = {}
                 finish_reason: str | None = None
                 saw_stop = False
 
-                async for ev_name, data_str in sse_utils.aiter_sse_events(resp.aiter_bytes(), label=cfg.get("provider_name") or "Anthropic"):
+                async for ev_name, data_str in sse_utils.aiter_sse_events(
+                    http_pool.iter_abortable_bytes(resp, active_resp_holder),
+                    label=cfg.get("provider_name") or "Anthropic",
+                ):
                     if getattr(session, "_cancelled", False):
                         yield {"type": "end", "reason": "cancelled"}
                         return
@@ -479,7 +494,7 @@ class AnthropicMessagesDriver(UpstreamDriver):
 
                     kind = item.get("type") or ev_name
                     if kind == "error":
-                        raise sse_utils.map_http_error(502, resp.headers, data_str, cfg, unbilled=False)
+                        raise sse_utils.map_sse_error(data_str, resp.headers, cfg, pre_output=not has_output)
 
                     if kind == "message_start":
                         msg_obj = item.get("message") if isinstance(item.get("message"), dict) else {}
@@ -493,6 +508,7 @@ class AnthropicMessagesDriver(UpstreamDriver):
                             continue
                         btype = cb.get("type")
                         if btype == "thinking":
+                            has_output = True
                             init_think = cb.get("thinking") if isinstance(cb.get("thinking"), str) else ""
                             blocks_by_idx[idx] = {
                                 "type": "thinking",
@@ -505,16 +521,22 @@ class AnthropicMessagesDriver(UpstreamDriver):
                             if init_think:
                                 yield {"type": "thinking", "delta": init_think}
                         elif btype == "redacted_thinking":
+                            has_output = True
                             blocks_by_idx[idx] = {
                                 "type": "redacted_thinking",
                                 "data": str(cb.get("data") or ""),
                             }
+                            if not thinking_started:
+                                thinking_started = True
+                                yield {"type": "thinking_start"}
                         elif btype == "text":
+                            has_output = True
                             init_txt = cb.get("text") if isinstance(cb.get("text"), str) else ""
                             blocks_by_idx[idx] = {"type": "text", "text": init_txt}
                             if init_txt:
                                 yield {"type": "text", "delta": init_txt}
                         elif btype == "tool_use":
+                            has_output = True
                             cid = str(cb.get("id") or f"toolu_{idx}")
                             cname = str(cb.get("name") or "")
                             init_inp = cb.get("input")
@@ -532,9 +554,11 @@ class AnthropicMessagesDriver(UpstreamDriver):
                             continue
                         dtype = delta.get("type")
                         if dtype == "text_delta" and isinstance(delta.get("text"), str) and delta["text"]:
+                            has_output = True
                             blk["text"] = blk.get("text", "") + delta["text"]
                             yield {"type": "text", "delta": delta["text"]}
                         elif dtype == "thinking_delta" and isinstance(delta.get("thinking"), str) and delta["thinking"]:
+                            has_output = True
                             if not thinking_started:
                                 thinking_started = True
                                 yield {"type": "thinking_start"}
@@ -545,6 +569,7 @@ class AnthropicMessagesDriver(UpstreamDriver):
                         elif dtype == "input_json_delta" and idx in calls_by_idx:
                             piece = delta.get("partial_json")
                             if isinstance(piece, str):
+                                has_output = True
                                 calls_by_idx[idx]["arguments"] += piece
                                 if len(calls_by_idx[idx]["arguments"].encode("utf-8")) > sse_utils.MAX_EVENT_BYTES:
                                     raise apierr.upstream_error("Anthropic tool call arguments exceeded size limit")
@@ -620,10 +645,8 @@ class AnthropicMessagesDriver(UpstreamDriver):
                         session, scope, client_echo, canonical_msgs, _rb, tools, parent_snapshot
                     )
                 yield {"type": "end", "reason": effective_finish}
-        except httpx.TimeoutException:
-            raise apierr.upstream_timeout(f"{cfg.get('provider_name') or 'Anthropic'} request timed out") from None
-        except httpx.HTTPError as exc:
-            raise apierr.upstream_error(f"{cfg.get('provider_name') or 'Anthropic'} connection error: {type(exc).__name__}") from None
+        except (httpx.TimeoutException, httpx.HTTPError) as exc:
+            raise http_pool.map_transport_error(exc, cfg.get("provider_name") or "Anthropic") from None
         finally:
             cache_engine.release_head(head_key, head_role, head_gate, head_marked)
             http_pool.clear_stream_abort(session, abort)

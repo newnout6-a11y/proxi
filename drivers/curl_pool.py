@@ -16,6 +16,7 @@ import http.client
 import io
 import queue
 import re
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -208,7 +209,7 @@ def account_scope(cfg: dict | None) -> str:
 class _Slot:
     __slots__ = ("session", "share", "key", "generation", "closed")
 
-    def __init__(self, session, share, key, generation: int = 0):
+    def __init__(self, session, share, key, generation: tuple[int, int] | int = (0, 0)):
         self.session = session
         self.share = share
         self.key = key
@@ -261,6 +262,10 @@ class AccountSessionPool:
         self._lock = threading.Lock()
         self._buckets: dict[tuple, queue.LifoQueue] = {}
         self._generation = 0
+        self._scope_generations: dict[str, int] = {}
+
+    def _slot_generation(self, scope: str) -> tuple[int, int]:
+        return (self._generation, self._scope_generations.get(scope, 0) if scope else 0)
 
     def _bucket_key(self, cfg: dict | None) -> tuple:
         cfg = cfg or {}
@@ -270,7 +275,7 @@ class AccountSessionPool:
         trust_env = bool(cfg.get("use_system_proxy", True)) and not proxy_url
         return (account_scope(cfg), proxy_url or "", profile, verify_tls, trust_env)
 
-    def _make_slot(self, key: tuple, generation: int) -> _Slot:
+    def _make_slot(self, key: tuple, generation: tuple[int, int] | int) -> _Slot:
         from curl_cffi import CurlShare, requests
 
         _, proxy_url, profile, verify_tls, trust_env = key
@@ -298,7 +303,7 @@ class AccountSessionPool:
     def acquire(self, cfg: dict | None = None) -> _Lease:
         key = self._bucket_key(cfg)
         with self._lock:
-            gen = self._generation
+            gen = self._slot_generation(key[0])
             bucket = self._buckets.get(key)
             if bucket is None:
                 bucket = queue.LifoQueue(maxsize=self._max_per_bucket)
@@ -317,7 +322,8 @@ class AccountSessionPool:
             slot.close()
             return
         with self._lock:
-            bucket = self._buckets.get(slot.key) if slot.generation == self._generation else None
+            cur_gen = self._slot_generation(slot.key[0])
+            bucket = self._buckets.get(slot.key) if slot.generation == cur_gen else None
         if bucket is None:
             slot.close()
             return
@@ -337,11 +343,13 @@ class AccountSessionPool:
         finally:
             lease.release()
 
-    def close_account(self, scope: str) -> None:
+    def close_account(self, cfg_or_scope: str | dict | None) -> None:
+        scope = cfg_or_scope if isinstance(cfg_or_scope, str) else account_scope(cfg_or_scope)
         if not scope:
             return
         drained = []
         with self._lock:
+            self._scope_generations[scope] = self._scope_generations.get(scope, 0) + 1
             keys = [k for k in self._buckets if k[0] == scope]
             for key in keys:
                 bucket = self._buckets.pop(key)
@@ -358,6 +366,7 @@ class AccountSessionPool:
         drained = []
         with self._lock:
             self._generation += 1
+            self._scope_generations.clear()
             for bucket in self._buckets.values():
                 while True:
                     try:
@@ -389,12 +398,103 @@ def _to_http_message(raw_headers) -> http.client.HTTPMessage:
     return msg
 
 
+_PRESEND_CURL_CODES = frozenset({
+    1,   # UNSUPPORTED_PROTOCOL
+    3,   # URL_MALFORMAT
+    5,   # COULDNT_RESOLVE_PROXY
+    6,   # COULDNT_RESOLVE_HOST
+    7,   # COULDNT_CONNECT
+    35,  # SSL_CONNECT_ERROR
+    45,  # INTERFACE_FAILED
+    53,  # SSL_ENGINE_NOTFOUND
+    54,  # SSL_ENGINE_SETFAILED
+    58,  # SSL_CERTPROBLEM
+    59,  # SSL_CIPHER
+    60,  # PEER_FAILED_VERIFICATION
+    64,  # USE_SSL_FAILED
+    66,  # SSL_ENGINE_INITFAILED
+    77,  # SSL_CACERT_BADFILE
+    82,  # SSL_CRL_BADFILE
+    83,  # SSL_ISSUER_ERROR
+    90,  # SSL_PINNEDPUBKEYNOTMATCH
+    91,  # SSL_INVALIDCERTSTATUS
+    96,  # QUIC_CONNECT_ERROR
+    97,  # PROXY
+    98,  # SSL_CLIENTCERT
+    101, # ECH_REQUIRED
+})
+_POSTSEND_CURL_CODES = frozenset({
+    8,   # WEIRD_SERVER_REPLY
+    16,  # HTTP2
+    18,  # PARTIAL_FILE
+    22,  # HTTP_RETURNED_ERROR
+    23,  # WRITE_ERROR
+    26,  # READ_ERROR
+    28,  # OPERATION_TIMEDOUT
+    42,  # ABORTED_BY_CALLBACK
+    47,  # TOO_MANY_REDIRECTS
+    52,  # GOT_NOTHING
+    55,  # SEND_ERROR
+    56,  # RECV_ERROR
+    61,  # BAD_CONTENT_ENCODING
+    92,  # HTTP2_STREAM
+    95,  # HTTP3
+})
+
+
 def _is_timeout_exc(exc: BaseException) -> bool:
     if isinstance(exc, TimeoutError) or getattr(exc, "code", None) == 28:
         return True
     try:
         from curl_cffi.requests.exceptions import Timeout as CurlTimeout
         if isinstance(exc, CurlTimeout):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def is_connect_timeout_exc(exc: BaseException) -> bool:
+    """True when `exc` specifically timed out during connection/TLS handshake before sending."""
+    try:
+        from curl_cffi.requests.exceptions import ConnectTimeout
+        if isinstance(exc, ConnectTimeout):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def is_presend_curl_exc(exc: BaseException) -> bool:
+    """True only when a curl_cffi/socket error provably occurred before HTTP bytes left."""
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        return True
+    if is_connect_timeout_exc(exc):
+        return True
+    code = getattr(exc, "code", None)
+    if type(code) is int and code != 0:
+        if code in _PRESEND_CURL_CODES:
+            return True
+        if code in _POSTSEND_CURL_CODES:
+            return False
+    if isinstance(exc, (ConnectionRefusedError, socket.gaierror)):
+        return True
+    try:
+        from curl_cffi.requests.exceptions import (
+            CertificateVerifyError,
+            ConnectTimeout,
+            DNSError,
+            InterfaceError,
+            InvalidSchema,
+            InvalidURL,
+            ProxyError,
+            SSLError,
+            URLRequired,
+        )
+        if isinstance(exc, (
+            DNSError, ProxyError, ConnectTimeout, SSLError, CertificateVerifyError,
+            InvalidSchema, InvalidURL, URLRequired, InterfaceError,
+        )):
             return True
     except ImportError:
         pass
@@ -607,8 +707,12 @@ def retool_open(
         except Exception as exc:
             lease.discard()
             if _is_timeout_exc(exc):
+                if is_connect_timeout_exc(exc):
+                    raise urllib.error.URLError(TimeoutError("upstream connect timed out")) from None
                 raise TimeoutError("upstream request timed out") from None
-            raise urllib.error.URLError(f"upstream connection failed: {type(exc).__name__}") from None
+            if is_presend_curl_exc(exc):
+                raise urllib.error.URLError(f"upstream connection failed: {type(exc).__name__}") from None
+            raise ConnectionError(f"upstream connection failed: {type(exc).__name__}") from None
 
         http_headers = _to_http_message(resp.headers)
         if resp.status_code >= 400:

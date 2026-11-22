@@ -177,6 +177,66 @@ def extract_error_message(raw_text: str, cfg: dict | None = None, limit: int = 3
     return scrubbed[:limit]
 
 
+_RATE_LIMIT_TYPES = frozenset({"rate_limit_error", "rate_limited", "rate_limit_exceeded"})
+_QUOTA_TYPES = frozenset({"billing_error", "insufficient_quota", "insufficient_credits"})
+_OVERLOADED_TYPES = frozenset({"overloaded_error", "service_unavailable", "model_overloaded"})
+_DEFINITIVE_SSE_REFUSAL_STATUSES = frozenset({400, 401, 402, 403, 404, 413, 422, 429})
+
+
+def _infer_sse_error_status(raw_body: str) -> int:
+    """Infer an HTTP-equivalent status from an upstream SSE JSON error payload."""
+    try:
+        parsed = json.loads((raw_body or "").strip())
+    except ValueError:
+        return 502
+    if not isinstance(parsed, dict):
+        return 502
+    err_obj = parsed.get("error") if isinstance(parsed.get("error"), dict) else parsed
+    raw_status = err_obj.get("status") or err_obj.get("status_code") or parsed.get("status")
+    if type(raw_status) is int and 400 <= raw_status <= 599:
+        return raw_status
+    raw_code = err_obj.get("code") if err_obj.get("code") is not None else parsed.get("code")
+    if type(raw_code) is int and 400 <= raw_code <= 599:
+        return raw_code
+    code_str = str(raw_code or "").strip().lower()
+    type_str = str(err_obj.get("type") or parsed.get("type") or "").strip().lower()
+    msg_low = str(err_obj.get("message") or parsed.get("message") or "").lower()
+
+    if type_str in _RATE_LIMIT_TYPES or code_str in _RATE_LIMIT_TYPES or any(
+        kw in msg_low for kw in ("rate limit", "rate-limit", "too many requests")
+    ):
+        return 429
+    if type_str in _QUOTA_TYPES or code_str in _QUOTA_TYPES or any(kw in msg_low for kw in _QUOTA_KEYWORDS):
+        return 402
+    if type_str in _OVERLOADED_TYPES or code_str in _OVERLOADED_TYPES or "overloaded" in msg_low:
+        return 503
+    if type_str in ("timeout_error", "upstream_timeout") or code_str in ("timeout", "upstream_timeout"):
+        return 504
+    if type_str == "authentication_error" or code_str in ("invalid_api_key", "authentication_error"):
+        return 401
+    if type_str == "permission_error" or code_str == "permission_error":
+        return 403
+    if type_str == "request_too_large":
+        return 413
+    if type_str == "not_found_error":
+        return 404
+    if type_str == "invalid_request_error" or code_str == "context_length_exceeded" or any(
+        kw in msg_low for kw in _CONTEXT_KEYWORDS
+    ):
+        return 400
+    return 502
+
+
+def map_sse_error(raw_body: str, headers, cfg: dict | None = None, *, pre_output: bool = False) -> apierr.ApiError:
+    """Translate an in-stream SSE JSON error into a typed `ApiError` without dropping 429/402/503 signals."""
+    status = _infer_sse_error_status(raw_body)
+    unbilled = bool(pre_output and status in _DEFINITIVE_SSE_REFUSAL_STATUSES)
+    err = map_http_error(status, headers, raw_body, cfg, unbilled=unbilled)
+    if status == 429 and not pre_output:
+        err.account_quota = False
+    return err
+
+
 def map_http_error(status: int, headers, raw_body: str, cfg: dict | None = None, *, unbilled: bool = True) -> apierr.ApiError:
     """Translate an upstream HTTP error response into a typed `apierr.ApiError`."""
     provider_label = (cfg or {}).get("provider_name") or (cfg or {}).get("provider_id") or "Upstream"

@@ -305,18 +305,9 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     if effort and effort != "auto":
         body["reasoning_effort"] = effort
     conversation = getattr(session, "_native_conversation_key", None) if session is not None else None
-    if model.startswith("openai/") and conversation:
-        # OpenAI routes a request with a cache key to where the same key's prefix is: through Minara, GPT-6.1 Sol read
-        # its cached prefix in 6 of 7 follow-ups with one and 1 of 7 without (2026-11-10). One key per conversation;
-        # a hash, so nothing of the client's identifiers goes upstream.
-        body["prompt_cache_key"] = "proxi-" + hashlib.sha256(
-            json.dumps(conversation, default=str).encode("utf-8")).hexdigest()[:32]
-    elif model.startswith("anthropic/") and conversation:
-        # OpenRouter spreads some Claude models over providers with caches of their own (Fable 5.2: Anthropic, Google
-        # Vertex, Azure): without a key a follow-up read the head in 3 of 5 requests and each new provider wrote it again
-        # (12.8 credits a 5.8k head), with one all 6 went to one provider and every follow-up read it (2026-11-10). The key
-        # follows this conversation's head. Identical heads from different chats must not use the same key; changes
-        # to instructions/tools still change the key, while an effort change in the same chat keeps it.
+    if model.startswith(("openai/", "anthropic/")) and conversation:
+        # Key by model, conversation, system head, and tools so identical instructions across different
+        # models, heads, or tool schemas never collide while effort changes on the same chat reuse the key.
         head_part = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
         seed = [model, conversation, head_part, body.get("tools")]
         body["prompt_cache_key"] = "proxi-" + hashlib.sha256(json.dumps(
@@ -1017,17 +1008,61 @@ class EventParser:
         return events
 
 
-def _error_body(response, limit=65536):
-    """The start of an error answer's body, to tell Minara's channel failures from real refusals."""
+_ABORTED = object()
+
+
+def _iter_response_chunks(response, stopped: threading.Event, deadline: float):
+    """Yield response body chunks while waking promptly if `abort()` signals `stopped`."""
+    resp_q = getattr(response, "queue", None)
+    if resp_q is None or not hasattr(resp_q, "get"):
+        for chunk in response.iter_content(chunk_size=None):
+            if stopped.is_set():
+                return
+            yield chunk
+        return
+    try:
+        from curl_cffi.requests.models import STREAM_END
+    except ImportError:
+        STREAM_END = None
+    while not stopped.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Minara stream read exceeded turn deadline")
+        try:
+            chunk = resp_q.get(timeout=min(0.25, remaining))
+        except queue.Empty:
+            continue
+        if stopped.is_set() or chunk is _ABORTED:
+            return
+        if isinstance(chunk, BaseException):
+            raise chunk
+        if chunk is STREAM_END or chunk is None:
+            return
+        yield chunk
+
+
+def _read_error_body(response, limit=65536):
+    """Read up to `limit` bytes of an error body and report whether the full body drained cleanly."""
     data = b""
+    clean = True
     try:
         for piece in response.iter_content():
-            data += piece if isinstance(piece, bytes) else str(piece).encode("utf-8")
-            if len(data) >= limit:
+            chunk = piece if isinstance(piece, bytes) else str(piece).encode("utf-8")
+            if not chunk:
+                continue
+            if len(data) + len(chunk) > limit:
+                data += chunk[: max(0, limit - len(data))]
+                clean = False
                 break
+            data += chunk
     except Exception:
-        pass
-    return data[:limit]
+        clean = False
+    return data[:limit], clean
+
+
+def _error_body(response, limit=65536):
+    """The start of an error answer's body, to tell Minara's channel failures from real refusals."""
+    return _read_error_body(response, limit=limit)[0]
 
 
 def _upstream_failure(item):
@@ -1797,6 +1832,9 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                           None if text_only else tool_choice, max_tokens, chunks, None if text_only else session,
                           instruction)
     route["measured"] = route["messages"] and level in set(model_provider.get("messages_levels") or ())
+    token = token_of(cfg)
+    if not isinstance(token, str) or not token.strip():
+        raise apierr.service_unavailable("Minara Bearer token is missing")
     # Requests that go at once with one Claude head nobody has cached yet (Claude Code starts several subagents in one
     # message): the first writes it, the others wait for its answer to begin and then read it, as on Retool
     # (direct._claim_head). Minara's cache is shared by all its accounts; an entry is there once its response began.
@@ -1806,14 +1844,13 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     head_role, head_gate = (direct._claim_head(head_key, time.monotonic(), id(session), warm=warm)
                             if head_key else (None, None))
     head_marked = False
-    token = token_of(cfg)
-    if not isinstance(token, str) or not token.strip():
-        raise apierr.service_unavailable("Minara Bearer token is missing")
     q = queue.Queue(maxsize=32)
     stopped = threading.Event()
     holder = {"response": None}
+    lease_holder = {"lease": None}
     close_lock = threading.Lock()
     close_claimed = False
+    delegated_lease = False
     close_finished = threading.Event()
     slots = _worker_slots(cfg)
     admitted = started = False
@@ -1835,10 +1872,20 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
         with close_lock:
             response = holder["response"]
             if response is None:
-                return
-            claimed = close_claimed
-            if not claimed:
-                close_claimed = True
+                pending = lease_holder["lease"] if delegated_lease else None
+                if pending is not None:
+                    lease_holder["lease"] = None
+                close_finished.set()
+                claimed = False
+            else:
+                pending = None
+                claimed = close_claimed
+                if not claimed:
+                    close_claimed = True
+        if response is None:
+            if pending is not None:
+                pending.release(reusable=False)
+            return
         if claimed:
             # Only worker/cleanup daemons call this, never the asyncio loop.
             close_finished.wait()
@@ -1848,24 +1895,38 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
         except Exception:
             pass
         finally:
-            close_finished.set()
+            with close_lock:
+                pending = lease_holder["lease"] if delegated_lease else None
+                if pending is not None:
+                    lease_holder["lease"] = None
+                close_finished.set()
+            if pending is not None:
+                pending.release(reusable=False)
 
     def abort():
         stopped.set()
-        response = holder["response"]
+        with close_lock:
+            response = holder["response"]
         if response is not None:
-            # Signal curl immediately, but leave the potentially blocking join
-            # to a daemon. Before headers arrive the request timeout bounds it.
+            # Signal curl and unblock iter_content queue immediately; close_response runs off-loop.
             quit_now = getattr(response, "quit_now", None)
             if quit_now is not None:
                 quit_now.set()
+            resp_q = getattr(response, "queue", None)
+            if resp_q is not None and hasattr(resp_q, "put_nowait"):
+                try:
+                    resp_q.put_nowait(_ABORTED)
+                except Exception:
+                    pass
             threading.Thread(target=close_response, name="minara-close", daemon=True).start()
 
     request_sent = getattr(session, "_provider_request_sent", None)
 
     def worker():
+        nonlocal delegated_lease
         lease = None
         stream_clean = False
+        response_received = False
         try:
             from curl_cffi.requests.exceptions import Timeout as CurlTimeout
             if stopped.is_set():
@@ -1875,6 +1936,8 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
             custom_post = getattr(session.backend, "_minara_post", None)
             if custom_post is None:
                 lease = curl_pool.POOL.acquire(cfg)
+                with close_lock:
+                    lease_holder["lease"] = lease
                 post = lease.session.post
             else:
                 post = custom_post
@@ -1916,21 +1979,24 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 }
                 if proxy_url:
                     post_kwargs["proxy"] = proxy_url
+                response_received = False
                 response = post(url, **post_kwargs)
-                holder["response"] = response
+                response_received = True
+                with close_lock:
+                    holder["response"] = response
                 if stopped.is_set():
                     return
                 if response.status_code == 200:
                     content_type = response.headers.get("content-type", "").lower()
                     if "text/event-stream" not in content_type:
                         raise apierr.upstream_error("Minara did not return an SSE stream")
-                    for data in sse_data(response.iter_content(chunk_size=None)):
+                    for data in sse_data(_iter_response_chunks(response, stopped, deadline)):
                         if stopped.is_set():
                             return
                         put(data)
                     stream_clean = not stopped.is_set()
                     break
-                text = _error_body(response)
+                text, body_clean = _read_error_body(response)
                 if (route["messages"] and not route["measured"] and response.status_code in (400, 404, 422)
                         and not _channel_trouble(response.status_code, text)):
                     # A level the relay moved to /v1/messages by itself, refused there before anything was generated:
@@ -1938,11 +2004,20 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                     switch_to_messages(body.get("model"), level, switched=False,
                                        reason="HTTP %s: %s" % (response.status_code, _upstream_message(text, 160)))
                     route["messages"] = False
-                    holder["response"] = None
+                    with close_lock:
+                        holder["response"] = None
                     try:
                         response.close()
                     except Exception:
                         pass
+                    if not body_clean and lease is not None:
+                        with close_lock:
+                            lease_holder["lease"] = None
+                        lease.release(reusable=False)
+                        lease = curl_pool.POOL.acquire(cfg)
+                        with close_lock:
+                            lease_holder["lease"] = lease
+                        post = lease.session.post
                     continue
                 error = _http_error(response.status_code, response.headers, text)
                 if response.status_code == 402:
@@ -1951,32 +2026,69 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                         refused()  # the balance check that follows marks the account exhausted
                 if not (delays and error.unbilled and _channel_trouble(response.status_code, text)
                         and time.monotonic() + delays[0] < deadline):
-                    stream_clean = True
+                    stream_clean = body_clean
                     raise error
                 # Said, so a slow answer can be told from Minara's own retries (one took 17 s on an image).
                 journal.emit("upstream.channel_retry", "Minara: нет рабочего канала (HTTP %s), повтор через %g с" % (
                     response.status_code, delays[0]), "info", upstream="minara", status=response.status_code,
                     delay=delays[0], model=body.get("model"))
                 # Minara's channel failures are answered before anything is generated or billed: ask again shortly.
-                holder["response"] = None
+                with close_lock:
+                    holder["response"] = None
                 try:
                     response.close()
                 except Exception:
                     pass
+                if not body_clean and lease is not None:
+                    with close_lock:
+                        lease_holder["lease"] = None
+                    lease.release(reusable=False)
+                    lease = curl_pool.POOL.acquire(cfg)
+                    with close_lock:
+                        lease_holder["lease"] = lease
+                    post = lease.session.post
                 if stopped.wait(delays.pop(0)):
                     return
         except apierr.ApiError as exc:
             put(exc)
         except Exception as exc:
             # curl exceptions may contain credential-bearing URLs/headers; never forward them.
-            timed_out = isinstance(exc, TimeoutError) or (
-                "CurlTimeout" in locals() and isinstance(exc, CurlTimeout)) or getattr(exc, "code", None) == 28
-            put(apierr.upstream_timeout("Minara upstream request timed out") if timed_out else
-                apierr.upstream_error("Minara connection or stream read failed"))
+            timed_out = curl_pool._is_timeout_exc(exc) or (
+                "CurlTimeout" in locals() and isinstance(exc, CurlTimeout))
+            err = (
+                apierr.upstream_timeout("Minara upstream request timed out")
+                if timed_out
+                else apierr.upstream_error("Minara connection or stream read failed")
+            )
+            err.unbilled = not response_received and curl_pool.is_presend_curl_exc(exc)
+            put(err)
         finally:
-            close_response()
-            if lease is not None:
-                lease.release(reusable=stream_clean)
+            with close_lock:
+                response = holder["response"]
+                st = getattr(response, "stream_task", None) if response is not None else None
+                detach = bool(
+                    stopped.is_set()
+                    and response is not None
+                    and st is not None
+                    and callable(getattr(st, "done", None))
+                    and not st.done()
+                    and not close_finished.is_set()
+                )
+                if detach:
+                    delegated_lease = True
+                    active_lease = None
+                    need_spawn = not close_claimed
+                else:
+                    active_lease = lease_holder["lease"]
+                    lease_holder["lease"] = None
+                    need_spawn = False
+            if detach:
+                if need_spawn:
+                    threading.Thread(target=close_response, name="minara-close", daemon=True).start()
+            else:
+                close_response()
+                if active_lease is not None:
+                    active_lease.release(reusable=stream_clean)
             slots.release()
             put(None)
 
