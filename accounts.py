@@ -812,7 +812,9 @@ class AccountDispatcher:
         return expired
 
     def refresh(self, backend):
-        refresher = backend.refresher
+        refresher = getattr(backend, "refresher", None)
+        if refresher is None:
+            return False
         detailed = getattr(refresher, "refresh_detailed", None)
         if detailed is not None:
             ok, kind, error = detailed(force=True)
@@ -822,7 +824,9 @@ class AccountDispatcher:
         now = self.clock()
         changed = False
         with self._lock:
-            state = self.state[backend]
+            state = self.state.get(backend)
+            if state is None:
+                return ok
             if ok:
                 self._network_failures = 0
                 state["auth_failures"] = 0
@@ -861,11 +865,14 @@ class AccountDispatcher:
         proves the session is alive: return such accounts to the pool at once."""
         revived = []
         with self._lock:
-            for backend in self.backends:
-                dead = self.state[backend]["reasons"].get("auth_dead")
+            for backend in list(self.backends):
+                state = self.state.get(backend)
+                if state is None:
+                    continue
+                dead = state["reasons"].get("auth_dead")
                 renewed = getattr(getattr(backend, "refresher", None), "last_success_at", None)
                 if dead and renewed is not None and renewed != dead.get("renewed_at"):
-                    self.state[backend]["auth_failures"] = 0
+                    state["auth_failures"] = 0
                     if self._set_reason(backend, "auth_dead", None):
                         revived.append((backend, backend.unavailable))
         for backend, reason in revived:
@@ -882,11 +889,11 @@ class AccountDispatcher:
         one journal line. A limit reported by a request that was sent (`sent_at`, on this dispatcher's clock)
         before the account's last return is old news: it changes nothing and returns None.
         """
-        if backend not in self.state:
-            return None
         now = self.clock()
         with self._lock:
-            state = self.state[backend]
+            state = self.state.get(backend)
+            if state is None:
+                return None
             hold = state["reasons"].get("rate_limited")
             if hold is not None and now < hold["until"]:
                 return hold["until_at"]
@@ -1296,8 +1303,9 @@ class AccountDispatcher:
     def confirm_minara_token(self, backend):
         """A chat request of this Minara account was answered 401/403: read /auth/me now (check_balance marks the account
         token_rejected when it refuses the token too). True when the account is out of the pool afterwards."""
-        if backend not in self.state:
-            return False
+        with self._lock:
+            if backend not in self.state:
+                return False
         self.check_balance(backend)
         return getattr(backend, "unavailable", None) is not None
 
@@ -1306,14 +1314,17 @@ class AccountDispatcher:
         revoked or expired before the date written in it). True when it is out of the pool now, for the caller to move
         the request. No balance read is needed: the regular one brings the account back once it shows more credits than
         at the refusal (MinaraAccount.note_refusal), or once its token is accepted again."""
-        if backend not in self.state:
-            return False
+        with self._lock:
+            if backend not in self.state:
+                return False
+            manager = self.managers.get(backend)
         rejected = getattr(error, "code", None) == "upstream_auth_error"
-        manager = self.managers.get(backend)
         if not rejected and getattr(manager, "note_refusal", None) is not None:
             manager.note_refusal()  # the transport did it already; again is harmless and covers another transport
         with self._lock:
-            state = self.state[backend]
+            state = self.state.get(backend)
+            if state is None:
+                return False
             if rejected:
                 changed = self._set_reason(backend, "auth_dead", {"error": "token_rejected",
                                                                   "status": getattr(error, "upstream_status", None)})
@@ -1327,16 +1338,34 @@ class AccountDispatcher:
         self._announce(backend, changed, reason)
         return True
 
+    @staticmethod
+    def _entry_matches_backend(entry, backend):
+        """True when `backend` belongs to a provider that can serve catalog `entry` or any target of a route alias."""
+        if entry is None:
+            return True
+        targets = entry.get("route_targets") if isinstance(entry, dict) else None
+        if targets:
+            return any(AccountDispatcher._entry_matches_backend(target, backend) for target in targets)
+        cfg = getattr(backend, "cfg", None) or {}
+        if isinstance(entry, dict) and entry.get("provider_id"):
+            return cfg.get("provider_id") == entry["provider_id"]
+        upstream = entry.get("upstream", "retool") if isinstance(entry, dict) else "retool"
+        return cfg.get("upstream", "retool") == upstream
+
     def recheck_exhausted(self, entry=None):
         """Before answering 402, confirm excluded balances (a top-up is adopted at once).
 
-        Only the accounts of the request's provider are read (`entry`, the model entry: a minara/* request never reads
-        Retool's accounts, nor the reverse), several at once: one after another, 51 spent Minara accounts took 15 s
-        before the 402 could be answered."""
-        minara = (entry or {}).get("upstream") == "minara" if entry is not None else None
+        Only the accounts of the request's provider are read (`entry`, the model entry or route alias: a minara/* request
+        never reads Retool's accounts, nor the reverse, while a mixed route alias checks every exhausted target
+        provider), several at once: one after another, 51 spent Minara accounts took 15 s before the 402 could be answered."""
         with self._lock:
-            exhausted = [b for b in self.backends if "exhausted" in self.state[b]["reasons"] and enabled(b)
-                         and (minara is None or ((getattr(b, "cfg", None) or {}).get("upstream") == "minara") == minara)]
+            exhausted = [
+                b for b in self.backends
+                if (st := self.state.get(b)) is not None
+                and "exhausted" in st["reasons"]
+                and enabled(b)
+                and self._entry_matches_backend(entry, b)
+            ]
         if not exhausted:
             return False
         if len(exhausted) == 1:
@@ -1357,7 +1386,9 @@ class AccountDispatcher:
         if backend in self.check_expiry([backend]):
             # An expired token is never sent: the answer would be a 401 and the balance would stay what it was.
             with self._lock:
-                state = self.state[backend]
+                state = self.state.get(backend)
+                if state is None:
+                    return False
                 state["next_balance"] = self.clock() + self._jitter(3600.0)
                 return "exhausted" in state["reasons"]
         info = manager.get_balance(force_refresh=True)
@@ -1369,7 +1400,9 @@ class AccountDispatcher:
         now = self.clock()
         changed = False
         with self._lock:
-            state = self.state[backend]
+            state = self.state.get(backend)
+            if state is None:
+                return False
             state["next_balance"] = now + self._jitter(self.balance_interval if fresh and self.balance_interval > 0
                                                        else TOKEN_RECHECK if rejected
                                                        else 60.0 if not fresh else 3600.0)
@@ -1393,10 +1426,10 @@ class AccountDispatcher:
 
     def check_balance_now(self, backend):
         """On-demand confirmation after a failed request, rate-limited per account."""
-        if backend not in self.state or self.managers.get(backend) is None:
-            return False
         with self._lock:
-            state = self.state[backend]
+            state = self.state.get(backend)
+            if state is None or self.managers.get(backend) is None:
+                return False
             pending = state["forced"]
             if pending is None:
                 if self.clock() - state["last_forced"] < FORCED_CHECK_GAP:
@@ -1410,12 +1443,15 @@ class AccountDispatcher:
             # Another request is already confirming this balance: share its result.
             pending.wait(30.0)
             with self._lock:
-                return "exhausted" in state["reasons"]
+                state = self.state.get(backend)
+                return False if state is None else ("exhausted" in state["reasons"])
         try:
             return self.check_balance(backend)
         finally:
             with self._lock:
-                state["forced"] = None
+                state = self.state.get(backend)
+                if state is not None:
+                    state["forced"] = None
             pending.set()
 
     def check_all(self, parallel=None):

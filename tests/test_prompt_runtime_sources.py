@@ -275,11 +275,12 @@ def structured_parsed(system="CLIENT_SYSTEM"):
 
 
 def test_the_composed_head_is_the_head_the_transport_sends(tmp_path, monkeypatch):
-    events, sent, _ = served(tmp_path, monkeypatch, planned("RULES\n\n{{client_system}}"))
+    events, sent, parsed = served(tmp_path, monkeypatch, planned("RULES\n\n{{client_system}}"))
     assert events[-1] == {"type": "end", "reason": "stop"}
     assert head_sent(sent) == "RULES\n\nCLIENT_SYSTEM"
-    assert sent[0][1]["openAICacheKey"] == direct.cache_key_for("RULES\n\nCLIENT_SYSTEM", "claude-opus-5-5",
-                                                                  sent[0][1]["tools"])
+    assert sent[0][1]["openAICacheKey"] == direct.cache_key_for(
+        "RULES\n\nCLIENT_SYSTEM", "claude-opus-5-5", sent[0][1]["tools"],
+        conversation_key=parsed.conversation_key)
 
 
 def test_a_legacy_plan_and_no_plan_take_the_legacy_head(tmp_path, monkeypatch):

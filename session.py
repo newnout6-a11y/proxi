@@ -327,6 +327,7 @@ class RelaySession:
         self._active_direct_abort = None
         self._abort_reason = None  # "timeout" while the watchdog aborts the stream (abort_active_turn)
         self._active_warm_abort = None
+        self._direct_detached = False
         self._cached_turn_ends = []
         self._native_history = native_history.History()
         self._native_client_messages = None
@@ -526,11 +527,14 @@ class RelaySession:
                 yield event
         finally:
             await turn.aclose()
-            if not completed and self.cfg.get("transport") != "direct":
-                # A timed-out, abandoned or failed turn cannot be read again by
-                # the next request sharing this Retool thread.
-                self._needs_drain = True
-                await self.aclose()
+            if not completed:
+                if self.cfg.get("transport") != "direct":
+                    # A timed-out, abandoned or failed turn cannot be read again by
+                    # the next request sharing this Retool thread.
+                    self._needs_drain = True
+                    await self.aclose()
+                elif getattr(self, "_busy", False) or getattr(self, "_active_direct_abort", None) is not None:
+                    self._direct_detached = True
 
     async def _stream_turn(self, prompt, model_provider, tool_names=None):
         """Yield normalised provider events, cleaning its poller on every exit."""
@@ -1640,8 +1644,12 @@ class SessionPool:
         kind, candidates = self._candidates(self.backends, model_entry, exclude)
         if kind == "reserve":
             # Every account is below the reserve: spend the richest one down to zero.
-            return max(candidates, key=lambda b: float("inf") if b.unavailable.get("available") is None
-                       else b.unavailable["available"])
+            def _reserve_rank(backend):
+                u = backend.unavailable
+                avail = u.get("available") if isinstance(u, dict) else None
+                return float("inf") if avail is None else avail
+
+            return max(candidates, key=_reserve_rank)
         counts = {b: 0 for b in self.backends}
         inflight_counts = {b: 0 for b in self.backends}
         for s in self._conversations.values():
@@ -1910,10 +1918,34 @@ class SessionPool:
             session = None
         if session is None:
             return None
-        # A route alias may stay on a later target of its account (_keeps); any other model only where it is served.
-        stays = (self._keeps(session.backend, model_entry, exclude) if _route_targets(model_entry)
-                 else self._serves(session.backend, model_entry, exclude))
+        # Both route aliases and non-route models keep sessions where _keeps permits (including reserve accounts).
+        stays = self._keeps(session.backend, model_entry, exclude)
         return session if stays else None
+
+    async def _isolate_detached(self, key, old, *, shared=False):
+        """Quarantine a session whose direct turn detached unfinished, carrying safe conversation state onto a fresh one."""
+        thread_id = self.cfg["thread_id"] if shared else old.thread_id
+        fresh = RelaySession(old.backend, thread_id)
+        for name in (
+            "_native_history", "_cached_head", "_registered_tools", "_direct",
+            "_cached_turn_ends", "_last_cache_key", "_warm_body", "_warm_at",
+            "_last_prefix_tokens", "_last_prompt_tokens", "_minara_effort",
+            "_minara_effort_model", "_minara_effort_set", "_count_anchor", "_state_mark",
+            "_cache_dependents", "_cache_dependent_records", "_cache_children",
+        ):
+            if hasattr(old, name):
+                val = getattr(old, name)
+                if name in ("_registered_tools", "_direct") and isinstance(val, dict):
+                    val = dict(val)
+                elif name == "_cached_turn_ends" and isinstance(val, list):
+                    val = list(val)
+                setattr(fresh, name, val)
+        if shared:
+            self._shared = fresh
+        else:
+            self._conversations[key] = fresh
+        await old.aclose()
+        return fresh
 
     async def _move(self, key, session, replacement, model_entry):
         """Move conversation `key` from `session` to a new session on `replacement`, and return that one: the history goes
@@ -2001,6 +2033,8 @@ class SessionPool:
                 locked = True
                 if self._shared is None:
                     self._shared = RelaySession(self.backend, self.cfg["thread_id"])
+                elif getattr(self._shared, "_direct_detached", False):
+                    self._shared = await self._isolate_detached(None, self._shared, shared=True)
                 session = self._shared
                 keep = True
             elif not isolated and conversation_key and (self.mode == "per_conversation" or
@@ -2066,6 +2100,8 @@ class SessionPool:
                     await lock.acquire()
                     locked = True
                     session = self._conversations.get(key)
+                    if session is not None and getattr(session, "_direct_detached", False):
+                        session = await self._isolate_detached(key, session)
                     if session is not None and not self._keeps(session.backend, model_entry, exclude):
                         # The account ran out, was signed out or has no route for this
                         # model: move the conversation.
@@ -2141,7 +2177,7 @@ class SessionPool:
                                  if name not in inherited}
                         if added:
                             parent._registered_tools.update(added)
-            if not keep or session._needs_drain or session._cancelled:
+            if not keep or session._needs_drain or session._cancelled or getattr(session, "_direct_detached", False):
                 await session.aclose()
         finally:
             self._touch_cache_parents(getattr(lease, "_cache_parents", []), -1,
