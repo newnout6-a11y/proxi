@@ -263,7 +263,11 @@ HOSTNAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
 
 _STORAGE_GUARD = threading.Lock()
 _STORAGE_LOCKS = {}
+_STORAGE_REFS = {}
 _STORAGE_LOCAL = threading.local()
+REPLACE_ATTEMPTS = 4
+_AUTH_LOCK_SUFFIX = re.compile(r"^([0-9a-f]{24})\.lock$", re.IGNORECASE)
+_AUTH_KEY_SUFFIX = re.compile(r"^([0-9a-f]{24})$", re.IGNORECASE)
 
 
 @contextmanager
@@ -276,59 +280,72 @@ def storage_lock(path, timeout=30, best_effort=False):
     (read-only directory); the in-process lock is still held.
     """
     path = os.path.normcase(os.path.realpath(os.fspath(path)))
-    with _STORAGE_GUARD:
-        lock = _STORAGE_LOCKS.setdefault(path, threading.RLock())
-    with lock:
-        held = getattr(_STORAGE_LOCAL, "held", set())
-        if path in held:
-            yield
-            return
-        try:
-            sidecar = open(path + ".lock", "a+b")
-        except OSError:
-            if not best_effort:
-                raise
-            sidecar = None
-        if sidecar is None:
-            yield
-            return
-        with sidecar as handle:
-            handle.seek(0, os.SEEK_END)
-            if not handle.tell():
-                handle.write(b"\0")
-                handle.flush()
-            deadline = time.monotonic() + timeout
-            while True:
-                try:
-                    if os.name == "nt":
-                        import msvcrt
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("configuration storage is busy") from None
-                    time.sleep(0.01)
-            _STORAGE_LOCAL.held = held | {path}
-            try:
+    counted = False
+    try:
+        with _STORAGE_GUARD:
+            lock = _STORAGE_LOCKS.setdefault(path, threading.RLock())
+            _STORAGE_REFS[path] = _STORAGE_REFS.get(path, 0) + 1
+            counted = True
+        with lock:
+            held = getattr(_STORAGE_LOCAL, "held", set())
+            if path in held:
                 yield
-            finally:
-                _STORAGE_LOCAL.held = held
-                if os.name == "nt":
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                return
+            try:
+                sidecar = open(path + ".lock", "a+b")
+            except OSError:
+                if not best_effort:
+                    raise
+                sidecar = None
+            if sidecar is None:
+                yield
+                return
+            with sidecar as handle:
+                handle.seek(0, os.SEEK_END)
+                if not handle.tell():
+                    handle.write(b"\0")
+                    handle.flush()
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("configuration storage is busy") from None
+                        time.sleep(0.01)
+                _STORAGE_LOCAL.held = held | {path}
+                try:
+                    yield
+                finally:
+                    _STORAGE_LOCAL.held = held
+                    if os.name == "nt":
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        if counted:
+            with _STORAGE_GUARD:
+                refs = _STORAGE_REFS.get(path, 1) - 1
+                if refs <= 0:
+                    _STORAGE_REFS.pop(path, None)
+                    _STORAGE_LOCKS.pop(path, None)
                 else:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    _STORAGE_REFS[path] = refs
 
 
 def _write_file(path, saved):
     """Atomic replace; callers hold storage_lock around read/merge/write."""
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(path)),
                                          prefix=".session-", suffix=".tmp", delete=False) as fh:
             temporary = fh.name
             try:
@@ -339,7 +356,16 @@ def _write_file(path, saved):
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
-        os.replace(temporary, path)
+        for attempt in range(REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, path)
+                temporary = None
+                break
+            except PermissionError:
+                # Windows: a scanner or indexer may hold the target for a moment.
+                if attempt + 1 == REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     finally:
         if temporary and os.path.exists(temporary):
             # A read-only temp (copied from a read-only target) cannot be unlinked on Windows.
@@ -347,7 +373,15 @@ def _write_file(path, saved):
                 os.chmod(temporary, stat.S_IWRITE | stat.S_IREAD)
             except OSError:
                 pass
-            os.unlink(temporary)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _renewal_lock_tag(cfg):
+    identity = cfg.get("account_id") or (str(cfg.get("base", "")) + "/" + str(cfg.get("page_uuid", "")))
+    return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
 
 def renewal_lock(cfg):
@@ -355,10 +389,112 @@ def renewal_lock(cfg):
     path = cfg.get("_config_path")
     if not path or not cfg.get("_persist_auth", False):
         return nullcontext()
-    identity = cfg.get("account_id") or (cfg.get("base", "") + "/" + cfg.get("page_uuid", ""))
-    tag = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    tag = _renewal_lock_tag(cfg)
     return storage_lock(os.fspath(path) + ".auth-" + tag,
                         timeout=max(30, cfg.get("upstream_timeout", 120) + 5))
+
+
+def _active_renewal_tags(cfg):
+    tags = set()
+    accounts = cfg.get("accounts")
+    if isinstance(accounts, list):
+        for acc in accounts:
+            if isinstance(acc, dict) and acc.get("upstream", "retool") == "retool":
+                tags.add(_renewal_lock_tag(acc))
+    elif not cfg.get("_empty_pool") and cfg.get("upstream", "retool") == "retool":
+        if cfg.get("account_id") or cfg.get("base") or cfg.get("page_uuid"):
+            tags.add(_renewal_lock_tag(cfg))
+    return tags
+
+
+def _try_unlink_unused_lock(lock_path, lock_key):
+    """Unlink an orphaned `.lock` sidecar and retire its `_STORAGE_LOCKS` entry when neither is held."""
+    held = getattr(_STORAGE_LOCAL, "held", set())
+    if lock_key in held:
+        return False
+    with _STORAGE_GUARD:
+        if _STORAGE_REFS.get(lock_key, 0) > 0:
+            return False
+        rlock = _STORAGE_LOCKS.get(lock_key)
+    if rlock is not None and not rlock.acquire(blocking=False):
+        return False
+    try:
+        if lock_path is not None:
+            try:
+                with open(lock_path, "r+b") as handle:
+                    if os.name == "nt":
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        os.unlink(lock_path)
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if os.name == "nt":
+                    os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+        if rlock is not None:
+            with _STORAGE_GUARD:
+                if _STORAGE_REFS.get(lock_key, 0) <= 0 and _STORAGE_LOCKS.get(lock_key) is rlock:
+                    _STORAGE_LOCKS.pop(lock_key, None)
+        return True
+    finally:
+        if rlock is not None:
+            rlock.release()
+
+
+def cleanup_unused_renewal_locks(cfg):
+    """Prune orphaned `<config_path>.auth-*.lock` sidecars and retired `_STORAGE_LOCKS` entries safely."""
+    path = (cfg or {}).get("_config_path")
+    if not path:
+        return 0
+    config_real = os.path.realpath(os.fspath(path))
+    directory = os.path.dirname(config_real)
+    file_prefix = os.path.normcase(os.path.basename(config_real) + ".auth-")
+    key_prefix = os.path.normcase(config_real) + ".auth-"
+    active_tags = _active_renewal_tags(cfg)
+    removed = 0
+    seen_keys = set()
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                norm_name = os.path.normcase(entry.name)
+                if not norm_name.startswith(file_prefix):
+                    continue
+                match = _AUTH_LOCK_SUFFIX.fullmatch(norm_name[len(file_prefix):])
+                if not match:
+                    continue
+                tag = match.group(1).lower()
+                if tag in active_tags:
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                lock_key = key_prefix + tag
+                seen_keys.add(lock_key)
+                if _try_unlink_unused_lock(entry.path, lock_key):
+                    removed += 1
+    except OSError:
+        pass
+    with _STORAGE_GUARD:
+        retired_keys = [
+            key for key in _STORAGE_LOCKS
+            if key.startswith(key_prefix)
+            and _AUTH_KEY_SUFFIX.fullmatch(key[len(key_prefix):])
+            and key[len(key_prefix):].lower() not in active_tags
+            and key not in seen_keys
+        ]
+    for lock_key in retired_keys:
+        if _try_unlink_unused_lock(None, lock_key):
+            removed += 1
+    return removed
 
 
 def _legacy_match(records, cfg):
@@ -526,8 +662,8 @@ def reload_auth(cfg):
         cookie, xsrf = target.get("cookie"), target.get("xsrf")
         if not cookie or not xsrf or (cookie, xsrf) == cfg.get("_disk_auth", (cfg["cookie"], cfg["xsrf"])):
             return False
-        cfg.update(cookie=cookie, xsrf=xsrf, _disk_auth=(cookie, xsrf),
-                   cookie_values=auth.secret_values(cookie, cfg.get("_extra_secrets", ())))
+        cfg.update(cookie=cookie, xsrf=xsrf, _disk_auth=(cookie, xsrf))
+        auth.update_cookie_values(cfg, cookie, cfg.get("_extra_secrets", ()))
         if isinstance(cfg.get("_account_ref"), dict):
             cfg["_account_ref"].update(cookie=cookie, xsrf=xsrf)
         return True
@@ -1090,29 +1226,37 @@ def _load(path):
                 cookie_strings.append(acc["cookie"])
     cookie_vals = []
     for c_str in cookie_strings:
-        for seg in c_str.split("; "):
+        for seg in c_str.split(";"):
             if "=" in seg:
-                val = seg.split("=", 1)[1]
+                val = seg.split("=", 1)[1].strip()
                 if val and not HOSTNAME.fullmatch(val) and val not in cookie_vals:
                     cookie_vals.append(val)
     cfg["cookie_values"] = cookie_vals
+    cfg["_root_cookie_values"] = cookie_vals
     search_key = web_search.key_of(cfg)
     if search_key and search_key not in cookie_vals:
         cookie_vals.append(search_key)  # masked wherever the relay redacts secrets, should it ever show up in a message
     # The secrets that are no cookie: a renewal or a new sign-in rebuilds cookie_values and keeps these (auth.secret_values).
     tokens = [r.get("bearer_token") for r in (accounts if accounts is not None else [cfg]) if r.get("upstream") == "minara"]
-    proxy_passwords = []
-    for raw_proxy in [cfg.get("proxy_url")] + [
-        r.get("proxy_url") for r in (accounts if accounts is not None else []) if isinstance(r, dict)
-    ]:
+    proxy_records = [r for r in ((accounts if accounts is not None else []) + provider_records) if isinstance(r, dict)]
+    proxy_secrets = []
+    for raw_proxy in [cfg.get("proxy_url")] + [r.get("proxy_url") for r in proxy_records]:
         if isinstance(raw_proxy, str) and "@" in raw_proxy:
             try:
-                pw = urllib.parse.urlsplit(raw_proxy).password
+                parts = urllib.parse.urlsplit(raw_proxy)
             except ValueError:
-                pw = None
-            if pw:
-                proxy_passwords.append(pw)
-    all_non_cookie_secrets = ([search_key] if search_key else []) + [t for t in tokens if t] + provider_secrets + proxy_passwords
+                continue
+            for val in (parts.username, parts.password):
+                if val:
+                    proxy_secrets.append(val)
+    relay_key = cfg.get("relay_api_key")
+    all_non_cookie_secrets = (
+        ([relay_key] if relay_key else [])
+        + ([search_key] if search_key else [])
+        + [t for t in tokens if t]
+        + provider_secrets
+        + proxy_secrets
+    )
     cfg["_extra_secrets"] = list(dict.fromkeys(all_non_cookie_secrets))
     for secret in cfg["_extra_secrets"]:
         if secret and secret not in cookie_vals:
@@ -1145,4 +1289,5 @@ def _load(path):
             # Read-only config: the ids derived from base and page_uuid are the same at every start until one can save them.
             console_log.write("warning: cannot save account_id to %s (%s); ids are kept in memory" % (
                 path, type(exc).__name__), file=sys.stderr)
+    cleanup_unused_renewal_locks(cfg)
     return cfg
