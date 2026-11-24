@@ -77,6 +77,30 @@ Relay смотрит, с какого канала пришёл **каждый**
 relay возвращает его в чат и тот же запрос задаёт через чат. Перемеры по расписанию для
 этого не нужны.
 
+### Нативный `/v1/responses`
+
+Для моделей с поддержкой OpenAI Responses API relay умеет работать через `POST /v1/responses`
+напрямую:
+
+- **Выбор эндпоинта:** `/v1/responses` включается явным переопределением в `minara_models`
+  (`"endpoint": "responses"` или `"use_responses": true`) либо по данным каталога Minara
+  (`supported_endpoint_types`, содержащему `"openai-response"` / `"responses"`, или
+  `"responses": true`). Для моделей Claude с явными блоками `cache_control`, если модель также
+  поддерживает `"openai"` или `"anthropic"`, сохраняется `/v1/chat/completions` или
+  `/v1/messages`, пока `/v1/responses` не задан явно.
+- **Протокол и кэш:** `responses_body(...)` собирает нативный payload (`instructions` без
+  служебного биллинг-префикса Claude Code, `input` с поддержкой изображений/файлов и подписанных
+  элементов `reasoning` с `encrypted_content` из `native_history`, `tools`, `tool_choice`,
+  `parallel_tool_calls`, `reasoning`, `text.verbosity`, `text.format`, `prompt_cache_key`,
+  `store: false`, `stream: true`). `ResponsesParser` требует явного терминального события
+  (`response.completed` или `response.incomplete`) и отклоняет оборванные потоки, сохраняя
+  `unbilled=False` при двусмысленных сбоях после отправки запроса.
+- **Безопасный fallback и каталог:** при явном предвыводном отказе эндпоинта/канала
+  (`unbilled=True`) запрос единожды откатывается с `/v1/responses` на `/v1/chat/completions`
+  (или `/v1/messages`). `minara_probe.py` и `minara_refresh.py` распознают
+  `"openai-response"` / `"responses"` в `supported_endpoint_types` и сохраняют метаданные
+  `responses` и `supported_endpoint_types` в каталоге и авто-оверлее.
+
 ## Какие модели публикуются
 
 Список и возможности моделей задаёт файл `minara_models.json` в корне проекта. Его
@@ -266,7 +290,7 @@ python scripts/add_minara_accounts.py --tokens-file tokens.txt --write    # до
   перечисленные: upstream ID, опубликованное имя `minara/…` или старое написание. Элемент
   списка может переопределить измеренное поле: `label`, `provider`, `context`,
   `max_output`, `tools`, `image`, `reasoning`, `reasoning_effort_levels`,
-  `forced_tool_choice`.
+  `forced_tool_choice`, `endpoint`, `use_responses`.
 - Аккаунтов может быть сколько угодно: новый диалог идёт на наименее загруженный, а
   кэш у них общий.
 

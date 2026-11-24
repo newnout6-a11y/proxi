@@ -21,7 +21,7 @@ AUTO_NAME = 'minara_models.auto.json'
 PUBLISHED = frozenset({'ok'})
 # What an account descriptor may override; anything else in it is an error (config._check_upstream).
 OVERRIDABLE = ('label', 'provider', 'context', 'max_output', 'tools', 'image', 'reasoning', 'reasoning_effort_levels',
-               'forced_tool_choice')
+               'forced_tool_choice', 'endpoint', 'use_responses')
 
 
 def _read(path):
@@ -140,6 +140,27 @@ def _effort_control(entry, studied=None):
     return 'selectable' if entry['reasoning_effort_levels'] else 'passthrough'
 
 
+def _default_reasoning_effort(upstream, found, reasoning, levels, effort_map):
+    """Default effort for Minara routes when client/config asks for `auto`.
+
+    Preserves explicit channel-measured `default_effort`, keeps custom account level overrides
+    passthrough (`effort_map is None`), and falls back to canonical medium/high preference when
+    present in `reasoning_effort_levels`."""
+    if not (reasoning and effort_map and levels):
+        return None
+    explicit = found.get('default_effort')
+    if explicit is not None:
+        return explicit
+    canonical = str(upstream or '').split('/', 1)[-1].replace('.', '-')
+    if canonical == 'claude-fable-5' and 'high' in levels:
+        return 'high'
+    if 'medium' in levels:
+        return 'medium'
+    if 'high' in levels:
+        return 'high'
+    return None
+
+
 def route(upstream, descriptor=None, measured=None):
     """The relay's model entry for one upstream id: the measurement, then the account's overrides."""
     if measured is None or measured is MEASURED:
@@ -156,6 +177,22 @@ def route(upstream, descriptor=None, measured=None):
     levels = list(value.get('reasoning_effort_levels', found.get('reasoning_effort_levels') or []))
     # An account that lists its own levels takes them as they are: the study's map no longer describes them.
     effort_map = None if 'reasoning_effort_levels' in value else found.get('effort_map')
+    raw_ep_types = value.get('supported_endpoint_types', found.get('supported_endpoint_types')) or ()
+    ep_types = [str(item).strip().lower() for item in raw_ep_types
+                if isinstance(item, str) and item.strip()]
+    endpoint = value.get('endpoint', found.get('endpoint'))
+    if endpoint is not None:
+        if not isinstance(endpoint, str) or endpoint.strip().lower() not in ('auto', 'chat', 'messages', 'responses'):
+            raise ValueError('invalid Minara model endpoint: ' + repr(endpoint))
+        endpoint = endpoint.strip().lower()
+    use_responses = value.get('use_responses', found.get('use_responses'))
+    if use_responses is not None and type(use_responses) is not bool:
+        raise ValueError('Minara model use_responses must be boolean')
+    responses_cap = bool(found.get('responses') or any(kind in ('openai-response', 'responses') for kind in ep_types))
+    if endpoint == 'responses' or use_responses is True:
+        responses_cap = True
+    elif endpoint in ('chat', 'messages') or use_responses is False:
+        responses_cap = False
     entry = {
         'id': public_id(upstream) if not found else found['id'],
         'upstream': 'minara', 'upstream_model': upstream,
@@ -171,10 +208,10 @@ def route(upstream, descriptor=None, measured=None):
             'forced_tool_choice', not upstream.startswith('anthropic/')))),
         'thinking': found.get('thinking'), 'thinking_signature': bool(found.get('thinking_signature')),
         'cache': found.get('cache') or ('explicit' if upstream.startswith('anthropic/') else 'automatic'),
+        'responses': responses_cap,
         'pricing': copy.deepcopy(found.get('pricing')), 'backend': found.get('backend'),
-        # The level sent when the client asks for none, where the model's own default lands on a channel that drops the
-        # cache marks (scripts/probe_minara.py cached_levels); None sends nothing, the model's own default.
-        'default_reasoning_effort': found.get('default_effort') if reasoning and effort_map else None,
+        # The level sent when `auto` is configured (measured default_effort, else canonical medium/high when supported).
+        'default_reasoning_effort': _default_reasoning_effort(upstream, found, reasoning, levels, effort_map),
         # The level that reasons like the model's own default, for a client that must name one (Codex's default level).
         'natural_reasoning_effort': found.get('natural_effort') if reasoning and effort_map else None,
         # The levels that go through Minara's /v1/messages: the chat path sends them to a channel without cache.
@@ -182,6 +219,12 @@ def route(upstream, descriptor=None, measured=None):
         'metadata_source': 'minara_models.json' if found else 'operator-configured',
         'metadata_status': ('measured ' + str(found.get('checked_at'))) if found.get('checked_at') else 'unverified',
     }
+    if ep_types:
+        entry['supported_endpoint_types'] = ep_types
+    if endpoint is not None:
+        entry['endpoint'] = endpoint
+    if use_responses is not None:
+        entry['use_responses'] = use_responses
     if found.get('served_as'):
         entry['served_as'] = found['served_as']
     entry['reasoning_effort_control'] = _effort_control(

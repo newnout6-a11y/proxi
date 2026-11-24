@@ -50,9 +50,10 @@ def _pricing_key(pricing):
 
 
 def chat_model(item):
-    """True for a model of the list the relay can publish: a chat model, not one the owner excluded."""
+    """True for a model of the list the relay can publish: a chat or responses model, not one the owner excluded."""
     upstream = item.get("id")
-    return (isinstance(upstream, str) and "/" in upstream and "openai" in (item.get("supported_endpoint_types") or [])
+    return (isinstance(upstream, str) and "/" in upstream
+            and (minara_probe.supports_chat(item) or minara_probe.supports_responses(item))
             and upstream not in minara_probe.NOT_CHAT and upstream not in minara_probe.INHERIT
             and not minara_probe.excluded(upstream))
 
@@ -240,18 +241,28 @@ class CatalogRefresher:
         now = _now()
         measured = minara_catalog.snapshot()
         overlay = state.setdefault("models", {})
-        # Prices first: Minara debits its own list, so a turn of a repriced model is priced wrong until this is taken.
+        # Prices and endpoint capabilities: Minara debits its own list, and may enable /v1/responses dynamically.
         for upstream, item in listed.items():
             entry = measured.get(upstream)
-            if entry is None or not isinstance(item.get("pricing"), dict):
+            if entry is None:
                 continue
-            if _pricing_key(entry.get("pricing")) != _pricing_key(item["pricing"]):
-                overlay[upstream] = dict(entry, pricing=copy.deepcopy(item["pricing"]), refreshed_at=now)
-                summary["repriced"].append(upstream)
-            # A published model whose price the relay cannot read has every turn unpriced: said on each look, never quietly.
-            problem = minara.price_problem(item["pricing"]) if entry.get("status") == "ok" else None
-            if problem:
-                summary["unpriced"][upstream] = problem
+            current = overlay.get(upstream) or entry
+            if isinstance(item.get("pricing"), dict):
+                if _pricing_key(current.get("pricing")) != _pricing_key(item["pricing"]):
+                    current = overlay[upstream] = dict(current, pricing=copy.deepcopy(item["pricing"]), refreshed_at=now)
+                    summary["repriced"].append(upstream)
+                # A published model whose price the relay cannot read has every turn unpriced: said on each look, never quietly.
+                problem = minara.price_problem(item["pricing"]) if entry.get("status") == "ok" else None
+                if problem:
+                    summary["unpriced"][upstream] = problem
+            ep_types = minara_probe.endpoint_types(item)
+            if ep_types:
+                has_resp = minara_probe.supports_responses(ep_types)
+                if (has_resp != bool(current.get("responses"))
+                        or ("supported_endpoint_types" in current
+                            and current.get("supported_endpoint_types") != ep_types)):
+                    overlay[upstream] = dict(current, responses=has_resp, supported_endpoint_types=ep_types,
+                                             refreshed_at=now)
         missing = state.setdefault("missing", {})
         self._relevel(listed, measured, overlay, summary, now)
         if complete:
