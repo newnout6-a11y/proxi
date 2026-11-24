@@ -33,6 +33,7 @@ import forced_choice
 import journal
 import client_context
 import console_log
+import console_records
 import native_history
 import models as model_catalog
 import summary_guard
@@ -1688,12 +1689,21 @@ def _ping(session, body):
                 monitor = getattr(session, "_console_warm_cache_monitor", None)
                 if monitor is None:
                     monitor = session._console_warm_cache_monitor = console_log.CacheMonitor()
-                console_log.write(monitor.line(request_id, warm_usage, sample_id=billing_id,
-                                              scope=(body.get("model"), body.get("openAICacheKey")))
-                                  + " [keepwarm] " + client_context.label())
+                warm_account = account_tag(session.backend)
+                warm_model = body.get("model")
+                cache_text, cache_fields, cache_level = monitor.fields(
+                    request_id, warm_usage, sample_id=billing_id, scope=(warm_model, body.get("openAICacheKey")))
+                label = client_context.label()
+                console_log.write(cache_text + " [keepwarm]" + (" " + label if label else ""),
+                                  kind="cache.summary", level=cache_level, keepwarm=True,
+                                  model=warm_model, account=warm_account, **cache_fields)
                 snapshot = getattr(manager, "balance_snapshot", None)
                 if snapshot:
-                    console_log.write(console_log.balance_line(request_id, snapshot(), actual_credits) + " [keepwarm]")
+                    bal_text, bal_fields, bal_level = console_log.balance_fields(
+                        request_id, snapshot(), actual_credits, account=warm_account, upstream="retool")
+                    console_log.write(bal_text + " [keepwarm]",
+                                      kind="account.balance", level=bal_level, keepwarm=True,
+                                      model=warm_model, **bal_fields)
                 journal.emit("cache.keepwarm_usage", "Стоимость запроса прогрева", "info",
                              billing_id=billing_id, model=body.get("model"), source="relay",
                              account=account_tag(session.backend),
@@ -2209,10 +2219,14 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                      signatures=sum(b["type"] == "thinking" for b in replayed), fork=forked,
                      **({"reminders_kept": reminders} if reminders else {}), **({"rewound": True} if rewound else {}))
         req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
-        console_log.write("[%s] [history] native continuation %s thinking=%d tool_calls=%d" % (
-            req_id, "forked from the last request" if forked else "restored",
-            sum(b["type"] in native_history.MODEL_STATE_BLOCKS for b in replayed),
-            sum(b["type"] == "tool_call" for b in replayed)))
+        thinking_count = sum(b["type"] in native_history.MODEL_STATE_BLOCKS for b in replayed)
+        tool_call_count = sum(b["type"] == "tool_call" for b in replayed)
+        console_log.write(
+            "[%s] [history] native continuation %s thinking=%d tool_calls=%d" % (
+                req_id, "forked from the last request" if forked else "restored", thinking_count, tool_call_count),
+            kind="native_history.continuation", level="info", request_id=req_id,
+            mode="forked" if forked else "restored", thinking=thinking_count, tool_calls=tool_call_count,
+            model=model_provider.get("model"), account=account_tag(getattr(session, "backend", None)))
     else:
         # A one-shot job continues nothing of the session it runs on, so it changes nothing of it either: Codex can run
         # its memory jobs on the session of a chat, whose signed history, cache points and keepwarm body stay the chat's.
@@ -2463,7 +2477,10 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 if not assist:
                     raise
                 model_name = model_provider.get("model")
-                console_log.write("[assist] retry without agent marker: %s" % (error.message or "")[:80])
+                console_log.write("[assist] retry without agent marker: %s" % (error.message or "")[:80],
+                                  kind="upstream.assist_retry", level="warn", model=model_name,
+                                  request_id=client_context.current().get("request_id") or getattr(session, "_request_tag", None),
+                                  account=account_tag(getattr(session, "backend", None)))
                 journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
                              model=model_name)
                 body = _unmarked(body)
@@ -2580,7 +2597,9 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
         with _DUMP_LOCK:
             known = _DUMP_RECENT.get(key)
             if known and (folder / ("%s-body.json" % known)).exists():
-                console_log.write("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known))
+                console_log.write("[debug] upstream %s diagnostic: %s (same body already saved)" % (status, known),
+                                  kind="upstream.diagnostic", level="debug", request_id=request_id,
+                                  upstream_status=status, diagnostic_id=known, deduplicated=True)
                 return known
             request_tag = "".join(c for c in str(request_id or "unknown") if c.isalnum())[:64]
             stamp = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), request_tag, uuid.uuid4().hex[:12])
@@ -2605,7 +2624,9 @@ def _dump_rejected_body(payload, detail, *, cfg=None, status=400, request_id=Non
             while len(_DUMP_RECENT) > 256:
                 del _DUMP_RECENT[next(iter(_DUMP_RECENT))]
             prune_diagnostics(cfg, folder, keep=stamp)
-        console_log.write("[debug] upstream %s diagnostic: %s" % (status, stamp))
+        console_log.write("[debug] upstream %s diagnostic: %s" % (status, stamp),
+                          kind="upstream.diagnostic", level="debug", request_id=request_id,
+                          upstream_status=status, diagnostic_id=stamp, deduplicated=False)
         return stamp
     except Exception:  # noqa: BLE001 - diagnostics must never break the turn
         pass
@@ -2746,18 +2767,19 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     elif json.loads(payload) != body:
         raise ValueError("replay payload does not match the supplied body")
     session._direct_reply = None
+    request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None)
     if cfg.get("direct_debug"):
         body_summary = {k: v for k, v in body.items() if k not in ("messages", "tools")}
         if "tools" in body:
             body_summary["tools_count"] = len(body["tools"])
-        console_log.write("[body] " + json.dumps(body_summary, ensure_ascii=False))
+        console_log.emit_body(request_id, body_summary, model=body.get("model"),
+                              account=account_tag(getattr(session, "backend", None)))
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
     headers["accept"] = "application/json"
     timeout = cfg.get("turn_timeout", 900)
     loop = asyncio.get_running_loop()
     budget = getattr(session, "_attempt_budget", None) or AttemptBudget()
-    request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None)
 
     abort_event = threading.Event()
 
@@ -3209,7 +3231,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 elapsed = loop_now() - think_started
                 console_log.write(f"[{req_id}] Waiting for upstream reasoning output... ({round(elapsed)}s elapsed)",
                                   kind="upstream.thinking_heartbeat", level="debug", elapsed_ms=round(elapsed * 1000),
-                                  message=None)
+                                  request_id=req_id, model=flags.get("model"),
+                                  account=account_tag(getattr(session, "backend", None)), message=None)
                 journal.emit("upstream.thinking_heartbeat",
                              f"Ожидаем ответ upstream после начала thinking ({round(elapsed)} с)",
                              "debug", elapsed=round(elapsed, 1), thread=journal.tag(req_id))
@@ -3225,7 +3248,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
 
         if cfg.get("direct_raw"):
             console_log.write("[raw] " + journal.redact_whole(str(item))[:200],
-                              kind="upstream.raw_diagnostic", level="debug")
+                              kind="upstream.raw_diagnostic", level="debug", request_id=req_id,
+                              model=flags.get("model"), account=account_tag(getattr(session, "backend", None)))
         try:
             event = json.loads(item)
         except Exception:
@@ -3261,7 +3285,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 think_started = loop_now()
                 reasoning_told = True
                 console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start",
-                                  kind="upstream.thinking_signal", signal="content_block_start", message=None)
+                                  kind="upstream.thinking_signal", signal="content_block_start", request_id=req_id,
+                                  model=flags.get("model"), account=account_tag(getattr(session, "backend", None)),
+                                  message=None)
                 journal.emit("upstream.thinking_signal", "Upstream сообщил начало блока thinking", "info",
                              source="upstream", signal="content_block_start", thread=journal.tag(req_id))
                 yield {"type": "thinking_start"}
@@ -3278,7 +3304,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                     reasoning_told = True
                     console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start "
                                       f"block={event.get('type')}", kind="upstream.thinking_signal",
-                                      signal="content_block_start", block=event.get("type"), message=None)
+                                      signal="content_block_start", block=event.get("type"), request_id=req_id,
+                                      model=flags.get("model"), account=account_tag(getattr(session, "backend", None)),
+                                      message=None)
                     journal.emit("upstream.thinking_signal", "Upstream начал рассуждение: зашифрованный блок без текста",
                                  "info", source="upstream", signal="content_block_start", block=event.get("type"),
                                  thread=journal.tag(req_id))
@@ -3304,8 +3332,10 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             block = event.get("type")
             if block == "text":
                 piece = event.get("partialText") or ""
-                if piece and cfg.get("direct_debug") and not text:
-                    console_log.write("[ttft] %.2fs" % (time.time() - started), text_only=True)
+                if piece and not text and (cfg.get("direct_debug") or console_records.enabled()
+                                           or console_records.structured_enabled()):
+                    console_log.emit_ttft(req_id, max(0.0, loop_now() - started), model=flags.get("model"),
+                                          account=account_tag(getattr(session, "backend", None)))
                 if piece:
                     text.append(piece)
                     reasoning_told = False
@@ -3366,8 +3396,12 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 flags["usage_seen"] = True
                 flags.setdefault("last_usage", {}).update(usage)
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
-                console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
-                                  (" " + client_context.label() if client_context.label() else ""), kind="cache.summary")
+                cache_text, cache_fields, cache_level = monitor.fields(req_id, usage, scope=cache_scope)
+                label = client_context.label()
+                console_log.write(cache_text + (" " + label if label else ""),
+                                  kind="cache.summary", level=cache_level,
+                                  model=flags.get("model"), account=account_tag(getattr(session, "backend", None)),
+                                  **cache_fields)
             credits_value = console_log.number(usage.get("creditsUsed"))
             normalized = {target: usage[source] for source, target in (
                 ('inputTokens', 'input_tokens'), ('outputTokens', 'output_tokens'),
