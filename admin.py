@@ -528,17 +528,16 @@ class Admin:
     def __init__(self, runtime):
         self.runtime = runtime
         self.cfg = runtime.cfg
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         # Saving the prompts document: read the revision it replaces, save, journal what changed, as one step.
         self.prompts_lock = threading.Lock()
         self.schema = _schema(self.cfg)
-        self._tokens_cache = None  # (config.json's path, mtime, size) -> the Bearer tokens saved in it
+        self._tokens_cache = None  # (config.json's path, mtime, size) -> (tokens, retool_ids)
         self._secrets_cache = None  # (the accounts' credentials) -> _account_secrets
         self._mask_cache = None  # (the credentials) -> _Masks
 
-    def _saved_tokens(self):
-        """The Bearer tokens of the accounts saved in config.json, pending ones included, read again only when the file
-        changes: it was read and parsed (492 KB with 501 accounts) for every string _safe masked."""
+    def _saved_tokens_and_ids(self):
+        """Credentials and Retool tenant/page IDs from config.json (pending ones included), cached by file stat."""
         path = self.cfg.get("_config_path")
         try:
             stat = os.stat(path) if path else None
@@ -547,17 +546,37 @@ class Admin:
         key = (path, stat.st_mtime_ns, stat.st_size) if stat is not None else None
         cached = self._tokens_cache
         if key is not None and cached is not None and cached[0] == key:
-            return cached[1]
+            return cached[1], cached[2]
         tokens = []
+        retool_ids = []
         saved = self._saved()
         for record in self._records(saved):
             token = (os.environ.get(record.get("bearer_token_env") or "")
                      or record.get("bearer_token"))
             if isinstance(token, str) and token:
                 tokens.append(token)
+            if record.get("upstream", "retool") == "retool" and not record.get("provider_id"):
+                cookie = record.get("cookie")
+                if isinstance(cookie, str) and cookie:
+                    tokens.append(cookie)
+                    tokens.extend(val for val in auth.secret_values(cookie) if len(val) >= SECRET_CHARS)
+                for field in ("xsrf", "page_uuid", "base"):
+                    val = record.get(field)
+                    if isinstance(val, str) and val:
+                        tokens.append(val)
+                for field in ("account_id", "page_uuid", "thread_id", "base"):
+                    val = record.get(field)
+                    if val and len(str(val)) >= 5:
+                        retool_ids.append(str(val))
         tokens.extend(admin_ops.collect_extra_secrets(saved))
-        self._tokens_cache = (key, tuple(tokens))
-        return self._tokens_cache[1]
+        result = (tuple(tokens), tuple(retool_ids))
+        self._tokens_cache = (key, result[0], result[1])
+        return result
+
+    def _saved_tokens(self):
+        """The credentials of the accounts saved in config.json, pending ones included, read again only when the file
+        changes: it was read and parsed (492 KB with 501 accounts) for every string _safe masked."""
+        return self._saved_tokens_and_ids()[0]
 
     def _account_secrets(self):
         """Credentials of every account; short values are skipped so they cannot mangle ordinary text.
@@ -565,13 +584,13 @@ class Admin:
         Built again only when an account's credentials or the saved tokens change: gathering them took ~0.1 s with 501
         accounts, three times for each switch of an account."""
         backends = list(getattr(self.runtime.accounts, "backends", None) or [])
-        tokens = self._saved_tokens()
-        extras = tuple(self.cfg.get("_extra_secrets") or ())
-        fingerprint = (tokens, extras, tuple(
+        tokens, saved_retool_ids = self._saved_tokens_and_ids()
+        extras = tuple(list(self.cfg.get("_extra_secrets") or ()))
+        fingerprint = (tokens, saved_retool_ids, extras, tuple(
             (id(backend),) + tuple((getattr(backend, "cfg", None) or {}).get(key) for key in (
                 "cookie", "xsrf", "bearer_token", "bearer_token_env", "api_key", "api_key_env",
-                "account_id", "page_uuid", "thread_id", "base", "provider_id"))
-            + (tuple((getattr(backend, "cfg", None) or {}).get("cookie_values") or ()),)
+                "account_id", "page_uuid", "thread_id", "base", "provider_id", "proxy_url"))
+            + (tuple(list((getattr(backend, "cfg", None) or {}).get("cookie_values") or ())),)
             for backend in backends))
         cached = self._secrets_cache
         if cached is not None and cached[0] == fingerprint:
@@ -583,12 +602,13 @@ class Admin:
         for backend in backends:
             cfg = getattr(backend, "cfg", None) or {}
             secrets += [cfg.get("cookie"), cfg.get("xsrf"), cfg.get("bearer_token"), cfg.get("api_key"),
-                        admin_ops._proxy_password(cfg.get("proxy_url")),
+                        *admin_ops._proxy_secrets(cfg.get("proxy_url")),
                         os.environ.get(cfg.get("bearer_token_env") or ""),
                         os.environ.get(cfg.get("api_key_env") or "")]
             secrets += [part.partition("=")[2].strip() for part in str(cfg.get("cookie") or "").split(";")]
-            secrets += cfg.get("cookie_values") or []
+            secrets += list(cfg.get("cookie_values") or ())
         secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= SECRET_CHARS]
+        secrets.extend(saved_retool_ids)
         for backend in backends:
             cfg = getattr(backend, "cfg", None) or {}
             if cfg.get("provider_id"):
@@ -604,15 +624,16 @@ class Admin:
         (redact.literal_pattern), built again only when a credential changes. Taken once per answer: the accounts page
         gathered every credential again for each account with an error and replaced ~2,000 of them one by one in every
         string, 35 s for 501 accounts (2026-11-13)."""
+        cookie_values = tuple(list(self.cfg.get("cookie_values") or ()))
         secrets = [self.cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf")]
-        secrets += self.cfg.get("cookie_values") or []
+        secrets += cookie_values
         secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= SECRET_CHARS]
         secrets += self._account_secrets()
         key = tuple(sorted(set(secrets)))
         cached = self._mask_cache
         if cached is None or cached[0] != key:
             cached = self._mask_cache = (key, _Masks(redact_module.literal_pattern(key),
-                                                     redact_module.cookie_pattern(self.cfg.get("cookie_values") or ())))
+                                                     redact_module.cookie_pattern(cookie_values)))
         return cached[1]
 
     def _safe(self, value, masks=None):
@@ -620,7 +641,7 @@ class Admin:
         if masks is None:
             masks = self._masks()
         if isinstance(value, str):
-            value = redact(value, cookie_values=self.cfg.get("cookie_values", []), cookie_pattern=masks.cookies)
+            value = redact(value, cookie_values=list(self.cfg.get("cookie_values") or ()), cookie_pattern=masks.cookies)
             if masks.pattern is not None:
                 value = masks.pattern.sub("[redacted]", value)
             return value
@@ -634,14 +655,19 @@ class Admin:
         path = self.cfg.get("_config_path")
         if not path:
             return {}
-        try:
-            with open(path, encoding="utf-8") as source:
-                saved = json.load(source)
-            if not isinstance(saved, dict):
-                raise ValueError("configuration is not an object")
-            return saved
-        except (OSError, ValueError):
-            raise apierr.service_unavailable("Cannot read relay settings")
+        for attempt in range(4):
+            try:
+                with open(path, encoding="utf-8") as source:
+                    saved = json.load(source)
+                if not isinstance(saved, dict):
+                    raise ValueError("configuration is not an object")
+                return saved
+            except PermissionError:
+                if attempt == 3:
+                    raise apierr.service_unavailable("Cannot read relay settings")
+                time.sleep(0.01 * (attempt + 1))
+            except (OSError, ValueError):
+                raise apierr.service_unavailable("Cannot read relay settings")
 
     def _live_schema(self):
         """The schema with the model lists of the catalog as it is now. They were taken once, when the admin started: a
@@ -1011,6 +1037,44 @@ class Admin:
         if isinstance(reference, dict) and reference is not backend.cfg:
             reference.update(changes)
 
+    def _locate_account(self, tag, saved=None):
+        """Find the live backend or pending record matching `tag` without polling balances over the network."""
+        if saved is None and self.cfg.get("_config_path"):
+            saved = self._saved()
+        records = self._records(saved) if saved is not None else None
+        single = saved is not None and not isinstance(saved.get("accounts"), list) and self._has_root_account(saved)
+        saved_holds = self._account_index(records or [])
+        backends = [b for b in self._live_backends() if not (getattr(b, "cfg", None) or {}).get("provider_id")]
+        for backend in backends:
+            if account_tag(backend, UNNAMED) == tag:
+                removed = records is not None and not single and not saved_holds(backend.cfg)
+                return {"account": tag, "pending": "removed" if removed else None, "_backend": backend}
+        loaded_holds = self._account_index([b.cfg for b in backends])
+        for record in ([] if single else records or []):
+            if not loaded_holds(record) and self._record_tag(record) == tag:
+                return {"account": tag, "pending": "added", "_record": record}
+        raise apierr.not_found("Unknown account")
+
+    def _decouple_backend(self, backend, record=None):
+        """Detach a promoted single-account backend from root `self.cfg` before mutating it in pool mode."""
+        if backend is None or backend.cfg is not self.cfg:
+            return
+        decoupled = {key: value for key, value in self.cfg.items() if key != "accounts"}
+        decoupled["cookie_values"] = self.cfg.get("cookie_values", [])
+        if not decoupled.get("_account_ref") and isinstance(self.cfg.get("accounts"), list):
+            ref = next(
+                (item for item in self.cfg["accounts"]
+                 if isinstance(item, dict) and self._same_account(item, decoupled)),
+                None,
+            )
+            if ref is not None:
+                decoupled["_account_ref"] = ref
+        if getattr(backend, "refresher", None) is not None and backend.refresher.cfg is self.cfg:
+            backend.refresher.cfg = decoupled
+        if getattr(backend, "credits", None) is not None and getattr(backend.credits, "cfg", None) is self.cfg:
+            backend.credits.cfg = decoupled
+        backend.cfg = decoupled
+
     def _patch_account(self, tag, changes):
         if not changes:
             raise apierr.bad_request("Expected enabled, priority, label, proxy_url or impersonate")
@@ -1028,89 +1092,99 @@ class Admin:
                 raise apierr.bad_request(f"Invalid value for '{key}'", param=key)
         if "label" in changes:
             changes["label"] = changes["label"].strip()
-        account = self._find(tag)
-        if account["pending"] == "removed":
-            raise apierr.conflict("The account is removed from config.json and leaves after a restart")
-        backend = account.get("_backend")
         live_changes = dict(changes)
         changed_transport = False
-        proxy_secret = None
-        with self._transaction(refreshers=()) as (path, saved):
-            record = self._saved_record(saved, account)
-            is_single = record is saved
-            if changes.get("enabled") is False and backend is not None and account_enabled(backend):
-                if not self._other_enabled(saved, backend):
-                    raise apierr.conflict("The last enabled account cannot be switched off")
-                if self.runtime.pool.mode == "shared" and backend is self.runtime.pool.backend:
-                    raise apierr.conflict("Shared session mode serves only the first account")
-            if "proxy_url" in changes:
-                raw_proxy = changes["proxy_url"]
-                existing_proxy = record.get("proxy_url")
-                if (isinstance(raw_proxy, str) and existing_proxy
-                        and raw_proxy.strip() == admin_ops.public_proxy_url(existing_proxy)):
-                    live_changes["proxy_url"] = existing_proxy
-                else:
-                    try:
-                        clean_proxy = http_pool.validate_proxy_url(raw_proxy)
-                    except ValueError as exc:
-                        raise apierr.bad_request(str(exc), param="proxy_url") from None
-                    if clean_proxy:
-                        record["proxy_url"] = clean_proxy
-                        live_changes["proxy_url"] = clean_proxy
-                        proxy_secret = admin_ops._proxy_password(clean_proxy)
+        proxy_secrets = []
+        with self.lock:
+            account = self._locate_account(tag)
+            if account["pending"] == "removed":
+                raise apierr.conflict("The account is removed from config.json and leaves after a restart")
+            backend = account.get("_backend")
+            with self._transaction(refreshers=()) as (path, saved):
+                record = self._saved_record(saved, account)
+                is_single = record is saved
+                if changes.get("enabled") is False and backend is not None and account_enabled(backend):
+                    if not self._other_enabled(saved, backend):
+                        raise apierr.conflict("The last enabled account cannot be switched off")
+                    if self.runtime.pool.mode == "shared" and backend is self.runtime.pool.backend:
+                        raise apierr.conflict("Shared session mode serves only the first account")
+                if "proxy_url" in changes:
+                    raw_proxy = changes["proxy_url"]
+                    existing_proxy = record.get("proxy_url")
+                    if (isinstance(raw_proxy, str) and existing_proxy
+                            and raw_proxy.strip() == admin_ops.public_proxy_url(existing_proxy)):
+                        live_changes["proxy_url"] = existing_proxy
                     else:
-                        record.pop("proxy_url", None)
-                        live_changes["proxy_url"] = "" if is_single else self.cfg.get("proxy_url", "")
-                    changed_transport = clean_proxy != (existing_proxy or None)
-            if "impersonate" in changes:
-                try:
-                    clean_imp = curl_pool.validate_impersonate(changes["impersonate"])
-                except ValueError as exc:
-                    raise apierr.bad_request(str(exc), param="impersonate") from None
-                existing_imp = record.get("impersonate")
-                if clean_imp:
-                    record["impersonate"] = clean_imp
-                    live_changes["impersonate"] = clean_imp
-                else:
-                    record.pop("impersonate", None)
-                    live_changes["impersonate"] = (
-                        curl_pool.DEFAULT_IMPERSONATE
-                        if is_single
-                        else self.cfg.get("impersonate", curl_pool.DEFAULT_IMPERSONATE)
-                    )
-                changed_transport = changed_transport or (clean_imp != (existing_imp or None))
-            for key in ("enabled", "priority", "label"):
-                if key in changes:
-                    record[key] = changes[key]
-            self._write(path, saved)
-            if proxy_secret:
-                self._mask_tokens([proxy_secret])
-            if backend is not None:
-                if changed_transport:
-                    curl_pool.close_account(backend.cfg)
-                    http_pool.close_account_clients(backend.cfg.get("account_id"))
-                backend.cfg.update(live_changes)
-                reference = backend.cfg.get("_account_ref")
-                if isinstance(reference, dict) and reference is not backend.cfg:
-                    for key in ("enabled", "priority", "label"):
-                        if key in live_changes:
-                            reference[key] = live_changes[key]
-                    if "proxy_url" in live_changes:
-                        if record.get("proxy_url"):
-                            reference["proxy_url"] = record["proxy_url"]
+                        try:
+                            clean_proxy = http_pool.validate_proxy_url(raw_proxy)
+                        except ValueError as exc:
+                            raise apierr.bad_request(str(exc), param="proxy_url") from None
+                        if clean_proxy:
+                            record["proxy_url"] = clean_proxy
+                            live_changes["proxy_url"] = clean_proxy
+                            proxy_secrets = admin_ops._proxy_secrets(clean_proxy)
                         else:
-                            reference.pop("proxy_url", None)
-                    if "impersonate" in live_changes:
-                        if record.get("impersonate"):
-                            reference["impersonate"] = record["impersonate"]
-                        else:
-                            reference.pop("impersonate", None)
+                            record.pop("proxy_url", None)
+                            live_changes["proxy_url"] = "" if is_single else self.cfg.get("proxy_url", "")
+                        changed_transport = clean_proxy != (existing_proxy or None)
+                if "impersonate" in changes:
+                    try:
+                        clean_imp = curl_pool.validate_impersonate(changes["impersonate"])
+                    except ValueError as exc:
+                        raise apierr.bad_request(str(exc), param="impersonate") from None
+                    existing_imp = record.get("impersonate")
+                    if clean_imp:
+                        record["impersonate"] = clean_imp
+                        live_changes["impersonate"] = clean_imp
+                    else:
+                        record.pop("impersonate", None)
+                        live_changes["impersonate"] = (
+                            curl_pool.DEFAULT_IMPERSONATE
+                            if is_single
+                            else self.cfg.get("impersonate", curl_pool.DEFAULT_IMPERSONATE)
+                        )
+                    changed_transport = changed_transport or (clean_imp != (existing_imp or None))
+                for key in ("enabled", "priority", "label"):
+                    if key in changes:
+                        record[key] = changes[key]
+                self._write(path, saved)
+                if proxy_secrets:
+                    self._mask_tokens(proxy_secrets)
+                if backend is not None:
+                    if backend.cfg is self.cfg and not is_single:
+                        self._decouple_backend(backend, record)
+                    if changed_transport:
+                        curl_pool.close_account(backend.cfg)
+                        scope = (
+                            backend.cfg.get("account_id")
+                            or backend.cfg.get("provider_id")
+                            or record.get("account_id")
+                            or curl_pool.account_scope(backend.cfg)
+                        )
+                        http_pool.close_account_clients(scope)
+                    backend.cfg.update(live_changes)
+                    reference = backend.cfg.get("_account_ref")
+                    if isinstance(reference, dict) and reference is not backend.cfg:
+                        for key in ("enabled", "priority", "label"):
+                            if key in live_changes:
+                                reference[key] = live_changes[key]
+                        if "proxy_url" in live_changes:
+                            if record.get("proxy_url"):
+                                reference["proxy_url"] = record["proxy_url"]
+                            else:
+                                reference.pop("proxy_url", None)
+                        if "impersonate" in live_changes:
+                            if record.get("impersonate"):
+                                reference["impersonate"] = record["impersonate"]
+                            else:
+                                reference.pop("impersonate", None)
         changed_log = dict(changes)
         if "proxy_url" in changed_log:
             changed_log["proxy_url"] = admin_ops.public_proxy_url(live_changes.get("proxy_url")) if live_changes.get("proxy_url") else ""
         journal.emit("admin.account", "Аккаунт %s изменён: %s" % (tag, ", ".join(sorted(changes))), "info",
                      account=tag, changed=changed_log)
-        return self._account_response(tag)
+        response_tag = account_tag(backend, tag) if backend is not None else tag
+        return self._account_response(response_tag)
 
     def _loaded(self, tag):
         account = self._find(tag)
@@ -1237,25 +1311,33 @@ class Admin:
         if data.get("upstream") == "minara" and "bearer_tokens" in data:
             return self._add_minara_accounts(data)
         record = self._new_account(data)
-        with self._transaction() as (path, saved):
-            for existing in self._records(saved):
-                if (record.get("upstream") != "minara" and existing.get("upstream") != "minara"
-                        and str(existing.get("base") or saved.get("base") or "").rstrip("/").lower() == record["base"]
-                        and str(existing.get("page_uuid") or "").lower() == record["page_uuid"]):
-                    raise apierr.conflict("This Retool app is already in the pool")
-            self._append_records(saved, [record])
-            self._write(path, saved)
-        # No provider IO or live routing change: only extend redaction before
-        # emitting the new account's operator-controlled label to the journal.
-        if record.get("upstream") == "minara":
-            self._mask_tokens([
-                os.environ.get(record.get("bearer_token_env") or "") or record.get("bearer_token"),
-                admin_ops._proxy_password(record.get("proxy_url")),
-            ])
-        elif record.get("proxy_url"):
-            self._mask_tokens([admin_ops._proxy_password(record.get("proxy_url"))])
-        tag = self._record_tag(record)
-        live = self._adopt(record)
+        with self.lock:
+            with self._transaction() as (path, saved):
+                for existing in self._records(saved):
+                    if (record.get("upstream") != "minara" and existing.get("upstream") != "minara"
+                            and str(existing.get("base") or saved.get("base") or "").rstrip("/").lower() == record["base"]
+                            and str(existing.get("page_uuid") or "").lower() == record["page_uuid"]):
+                        raise apierr.conflict("This Retool app is already in the pool")
+                self._append_records(saved, [record])
+                self._write(path, saved)
+            # Register secrets before _adopt() so any adoption failure or journal entry redacts pending credentials.
+            if record.get("upstream") == "minara":
+                self._mask_tokens([
+                    os.environ.get(record.get("bearer_token_env") or "") or record.get("bearer_token"),
+                    *admin_ops._proxy_secrets(record.get("proxy_url")),
+                ])
+            else:
+                cookie = record.get("cookie") or ""
+                self._mask_tokens([
+                    cookie,
+                    record.get("xsrf"),
+                    record.get("page_uuid"),
+                    record.get("base"),
+                    *(val for val in auth.secret_values(cookie) if len(val) >= SECRET_CHARS),
+                    *admin_ops._proxy_secrets(record.get("proxy_url")),
+                ])
+            tag = self._record_tag(record)
+            live = self._adopt(record)
         journal.emit("admin.account", "Добавлен аккаунт %s%s" % (
             tag, ", подключён в пул" if live else ", подключится после перезапуска"), "success",
             account=tag, label=record.get("label", ""), live=live)
@@ -1317,24 +1399,25 @@ class Admin:
             impersonate = curl_pool.validate_impersonate(data.get("impersonate"))
         except ValueError as exc:
             raise apierr.bad_request(str(exc), param="impersonate") from None
-        with self._transaction() as (path, saved):
-            results, records = minara_accounts.plan(
-                self._records(saved), data.get("bearer_tokens"), now=time.time(), label=data.get("label"),
-                base=data.get("base"), minara_models=data.get("minara_models"),
-                proxy_url=proxy_url, impersonate=impersonate)
-            renewed = minara_accounts.apply_renewals(results)
-            if records:
-                self._append_records(saved, records)
-            if records or renewed:
-                self._write(path, saved)
-        self._mask_tokens(
-            [record["bearer_token"] for record in records]
-            + renewed
-            + ([admin_ops._proxy_password(proxy_url)] if proxy_url else [])
-        )
-        adopted = [record for record in records if self._adopt(record)]
-        renewed_live = sum(1 for result in results
-                           if result.get("status") == "renewed" and self._renew_token(result["of"]))
+        with self.lock:
+            with self._transaction() as (path, saved):
+                results, records = minara_accounts.plan(
+                    self._records(saved), data.get("bearer_tokens"), now=time.time(), label=data.get("label"),
+                    base=data.get("base"), minara_models=data.get("minara_models"),
+                    proxy_url=proxy_url, impersonate=impersonate)
+                renewed = minara_accounts.apply_renewals(results)
+                if records:
+                    self._append_records(saved, records)
+                if records or renewed:
+                    self._write(path, saved)
+            self._mask_tokens(
+                [record["bearer_token"] for record in records]
+                + renewed
+                + (admin_ops._proxy_secrets(proxy_url) if proxy_url else [])
+            )
+            adopted = [record for record in records if self._adopt(record)]
+            renewed_live = sum(1 for result in results
+                               if result.get("status") == "renewed" and self._renew_token(result["of"]))
         skipped = len(results) - len(records) - len(renewed)
         later = len(records) - len(adopted) + len(renewed) - renewed_live
         if records or renewed:
@@ -1388,7 +1471,7 @@ class Admin:
                     first["account_id"] = self.cfg["account_id"]
                 # The access descriptor moves with the account: with accounts[] a root copy is ignored,
                 # and config.load would warn about it at every start.
-                for key in ("cookie", "xsrf", "provider_access", "upstream", "bearer_token", "bearer_token_env", "minara_models"):
+                for key in ("cookie", "xsrf", "account_id", "provider_access", "upstream", "bearer_token", "bearer_token_env", "minara_models"):
                     saved.pop(key, None)
                 saved["accounts"] = [first]
         saved["accounts"].extend(records)
@@ -1406,42 +1489,57 @@ class Admin:
 
     def _mask_tokens(self, tokens):
         """New accounts' tokens join the secrets every response and journal line is cleaned of (a renewal keeps them)."""
-        values = self.cfg.setdefault("cookie_values", [])
-        extras = self.cfg.setdefault("_extra_secrets", [])
-        for token in tokens:
-            if not token:
-                continue
-            if token not in values:
-                values.append(token)
-            if token not in extras:
-                extras.append(token)
+        lock = getattr(self, "lock", None)
+        cookie_lock = getattr(auth, "_COOKIE_VALUES_LOCK", None)
+        with (lock if lock is not None else contextlib.nullcontext()), (
+            cookie_lock if cookie_lock is not None else contextlib.nullcontext()
+        ):
+            values = self.cfg.setdefault("cookie_values", [])
+            extras = self.cfg.setdefault("_extra_secrets", [])
+            root_values = self.cfg.get("_root_cookie_values")
+            targets = [values]
+            if isinstance(root_values, list) and root_values is not values:
+                targets.append(root_values)
+            seen_extras = set(extras)
+            for token in tokens:
+                if not isinstance(token, str) or not token:
+                    continue
+                for target in targets:
+                    if token not in target:
+                        target.append(token)
+                if token not in seen_extras:
+                    extras.append(token)
+                    seen_extras.add(token)
 
     def _delete_account(self, tag):
-        account = self._find(tag)
-        if account["pending"] == "removed":
-            raise apierr.conflict("The account is already removed and leaves after a restart")
-        backend = account.get("_backend")
-        # Only this account's renewal can write the record being removed (or the root it shares with the file).
-        with self._transaction(refreshers=(getattr(backend, "refresher", None),)) as (path, saved):
-            record = self._saved_record(saved, account)
-            has_providers = any(isinstance(p, dict) and p.get("enabled", True) is not False
-                                for p in (saved.get("providers") or []))
-            if not has_providers and (not isinstance(saved.get("accounts"), list) or len(self._records(saved)) <= 1):
-                raise apierr.conflict("The last account cannot be removed")
-            if backend is not None and account_enabled(backend) and not self._other_enabled(saved, backend):
-                raise apierr.conflict("The last enabled account cannot be removed")
-            if backend is not None and self.runtime.pool.mode == "shared" and backend is self.runtime.pool.backend:
-                raise apierr.conflict("Shared session mode serves only the first account")
-            remaining = [item for item in (saved.get("accounts") or []) if item is not record]
-            if not has_providers and not any(isinstance(item, dict) and item.get("enabled", True) is not False for item in remaining):
-                raise apierr.conflict("No enabled account would remain")
-            saved["accounts"] = remaining
-            if self._same_account(saved, record) and (saved.get("base") or saved.get("page_uuid")):
-                self._scrub_root(saved, record, remaining)
-            self._write(path, saved)
-            if backend is not None:
-                self._apply_live(backend, {"enabled": False})
-        adopted = self._drop(backend)
+        with self.lock:
+            account = self._locate_account(tag)
+            if account["pending"] == "removed":
+                raise apierr.conflict("The account is already removed and leaves after a restart")
+            backend = account.get("_backend")
+            # Only this account's renewal can write the record being removed (or the root it shares with the file).
+            with self._transaction(refreshers=(getattr(backend, "refresher", None),)) as (path, saved):
+                record = self._saved_record(saved, account)
+                has_providers = any(isinstance(p, dict) and p.get("enabled", True) is not False
+                                    for p in (saved.get("providers") or []))
+                if not has_providers and (not isinstance(saved.get("accounts"), list) or len(self._records(saved)) <= 1):
+                    raise apierr.conflict("The last account cannot be removed")
+                if backend is not None and account_enabled(backend) and not self._other_enabled(saved, backend):
+                    raise apierr.conflict("The last enabled account cannot be removed")
+                if backend is not None and self.runtime.pool.mode == "shared" and backend is self.runtime.pool.backend:
+                    raise apierr.conflict("Shared session mode serves only the first account")
+                remaining = [item for item in (saved.get("accounts") or []) if item is not record]
+                if not has_providers and not any(isinstance(item, dict) and item.get("enabled", True) is not False for item in remaining):
+                    raise apierr.conflict("No enabled account would remain")
+                saved["accounts"] = remaining
+                if self._same_account(saved, record) and (saved.get("base") or saved.get("page_uuid")):
+                    self._scrub_root(saved, record, remaining)
+                self._write(path, saved)
+                if backend is not None:
+                    if backend.cfg is self.cfg and isinstance(self.cfg.get("accounts"), list):
+                        self._decouple_backend(backend, record)
+                    self._apply_live(backend, {"enabled": False})
+            adopted = self._drop(backend)
         journal.emit("admin.account", "Аккаунт %s удалён из config.json%s" % (
             tag, ", снят с пула" if adopted else ""), "warn", account=tag, live=adopted)
         return {"ok": True, "pending": "removed" if backend is not None and not adopted else None,
@@ -1455,7 +1553,12 @@ class Admin:
             return False
         try:
             curl_pool.close_account(backend.cfg)
-            http_pool.close_account_clients(backend.cfg.get("account_id"))
+            scope = (
+                backend.cfg.get("account_id")
+                or backend.cfg.get("provider_id")
+                or curl_pool.account_scope(backend.cfg)
+            )
+            http_pool.close_account_clients(scope)
             runtime.pool.remove_account(backend)
             if getattr(runtime, "accounts", None) is not None:
                 runtime.accounts.remove_account(backend)
@@ -1600,7 +1703,8 @@ class Admin:
     def _loggable(self, key, value):
         """Free text (a role can hold private rules) is journaled as its length and a short hash, never verbatim."""
         if isinstance(value, str) and _free_text(self.schema[key]):
-            return {"length": len(value), "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]}
+            encoded = value.encode("utf-8", "surrogatepass")
+            return {"length": len(value), "sha256": hashlib.sha256(encoded).hexdigest()[:12]}
         return value
 
     def _update(self, changes):
@@ -1890,13 +1994,14 @@ class Admin:
             text=(query.get("q") or [""])[0][:200] or None,
             turn=(query.get("turn") or [""])[0] or None,
             before=_int_param(query, "before", 0, 0, 2 ** 62) or None)
-        last_seq = data[-1]["seq"] if data else self.runtime.journal.last_seq
+        last_seq = data[-1].get("seq", self.runtime.journal.last_seq) if data else self.runtime.journal.last_seq
         return {"data": data, "last_seq": last_seq}
 
     def _stream(self, handler, query):
         """Server-sent journal events; the key travels in headers via fetch streaming."""
         events = self.runtime.journal
-        since = _int_param(query, "since", events.last_seq, 0, 2 ** 62)
+        last_seq, epoch = events.state()
+        since = _int_param(query, "since", last_seq, 0, 2 ** 62)
         handler._status = 200
         handler.close_connection = True
         handler.send_response(200)
@@ -1914,21 +2019,30 @@ class Admin:
             handler._holds_slot = False
             handler.server.release_slot()
         writer = sse.StreamWriter(handler)
-        writer.event("hello", {"last_seq": events.last_seq, "server_time": time.time()})
+        writer.event("hello", {"last_seq": last_seq, "reset_epoch": epoch, "server_time": time.time()})
         deadline = time.monotonic() + STREAM_MAX_SECONDS
         last_write = time.monotonic()
         while not writer.broken and time.monotonic() < deadline:
-            if events.last_seq < since:
+            cur_seq, cur_epoch = events.state()
+            if cur_epoch != epoch or cur_seq < since:
                 # The buffer was cleared: restart numbering for this follower.
-                writer.event("reset", {"last_seq": events.last_seq})
+                writer.event("reset", {"last_seq": cur_seq, "reset_epoch": cur_epoch})
+                epoch = cur_epoch
                 since = 0
-            if events.wait(since, 1.0):
-                batch = events.query(since=since, limit=500, order="asc")
+                last_write = time.monotonic()
+            if events.wait(since, 1.0, epoch=epoch):
+                snap_epoch, snap_seq, batch = events.poll_since(since=since, limit=500)
+                if snap_epoch != epoch or snap_seq < since:
+                    writer.event("reset", {"last_seq": snap_seq, "reset_epoch": snap_epoch})
+                    epoch = snap_epoch
+                    since = 0
+                    snap_epoch, snap_seq, batch = events.poll_since(since=0, limit=500)
+                    last_write = time.monotonic()
                 for event in batch:
                     writer.event("journal", event)
                 if batch:
-                    since = batch[-1]["seq"]
-                last_write = time.monotonic()
+                    since = batch[-1].get("seq", since)
+                    last_write = time.monotonic()
             elif time.monotonic() - last_write >= STREAM_HEARTBEAT:
                 writer.comment("tick")
                 last_write = time.monotonic()
@@ -2100,7 +2214,8 @@ class Admin:
             validate.load_json(handler._read_body())
             self.runtime.journal.reset()
             journal.emit("admin.journal_cleared", "Журнал очищен оператором: события в памяти и файлы journal.jsonl на диске", "warn")
-            payload = {"ok": True, "last_seq": self.runtime.journal.last_seq}
+            last_seq, reset_epoch = self.runtime.journal.state()
+            payload = {"ok": True, "last_seq": last_seq, "reset_epoch": reset_epoch}
         elif handler.command == "PATCH" and path == "/admin/api/settings":
             # Guard failures must close a connection whose body was not consumed.
             handler.close_connection = True
