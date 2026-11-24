@@ -324,9 +324,15 @@ def test_bind_provider_gives_an_alias_turn_its_targets_fields_and_drops_the_firs
     cfg, _, alias = alias_pool(tmp_path, monkeypatch, [OPUS, MINARA_OPUS])
     retool_target, minara_target = (models.bind_target(alias, target) for target in alias["route_targets"])
     provider = {"model": "anthropic/claude-opus-5.5", "reasoningEffort": "medium"}
-    assert models.bind_provider(provider, minara_target, None, {"reasoning_effort": "auto"}) is None
+    assert models.bind_provider(provider, minara_target, None, {"reasoning_effort": "auto"}) == "medium"
     assert provider == {"model": "anthropic/claude-opus-5.5", "route_model": MINARA_OPUS,
-                        "pricing": minara_target["pricing"], "refuses_forced_tool_choice": True}
+                        "pricing": minara_target["pricing"], "refuses_forced_tool_choice": True,
+                        "reasoningEffort": "medium"}
+    no_reasoning_target = {**minara_target, "reasoning_effort_levels": None, "default_reasoning_effort": None}
+    provider_no_r = {"model": "anthropic/claude-opus-5.5", "reasoningEffort": "medium"}
+    assert models.bind_provider(provider_no_r, no_reasoning_target, None, {"reasoning_effort": "auto"}) is None
+    assert provider_no_r == {"model": "anthropic/claude-opus-5.5", "route_model": MINARA_OPUS,
+                             "pricing": minara_target["pricing"], "refuses_forced_tool_choice": True}
     provider = {"model": OPUS, "route_model": "x", "pricing": {"prompt": 1}, "refuses_forced_tool_choice": True}
     assert models.bind_provider(provider, retool_target, "xhigh", {"claude_xhigh_effort": "max"}) == "max"
     assert provider == {"model": OPUS, "reasoningEffort": "max"}
