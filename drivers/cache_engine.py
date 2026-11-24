@@ -6,6 +6,8 @@ import copy
 import hashlib
 import json
 import time
+import urllib.parse
+import uuid
 
 import apierr
 import conversation_state
@@ -170,12 +172,13 @@ def apply_openai_cache_hints(
         return
     opts = provider_options or {}
     preset = str(cfg.get("preset") or "").lower()
-    if preset in ("xai", "deepseek"):
+    if preset in ("xai", "deepseek") or _is_xai_cfg(cfg):
         return
     low_model = (model or "").lower()
 
-    supports_cache_key = preset in ("openai", "openai-responses", "openrouter") or low_model.startswith(
-        ("gpt-", "o1", "o3", "o4", "openai/", "anthropic/", "google/")
+    supports_cache_key = preset in ("openai", "openai-responses", "openrouter") or (
+        preset in ("custom", "")
+        and low_model.startswith(("gpt-", "o1", "o3", "o4", "openai/", "anthropic/", "google/"))
     )
     if not supports_cache_key:
         return
@@ -209,6 +212,58 @@ def apply_openai_cache_hints(
             body["prompt_cache_retention"] = ret
         elif str(cfg.get("cache_policy") or "").lower() == "1h":
             body["prompt_cache_retention"] = "24h"
+
+
+def _is_xai_cfg(cfg: dict) -> bool:
+    preset = str(cfg.get("preset") or "").lower()
+    if preset == "xai":
+        return True
+    base = str(cfg.get("base_url") or cfg.get("base") or "").strip()
+    if not base:
+        return False
+    try:
+        host = (urllib.parse.urlsplit(base).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return host == "api.x.ai" or host.endswith(".x.ai")
+
+
+def xai_conversation_id(cfg: dict, session, model: str | None = None) -> str | None:
+    """Derive a deterministic, secret-free `x-grok-conv-id` UUID scoped per conversation and credential."""
+    if not cfg.get("direct_cache", True) or str(cfg.get("cache_policy") or "auto").lower() == "off":
+        return None
+    if not _is_xai_cfg(cfg):
+        return None
+    conv_key = getattr(session, "_native_conversation_key", None) if session is not None else None
+    if not conv_key:
+        return None
+    client_cred = getattr(session, "_credential_scope", None) if session is not None else None
+    raw_secret = str(cfg.get("api_key") or cfg.get("bearer_token") or "").strip()
+    secret_hash = hashlib.sha256(raw_secret.encode("utf-8", "surrogatepass")).hexdigest()[:16] if raw_secret else ""
+    upstream_cred = cfg.get("account_id") or secret_hash
+    seed = [
+        "xai-conv",
+        cfg.get("provider_id") or cfg.get("preset") or "xai",
+        upstream_cred,
+        client_cred or "",
+        conv_key,
+        model or "",
+    ]
+    raw_digest = hashlib.sha256(
+        json.dumps(seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass")
+    ).digest()
+    return str(uuid.UUID(bytes=raw_digest[:16]))
+
+
+def apply_openai_cache_headers(headers: dict[str, str], cfg: dict, session, model: str | None = None) -> None:
+    """Attach provider-specific conversation cache headers (such as xAI's `x-grok-conv-id`) without clobbering custom headers."""
+    if not isinstance(headers, dict):
+        return
+    if any(k.lower() == "x-grok-conv-id" for k in headers):
+        return
+    grok_conv_id = xai_conversation_id(cfg, session, model=model)
+    if grok_conv_id:
+        headers["x-grok-conv-id"] = grok_conv_id
 
 
 def claim_universal_head(

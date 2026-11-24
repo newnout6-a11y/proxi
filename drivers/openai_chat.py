@@ -4,12 +4,13 @@ from __future__ import annotations
 import copy
 import json
 import math
+import urllib.parse
 
 import apierr
 from catalog import discovery, models_dev
 import client_context
 import conversation_state
-from drivers import cache_engine, http_pool, sse_utils
+from drivers import cache_engine, http_pool, presets, sse_utils
 from drivers.base import DriverCapabilities, UpstreamDriver, register_driver
 
 _FINISH_MAP = {
@@ -165,7 +166,7 @@ def _canonical_to_chat_messages(canonical: list[dict], *, preset: str = "", is_o
             if in_active_tool_loop and calls:
                 if (is_openrouter or preset == "openrouter") and or_details:
                     entry["reasoning_details"] = or_details
-                elif thinking_texts and preset in ("deepseek", "moonshot", "siliconflow", "vllm", "ollama", "custom", ""):
+                elif thinking_texts and preset in ("deepseek", "moonshot", "zai", "siliconflow", "vllm", "ollama", "custom", ""):
                     entry["reasoning_content"] = "".join(thinking_texts)
             out.append(entry)
             continue
@@ -327,12 +328,23 @@ class OpenAIChatDriver(UpstreamDriver):
             )
 
         base = str(cfg.get("base_url") or cfg.get("base") or "").rstrip("/")
-        is_openrouter = preset == "openrouter" or "openrouter.ai" in base.lower()
+        try:
+            base_host = (urllib.parse.urlsplit(base).hostname or "").lower().rstrip(".") if base else ""
+        except ValueError:
+            base_host = ""
+        detected_preset = presets.detect_preset_from_url(base) if not preset else ""
+        eff_preset = preset or detected_preset
+        is_openrouter = eff_preset == "openrouter" or base_host == "openrouter.ai" or base_host.endswith(".openrouter.ai")
+        is_openai = eff_preset == "openai" or base_host == "api.openai.com"
+        is_zai = eff_preset == "zai" or base_host in ("api.z.ai", "open.bigmodel.cn")
+        is_moonshot = eff_preset == "moonshot" or base_host in ("api.moonshot.ai", "api.moonshot.cn")
+        is_local_no_stream_opts = eff_preset in ("ollama", "lmstudio")
+        is_incompatible_reasoning = eff_preset in ("ollama", "lmstudio", "mistral", "deepseek")
 
         chat_messages: list[dict] = []
         if clean_head:
             chat_messages.append({"role": "system", "content": clean_head})
-        chat_messages.extend(_canonical_to_chat_messages(canonical_msgs, preset=preset, is_openrouter=is_openrouter))
+        chat_messages.extend(_canonical_to_chat_messages(canonical_msgs, preset=eff_preset, is_openrouter=is_openrouter))
 
         side_task = client_context.current().get("client_task") in client_context.SIDE_TASKS
         if is_openrouter and model.lower().startswith(("anthropic/", "google/")):
@@ -348,12 +360,29 @@ class OpenAIChatDriver(UpstreamDriver):
             "messages": chat_messages,
             "stream": True,
         }
-        # Local Ollama/LM Studio older builds ignore or accept stream_options; standard OpenAI/OpenRouter require it for usage
-        if preset not in ("lmstudio",):
+        # Older Ollama and LM Studio builds reject or mis-handle stream_options; hosted OpenAI-compatible endpoints use it for usage.
+        if not is_local_no_stream_opts:
             body["stream_options"] = {"include_usage": True}
 
+        provider_opts = getattr(session, "_provider_options", None) or {}
+        raw_thinking_opt = provider_opts.get("thinking") if isinstance(provider_opts.get("thinking"), dict) else {}
+        thinking_type = str(raw_thinking_opt.get("type") or "").lower()
+        supports_reasoning = bound_entry.get("reasoning") is not False
+        slug = models_dev.canonical_slug(model)
+        has_reasoning_cap = (
+            bool(bound_entry["reasoning"])
+            if "reasoning" in bound_entry
+            else slug.startswith(("o1", "o3", "o4", "gpt-5"))
+        )
+        is_openai_reasoning = has_reasoning_cap and not is_local_no_stream_opts and (
+            is_openai
+            or bound_entry.get("provider") == "openai"
+            or slug.startswith(("o1", "o3", "o4", "gpt-5"))
+        )
+        use_max_completion_tokens = bool(bound_entry.get("max_completion_tokens")) or is_openai_reasoning
+
         if max_tokens is not None:
-            if preset == "openai" and bound_entry.get("reasoning"):
+            if use_max_completion_tokens:
                 body["max_completion_tokens"] = max_tokens
             else:
                 body["max_tokens"] = max_tokens
@@ -369,21 +398,46 @@ class OpenAIChatDriver(UpstreamDriver):
                     else copy.deepcopy(tool_choice)
                 )
 
-        if effort and preset not in ("ollama", "lmstudio"):
+        reasoning_active = bool(
+            supports_reasoning
+            and effort != "none"
+            and thinking_type != "disabled"
+            and (effort or thinking_type in ("enabled", "adaptive") or raw_thinking_opt.get("budget_tokens"))
+        )
+        if is_openrouter:
+            if reasoning_active:
+                if effort:
+                    body["reasoning"] = {"effort": effort}
+                elif isinstance(raw_thinking_opt.get("budget_tokens"), int) and raw_thinking_opt["budget_tokens"] > 0:
+                    body["reasoning"] = {"max_tokens": raw_thinking_opt["budget_tokens"]}
+                else:
+                    body["reasoning"] = {"enabled": True}
+        elif is_zai or is_moonshot:
+            if supports_reasoning and (thinking_type == "disabled" or effort == "none"):
+                body["thinking"] = {"type": "disabled"}
+            elif reasoning_active:
+                body["thinking"] = {"type": "enabled"}
+        elif supports_reasoning and effort and not is_incompatible_reasoning:
             body["reasoning_effort"] = effort
 
-        provider_opts = getattr(session, "_provider_options", None) or {}
+        strip_sampling = (
+            is_openai_reasoning
+            or (is_openrouter and reasoning_active and model.lower().startswith("anthropic/"))
+            or (is_moonshot and isinstance(body.get("thinking"), dict) and body["thinking"].get("type") == "enabled")
+        )
         for k in ("temperature", "top_p", "seed", "presence_penalty", "frequency_penalty", "parallel_tool_calls", "service_tier"):
             if provider_opts.get(k) is not None:
-                # OpenAI reasoning models reject non-1 temperature
-                if k in ("temperature", "top_p") and preset == "openai" and bound_entry.get("reasoning"):
+                # OpenAI/Anthropic/Kimi reasoning modes reject non-1 temperature or top_p
+                if k in ("temperature", "top_p") and strip_sampling:
+                    if k == "temperature" and provider_opts[k] == 1.0 and not is_openai_reasoning:
+                        body[k] = provider_opts[k]
                     continue
                 body[k] = provider_opts[k]
         if provider_opts.get("stop_sequences"):
             body["stop"] = list(provider_opts["stop_sequences"])
 
         cache_engine.apply_openai_cache_hints(
-            body, cfg, session, model, provider_opts, include_retention=(preset == "openai"), head=clean_head, tools=cleaned_tools
+            body, cfg, session, model, provider_opts, include_retention=is_openai, head=clean_head, tools=cleaned_tools
         )
         body = sse_utils.apply_body_overrides(body, cfg.get("body_overrides"))
 
@@ -391,6 +445,7 @@ class OpenAIChatDriver(UpstreamDriver):
         headers = discovery.build_auth_headers(cfg)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream"
+        cache_engine.apply_openai_cache_headers(headers, cfg, session, model)
 
         head_key, head_role, head_gate = cache_engine.claim_universal_head(
             cfg, session, self.driver_id, model, effort, cleaned_tools, clean_head

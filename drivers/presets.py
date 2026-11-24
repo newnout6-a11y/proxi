@@ -134,6 +134,22 @@ PRESETS: dict[str, dict] = {
         "cache_policy": "off",
         "balance_endpoint": "https://api.siliconflow.com/v1/user/info",
     },
+    "zai": {
+        "name": "Z.ai (GLM)",
+        "driver": "openai-chat",
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "auth_mode": "bearer",
+        "cache_policy": "auto",
+        "balance_endpoint": None,
+    },
+    "vertex": {
+        "name": "Google Vertex AI",
+        "driver": "openai-chat",
+        "base_url": "https://aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{location}/endpoints/openapi",
+        "auth_mode": "bearer",
+        "cache_policy": "auto",
+        "balance_endpoint": None,
+    },
     "ollama": {
         "name": "Ollama (Local)",
         "driver": "openai-chat",
@@ -215,12 +231,14 @@ def normalize_base_url(base_url: str, *, allow_insecure_http: bool = False) -> s
         if path.lower().endswith(suffix):
             path = path[: -len(suffix)].rstrip("/")
             break
-    # Official hosts where bare root implies /v1
-    host_lower = parts.hostname.lower()
+    # Official hosts where bare root implies a standard API path prefix
+    host_lower = parts.hostname.lower().rstrip(".")
     if not path and host_lower in ("api.openai.com", "api.anthropic.com", "api.groq.com", "api.x.ai", "api.mistral.ai"):
         path = "/v1" if host_lower != "api.groq.com" else "/openai/v1"
     elif not path and host_lower == "openrouter.ai":
         path = "/api/v1"
+    elif not path and host_lower in ("api.z.ai", "open.bigmodel.cn"):
+        path = "/api/paas/v4"
     rebuilt = urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, "", ""))
     return rebuilt.rstrip("/")
 
@@ -231,7 +249,7 @@ def detect_preset_from_url(base_url: str | None) -> str | None:
         return None
     try:
         parts = urllib.parse.urlsplit(base_url.strip())
-        host = (parts.hostname or "").lower()
+        host = (parts.hostname or "").lower().rstrip(".")
         port = parts.port
     except ValueError:
         return None
@@ -257,8 +275,15 @@ def detect_preset_from_url(base_url: str | None) -> str | None:
         "api.moonshot.cn": "moonshot",
         "api.siliconflow.com": "siliconflow",
         "api.siliconflow.cn": "siliconflow",
+        "api.z.ai": "zai",
+        "open.bigmodel.cn": "zai",
+        "aiplatform.googleapis.com": "vertex",
     }
-    return host_map.get(host)
+    if host in host_map:
+        return host_map[host]
+    if host.endswith("-aiplatform.googleapis.com") or host.endswith(".aiplatform.googleapis.com"):
+        return "vertex"
+    return None
 
 
 def _preset_balance_endpoint(chosen_preset: str | None, spec: dict, norm_base: str) -> str | None:

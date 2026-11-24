@@ -92,6 +92,20 @@ def strict_tool_arguments(raw_args: str) -> tuple[dict | None, bool]:
         return None, False
 
 
+def _decode_sse_data_line(line: bytes, data_lines: list[str], data_size: int, *, label: str, max_bytes: int) -> int:
+    val = line[5:]
+    if val.startswith(b" "):
+        val = val[1:]
+    data_size += len(val)
+    if data_size > max_bytes:
+        raise apierr.upstream_error(f"{label} SSE event exceeds size limit")
+    try:
+        data_lines.append(val.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise apierr.upstream_error(f"{label} SSE event contains invalid UTF-8") from None
+    return data_size
+
+
 async def aiter_sse_events(byte_chunks, *, label: str = "Upstream", max_bytes: int = MAX_EVENT_BYTES):
     """Async generator parsing raw HTTP byte chunks into `(event_name | None, data_str)` SSE frames."""
     buffer = b""
@@ -123,28 +137,31 @@ async def aiter_sse_events(byte_chunks, *, label: str = "Upstream", max_bytes: i
                 raw_ev = line[6:].lstrip(b" ")
                 event_name = raw_ev.decode("utf-8", errors="replace").strip() or None
             elif line.startswith(b"data:"):
-                val = line[5:]
-                if val.startswith(b" "):
-                    val = val[1:]
-                data_size += len(val)
-                if data_size > max_bytes:
-                    raise apierr.upstream_error(f"{label} SSE event exceeds size limit")
-                try:
-                    data_lines.append(val.decode("utf-8"))
-                except UnicodeDecodeError:
-                    raise apierr.upstream_error(f"{label} SSE event contains invalid UTF-8") from None
+                data_size = _decode_sse_data_line(line, data_lines, data_size, label=label, max_bytes=max_bytes)
         if len(buffer) > max_bytes:
             raise apierr.upstream_error(f"{label} SSE buffer exceeds size limit")
 
+    unterminated_data = False
     if buffer.strip():
         line = buffer.rstrip(b"\r")
+        if len(line) > max_bytes:
+            raise apierr.upstream_error(f"{label} SSE line exceeds size limit")
         if line.startswith(b"data:"):
-            val = line[5:]
-            if val.startswith(b" "):
-                val = val[1:]
-            data_lines.append(val.decode("utf-8", errors="replace"))
+            _decode_sse_data_line(line, data_lines, data_size, label=label, max_bytes=max_bytes)
+            unterminated_data = True
+        elif not line.startswith(b":"):
+            raise apierr.upstream_error(f"{label} SSE stream ended with unterminated frame")
     if data_lines:
-        yield event_name, "\n".join(data_lines)
+        payload = "\n".join(data_lines)
+        stripped = payload.strip()
+        if unterminated_data and not stripped:
+            raise apierr.upstream_error(f"{label} SSE stream ended with unterminated data line")
+        if stripped != "[DONE]" and (unterminated_data or stripped.startswith(("{", "[", '"'))):
+            try:
+                bounded_json(payload)
+            except (ValueError, RecursionError):
+                raise apierr.upstream_error(f"{label} SSE stream ended with truncated data frame") from None
+        yield event_name, payload
 
 
 def extract_error_message(raw_text: str, cfg: dict | None = None, limit: int = 320) -> str:

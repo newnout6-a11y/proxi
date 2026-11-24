@@ -471,7 +471,6 @@ class AnthropicMessagesDriver(UpstreamDriver):
                 calls_by_idx: dict[int, dict] = {}
                 thinking_started = False
                 has_output = False
-                emitted_sig = False
                 raw_usage: dict = {}
                 finish_reason: str | None = None
                 saw_stop = False
@@ -514,6 +513,7 @@ class AnthropicMessagesDriver(UpstreamDriver):
                                 "type": "thinking",
                                 "thinking": init_think,
                                 "signature": cb.get("signature") if isinstance(cb.get("signature"), str) else "",
+                                "signature_emitted": False,
                             }
                             if not thinking_started:
                                 thinking_started = True
@@ -584,8 +584,8 @@ class AnthropicMessagesDriver(UpstreamDriver):
                     elif kind == "content_block_stop":
                         idx = item.get("index")
                         blk = blocks_by_idx.get(idx) if type(idx) is int else None
-                        if blk and blk.get("type") == "thinking" and blk.get("signature") and not emitted_sig:
-                            emitted_sig = True
+                        if blk and blk.get("type") == "thinking" and blk.get("signature") and not blk.get("signature_emitted"):
+                            blk["signature_emitted"] = True
                             yield {"type": "thinking_signature", "signature": blk["signature"]}
 
                     elif kind == "message_delta":
