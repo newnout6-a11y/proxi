@@ -19,3 +19,8 @@ export function spendUnitOf(chosen, totals) {
 export function spendAxisLabel(value, unit) {
   return unit === 'usd' ? `$${fmtFixed(value, value < 0.1 ? 4 : 2)}` : fmtFixed(value, value < 1 ? 2 : 1);
 }
+
+/** Whether the spend chart's peak annotation differs from the top Y-axis tick (or is an unsure lower bound). */
+export function showSpendPeak(peak, max, unit, unsure = false) {
+  return Boolean(unsure) || spendAxisLabel(peak, unit) !== spendAxisLabel(max, unit);
+}

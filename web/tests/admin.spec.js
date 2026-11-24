@@ -1680,3 +1680,108 @@ test('editing a provider sends only what the edit changed and names the saved he
   expect(sent).not.toHaveProperty('body_overrides');
   expect(sent).not.toHaveProperty('proxy_url');
 });
+
+test('journal clear preserves SSE reset and admin.journal_cleared when SSE arrives before POST resolves', async ({ page }) => {
+  const state = await mockAdmin(page);
+  state.clearLastSeq = 1;
+  state.onClear = async (s) => {
+    s.stream.push(
+      { _event: 'reset', data: { last_seq: 0 } },
+      ev(1, 'admin.journal_cleared', 'Журнал очищен оператором: события в памяти и файлы journal.jsonl на диске', 'warn'),
+    );
+    const seenBefore = s.streamRequests;
+    const deadline = Date.now() + 5000;
+    while (s.streamRequests === seenBefore && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await new Promise((r) => setTimeout(r, 120));
+  };
+  await login(page);
+  await openEvents(page);
+  await expect(page.locator('.log-row')).toHaveCount(journal.length);
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Очистить' }).click();
+  await expect(page.locator('.log-row')).toHaveCount(1, { timeout: 10000 });
+  await expect(page.locator('.log-row').first()).toContainText('Журнал очищен оператором');
+  await expect(page.locator('.log-row .seq').first()).toHaveText('#1');
+});
+
+test('editing a preset provider to a custom base_url sends preset: "custom" in PATCH', async ({ page }) => {
+  const state = await mockAdmin(page);
+  state.providers.push({
+    id: 'openrouter', name: 'OpenRouter', preset: 'openrouter', driver: 'openai-chat',
+    base_url: 'https://openrouter.ai/api/v1', auth_mode: 'bearer', routing_strategy: 'fill-first', cache_policy: 'auto',
+    enabled: true, routable: true, auto_discover: true, proxy_url: null, published_models_count: 1, credentials_count: 1,
+    credentials: [{ index: 1, api_key_set: true, api_key_env: null }], turns: 0, cost_usd: 0,
+    headers_keys: [], body_overrides: {}, models: [],
+  });
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.locator('.gw-row', { hasText: 'OpenRouter' }).getByRole('button', { name: 'Изменить' }).click();
+  await page.getByLabel('Base URL').fill('https://custom-gateway.invalid/v1');
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(page.getByText('Провайдер обновлён')).toBeVisible();
+  expect(state.providerPatches).toHaveLength(1);
+  expect(state.providerPatches[0].body.base_url).toBe('https://custom-gateway.invalid/v1');
+  expect(state.providerPatches[0].body.preset).toBe('custom');
+});
+
+test('SpendChart formats sub-cent USD peak annotation with $ and 4 decimals matching Y-axis', async ({ page }) => {
+  const buckets = metricsFor(3600).buckets.map((b, i) => ({
+    ...b,
+    credits: 0,
+    keepwarm_credits: 0,
+    cost_usd: i === 25 ? 0.0042 : i === 26 ? 0.0011 : 0,
+  }));
+  await mockAdmin(page, { metricsPatch: { buckets, totals: { credits: 0, keepwarm_credits: 0, cost_usd: 0.0053 } } });
+  await login(page);
+  await expect(page.getByRole('slider', { name: /Расход USD/ }).locator('.c-label-accent')).toHaveText('$0,0042');
+});
+
+test('mixed-upstream failover turn preserves both Minara credits and USD in Turns', async ({ page }) => {
+  await mockAdmin(page);
+  await serveEvents(page, [
+    eventAt('t-mixed', -100, 'turn.begin', { model: 'coding-best' }),
+    eventAt('t-mixed', -100, 'upstream.usage_start', { attempt: 1 }),
+    eventAt('t-mixed', -98, 'upstream.usage', { credits: null, minara_credits: 2.2, cost_usd: 0.01, attempt: 1, credits_reported: false }),
+    eventAt('t-mixed', -98, 'upstream.usage_start', { attempt: 2 }),
+    eventAt('t-mixed', -96, 'upstream.usage', { credits: null, minara_credits: null, cost_usd: 0.03, attempt: 2, credits_reported: false }),
+    eventAt('t-mixed', -95, 'turn.end', { reason: 'stop', duration_ms: 5000 }),
+  ]);
+  await login(page);
+  await nav(page, 'Активность');
+  const costCell = page.locator('.trace', { hasText: 'coding-best' }).locator('.trace-cost');
+  await expect(costCell).toContainText('2,20 + $0,03');
+  await expect(costCell).toContainText('кредитов Minara + USD');
+});
+
+test('client AccessKey form validates non-numeric limits and creates/edits Minara limit fields', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.getByRole('button', { name: 'Создать ключ' }).click();
+  await page.getByLabel('Название клиента / устройства').fill('Agent Key');
+  await page.getByLabel(/Лимит запросов в минуту/).fill('abc');
+  await page.getByRole('button', { name: 'Выпустить ключ' }).click();
+  await expect(page.getByRole('alert')).toContainText('RPM');
+  expect(state.clientKeys).toHaveLength(0);
+
+  await page.getByLabel(/Лимит запросов в минуту/).fill('30');
+  await page.getByLabel(/Бюджет в USD/).fill('15.5');
+  await page.getByLabel(/Лимит Minara за запрос/).fill('25');
+  await page.getByLabel(/Дневной лимит Minara/).fill('200');
+  await page.getByLabel(/Разрешить подтверждение дорогих запросов Minara/).check();
+  await page.getByRole('button', { name: 'Выпустить ключ' }).click();
+  const row = page.locator('.gw-row', { hasText: 'Agent Key' });
+  await expect(row).toContainText('лимит 30 RPM');
+  await expect(row).toContainText('Minara/запрос ≤ 25,00');
+  await expect(row).toContainText('Minara/день ≤ 200,00');
+  await expect(row).toContainText('подтверждение цены разрешено');
+
+  await row.getByRole('button', { name: 'Изменить' }).click();
+  await page.getByLabel(/Лимит Minara за запрос/).fill('40');
+  await page.getByLabel(/Разрешить подтверждение дорогих запросов Minara/).uncheck();
+  await page.getByRole('button', { name: 'Сохранить ключ' }).click();
+  await expect(row).toContainText('Minara/запрос ≤ 40,00');
+  await expect(row).not.toContainText('подтверждение цены разрешено');
+});

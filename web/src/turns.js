@@ -250,6 +250,15 @@ export const isUsdOnly = (cost) => cost.usd !== undefined && cost.minara === und
 /** The figure the turn list shows: Minara's credits, else the dollars of a dollar-only turn, else Retool's credits. */
 export const shownCost = (cost) => (cost.minara !== undefined ? cost.minara : isUsdOnly(cost) ? cost.usd : cost.credits);
 
+/** Ordered currency parts present on a turn's cost so mixed-upstream failovers never drop secondary currencies. */
+export function costCurrencies(cost) {
+  const parts = [];
+  if (cost.minara !== undefined) parts.push({ kind: 'minara', value: cost.minara });
+  if (cost.credits !== null && cost.credits !== undefined) parts.push({ kind: 'credits', value: cost.credits });
+  if (cost.usd !== undefined) parts.push({ kind: 'usd', value: cost.usd });
+  return parts;
+}
+
 /** A turn silent for longer than this is not running any more: the relay's own turn timeout is 15 minutes by default. */
 export const STALE_AFTER = 20 * 60;
 

@@ -335,12 +335,18 @@ PS_PROVIDER_RE = re.compile(r"""(?:^|[\s'"=,:])(?:variable|function|env|alias|ce
                             re.IGNORECASE)
 
 
+def _git_subcommand_index(words):
+    """Index in `words` of the git subcommand (first word after git that is no option), else None."""
+    for index, word in enumerate(words[1:], 1):
+        if not word.startswith("-"):
+            return index
+    return None
+
+
 def _git_subcommand(words):
     """The subcommand of a git segment: the first word after git that is no option ("" when there is none)."""
-    for word in words[1:]:
-        if not word.startswith("-"):
-            return word.lower()
-    return ""
+    index = _git_subcommand_index(words)
+    return words[index].lower() if index is not None else ""
 
 
 def _git_fetch_source(words):
@@ -398,7 +404,8 @@ def _check_segments(segments, patterns, depth=0) -> None:
             raise PolicyError("git command/config overrides require allow_all")
         if base == "git":
             words = flattened.split()
-            subcommand = _git_subcommand(words)
+            sub_index = _git_subcommand_index(words)
+            subcommand = words[sub_index].lower() if sub_index is not None else ""
             if subcommand not in GIT_READ_ONLY or GIT_EXEC_RE.search(flattened):
                 raise PolicyError("git %s requires allow_all: the allowlist runs only git commands that read, and fetch "
                                   "from a configured remote, without --exec (%s)"
@@ -413,7 +420,7 @@ def _check_segments(segments, patterns, depth=0) -> None:
                     raise PolicyError("git fetch from %s requires allow_all: the allowlist fetches only from a configured "
                                       "remote, by its name (git fetch origin)" % place)
             if (subcommand in ("branch", "tag")
-                    and not _git_lists_refs(subcommand, words[words.index(subcommand) + 1:])):
+                    and not _git_lists_refs(subcommand, words[sub_index + 1:])):
                 raise PolicyError("git %s may only list under the allowlist" % subcommand)
         if GLOBAL_BLOCKED_RE.search(flattened):
             raise PolicyError("command preprocessing flags require allow_all")

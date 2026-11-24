@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { STALE_AFTER, STALE_MARGIN, TASK_LABEL, buildTraces, costOf, effortText, isUsdOnly, phasesOf, scaleOf, shownCost, speedOf, staleLimit, statusAt } from '../src/turns.js';
+import { STALE_AFTER, STALE_MARGIN, TASK_LABEL, buildTraces, costCurrencies, costOf, effortText, isUsdOnly, phasesOf, scaleOf, shownCost, speedOf, staleLimit, statusAt } from '../src/turns.js';
 import { fmtSpeed } from '../src/format.js';
 import { MIN_FORECAST_SECONDS, burnRate, coverageOf, coveredSeconds, fmtSince, fmtSpan, uncoveredBuckets } from '../src/coverage.js';
 
@@ -607,4 +607,18 @@ test('the dollars of a Minara reply are the same money as its Minara credits, no
     USAGE(2, null, { credits_reported: false, minara_credits: null, cost_usd: 0.03 }), END()]));
   assert.equal(mixed.minara, 2.2);
   assert.equal(mixed.usd, 0.03);
+  assert.deepEqual(costCurrencies(mixed), [
+    { kind: 'minara', value: 2.2 },
+    { kind: 'usd', value: 0.03 },
+  ]);
+  // Failover from Retool to a universal provider preserves both Retool credits and USD.
+  const retoolUsd = costOf(turnOf([START(1), USAGE(1, 0.4), START(2),
+    USAGE(2, null, { credits_reported: false, cost_usd: 0.012 }), END()]));
+  assert.deepEqual(costCurrencies(retoolUsd), [
+    { kind: 'credits', value: 0.4 },
+    { kind: 'usd', value: 0.012 },
+  ]);
+  assert.deepEqual(costCurrencies(cost), [{ kind: 'minara', value: 11 }]);
+  assert.deepEqual(costCurrencies(turnOf([END('error')])), [{ kind: 'credits', value: 0 }]);
+  assert.deepEqual(costCurrencies(turnOf([])), []);
 });

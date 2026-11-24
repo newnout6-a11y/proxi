@@ -5,7 +5,10 @@ import { usePolling } from '../useJournal.js';
 import { Dot } from '../motion.jsx';
 import { Button, CopyButton, Tag, Toggle, useToast } from '../ui.jsx';
 import { fmtFixed, fmtInt, isNum } from '../format.js';
-import { EMPTY_PROVIDER, buildProviderPayload, presetMatchesUrl, providerToForm } from '../providerForm.js';
+import {
+  EMPTY_CLIENT_KEY, EMPTY_PROVIDER, buildClientKeyPayload, buildProviderPayload, clientKeyToForm,
+  presetMatchesUrl, providerToForm,
+} from '../providerForm.js';
 
 const DRIVER_LABELS = {
   'openai-chat': 'OpenAI Chat Completions',
@@ -307,7 +310,7 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
   const [pingResult, setPingResult] = useState({});
 
   const [keyFormOpen, setKeyFormOpen] = useState(false);
-  const [keyDraft, setKeyDraft] = useState({ label: '', allowed_text: '', rpm_limit: '', max_budget_usd: '' });
+  const [keyDraft, setKeyDraft] = useState(EMPTY_CLIENT_KEY);
   const [keyError, setKeyError] = useState('');
   const [createdRawKey, setCreatedRawKey] = useState(null);
 
@@ -387,24 +390,26 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
   async function saveClientKey(e) {
     e.preventDefault();
     setKeyError('');
-    const label = keyDraft.label.trim();
-    if (!label) {
-      setKeyError('Укажите название клиента или устройства');
+    let body;
+    try {
+      body = buildClientKeyPayload(keyDraft);
+    } catch (err) {
+      setKeyError(err.message);
       return;
     }
-    const allowed = keyDraft.allowed_text.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
-    const body = {
-      label,
-      allowed_models: allowed.length ? allowed : null,
-      rpm_limit: keyDraft.rpm_limit !== '' ? parseInt(keyDraft.rpm_limit, 10) : null,
-      max_budget_usd: keyDraft.max_budget_usd !== '' ? parseFloat(keyDraft.max_budget_usd) : null,
-    };
     await withBusy('save-ckey', async () => {
-      const res = await api(apiKey, 'client-keys', { method: 'POST', body });
-      setCreatedRawKey({ label, key: res.raw_key });
-      setKeyFormOpen(false);
-      setKeyDraft({ label: '', allowed_text: '', rpm_limit: '', max_budget_usd: '' });
-      toast({ tone: 'success', title: 'Клиентский ключ создан', text: 'Скопируйте ключ — целиком он показывается один раз' });
+      if (keyDraft.editing) {
+        await api(apiKey, `client-keys/${encodeURIComponent(keyDraft.id)}`, { method: 'PATCH', body });
+        setKeyFormOpen(false);
+        setKeyDraft(EMPTY_CLIENT_KEY);
+        toast({ tone: 'success', title: 'Клиентский ключ обновлён', text: body.label });
+      } else {
+        const res = await api(apiKey, 'client-keys', { method: 'POST', body });
+        setCreatedRawKey({ label: body.label, key: res.raw_key });
+        setKeyFormOpen(false);
+        setKeyDraft(EMPTY_CLIENT_KEY);
+        toast({ tone: 'success', title: 'Клиентский ключ создан', text: 'Скопируйте ключ — целиком он показывается один раз' });
+      }
     });
   }
 
@@ -631,7 +636,7 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
             <h2><KeyRound size={16} strokeWidth={1.5} aria-hidden="true" /> Клиентские ключи (AccessKeys)</h2>
             <p className="panel-meta">отдельные ключи для IDE и устройств с лимитами RPM, бюджетом USD и фильтром моделей</p>
           </div>
-          <Button icon={Plus} disabled={keyFormOpen} onClick={() => { setKeyError(''); setKeyFormOpen(true); }}>
+          <Button icon={Plus} disabled={keyFormOpen && !keyDraft.editing} onClick={() => { setKeyDraft(EMPTY_CLIENT_KEY); setKeyError(''); setKeyFormOpen(true); }}>
             Создать ключ
           </Button>
         </div>
@@ -656,29 +661,44 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
             <div className="form-grid">
               <label className="field">
                 <span>Название клиента / устройства</span>
-                <input value={keyDraft.label} onChange={(e) => setKeyDraft((d) => ({ ...d, label: e.target.value }))}
+                <input value={keyDraft.label} onChange={(e) => { setKeyDraft((d) => ({ ...d, label: e.target.value })); setKeyError(''); }}
                   placeholder="Cursor рабочий ноутбук" maxLength={64} required />
               </label>
               <label className="field">
                 <span>Разрешённые модели (glob через запятую, пусто — все)</span>
-                <input value={keyDraft.allowed_text} onChange={(e) => setKeyDraft((d) => ({ ...d, allowed_text: e.target.value }))}
+                <input value={keyDraft.allowed_text} onChange={(e) => { setKeyDraft((d) => ({ ...d, allowed_text: e.target.value })); setKeyError(''); }}
                   placeholder="coding-best, openrouter/*" spellCheck={false} />
               </label>
               <label className="field">
                 <span>Лимит запросов в минуту (RPM, необязательно)</span>
-                <input type="number" min="1" max="100000" value={keyDraft.rpm_limit}
-                  onChange={(e) => setKeyDraft((d) => ({ ...d, rpm_limit: e.target.value }))} placeholder="60" />
+                <input type="text" inputMode="numeric" value={keyDraft.rpm_limit}
+                  onChange={(e) => { setKeyDraft((d) => ({ ...d, rpm_limit: e.target.value })); setKeyError(''); }} placeholder="60" spellCheck={false} />
               </label>
               <label className="field">
                 <span>Бюджет в USD (необязательно): ходы Minara и API-провайдеров с запуска relay, ходы Retool не входят</span>
-                <input type="number" min="0" step="0.01" value={keyDraft.max_budget_usd}
-                  onChange={(e) => setKeyDraft((d) => ({ ...d, max_budget_usd: e.target.value }))} placeholder="10.00" />
+                <input type="text" inputMode="decimal" value={keyDraft.max_budget_usd}
+                  onChange={(e) => { setKeyDraft((d) => ({ ...d, max_budget_usd: e.target.value })); setKeyError(''); }} placeholder="10.00" spellCheck={false} />
+              </label>
+              <label className="field">
+                <span>Лимит Minara за запрос (кредиты, необязательно)</span>
+                <input type="text" inputMode="decimal" value={keyDraft.max_request_minara}
+                  onChange={(e) => { setKeyDraft((d) => ({ ...d, max_request_minara: e.target.value })); setKeyError(''); }} placeholder="50" spellCheck={false} />
+              </label>
+              <label className="field">
+                <span>Дневной лимит Minara (кредиты, необязательно)</span>
+                <input type="text" inputMode="decimal" value={keyDraft.max_day_minara}
+                  onChange={(e) => { setKeyDraft((d) => ({ ...d, max_day_minara: e.target.value })); setKeyError(''); }} placeholder="500" spellCheck={false} />
               </label>
             </div>
+            <label className="check">
+              <input type="checkbox" checked={!!keyDraft.allow_cost_confirm}
+                onChange={(e) => { setKeyDraft((d) => ({ ...d, allow_cost_confirm: e.target.checked })); setKeyError(''); }} />
+              <span>Разрешить подтверждение дорогих запросов Minara (x-proxi-confirm-cost)</span>
+            </label>
             {keyError && <p className="banner tone-neg" role="alert">{keyError}</p>}
             <div className="form-actions">
-              <Button onClick={() => setKeyFormOpen(false)}>Отмена</Button>
-              <Button tone="primary" type="submit" disabled={!!busy['save-ckey']}>Выпустить ключ</Button>
+              <Button onClick={() => { setKeyFormOpen(false); setKeyDraft(EMPTY_CLIENT_KEY); setKeyError(''); }}>Отмена</Button>
+              <Button tone="primary" type="submit" disabled={!!busy['save-ckey']}>{keyDraft.editing ? 'Сохранить ключ' : 'Выпустить ключ'}</Button>
             </div>
           </form>
         )}
@@ -701,6 +721,15 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
                     {isNum(ck.rpm_limit) && ` · лимит ${fmtInt(ck.rpm_limit)} RPM`}
                     {' · с запуска relay, без Retool'}
                   </span>
+                  {(isNum(ck.max_request_minara) || isNum(ck.max_day_minara) || ck.allow_cost_confirm) && (
+                    <span>
+                      {[
+                        isNum(ck.max_request_minara) && `Minara/запрос ≤ ${fmtFixed(ck.max_request_minara, 2)}`,
+                        isNum(ck.max_day_minara) && `Minara/день ≤ ${fmtFixed(ck.max_day_minara, 2)}`,
+                        ck.allow_cost_confirm && 'подтверждение цены разрешено',
+                      ].filter(Boolean).join(' · ')}
+                    </span>
+                  )}
                   {ck.allowed_models?.length > 0 && <span>модели: {ck.allowed_models.join(', ')}</span>}
                 </div>
                 <div className="gw-actions">
@@ -710,10 +739,23 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
                     label={`Клиентский ключ ${ck.label} активен`}
                     onChange={(enabled) => withBusy(`ckey:${ck.id}`, () => api(apiKey, `client-keys/${ck.id}`, { method: 'PATCH', body: { enabled } }))}
                   />
+                  <Button icon={Wrench} onClick={() => {
+                    setKeyDraft(clientKeyToForm(ck));
+                    setKeyError('');
+                    setKeyFormOpen(true);
+                  }}>
+                    Изменить
+                  </Button>
                   <button type="button" className="icon-button tone-danger" aria-label={`Удалить клиентский ключ ${ck.label}`}
                     onClick={() => {
                       if (!window.confirm(`Отозвать и удалить ключ «${ck.label}»?`)) return;
-                      withBusy(`del-ckey:${ck.id}`, () => api(apiKey, `client-keys/${ck.id}`, { method: 'DELETE', body: {} }));
+                      withBusy(`del-ckey:${ck.id}`, async () => {
+                        await api(apiKey, `client-keys/${ck.id}`, { method: 'DELETE', body: {} });
+                        if (keyDraft.editing && keyDraft.id === ck.id) {
+                          setKeyFormOpen(false);
+                          setKeyDraft(EMPTY_CLIENT_KEY);
+                        }
+                      });
                     }}>
                     <Trash size={16} strokeWidth={1.5} />
                   </button>
