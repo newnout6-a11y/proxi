@@ -1405,6 +1405,11 @@ def _error_of_event(event):
     if status == 429:
         return apierr.too_many_requests(text)
     if status in (401, 403):
+        if status == 403 and apierr.is_assist_not_in_plan(text):
+            error = apierr.upstream_error(text)
+            error.plan_refusal = True
+            error.unbilled = True
+            return error
         if event.get("isUsingRetoolManagedKey") and ("invalid x-api-key" in text or "authentication_error" in text):
             return apierr.upstream_error(text)
         return apierr.upstream_auth_failed(text)
@@ -2419,16 +2424,21 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                     note(event)
                     yield event
         except apierr.ApiError as error:
-            assist = (error.status == 400 and "metadata" in body
-                      and "not available right now" in (error.message or "").lower())
+            said = (error.message or "").lower()
+            unavailable = (error.status == 400 and "metadata" in body and "not available right now" in said)
+            # Retool 4.103.0 Cloud gate (assistCopilotStreamGateEnabled) rejects metadata.sandpackAgent
+            # without sandbox attestation as 400 "Invalid request format"; fall back to unmarked Assist when
+            # no tool-result hint rebuild applies so paid Assist orgs succeed and Freetool orgs hit 403 plan_refusal.
+            gate_rejected = (error.status == 400 and not began and isinstance(body.get("metadata"), dict)
+                             and bool(body["metadata"].get("sandpackAgent")) and "invalid request format" in said)
+            assist = unavailable or gate_rejected
             # What may be upstream's refusal of a hint on a tool result: a message that names the cache, or the route
             # validator's own words, which name nothing ("Invalid request format", an empty body). One that names thinking,
             # a signature or the blocks of the history is about the signed branch, whose own handling follows, and any
             # other reason it names (a prompt too long, a tool schema, the content filter) is not the hint's.
-            said = (error.message or "").lower()
             plausible = "cache" in said or said.strip() in ("", "{}") or "invalid request format" in said
             about_branch = conversation_state.blocks_refused(error) and "cache" not in said
-            if pruned_parent and not began and not assist and about_branch and error.status in (400, 422):
+            if pruned_parent and not began and not unavailable and about_branch and error.status in (400, 422):
                 # Upstream refused the history of a branch that had lost a call: forget those branches and ask again from
                 # what the client sent (no signatures, like any first request after a reset). If that is answered the
                 # shape was the cause, and replies are no longer cut down that way for the rest of the run.
@@ -2448,7 +2458,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                                          model=model_provider.get("model"))
                         yield event
                 return
-            if rebuild is not None and not began and not assist and plausible and not about_branch \
+            if rebuild is not None and not began and not unavailable and plausible and not about_branch \
                     and error.status in (400, 422):
                 # Upstream refused a body that carries a cache hint on the result of a tool, a shape that was never seen
                 # accepted: ask again without those hints, and once that is answered stop sending them (this run).
@@ -2481,8 +2491,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                                   kind="upstream.assist_retry", level="warn", model=model_name,
                                   request_id=client_context.current().get("request_id") or getattr(session, "_request_tag", None),
                                   account=account_tag(getattr(session, "backend", None)))
-                journal.emit("upstream.assist_retry", "Модель только в списке Assist — повтор без маркера", "warn",
-                             model=model_name)
+                journal.emit("upstream.assist_retry",
+                             ("Запрос с маркером App Builder отклонён (%s) — повтор без маркера"
+                              % (error.message or "")[:80])
+                             if gate_rejected else "Модель только в списке Assist — повтор без маркера",
+                             "warn", model=model_name)
                 body = _unmarked(body)
                 if body.get("openAICacheKey") and not side_request:  # what the turn keeps warm, as above
                     session._turn_body = body
@@ -2876,7 +2889,8 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         error.upstream_status = exc.code
                         error.cloudflare_challenge = True
                         raise error
-                    if exc.code in (401, 403) and attempt == 0:
+                    assist_plan_refusal = exc.code == 403 and apierr.is_assist_not_in_plan(detail)
+                    if exc.code in (401, 403) and attempt == 0 and not assist_plan_refusal:
                         attempt = 1
                         # The 401 may come from a header snapshot taken just before
                         # a keepalive rotation: pass the rejected cookie so the
@@ -3443,6 +3457,8 @@ def _http_error(status, detail):
         pass
     if status == 429:
         return (429, "rate_limit_error", text)
+    if status == 403 and apierr.is_assist_not_in_plan(detail):
+        return (502, "upstream_error", text)
     if status in (401, 403):
         return (502, "upstream_auth_error", text)
     if status in (400, 422):
@@ -3461,4 +3477,7 @@ def _api_error(status, detail, headers=None):
         # move; the orchestrator holds this account back from this model only and moves the turn
         # (AccountDispatcher.mark_plan_refusal).
         error.plan_refusal = True
+    elif status == 403 and apierr.is_assist_not_in_plan(detail):
+        error.plan_refusal = True
+        error.unbilled = True
     return error
