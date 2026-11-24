@@ -238,7 +238,7 @@ class CatalogRefresher:
         reference = len(previous) or len(minara_catalog.SHIPPED)
         complete = len(listed) >= COMPLETE_SHARE * reference
         now = _now()
-        measured = minara_catalog.MEASURED
+        measured = minara_catalog.snapshot()
         overlay = state.setdefault("models", {})
         # Prices first: Minara debits its own list, so a turn of a repriced model is priced wrong until this is taken.
         for upstream, item in listed.items():
@@ -274,7 +274,10 @@ class CatalogRefresher:
         state["spent_credits"] = round(float(state.get("spent_credits") or 0) + summary["spent_credits"], 4)
         with self._file_lock:
             fresh = self._read()
-            state["switched"] = fresh.get("switched") or state.get("switched") or {}
+            if "switched" in fresh and isinstance(fresh["switched"], dict):
+                state["switched"] = fresh["switched"]
+            elif not isinstance(state.get("switched"), dict):
+                state["switched"] = {}
             self._write(state)
         changed = minara_catalog.apply_overlay(self.path)
         if changed:
@@ -391,20 +394,21 @@ class CatalogRefresher:
                 published = {}
         studies = {upstream: dict(study, _question="hard")} if study else {}
         generated = minara_probe.generate({upstream: results}, [item], published, studies)
-        return inherit_effort(generated["models"][0], minara_catalog.MEASURED)
+        return inherit_effort(generated["models"][0], minara_catalog.snapshot())
 
     def install(self):
         """Rebuild the routes from the measured catalog, in place: every account's cfg holds the same dict."""
         import models
         routes = models.build_minara_catalog(self.cfg.get("accounts") or [self.cfg])
-        target = self.cfg.get("_minara_models")
-        if not isinstance(target, dict):
-            self.cfg["_minara_models"] = routes
-            return
-        for key, value in routes.items():
-            target[key] = value
-        for key in [key for key in target if key not in routes]:
-            target.pop(key, None)
+        with models._CATALOG_LOCK:
+            target = self.cfg.get("_minara_models")
+            if not isinstance(target, dict):
+                self.cfg["_minara_models"] = routes
+                return
+            for key, value in routes.items():
+                target[key] = value
+            for key in [key for key in target if key not in routes]:
+                target.pop(key, None)
 
     def _report(self, summary):
         for upstream in summary["added"]:
@@ -422,7 +426,7 @@ class CatalogRefresher:
             console_log.write("[catalog] Minara: %s is gone from Minara's list, unpublished" % name)
         for upstream in summary["releveled"]:
             name = minara_catalog.public_id(upstream)
-            entry = minara_catalog.MEASURED.get(upstream) or {}
+            entry = minara_catalog.snapshot().get(upstream) or {}
             journal.emit("catalog.model_releveled", "Minara: уровни effort %s по данным провайдера: %s" % (
                 name, ", ".join(entry.get("reasoning_effort_levels") or ()) or "нет"), "info", upstream="minara",
                 model=name, upstream_model=upstream, levels=entry.get("reasoning_effort_levels"))

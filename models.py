@@ -8,10 +8,13 @@ import datetime
 import fnmatch
 import re
 import sys
+import threading
 import console_log
 import minara_catalog as minara_routes
 
 from apierr import ApiError, bad_request, not_found, service_unavailable
+
+_CATALOG_LOCK = threading.RLock()
 
 # Accepted reasoning effort values per Retool route (bundle plus dated live probes).
 EFFORTS_BY_PROVIDER = {
@@ -304,89 +307,113 @@ def add_discovered(found):
     """Publish Retool models the catalog refresh found in Retool's own model registry and saw answer (retool_refresh),
     in place: each one becomes a CATALOG entry with the fields an audited entry has, and its route is verified by that
     answer. An audited entry of the same id always wins. Returns the ids added or changed."""
-    changed = []
-    for raw in found:
-        name, provider = raw.get('id'), raw.get('provider')
-        if not isinstance(name, str) or not name or provider not in EFFORTS_BY_PROVIDER:
-            continue
-        known = _BY_ID.get(name)
-        if known is not None and not known.get('discovered'):
-            continue
-        levels = [level for level in raw.get('reasoning_effort_levels') or ()
-                  if level in EFFORTS_BY_PROVIDER[provider] and level not in _DISCOVERED_REFUSED_LEVELS.get(provider, ())]
-        checked = str(raw.get('checked_at') or _today().isoformat())
-        entry = {'id': name, 'label': str(raw.get('label') or name), 'provider': provider,
-                 'context': int(raw.get('context') or 0) or None, 'max_output': int(raw.get('max_output') or 0) or None,
-                 'reasoning': bool(levels or raw.get('reasoning')), 'tools': bool(raw.get('tools', True)),
-                 'vision': bool(raw.get('vision')), 'verbosity_levels': [], 'reasoning_effort_levels': levels,
-                 'default_reasoning_effort': _recommended_effort(name, levels),
-                 'reasoning_effort_control': 'selectable' if levels else 'provider-managed',
-                 'metadata_checked_at': checked, 'metadata_source': [str(raw.get('source') or '')],
-                 'metadata_status': 'discovered',
-                 'metadata_notes': ("Found in Retool's own model registry (its frontend) by the relay's catalog refresh: "
-                                    "limits and levels are the registry's, not separately audited."),
-                 'route_checked_at': checked, 'route_status': 'verified',
-                 'route_reason': 'A probe question was answered on the Retool route (catalog refresh, %s).' % checked,
-                 'discovered': True}
-        if known == entry:
-            continue
-        if known is None:
-            CATALOG.append(entry)
-        else:
-            CATALOG[CATALOG.index(known)] = entry
-        _BY_ID[name] = entry
-        version = _CLAUDE_VERSION.match(name)
-        if version and '%s%s.%s' % version.groups() not in ALIASES:
-            ALIASES['%s%s.%s' % version.groups()] = name  # claude-fable-5.2 as well as claude-fable-5-2
-        changed.append(name)
-    return changed
+    with _CATALOG_LOCK:
+        changed = []
+        for raw in found:
+            name, provider = raw.get('id'), raw.get('provider')
+            if not isinstance(name, str) or not name or provider not in EFFORTS_BY_PROVIDER:
+                continue
+            known = _BY_ID.get(name)
+            if known is not None and not known.get('discovered'):
+                continue
+            levels = [level for level in raw.get('reasoning_effort_levels') or ()
+                      if level in EFFORTS_BY_PROVIDER[provider] and level not in _DISCOVERED_REFUSED_LEVELS.get(provider, ())]
+            checked = str(raw.get('checked_at') or _today().isoformat())
+            entry = {'id': name, 'label': str(raw.get('label') or name), 'provider': provider,
+                     'context': int(raw.get('context') or 0) or None, 'max_output': int(raw.get('max_output') or 0) or None,
+                     'reasoning': bool(levels or raw.get('reasoning')), 'tools': bool(raw.get('tools', True)),
+                     'vision': bool(raw.get('vision')), 'verbosity_levels': [], 'reasoning_effort_levels': levels,
+                     'default_reasoning_effort': _recommended_effort(name, levels),
+                     'reasoning_effort_control': 'selectable' if levels else 'provider-managed',
+                     'metadata_checked_at': checked, 'metadata_source': [str(raw.get('source') or '')],
+                     'metadata_status': 'discovered',
+                     'metadata_notes': ("Found in Retool's own model registry (its frontend) by the relay's catalog refresh: "
+                                        "limits and levels are the registry's, not separately audited."),
+                     'route_checked_at': checked, 'route_status': 'verified',
+                     'route_reason': 'A probe question was answered on the Retool route (catalog refresh, %s).' % checked,
+                     'discovered': True}
+            if known == entry:
+                continue
+            if known is None:
+                CATALOG.append(entry)
+            else:
+                CATALOG[CATALOG.index(known)] = entry
+            _BY_ID[name] = entry
+            version = _CLAUDE_VERSION.match(name)
+            if version and '%s%s.%s' % version.groups() not in ALIASES:
+                ALIASES['%s%s.%s' % version.groups()] = name  # claude-fable-5.2 as well as claude-fable-5-2
+            changed.append(name)
+        return changed
 
 
 def add_levels(verified):
     """Effort levels Retool's own registry documents for a model and a probe question saw its route take (retool_refresh),
     in place: each joins the model's reasoning_effort_levels, in EFFORT_ORDER, audited entries included. A route whose
     effort is accepted and ignored (GLM, Haiku) and a Minara entry never change. Returns the ids changed."""
-    changed = []
-    for name, added in (verified or {}).items():
-        entry = _BY_ID.get(name)
-        if (entry is None or entry.get('upstream') == 'minara' or entry.get('route_status') != 'verified'
-                or entry.get('reasoning_effort_control') == 'accepted-ignored'):
-            continue
-        known = list(entry.get('reasoning_effort_levels') or ())
-        extra = [level for level in added or () if level in EFFORT_ORDER and level not in known]
-        if not extra:
-            continue
-        levels = [level for level in EFFORT_ORDER if level in known or level in extra]
-        # A new entry rather than an edit, as add_discovered does: a request already holding the old one keeps it.
-        updated = dict(entry, reasoning_effort_levels=levels, reasoning=True, reasoning_effort_control='selectable',
-                       reasoning_effort_added=[level for level in levels if level not in known
-                                               or level in (entry.get('reasoning_effort_added') or ())])
-        if updated.get('default_reasoning_effort') not in levels:
-            updated['default_reasoning_effort'] = _recommended_effort(name, levels)
-        CATALOG[CATALOG.index(entry)] = updated
-        _BY_ID[name] = updated
-        changed.append(name)
-    return changed
+    with _CATALOG_LOCK:
+        changed = []
+        for name, added in (verified or {}).items():
+            entry = _BY_ID.get(name)
+            if (entry is None or entry.get('upstream') == 'minara' or entry.get('route_status') != 'verified'
+                    or entry.get('reasoning_effort_control') == 'accepted-ignored'):
+                continue
+            known = list(entry.get('reasoning_effort_levels') or ())
+            extra = [level for level in added or () if level in EFFORT_ORDER and level not in known]
+            if not extra:
+                continue
+            levels = [level for level in EFFORT_ORDER if level in known or level in extra]
+            # A new entry rather than an edit, as add_discovered does: a request already holding the old one keeps it.
+            updated = dict(entry, reasoning_effort_levels=levels, reasoning=True, reasoning_effort_control='selectable',
+                           reasoning_effort_added=[level for level in levels if level not in known
+                                                   or level in (entry.get('reasoning_effort_added') or ())])
+            if updated.get('default_reasoning_effort') not in levels:
+                updated['default_reasoning_effort'] = _recommended_effort(name, levels)
+            CATALOG[CATALOG.index(entry)] = updated
+            _BY_ID[name] = updated
+            changed.append(name)
+        return changed
 
 
-def _is_claude_route(model):
-    """A catalog id of the Anthropic provider; a name the catalog lacks (strict_models off) counts when it says claude."""
-    entry = _BY_ID.get(model)
-    return entry['provider'] == 'anthropic' if entry else str(model or '').startswith('claude')
+def _entry_is_retool_claude(entry):
+    """True when `entry` (or any target of a route alias) routes to Retool's Anthropic/Claude endpoint."""
+    if not isinstance(entry, dict):
+        return False
+    targets = entry.get('route_targets')
+    if targets:
+        return any(_entry_is_retool_claude(target) for target in targets)
+    if entry.get('upstream', 'retool') != 'retool' or entry.get('provider_id'):
+        return False
+    return entry.get('provider') == 'anthropic'
 
 
-def refuses_forced_tool_choice(model):
+def _is_claude_route(model, entry=None, cfg=None):
+    """A catalog id (or route alias) of a Retool Anthropic route; unknown names count when they say claude."""
+    if isinstance(model, dict) and entry is None:
+        entry = model
+        model = entry.get('id')
+    if entry is not None:
+        return _entry_is_retool_claude(entry)
+    if cfg is not None:
+        resolved = universal_entry(model, cfg)
+        if resolved is not None:
+            return _entry_is_retool_claude(resolved)
+    with _CATALOG_LOCK:
+        known = _BY_ID.get(model)
+    return _entry_is_retool_claude(known) if known is not None else str(model or '').startswith('claude')
+
+
+def refuses_forced_tool_choice(model, entry=None, cfg=None):
     """True when Retool answers 400 to tool_choice any/required/named for the route: every Claude model, with and
     without thinking, at every effort (live probes of 2026-11-06). GPT and GLM take both natively. The relay asks for
     the call in words instead (forced_choice)."""
-    return _is_claude_route(model)
+    return _is_claude_route(model, entry=entry, cfg=cfg)
 
 
-def ignores_output_cap(model):
+def ignores_output_cap(model, entry=None, cfg=None):
     """True when the route takes maxCompletionTokens and does not keep it: a cap of 300 returned 5,466 tokens and
     end_turn from Claude (live probes of 2026-11-06). GPT and GLM keep it. The relay cuts the reply itself
     (adapters.OutputCapAdapter)."""
-    return _is_claude_route(model)
+    return _is_claude_route(model, entry=entry, cfg=cfg)
 
 
 def _today():
@@ -445,8 +472,9 @@ def build_minara_catalog(configs):
 def configure_minara(configs):
     """Install explicitly configured routes; no guessed provider-wide capabilities."""
     routes = build_minara_catalog(configs)
-    _MINARA_MODELS.clear()
-    _MINARA_MODELS.update(routes)
+    with _CATALOG_LOCK:
+        _MINARA_MODELS.clear()
+        _MINARA_MODELS.update(routes)
 
 
 def _minara_reason(entry, cfg):
@@ -576,7 +604,7 @@ def universal_entry(name, cfg=None):
         return prov[name]
     if '/' in name:
         for entry in prov.values():
-            if f"{entry['provider_id']}/{entry['upstream_model']}" == name:
+            if entry.get('provider_id') and entry.get('upstream_model') and f"{entry['provider_id']}/{entry['upstream_model']}" == name:
                 return entry
     return None
 
@@ -605,21 +633,25 @@ def bind_entry_for_backend(entry, backend_cfg):
 def minara_entry(name, cfg=None):
     """The Minara route a client name means: its published minara/<name>, or the older minara/<upstream id>."""
     routes = minara_catalog(cfg)
-    if name in routes:
-        return routes[name]
-    if isinstance(name, str) and name.startswith('minara/'):
-        upstream = name[len('minara/'):]
-        for entry in routes.values():
-            if entry.get('upstream_model') == upstream:
-                return entry
+    with _CATALOG_LOCK:
+        if name in routes:
+            return routes[name]
+        if isinstance(name, str) and name.startswith('minara/'):
+            upstream = name[len('minara/'):]
+            for entry in list(routes.values()):
+                if entry.get('upstream_model') == upstream:
+                    return entry
     return None
 
 
 def catalog(cfg=None):
-    aliases = route_alias_catalog(cfg)
-    base_list = [aliases.get(m['id'], m) for m in CATALOG]
+    aliases = dict(route_alias_catalog(cfg))
+    prov = list(provider_catalog(cfg).values())
+    with _CATALOG_LOCK:
+        base_list = [aliases.get(m['id'], m) for m in CATALOG]
+        minara_items = list(minara_catalog(cfg).values())
     seen = {m['id'] for m in base_list}
-    for item in list(minara_catalog(cfg).values()) + list(provider_catalog(cfg).values()) + list(aliases.values()):
+    for item in minara_items + prov + list(aliases.values()):
         if item['id'] not in seen:
             seen.add(item['id'])
             base_list.append(item)
@@ -875,7 +907,11 @@ def codex_catalog(entries=None, snapshot=None):
     others as copies of their base (same text and overrides): Codex looks a model up by its exact slug in
     a provider catalog, so a virtual model needs its own entry. Without a snapshot the catalog is unchanged.
     """
-    listed = list(CATALOG if entries is None else entries)
+    if entries is None:
+        with _CATALOG_LOCK:
+            listed = list(CATALOG)
+    else:
+        listed = list(entries)
     result = []
     for index, entry in enumerate(listed + virtual_entries(listed, snapshot)):
         model = entry['virtual']['base'] if 'virtual' in entry else entry['id']
@@ -926,7 +962,7 @@ def codex_catalog(entries=None, snapshot=None):
             # without it, which the relay rejects; newer versions ignore the unknown key.
             'supports_parallel_tool_calls': True,
             'truncation_policy': {'mode': 'tokens', 'limit': 10000},
-            'context_window': entry.get('context', 128000),
+            'context_window': entry.get('context') or 128000,
             'effective_context_window_percent': 95,
             'experimental_supported_tools': [],
             'input_modalities': ['text', 'image'] if entry.get('vision') else ['text'],
@@ -1016,26 +1052,62 @@ def parse_model_name(name, cfg=None):
         original = original[:-len('[1m]')].rstrip()
     if minara_entry(original, cfg) is not None or universal_entry(original, cfg) is not None:
         return ModelName(original, None, None)
+    if '#' not in original and '@' not in original and ':' in original:
+        head, tail = original.rsplit(':', 1)
+        candidate = tail.strip().lower()
+        if (
+            candidate in EFFORT_ORDER
+            and not head.endswith(':')
+            and (minara_entry(head.strip(), cfg) is not None or universal_entry(head.strip(), cfg) is not None)
+        ):
+            return ModelName(head.strip(), None, candidate)
     if '#' in original or '@' in original:
-        base = original.split('@', 1)[0].split('#', 1)[0]
+        raw_base = original.split('@', 1)[0].split('#', 1)[0]
+        base = raw_base.strip()
         if (minara_entry(base, cfg) is not None or universal_entry(base, cfg) is not None) and ':' in base:
             # Shield provider ID colons from the legacy effort delimiter below.
-            rest = original[len(base):]
+            rest = original[len(raw_base):].strip()
             profile = None
             effort = None
             if '#' in rest:
-                rest, effort = rest.rsplit('#', 1)
+                rest, raw_effort = rest.rsplit('#', 1)
+                rest = rest.strip()
+                effort = raw_effort.strip().lower()
                 if effort not in EFFORT_ORDER:
                     raise bad_request('invalid reasoning effort suffix', param='model')
+            elif rest.startswith('@') and ':' in rest:
+                head_rest, tail_rest = rest.rsplit(':', 1)
+                cand = tail_rest.strip().lower()
+                if cand in EFFORT_ORDER:
+                    rest, effort = head_rest.strip(), cand
+                else:
+                    raise bad_request("model '%s': '%s' after the profile is not a reasoning effort (%s)"
+                                      % (original[:100], tail_rest.strip()[:40], ', '.join(EFFORT_ORDER)), param='model')
             if rest.startswith('@'):
-                profile = rest[1:]
+                profile = rest[1:].strip()
+                if not profile:
+                    raise bad_request("model '%s' names no profile after '@'" % original[:100], param='model')
                 if not _profile_pattern().fullmatch(profile):
                     raise bad_request('invalid model profile', param='model')
+            elif rest:
+                raise bad_request('invalid model profile', param='model')
             return ModelName(base, profile, effort)
     shown = original[:100]
     text, effort = original, None
     for separator in ('#', ':'):
         if separator in text:
+            if separator == ':' and '/' in text:
+                head, tail = text.rsplit(':', 1)
+                candidate = tail.strip().lower()
+                first_tail = text.split(':', 1)[1]
+                if (
+                    candidate in EFFORT_ORDER
+                    and not head.endswith(':')
+                    and first_tail.split(':', 1)[0].strip().lower() not in EFFORT_ORDER
+                    and (head.count(':') == 0 or head.rsplit(':', 1)[1].strip().lower() not in EFFORT_ORDER)
+                ):
+                    effort, text = candidate, head.strip()
+                    break
             head, tail = text.split(separator, 1)
             candidate = tail.strip().lower()
             if candidate in EFFORT_ORDER:

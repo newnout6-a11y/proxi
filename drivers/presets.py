@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import os
 import re
 import urllib.parse
@@ -253,9 +254,25 @@ def detect_preset_from_url(base_url: str | None) -> str | None:
         "api.together.xyz": "together",
         "api.fireworks.ai": "fireworks",
         "api.moonshot.ai": "moonshot",
+        "api.moonshot.cn": "moonshot",
         "api.siliconflow.com": "siliconflow",
+        "api.siliconflow.cn": "siliconflow",
     }
     return host_map.get(host)
+
+
+def _preset_balance_endpoint(chosen_preset: str | None, spec: dict, norm_base: str) -> str | None:
+    """Derive a regional (.cn) balance endpoint matching `norm_base`'s origin for Moonshot/SiliconFlow."""
+    endpoint = spec.get("balance_endpoint")
+    if not endpoint or chosen_preset not in ("moonshot", "siliconflow"):
+        return endpoint
+    base_parts = urllib.parse.urlsplit(norm_base)
+    host = (base_parts.hostname or "").lower().rstrip(".")
+    suffix = f".{chosen_preset}.cn"
+    if host == f"api{suffix}" or host.endswith(suffix):
+        ep_parts = urllib.parse.urlsplit(endpoint)
+        return urllib.parse.urlunsplit((base_parts.scheme, base_parts.netloc, ep_parts.path, ep_parts.query, ""))
+    return endpoint
 
 
 def identify_connection(
@@ -322,7 +339,7 @@ def identify_connection(
         "base_url": norm_base,
         "auth_mode": resolved_auth,
         "cache_policy": spec.get("cache_policy", "auto"),
-        "balance_endpoint": spec.get("balance_endpoint"),
+        "balance_endpoint": _preset_balance_endpoint(chosen_preset, spec, norm_base),
     }
 
 
@@ -357,6 +374,51 @@ def _derived_credential_id(provider_id: str, index: int) -> str:
     return f"{provider_id}-{digest}"
 
 
+_BOOL_SETTINGS = ("http2", "verify_tls", "use_system_proxy", "direct_cache")
+_POSITIVE_TIMEOUT_SETTINGS = ("connect_timeout", "upstream_timeout", "turn_timeout", "recv_timeout")
+_NONNEG_TIMEOUT_SETTINGS = (
+    "stream_first_token_timeout",
+    "stream_idle_timeout",
+    "stream_tool_timeout",
+    "stream_thinking_timeout",
+)
+
+
+def _extract_runtime_settings(source: dict, where: str, inherited: dict | None = None) -> dict:
+    """Validate and merge per-provider / per-credential transport, balance floor, cache, and timeout settings."""
+    out = dict(inherited or {})
+    for key in _BOOL_SETTINGS:
+        if key in source and source[key] is not None:
+            if type(source[key]) is not bool:
+                raise ValueError(f"{where}: '{key}' must be a boolean")
+            out[key] = source[key]
+    if "user_agent" in source and source["user_agent"] is not None:
+        ua = source["user_agent"]
+        if not isinstance(ua, str) or any(ord(ch) < 32 or ord(ch) == 127 for ch in ua):
+            raise ValueError(f"{where}: user_agent must be a single-line string")
+        cleaned_ua = ua.strip()
+        if cleaned_ua:
+            out["user_agent"] = cleaned_ua
+    if "min_balance_usd" in source and source["min_balance_usd"] is not None:
+        val = source["min_balance_usd"]
+        if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
+            raise ValueError(f"{where}: 'min_balance_usd' must be a non-negative finite number")
+        out["min_balance_usd"] = float(val)
+    for key in _POSITIVE_TIMEOUT_SETTINGS:
+        if key in source and source[key] is not None:
+            val = source[key]
+            if type(val) not in (int, float) or not math.isfinite(val) or val <= 0:
+                raise ValueError(f"{where}: '{key}' must be a positive number")
+            out[key] = val
+    for key in _NONNEG_TIMEOUT_SETTINGS:
+        if key in source and source[key] is not None:
+            val = source[key]
+            if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
+                raise ValueError(f"{where}: '{key}' must be a non-negative finite number")
+            out[key] = val
+    return out
+
+
 def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tuple[dict, list[dict], list[str]]:
     """Validate one provider record (on a copy) and expand its credentials into normalized backend records.
 
@@ -375,11 +437,12 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
     # Support OpenCode-style nested `options: { baseURL, apiKey, headers }` alongside flat fields.
     options = provider.get("options") if isinstance(provider.get("options"), dict) else {}
     raw_base = provider.get("base_url") or provider.get("base") or options.get("baseURL") or options.get("baseUrl")
-    top_key = provider.get("api_key") or provider.get("bearer_token") or options.get("apiKey")
     top_env = provider.get("api_key_env") or provider.get("bearer_token_env")
     if top_env is not None and (not isinstance(top_env, str) or not ENV_PATTERN.fullmatch(top_env)):
         raise ValueError(f"{where}: api_key_env must be a valid environment variable name")
-    resolved_top_key = (os.environ.get(top_env, "") if top_env else "") or (top_key or "")
+    # Explicit api_key_env is authoritative and must not fall back to stale inline api_key / options.apiKey.
+    top_key = None if top_env else (provider.get("api_key") or provider.get("bearer_token") or options.get("apiKey"))
+    resolved_top_key = os.environ.get(top_env, "") if top_env else (top_key or "")
 
     conn = identify_connection(
         api_key=resolved_top_key if isinstance(resolved_top_key, str) else None,
@@ -415,6 +478,7 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
     }
     body_overrides = _validate_body_overrides(provider.get("body_overrides"), where)
     provider_proxy = http_pool.validate_proxy_url(provider.get("proxy_url"))
+    provider_settings = _extract_runtime_settings(provider, where)
 
     models_spec = provider.get("models")
     if models_spec is not None and not isinstance(models_spec, (list, dict)):
@@ -434,8 +498,7 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
                 for k in ("account_id", "label", "priority", "weight", "enabled", "proxy_url")
                 if k in provider
             }
-            | ({"api_key": top_key} if top_key else {})
-            | ({"api_key_env": top_env} if top_env else {})
+            | ({"api_key_env": top_env} if top_env else ({"api_key": top_key} if top_key else {}))
         ]
     elif not isinstance(raw_creds, list) or not raw_creds:
         raise ValueError(f"{where}: credentials must be a non-empty list when provided")
@@ -460,6 +523,7 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
         "models": copy.deepcopy(models_spec) if models_spec is not None else [],
         "model_whitelist": list(whitelist) if whitelist is not None else None,
         "model_blacklist": list(blacklist) if blacklist is not None else None,
+        **provider_settings,
     }
 
     provider_priority = provider.get("priority", 0)
@@ -486,7 +550,11 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
         c_env = cred.get("api_key_env") or cred.get("bearer_token_env")
         if c_env is not None and (not isinstance(c_env, str) or not ENV_PATTERN.fullmatch(c_env)):
             raise ValueError(f"{cwhere}: api_key_env must be a valid environment variable name")
-        c_raw = (os.environ.get(c_env, "") if c_env else "") or cred.get("api_key") or cred.get("bearer_token") or ""
+        # When api_key_env is set, an empty/unset env var must fail loudly rather than falling back to inline keys.
+        if c_env:
+            c_raw = os.environ.get(c_env, "")
+        else:
+            c_raw = cred.get("api_key") or cred.get("bearer_token") or ""
         token = clean_api_key(c_raw) if c_raw else ""
         if conn["auth_mode"] != "none" and not token:
             hint = f" (env {c_env} is empty)" if c_env else ""
@@ -519,6 +587,7 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
         if not isinstance(acc_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", acc_id):
             raise ValueError(f"{cwhere}: invalid credential id '{acc_id}'")
 
+        cred_settings = _extract_runtime_settings(cred, cwhere, inherited=provider_settings)
         records.append({
             "account_id": acc_id,
             "upstream": conn["driver"],
@@ -545,6 +614,7 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
             "weight": float(weight),
             "label": label,
             "_provider_meta": meta,
+            **cred_settings,
         })
 
     return meta, records, secrets_found

@@ -10,6 +10,7 @@ import os
 import pathlib
 import tempfile
 import threading
+import time
 
 import console_log
 from drivers import http_pool
@@ -17,6 +18,8 @@ import journal
 
 AUTO_NAME = "provider_models.auto.json"
 MAX_ANTHROPIC_PAGES = 5
+_OVERLAY_IO_LOCK = threading.Lock()
+_REPLACE_ATTEMPTS = 5
 
 _NON_CHAT_PATTERNS = (
     "*embed*",
@@ -43,10 +46,11 @@ def load_overlay(path: str | os.PathLike | None) -> dict[str, list[dict]]:
     """Read `provider_models.auto.json` -> `{provider_id: [discovered_model_dict, ...]}`."""
     if not path:
         return {}
-    try:
-        raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    with _OVERLAY_IO_LOCK:
+        try:
+            raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
     providers = raw.get("providers") if isinstance(raw, dict) else None
     if not isinstance(providers, dict):
         return {}
@@ -57,6 +61,18 @@ def load_overlay(path: str | os.PathLike | None) -> dict[str, list[dict]]:
     return out
 
 
+def _replace_with_retry(tmp: str, target: pathlib.Path) -> None:
+    """Replace `target` atomically, retrying transient Windows file-sharing PermissionError."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError:
+            if attempt + 1 == _REPLACE_ATTEMPTS:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def save_overlay(path: str | os.PathLike | None, providers_map: dict[str, list[dict]]) -> bool:
     if not path:
         return False
@@ -65,15 +81,24 @@ def save_overlay(path: str | os.PathLike | None, providers_map: dict[str, list[d
         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "providers": providers_map,
     }
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".prov_models_", suffix=".tmp", dir=str(target.parent))
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, target)
-        return True
-    except OSError:
-        return False
+    with _OVERLAY_IO_LOCK:
+        tmp = None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".prov_models_", suffix=".tmp", dir=str(target.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            _replace_with_retry(tmp, target)
+            tmp = None
+            return True
+        except OSError:
+            return False
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 DEFAULT_USER_AGENT = "Proxi-Gateway/2.0"
@@ -327,6 +352,30 @@ class UniversalCatalogRefresher:
                 chosen[pid] = acc_cfg
         return chosen
 
+    def _active_provider_ids(self) -> set[str]:
+        """Configured universal provider IDs (including disabled/non-auto-discover) currently alive in cfg/pool."""
+        meta_map = self.cfg.get("_providers_meta")
+        providers_raw = self.cfg.get("providers")
+        if isinstance(meta_map, dict) or isinstance(providers_raw, list):
+            ids: set[str] | None = None
+            if isinstance(meta_map, dict):
+                ids = set(meta_map.keys())
+            if isinstance(providers_raw, list):
+                raw_ids = {
+                    str(p.get("id") or "").strip().lower()
+                    for p in providers_raw
+                    if isinstance(p, dict) and str(p.get("id") or "").strip()
+                }
+                ids = raw_ids if ids is None else (ids & raw_ids)
+            return ids or set()
+        pool = getattr(getattr(self.runtime, "pool", None), "backends", None)
+        configs = [b.cfg for b in pool] if pool is not None else (self.cfg.get("accounts") or [])
+        return {
+            str(acc_cfg.get("provider_id"))
+            for acc_cfg in configs
+            if isinstance(acc_cfg, dict) and acc_cfg.get("provider_id")
+        }
+
     async def refresh_async(self, provider_id: str | None = None) -> dict:
         from catalog import models_dev, router
         import models as model_catalog
@@ -339,17 +388,14 @@ class UniversalCatalogRefresher:
 
         targets = self._universal_provider_backends(provider_id)
         path = overlay_path(self.cfg.get("_config_path"))
-        current_overlay = load_overlay(path)
         results: dict[str, dict] = {}
-        changed = False
+        discovered_by_pid: dict[str, tuple[dict, list[dict]]] = {}
 
         for pid, acc_cfg in targets.items():
             try:
                 found = await discover_provider_models(acc_cfg)
                 results[pid] = {"ok": True, "count": len(found)}
-                if current_overlay.get(pid) != found:
-                    current_overlay[pid] = found
-                    changed = True
+                discovered_by_pid[pid] = (acc_cfg, found)
             except Exception as exc:  # noqa: BLE001
                 msg = journal.scrub(str(exc))[:240]
                 results[pid] = {"ok": False, "error": msg}
@@ -361,17 +407,45 @@ class UniversalCatalogRefresher:
                     error=msg,
                 )
 
-        if changed and path is not None:
-            save_overlay(path, current_overlay)
-
-        # Rebuild runtime catalogs in place
-        self.cfg["_discovered_provider_models"] = current_overlay
-        self.cfg["_provider_models"] = router.build_provider_catalog(self.cfg, current_overlay)
-        self.cfg["_route_aliases"] = router.build_route_aliases(self.cfg, model_catalog)
+        changed = False
+        pruned = False
         with self._lock:
+            active_targets = self._universal_provider_backends(provider_id)
+            valid_pids = self._active_provider_ids()
+            current_overlay = (
+                load_overlay(path)
+                if path is not None
+                else dict(self.cfg.get("_discovered_provider_models") or {})
+            )
+            for stale_pid in [pid for pid in current_overlay if pid not in valid_pids]:
+                current_overlay.pop(stale_pid, None)
+                pruned = True
+            for pid, (orig_cfg, found) in discovered_by_pid.items():
+                current_cfg = active_targets.get(pid)
+                if current_cfg is None or pid not in valid_pids:
+                    results.pop(pid, None)
+                    continue
+                if (current_cfg.get("base_url") or current_cfg.get("base")) != (
+                    orig_cfg.get("base_url") or orig_cfg.get("base")
+                ):
+                    results.pop(pid, None)
+                    continue
+                if current_overlay.get(pid) != found:
+                    current_overlay[pid] = found
+                    changed = True
+
+            if (changed or pruned) and path is not None:
+                save_overlay(path, current_overlay)
+
+            # Rebuild runtime catalogs atomically under lock
+            self.cfg["_discovered_provider_models"] = current_overlay
+            self.cfg["_provider_models"] = router.build_provider_catalog(self.cfg, current_overlay)
+            self.cfg["_route_aliases"] = router.build_route_aliases(self.cfg, model_catalog)
+            for pid in [p for p in results if p not in valid_pids]:
+                results.pop(pid, None)
             self.last_refresh.update(results)
 
-        if changed and callable(self.after_look):
+        if (changed or pruned) and callable(self.after_look):
             try:
                 await asyncio.to_thread(self.after_look, "providers")
             except Exception:

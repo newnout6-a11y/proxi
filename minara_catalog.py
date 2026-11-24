@@ -12,6 +12,7 @@ import copy
 import datetime
 import json
 import pathlib
+import threading
 
 FILE = pathlib.Path(__file__).with_name('minara_models.json')
 # What the relay measured by itself after this file was made (minara_refresh): a model Minara added, a new price, a model
@@ -53,6 +54,13 @@ def when(value):
 MEASURED, CREDITS_PER_USD = load()
 SHIPPED = dict(MEASURED)  # this file's entries, whatever an overlay put over them
 GENERATED_AT = _read(FILE).get('generated_at')
+_LOCK = threading.RLock()
+
+
+def snapshot():
+    """Return a shallow copy of the measured catalog under lock for safe iteration."""
+    with _LOCK:
+        return dict(MEASURED)
 
 
 def overlay_wins(entry, shipped=None, generated_at=None):
@@ -69,19 +77,20 @@ def apply_overlay(path):
     """Put the entries of an overlay file (minara_refresh writes it) over the measured catalog, in place; their ids.
 
     An entry wins over the shipped one only when newer than the shipped file; an unreadable overlay changes nothing."""
-    data = _read(path) if path else {}
-    changed = []
-    for upstream, entry in (data.get('models') or {}).items():
-        if not isinstance(entry, dict) or entry.get('upstream_model') != upstream:
-            continue
-        if overlay_wins(entry, SHIPPED.get(upstream)):
-            if MEASURED.get(upstream) != entry:
-                MEASURED[upstream] = entry
+    with _LOCK:
+        data = _read(path) if path else {}
+        changed = []
+        for upstream, entry in (data.get('models') or {}).items():
+            if not isinstance(entry, dict) or entry.get('upstream_model') != upstream:
+                continue
+            if overlay_wins(entry, SHIPPED.get(upstream)):
+                if MEASURED.get(upstream) != entry:
+                    MEASURED[upstream] = entry
+                    changed.append(upstream)
+            elif upstream in SHIPPED and MEASURED.get(upstream) is not SHIPPED[upstream]:
+                MEASURED[upstream] = SHIPPED[upstream]
                 changed.append(upstream)
-        elif upstream in SHIPPED and MEASURED.get(upstream) is not SHIPPED[upstream]:
-            MEASURED[upstream] = SHIPPED[upstream]
-            changed.append(upstream)
-    return changed
+        return changed
 
 
 def overlay_path(config_path):
@@ -102,7 +111,8 @@ def upstream_of(ident, measured=None):
 
     Accepts the upstream id itself (anthropic/claude-opus-5.5), the published name (minara/claude-opus-5-5) and the older
     minara/<upstream id> (minara/anthropic/claude-opus-5.5)."""
-    measured = MEASURED if measured is None else measured
+    if measured is None or measured is MEASURED:
+        measured = snapshot()
     if not isinstance(ident, str) or not ident:
         return None
     if ident in measured:
@@ -111,7 +121,7 @@ def upstream_of(ident, measured=None):
         rest = ident[len('minara/'):]
         if rest in measured:
             return rest
-        for upstream, entry in measured.items():
+        for upstream, entry in list(measured.items()):
             if entry.get('id') == ident:
                 return upstream
         return rest if '/' in rest else None
@@ -132,8 +142,11 @@ def _effort_control(entry, studied=None):
 
 def route(upstream, descriptor=None, measured=None):
     """The relay's model entry for one upstream id: the measurement, then the account's overrides."""
-    measured = MEASURED if measured is None else measured
-    found = measured.get(upstream) or {}
+    if measured is None or measured is MEASURED:
+        with _LOCK:
+            found = MEASURED.get(upstream) or {}
+    else:
+        found = measured.get(upstream) or {}
     value = dict(descriptor or {})
     tools = value.get('tools', found.get('tools'))
     vision = value.get('image', found.get('vision'))
@@ -179,12 +192,13 @@ def route(upstream, descriptor=None, measured=None):
 def descriptors(cfg):
     """(upstream id, overrides) for every model this Minara account serves."""
     listed = cfg.get('minara_models')
+    measured = snapshot()
     if not listed:
-        return [(upstream, None) for upstream, entry in MEASURED.items() if entry.get('status') in PUBLISHED]
+        return [(upstream, None) for upstream, entry in measured.items() if entry.get('status') in PUBLISHED]
     result = []
     for item in listed:
         value = {'id': item} if isinstance(item, str) else dict(item)
-        upstream = upstream_of(value.get('id'))
+        upstream = upstream_of(value.get('id'), measured=measured)
         if upstream is not None:
             result.append((upstream, {key: value[key] for key in OVERRIDABLE if key in value} or None))
     return result
