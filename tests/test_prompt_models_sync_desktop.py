@@ -50,7 +50,7 @@ def test_virtual_rows_follow_the_user_rows_and_take_their_base_models_selectors(
     by_name = {row['name']: row for row in rows}
     assert by_name['claude-opus-5-5@mine'] == {
         'name': 'claude-opus-5-5@mine', 'labelOverride': 'Claude Opus 5.5 (profile mine)', 'isFamilyDefault': False,
-        'anthropicFamilyTier': 'opus', 'maxEffort': 'high'}
+        'anthropicFamilyTier': 'opus', 'behavesAs': 'claude-opus-5-5', 'maxEffort': 'high'}
     assert by_name['claude-opus-4-6@mine']['maxEffort'] == 'max'  # Opus 4.6's own four-level picker, not Opus 5's
     assert by_name['claude-opus-4-6@mine']['isFamilyDefault'] is False
     haiku = by_name['claude-haiku-4-5-20251001@mine']
@@ -123,7 +123,7 @@ def test_a_hand_edited_virtual_row_keeps_its_own_fields_like_any_row(tmp_path, m
     assert code == 0, error
     assert saved_rows(path)['claude-opus-5-5@mine'] == {
         'name': 'claude-opus-5-5@mine', 'labelOverride': 'My Opus', 'supports1m': True, 'isFamilyDefault': False,
-        'anthropicFamilyTier': 'opus', 'maxEffort': 'high'}
+        'anthropicFamilyTier': 'opus', 'behavesAs': 'claude-opus-5-5', 'maxEffort': 'high'}
     assert 'claude-opus-5-5@mine' not in report['added']
 
 

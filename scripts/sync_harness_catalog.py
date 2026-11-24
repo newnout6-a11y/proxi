@@ -25,9 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import models
 from scripts import sync_virtual_models
 from scripts.probe_client_settings import routable_entries
-from scripts.sync_opencode_catalog import (MASK, UNKNOWN_CONTEXT, UNKNOWN_OUTPUT, is_environment_list, is_secret_flag,
-                                           is_secret_key, mask_string, mask_text, read_file, write_backed_up,
-                                           write_preview)
+from scripts.sync_opencode_catalog import (MASK, UNKNOWN_CONTEXT, UNKNOWN_OUTPUT, _positive_int, is_environment_list,
+                                           is_secret_flag, is_secret_key, mask_string, mask_text, read_file,
+                                           write_backed_up, write_preview)
 
 STR = 'tag:yaml.org,2002:str'
 HARNESS_THINKING_LEVELS = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
@@ -124,9 +124,9 @@ def update_document(document, entries):
         updated = []
         for entry in selected:
             item = _copy(old.get(entry['id']) or {})
-            item.update(id=entry['id'], name=entry['label'],
-                        contextWindow=entry['context'] or UNKNOWN_CONTEXT,
-                        maxTokens=entry['max_output'] or UNKNOWN_OUTPUT,
+            item.update(id=entry['id'], name=entry.get('label') or entry['id'],
+                        contextWindow=_positive_int(entry.get('context'), UNKNOWN_CONTEXT),
+                        maxTokens=_positive_int(entry.get('max_output'), UNKNOWN_OUTPUT),
                         input=['text', 'image'] if entry.get('vision') else ['text'])
             item['reasoningEfforts'] = _harness_efforts(entry, provider.get('reasoning'))
             updated.append(item)

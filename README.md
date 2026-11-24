@@ -37,10 +37,23 @@ Gemini, Grok, GLM, DeepSeek, Kimi и другие) через Bearer-автор�
   из KV-кэша Retool) и нативной поддержкой клиентских инструментов. Первый токен —
   около 1.5–2 секунд вместе с контекстом. Устаревший WebSocket sandbox-путь отключён.
   Замеры — [docs/direct-transport.md](docs/direct-transport.md).
+- Защищённый HTTP/TLS-транспорт и отмена стрима: пул сессий Retool `drivers/curl_pool.py`
+  с профилем `chrome152`, общий HTTP/2-пул `drivers/http_pool.py` (`retool_http_backend`),
+  индивидуальные `proxy_url`/`impersonate` на уровне аккаунта или провайдера, немедленная
+  отмена upstream-стрима при обрыве клиента (`make_stream_abort`) и белый список заголовков
+  `anthropic-beta` (`SAFE_ANTHROPIC_BETAS` в `drivers/anthropic_messages.py`).
+- Универсальные провайдеры и маршруты: `providers[]` с пресетами `drivers/presets.py`
+  (OpenAI, Responses, Anthropic, OpenRouter, DeepSeek, Gemini, Groq, xAI, Mistral, локальные
+  Ollama/vLLM/LM Studio и др.) и `routes[]` для пользовательских алиасов моделей с несколькими `targets[]` и стратегией маршрутизации.
 - Управление системным промптом без перезапуска: файл `prompts.json` с профилями и правилами
   (по клиенту, модели, назначению запроса и заголовку), правки system клиента, истории и описаний
-  tools, предпросмотр итогового промпта и просмотр того, что увидела модель. Без файла поведение
+  tools, предпросмотр итогового промпта и просмотр того, что увидела модель. Виртуальные модели
+  `@<profile>` доступны в runtime только при включённом `publish_as_model` (иначе 404), а привязка
+  ревизий диалогов ведётся по модели (`per-model pins`) с защитой compaction. Без файла поведение
   прежнее. Руководство — [docs/prompt-control.md](docs/prompt-control.md).
+- Структурированное логирование консоли и событий: `RELAY_LOG_FORMAT` (`text`, `structured`
+  или `jsonl` для JSONL-записей) через `console_log.py` / `console_records.py`
+  и автоматическая синхронизация каталогов OpenCode и DeepSeek Harness (`client_sync.py`).
 
 ## Установка
 
@@ -981,8 +994,16 @@ JSON-объектами с `ts`, `kind` и `level`. Для файла целик
 | account_refresh_parallel | 3 — сколько фоновых проверок аккаунтов (продление/баланс) диспетчер ведёт одновременно; на запрос баланса по `/v1/balance`, `/health` и в админке не влияет (там до 8 параллельно) |
 | retool_catalog_refresh_hours | 6 — как часто relay сам читает реестр моделей Retool и публикует новую чатовую модель, ответившую на вопрос (часы, 0–168; 0 — не проверять), см. «Каталог Retool обновляется сам» |
 | retool_catalog_probes | 10 — сколько новых моделей Retool одна проверка может спросить (0–50) |
+| impersonate | `"chrome152"` — TLS/HTTP-профиль `curl_cffi` для Retool по умолчанию; можно переопределить внутри записи `accounts[]` |
+| proxy_url | `""` — HTTP/HTTPS/SOCKS5-прокси по умолчанию или в записи `accounts[]` / `providers[]` (системные env-прокси не подставляются) |
+| http2 | `true` — включить HTTP/2 для upstream-подключений |
+| retool_http_backend | `"curl_cffi"` — HTTP-клиент для Retool (`curl_cffi` через `drivers/curl_pool.py` или `httpx`) |
+| providers | `null` — список универсальных API-провайдеров `providers[]`; `null` сохраняет корневую/legacy-настройку Retool |
+| routes | `[]` — пользовательские алиасы моделей `{id (или alias), targets[], label, strategy, enabled}` поверх активного каталога |
 | opencode_sync | true — после каждой проверки каталога (Retool и Minara) relay сам переписывает список своих моделей в файле настроек OpenCode, с резервной копией в `catalog-backups`; `false` — файл OpenCode не трогается, см. «Каталог Retool обновляется сам» |
 | opencode_settings | "" — файл настроек OpenCode для `opencode_sync`; пусто — `~/.config/opencode/opencode.jsonc` или `opencode.json` |
+| harness_sync | true — после обновления каталога relay автоматически переписывает модели активного профиля DeepSeek Harness (`cordis.patch.yml` / `settings.yaml`) с резервной копией; работает независимо от `opencode_sync` |
+| harness_settings | "" — явный путь к конфигу DeepSeek Harness для `harness_sync`; пусто — автоопределение активного профиля `~/.dsh` |
 | account_move_keeps_history | false — диалог, которому приходится сменить аккаунт (баланс, вход, часовой лимит, нет маршрута), оставляет на старом подписанные блоки рассуждений: его первый запрос на новом отличается от закэшированного, и весь префикс пишется заново (79 тыс.–580 тыс. токенов в журнале, 8–58 кредитов, 38 с до первого токена). Кэш провайдера при этом общий для аккаунтов (префикс, записанный на одном аккаунте, целиком прочитан на другом: 12 пар из 12, 2026-11-07), так что переписывать его заставляет потеря подписей, а не смена аккаунта. `true` — подписанные ветки едут с диалогом как восстановленные с диска (`carried_branches` в `account.migrate`); принимает ли upstream подпись на другом аккаунте, не проверено, поэтому отказ, который называет блоки, забывает ветки, а следующий запрос уходит без подписей, как раньше. Применяется сразу |
 | account_rate_limit_cooldown | 900 — на сколько секунд аккаунт уходит из пула после ответа Retool о часовом лимите managed-ключей (1–3600); повтор сразу после возврата удлиняет паузу на 5 минут за раз, потолок — большее из этого значения и 20 минут; заголовок `Retry-After`, если Retool его пришлёт, главнее. Применяется после перезапуска |
 | account_rate_limit_wait | 0 — сколько секунд (0–120) запрос диалога с префиксом не меньше 8000 токенов один раз ждёт аккаунт, ответивший о часовом лимите, и спрашивает его ещё раз, прежде чем диалог переедет на другой аккаунт и запишет весь префикс заново; аккаунт на время ожидания не исключается; `Retry-After`, если Retool его пришлёт и он не больше значения, задаёт ожидание, без него ждём всё значение; `0` — переезжать сразу. Применяется сразу. Подробности: «Установка», пункт про часовой лимит Retool |
@@ -1251,18 +1272,21 @@ retool-edge.com): названия, окна, пределы вывода, ур�
 
 Всё это relay пишет в `retool_models.auto.json` рядом с `config.json` (в git не попадает) и
 кладёт в каталог при каждом запуске. Запись из ручного каталога всегда главнее. Codex и Claude
-Code видят новую модель и новые уровни сразу. Список моделей **OpenCode** relay обновляет сам
-(`client_sync.py`, настройка `opencode_sync`). После каждой проверки каталога, Retool или
-Minara, он запускает `scripts/sync_opencode_catalog.py --write` для файла настроек OpenCode:
-`opencode_settings`, а если она пуста — `~/.config/opencode/opencode.jsonc` (или
-`opencode.json`). Актуальный список не переписывается. Перед каждым изменением прежний файл
-сохраняется в `catalog-backups` рядом с ним. Итог — событие `client.opencode_synced` или
-`client.opencode_sync_failed` в журнале и строка `[catalog] OpenCode: …` в консоли. Служба
-OpenCode 2.x (`opencode-cli serve --service`) перечитывает файл сама; уже открытое окно OpenCode
-может понадобиться перезагрузить. Раньше список
-обновлялся только ручным запуском скрипта: 14 ноября у Gemini 4 Argon в OpenCode не было ни
-одного уровня effort, хотя relay получил их накануне. Список Claude Desktop по-прежнему правится
-вручную.
+Code видят новую модель и новые уровни сразу. Списки моделей **OpenCode** и **DeepSeek Harness**
+relay обновляет сам (`client_sync.py`). После каждой проверки каталога (Retool, Minara или
+универсальных `providers[]` / `routes[]`) он запускает `scripts/sync_opencode_catalog.py --write`
+для OpenCode (`opencode_sync`, путь `opencode_settings`, а если она пуста —
+`~/.config/opencode/opencode.jsonc` или `opencode.json`) и независимо —
+`scripts/sync_harness_catalog.py --write` для активного профиля DeepSeek Harness
+(`harness_sync`, путь `harness_settings` или автопоиск `~/.dsh`). Актуальные списки не
+переписываются. Перед каждым изменением прежний файл сохраняется в `catalog-backups` рядом с ним
+(на Windows с безопасной атомарной заменой и повторами при временных блокировках). Итог —
+событие `client.opencode_synced` / `client.harness_synced` (или `*_sync_failed`) в журнале и строка
+`[catalog] OpenCode: …` / `[catalog] DeepSeek Harness (…): …` в консоли. Служба OpenCode 2.x
+(`opencode-cli serve --service`) перечитывает файл сама; уже открытое окно OpenCode или Harness
+может понадобиться перезагрузить. Раньше список обновлялся только ручным запуском скрипта: 14 ноября
+у Gemini 4 Argon в OpenCode не было ни одного уровня effort, хотя relay получил их накануне.
+Список Claude Desktop по-прежнему обновляется вручную скриптом `scripts/sync_claude_desktop_catalog.py`.
 
 ### Окно контекста у клиентов Claude
 
@@ -1947,11 +1971,11 @@ relay с этим делает. 429 приходит до начала гене�
 | Слой | Модули |
 |---|---|
 | HTTP и входящие запросы | `proxy.py` (сервер, маршруты, лимиты, слоты), `auth.py` (ключ relay, заголовки upstream), `validate.py` (строгий разбор трёх диалектов), `apierr.py` (ошибки в форме OpenAI/Anthropic), `sse.py`, `io_workers.py` |
-| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `stream_watchdog.py` (таймауты первого токена, простоя и tool-call при стриминге), `drivers/` (реестр драйверов апстримов, пул `httpx`, пресеты провайдеров), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `minara.py` (транспорт Minara: чат и `/v1/messages`), `cost_guard.py` (защита по цене: оценка запроса Minara до отправки и потолки), `upstream_attempts.py`, `upstream_diagnostics.py` |
+| Ход и диалог | `orchestrator.py` (ход, контекст, exec-цикл), `session.py` (пул диалогов, выбор аккаунта, повторы, отмена), `stream_watchdog.py` (таймауты первого токена, простоя и tool-call при стриминге), `drivers/` (реестр драйверов апстримов, Chrome/152 пул `drivers/curl_pool.py`, HTTP/2-пул `drivers/http_pool.py`, пресеты `drivers/presets.py`, `SAFE_ANTHROPIC_BETAS`, немедленная отмена стрима), `direct.py` (прямой транспорт Retool, кэш, keepwarm), `minara.py` (транспорт Minara: чат и `/v1/messages`), `cost_guard.py` (защита по цене: оценка запроса Minara до отправки и потолки), `upstream_attempts.py`, `upstream_diagnostics.py` |
 | История между ходами и перезапусками | `native_history.py`, `conversation_state.py`, `conversation_infer.py`, `compaction_tools.py`, `summary_guard.py` |
 | Ответ клиенту | `adapters.py` (Chat, Responses, Messages), `structured.py`, `forced_choice.py`, `generation.py`, `web_search.py` |
 | Клиенты и системный промпт | `client_context.py`, `context.py`, `prompt_policy.py` (профили и правила `prompts.json`), `prompt_body.py` (правки истории и tools), `prompt_stabilizer.py`, `tool_names.py`, `tool_union.py`, `tool_search_policy.py` |
-| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей), `catalog/` (`models.dev` метаданные и цены, автодискавери `/models`, маршруты/алиасы `routes[]`), `minara_accounts.py` (токены Minara и их срок), `minara_catalog.py` (опубликованные модели Minara), `minara_refresh.py` (каталог Minara обновляется сам), `minara_probe.py` (замеры моделей Minara), `retool_catalog.py` (реестр моделей Retool), `retool_refresh.py` (каталог Retool обновляется сам), `retool_plans.py` (отказы тарифа Retool переживают перезапуск: `retool_plans.auto.json`), `client_sync.py` (список моделей OpenCode обновляется сам) |
+| Аккаунты, каталог, кредиты | `config.py`, `accounts.py` (диспетчер аккаунтов), `account_report.py`, `upstream_refresh.py` (продление сессий Retool), `credits.py`, `models.py` (каталог моделей), `catalog/` (`models.dev` метаданные и цены, автодискавери `/models`, универсальные `providers[]`, маршруты/алиасы `routes[]`), `minara_accounts.py` (токены Minara и их срок), `minara_catalog.py` (опубликованные модели Minara), `minara_refresh.py` (каталог Minara обновляется сам), `minara_probe.py` (замеры моделей Minara), `retool_catalog.py` (реестр моделей Retool), `retool_refresh.py` (каталог Retool обновляется сам), `retool_plans.py` (отказы тарифа Retool переживают перезапуск: `retool_plans.auto.json`), `client_sync.py` (списки моделей OpenCode и DeepSeek Harness обновляются сами) |
 | Наблюдаемость, админка, команды | `journal.py`, `console_log.py`, `console_clock.py` (время в строках консоли), `console_records.py` (JSONL), `redact.py`, `admin.py`, `executor.py` (локальные команды по allowlist) |
 
 Путь запроса: proxy.py (HTTP/роутинг/лимиты) -> validate.py (строгая схема) -> orchestrator.py
