@@ -865,6 +865,13 @@ tools." in 2.1.316 (an unofficial
 product is closed and Anthropic documents the instruction only in prose) and "Your task is to
 create a detailed summary of the conversation so far" in earlier versions.
 
+### Effort on a gateway model
+
+Claude Code and Claude Desktop have separate settings. For Claude Code 2.1.330,
+`claude --model minara/claude-sonnet-5-5 --effort low` sends `output_config.effort`
+for this model. A global `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT` override is unnecessary
+for this tested model and would affect other model IDs as well.
+
 ## Claude Desktop on Windows
 
 The installed 4.4212.0.0 client reads its configuration from one source, chosen
@@ -896,6 +903,14 @@ private. Nothing is written and no backup is made when the generated list equals
 the existing one, compared as parsed JSON so another layout does not count: the
 summary then shows `written: false, changed: false` (a preview shows `changed` as
 well, and `written` is `false` until `--write` has actually replaced something).
+For a `minara/claude-*` row, `maxEffort` limits the picker; it does not identify
+the native Claude model whose capabilities the picker uses. A missing `behavesAs`
+can leave an existing row without the effort picker. Preview with
+`python scripts/sync_claude_desktop_catalog.py --effort-only`. Then add `--write
+--backup-dir PATH` to update only `behavesAs` and `maxEffort` on existing rows.
+This keeps the default, list order, aliases already supplied by the user, and
+context settings. Run a full sync separately when the model list needs to change.
+
 Quit Desktop first: it reads its configuration at launch. Every other
 key, the endpoint, the gateway key and the authentication scheme stay untouched.
 The script never writes `HKLM` and never creates a policy: a policy that sets any

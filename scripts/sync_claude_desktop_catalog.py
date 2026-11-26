@@ -246,6 +246,27 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
     return result
 
 
+def refresh_effort_fields(previous, generated):
+    """Refresh the picker on existing rows without changing membership, order or other settings."""
+    if not isinstance(previous, list) or any(not isinstance(item, (dict, str)) for item in previous):
+        raise ValueError('Expected an existing Claude Desktop model policy list')
+    by_name = _rows_by_name(generated)
+    result = []
+    for item in previous:
+        row = {'name': item} if isinstance(item, str) else dict(item)
+        name = row.get('name')
+        entry = by_name.get(name) if isinstance(name, str) else None
+        if entry is not None:
+            if not row.get('behavesAs') and entry.get('behavesAs'):
+                row['behavesAs'] = entry['behavesAs']
+            if 'maxEffort' in entry:
+                row['maxEffort'] = entry['maxEffort']
+            else:
+                row.pop('maxEffort', None)
+        result.append(item if isinstance(item, str) and len(row) == 1 else row)
+    return result
+
+
 def changed_fields(previous, result):
     """Every field an existing row loses or changes: [{model, field, was, now}]; null stands for absent.
 
@@ -253,6 +274,8 @@ def changed_fields(previous, result):
     """
     old, absent, changes = _rows_by_name(previous), object(), []
     for row in result:
+        if not isinstance(row, dict) or not isinstance(row.get('name'), str):
+            continue
         before = old.get(row['name'])
         if before is None:
             continue
@@ -579,13 +602,18 @@ def run(args):
     entries = [entry for entry in models.catalog(relay) if models.catalog_routable(entry, relay)]
     entries, virtual = sync_virtual_models.with_virtual_models(entries, args)
     desktop = _catalog_hint(args, warnings)
-    result = build_catalog(entries, previous, default_model=args.default_model, desktop=desktop,
+    result = build_catalog(entries, [] if args.effort_only else previous,
+                           default_model=args.default_model, desktop=desktop,
                            include_unlisted=args.include_unlisted,
                            allow_downgrade=relay['allow_effort_downgrade'])
-    before, after = _names(previous), [item['name'] for item in result]
+    if args.effort_only:
+        result = refresh_effort_fields(previous, result)
+    before, after = _names(previous), _names(result)
+    if not after:
+        raise SyncError('Refusing to write or preview an empty Claude Desktop model list')
     skipped = ([entry['id'] for entry in claude_routes(entries) if _base_id(entry) not in desktop]
                if desktop is not None and not args.include_unlisted else [])
-    if any(name in skipped for name in before):
+    if not args.effort_only and any(name in skipped for name in before):
         warnings.append('Removed rows the Anthropic catalog does not list for Code/Cowork: %s; '
                         '--include-unlisted keeps them' % ', '.join(name for name in before if name in skipped))
     virtual_names = {entry['id'] for entry in entries if 'virtual' in entry}
@@ -641,8 +669,11 @@ def main(argv=None):
                              r'(default %%LOCALAPPDATA%%\Claude-3p\model-catalog\published.json)')
     parser.add_argument('--include-unlisted', action='store_true',
                         help="Also list Claude routes the catalog does not offer for Code/Cowork")
-    parser.add_argument('--default-model',
-                        help="Make this model first (Desktop's default); otherwise the order is kept")
+    picker_mode = parser.add_mutually_exclusive_group()
+    picker_mode.add_argument('--default-model',
+                             help="Make this model first (Desktop's default); otherwise the order is kept")
+    picker_mode.add_argument('--effort-only', action='store_true',
+                             help='Refresh effort metadata on existing rows without changing the list or default')
     parser.add_argument('--output', help='New private preview; never overwritten')
     parser.add_argument('--write', action='store_true')
     parser.add_argument('--backup-dir',
