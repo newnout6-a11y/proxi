@@ -17,3 +17,8 @@ ruamel.yaml>=0.18.6,<0.19
 
 # Browser TLS impersonation required by the optional Minara upstream.
 curl_cffi==0.17.0
+
+# Time zone data for zoneinfo, which Windows does not ship: Minara price expressions that read the clock (hour(), day())
+# name a zone (minara.py), and without it every zone is unknown and the price cannot be read (a clean CI install failed
+# test_the_clock_functions_read_the_time_in_their_zone, so CI on main was red).
+tzdata>=2025.2
