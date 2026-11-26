@@ -19,7 +19,8 @@ import zoneinfo
 
 import apierr
 import client_context
-from drivers import curl_pool, http_pool
+import conversation_state
+from drivers import cache_engine, curl_pool, http_pool
 import forced_choice
 import journal
 
@@ -29,6 +30,107 @@ HEAD_WARM = 3300.0  # seconds a Claude head used by a request stays readable wit
 SILENCE_LIMIT = 600.0  # seconds a reply may send nothing (a model that reasons before it writes) before curl cuts it  # Claude Code's attribution line (prompt_policy.BILLING_PREFIX)
 MAX_EVENT_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 128
+RESPONSES_ENDPOINTS = ("openai-response", "responses")
+_RESPONSES_UNSUPPORTED_MARKS = (
+    b"unsupported endpoint",
+    b"invalid url",
+    b"unknown endpoint",
+    b"route not found",
+    b"endpoint not found",
+    b"does not support responses",
+    b"not support responses",
+    b"responses api is not supported",
+    b"responses endpoint is not supported",
+    b"unsupported api",
+    b"unknown route",
+    b"404 page not found",
+)
+
+
+def _strip_billing_prefix(head):
+    """Strip Claude Code's per-conversation attribution header so instructions share cache keys."""
+    first, separator, rest = (head or "").partition("\n")
+    if first.startswith(BILLING_PREFIX) and separator:
+        # Claude Code's attribution line (x-anthropic-billing-header: cc_version=...; cch=<per-conversation>;) goes
+        # nowhere on Minara. Glued to the instructions, it made Minara drop the whole system prompt: 25 prompt tokens, the
+        # model knew none of the rules (Opus 5.5 and 4.7, 2026-11-10), so Claude Code ran without its system prompt on
+        # minara/claude-*. Without it the instructions arrive, and every conversation of a client has the same head: its
+        # fingerprint no longer splits the cache, so subagents read the head one of them wrote.
+        return rest
+    return head or ""
+
+
+def _normalize_endpoint_types(raw):
+    if not isinstance(raw, (list, tuple, set)):
+        return ()
+    seen, result = set(), []
+    for item in raw:
+        val = str(item or "").strip().lower()
+        if val and val not in seen:
+            seen.add(val)
+            result.append(val)
+    return tuple(result)
+
+
+def _entry_for_model(model_provider, cfg=None, session=None, bound_entry=None):
+    """Return the bound catalog entry or resolve a matching route from cfg._minara_models."""
+    entry = bound_entry if isinstance(bound_entry, dict) else getattr(session, "_bound_entry", None)
+    if isinstance(entry, dict):
+        return entry
+    routes = (cfg or {}).get("_minara_models")
+    if not isinstance(routes, dict):
+        return None
+    target = str((model_provider or {}).get("upstream_model") or (model_provider or {}).get("model") or "")
+    stripped = target[len("minara/"):] if target.startswith("minara/") else target
+    for candidate in routes.values():
+        if not isinstance(candidate, dict):
+            continue
+        if target and (candidate.get("id") == target or candidate.get("upstream_model") == target):
+            return candidate
+        if stripped and (candidate.get("upstream_model") == stripped or candidate.get("id") == stripped):
+            return candidate
+    return None
+
+
+def use_responses(model_provider, cfg=None, session=None, *, bound_entry=None):
+    """True when this Minara request should use native POST /v1/responses.
+
+    Explicit `endpoint` / `use_responses` overrides win first. Otherwise catalog capability
+    (`supported_endpoint_types` containing `openai-response`/`responses`, or `responses: True`) enables
+    `/v1/responses`, keeping chat/messages for `anthropic/` models whenever `openai` or `anthropic` is
+    also supported so explicit `cache_control` marks are preserved.
+    """
+    provider = model_provider or {}
+    entry = _entry_for_model(provider, cfg=cfg, session=session, bound_entry=bound_entry) or {}
+    model = str(provider.get("upstream_model") or provider.get("model") or entry.get("upstream_model") or entry.get("id") or "")
+    if model.startswith("minara/"):
+        model = model[len("minara/"):]
+
+    for source in (provider, entry):
+        explicit_ep = source.get("endpoint")
+        if isinstance(explicit_ep, str) and explicit_ep.strip():
+            norm_ep = explicit_ep.strip().lower().lstrip("/")
+            if norm_ep.startswith("v1/"):
+                norm_ep = norm_ep[3:]
+            if norm_ep in RESPONSES_ENDPOINTS:
+                return True
+            if norm_ep in ("chat", "chat/completions", "openai", "messages", "anthropic"):
+                return False
+        explicit_flag = source.get("use_responses")
+        if isinstance(explicit_flag, bool):
+            return explicit_flag
+
+    ep_types = _normalize_endpoint_types(provider.get("supported_endpoint_types") or entry.get("supported_endpoint_types"))
+    has_responses_ep = any(ep in RESPONSES_ENDPOINTS for ep in ep_types)
+    cap_flag = provider.get("responses") if "responses" in provider else entry.get("responses")
+    if not (has_responses_ep or cap_flag is True):
+        return False
+
+    if model.startswith("anthropic/"):
+        if ep_types:
+            return not any(ep in ("openai", "anthropic") for ep in ep_types)
+        return False
+    return True
 
 
 def _bounded_json(text, **kwargs):
@@ -95,6 +197,23 @@ def token_of(cfg):
     return (os.environ.get(name, "") if name else "") or cfg.get("bearer_token", "")
 
 
+def _image_data_url(block):
+    data = block.get("imageData", "")
+    if data.startswith(("https://", "http://", "data:")):
+        return data
+    return "data:%s;base64,%s" % (block.get("mimeType", "image/png"), data)
+
+
+def _tool_result_text(result):
+    if (isinstance(result, list) and result
+            and all(isinstance(block, dict) and block.get("type") == "text" for block in result)):
+        # Text blocks (MCP results, Claude Code's Agent and ToolSearch results): their text, as a model reads them
+        # natively. json.dumps showed it the escaped blocks ('[{"type": "text", "text": "line \"one\"\n..."}]'): exact
+        # text lost for edits, and every result paid for the wrapper and the escapes (audit, 2026-11-10).
+        return "\n".join(block.get("text") or "" for block in result)
+    return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+
+
 def _content(blocks):
     if isinstance(blocks, str):
         return blocks
@@ -106,10 +225,7 @@ def _content(blocks):
         if kind == "text":
             result.append({"type": "text", "text": block.get("text", "")})
         elif kind == "image":
-            data = block.get("imageData", "")
-            url = data if data.startswith(("https://", "http://", "data:")) else (
-                "data:%s;base64,%s" % (block.get("mimeType", "image/png"), data))
-            result.append({"type": "image_url", "image_url": {"url": url}})
+            result.append({"type": "image_url", "image_url": {"url": _image_data_url(block)}})
         elif kind == "image_url":
             result.append(copy.deepcopy(block))
     return result
@@ -119,16 +235,8 @@ def _message(message):
     role = message.get("role", "user")
     value = message.get("content")
     if role == "tool" and isinstance(value, dict):
-        result = value.get("toolResult", "")
-        if (isinstance(result, list) and result
-                and all(isinstance(block, dict) and block.get("type") == "text" for block in result)):
-            # Text blocks (MCP results, Claude Code's Agent and ToolSearch results): their text, as a model reads them
-            # natively. json.dumps showed it the escaped blocks ('[{"type": "text", "text": "line \"one\"\n..."}]'): exact
-            # text lost for edits, and every result paid for the wrapper and the escapes (audit, 2026-11-10).
-            result = "\n".join(block.get("text") or "" for block in result)
-        elif not isinstance(result, str):
-            result = json.dumps(result, ensure_ascii=False)
-        return {"role": "tool", "tool_call_id": value.get("toolCallId"), "content": result}
+        return {"role": "tool", "tool_call_id": value.get("toolCallId"),
+                "content": _tool_result_text(value.get("toolResult", ""))}
     result = {"role": role, "content": _content(value)}
     if role == "assistant":
         calls = []
@@ -238,6 +346,362 @@ def _cache_marks(messages, ttl, mark_tail=True):
                 break
 
 
+def _chat_tools(tools):
+    """Normalize relay tool specs to OpenAI chat function format, stripping relay-internal x-* fields."""
+    if not tools:
+        return None
+    declared = []
+    for tool in tools:
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            # Only the standard fields: the relay marks a Codex custom tool inside its function (x-client-type,
+            # x-format with the whole grammar), which no upstream should see.
+            fn = {key: copy.deepcopy(value) for key, value in tool["function"].items()
+                  if key in ("name", "description", "parameters", "strict")}
+            declared.append({"type": "function", "function": fn})
+        else:
+            fn = {key: copy.deepcopy(tool[key]) for key in ("name", "description", "parameters", "strict") if key in tool}
+            if "parameters" not in fn:
+                fn["parameters"] = copy.deepcopy(tool.get("input_schema", {"type": "object", "properties": {}}))
+            declared.append({"type": "function", "function": fn})
+    return declared
+
+
+def _responses_tools(tools):
+    """Convert relay tool specs into flat OpenAI /v1/responses function declarations."""
+    chat_tools = _chat_tools(tools)
+    if not chat_tools:
+        return None
+    out = []
+    for tool in chat_tools:
+        fn = tool.get("function") or {}
+        entry = {
+            "type": "function",
+            "name": fn.get("name"),
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+        if fn.get("description"):
+            entry["description"] = fn["description"]
+        if fn.get("strict") is not None:
+            entry["strict"] = fn["strict"]
+        out.append(entry)
+    return out
+
+
+def _prompt_cache_key(cfg, session, model, head_part, chat_tools):
+    """Deterministic `proxi-...` cache key scoped identically across chat and Responses requests."""
+    if not (cfg or {}).get("direct_cache", True):
+        return None
+    if str((cfg or {}).get("cache_policy") or "auto").lower() == "off":
+        return None
+    conversation = getattr(session, "_native_conversation_key", None) if session is not None else None
+    if not (model.startswith(("openai/", "anthropic/")) and conversation):
+        return None
+    # Key by model, conversation, system head, and tools so identical instructions across different
+    # models, heads, or tool schemas never collide while effort changes on the same chat reuse the key.
+    seed = [model, conversation, head_part, chat_tools]
+    return "proxi-" + hashlib.sha256(json.dumps(
+        seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def _responses_user_parts(blocks):
+    if isinstance(blocks, str):
+        return [{"type": "input_text", "text": blocks}] if blocks else []
+    parts = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind in ("text", "input_text") and block.get("text"):
+            parts.append({"type": "input_text", "text": block["text"]})
+        elif kind == "image":
+            parts.append({"type": "input_image", "image_url": _image_data_url(block)})
+        elif kind == "image_url":
+            iu = block.get("image_url")
+            url = iu.get("url") if isinstance(iu, dict) else str(iu or "")
+            if url:
+                item = {"type": "input_image", "image_url": url}
+                detail = iu.get("detail") if isinstance(iu, dict) else block.get("detail")
+                if detail:
+                    item["detail"] = detail
+                parts.append(item)
+        elif kind == "input_image" and block.get("image_url"):
+            parts.append(copy.deepcopy(block))
+        elif kind == "document":
+            fname = block.get("filename") or "document.pdf"
+            if block.get("file_url"):
+                parts.append({"type": "input_file", "filename": fname, "file_url": block["file_url"]})
+            else:
+                b64 = block.get("data") or ""
+                mime = block.get("media_type") or "application/pdf"
+                file_data = b64 if str(b64).startswith("data:") else f"data:{mime};base64,{b64}"
+                parts.append({"type": "input_file", "filename": fname, "file_data": file_data})
+        elif kind == "file":
+            fobj = block.get("file") if isinstance(block.get("file"), dict) else block
+            item = {"type": "input_file"}
+            for field in ("filename", "file_data", "file_id", "file_url"):
+                if fobj.get(field):
+                    item[field] = fobj[field]
+            if len(item) > 1:
+                parts.append(item)
+        elif kind == "input_file":
+            parts.append(copy.deepcopy(block))
+    return parts
+
+
+def _normalize_reasoning_summary(summary):
+    out = []
+    for entry in summary if isinstance(summary, list) else []:
+        if isinstance(entry, dict) and entry.get("text"):
+            out.append({"type": entry.get("type") or "summary_text", "text": entry["text"]})
+        elif isinstance(entry, str) and entry:
+            out.append({"type": "summary_text", "text": entry})
+    return out
+
+
+def _canonical_to_responses_input(canonical):
+    """Convert canonical history (including signed `responses_reasoning` blocks) to `/v1/responses` input items."""
+    items = []
+    queued_images = []
+    visual_kinds = ("text", "image", "image_url")
+
+    for msg in canonical:
+        if not isinstance(msg, dict) or not msg.get("role"):
+            if isinstance(msg, list):
+                parts = _responses_user_parts(msg)
+                if parts:
+                    items.append({"type": "message", "role": "user", "content": parts})
+            elif msg is not None:
+                items.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": str(msg)}]})
+            continue
+        role = msg.get("role", "user")
+        if role != "tool" and queued_images:
+            items.append({"type": "message", "role": "user", "content": queued_images})
+            queued_images = []
+
+        val = msg.get("content")
+        if role == "tool":
+            if isinstance(val, dict):
+                call_id = str(val.get("toolCallId") or "")
+                res = val.get("toolResult", "")
+                if (isinstance(res, list) and res
+                        and all(isinstance(b, dict) and b.get("type") in visual_kinds for b in res)
+                        and any(b["type"] in ("image", "image_url") for b in res)):
+                    texts = [b.get("text", "") for b in res if b["type"] == "text"]
+                    visual = _responses_user_parts([b for b in res if b["type"] in ("image", "image_url")])
+                    items.append({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "\n".join(texts) + ("\n" if texts else "") + "Image result follows as visual input.",
+                    })
+                    queued_images.append({"type": "input_text", "text": f"Images returned by tool call {call_id}:"})
+                    queued_images.extend(visual)
+                else:
+                    items.append({"type": "function_call_output", "call_id": call_id, "output": _tool_result_text(res)})
+            elif msg.get("tool_call_id"):
+                items.append({
+                    "type": "function_call_output",
+                    "call_id": str(msg["tool_call_id"]),
+                    "output": _tool_result_text(val if val is not None else ""),
+                })
+            continue
+
+        if role == "assistant":
+            blocks = (val if isinstance(val, list)
+                      else ([{"type": "text", "text": val}] if isinstance(val, str) and val else []))
+            assistant_texts = []
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                btype = b.get("type")
+                if btype == "thinking" and isinstance(b.get("responses_reasoning"), dict):
+                    rr = b["responses_reasoning"]
+                    if rr.get("encrypted_content"):
+                        if assistant_texts:
+                            items.append({"type": "message", "role": "assistant", "content": assistant_texts})
+                            assistant_texts = []
+                        items.append({
+                            "type": "reasoning",
+                            "summary": _normalize_reasoning_summary(rr.get("summary")),
+                            "encrypted_content": rr["encrypted_content"],
+                        })
+                elif btype == "reasoning" and b.get("encrypted_content"):
+                    if assistant_texts:
+                        items.append({"type": "message", "role": "assistant", "content": assistant_texts})
+                        assistant_texts = []
+                    items.append({
+                        "type": "reasoning",
+                        "summary": _normalize_reasoning_summary(b.get("summary")),
+                        "encrypted_content": b["encrypted_content"],
+                    })
+                elif btype in ("text", "output_text") and b.get("text"):
+                    assistant_texts.append({"type": "output_text", "text": b["text"]})
+                elif btype == "tool_call":
+                    if assistant_texts:
+                        items.append({"type": "message", "role": "assistant", "content": assistant_texts})
+                        assistant_texts = []
+                    items.append({
+                        "type": "function_call",
+                        "call_id": b["toolCallId"],
+                        "name": b["toolName"],
+                        "arguments": json.dumps(b.get("toolInput", {}), ensure_ascii=False),
+                    })
+            if isinstance(msg.get("tool_calls"), list):
+                if assistant_texts:
+                    items.append({"type": "message", "role": "assistant", "content": assistant_texts})
+                    assistant_texts = []
+                for tc in msg["tool_calls"]:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                        args = fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(
+                            fn.get("arguments") or {}, ensure_ascii=False)
+                        items.append({
+                            "type": "function_call",
+                            "call_id": str(tc.get("id") or ""),
+                            "name": str(fn.get("name") or ""),
+                            "arguments": args,
+                        })
+            if assistant_texts:
+                items.append({"type": "message", "role": "assistant", "content": assistant_texts})
+            continue
+
+        parts = _responses_user_parts(val)
+        if parts:
+            items.append({
+                "type": "message",
+                "role": "developer" if role in ("system", "developer") else "user",
+                "content": parts,
+            })
+
+    if queued_images:
+        items.append({"type": "message", "role": "user", "content": queued_images})
+    return items
+
+
+def _responses_text_format(spec):
+    if not isinstance(spec, dict):
+        return None
+    kind = spec.get("kind")
+    if kind == "json_object":
+        return {"type": "json_object"}
+    if kind == "json_schema":
+        fmt = {
+            "type": "json_schema",
+            "name": spec.get("name") or "response",
+            "schema": copy.deepcopy(spec.get("schema") or {}),
+            "strict": bool(spec.get("strict", True)),
+        }
+        if spec.get("description"):
+            fmt["description"] = spec["description"]
+        return fmt
+    if spec.get("type"):
+        return copy.deepcopy(spec)
+    return None
+
+
+def _build_responses_context(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens,
+                             chunks=None, session=None, instruction=None, text_only=False):
+    cfg = cfg or {}
+    provider = model_provider or {}
+    bound = _entry_for_model(provider, cfg=cfg, session=session) or {}
+    model = provider.get("upstream_model") or provider.get("model", "")
+    if model.startswith("minara/"):
+        model = model[len("minara/"):]
+    clean_head = _strip_billing_prefix(head)
+    effort = provider.get("reasoningEffort") or provider.get("reasoning_effort") or provider.get("effort")
+    if effort == "auto":
+        effort = None
+
+    scope = cache_engine.build_scope(session, "minara", cfg, model, effort, clean_head, tools, tool_choice)
+    if text_only:
+        parent_snapshot, canonical_msgs, client_echo = None, cache_engine._fallback_canonical(chunks, prompt), None
+    else:
+        parent_snapshot, canonical_msgs, client_echo = cache_engine.prepare_canonical_history(
+            session, scope, tools, chunks, prompt
+        )
+    input_items = _canonical_to_responses_input(canonical_msgs)
+    if instruction:
+        input_items.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": instruction}]})
+
+    body = {
+        "model": model,
+        "input": input_items,
+        "stream": True,
+        "store": False,
+    }
+    if clean_head:
+        body["instructions"] = clean_head
+    if max_tokens is not None:
+        body["max_output_tokens"] = max_tokens
+
+    provider_opts = (getattr(session, "_provider_options", None) or {}) if session is not None else {}
+    reasoning_flag = provider.get("reasoning") if "reasoning" in provider else bound.get("reasoning")
+    reasoning_enabled = reasoning_flag if reasoning_flag is not None else (bool(effort) or not model.startswith("anthropic/"))
+    if reasoning_enabled or effort:
+        summary_mode = provider.get("reasoning_summary") or provider_opts.get("reasoning_summary") or "auto"
+        r_cfg = {}
+        if effort:
+            r_cfg["effort"] = effort
+        if effort != "none" and summary_mode:
+            r_cfg["summary"] = summary_mode
+        if r_cfg:
+            body["reasoning"] = r_cfg
+        if effort != "none":
+            body["include"] = ["reasoning.encrypted_content"]
+
+    chat_tools = _chat_tools(tools)
+    resp_tools = _responses_tools(tools)
+    if resp_tools:
+        body["tools"] = resp_tools
+        if tool_choice:
+            if isinstance(tool_choice, str):
+                body["tool_choice"] = (tool_choice if tool_choice in ("auto", "none", "required")
+                                       else {"type": "function", "name": tool_choice})
+            elif isinstance(tool_choice, dict) and isinstance(tool_choice.get("function"), dict):
+                body["tool_choice"] = {"type": "function", "name": tool_choice["function"]["name"]}
+            elif isinstance(tool_choice, dict):
+                body["tool_choice"] = copy.deepcopy(tool_choice)
+
+    for key in ("parallel_tool_calls", "service_tier"):
+        val = provider.get(key)
+        if val is None:
+            val = provider_opts.get(key)
+        if val is None and key == "parallel_tool_calls":
+            val = cfg.get(key)
+        if val is not None:
+            body[key] = val
+
+    text_cfg = {}
+    provider_text = provider.get("text") if isinstance(provider.get("text"), dict) else {}
+    opts_text = provider_opts.get("text") if isinstance(provider_opts.get("text"), dict) else {}
+    verbosity = (provider.get("verbosity") or provider_text.get("verbosity")
+                 or provider_opts.get("verbosity") or opts_text.get("verbosity"))
+    if verbosity in ("low", "medium", "high"):
+        text_cfg["verbosity"] = verbosity
+    raw_fmt = (provider_text.get("format") or opts_text.get("format")
+               or (getattr(session, "_structured_output", None) if session is not None else None)
+               or provider.get("structured_output") or provider_opts.get("structured_output"))
+    text_fmt = _responses_text_format(raw_fmt)
+    if text_fmt is not None:
+        text_cfg["format"] = text_fmt
+    if text_cfg:
+        body["text"] = text_cfg
+
+    cache_key = _prompt_cache_key(cfg, session, model, clean_head or None, chat_tools)
+    if cache_key:
+        body["prompt_cache_key"] = cache_key
+
+    return body, (parent_snapshot, scope, canonical_msgs, client_echo)
+
+
+def responses_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens,
+                   chunks=None, session=None, instruction=None):
+    """Translate canonical history (and signed `responses_reasoning` blocks) into a Minara `/v1/responses` body."""
+    return _build_responses_context(
+        cfg, model_provider, head, prompt, tools, tool_choice, max_tokens,
+        chunks=chunks, session=session, instruction=instruction,
+    )[0]
+
+
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None,
                instruction=None, mark_tail=True):
     """Translate canonical client history, not signed Retool replies, to OpenAI roles.
@@ -247,14 +711,7 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     model = model_provider.get("upstream_model") or model_provider.get("model", "")
     if model.startswith("minara/"):
         model = model[len("minara/"):]
-    first, separator, rest = (head or "").partition("\n")
-    if first.startswith(BILLING_PREFIX) and separator:
-        # Claude Code's attribution line (x-anthropic-billing-header: cc_version=...; cch=<per-conversation>;) goes
-        # nowhere on Minara. Glued to the instructions, it made Minara drop the whole system prompt: 25 prompt tokens, the
-        # model knew none of the rules (Opus 5.5 and 4.7, 2026-11-10), so Claude Code ran without its system prompt on
-        # minara/claude-*. Without it the instructions arrive, and every conversation of a client has the same head: its
-        # fingerprint no longer splits the cache, so subagents read the head one of them wrote.
-        head = rest
+    head = _strip_billing_prefix(head)
     messages = [{"role": "system", "content": head}] if head else []
     canonical = getattr(session, "_native_client_messages", None)
     if canonical is not None and getattr(session, "_native_allow_cold_replay", True):
@@ -283,35 +740,19 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     body = {"model": model, "messages": messages, "stream": True, "stream_options": {"include_usage": True}}
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
-    if tools:
-        declared = []
-        for tool in tools:
-            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
-                # Only the standard fields: the relay marks a Codex custom tool inside its function (x-client-type,
-                # x-format with the whole grammar), which no upstream should see.
-                fn = {key: copy.deepcopy(value) for key, value in tool["function"].items()
-                      if key in ("name", "description", "parameters", "strict")}
-                declared.append({"type": "function", "function": fn})
-            else:
-                fn = {key: copy.deepcopy(tool[key]) for key in ("name", "description", "parameters", "strict") if key in tool}
-                if "parameters" not in fn:
-                    fn["parameters"] = copy.deepcopy(tool.get("input_schema", {"type": "object", "properties": {}}))
-                declared.append({"type": "function", "function": fn})
-        body["tools"] = declared
+    chat_tools = _chat_tools(tools)
+    if chat_tools:
+        body["tools"] = chat_tools
     if tool_choice:
         body["tool_choice"] = (tool_choice if tool_choice in ("auto", "none", "required") else
                                {"type": "function", "function": {"name": tool_choice}}) if isinstance(tool_choice, str) else copy.deepcopy(tool_choice)
     effort = model_provider.get("reasoningEffort") or model_provider.get("reasoning_effort") or model_provider.get("effort")
     if effort and effort != "auto":
         body["reasoning_effort"] = effort
-    conversation = getattr(session, "_native_conversation_key", None) if session is not None else None
-    if model.startswith(("openai/", "anthropic/")) and conversation:
-        # Key by model, conversation, system head, and tools so identical instructions across different
-        # models, heads, or tool schemas never collide while effort changes on the same chat reuse the key.
-        head_part = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
-        seed = [model, conversation, head_part, body.get("tools")]
-        body["prompt_cache_key"] = "proxi-" + hashlib.sha256(json.dumps(
-            seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+    head_part = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
+    cache_key = _prompt_cache_key(cfg, session, model, head_part, body.get("tools"))
+    if cache_key:
+        body["prompt_cache_key"] = cache_key
     return body
 
 
@@ -352,19 +793,38 @@ def _count(value):
     return value if type(value) is int and value >= 0 else None
 
 
-def _modalities(value):
-    """The audio and image tokens inside an OpenAI-shaped usage's prompt_tokens and completion_tokens: a price expression
-    that bills them apart (new-api's ai, img, ao, img_o) takes them out of p and c. Only the price reads them."""
+def _modalities(value, in_field="prompt_tokens_details", out_field="completion_tokens_details"):
+    """The audio and image tokens inside prompt/completion usage: a price expression that bills them apart
+    (new-api's ai, img, ao, img_o) takes them out of p and c. Only the price reads them."""
     found = {}
-    for field, source, target in (("prompt_tokens_details", "audio_tokens", "audio_input_tokens"),
-                                   ("prompt_tokens_details", "image_tokens", "image_input_tokens"),
-                                   ("completion_tokens_details", "audio_tokens", "audio_output_tokens"),
-                                   ("completion_tokens_details", "image_tokens", "image_output_tokens")):
+    for field, source, target in ((in_field, "audio_tokens", "audio_input_tokens"),
+                                   (in_field, "image_tokens", "image_input_tokens"),
+                                   (out_field, "audio_tokens", "audio_output_tokens"),
+                                   (out_field, "image_tokens", "image_output_tokens")):
         details = value.get(field)
         number = _count(details.get(source)) if isinstance(details, dict) else None
         if number:
             found[target] = number
     return found
+
+
+def _apply_cost_and_currency(result, value, pricing, modalities=None, *, include_upstream_cost=True):
+    cost = value.get("cost")
+    reported = cost if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0 else None
+    estimate = (estimated_cost(pricing, dict(result, **(modalities or {})))
+                if pricing is not None and ("input_tokens" in result or "output_tokens" in result) else None)
+    if estimate is not None:
+        result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
+        if include_upstream_cost and reported is not None:
+            result["upstream_cost"] = reported
+    elif reported is not None and not (reported == 0 and result.get("output_tokens")):
+        result["provider_cost"] = reported  # NOT Retool credits.
+        currency = value.get("currency")
+        if isinstance(currency, str) and 1 <= len(currency) <= 16 and currency.isascii() and currency.isalpha():
+            result["provider_cost_currency"] = currency.upper()
+        else:
+            result["provider_cost_currency"] = "USD"
+    return result
 
 
 def normalize_usage(value, pricing=None):
@@ -395,28 +855,88 @@ def normalize_usage(value, pricing=None):
             # Contradictory details must not inflate an authoritative total.
             result.pop('cache_read', None)
             result.pop('cache_write', None)
-    cost = value.get("cost")
-    reported = cost if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0 else None
     # Minara debits its own price list (its /v1/models pricing), 220 credits per dollar of it, not the cost upstream
     # reports: a cache write is billed at its cache_write price (1.25x input) whether its TTL is 5 minutes or an hour,
     # Sonnet 5.5's reads at $0.2/M. OpenRouter's usage.cost bills an hour-long write at 2x input: an Opus 5.5 write of
     # 17,139 tokens reported 30.19 credits and was debited 18.88, the list price; balances over whole runs matched the list
     # to 0.0002 credits (end-to-end runs of 2026-11-10). So the list prices every reply it can read; what upstream reported
     # stays as upstream_cost, for diagnosis.
-    estimate = (estimated_cost(pricing, dict(result, **_modalities(value)))
-                if pricing is not None and ('input_tokens' in result or 'output_tokens' in result) else None)
-    if estimate is not None:
-        result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
-        if reported is not None:
-            result["upstream_cost"] = reported
-    elif reported is not None and not (reported == 0 and result.get("output_tokens")):
-        result["provider_cost"] = reported  # NOT Retool credits.
-        currency = value.get("currency")
-        if isinstance(currency, str) and 1 <= len(currency) <= 16 and currency.isascii() and currency.isalpha():
-            result["provider_cost_currency"] = currency.upper()
+    return _apply_cost_and_currency(result, value, pricing, _modalities(value))
+
+
+def normalize_responses_usage(value, pricing=None, channel=None, provider=None):
+    """Normalize OpenAI /v1/responses usage counters into the relay's canonical format and Minara cost."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for source, target in (("input_tokens", "input_tokens"), ("output_tokens", "output_tokens")):
+        number = _count(value.get(source))
+        if number is not None:
+            result[target] = number
+    in_details = value.get("input_tokens_details") if isinstance(value.get("input_tokens_details"), dict) else {}
+    out_details = value.get("output_tokens_details") if isinstance(value.get("output_tokens_details"), dict) else {}
+    cached = _count(in_details.get("cached_tokens"))
+    if cached is not None:
+        result["cache_read"] = cached
+    written = _count(in_details.get("cache_write_tokens"))
+    if written is None:
+        written = _count(in_details.get("cache_creation_input_tokens"))
+    if written is not None:
+        result["cache_write"] = written
+    if in_details:
+        result["cache_write_reported"] = ("cache_write_tokens" in in_details or "cache_creation_input_tokens" in in_details)
+    reasoning_tok = _count(out_details.get("reasoning_tokens"))
+    if reasoning_tok is not None:
+        result["reasoning_tokens"] = reasoning_tok
+    if "input_tokens" in result:
+        cached_total = result.get("cache_read", 0) + result.get("cache_write", 0)
+        if cached_total <= result["input_tokens"]:
+            result["input_tokens"] -= cached_total
         else:
-            result["provider_cost_currency"] = "USD"
-    return result
+            result.pop("cache_read", None)
+            result.pop("cache_write", None)
+    result["channel_path"] = "responses"
+    if channel:
+        result["channel"] = channel
+    resolved_provider = provider_of(channel, provider)
+    if resolved_provider:
+        result["provider"] = resolved_provider
+    modalities = _modalities(value, in_field="input_tokens_details", out_field="output_tokens_details")
+    return _apply_cost_and_currency(result, value, pricing, modalities)
+
+
+def _stream_error(message, *, unbilled=False):
+    error = apierr.upstream_error(message)
+    error.unbilled = bool(unbilled)
+    return error
+
+
+def _finalize_tool_calls(calls, order=None, *, require_id_name=True):
+    """Validate and emit final tool_call events with strict finite-JSON checking."""
+    events = []
+    keys = order if order is not None else sorted(calls)
+    for key in keys:
+        call = calls[key]
+        if require_id_name and (not call.get("id") or not call.get("name")):
+            raise _stream_error("Minara returned an incomplete tool call")
+        if not require_id_name and not call.get("name"):
+            continue
+        event = {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": call["arguments"] or "{}"}
+        try:
+            def invalid_number(value):
+                raise ValueError("nonfinite argument")
+
+            def finite_float(value):
+                number = float(value)
+                return number if math.isfinite(number) else invalid_number(value)
+
+            parsed = _bounded_json(event["arguments"], parse_constant=invalid_number, parse_float=finite_float)
+            if not isinstance(parsed, dict):
+                raise ValueError("tool arguments must be an object")
+        except (ValueError, RecursionError):
+            event["invalid"] = True
+        events.append(event)
+    return events
 
 
 def estimated_cost(pricing, usage):
@@ -897,24 +1417,8 @@ class EventParser:
             raise apierr.upstream_error("Minara sent data after DONE")
         if data == "[DONE]":
             if self.finish is None:
-                raise apierr.upstream_error("Minara stream ended without a finish reason")
-            events = []
-            for call in self.calls.values():
-                if not call["id"] or not call["name"]:
-                    raise apierr.upstream_error("Minara returned an incomplete tool call")
-                event = {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": call["arguments"] or "{}"}
-                try:
-                    def invalid_number(value):
-                        raise ValueError("nonfinite argument")
-                    def finite_float(value):
-                        number = float(value)
-                        return number if math.isfinite(number) else invalid_number(value)
-                    parsed = _bounded_json(event["arguments"], parse_constant=invalid_number, parse_float=finite_float)
-                    if not isinstance(parsed, dict):
-                        raise ValueError("tool arguments must be an object")
-                except (ValueError, RecursionError):
-                    event["invalid"] = True
-                events.append(event)
+                raise _stream_error("Minara stream ended without a finish reason")
+            events = _finalize_tool_calls(self.calls)
             self.done = True
             events.append({"type": "end", "reason": self.finish})
             return events
@@ -1091,13 +1595,45 @@ def _channel_trouble(status, text):
     return status in (400, 404, 500, 502, 503) and any(mark in text for mark in _CHANNEL_MARKS)
 
 
+def _responses_endpoint_refusal(status, text):
+    """True when HTTP status and body explicitly refuse /v1/responses before reaching a billed model."""
+    low = (text if isinstance(text, bytes) else str(text or "").encode("utf-8", "replace")).lower()
+    if b"<html" in low[:200] and any(k in low[:1500] for k in (b"cloudflare", b"attention required", b"just a moment")):
+        return False
+    if any(mark in low for mark in _RESPONSES_UNSUPPORTED_MARKS):
+        return status in (400, 404, 405, 422, 501)
+    if status in (405, 501):
+        return True
+    if status == 404 and b"not found" in low:
+        return True
+    return False
+
+
+def _responses_fallback_refusal(status, text):
+    """True when a /v1/responses HTTP failure before output is an endpoint or channel refusal."""
+    if _responses_endpoint_refusal(status, text):
+        return True
+    low = (text if isinstance(text, bytes) else str(text or "").encode("utf-8", "replace")).lower()
+    if status == 404 and b"<html" not in low[:200]:
+        return True
+    if status in (400, 404, 422):
+        if any(mark in low for mark in _DEFINITE_CHANNEL_REFUSALS):
+            return True
+        if b"channel" in low and (b"responses" in low or b"endpoint" in low or b"unsupported" in low):
+            return True
+    return False
+
+
 def _http_error(status, headers, text=b""):
     """The error a Minara answer of `status` becomes, marked as upstream's (the journal logged them as the relay's)."""
     error = _status_error(status, headers, text)
     error.upstream_status = status
     # An HTTP response alone does not prove a turn was never sent to a model (e.g. a gateway timeout).
-    error.unbilled = (status in (401, 402, 403, 429) or (
-        status in (400, 404, 500, 502, 503) and any(mark in text.lower() for mark in _DEFINITE_CHANNEL_REFUSALS)))
+    error.unbilled = (
+        status in (401, 402, 403, 429)
+        or (status in (400, 404, 500, 502, 503) and any(mark in text.lower() for mark in _DEFINITE_CHANNEL_REFUSALS))
+        or _responses_endpoint_refusal(status, text)
+    )
     return error
 
 
@@ -1231,7 +1767,27 @@ def _sse_error(item, *, pre_output=False):
         error.upstream_status = 402
         error.unbilled = bool(pre_output)
         return error
-    return apierr.upstream_error("Minara returned a stream error" + suffix)
+    low_bytes = low.encode("utf-8", "replace")
+    if pre_output and (
+        any(mark in low_bytes for mark in _DEFINITE_CHANNEL_REFUSALS)
+        or any(mark in low_bytes for mark in _RESPONSES_UNSUPPORTED_MARKS)
+        or code in ("channel_unavailable", "no_enabled_channel", "channel_selection")
+    ):
+        error = apierr.service_unavailable("Minara returned a stream error" + suffix)
+        error.retry_after = CHANNEL_RETRY_AFTER
+        error.unbilled = True
+        return error
+    error = apierr.upstream_error("Minara returned a stream error" + suffix)
+    error.unbilled = False
+    return error
+
+
+def _commit_pending_history(session):
+    commit_fn = getattr(session, "_pending_history_commit", None) if session is not None else None
+    if session is not None:
+        session._pending_history_commit = None
+    if callable(commit_fn) and not getattr(session, "_cancelled", False):
+        commit_fn()
 
 
 def _forced_requirement(model_provider, tools, tool_choice):
@@ -1262,31 +1818,48 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
             and context.get("compaction_tools") == "restored"):
         # The compaction of a Codex chat, whose tools the relay declared again to read the chat's cache: Codex cannot take
         # a call in reply to it (the summary becomes "(no summary available)"), so a reply with one is not passed on.
-        async with contextlib.aclosing(_summary_events(cfg, session, model_provider, prompt, head, tools, tool_choice,
-                                                       max_tokens, chunks)) as events:
-            async for event in events:
-                yield event
+        try:
+            async with contextlib.aclosing(_summary_events(cfg, session, model_provider, prompt, head, tools, tool_choice,
+                                                           max_tokens, chunks)) as events:
+                async for event in events:
+                    yield event
+            _commit_pending_history(session)
+        finally:
+            if session is not None:
+                session._pending_history_commit = None
         return
     if required is None:
-        async with contextlib.aclosing(_stream(cfg, session, model_provider, prompt, head, tools, tool_choice,
-                                               max_tokens, chunks)) as events:
-            async for event in events:
-                yield event
+        try:
+            async with contextlib.aclosing(_stream(cfg, session, model_provider, prompt, head, tools, tool_choice,
+                                                   max_tokens, chunks)) as events:
+                async for event in events:
+                    yield event
+            _commit_pending_history(session)
+        finally:
+            if session is not None:
+                session._pending_history_commit = None
         return
     # The reply is released once it holds the call; an attempt without it is asked again once, more firmly, and nothing of
     # it reaches the client (its cost still counts). A second miss is the error a route that ignores a choice earns.
     for attempt in (1, 2):
         gate = forced_choice.Gate(required)
         end = None
-        async with contextlib.aclosing(_stream(cfg, session, model_provider, prompt, head, tools, "auto", max_tokens,
-                                               chunks, forced_choice.instruction(required, firm=attempt > 1))) as events:
-            async for event in events:
-                if event.get("type") == "end":
-                    end = event
-                    continue
-                for ready in gate.feed(event):
-                    yield ready
+        try:
+            async with contextlib.aclosing(_stream(cfg, session, model_provider, prompt, head, tools, "auto", max_tokens,
+                                                   chunks, forced_choice.instruction(required, firm=attempt > 1))) as events:
+                async for event in events:
+                    if event.get("type") == "end":
+                        end = event
+                        continue
+                    for ready in gate.feed(event):
+                        yield ready
+        except Exception:
+            if session is not None:
+                session._pending_history_commit = None
+            raise
         if end is None:
+            if session is not None:
+                session._pending_history_commit = None
             return
         reason = end.get("reason")
         # A refusal, or a cap spent on reasoning alone, repeats for the same body: both end the turn as they would under a
@@ -1294,12 +1867,18 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         # (under a named choice that could hand the client a call to another tool). Asking again only paid twice.
         terminal = reason == "content_filter" or (reason == "length" and not gate.text and not gate.called)
         if gate.complied or reason == "cancelled" or terminal:
+            if gate.complied and reason in ("stop", "tool_calls"):
+                _commit_pending_history(session)
+            elif session is not None:
+                session._pending_history_commit = None
             if terminal and not gate.complied:
                 for held in gate.held:
                     if held.get("type") != "tool_call":
                         yield held
             yield end
             return
+        if session is not None:
+            session._pending_history_commit = None
         journal.emit("turn.forced_choice_missed",
                      "Модель не вызвала требуемый инструмент%s" % (": повтор с усиленной просьбой" if attempt == 1 else ""),
                      "warn", model=model_provider.get("model"), tool=required.named, called=gate.called,
@@ -1308,7 +1887,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
 
 
 def channel_of(ident):
-    """The channel behind a Minara reply id: gen- OpenRouter, msg_bdrk_ Bedrock, any other msg_ Anthropic's own API."""
+    """The channel behind a Minara reply id: gen- OpenRouter, msg_bdrk_ Bedrock, msg_ Anthropic, resp_ OpenAI Responses."""
     ident = str(ident or "")
     if ident.startswith("gen-"):
         return "openrouter"
@@ -1316,6 +1895,8 @@ def channel_of(ident):
         return "bedrock"
     if ident.startswith("msg_"):
         return "anthropic"
+    if ident.startswith("resp_"):
+        return "openai-responses"
     return "other" if ident else None
 
 
@@ -1593,21 +2174,7 @@ def normalize_messages_usage(value, pricing=None, channel=None):
         provider = provider_of(channel)  # nothing in an Anthropic-shaped reply names OpenRouter's provider
         if provider:
             result["provider"] = provider
-    estimate = (estimated_cost(pricing, dict(result, **_modalities(value)))
-                if pricing is not None and ("input_tokens" in result or "output_tokens" in result) else None)
-    if estimate is not None:
-        result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
-    else:
-        cost = value.get("cost")
-        reported = cost if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0 else None
-        if reported is not None and not (reported == 0 and result.get("output_tokens")):
-            result["provider_cost"] = reported
-            currency = value.get("currency")
-            if isinstance(currency, str) and 1 <= len(currency) <= 16 and currency.isascii() and currency.isalpha():
-                result["provider_cost_currency"] = currency.upper()
-            else:
-                result["provider_cost_currency"] = "USD"
-    return result
+    return _apply_cost_and_currency(result, value, pricing, _modalities(value), include_upstream_cost=False)
 
 
 _STOP_REASONS = {"end_turn": "stop", "stop_sequence": "stop", "pause_turn": "stop", "max_tokens": "length",
@@ -1727,23 +2294,277 @@ class MessagesParser:
             events.append(self._usage_event())
         elif kind == "message_stop":
             if self.finish is None:
-                raise apierr.upstream_error("Minara stream ended without a stop reason")
-            for index in sorted(self.calls):
-                call = self.calls[index]
-                event = {"type": "tool_call", "id": call["id"], "name": call["name"], "arguments": call["arguments"] or "{}"}
-                try:
-                    def invalid_number(value):
-                        raise ValueError("nonfinite argument")
+                raise _stream_error("Minara stream ended without a stop reason")
+            events.extend(_finalize_tool_calls(self.calls, require_id_name=False))
+            self.done = True
+            events.append({"type": "end", "reason": self.finish})
+        return events
 
-                    def finite_float(value):
-                        number = float(value)
-                        return number if math.isfinite(number) else invalid_number(value)
-                    parsed = _bounded_json(event["arguments"], parse_constant=invalid_number, parse_float=finite_float)
-                    if not isinstance(parsed, dict):
-                        raise ValueError("tool arguments must be an object")
-                except (ValueError, RecursionError):
-                    event["invalid"] = True
-                events.append(event)
+
+class ResponsesParser:
+    """Canonical relay events for Minara's native `/v1/responses` SSE stream."""
+
+    def __init__(self, max_bytes=MAX_EVENT_BYTES, pricing=None):
+        self.pricing = pricing
+        self.max_bytes = max_bytes
+        self.calls = {}
+        self._call_order = []
+        self._index_to_item_id = {}
+        self._finalized_calls = []
+        self.finish = None
+        self.done = False
+        self.thinking = False
+        self.signed = False
+        self.text = ""
+        self.thinking_text = ""
+        self.encrypted_reasoning = []
+        self.reply_id = ""
+        self.provider = None
+        self.usage = {}
+
+    def reasoning_details(self):
+        return list(self.encrypted_reasoning)
+
+    def reply_key(self):
+        calls = [self.calls[item_id] for item_id in self._call_order]
+        if calls:
+            return ("calls",) + tuple(call["id"] for call in calls)
+        if self.text.strip():
+            return ("text", hashlib.sha256(self.text.encode("utf-8")).hexdigest())
+        return None
+
+    def reply_blocks(self):
+        blocks = []
+        if self.encrypted_reasoning:
+            for rr in self.encrypted_reasoning:
+                blocks.append({
+                    "type": "thinking",
+                    "thinking": self.thinking_text,
+                    "signature": rr["encrypted_content"],
+                    "responses_reasoning": rr,
+                })
+        elif self.thinking_text:
+            blocks.append({
+                "type": "thinking",
+                "thinking": self.thinking_text,
+                "signature": "unsigned:responses_summary",
+            })
+        if self.text:
+            blocks.append({"type": "text", "text": self.text})
+        for event in self._finalized_calls:
+            if event.get("invalid"):
+                continue
+            parsed = _bounded_json(event["arguments"])
+            if isinstance(parsed, dict):
+                blocks.append({
+                    "type": "tool_call",
+                    "toolCallId": event["id"],
+                    "toolName": event["name"],
+                    "toolInput": parsed,
+                })
+        return blocks
+
+    def _capture_meta(self, resp_obj, item=None):
+        if isinstance(resp_obj, dict):
+            if not self.reply_id and isinstance(resp_obj.get("id"), str) and resp_obj["id"]:
+                self.reply_id = resp_obj["id"]
+            prov = resp_obj.get("provider")
+            if self.provider is None and isinstance(prov, str) and prov and len(prov) <= 80:
+                self.provider = prov
+        if isinstance(item, dict) and self.provider is None:
+            prov = item.get("provider")
+            if isinstance(prov, str) and prov and len(prov) <= 80:
+                self.provider = prov
+
+    def _append_thinking(self, delta, events):
+        if len((self.thinking_text + delta).encode("utf-8")) > self.max_bytes:
+            raise _stream_error("Minara reasoning exceeds the size limit")
+        if not self.thinking:
+            self.thinking = True
+            events.append({"type": "thinking_start"})
+        self.thinking_text += delta
+        events.append({"type": "thinking", "delta": delta})
+
+    def _register_call(self, out_item, out_idx=None):
+        item_id = str(out_item.get("id") or out_item.get("call_id")
+                      or (f"idx_{out_idx}" if type(out_idx) is int else ""))
+        if not item_id:
+            raise _stream_error("Minara returned a function call without an identifier")
+        call_id = str(out_item.get("call_id") or item_id)
+        name = str(out_item.get("name") or "")
+        args = out_item.get("arguments") if isinstance(out_item.get("arguments"), str) else ""
+        if len(args.encode("utf-8")) > self.max_bytes:
+            raise _stream_error("Minara tool call exceeds the size limit")
+        if item_id not in self.calls:
+            if len(self.calls) >= 128:
+                raise _stream_error("Minara returned too many tool calls")
+            self.calls[item_id] = {"id": call_id, "name": name, "arguments": args}
+            self._call_order.append(item_id)
+        else:
+            slot = self.calls[item_id]
+            if call_id:
+                slot["id"] = call_id
+            if name:
+                slot["name"] = name
+            if args:
+                slot["arguments"] = args
+        if type(out_idx) is int:
+            self._index_to_item_id[out_idx] = item_id
+        return self.calls[item_id]
+
+    def _resolve_call(self, item_id, out_idx=None):
+        key = str(item_id or "")
+        if key not in self.calls and type(out_idx) is int:
+            key = self._index_to_item_id.get(out_idx, key)
+        return self.calls.get(key)
+
+    def _finish_output_item(self, out_item, out_idx, events):
+        itype = out_item.get("type")
+        if itype == "reasoning":
+            summary = out_item.get("summary") if isinstance(out_item.get("summary"), list) else []
+            enc = out_item.get("encrypted_content")
+            if isinstance(enc, str) and enc and len(enc.encode("utf-8")) > self.max_bytes:
+                raise _stream_error("Minara reasoning exceeds the size limit")
+            if not self.thinking and (enc or summary):
+                self.thinking = True
+                events.append({"type": "thinking_start"})
+            if not self.thinking_text and summary:
+                sum_text = "".join(
+                    s.get("text", "") for s in summary if isinstance(s, dict) and isinstance(s.get("text"), str)
+                )
+                if sum_text:
+                    self._append_thinking(sum_text, events)
+            if isinstance(enc, str) and enc:
+                if not any(existing.get("encrypted_content") == enc for existing in self.encrypted_reasoning):
+                    self.encrypted_reasoning.append({
+                        "summary": copy.deepcopy(summary),
+                        "encrypted_content": enc,
+                    })
+                if not self.signed:
+                    self.signed = True
+                    events.append({"type": "thinking_signature", "signature": enc})
+        elif itype == "function_call":
+            self._register_call(out_item, out_idx)
+        elif itype == "message" and not self.text and isinstance(out_item.get("content"), list):
+            fallback_text = "".join(
+                part.get("text", "") for part in out_item["content"]
+                if isinstance(part, dict) and part.get("type") in ("output_text", "text", "refusal")
+                and isinstance(part.get("text"), str)
+            )
+            if fallback_text:
+                self.text = fallback_text
+                events.append({"type": "text", "delta": fallback_text})
+
+    def feed(self, data):
+        if data == "[DONE]":
+            if self.done:
+                return []
+            raise _stream_error("Minara stream ended before response.completed")
+        if self.done:
+            raise _stream_error("Minara sent data after response completion")
+        try:
+            item = _bounded_json(data)
+        except (ValueError, RecursionError):
+            raise _stream_error("Minara returned malformed SSE JSON") from None
+        if not isinstance(item, dict):
+            raise _stream_error("Minara returned a stream error")
+
+        kind = item.get("type")
+        pre_output = not (self.text or self.calls or self.thinking or self.encrypted_reasoning)
+        if kind == "error" or ("error" in item and item.get("error") is not None):
+            raise _sse_error(item, pre_output=pre_output)
+        failed = _upstream_failure(item)
+        if failed:
+            raise _stream_error("Minara's upstream failed: " + failed)
+        if kind == "response.failed":
+            resp_obj = item.get("response") if isinstance(item.get("response"), dict) else {}
+            self._capture_meta(resp_obj, item)
+            raw_err = resp_obj.get("error")
+            raise _sse_error(
+                {"error": raw_err, "message": resp_obj.get("status") or "response.failed"},
+                pre_output=pre_output,
+            )
+
+        events = []
+        if kind in ("response.created", "response.in_progress"):
+            self._capture_meta(item.get("response"), item)
+            return events
+
+        if kind == "response.output_item.added":
+            out_item = item.get("item") if isinstance(item.get("item"), dict) else {}
+            itype = out_item.get("type")
+            if itype == "reasoning":
+                if not self.thinking:
+                    self.thinking = True
+                    events.append({"type": "thinking_start"})
+            elif itype == "function_call":
+                slot = self._register_call(out_item, item.get("output_index"))
+                if slot["id"] and slot["name"]:
+                    events.append({"type": "tool_call", **slot, "partial": True})
+        elif kind in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning.delta"):
+            delta = item.get("delta")
+            if isinstance(delta, str) and delta:
+                self._append_thinking(delta, events)
+        elif kind in ("response.reasoning_summary_text.done", "response.reasoning_text.done"):
+            if not self.thinking_text and isinstance(item.get("text"), str) and item["text"]:
+                self._append_thinking(item["text"], events)
+        elif kind in ("response.output_text.delta", "response.refusal.delta"):
+            delta = item.get("delta")
+            if isinstance(delta, str) and delta:
+                self.text += delta
+                events.append({"type": "text", "delta": delta})
+        elif kind == "response.function_call_arguments.delta":
+            slot = self._resolve_call(item.get("item_id"), item.get("output_index"))
+            if slot is None:
+                raise _stream_error("Minara returned tool arguments for an unknown call")
+            piece = item.get("delta")
+            if not isinstance(piece, str):
+                raise _stream_error("Minara returned an invalid tool fragment")
+            slot["arguments"] += piece
+            if len(slot["arguments"].encode("utf-8")) > self.max_bytes:
+                raise _stream_error("Minara tool call exceeds the size limit")
+            if slot["id"] and slot["name"]:
+                events.append({"type": "tool_call", **slot, "partial": True})
+        elif kind == "response.function_call_arguments.done":
+            slot = self._resolve_call(item.get("item_id"), item.get("output_index"))
+            full_args = item.get("arguments")
+            if slot is not None and isinstance(full_args, str) and full_args:
+                if len(full_args.encode("utf-8")) > self.max_bytes:
+                    raise _stream_error("Minara tool call exceeds the size limit")
+                slot["arguments"] = full_args
+        elif kind == "response.output_item.done":
+            out_item = item.get("item") if isinstance(item.get("item"), dict) else {}
+            self._finish_output_item(out_item, item.get("output_index"), events)
+        elif kind in ("response.completed", "response.incomplete"):
+            resp_obj = item.get("response") if isinstance(item.get("response"), dict) else {}
+            self._capture_meta(resp_obj, item)
+            if resp_obj.get("status") == "failed" or resp_obj.get("error"):
+                raise _sse_error({"error": resp_obj.get("error") or "response failed"}, pre_output=pre_output)
+            if isinstance(resp_obj.get("output"), list):
+                for idx, out_item in enumerate(resp_obj["output"]):
+                    if isinstance(out_item, dict):
+                        itype = out_item.get("type")
+                        if itype == "function_call":
+                            item_id = str(out_item.get("id") or out_item.get("call_id") or "")
+                            if item_id and item_id in self.calls:
+                                continue
+                        self._finish_output_item(out_item, idx, events)
+            final_calls = _finalize_tool_calls(self.calls, self._call_order)
+            self._finalized_calls = final_calls
+            events.extend(final_calls)
+            if kind == "response.incomplete":
+                inc = resp_obj.get("incomplete_details") if isinstance(resp_obj.get("incomplete_details"), dict) else {}
+                self.finish = "content_filter" if inc.get("reason") == "content_filter" else "length"
+            else:
+                self.finish = "tool_calls" if final_calls else "stop"
+            if isinstance(resp_obj.get("usage"), dict):
+                self.usage = dict(resp_obj["usage"])
+                events.append({
+                    "type": "usage",
+                    "usage": normalize_responses_usage(
+                        self.usage, self.pricing, channel=channel_of(self.reply_id), provider=self.provider
+                    ),
+                })
             self.done = True
             events.append({"type": "end", "reason": self.finish})
         return events
@@ -1799,12 +2620,16 @@ async def _summary_events(cfg, session, model_provider, prompt, head, tools, too
                 for ready in gate.feed(event):
                     yield ready
         if end is None:
+            if session is not None:
+                session._pending_history_commit = None
             return
         if not gate.called or end.get("reason") == "cancelled" or fallback:
             for ready in gate.release():
                 yield ready
             yield end
             return
+        if session is not None:
+            session._pending_history_commit = None
         journal.emit("turn.compaction_tool_call",
                      "Модель вызвала инструмент вместо сводки сжатия: ответ отброшен, %s" % (
                          "запрос повторён с просьбой ответить текстом" if attempt < summary_guard.TRIES_WITH_TOOLS else
@@ -1817,28 +2642,60 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                   instruction=None, text_only=False):
     import direct
     side = client_context.current().get("client_task") in client_context.SIDE_TASKS
-    # text_only: the request as the client's own text, no tools and no canonical history (the summary guard's last try).
-    body = build_body(cfg, model_provider, head, prompt, None if text_only else tools, None if text_only else tool_choice,
-                      max_tokens, chunks, None if text_only else session, instruction, mark_tail=not side)
-    # The path: chat, or /v1/messages for a Claude level that the chat path sends to a channel without cache. A level the
-    # relay moved there itself (not measured) goes back to chat when /v1/messages refuses it.
-    level = body.get("reasoning_effort") or "default"
-    route = {"messages": use_messages(model_provider, body)}
-    if side and route["messages"]:
-        # A side request marks no tail of its own, so on /v1/messages it read the dialog's cache and wrote nothing, and
-        # Minara bills such a reply at the input price for its whole prompt (TOOL_RESULTS_END). There it writes its tail:
-        # the instruction at the write price instead of the whole conversation at the input price.
-        body = build_body(cfg, model_provider, head, prompt, None if text_only else tools,
-                          None if text_only else tool_choice, max_tokens, chunks, None if text_only else session,
-                          instruction)
-    route["measured"] = route["messages"] and level in set(model_provider.get("messages_levels") or ())
+    if session is not None:
+        session._pending_history_commit = None
+
+    def _make_chat_route():
+        chat = build_body(
+            cfg, model_provider, head, prompt,
+            None if text_only else tools, None if text_only else tool_choice,
+            max_tokens, chunks, None if text_only else session,
+            instruction, mark_tail=not side,
+        )
+        # The path: chat, or /v1/messages for a Claude level that the chat path sends to a channel without cache. A level the
+        # relay moved there itself (not measured) goes back to chat when /v1/messages refuses it.
+        chat_level = chat.get("reasoning_effort") or "default"
+        use_msg = use_messages(model_provider, chat)
+        if side and use_msg:
+            # A side request marks no tail of its own, so on /v1/messages it read the dialog's cache and wrote nothing, and
+            # Minara bills such a reply at the input price for its whole prompt (TOOL_RESULTS_END). There it writes its tail:
+            # the instruction at the write price instead of the whole conversation at the input price.
+            chat = build_body(
+                cfg, model_provider, head, prompt,
+                None if text_only else tools, None if text_only else tool_choice,
+                max_tokens, chunks, None if text_only else session,
+                instruction,
+            )
+        measured = use_msg and chat_level in set(model_provider.get("messages_levels") or ())
+        return chat, chat_level, use_msg, measured
+
+    is_resp = use_responses(model_provider, cfg=cfg, session=session)
+    if is_resp:
+        resp_body, resp_hist_state = _build_responses_context(
+            cfg, model_provider, head, prompt,
+            None if text_only else tools, None if text_only else tool_choice,
+            max_tokens, chunks=chunks, session=session, instruction=instruction, text_only=text_only,
+        )
+        body = None
+        level = (resp_body.get("reasoning") or {}).get("effort") or "default"
+        model_id = resp_body.get("model")
+        route = {"responses": True, "messages": False, "measured": False,
+                 "responses_fallback_tried": False, "active": None}
+        head_key = None
+    else:
+        resp_body, resp_hist_state = None, None
+        body, level, msg_flag, measured = _make_chat_route()
+        model_id = body.get("model")
+        route = {"responses": False, "messages": msg_flag, "measured": measured,
+                 "responses_fallback_tried": False, "active": None}
+        head_key = _head_key(body) if cfg.get("direct_cache", True) else None
+
     token = token_of(cfg)
     if not isinstance(token, str) or not token.strip():
         raise apierr.service_unavailable("Minara Bearer token is missing")
     # Requests that go at once with one Claude head nobody has cached yet (Claude Code starts several subagents in one
     # message): the first writes it, the others wait for its answer to begin and then read it, as on Retool
     # (direct._claim_head). Minara's cache is shared by all its accounts; an entry is there once its response began.
-    head_key = _head_key(body) if cfg.get("direct_cache", True) else None
     # Its cache lasts an hour: a head used within the last 55 minutes is read, no request waits for a leader.
     warm = HEAD_WARM if cfg.get("minara_cache_ttl", "1h") == "1h" else None  # 5-minute marks: Retool's window
     head_role, head_gate = (direct._claim_head(head_key, time.monotonic(), id(session), warm=warm)
@@ -1923,7 +2780,7 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     request_sent = getattr(session, "_provider_request_sent", None)
 
     def worker():
-        nonlocal delegated_lease
+        nonlocal delegated_lease, body, level, model_id
         lease = None
         stream_clean = False
         response_received = False
@@ -1948,9 +2805,28 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
             base = cfg.get("base", BASE).rstrip("/")
             profile = curl_pool.resolve_profile(cfg)
             proxy_url = http_pool.validate_proxy_url(cfg.get("proxy_url")) if custom_post is not None else None
+            def recycle_error_response(resp_obj, clean_flag):
+                nonlocal lease, post
+                with close_lock:
+                    holder["response"] = None
+                try:
+                    resp_obj.close()
+                except Exception:
+                    pass
+                if not clean_flag and lease is not None:
+                    with close_lock:
+                        lease_holder["lease"] = None
+                    lease.release(reusable=False)
+                    lease = curl_pool.POOL.acquire(cfg)
+                    with close_lock:
+                        lease_holder["lease"] = lease
+                    post = lease.session.post
+
             while True:
                 extra_headers = {"Authorization": "Bearer " + token}
-                if route["messages"]:
+                if route["responses"]:
+                    url, payload = base + "/responses", resp_body
+                elif route["messages"]:
                     url, payload = base + "/messages", messages_body(body)
                     extra_headers["anthropic-version"] = ANTHROPIC_VERSION
                 else:
@@ -1989,7 +2865,8 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 if response.status_code == 200:
                     content_type = response.headers.get("content-type", "").lower()
                     if "text/event-stream" not in content_type:
-                        raise apierr.upstream_error("Minara did not return an SSE stream")
+                        raise _stream_error("Minara did not return an SSE stream")
+                    route["active"] = "responses" if route["responses"] else ("messages" if route["messages"] else "chat")
                     for data in sse_data(_iter_response_chunks(response, stopped, deadline)):
                         if stopped.is_set():
                             return
@@ -1997,6 +2874,24 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                     stream_clean = not stopped.is_set()
                     break
                 text, body_clean = _read_error_body(response)
+                if (route["responses"] and not route["responses_fallback_tried"]
+                        and cfg.get("minara_responses_fallback", True)
+                        and _responses_fallback_refusal(response.status_code, text)):
+                    route["responses_fallback_tried"] = True
+                    route["responses"] = False
+                    body, level, route["messages"], route["measured"] = _make_chat_route()
+                    model_id = body.get("model") or model_id
+                    target_path = "/v1/messages" if route["messages"] else "/v1/chat/completions"
+                    journal.emit(
+                        "upstream.endpoint_fallback",
+                        "Minara не приняла /v1/responses (HTTP %s): запрос идёт через %s" % (
+                            response.status_code, target_path),
+                        "warn", upstream="minara", status=response.status_code,
+                        model=model_id, path=("messages" if route["messages"] else "chat"),
+                        reason=_upstream_message(text, 160),
+                    )
+                    recycle_error_response(response, body_clean)
+                    continue
                 if (route["messages"] and not route["measured"] and response.status_code in (400, 404, 422)
                         and not _channel_trouble(response.status_code, text)):
                     # A level the relay moved to /v1/messages by itself, refused there before anything was generated:
@@ -2004,20 +2899,7 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                     switch_to_messages(body.get("model"), level, switched=False,
                                        reason="HTTP %s: %s" % (response.status_code, _upstream_message(text, 160)))
                     route["messages"] = False
-                    with close_lock:
-                        holder["response"] = None
-                    try:
-                        response.close()
-                    except Exception:
-                        pass
-                    if not body_clean and lease is not None:
-                        with close_lock:
-                            lease_holder["lease"] = None
-                        lease.release(reusable=False)
-                        lease = curl_pool.POOL.acquire(cfg)
-                        with close_lock:
-                            lease_holder["lease"] = lease
-                        post = lease.session.post
+                    recycle_error_response(response, body_clean)
                     continue
                 error = _http_error(response.status_code, response.headers, text)
                 if response.status_code == 402:
@@ -2031,22 +2913,9 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 # Said, so a slow answer can be told from Minara's own retries (one took 17 s on an image).
                 journal.emit("upstream.channel_retry", "Minara: нет рабочего канала (HTTP %s), повтор через %g с" % (
                     response.status_code, delays[0]), "info", upstream="minara", status=response.status_code,
-                    delay=delays[0], model=body.get("model"))
+                    delay=delays[0], model=model_id)
                 # Minara's channel failures are answered before anything is generated or billed: ask again shortly.
-                with close_lock:
-                    holder["response"] = None
-                try:
-                    response.close()
-                except Exception:
-                    pass
-                if not body_clean and lease is not None:
-                    with close_lock:
-                        lease_holder["lease"] = None
-                    lease.release(reusable=False)
-                    lease = curl_pool.POOL.acquire(cfg)
-                    with close_lock:
-                        lease_holder["lease"] = lease
-                    post = lease.session.post
+                recycle_error_response(response, body_clean)
                 if stopped.wait(delays.pop(0)):
                     return
         except apierr.ApiError as exc:
@@ -2102,7 +2971,7 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
             waiting_since = time.monotonic()
             outcome = await direct._wait_for_head(head_gate)
             journal.emit("cache.head_wait", "Запрос ждал начала ответа соседнего запроса с той же головой: голова "
-                         "читается из кэша, а не пишется второй раз", "info", outcome=outcome, model=body.get("model"),
+                         "читается из кэша, а не пишется второй раз", "info", outcome=outcome, model=model_id,
                          upstream="minara", waited_ms=round((time.monotonic() - waiting_since) * 1000))
         while not slots.acquire(blocking=False):
             if stopped.is_set() or getattr(session, '_cancelled', False):
@@ -2138,21 +3007,35 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 continue
             if item is None:
                 if parser is None or not parser.done:
-                    raise apierr.upstream_error("Minara stream ended before DONE")
+                    raise _stream_error("Minara stream ended before DONE")
                 return
             if isinstance(item, dict) and item.get("type") == "request_sent":
                 yield item
                 continue
             if isinstance(item, Exception):
+                if (isinstance(item, apierr.ApiError) and item.status in (400, 422)
+                        and resp_hist_state is not None and resp_hist_state[0] is not None):
+                    conversation_state.refuse(session, resp_hist_state[0], item)
                 raise item
             if parser is None:
-                parser = (MessagesParser if route["messages"] else EventParser)(pricing=model_provider.get("pricing"))
+                path = route["active"] or ("responses" if route["responses"] else ("messages" if route["messages"] else "chat"))
+                parser_cls = {"responses": ResponsesParser, "messages": MessagesParser, "chat": EventParser}[path]
+                parser = parser_cls(pricing=model_provider.get("pricing"))
             if head_gate is not None and not head_marked:
                 head_marked = True
                 direct._head_started(head_gate, head_key)  # the answer began: the head is in the cache now
             for event in parser.feed(item):
                 yield event
             if parser.done:
+                if (isinstance(parser, ResponsesParser) and not text_only and resp_hist_state is not None
+                        and parser.finish in ("stop", "tool_calls") and session is not None):
+                    reply_blocks = parser.reply_blocks()
+                    parent_snap, scope, canonical_msgs, client_echo = resp_hist_state
+                    if reply_blocks and client_echo is not None:
+                        session._pending_history_commit = (
+                            lambda _rb=reply_blocks, _s=scope, _ce=client_echo, _cm=canonical_msgs, _ps=parent_snap:
+                            cache_engine.record_canonical_reply(session, _s, _ce, _cm, _rb, tools, _ps)
+                        )
                 return
     finally:
         if head_role == "lead" and not head_marked:

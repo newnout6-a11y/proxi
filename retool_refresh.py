@@ -75,7 +75,7 @@ def fetch(url, limit, timeout=30.0, cfg=None):
     return data.decode("utf-8", "replace")
 
 
-def probe(backend, entry, timeout=90.0, effort=None):
+def probe(backend, entry, timeout=90.0, effort=None, refresher=None):
     """Ask `entry`'s model one short question through `backend` (a Retool account) on the relay's own route: a dict with
     `ok` (it answered with the expected word), `http`, `error`, `credits` (what Retool reported), `thinking` (thinking
     events seen), `accepted` (the model began to answer) and `seconds`. A model that only thinks within the output limit
@@ -93,14 +93,20 @@ def probe(backend, entry, timeout=90.0, effort=None):
     elif "low" in (entry.get("reasoning_effort_levels") or ()):
         provider["reasoningEffort"] = "low"  # a small answer: thinking at length would eat the output limit
     body = direct.build_body(cfg, provider, head, "Reply now with the word.", [], None, 2048)
-    headers = auth.upstream_headers(cfg)
-    headers["content-type"] = "application/json"
     url = str(cfg["base"]).rstrip("/") + direct.ROUTE
     payload = json.dumps(body).encode("utf-8")
     row = {"ok": False, "http": None, "error": None, "credits": None, "thinking": 0, "accepted": False,
            "seconds": None}
     text, ended, started = [], False, time.monotonic()
-    try:
+    active_refresher = refresher if refresher is not None else getattr(backend, "refresher", None)
+
+    def _run_once():
+        nonlocal ended
+        text.clear()
+        ended = False
+        row.update({"ok": False, "http": None, "error": None, "credits": None, "thinking": 0, "accepted": False})
+        headers = auth.upstream_headers(cfg)
+        headers["content-type"] = "application/json"
         with curl_pool.retool_open(cfg, url, data=payload, headers=headers, method="POST", timeout=timeout,
                                    stream=True) as response:
             row["http"] = response.status
@@ -132,6 +138,13 @@ def probe(backend, entry, timeout=90.0, effort=None):
                     break
                 if effort is not None and row["accepted"]:
                     break  # the route took the level: the model is answering at it
+
+    try:
+        call_fn = getattr(active_refresher, "call", None)
+        if callable(call_fn):
+            call_fn(_run_once)
+        else:
+            _run_once()
     except urllib.error.HTTPError as error:
         row["http"] = error.code
         row["error"] = error.read(2000).decode("utf-8", "replace")[:300]
@@ -171,6 +184,7 @@ class CatalogRefresher:
         self.last = None
         self.next_at = None
         self.after_look = None  # called with "retool" after every look (client_sync.OpenCodeSync: the client lists)
+        self._probe_cursor = 0
 
     # -- lifecycle ---------------------------------------------------------------------------------------------------
     def start(self):
@@ -235,8 +249,12 @@ class CatalogRefresher:
                     and "client_version" in state):
                 summary.pop("error", None)
                 return state["registry"]
-            script = (self._fetch(EDGE + entry, SCRIPT_BYTES, cfg=backend.cfg)
-                      if self._fetch is fetch else self._fetch(EDGE + entry, SCRIPT_BYTES))
+            try:
+                script = (self._fetch(EDGE + entry, SCRIPT_BYTES, cfg=backend.cfg)
+                          if self._fetch is fetch else self._fetch(EDGE + entry, SCRIPT_BYTES))
+            except OSError as error:
+                summary["error"] = "entry script: %s" % error
+                continue
             # The version the frontend sends as X-Retool-Client-Version; None when the script no longer names it.
             state["client_version"] = retool_catalog.client_version(script)
             if state["client_version"]:
@@ -245,17 +263,26 @@ class CatalogRefresher:
             if state.get("registry_chunk") in chunks:
                 chunks.remove(state["registry_chunk"])
                 chunks.insert(0, state["registry_chunk"])
+            chunk_error = None
             for chunk in [entry] + [name for name in chunks if name != entry]:
-                text = (script if chunk == entry
-                        else (self._fetch(EDGE + chunk, SCRIPT_BYTES, cfg=backend.cfg)
-                              if self._fetch is fetch else self._fetch(EDGE + chunk, SCRIPT_BYTES)))
+                if chunk == entry:
+                    text = script
+                else:
+                    try:
+                        text = (self._fetch(EDGE + chunk, SCRIPT_BYTES, cfg=backend.cfg)
+                                if self._fetch is fetch else self._fetch(EDGE + chunk, SCRIPT_BYTES))
+                    except OSError as error:
+                        chunk_error = "script %s: %s" % (chunk, error)
+                        continue
                 registry = retool_catalog.parse_registry(text)
                 if registry is not None:
                     state.update(entry_script=entry, registry_chunk=chunk, registry=retool_catalog.chat_models(registry),
                                  registry_read_at=summary["at"])
                     summary.pop("error", None)
                     return state["registry"]
-            summary["error"] = "no model registry in the frontend's %d scripts" % (len(chunks) + 1)
+            summary["error"] = chunk_error or ("no model registry in the frontend's %d scripts" % (len(chunks) + 1))
+            if chunk_error:
+                continue
             return None
         summary.setdefault("error", "no enabled Retool account")
         return None
@@ -282,6 +309,46 @@ class CatalogRefresher:
         return (datetime.datetime.now(datetime.timezone.utc)
                 + datetime.timedelta(days=wait)).isoformat(timespec="seconds")
 
+    def _probe_with_rotation(self, accounts, entry, summary, *, effort=None, unhealthy=None):
+        """Probe across available/healthy accounts (rotating round-robin), failing over on account/transient errors."""
+        if not accounts:
+            return None, {"ok": False, "http": None, "error": "no account"}
+        unhealthy = unhealthy if unhealthy is not None else set()
+        model_id = entry["id"]
+        start = self._probe_cursor % len(accounts)
+        self._probe_cursor += 1
+        rotated = accounts[start:] + accounts[:start]
+        now_wall = time.time()
+
+        def _plan_held(backend):
+            refused = getattr(backend, "refused_models", None) or {}
+            hold = refused.get(model_id)
+            if isinstance(hold, dict):
+                until_at = hold.get("until_at")
+                return until_at is None or until_at > now_wall
+            return bool(hold)
+
+        healthy = [b for b in rotated if id(b) not in unhealthy]
+        candidates = sorted(healthy, key=_plan_held) or rotated
+        last_backend, last_result = candidates[0], None
+        for backend in candidates:
+            result = (
+                self._probe(backend, entry)
+                if effort is None
+                else self._probe(backend, entry, effort=effort)
+            )
+            self._spent(summary, backend, result)
+            last_backend, last_result = backend, result
+            if result.get("ok"):
+                return backend, result
+            http = result.get("http")
+            if http in (401, 403, 429):
+                unhealthy.add(id(backend))
+            if http in (None, 401, 402, 403, 429) or (isinstance(http, int) and http >= 500):
+                continue
+            return backend, result
+        return last_backend, last_result
+
     def run_once(self):
         """One look at Retool's registry; a summary of what changed (also kept as self.last)."""
         summary = {"at": _now(), "entry_script": None, "registry": 0, "new": [], "added": [], "failed": [],
@@ -297,6 +364,7 @@ class CatalogRefresher:
         records = state.setdefault("measurements", {})
         today = summary["at"][:10]
         budget = self.probes
+        unhealthy = set()
         for ident, model in sorted(retool_catalog.new_models(found, published).items()):
             summary["new"].append(ident)
             accounts = self._accounts(model["provider"])
@@ -314,25 +382,24 @@ class CatalogRefresher:
                 break
             budget -= 1
             entry = dict(model, source=EDGE + str(state.get("registry_chunk") or ""), checked_at=today)
-            backend = accounts[0]
-            result = self._probe(backend, entry)
+            backend, result = self._probe_with_rotation(accounts, entry, summary, unhealthy=unhealthy)
             record.update(last=summary["at"], account=account_tag(backend),
                           result={key: result.get(key) for key in ("ok", "http", "error", "credits", "thinking",
                                                                    "seconds")})
-            self._spent(summary, backend, result)
             if result.get("ok"):
                 published[ident] = dict(entry, published_at=summary["at"], thinking=bool(result.get("thinking")))
                 records.pop(ident, None)
                 summary["added"].append(ident)
             else:
-                record["failures"] = int(record.get("failures") or 0) + 1
-                record["retry_after"] = self._retry_after(record["failures"])
+                if result.get("http") not in (401, 403):
+                    record["failures"] = int(record.get("failures") or 0) + 1
+                    record["retry_after"] = self._retry_after(record["failures"])
                 summary["failed"].append([ident, result.get("error") or "HTTP %s" % result.get("http")])
         if self.path:
             # The models just published are in the catalog before their levels are compared.
             retool_catalog.write(self.path, state)
             retool_catalog.apply_overlay(self.path)
-        self._relevel(found, state, summary, budget)
+        self._relevel(found, state, summary, budget, unhealthy=unhealthy)
         state["refreshed_at"] = summary["at"]
         if self.path:
             retool_catalog.write(self.path, state)
@@ -341,7 +408,7 @@ class CatalogRefresher:
         self.last = summary
         return summary
 
-    def _relevel(self, found, state, summary, budget):
+    def _relevel(self, found, state, summary, budget, *, unhealthy=None):
         """The effort levels Retool's registry documents for a model the relay routes and the relay does not offer yet:
         each is asked one question at that level (probe with `effort`), within the look's probe budget. A level the route
         takes is offered at once (state "levels", models.add_levels); one it refuses is asked again after a day, three,
@@ -349,6 +416,7 @@ class CatalogRefresher:
         2026-11-03) and routes whose effort is accepted and ignored (GLM, Haiku) are not asked; a level the registry no
         longer lists stays, as the route took it."""
         levels_state = state.setdefault("levels", {})
+        unhealthy = unhealthy if unhealthy is not None else set()
         for ident, model in sorted(found.items()):
             entry = models._BY_ID.get(ident)
             if (entry is None or entry.get("route_status") != "verified"
@@ -378,9 +446,7 @@ class CatalogRefresher:
                 if self._stop.is_set():
                     return budget
                 budget -= 1
-                backend = accounts[0]
-                result = self._probe(backend, entry, effort=level)
-                self._spent(summary, backend, result)
+                backend, result = self._probe_with_rotation(accounts, entry, summary, effort=level, unhealthy=unhealthy)
                 record = levels_state.setdefault(ident, {})
                 if result.get("ok"):
                     record["verified"] = [step for step in models.EFFORT_ORDER
@@ -389,11 +455,12 @@ class CatalogRefresher:
                     record["checked_at"] = summary["at"]
                     summary["leveled"].append([ident, level])
                 else:
-                    failures = int(mark.get("failures") or 0) + 1
                     reason = result.get("error") or "HTTP %s" % result.get("http")
-                    record.setdefault("refused", {})[level] = {
-                        "failures": failures, "http": result.get("http"), "error": reason, "last": summary["at"],
-                        "account": account_tag(backend), "retry_after": self._retry_after(failures)}
+                    if result.get("http") not in (401, 403):
+                        failures = int(mark.get("failures") or 0) + 1
+                        record.setdefault("refused", {})[level] = {
+                            "failures": failures, "http": result.get("http"), "error": reason, "last": summary["at"],
+                            "account": account_tag(backend), "retry_after": self._retry_after(failures)}
                     summary["refused_levels"].append([ident, level, reason])
         return budget
 

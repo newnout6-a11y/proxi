@@ -30,6 +30,7 @@ import collections
 import json
 import math
 import os
+import tempfile
 import threading
 import time
 
@@ -47,6 +48,7 @@ WARM_OWN = 1800.0
 LEVEL_OUTPUT = {"none": 2000, "minimal": 2000, "low": 2000, "medium": 8000, "high": 16000, "xhigh": 32000, "max": 32000}
 DEFAULT_OUTPUT = 8000
 MAX_DIALOGS = 4096  # dialogs whose last priced turn is remembered (the oldest go first)
+REPLACE_ATTEMPTS = 4
 
 Estimate = collections.namedtuple(
     "Estimate", "credits usd prompt_tokens cache_read written output_tokens warm basis")
@@ -128,6 +130,7 @@ class Guard:
 
     def __init__(self, path=None, clock=time.time):
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()
         self._clock = clock
         self._path = path
         self._hour = collections.deque()  # (at, credits) of each Minara debit of the last hour
@@ -190,12 +193,17 @@ class Guard:
         if conversation:
             with self._lock:
                 record = self._dialogs.get(conversation)
-        if record is not None and record.get("model") == model:
+        if record is not None:
+            if record.get("model") != model:
+                return 0
             age = self._clock() - record["at"]
-            if age < (WARM_SHARED if shared else WARM_OWN) and (shared or record.get("account") == account):
-                return record["prompt"]
+            if age >= (WARM_SHARED if shared else WARM_OWN):
+                return 0
+            if not shared and record.get("account") != account:
+                return 0
+            return record["prompt"]
         # A session with a prefix of its own served this dialog on this account (now, or before a restart).
-        return int(session_prefix or 0)
+        return max(0, int(session_prefix or 0))
 
     # -- the ceilings ---------------------------------------------------------------------------------------------------
     def check(self, cfg, est, *, entry, account, key=None, confirm=None):
@@ -266,15 +274,40 @@ class Guard:
     def _save(self):
         if not self._path:
             return
-        with self._lock:
-            payload = {"keys": {key_id: dict(record) for key_id, record in self._keys.items()}}
-        temporary = self._path + ".tmp"
-        try:
-            with open(temporary, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
-            os.replace(temporary, self._path)
-        except OSError:
-            pass  # a key's day only: the guard keeps working from memory
+        with self._save_lock:
+            with self._lock:
+                payload = {"keys": {key_id: dict(record) for key_id, record in self._keys.items()}}
+            temporary = None
+            try:
+                directory = os.path.dirname(os.path.abspath(self._path))
+                fd, temporary = tempfile.mkstemp(prefix=".cost_guard-", suffix=".tmp", dir=directory)
+                try:
+                    handle = os.fdopen(fd, "w", encoding="utf-8")
+                except BaseException:
+                    os.close(fd)
+                    raise
+                with handle:
+                    json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                for attempt in range(REPLACE_ATTEMPTS):
+                    try:
+                        os.replace(temporary, self._path)
+                        temporary = None
+                        break
+                    except PermissionError:
+                        # Windows: a scanner or indexer may hold the target for a moment.
+                        if attempt + 1 == REPLACE_ATTEMPTS:
+                            raise
+                        time.sleep(0.05 * (attempt + 1))
+            except OSError:
+                pass  # a key's day only: the guard keeps working from memory
+            finally:
+                if temporary is not None and os.path.exists(temporary):
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass
 
 
 def state_path(cfg):

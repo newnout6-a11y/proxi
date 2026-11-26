@@ -337,7 +337,9 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
       state.streamRequests += 1;
       const items = state.stream.splice(0);
       const body = `event: hello\ndata: ${JSON.stringify({ last_seq: events.length })}\n\n`
-        + items.map((item) => `event: journal\ndata: ${JSON.stringify(item)}\n\n`).join('');
+        + items.map((item) => (item && item._event
+          ? `event: ${item._event}\ndata: ${JSON.stringify(item.data)}\n\n`
+          : `event: journal\ndata: ${JSON.stringify(item)}\n\n`)).join('');
       return route.fulfill({ status: 200, headers: { 'content-type': 'text/event-stream' }, body });
     }
     if (path === '/admin/api/session' && method === 'POST') {
@@ -346,7 +348,8 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     }
     if (path === '/admin/api/events/clear' && method === 'POST') {
       state.cleared = true;
-      return reply(200, { ok: true, last_seq: 0 });
+      if (state.onClear) await state.onClear(state);
+      return reply(200, { ok: true, last_seq: state.clearLastSeq ?? 0 });
     }
     if (path === '/admin/api/accounts' && method === 'GET') {
       return reply(200, { accounts: state.pool, summary: poolSummary(state.pool), restart_required: state.pool.some((a) => a.pending),
@@ -439,11 +442,30 @@ export async function mockAdmin(page, { rich = false, empty = false, overviewPat
     if (path === '/admin/api/client-keys' && method === 'GET') return reply(200, { client_keys: state.clientKeys });
     if (path === '/admin/api/client-keys' && method === 'POST') {
       const body = request.postDataJSON();
-      const ck = { id: 'ck-1', label: body.label, key_preview: 'sk-proxi-…abcd', enabled: true,
-        allowed_models: body.allowed_models || null, rpm_limit: body.rpm_limit ?? null, max_budget_usd: body.max_budget_usd ?? null,
-        requests: 0, spent_usd: 0 };
+      const ck = {
+        id: `ck-${state.clientKeys.length + 1}`,
+        label: body.label,
+        key_preview: 'sk-proxi-…abcd',
+        enabled: true,
+        allowed_models: body.allowed_models || null,
+        rpm_limit: body.rpm_limit ?? null,
+        max_budget_usd: body.max_budget_usd ?? null,
+        max_request_minara: body.max_request_minara ?? null,
+        max_day_minara: body.max_day_minara ?? null,
+        allow_cost_confirm: Boolean(body.allow_cost_confirm),
+        requests: 0,
+        spent_usd: 0,
+      };
       state.clientKeys.push(ck);
       return reply(200, { client_key: ck, raw_key: 'sk-proxi-e2e-synthetic-test-key-abcd' });
+    }
+    const ckeyMatch = path.match(/^\/admin\/api\/client-keys\/([^/]+)$/);
+    if (ckeyMatch && method === 'PATCH') {
+      const body = request.postDataJSON();
+      const idx = state.clientKeys.findIndex((k) => k.id === ckeyMatch[1]);
+      if (idx < 0) return reply(404, { error: { message: 'Unknown client key' } });
+      state.clientKeys[idx] = { ...state.clientKeys[idx], ...body };
+      return reply(200, { client_key: state.clientKeys[idx] });
     }
     if (path === '/admin/api/models/ping' && method === 'POST') {
       const body = request.postDataJSON();

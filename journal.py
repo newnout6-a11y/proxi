@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+from urllib.parse import unquote, urlsplit
 
 import client_context
 import console_clock
@@ -604,20 +605,48 @@ class _Secrets(list):
     cookies = False
 
 
+def _proxy_secrets(url):
+    """Extract non-empty username and password credentials from a proxy URL."""
+    if not isinstance(url, str) or "@" not in url:
+        return []
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return []
+    found = []
+    for raw in (parts.username, parts.password):
+        if isinstance(raw, str) and raw:
+            found.append(raw)
+            if "%" in raw:
+                unquoted = unquote(raw)
+                if unquoted and unquoted != raw:
+                    found.append(unquoted)
+    return found
+
+
 def configured_secret_values(cfg):
     """Credentials and private routing IDs that should be masked even when echoed as plain text."""
     fields = ("relay_api_key", "cookie", "xsrf", "thread_id", "page_uuid", "bearer_token", "api_key")
     values = [cfg.get(key) for key in fields]
-    values += _cookie_secrets(cfg.get("cookie_values"))
-    for account in cfg.get("accounts") or ():
+    values += _cookie_secrets(list(cfg.get("cookie_values") or ()))
+    values += _proxy_secrets(cfg.get("proxy_url"))
+    for account in list(cfg.get("accounts") or ()):
         if isinstance(account, dict):
             values += [account.get(key) for key in fields]
-            values += _cookie_secrets(account.get("cookie_values"))
-    values.extend(cfg.get("_extra_secrets") or ())
-    values.extend(profile.get("key") for profile in cfg.get("client_keys") or () if isinstance(profile, dict))
+            values += _cookie_secrets(list(account.get("cookie_values") or ()))
+            values += _proxy_secrets(account.get("proxy_url"))
+    for provider in list(cfg.get("providers") or ()):
+        if isinstance(provider, dict):
+            values += _proxy_secrets(provider.get("proxy_url"))
+            for cred in list(provider.get("credentials") or ()):
+                if isinstance(cred, dict):
+                    values += _proxy_secrets(cred.get("proxy_url"))
+    values.extend(list(cfg.get("_extra_secrets") or ()))
+    values.extend(profile.get("key") for profile in list(cfg.get("client_keys") or ()) if isinstance(profile, dict))
     # A client's tool call can contain the search key even though it lives only in the environment.
     values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))
-    return [value for value in values if isinstance(value, str) and len(value) >= 4]
+    return sorted({value for value in values if isinstance(value, str) and len(value) >= 4},
+                  key=lambda s: (-len(s), s))
 
 
 class Journal:
@@ -625,6 +654,7 @@ class Journal:
         self._cond = threading.Condition()
         self._events = collections.deque(maxlen=capacity)
         self._seq = 0
+        self._reset_epoch = 0
         self._cfg = None
         self._path = None
         self._file = None
@@ -680,7 +710,7 @@ class Journal:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if not isinstance(event, dict) or not isinstance(event.get("seq"), int):
+            if not isinstance(event, dict) or type(event.get("seq")) is not int:
                 continue
             # Re-clean with the CURRENT patterns and secrets: events written by
             # older code (or before a redact fixup) must not serve raw.
@@ -706,6 +736,7 @@ class Journal:
         with self._cond:
             self._events.clear()
             self._seq = 0
+            self._reset_epoch += 1
             # A cleared journal has no history: coverage starts over from this moment.
             self._rollup = _Rollup(self._now())
             self._cond.notify_all()
@@ -764,11 +795,14 @@ class Journal:
             text = value if value.isascii() else value.encode("utf-8", "backslashreplace").decode("utf-8")
             cookies = getattr(secrets, "cookies", False)  # False: a plain list, the pattern is looked up by redact()
             text = redact(text, cookie_values=(self._cfg or {}).get("cookie_values", ()), cookie_pattern=cookies)
-            # Each secret is replaced in turn, as before; a text that holds none of them (nearly every one) skips the loop.
-            pattern = getattr(secrets, "pattern", False)  # False: a plain list, whose secrets are all tried
-            if pattern is False or (pattern is not None and pattern.search(text)):
-                for secret in secrets:
-                    text = text.replace(secret, "[redacted]")
+            # Replace longest-first in one pass via the compiled prefix-tree/alternation regex
+            # so a shorter secret that is a prefix of a longer one never leaks the tail.
+            pattern = getattr(secrets, "pattern", False)  # False: a plain list, build/lookup pattern once
+            if pattern is False:
+                ordered = sorted({s for s in secrets if isinstance(s, str) and s}, key=lambda s: (-len(s), s))
+                pattern = self._pattern_of(ordered)
+            if pattern is not None:
+                text = pattern.sub("[redacted]", text)
             text = text if len(text) <= 4000 else text[:4000] + "…[+%d]" % (len(text) - 4000)
             if remember and len(memo) < _MEMO_SIZE:
                 memo[value] = text
@@ -901,23 +935,35 @@ class Journal:
         with self._cond:
             return self._seq
 
+    @property
+    def reset_epoch(self):
+        with self._cond:
+            return self._reset_epoch
+
+    def state(self):
+        """Atomic ``(last_seq, reset_epoch)`` snapshot under the journal lock."""
+        with self._cond:
+            return self._seq, self._reset_epoch
+
     def _snapshot(self):
         with self._cond:
             return list(self._events)
 
-    def query(self, since=0, limit=300, levels=None, categories=None, text=None, turn=None, before=None, order="desc"):
+    @staticmethod
+    def _query_events(events, since=0, limit=300, levels=None, categories=None, text=None, turn=None, before=None,
+                      order="desc"):
         items = []
         needle = (text or "").lower()
-        events = self._snapshot()
         if order == "asc":
             for event in events:
-                if event["seq"] <= since:
+                seq = event.get("seq")
+                if type(seq) is not int or seq <= since:
                     continue
-                if before is not None and event["seq"] >= before:
+                if before is not None and seq >= before:
                     break
-                if levels and event["level"] not in levels:
+                if levels and event.get("level") not in levels:
                     continue
-                if categories and event["category"] not in categories:
+                if categories and event.get("category") not in categories:
                     continue
                 if turn and event.get("turn_id") != turn:
                     continue
@@ -928,13 +974,14 @@ class Journal:
                     break
             return items
         for event in reversed(events):
-            if event["seq"] <= since:
+            seq = event.get("seq")
+            if type(seq) is not int or seq <= since:
                 break
-            if before is not None and event["seq"] >= before:
+            if before is not None and seq >= before:
                 continue
-            if levels and event["level"] not in levels:
+            if levels and event.get("level") not in levels:
                 continue
-            if categories and event["category"] not in categories:
+            if categories and event.get("category") not in categories:
                 continue
             if turn and event.get("turn_id") != turn:
                 continue
@@ -946,13 +993,24 @@ class Journal:
         items.reverse()
         return items
 
-    def wait(self, since, timeout):
-        """Block until an event newer than ``since`` exists or the timeout elapses."""
+    def query(self, since=0, limit=300, levels=None, categories=None, text=None, turn=None, before=None, order="desc"):
+        return self._query_events(self._snapshot(), since=since, limit=limit, levels=levels, categories=categories,
+                                  text=text, turn=turn, before=before, order=order)
+
+    def poll_since(self, since=0, limit=500):
+        """Atomically capture ``(reset_epoch, last_seq, batch)`` for SSE subscribers."""
         with self._cond:
-            if self._seq > since:
+            epoch, seq = self._reset_epoch, self._seq
+            events = list(self._events)
+        return epoch, seq, self._query_events(events, since=since, limit=limit, order="asc")
+
+    def wait(self, since, timeout, epoch=None):
+        """Block until an event newer than ``since`` exists, a reset changes ``epoch``, or the timeout elapses."""
+        with self._cond:
+            if self._seq > since or (epoch is not None and self._reset_epoch != epoch):
                 return True
             self._cond.wait(timeout)
-            return self._seq > since
+            return self._seq > since or (epoch is not None and self._reset_epoch != epoch)
 
     def turns(self, limit=60):
         """Group turn-scoped events into compact traces, newest first.
@@ -970,18 +1028,22 @@ class Journal:
         # trace so per-client cache economics (opencode vs claude-cli) are queryable.
         clients = {}
         for event in snapshot:
-            if event["kind"] == "http.request":
+            if event.get("kind") == "http.request":
                 rid = str(event.get("request_id") or "")
-                client = (event.get("data") or {}).get("client")
+                raw_data = event.get("data")
+                client = raw_data.get("client") if isinstance(raw_data, dict) else None
                 if rid and client:
                     clients[rid] = str(client)[:60]
         for event in snapshot:
             turn_id = event.get("turn_id")
-            if not turn_id:
+            if not turn_id or not isinstance(turn_id, (str, int)) or isinstance(turn_id, bool):
                 continue
+            kind = event.get("kind")
+            kind = kind if isinstance(kind, str) else ""
+            ts = _number(event.get("ts"))
             trace = traces.get(turn_id)
             if trace is None:
-                trace = traces[turn_id] = {"turn_id": turn_id, "started": event["ts"], "ended": None,
+                trace = traces[turn_id] = {"turn_id": turn_id, "started": ts, "ended": None,
                                            "status": "running", "model": None, "effort": None,
                                            "transport": None, "dialect": None, "client": clients.get(str(event.get("request_id"))),
                                            "credits": None, "credits_complete": False, "credits_unknown": 0,
@@ -993,18 +1055,20 @@ class Journal:
                                            "errors": 0, "cache_read": 0, "cache_write": 0,
                                            "events": 0, "request_id": event.get("request_id")}
                 costs[turn_id] = _Turn()
-            data = event.get("data") or {}
+            elif trace["started"] is None and ts is not None:
+                trace["started"] = ts
+            raw_data = event.get("data")
+            data = raw_data if isinstance(raw_data, dict) else {}
             trace["events"] += 1
-            kind = event["kind"]
             if not trace.get("account") and event.get("account"):
-                trace["account"] = event["account"]
+                trace["account"] = event.get("account")
             if kind == "route.bound" and data.get("upstream"):
                 trace["upstream"] = data["upstream"]
             if kind == "turn.begin":
                 for key in ("model", "effort", "transport", "dialect"):
                     trace[key] = data.get(key)
             elif kind == "turn.end":
-                trace["ended"] = event["ts"]
+                trace["ended"] = ts
                 trace["duration_ms"] = data.get("duration_ms")
                 trace["output_tokens"] = data.get("output_tokens")
                 trace["tokens_per_second"] = None
@@ -1028,7 +1092,7 @@ class Journal:
                 trace["tools"] += 1
             elif kind == "exec.result":
                 trace["commands"] += 1
-            if event["level"] == "error":
+            if event.get("level") == "error":
                 trace["errors"] += 1
         for turn_id, trace in traces.items():
             total, priced, unknown = costs[turn_id].summary()

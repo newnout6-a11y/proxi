@@ -12,6 +12,7 @@ import copy
 import datetime
 import json
 import pathlib
+import threading
 
 FILE = pathlib.Path(__file__).with_name('minara_models.json')
 # What the relay measured by itself after this file was made (minara_refresh): a model Minara added, a new price, a model
@@ -20,7 +21,7 @@ AUTO_NAME = 'minara_models.auto.json'
 PUBLISHED = frozenset({'ok'})
 # What an account descriptor may override; anything else in it is an error (config._check_upstream).
 OVERRIDABLE = ('label', 'provider', 'context', 'max_output', 'tools', 'image', 'reasoning', 'reasoning_effort_levels',
-               'forced_tool_choice')
+               'forced_tool_choice', 'endpoint', 'use_responses')
 
 
 def _read(path):
@@ -53,6 +54,13 @@ def when(value):
 MEASURED, CREDITS_PER_USD = load()
 SHIPPED = dict(MEASURED)  # this file's entries, whatever an overlay put over them
 GENERATED_AT = _read(FILE).get('generated_at')
+_LOCK = threading.RLock()
+
+
+def snapshot():
+    """Return a shallow copy of the measured catalog under lock for safe iteration."""
+    with _LOCK:
+        return dict(MEASURED)
 
 
 def overlay_wins(entry, shipped=None, generated_at=None):
@@ -69,19 +77,20 @@ def apply_overlay(path):
     """Put the entries of an overlay file (minara_refresh writes it) over the measured catalog, in place; their ids.
 
     An entry wins over the shipped one only when newer than the shipped file; an unreadable overlay changes nothing."""
-    data = _read(path) if path else {}
-    changed = []
-    for upstream, entry in (data.get('models') or {}).items():
-        if not isinstance(entry, dict) or entry.get('upstream_model') != upstream:
-            continue
-        if overlay_wins(entry, SHIPPED.get(upstream)):
-            if MEASURED.get(upstream) != entry:
-                MEASURED[upstream] = entry
+    with _LOCK:
+        data = _read(path) if path else {}
+        changed = []
+        for upstream, entry in (data.get('models') or {}).items():
+            if not isinstance(entry, dict) or entry.get('upstream_model') != upstream:
+                continue
+            if overlay_wins(entry, SHIPPED.get(upstream)):
+                if MEASURED.get(upstream) != entry:
+                    MEASURED[upstream] = entry
+                    changed.append(upstream)
+            elif upstream in SHIPPED and MEASURED.get(upstream) is not SHIPPED[upstream]:
+                MEASURED[upstream] = SHIPPED[upstream]
                 changed.append(upstream)
-        elif upstream in SHIPPED and MEASURED.get(upstream) is not SHIPPED[upstream]:
-            MEASURED[upstream] = SHIPPED[upstream]
-            changed.append(upstream)
-    return changed
+        return changed
 
 
 def overlay_path(config_path):
@@ -102,7 +111,8 @@ def upstream_of(ident, measured=None):
 
     Accepts the upstream id itself (anthropic/claude-opus-5.5), the published name (minara/claude-opus-5-5) and the older
     minara/<upstream id> (minara/anthropic/claude-opus-5.5)."""
-    measured = MEASURED if measured is None else measured
+    if measured is None or measured is MEASURED:
+        measured = snapshot()
     if not isinstance(ident, str) or not ident:
         return None
     if ident in measured:
@@ -111,7 +121,7 @@ def upstream_of(ident, measured=None):
         rest = ident[len('minara/'):]
         if rest in measured:
             return rest
-        for upstream, entry in measured.items():
+        for upstream, entry in list(measured.items()):
             if entry.get('id') == ident:
                 return upstream
         return rest if '/' in rest else None
@@ -130,10 +140,34 @@ def _effort_control(entry, studied=None):
     return 'selectable' if entry['reasoning_effort_levels'] else 'passthrough'
 
 
+def _default_reasoning_effort(upstream, found, reasoning, levels, effort_map):
+    """Default effort for Minara routes when client/config asks for `auto`.
+
+    Preserves explicit channel-measured `default_effort`, keeps custom account level overrides
+    passthrough (`effort_map is None`), and falls back to canonical medium/high preference when
+    present in `reasoning_effort_levels`."""
+    if not (reasoning and effort_map and levels):
+        return None
+    explicit = found.get('default_effort')
+    if explicit is not None:
+        return explicit
+    canonical = str(upstream or '').split('/', 1)[-1].replace('.', '-')
+    if canonical == 'claude-fable-5' and 'high' in levels:
+        return 'high'
+    if 'medium' in levels:
+        return 'medium'
+    if 'high' in levels:
+        return 'high'
+    return None
+
+
 def route(upstream, descriptor=None, measured=None):
     """The relay's model entry for one upstream id: the measurement, then the account's overrides."""
-    measured = MEASURED if measured is None else measured
-    found = measured.get(upstream) or {}
+    if measured is None or measured is MEASURED:
+        with _LOCK:
+            found = MEASURED.get(upstream) or {}
+    else:
+        found = measured.get(upstream) or {}
     value = dict(descriptor or {})
     tools = value.get('tools', found.get('tools'))
     vision = value.get('image', found.get('vision'))
@@ -143,6 +177,22 @@ def route(upstream, descriptor=None, measured=None):
     levels = list(value.get('reasoning_effort_levels', found.get('reasoning_effort_levels') or []))
     # An account that lists its own levels takes them as they are: the study's map no longer describes them.
     effort_map = None if 'reasoning_effort_levels' in value else found.get('effort_map')
+    raw_ep_types = value.get('supported_endpoint_types', found.get('supported_endpoint_types')) or ()
+    ep_types = [str(item).strip().lower() for item in raw_ep_types
+                if isinstance(item, str) and item.strip()]
+    endpoint = value.get('endpoint', found.get('endpoint'))
+    if endpoint is not None:
+        if not isinstance(endpoint, str) or endpoint.strip().lower() not in ('auto', 'chat', 'messages', 'responses'):
+            raise ValueError('invalid Minara model endpoint: ' + repr(endpoint))
+        endpoint = endpoint.strip().lower()
+    use_responses = value.get('use_responses', found.get('use_responses'))
+    if use_responses is not None and type(use_responses) is not bool:
+        raise ValueError('Minara model use_responses must be boolean')
+    responses_cap = bool(found.get('responses') or any(kind in ('openai-response', 'responses') for kind in ep_types))
+    if endpoint == 'responses' or use_responses is True:
+        responses_cap = True
+    elif endpoint in ('chat', 'messages') or use_responses is False:
+        responses_cap = False
     entry = {
         'id': public_id(upstream) if not found else found['id'],
         'upstream': 'minara', 'upstream_model': upstream,
@@ -158,10 +208,10 @@ def route(upstream, descriptor=None, measured=None):
             'forced_tool_choice', not upstream.startswith('anthropic/')))),
         'thinking': found.get('thinking'), 'thinking_signature': bool(found.get('thinking_signature')),
         'cache': found.get('cache') or ('explicit' if upstream.startswith('anthropic/') else 'automatic'),
+        'responses': responses_cap,
         'pricing': copy.deepcopy(found.get('pricing')), 'backend': found.get('backend'),
-        # The level sent when the client asks for none, where the model's own default lands on a channel that drops the
-        # cache marks (scripts/probe_minara.py cached_levels); None sends nothing, the model's own default.
-        'default_reasoning_effort': found.get('default_effort') if reasoning and effort_map else None,
+        # The level sent when `auto` is configured (measured default_effort, else canonical medium/high when supported).
+        'default_reasoning_effort': _default_reasoning_effort(upstream, found, reasoning, levels, effort_map),
         # The level that reasons like the model's own default, for a client that must name one (Codex's default level).
         'natural_reasoning_effort': found.get('natural_effort') if reasoning and effort_map else None,
         # The levels that go through Minara's /v1/messages: the chat path sends them to a channel without cache.
@@ -169,6 +219,12 @@ def route(upstream, descriptor=None, measured=None):
         'metadata_source': 'minara_models.json' if found else 'operator-configured',
         'metadata_status': ('measured ' + str(found.get('checked_at'))) if found.get('checked_at') else 'unverified',
     }
+    if ep_types:
+        entry['supported_endpoint_types'] = ep_types
+    if endpoint is not None:
+        entry['endpoint'] = endpoint
+    if use_responses is not None:
+        entry['use_responses'] = use_responses
     if found.get('served_as'):
         entry['served_as'] = found['served_as']
     entry['reasoning_effort_control'] = _effort_control(
@@ -179,12 +235,13 @@ def route(upstream, descriptor=None, measured=None):
 def descriptors(cfg):
     """(upstream id, overrides) for every model this Minara account serves."""
     listed = cfg.get('minara_models')
+    measured = snapshot()
     if not listed:
-        return [(upstream, None) for upstream, entry in MEASURED.items() if entry.get('status') in PUBLISHED]
+        return [(upstream, None) for upstream, entry in measured.items() if entry.get('status') in PUBLISHED]
     result = []
     for item in listed:
         value = {'id': item} if isinstance(item, str) else dict(item)
-        upstream = upstream_of(value.get('id'))
+        upstream = upstream_of(value.get('id'), measured=measured)
         if upstream is not None:
             result.append((upstream, {key: value[key] for key in OVERRIDABLE if key in value} or None))
     return result

@@ -101,8 +101,9 @@ export function providerToForm(prov) {
   const models = modelsText(prov.models);
   const overrides = prov.body_overrides && Object.keys(prov.body_overrides).length
     ? JSON.stringify(prov.body_overrides, null, 2) : '';
+  const preset = prov.preset && prov.preset !== 'custom' ? prov.preset : '';
   return {
-    preset: prov.preset && prov.preset !== 'custom' ? prov.preset : '',
+    preset,
     name: prov.name || prov.id,
     id: prov.id,
     driver: prov.driver || 'openai-chat',
@@ -123,7 +124,7 @@ export function providerToForm(prov) {
     saved_headers: [...(prov.headers_keys || [])],
     body_overrides_text: overrides,
     // What the form started with: a field left as it was is not sent.
-    initial: { models_text: models, proxy_url: prov.proxy_url || '', body_overrides_text: overrides },
+    initial: { preset, models_text: models, proxy_url: prov.proxy_url || '', body_overrides_text: overrides },
   };
 }
 
@@ -149,6 +150,7 @@ export function buildProviderPayload(form, editingId, presets = []) {
   if (!editingId && form.id.trim()) payload.id = form.id.trim().toLowerCase();
   const preset = presets.find((p) => p.id === form.preset);
   if (form.preset && (!preset || presetMatchesUrl(preset, payload.base_url))) payload.preset = form.preset;
+  else if (editingId) payload.preset = 'custom';
   if (form.auth_mode === 'custom-header') payload.auth_header_name = form.auth_header_name.trim();
 
   if (form.auth_mode !== 'none') {
@@ -176,4 +178,67 @@ export function buildProviderPayload(form, editingId, presets = []) {
     else if (editingId) payload.body_overrides = {};
   }
   return payload;
+}
+
+export const EMPTY_CLIENT_KEY = {
+  id: '',
+  label: '',
+  allowed_text: '',
+  rpm_limit: '',
+  max_budget_usd: '',
+  max_request_minara: '',
+  max_day_minara: '',
+  allow_cost_confirm: false,
+  editing: false,
+};
+
+/** Populate the client AccessKey edit form from a public key record. */
+export function clientKeyToForm(ck) {
+  return {
+    id: ck.id || '',
+    label: ck.label || '',
+    allowed_text: (ck.allowed_models || []).join(', '),
+    rpm_limit: ck.rpm_limit !== null && ck.rpm_limit !== undefined ? String(ck.rpm_limit) : '',
+    max_budget_usd: ck.max_budget_usd !== null && ck.max_budget_usd !== undefined ? String(ck.max_budget_usd) : '',
+    max_request_minara: ck.max_request_minara !== null && ck.max_request_minara !== undefined ? String(ck.max_request_minara) : '',
+    max_day_minara: ck.max_day_minara !== null && ck.max_day_minara !== undefined ? String(ck.max_day_minara) : '',
+    allow_cost_confirm: ck.allow_cost_confirm === true,
+    editing: true,
+  };
+}
+
+function parseOptionalInt(rawValue, fieldName, min, max) {
+  const raw = String(rawValue ?? '').trim();
+  if (!raw) return null;
+  if (!/^\d+$/.test(raw)) throw new Error(`Поле «${fieldName}» должно быть целым числом от ${min} до ${max}`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`Поле «${fieldName}» должно быть целым числом от ${min} до ${max}`);
+  }
+  return value;
+}
+
+function parseOptionalNonNegativeNumber(rawValue, fieldName) {
+  const raw = String(rawValue ?? '').trim().replace(',', '.');
+  if (!raw) return null;
+  if (!/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(raw)) throw new Error(`Поле «${fieldName}» должно быть неотрицательным числом`);
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) throw new Error(`Поле «${fieldName}» должно быть неотрицательным числом`);
+  return value;
+}
+
+/** Validate and build the POST / PATCH payload for a virtual client AccessKey. */
+export function buildClientKeyPayload(draft) {
+  const label = String(draft.label || '').trim();
+  if (!label) throw new Error('Укажите название клиента или устройства');
+  const allowed = String(draft.allowed_text || '').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+  return {
+    label,
+    allowed_models: allowed.length ? allowed : null,
+    rpm_limit: parseOptionalInt(draft.rpm_limit, 'Лимит RPM', 1, 100000),
+    max_budget_usd: parseOptionalNonNegativeNumber(draft.max_budget_usd, 'Бюджет в USD'),
+    max_request_minara: parseOptionalNonNegativeNumber(draft.max_request_minara, 'Лимит Minara за запрос'),
+    max_day_minara: parseOptionalNonNegativeNumber(draft.max_day_minara, 'Дневной лимит Minara'),
+    allow_cost_confirm: Boolean(draft.allow_cost_confirm),
+  };
 }

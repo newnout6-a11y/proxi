@@ -38,7 +38,7 @@ import models
 from apierr import ApiError
 from scripts import sync_virtual_models
 from scripts.audit_models import load_accounts
-from scripts.sync_opencode_catalog import write_backed_up
+from scripts.sync_opencode_catalog import _unlink_quiet, write_backed_up
 
 POLICY_PATH = r'Software\Policies\Claude'
 VALUE_NAME = 'inferenceModels'
@@ -65,12 +65,16 @@ DESKTOP_SURFACES = ('ccd', 'cc', 'cowork')
 # catalog (v4008) agrees. A model missing here is assumed to have the full picker, which
 # is the safe side: the cap keeps Desktop from requesting a level the route rejects.
 NATIVE_EFFORTS = {
-    **dict.fromkeys(('claude-fable-5-1', 'claude-fable-5', 'claude-opus-5-5', 'claude-sonnet-5-5',
-                     'claude-haiku-5-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8',
-                     'claude-opus-4-7'), DESKTOP_EFFORTS),
+    **dict.fromkeys(('claude-fable-5-2', 'claude-fable-5-1', 'claude-fable-5', 'claude-opus-5-5',
+                     'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5', 'claude-sonnet-5',
+                     'claude-opus-4-8', 'claude-opus-4-7'), DESKTOP_EFFORTS),
     **dict.fromkeys(('claude-opus-4-6', 'claude-sonnet-4-6'), ('low', 'medium', 'high', 'max')),
-    **dict.fromkeys(('claude-haiku-4-5-20251001', 'claude-opus-4-5-20251101', 'claude-sonnet-4-5-20250929',
-                     'claude-opus-4-20250514', 'claude-opus-4-1-20250805', 'claude-sonnet-4-20250514'), ()),
+    **dict.fromkeys(('claude-haiku-4-5-20251001', 'claude-haiku-4-5',
+                     'claude-opus-4-5-20251101', 'claude-opus-4-5',
+                     'claude-sonnet-4-5-20250929', 'claude-sonnet-4-5',
+                     'claude-opus-4-20250514', 'claude-opus-4',
+                     'claude-opus-4-1-20250805', 'claude-opus-4-1',
+                     'claude-sonnet-4-20250514', 'claude-sonnet-4'), ()),
 }
 
 
@@ -127,12 +131,12 @@ def claude_routes(entries):
 
 def _base_id(entry):
     """The Anthropic catalog model behind an entry: itself, the primary target of a route alias, or the base of a
-    virtual <model>@<profile> entry, stripped of any provider prefix (minara/claude-opus-5-5 -> claude-opus-5-5)."""
+    virtual <model>@<profile> entry, stripped of provider prefix and :tag (or/anthropic/claude-opus-4.6:free -> claude-opus-4-6)."""
     if entry.get('is_route_alias') and entry.get('route_targets'):
         raw = entry['route_targets'][0]['id']
     else:
         raw = entry.get('virtual', {}).get('base', entry['id'])
-    bare = raw.rsplit('/', 1)[-1]
+    bare = raw.rsplit('/', 1)[-1].split(':', 1)[0]
     return bare.replace('.', '-') if bare.startswith('claude-') else bare
 
 
@@ -204,19 +208,36 @@ def build_catalog(entries, previous, *, default_model=None, desktop=None, includ
     bases = [entry for entry in listed if 'virtual' not in entry]
     for name in names:
         entry = by_id[name]
+        base_id = _base_id(entry)
         metadata = models.desktop_metadata(entry, bases)
         item = copy.deepcopy(old.get(name) or {})
         item['name'] = name
         if name not in old:
-            item['labelOverride'] = metadata.get('display_name', entry['label'])
+            item['labelOverride'] = metadata.get('display_name', entry.get('label', name))
         item['isFamilyDefault'] = bool(metadata.get('is_family_default'))
         tier = metadata.get('anthropic_family_tier')
         if tier:
             item['anthropicFamilyTier'] = tier
         else:
             item.pop('anthropicFamilyTier', None)
+        # Desktop resolves native effort pickers and capabilities via behavesAs || name, so
+        # prefixed/virtual/aliased Claude rows need behavesAs pointing at their native base ID.
+        if name != base_id and not item.get('behavesAs') and (
+                base_id in NATIVE_EFFORTS or (base_id.startswith('claude-') and tier is not None)):
+            item['behavesAs'] = base_id
+        if 'supports1m' not in item:
+            route_limit = entry.get('route_input_tokens')
+            ctx = entry.get('context')
+            if route_limit is not None and not isinstance(route_limit, bool) and isinstance(route_limit, int):
+                if route_limit >= 1_000_000:
+                    item['supports1m'] = True
+            elif (metadata.get('supports_1m')
+                  or (not isinstance(ctx, bool) and isinstance(ctx, int) and ctx >= 1_000_000
+                      and (entry.get('upstream') not in (None, 'retool') or entry.get('provider_id')
+                           or (name != base_id and 'virtual' not in entry and entry.get('upstream') != 'retool')))):
+                item['supports1m'] = True
         cap = compatible_effort_cap(entry.get('reasoning_effort_levels') or [],
-                                    native_efforts(_base_id(entry), desktop), allow_downgrade)
+                                    native_efforts(base_id, desktop), allow_downgrade)
         if cap:
             item['maxEffort'] = cap
         else:
@@ -576,11 +597,15 @@ def run(args):
                         'like) loses its row')
     encoded = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
     if args.output:
+        output_path = Path(args.output)
         try:
-            with Path(args.output).open('x', encoding='utf-8') as output:
+            with output_path.open('x', encoding='utf-8') as output:
                 json.dump(result, output, ensure_ascii=False, indent=2)
         except FileExistsError:
             raise SyncError('Preview file already exists and is never overwritten: %s' % args.output) from None
+        except BaseException:
+            _unlink_quiet(output_path)
+            raise
     # Parsed values decide, not bytes: the same list in another JSON layout needs no write and no backup.
     changed = result != previous
     backup = None

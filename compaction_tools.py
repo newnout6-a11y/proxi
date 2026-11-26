@@ -20,6 +20,7 @@ import copy
 import hashlib
 import json
 import os
+import tempfile
 import threading
 import time
 
@@ -34,6 +35,7 @@ MAX_CHARS = 1024 * 1024
 # chat was last seen is written again.
 FILE_NAME = "chat-tools.json"
 SAVE_EVERY = 60
+REPLACE_ATTEMPTS = 4
 
 
 def _digest(tools):
@@ -51,6 +53,7 @@ class ChatTools:
         self._chats = collections.OrderedDict()
         self._path = path
         self._dirty = False
+        self._revision = 0
         self._saved_at = 0.0
         self._warned = False
         self._load()
@@ -75,6 +78,7 @@ class ChatTools:
             while len(self._chats) > self._max:
                 self._chats.popitem(last=False)
             self._dirty = True
+            self._revision += 1
             due = changed or now - self._saved_at >= SAVE_EVERY
         if due:
             self._save(now)
@@ -127,21 +131,51 @@ class ChatTools:
             with self._lock:
                 if not self._dirty:
                     return
-                self._dirty = False
-                self._saved_at = now
+                revision = self._revision
                 lists, chats = {}, []
                 for key, (model, tools, seen) in self._chats.items():
                     digest = _digest(tools)
                     lists.setdefault(digest, tools)
                     chats.append([key, model, digest, seen])
                 document = {"version": 1, "lists": lists, "chats": chats}
+            temporary = None
             try:
-                temporary = "%s.%d.tmp" % (self._path, os.getpid())
-                with open(temporary, "w", encoding="utf-8") as handle:
+                directory = os.path.dirname(os.path.abspath(self._path))
+                fd, temporary = tempfile.mkstemp(prefix=".chat-tools-", suffix=".tmp", dir=directory)
+                try:
+                    handle = os.fdopen(fd, "w", encoding="utf-8")
+                except BaseException:
+                    os.close(fd)
+                    raise
+                with handle:
                     json.dump(document, handle, ensure_ascii=False)
-                os.replace(temporary, self._path)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                for attempt in range(REPLACE_ATTEMPTS):
+                    try:
+                        os.replace(temporary, self._path)
+                        temporary = None
+                        break
+                    except PermissionError:
+                        # Windows: a scanner or indexer may hold the target for a moment.
+                        if attempt + 1 == REPLACE_ATTEMPTS:
+                            raise
+                        time.sleep(0.05 * (attempt + 1))
             except (OSError, TypeError, ValueError) as exc:
+                with self._lock:
+                    self._dirty = True
                 if not self._warned:
                     self._warned = True
                     journal.emit("codex.chat_tools_save_failed", "Инструменты чатов Codex не сохранены на диск: %s"
                                  % type(exc).__name__, "warn")
+            else:
+                with self._lock:
+                    self._saved_at = now
+                    if self._revision == revision:
+                        self._dirty = False
+            finally:
+                if temporary is not None and os.path.exists(temporary):
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass

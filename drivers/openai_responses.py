@@ -315,6 +315,7 @@ class OpenAIResponsesDriver(UpstreamDriver):
         headers = discovery.build_auth_headers(cfg)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream"
+        cache_engine.apply_openai_cache_headers(headers, cfg, session, model)
 
         head_key, head_role, head_gate = cache_engine.claim_universal_head(
             cfg, session, self.driver_id, model, effort, resp_tools, clean_head
@@ -392,7 +393,7 @@ class OpenAIResponsesDriver(UpstreamDriver):
                             pre_output=not has_output,
                         )
 
-                    if kind == "response.reasoning_summary_text.delta":
+                    if kind in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
                         delta_txt = item.get("delta")
                         if isinstance(delta_txt, str) and delta_txt:
                             has_output = True

@@ -102,7 +102,7 @@ class OpenCodeSync:
         else:
             summary = _summary(done.stdout)
             if summary is None or done.returncode:
-                detail = (done.stderr or "").strip().splitlines()
+                detail = (done.stderr or "").strip().splitlines() or (done.stdout or "").strip().splitlines()
                 summary = {"error": (detail[-1] if detail else "exit status %s" % done.returncode)[:300]}
         # Never a credential in what is kept or said: an error can quote a path or a line of the files read.
         if summary.get("error"):
@@ -110,13 +110,11 @@ class OpenCodeSync:
         return summary
 
     def __call__(self, reason):
-        if not self.cfg.get("opencode_sync", True):
-            return None
         relay_config = self.cfg.get("_config_path")
         if not relay_config:
             return None
-        path = settings_path(self.cfg)
-        opencode_ready = path is not None and path.is_file() and SCRIPT.is_file()
+        path = settings_path(self.cfg) if self.cfg.get("opencode_sync", True) else None
+        opencode_ready = bool(self.cfg.get("opencode_sync", True)) and path is not None and path.is_file() and SCRIPT.is_file()
         harness_paths = harness_settings_paths(self.cfg) if (self.cfg.get("harness_sync", True) and HARNESS_SCRIPT.is_file()) else []
         if not opencode_ready and not harness_paths:
             return None

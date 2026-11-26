@@ -505,6 +505,7 @@ def make_handler(runtime: Runtime):
             fields = dict(method=self.command, path=self.path, route=route, status=status, http_status=http_status or None,
                           duration_ms=round(took), slot_wait_ms=round(slot_wait * 1000),
                           model=None if model == "-" else model, stream=streaming, error=error,
+                          attempt=holder.get("_journal_attempt") or None,
                           expected=True if expected else None, disconnected=True if disconnected else None)
             fields.update(holder.get("_console_route") or {})
             console_log.write("relay %s %s %s %s %s%s %.0fms %s" % (
@@ -521,13 +522,12 @@ def make_handler(runtime: Runtime):
                     spent = getattr(self, "_minara_used", None) if minara else self._credits_used
                     balance = snapshot()
                     upstream = (getattr(backend, "cfg", None) or {}).get("upstream", "retool") if backend else None
-                    console_log.write(console_log.balance_line(self.request_id, balance, spent, account=tag),
-                                      kind="account.balance", account=account_tag(backend), upstream=upstream,
-                                      available=console_log.number(balance.get("available"), signed=True),
-                                      unit=balance.get("unit") or ("retool_credits" if upstream == "retool" else None),
-                                      stale=balance.get("stale"), estimated=balance.get("estimated"),
-                                      unreported_usage=balance.get("unreported_usage"), message=None,
-                                      text_only=backend is None)
+                    bal_text, bal_fields, bal_level = console_log.balance_fields(
+                        self.request_id, balance, spent, account=tag, upstream=upstream)
+                    bal_fields["account"] = account_tag(backend)
+                    console_log.write(bal_text, kind="account.balance", level=bal_level,
+                                      model=None if model == "-" else model, message=None,
+                                      text_only=backend is None, **bal_fields)
             # Admin polling and live streams would drown the journal in its own traffic. A slow answer is journaled all the
             # same (the live journal stream excepted, which lasts by design): a page that took seconds to open left no
             # trace anywhere but the console (2026-11-13).
@@ -689,7 +689,8 @@ def make_handler(runtime: Runtime):
             except Exception as exc:  # never leak a bare traceback
                 self._close_if_body_unread()
                 console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__,
-                                  journal.redact_whole(str(exc))[:200]), kind="http.exception", level="error")
+                                  journal.redact_whole(str(exc))[:200]), kind="http.exception", level="error",
+                                  request_id=self.request_id, exception_type=type(exc).__name__, route=self._log_route)
                 self._error_code = "internal_error"
                 journal.emit("http.exception", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "error",
                              request_id=self.request_id, path=self.path)
@@ -948,7 +949,9 @@ def make_handler(runtime: Runtime):
                          "Сжатие Codex: объявлены инструменты чата (%d), сводка читает его кэш вместо записи всей истории"
                          % len(tools), "info", request_id=self.request_id, tools=len(tools), conversation=journal.tag(key))
             console_log.write("[%s] [cache] Codex compaction declares the chat's %d tools again: the summary reads the chat's "
-                              "cache" % (self.request_id, len(tools)))
+                              "cache" % (self.request_id, len(tools)),
+                              kind="codex.compaction_tools", level="info", request_id=self.request_id,
+                              tools=len(tools), conversation=journal.tag(key))
             return {**data, "tools": tools, "parallel_tool_calls": True}
 
         def _read_body(self):
@@ -1113,10 +1116,12 @@ def make_handler(runtime: Runtime):
                                          parsed={key: value for key, value in vars(parsed).items()
                                                   if key not in ("client_key", "credential_scope") and not key.startswith("prompt_")},
                                          effective_effort=self._effort_str)
-            client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
+            client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose,
+                                 "model": parsed.model})
             task_note = " | TASK: " + parsed.client_task if parsed.client_task else ""
             console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}{task_note}",
                               kind="request.validated", model=parsed.model, requested_effort=self._effort_str or None,
+                              request_purpose=parsed.request_purpose, client_task=parsed.client_task or None,
                               method=self.command, path=self.path, stream=parsed.stream, message=None)
 
             wait = runtime.limiter.take()
@@ -1256,10 +1261,16 @@ def make_handler(runtime: Runtime):
         # The models a prompt suggestion runs on with prompt_suggestion_model "auto", fastest first (design_routing_errors.md
         # section 5.1). Each serves only when the live catalog has it (a Minara model needs a Minara account) and an account
         # can take it now. Claude Haiku 4.5 on Retool answered all 8 suggestions of the live journal (TTFT 1.1 s); Minara's
-        # Haiku 4.5 writes without reasoning first; gpt-5-nano and GLM-5.3-Flash reason, on their lowest level. When none
-        # can, the chat model serves the suggestion on its lowest level. The chain of 54b1023 had fast-auto, a model no
-        # catalog has, and gpt-5.6-luna and gpt-5.5, reasoning models outside the plan of part of the pool.
-        SUGGESTION_MODELS = ("claude-haiku-4-5-20251001", "minara/claude-haiku-4-5", "gpt-5-nano", "zai-org/GLM-5.3-Flash")
+        # DeepSeek V4 Flash and GLM-5.3-Flash give fast, low-cost Minara fallbacks before Haiku 4.5 / gpt-5-nano / GLM-5.3-Flash.
+        # When none can, the chat model serves the suggestion on its lowest level.
+        SUGGESTION_MODELS = (
+            "claude-haiku-4-5-20251001",
+            "minara/deepseek-v4-flash",
+            "minara/glm-5.3-flash",
+            "minara/claude-haiku-4-5",
+            "gpt-5-nano",
+            "zai-org/GLM-5.3-Flash",
+        )
         # The conversation a suggestion reads: the latest messages and the suggestion request, each cut to a few lines.
         SUGGESTION_TAIL = 6
         SUGGESTION_CHUNK_CHARS = 1200
@@ -1531,6 +1542,20 @@ def make_handler(runtime: Runtime):
                     error = runtime.pool.unavailable_error(entry, **scope)
             return error
 
+        @staticmethod
+        def _raise_if_future_failed(fut, *, wait_on_sentinel=False):
+            """Surface an unhandled turn-runner exception instead of returning an empty 200."""
+            if wait_on_sentinel and not fut.done():
+                try:
+                    fut.result(timeout=0.5)
+                except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
+                    return
+                return
+            if fut.done() and not fut.cancelled():
+                exc = fut.exception()
+                if exc is not None:
+                    raise exc
+
         def _collect(self, fut, events, adapter, prompt_text, holder_session=None):
             holder_session = holder_session or {}
             reason = "stop"
@@ -1543,9 +1568,11 @@ def make_handler(runtime: Runtime):
                         self._cancel_turn(fut, holder_session)
                         return "cancelled"
                     if fut.done() and events.empty():
+                        self._raise_if_future_failed(fut)
                         break
                     continue
                 if event is None:
+                    self._raise_if_future_failed(fut, wait_on_sentinel=True)
                     break
                 self._trace_relay_event(event)
                 kind = event.get("type")
@@ -1558,7 +1585,7 @@ def make_handler(runtime: Runtime):
                 try:
                     adapter.feed(event)
                 except apierr.ApiError:
-                    self._cancel_turn(fut, holder_session)
+                    self._cancel_turn(fut, holder_session, client_left=False)
                     raise
                 if sse.client_gone(self):
                     self._cancel_turn(fut, holder_session)
@@ -1586,8 +1613,9 @@ def make_handler(runtime: Runtime):
                     item["error"] = {"exception_type": type(error).__name__, "message": str(error), **vars(error)}
                 trace.event("relay_event", event=item)
 
-        def _cancel_turn(self, fut, holder):
-            self._client_left = True  # the turn was cancelled because its client went away (or the write to it failed)
+        def _cancel_turn(self, fut, holder, *, client_left=True):
+            if client_left:
+                self._client_left = True  # the turn was cancelled because its client went away (or the write to it failed)
             event = holder.get("cancel_event")
             if event is not None:
                 event.set()
@@ -1614,9 +1642,11 @@ def make_handler(runtime: Runtime):
                         self._cancel_turn(fut, holder)
                         return "cancelled"
                     if fut.done() and events.empty():
+                        self._raise_if_future_failed(fut)
                         break
                     continue
                 if event is None:
+                    self._raise_if_future_failed(fut, wait_on_sentinel=True)
                     break
                 self._trace_relay_event(event)
                 if event.get("type") == "error":
@@ -1629,7 +1659,7 @@ def make_handler(runtime: Runtime):
                 try:
                     adapter.feed(event)
                 except apierr.ApiError:
-                    self._cancel_turn(fut, holder)
+                    self._cancel_turn(fut, holder, client_left=False)
                     raise
                 self._keep_alive(adapter, writer)
                 # Check for a disconnect on every event, not only when the stream idles.
@@ -1765,11 +1795,14 @@ def startup_round(runtime):
         # The balances were just read: the report takes them from the managers' caches, not from the network again.
         balance = account_report.balance_report(account_report.collect(runtime))
     except Exception as exc:  # noqa: BLE001 - the relay serves whatever the round could not read
-        console_log.write("[startup] balance round failed: %s" % type(exc).__name__)
+        console_log.write("[startup] balance round failed: %s" % type(exc).__name__,
+                          kind="relay.startup_balances", level="warn", error=type(exc).__name__)
         return None
     for line in balance_lines(balance):
-        console_log.write("[startup]" + line)
-    console_log.write("[startup] balances of %d accounts read in %.0f s" % (checked, time.monotonic() - started))
+        console_log.write("[startup]" + line, kind="relay.startup_balances")
+    console_log.write("[startup] balances of %d accounts read in %.0f s" % (checked, time.monotonic() - started),
+                      kind="relay.startup_balances", accounts_checked=checked,
+                      duration_ms=round((time.monotonic() - started) * 1000))
     return balance
 
 

@@ -237,6 +237,7 @@ def upstream_headers(cfg) -> dict:
 
 # Cookie values that are just host names (lastSubdomain=tenant.retool.com) are not secrets: masking them hides the tenant.
 HOST_NAME = re.compile(r"[A-Za-z0-9.\-]+\.(com|app|io|dev|net|org)")
+_COOKIE_VALUES_LOCK = threading.Lock()
 
 
 def secret_values(cookie, extra=()):
@@ -252,6 +253,33 @@ def secret_values(cookie, extra=()):
             values.append(value)
     values += [value for value in extra or () if isinstance(value, str) and value and value not in values]
     return values
+
+
+def update_cookie_values(cfg, cookie, extra=()):
+    """Merge `cookie` secrets (plus `extra`) into `cfg['cookie_values']` and any shared root list in place."""
+    new_values = secret_values(cookie, extra)
+    with _COOKIE_VALUES_LOCK:
+        root = cfg.get("_root_cookie_values")
+        current = cfg.get("cookie_values")
+        targets = []
+        if isinstance(root, list):
+            targets.append(root)
+        if isinstance(current, list) and current is not root:
+            targets.append(current)
+        for target in targets:
+            for val in new_values:
+                if val not in target:
+                    target.append(val)
+        if not isinstance(current, list):
+            if isinstance(root, list) and not current:
+                cfg["cookie_values"] = root
+            else:
+                merged = list(current or ())
+                for val in new_values:
+                    if val not in merged:
+                        merged.append(val)
+                cfg["cookie_values"] = merged
+    return cfg["cookie_values"]
 
 
 def merge_set_cookie(cfg, headers) -> bool:
@@ -293,7 +321,8 @@ def merge_set_cookie(cfg, headers) -> bool:
             xsrf_set = True
     if dirty:
         cookie = "; ".join(key + "=" + value for key, value in jar.items())
-        cfg.update(cookie=cookie, cookie_values=secret_values(cookie, cfg.get("_extra_secrets", ())), xsrf=xsrf)
+        cfg.update(cookie=cookie, xsrf=xsrf)
+        update_cookie_values(cfg, cookie, cfg.get("_extra_secrets", ()))
     return changed
 
 
@@ -429,6 +458,12 @@ class ClientKeyManager:
             normalized[norm["id"]] = norm
         with self._lock:
             self._keys = normalized
+            for stale_id in set(self._usage) - set(normalized):
+                self._usage.pop(stale_id, None)
+            for stale_id in set(self._rpm_stamps) - set(normalized):
+                self._rpm_stamps.pop(stale_id, None)
+            for stale_id in set(self._counted) - set(normalized):
+                self._counted.pop(stale_id, None)
             for kid in normalized:
                 self._usage.setdefault(
                     kid,

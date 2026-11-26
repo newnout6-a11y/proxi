@@ -8,6 +8,7 @@ Provides:
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import math
@@ -15,6 +16,7 @@ import os
 import pathlib
 import re
 import tempfile
+import threading
 
 from drivers import http_pool
 
@@ -28,6 +30,8 @@ _PREVIEW_SUFFIX = re.compile(r"-(?:preview|latest|exp|beta)(?:-\d{2,4}-\d{2})?$"
 
 _SHIPPED: dict[str, dict] = {}
 _LIVE_OVERLAY: dict[str, dict] = {}
+_OVERLAY_LOCK = threading.Lock()
+_REPLACE_ATTEMPTS = 5
 
 
 def _load_snapshot() -> dict[str, dict]:
@@ -173,7 +177,8 @@ def apply_cache_file(path: str | os.PathLike | None) -> int:
     models = data.get("models") if isinstance(data, dict) else None
     if not isinstance(models, dict):
         return 0
-    _LIVE_OVERLAY.update({k: v for k, v in models.items() if isinstance(v, dict)})
+    with _OVERLAY_LOCK:
+        _LIVE_OVERLAY.update({k: v for k, v in models.items() if isinstance(v, dict)})
     return len(models)
 
 
@@ -194,16 +199,33 @@ async def refresh_models_dev_async(cfg: dict) -> int:
     parsed = parse_models_dev_payload(resp.json())
     if not parsed:
         return 0
-    _LIVE_OVERLAY.update(parsed)
+    with _OVERLAY_LOCK:
+        _LIVE_OVERLAY.update(parsed)
     target = cache_path(cfg.get("_config_path"))
     if target is not None:
+        tmp = None
         try:
+            target.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".models_dev_", suffix=".tmp", dir=str(target.parent))
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"source": url, "models": parsed}, fh, ensure_ascii=False, indent=2)
-            os.replace(tmp, target)
+            for attempt in range(_REPLACE_ATTEMPTS):
+                try:
+                    os.replace(tmp, target)
+                    tmp = None
+                    break
+                except PermissionError:
+                    if attempt + 1 == _REPLACE_ATTEMPTS:
+                        raise
+                    await asyncio.sleep(0.05 * (attempt + 1))
         except OSError:
             pass
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
     return len(parsed)
 
 
@@ -211,7 +233,8 @@ def _match_entry(model_id: str) -> dict | None:
     slug = canonical_slug(model_id)
     if not slug:
         return None
-    merged_table = {**_SHIPPED, **_LIVE_OVERLAY}
+    with _OVERLAY_LOCK:
+        merged_table = {**_SHIPPED, **_LIVE_OVERLAY}
     if slug in merged_table:
         return merged_table[slug]
     stripped = _PREVIEW_SUFFIX.sub("", slug)

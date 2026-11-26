@@ -95,8 +95,9 @@ export default function Journal({ apiKey, journal, overview, onUnauthorized, emb
     // the dialog used to promise the file was kept, and hours of evidence went with one click.
     if (!window.confirm('Очистить журнал? Будут стёрты события в памяти relay и файлы на диске: journal.jsonl и все journal.jsonl.N. Восстановить их будет нельзя.')) return;
     try {
+      const clearEpoch = journal.epoch?.();
       await api(apiKey, 'events/clear', { method: 'POST', body: {} });
-      journal.reset();
+      journal.reset(clearEpoch);
       setFrozen(null);
       setOpen(null);
       toast({ tone: 'warn', title: 'Журнал очищен' });

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import os
 import queue
@@ -17,7 +18,7 @@ import auth
 import client_context
 import client_sync
 from catalog import discovery, router
-from drivers import http_pool, presets
+from drivers import curl_pool, http_pool, presets
 import journal
 import models
 import validate
@@ -82,6 +83,30 @@ def _proxy_password(url):
         return None
 
 
+def _proxy_secrets(url) -> list[str]:
+    """Extract non-empty username and password from a proxy_url."""
+    if not isinstance(url, str) or "@" not in url:
+        return []
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return []
+    found: list[str] = []
+    for raw in (parts.username, parts.password):
+        if isinstance(raw, str) and raw:
+            if raw not in found:
+                found.append(raw)
+            if "%" in raw:
+                unquoted = urllib.parse.unquote(raw)
+                if unquoted and unquoted not in found:
+                    found.append(unquoted)
+    return found
+
+
+def _admin_lock(admin_obj):
+    return getattr(admin_obj, "lock", None) or contextlib.nullcontext()
+
+
 def collect_extra_secrets(saved: dict | None) -> list[str]:
     """Gather API keys and virtual client keys from saved config so `Admin._safe` masks them everywhere."""
     if not isinstance(saved, dict):
@@ -94,12 +119,16 @@ def collect_extra_secrets(saved: dict | None) -> list[str]:
             if len(s) >= 8 and s not in found:
                 found.append(s)
 
+    def _add_proxy(url):
+        for secret in _proxy_secrets(url):
+            _add(secret)
+
     for prov in saved.get("providers") or []:
         if not isinstance(prov, dict):
             continue
         _add(prov.get("api_key"))
         _add(prov.get("bearer_token"))
-        _add(_proxy_password(prov.get("proxy_url")))
+        _add_proxy(prov.get("proxy_url"))
         opts = prov.get("options") if isinstance(prov.get("options"), dict) else {}
         _add(opts.get("apiKey"))
         env_name = prov.get("api_key_env") or prov.get("bearer_token_env")
@@ -116,7 +145,7 @@ def collect_extra_secrets(saved: dict | None) -> list[str]:
             if isinstance(cred, dict):
                 _add(cred.get("api_key"))
                 _add(cred.get("bearer_token"))
-                _add(_proxy_password(cred.get("proxy_url")))
+                _add_proxy(cred.get("proxy_url"))
                 c_env = cred.get("api_key_env") or cred.get("bearer_token_env")
                 if isinstance(c_env, str) and c_env:
                     _add(os.environ.get(c_env))
@@ -125,10 +154,10 @@ def collect_extra_secrets(saved: dict | None) -> list[str]:
         if isinstance(ck, dict):
             _add(ck.get("key"))
 
-    _add(_proxy_password(saved.get("proxy_url")))
+    _add_proxy(saved.get("proxy_url"))
     for acc in saved.get("accounts") or []:
         if isinstance(acc, dict):
-            _add(_proxy_password(acc.get("proxy_url")))
+            _add_proxy(acc.get("proxy_url"))
 
     return found
 
@@ -182,6 +211,7 @@ def _sanitize_saved_provider(raw: dict, meta: dict) -> dict:
     if clean["auth_mode"] == "none":
         for k in ("api_key", "bearer_token", "api_key_env", "bearer_token_env", "credentials"):
             clean.pop(k, None)
+        _drop_options_api_key(clean)
     return clean
 
 
@@ -359,7 +389,9 @@ def _replace_provider_backends_live(admin_obj, provider_id: str, new_records: li
     existing = [b for b in list(getattr(pool, "backends", None) or []) if (getattr(b, "cfg", None) or {}).get("provider_id") == provider_id]
     for b in existing:
         b.cfg["enabled"] = False
-        http_pool.close_account_clients(b.cfg.get("account_id"))
+        http_pool.close_account_clients(
+            b.cfg.get("account_id") or b.cfg.get("provider_id") or curl_pool.account_scope(b.cfg)
+        )
         try:
             pool.remove_account(b)
         except Exception:
@@ -423,6 +455,121 @@ def _merge_headers(saved, changes):
     return merged
 
 
+def _drop_options_api_key(provider: dict) -> None:
+    opts = provider.get("options")
+    if isinstance(opts, dict) and "apiKey" in opts:
+        opts.pop("apiKey", None)
+        if not opts:
+            provider.pop("options", None)
+
+
+def _preset_matches_base_url(preset_id: str | None, base_url: str | None) -> bool:
+    if not preset_id or preset_id == "custom" or preset_id not in presets.PRESETS:
+        return False
+    if not isinstance(base_url, str) or not base_url.strip():
+        return True
+    if presets.detect_preset_from_url(base_url) == preset_id:
+        return True
+    spec_url = presets.PRESETS[preset_id].get("base_url") or ""
+    try:
+        new_parts = urllib.parse.urlsplit(base_url.strip())
+        spec_parts = urllib.parse.urlsplit(spec_url)
+        new_host = (new_parts.hostname or "").lower()
+        spec_host = (spec_parts.hostname or "").lower()
+        if not new_host or not spec_host:
+            return False
+        if new_host == spec_host and (new_parts.port or None) == (spec_parts.port or None):
+            return True
+        if preset_id in ("moonshot", "siliconflow") and new_host == f"api.{preset_id}.cn":
+            return True
+        return False
+    except ValueError:
+        return False
+
+
+def _merge_credentials_patch(existing: dict, raw_creds: list) -> list:
+    existing_creds = existing.get("credentials") if isinstance(existing.get("credentials"), list) else []
+    by_id = {}
+    for prev in existing_creds:
+        if isinstance(prev, dict):
+            pid = prev.get("id") or prev.get("account_id")
+            if pid:
+                by_id[pid] = prev
+    merged_list = []
+    for idx, item in enumerate(raw_creds):
+        if not isinstance(item, dict):
+            merged_list.append(item)
+            continue
+        cred = copy.deepcopy(item)
+        cid = cred.get("id") or cred.get("account_id")
+        prev = by_id.get(cid) if cid in by_id else None
+        if prev is None and isinstance(cred.get("index"), int) and 1 <= cred["index"] <= len(existing_creds):
+            prev = existing_creds[cred["index"] - 1]
+        elif prev is None and idx < len(existing_creds):
+            prev = existing_creds[idx]
+        if not isinstance(prev, dict):
+            prev = None
+
+        raw_proxy = cred.get("proxy_url")
+        if isinstance(raw_proxy, str):
+            prev_proxy = prev.get("proxy_url") if prev else None
+            if prev_proxy and raw_proxy != prev_proxy and raw_proxy == public_proxy_url(prev_proxy):
+                cred["proxy_url"] = prev_proxy
+            elif not prev_proxy and existing.get("proxy_url") and raw_proxy == public_proxy_url(existing.get("proxy_url")):
+                cred["proxy_url"] = existing["proxy_url"]
+            elif PROXY_USERINFO_MASK + "@" in raw_proxy or raw_proxy == PROXY_USERINFO_MASK:
+                matched_proxy = next(
+                    (c.get("proxy_url") for c in existing_creds
+                     if isinstance(c, dict) and c.get("proxy_url") and public_proxy_url(c.get("proxy_url")) == raw_proxy),
+                    None,
+                )
+                if matched_proxy:
+                    cred["proxy_url"] = matched_proxy
+
+        has_env = bool((isinstance(cred.get("api_key_env"), str) and cred["api_key_env"].strip())
+                       or (isinstance(cred.get("bearer_token_env"), str) and cred["bearer_token_env"].strip()))
+        prev_key = None
+        if prev is not None:
+            prev_key = prev.get("api_key") or prev.get("bearer_token")
+        elif idx == 0 and not existing_creds:
+            opts = existing.get("options") if isinstance(existing.get("options"), dict) else {}
+            prev_key = existing.get("api_key") or existing.get("bearer_token") or opts.get("apiKey")
+
+        if has_env:
+            cred.pop("api_key", None)
+            cred.pop("bearer_token", None)
+        else:
+            for k_field in ("api_key", "bearer_token"):
+                if k_field in cred:
+                    val = cred[k_field]
+                    is_blank = val is None or (isinstance(val, str) and not val.strip())
+                    is_masked = isinstance(val, str) and prev_key and val in (KEY_MASK, mask_key_preview(prev_key))
+                    if (is_blank or is_masked) and prev_key:
+                        cred[k_field] = prev_key
+                    elif is_blank:
+                        cred.pop(k_field, None)
+            if "api_key" not in cred and "bearer_token" not in cred:
+                if prev_key:
+                    cred["api_key"] = prev_key
+                elif prev is not None:
+                    for env_field in ("api_key_env", "bearer_token_env"):
+                        if prev.get(env_field) and env_field not in cred:
+                            cred[env_field] = prev[env_field]
+        merged_list.append(cred)
+    return merged_list
+
+
+def _apply_custom_preset_override(source: dict, meta: dict, records: list[dict]) -> None:
+    if str((source or {}).get("preset") or "").strip().lower() != "custom":
+        return
+    endpoint = source.get("balance_endpoint") if "balance_endpoint" in source else None
+    meta["preset"] = "custom"
+    meta["balance_endpoint"] = endpoint
+    for rec in records:
+        rec["preset"] = "custom"
+        rec["balance_endpoint"] = endpoint
+
+
 def _merge_provider_patch(existing: dict, data: dict) -> dict:
     """The saved provider with a PATCH (or a probe of the saved provider) over it.
 
@@ -433,9 +580,15 @@ def _merge_provider_patch(existing: dict, data: dict) -> dict:
     for k, v in data.items():
         if k in ("id", "discover_now", "provider_id"):
             continue
-        if k == "api_key" and (v is None or (isinstance(v, str) and not v.strip())):
-            # Empty key on edit preserves existing stored credentials unless switching to keyless
-            continue
+        if k in ("api_key", "bearer_token"):
+            prev_key = existing.get("api_key") or existing.get("bearer_token") or (
+                (existing.get("options") or {}).get("apiKey") if isinstance(existing.get("options"), dict) else None
+            )
+            if v is None or (isinstance(v, str) and not v.strip()):
+                # Empty key on edit preserves existing stored credentials unless switching to keyless
+                continue
+            if isinstance(v, str) and prev_key and v in (KEY_MASK, mask_key_preview(prev_key)):
+                continue
         if k == "headers" and (v is None or isinstance(v, dict)):
             headers = None if v is None else _merge_headers(existing.get("headers"), v)
             if headers:
@@ -446,22 +599,50 @@ def _merge_provider_patch(existing: dict, data: dict) -> dict:
         if (k == "proxy_url" and isinstance(v, str) and v != existing.get("proxy_url")
                 and v == public_proxy_url(existing.get("proxy_url"))):
             continue
+        if k == "credentials" and isinstance(v, list) and v:
+            merged[k] = _merge_credentials_patch(existing, v)
+            continue
+        if k == "preset" and (v is None or (isinstance(v, str) and v.strip().lower() in ("", "custom"))):
+            merged["preset"] = "custom"
+            if "balance_endpoint" not in data:
+                merged.pop("balance_endpoint", None)
+            continue
         merged[k] = v
 
+    # When base_url moves off a preset host without naming a new preset, clear stale preset/balance_endpoint.
+    if "preset" not in data and ("base_url" in data or "base" in data):
+        old_preset = str(existing.get("preset") or "").strip().lower()
+        new_base = data.get("base_url") if "base_url" in data else data.get("base")
+        if old_preset and old_preset != "custom" and not _preset_matches_base_url(old_preset, new_base):
+            merged["preset"] = "custom"
+            if "balance_endpoint" not in data:
+                merged.pop("balance_endpoint", None)
+
     # Mutual exclusivity when switching from api_key_env <-> api_key or credentials
-    if isinstance(data.get("api_key"), str) and data["api_key"].strip():
+    if (isinstance(data.get("api_key"), str) and data["api_key"].strip()) or (
+        isinstance(data.get("bearer_token"), str) and data["bearer_token"].strip()
+    ):
         merged.pop("api_key_env", None)
         merged.pop("bearer_token_env", None)
         merged.pop("credentials", None)
-    elif isinstance(data.get("api_key_env"), str) and data["api_key_env"].strip():
+        _drop_options_api_key(merged)
+    elif (isinstance(data.get("api_key_env"), str) and data["api_key_env"].strip()) or (
+        isinstance(data.get("bearer_token_env"), str) and data["bearer_token_env"].strip()
+    ):
         merged.pop("api_key", None)
         merged.pop("bearer_token", None)
         merged.pop("credentials", None)
+        _drop_options_api_key(merged)
     elif isinstance(data.get("credentials"), list) and data["credentials"]:
         merged.pop("api_key", None)
         merged.pop("bearer_token", None)
         merged.pop("api_key_env", None)
         merged.pop("bearer_token_env", None)
+        _drop_options_api_key(merged)
+    if merged.get("auth_mode") == "none":
+        for k in ("api_key", "bearer_token", "api_key_env", "bearer_token_env", "credentials"):
+            merged.pop(k, None)
+        _drop_options_api_key(merged)
     return merged
 
 
@@ -484,25 +665,26 @@ def create_provider(admin_obj, data: dict) -> dict:
         meta, records, secrets_found = presets.expand_provider_to_accounts(copy.deepcopy(data), "provider")
     except ValueError as exc:
         raise apierr.bad_request(str(exc))
+    _apply_custom_preset_override(data, meta, records)
 
     pid = meta["id"]
     clean = _sanitize_saved_provider(data, meta)
-    admin_obj._mask_tokens(secrets_found)
 
-    with admin_obj._transaction() as (path, saved):
-        prov_list = saved.get("providers")
-        if not isinstance(prov_list, list):
-            prov_list = saved["providers"] = []
-        if any(isinstance(p, dict) and str(p.get("id") or "").strip().lower() == pid for p in prov_list):
-            raise apierr.conflict(f"Provider '{pid}' already exists")
-        prov_list.append(clean)
-        admin_obj._write(path, saved)
-        admin_obj.cfg["providers"] = copy.deepcopy(prov_list)
-
-    metas = admin_obj.cfg.setdefault("_providers_meta", {})
-    metas[pid] = meta
-    live = _replace_provider_backends_live(admin_obj, pid, records)
-    _rebuild_universal_catalogs(admin_obj.cfg)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction() as (path, saved):
+            prov_list = saved.get("providers")
+            if not isinstance(prov_list, list):
+                prov_list = saved["providers"] = []
+            if any(isinstance(p, dict) and str(p.get("id") or "").strip().lower() == pid for p in prov_list):
+                raise apierr.conflict(f"Provider '{pid}' already exists")
+            prov_list.append(clean)
+            admin_obj._write(path, saved)
+            admin_obj.cfg["providers"] = copy.deepcopy(prov_list)
+        admin_obj._mask_tokens(secrets_found)
+        metas = admin_obj.cfg.setdefault("_providers_meta", {})
+        metas[pid] = meta
+        live = _replace_provider_backends_live(admin_obj, pid, records)
+        _rebuild_universal_catalogs(admin_obj.cfg)
 
     refresher = getattr(admin_obj.runtime, "provider_catalog", None)
     disc_res = None
@@ -532,34 +714,36 @@ def update_provider(admin_obj, provider_id: str, data: dict) -> dict:
     if "models" in data:
         _check_models(data["models"])
 
-    with admin_obj._transaction() as (path, saved):
-        prov_list = saved.get("providers") if isinstance(saved.get("providers"), list) else []
-        idx = next((i for i, p in enumerate(prov_list) if isinstance(p, dict) and str(p.get("id") or "").strip().lower() == pid), None)
-        if idx is None:
-            raise apierr.not_found(f"Unknown provider '{pid}'")
-        existing = copy.deepcopy(prov_list[idx])
-        if (data.get("enabled") is False and existing.get("enabled", True) is not False
-                and not _serves_without(admin_obj, saved, pid)):
-            raise apierr.conflict("The last enabled provider cannot be switched off: nothing else would answer")
-        merged = _merge_provider_patch(existing, data)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction() as (path, saved):
+            prov_list = saved.get("providers") if isinstance(saved.get("providers"), list) else []
+            idx = next((i for i, p in enumerate(prov_list) if isinstance(p, dict) and str(p.get("id") or "").strip().lower() == pid), None)
+            if idx is None:
+                raise apierr.not_found(f"Unknown provider '{pid}'")
+            existing = copy.deepcopy(prov_list[idx])
+            if (data.get("enabled") is False and existing.get("enabled", True) is not False
+                    and not _serves_without(admin_obj, saved, pid)):
+                raise apierr.conflict("The last enabled provider cannot be switched off: nothing else would answer")
+            merged = _merge_provider_patch(existing, data)
 
-        merged["id"] = pid
-        try:
-            meta, records, secrets_found = presets.expand_provider_to_accounts(copy.deepcopy(merged), f"providers[{pid}]")
-        except ValueError as exc:
-            raise apierr.bad_request(str(exc))
+            merged["id"] = pid
+            try:
+                meta, records, secrets_found = presets.expand_provider_to_accounts(copy.deepcopy(merged), f"providers[{pid}]")
+            except ValueError as exc:
+                raise apierr.bad_request(str(exc))
+            _apply_custom_preset_override(merged, meta, records)
 
-        clean = _sanitize_saved_provider(merged, meta)
-        admin_obj._mask_tokens(secrets_found)
-        prov_list[idx] = clean
-        admin_obj._write(path, saved)
-        admin_obj.cfg["providers"] = copy.deepcopy(prov_list)
+            clean = _sanitize_saved_provider(merged, meta)
+            admin_obj._mask_tokens(secrets_found)
+            prov_list[idx] = clean
+            admin_obj._write(path, saved)
+            admin_obj.cfg["providers"] = copy.deepcopy(prov_list)
 
-    metas = admin_obj.cfg.setdefault("_providers_meta", {})
-    old_meta = metas.get(pid) or {}
-    metas[pid] = meta
-    live = _replace_provider_backends_live(admin_obj, pid, records)
-    _rebuild_universal_catalogs(admin_obj.cfg)
+        metas = admin_obj.cfg.setdefault("_providers_meta", {})
+        old_meta = metas.get(pid) or {}
+        metas[pid] = meta
+        live = _replace_provider_backends_live(admin_obj, pid, records)
+        _rebuild_universal_catalogs(admin_obj.cfg)
 
     conn_changed = (
         old_meta.get("base_url") != meta["base_url"]
@@ -587,29 +771,30 @@ def update_provider(admin_obj, provider_id: str, data: dict) -> dict:
 
 def delete_provider(admin_obj, provider_id: str) -> dict:
     pid = provider_id.strip().lower()
-    with admin_obj._transaction() as (path, saved):
-        prov_list = saved.get("providers") if isinstance(saved.get("providers"), list) else []
-        remaining = [p for p in prov_list if not (isinstance(p, dict) and str(p.get("id") or "").strip().lower() == pid)]
-        if len(remaining) == len(prov_list):
-            raise apierr.not_found(f"Unknown provider '{pid}'")
-        removed = [p for p in prov_list if p not in remaining]
-        if (any(isinstance(p, dict) and p.get("enabled", True) is not False for p in removed)
-                and not _serves_without(admin_obj, saved, pid)):
-            raise apierr.conflict("The last enabled provider cannot be removed: nothing else would answer")
-        saved["providers"] = remaining
-        admin_obj._write(path, saved)
-        admin_obj.cfg["providers"] = copy.deepcopy(remaining)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction() as (path, saved):
+            prov_list = saved.get("providers") if isinstance(saved.get("providers"), list) else []
+            remaining = [p for p in prov_list if not (isinstance(p, dict) and str(p.get("id") or "").strip().lower() == pid)]
+            if len(remaining) == len(prov_list):
+                raise apierr.not_found(f"Unknown provider '{pid}'")
+            removed = [p for p in prov_list if p not in remaining]
+            if (any(isinstance(p, dict) and p.get("enabled", True) is not False for p in removed)
+                    and not _serves_without(admin_obj, saved, pid)):
+                raise apierr.conflict("The last enabled provider cannot be removed: nothing else would answer")
+            saved["providers"] = remaining
+            admin_obj._write(path, saved)
+            admin_obj.cfg["providers"] = copy.deepcopy(remaining)
 
-    (admin_obj.cfg.get("_providers_meta") or {}).pop(pid, None)
-    overlay = admin_obj.cfg.get("_discovered_provider_models")
-    if isinstance(overlay, dict) and pid in overlay:
-        overlay.pop(pid, None)
-        ov_path = discovery.overlay_path(admin_obj.cfg.get("_config_path"))
-        if ov_path is not None:
-            discovery.save_overlay(ov_path, overlay)
+        (admin_obj.cfg.get("_providers_meta") or {}).pop(pid, None)
+        overlay = admin_obj.cfg.get("_discovered_provider_models")
+        if isinstance(overlay, dict) and pid in overlay:
+            overlay.pop(pid, None)
+            ov_path = discovery.overlay_path(admin_obj.cfg.get("_config_path"))
+            if ov_path is not None:
+                discovery.save_overlay(ov_path, overlay)
 
-    _replace_provider_backends_live(admin_obj, pid, [])
-    _rebuild_universal_catalogs(admin_obj.cfg)
+        _replace_provider_backends_live(admin_obj, pid, [])
+        _rebuild_universal_catalogs(admin_obj.cfg)
     journal.emit("admin.provider", f"Удалён провайдер {pid}", "warn", provider=pid)
     return {"ok": True, "restart_required": False}
 
@@ -639,6 +824,7 @@ def test_provider_connection(admin_obj, data: dict) -> dict:
         meta, records, secrets_found = presets.expand_provider_to_accounts(candidate, "provider_test")
     except ValueError as exc:
         raise apierr.bad_request(str(exc))
+    _apply_custom_preset_override(candidate, meta, records)
 
     admin_obj._mask_tokens(secrets_found)
     t0 = time.monotonic()
@@ -839,16 +1025,17 @@ def list_routes(admin_obj) -> dict:
 def create_route(admin_obj, data: dict) -> dict:
     clean = _validate_route(data)
     rid = clean["id"]
-    with admin_obj._transaction(refreshers=()) as (path, saved):
-        routes = saved.get("routes")
-        if not isinstance(routes, list):
-            routes = saved["routes"] = []
-        if any(isinstance(r, dict) and str(r.get("id") or "") == rid for r in routes):
-            raise apierr.conflict(f"Route alias '{rid}' already exists")
-        routes.append(clean)
-        admin_obj._write(path, saved)
-        admin_obj.cfg["routes"] = copy.deepcopy(routes)
-    admin_obj.cfg["_route_aliases"] = router.build_route_aliases(admin_obj.cfg, models)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction(refreshers=()) as (path, saved):
+            routes = saved.get("routes")
+            if not isinstance(routes, list):
+                routes = saved["routes"] = []
+            if any(isinstance(r, dict) and str(r.get("id") or "") == rid for r in routes):
+                raise apierr.conflict(f"Route alias '{rid}' already exists")
+            routes.append(clean)
+            admin_obj._write(path, saved)
+            admin_obj.cfg["routes"] = copy.deepcopy(routes)
+        admin_obj.cfg["_route_aliases"] = router.build_route_aliases(admin_obj.cfg, models)
     journal.emit("admin.route", f"Создан маршрут-алиас {rid} -> {', '.join(clean['targets'][:3])}", "success", route=rid)
     return admin_obj._safe({"route": _enrich_route(clean, admin_obj)})
 
@@ -856,31 +1043,33 @@ def create_route(admin_obj, data: dict) -> dict:
 def update_route(admin_obj, route_id: str, data: dict) -> dict:
     if not isinstance(data, dict) or not data:
         raise apierr.bad_request("Expected route fields to update")
-    with admin_obj._transaction(refreshers=()) as (path, saved):
-        routes = saved.get("routes") if isinstance(saved.get("routes"), list) else []
-        idx = next((i for i, r in enumerate(routes) if isinstance(r, dict) and str(r.get("id") or "") == route_id), None)
-        if idx is None:
-            raise apierr.not_found(f"Unknown route '{route_id}'")
-        merged = {**routes[idx], **data, "id": route_id}
-        clean = _validate_route(merged, fixed_id=route_id)
-        routes[idx] = clean
-        admin_obj._write(path, saved)
-        admin_obj.cfg["routes"] = copy.deepcopy(routes)
-    admin_obj.cfg["_route_aliases"] = router.build_route_aliases(admin_obj.cfg, models)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction(refreshers=()) as (path, saved):
+            routes = saved.get("routes") if isinstance(saved.get("routes"), list) else []
+            idx = next((i for i, r in enumerate(routes) if isinstance(r, dict) and str(r.get("id") or "") == route_id), None)
+            if idx is None:
+                raise apierr.not_found(f"Unknown route '{route_id}'")
+            merged = {**routes[idx], **data, "id": route_id}
+            clean = _validate_route(merged, fixed_id=route_id)
+            routes[idx] = clean
+            admin_obj._write(path, saved)
+            admin_obj.cfg["routes"] = copy.deepcopy(routes)
+        admin_obj.cfg["_route_aliases"] = router.build_route_aliases(admin_obj.cfg, models)
     journal.emit("admin.route", f"Обновлён маршрут-алиас {route_id}", "info", route=route_id)
     return admin_obj._safe({"route": _enrich_route(clean, admin_obj)})
 
 
 def delete_route(admin_obj, route_id: str) -> dict:
-    with admin_obj._transaction(refreshers=()) as (path, saved):
-        routes = saved.get("routes") if isinstance(saved.get("routes"), list) else []
-        remaining = [r for r in routes if not (isinstance(r, dict) and str(r.get("id") or "") == route_id)]
-        if len(remaining) == len(routes):
-            raise apierr.not_found(f"Unknown route '{route_id}'")
-        saved["routes"] = remaining
-        admin_obj._write(path, saved)
-        admin_obj.cfg["routes"] = copy.deepcopy(remaining)
-    admin_obj.cfg["_route_aliases"] = router.build_route_aliases(admin_obj.cfg, models)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction(refreshers=()) as (path, saved):
+            routes = saved.get("routes") if isinstance(saved.get("routes"), list) else []
+            remaining = [r for r in routes if not (isinstance(r, dict) and str(r.get("id") or "") == route_id)]
+            if len(remaining) == len(routes):
+                raise apierr.not_found(f"Unknown route '{route_id}'")
+            saved["routes"] = remaining
+            admin_obj._write(path, saved)
+            admin_obj.cfg["routes"] = copy.deepcopy(remaining)
+        admin_obj.cfg["_route_aliases"] = router.build_route_aliases(admin_obj.cfg, models)
     journal.emit("admin.route", f"Удалён маршрут-алиас {route_id}", "warn", route=route_id)
     return {"ok": True}
 
@@ -918,30 +1107,34 @@ def create_client_key(admin_obj, data: dict) -> dict:
         "id": kid,
         "label": label,
         "key": raw_key,
-        "enabled": bool(data.get("enabled", True)),
+        "enabled": data["enabled"] if "enabled" in data else True,
         "allowed_models": data.get("allowed_models"),
         "rpm_limit": data.get("rpm_limit"),
         "max_budget_usd": data.get("max_budget_usd"),
+        "max_request_minara": data.get("max_request_minara"),
+        "max_day_minara": data.get("max_day_minara"),
+        "allow_cost_confirm": data["allow_cost_confirm"] if "allow_cost_confirm" in data else False,
     }
     try:
         clean = auth.validate_client_key_entry(candidate, "client_key")
     except ValueError as exc:
         raise apierr.bad_request(str(exc))
 
-    with admin_obj._transaction(refreshers=()) as (path, saved):
-        ck_list = saved.get("client_keys")
-        if not isinstance(ck_list, list):
-            ck_list = saved["client_keys"] = []
-        if any(isinstance(k, dict) and str(k.get("id") or "") == clean["id"] for k in ck_list):
-            raise apierr.conflict(f"Client key '{clean['id']}' already exists")
-        ck_list.append(clean)
-        admin_obj._write(path, saved)
-        admin_obj.cfg["client_keys"] = copy.deepcopy(ck_list)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction(refreshers=()) as (path, saved):
+            ck_list = saved.get("client_keys")
+            if not isinstance(ck_list, list):
+                ck_list = saved["client_keys"] = []
+            if any(isinstance(k, dict) and str(k.get("id") or "") == clean["id"] for k in ck_list):
+                raise apierr.conflict(f"Client key '{clean['id']}' already exists")
+            ck_list.append(clean)
+            admin_obj._write(path, saved)
+            admin_obj.cfg["client_keys"] = copy.deepcopy(ck_list)
 
-    admin_obj._mask_tokens([raw_key])
-    admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
-    public = next((item for item in _public_client_keys(admin_obj, admin_obj.runtime.client_keys.list_public())
-                   if item["id"] == clean["id"]), None)
+        admin_obj._mask_tokens([raw_key])
+        admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
+        public = next((item for item in _public_client_keys(admin_obj, admin_obj.runtime.client_keys.list_public())
+                       if item["id"] == clean["id"]), None)
     journal.emit("admin.client_key", f"Создан клиентский ключ {clean['label']} ({clean['id']})", "success", key_id=clean["id"])
     # Return `raw_key` ONCE (outside _safe) so the operator can copy it on creation!
     resp = admin_obj._safe({"client_key": public})
@@ -953,32 +1146,36 @@ def update_client_key(admin_obj, key_id: str, data: dict) -> dict:
     if not isinstance(data, dict) or not data:
         raise apierr.bad_request("Expected client key fields to update")
     rotated_raw = None
-    with admin_obj._transaction(refreshers=()) as (path, saved):
-        ck_list = saved.get("client_keys") if isinstance(saved.get("client_keys"), list) else []
-        idx = next((i for i, k in enumerate(ck_list) if isinstance(k, dict) and str(k.get("id") or "") == key_id), None)
-        if idx is None:
-            raise apierr.not_found(f"Unknown client key '{key_id}'")
-        merged = copy.deepcopy(ck_list[idx])
-        for field in ("label", "enabled", "allowed_models", "rpm_limit", "max_budget_usd"):
-            if field in data:
-                merged[field] = data[field]
-        if data.get("rotate_key") is True:
-            rotated_raw = auth.generate_client_key()
-            merged["key"] = rotated_raw
-        merged["id"] = key_id
-        try:
-            clean = auth.validate_client_key_entry(merged, f"client_keys[{key_id}]")
-        except ValueError as exc:
-            raise apierr.bad_request(str(exc))
-        ck_list[idx] = clean
-        admin_obj._write(path, saved)
-        admin_obj.cfg["client_keys"] = copy.deepcopy(ck_list)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction(refreshers=()) as (path, saved):
+            ck_list = saved.get("client_keys") if isinstance(saved.get("client_keys"), list) else []
+            idx = next((i for i, k in enumerate(ck_list) if isinstance(k, dict) and str(k.get("id") or "") == key_id), None)
+            if idx is None:
+                raise apierr.not_found(f"Unknown client key '{key_id}'")
+            merged = copy.deepcopy(ck_list[idx])
+            for field in (
+                "label", "enabled", "allowed_models", "rpm_limit", "max_budget_usd",
+                "max_request_minara", "max_day_minara", "allow_cost_confirm",
+            ):
+                if field in data:
+                    merged[field] = data[field]
+            if data.get("rotate_key") is True:
+                rotated_raw = auth.generate_client_key()
+                merged["key"] = rotated_raw
+            merged["id"] = key_id
+            try:
+                clean = auth.validate_client_key_entry(merged, f"client_keys[{key_id}]")
+            except ValueError as exc:
+                raise apierr.bad_request(str(exc))
+            ck_list[idx] = clean
+            admin_obj._write(path, saved)
+            admin_obj.cfg["client_keys"] = copy.deepcopy(ck_list)
 
-    if rotated_raw:
-        admin_obj._mask_tokens([rotated_raw])
-    admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
-    public = next((item for item in _public_client_keys(admin_obj, admin_obj.runtime.client_keys.list_public())
-                   if item["id"] == key_id), None)
+        if rotated_raw:
+            admin_obj._mask_tokens([rotated_raw])
+        admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
+        public = next((item for item in _public_client_keys(admin_obj, admin_obj.runtime.client_keys.list_public())
+                       if item["id"] == key_id), None)
     journal.emit("admin.client_key", f"Обновлён клиентский ключ {clean['label']} ({key_id})", "info", key_id=key_id)
     resp = admin_obj._safe({"client_key": public})
     if rotated_raw:
@@ -987,16 +1184,17 @@ def update_client_key(admin_obj, key_id: str, data: dict) -> dict:
 
 
 def delete_client_key(admin_obj, key_id: str) -> dict:
-    with admin_obj._transaction(refreshers=()) as (path, saved):
-        ck_list = saved.get("client_keys") if isinstance(saved.get("client_keys"), list) else []
-        remaining = [k for k in ck_list if not (isinstance(k, dict) and str(k.get("id") or "") == key_id)]
-        if len(remaining) == len(ck_list):
-            raise apierr.not_found(f"Unknown client key '{key_id}'")
-        saved["client_keys"] = remaining
-        admin_obj._write(path, saved)
-        admin_obj.cfg["client_keys"] = copy.deepcopy(remaining)
+    with _admin_lock(admin_obj):
+        with admin_obj._transaction(refreshers=()) as (path, saved):
+            ck_list = saved.get("client_keys") if isinstance(saved.get("client_keys"), list) else []
+            remaining = [k for k in ck_list if not (isinstance(k, dict) and str(k.get("id") or "") == key_id)]
+            if len(remaining) == len(ck_list):
+                raise apierr.not_found(f"Unknown client key '{key_id}'")
+            saved["client_keys"] = remaining
+            admin_obj._write(path, saved)
+            admin_obj.cfg["client_keys"] = copy.deepcopy(remaining)
 
-    admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
+        admin_obj.runtime.client_keys.reload(admin_obj.cfg["client_keys"])
     journal.emit("admin.client_key", f"Удалён клиентский ключ {key_id}", "warn", key_id=key_id)
     return {"ok": True}
 

@@ -1,5 +1,6 @@
 """Per-account reporting shared by the relay API (/v1/balance, /v1/usage, /health) and the admin API."""
 import concurrent.futures
+import contextlib
 
 import console_log
 from minara_catalog import CREDITS_PER_USD
@@ -13,9 +14,14 @@ BALANCE_PARALLEL = 8
 
 def account_managers(runtime):
     """(backend, CreditsManager) per account; the primary account follows runtime.credits."""
+    accounts = runtime.accounts
+    lock = getattr(accounts, "_lock", None)
+    with (lock if lock is not None else contextlib.nullcontext()):
+        backends = list(accounts.backends)
+        managers = dict(accounts.managers)
     rows = []
-    for backend in runtime.accounts.backends:
-        manager = runtime.credits if backend is runtime.backend else runtime.accounts.managers.get(backend)
+    for backend in backends:
+        manager = runtime.credits if backend is runtime.backend else managers.get(backend)
         if manager is not None:
             rows.append((backend, manager))
     if rows:
@@ -30,7 +36,37 @@ def known(value):
 
 
 def account_states(runtime):
-    return {backend: row for backend, row in zip(runtime.accounts.backends, runtime.accounts.status())}
+    accounts = runtime.accounts
+    lock = getattr(accounts, "_lock", None)
+    state_map = getattr(accounts, "state", None)
+    if lock is not None and isinstance(state_map, dict) and "status" not in getattr(accounts, "__dict__", {}):
+        with lock:
+            rows = {}
+            for backend in accounts.backends:
+                st = state_map.get(backend)
+                if st is None:
+                    continue
+                rows[backend] = {
+                    "account": account_tag(backend, UNNAMED),
+                    "state": (backend.unavailable or {}).get("reason", "active"),
+                    "available": st["available"],
+                    "auth_failures": st["auth_failures"],
+                    "rate_limited_until": (st["reasons"].get("rate_limited") or {}).get("until_at"),
+                }
+            return rows
+    backends = list(accounts.backends)
+    statuses = list(accounts.status())
+    if len(backends) == len(statuses):
+        return {backend: row for backend, row in zip(backends, statuses)}
+    by_tag = {}
+    for backend in backends:
+        by_tag.setdefault(account_tag(backend, UNNAMED), []).append(backend)
+    out = {}
+    for row in statuses:
+        matches = by_tag.get(row.get("account"))
+        if matches:
+            out[matches.pop(0)] = row
+    return out
 
 
 def collect(runtime, *, force_refresh=False):

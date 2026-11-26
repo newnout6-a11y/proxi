@@ -313,6 +313,21 @@ def _opt_int(data, key, low=1, high=MAX_TOKENS_CAP):
     return value
 
 
+def _iter_blocks(value):
+    """Yield every dict block in `value`, descending into nested `content` and `output` containers."""
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, list):
+            stack.extend(reversed(current))
+        elif isinstance(current, dict):
+            yield current
+            for key in ("content", "output"):
+                nested = current.get(key)
+                if isinstance(nested, (list, dict)):
+                    stack.append(nested)
+
+
 def _reject_images_unsupported(entry, data):
     """The catalog `vision` flag is otherwise declarative: upstream rejects image
     input for non-vision models with a bare 400. Fail fast with a clear 422."""
@@ -321,23 +336,15 @@ def _reject_images_unsupported(entry, data):
     blocks = []
     messages = data.get("messages") if isinstance(data, dict) else None
     for message in messages or []:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if isinstance(content, list):
-            blocks.extend(b for b in content if isinstance(b, dict))
-        elif isinstance(content, dict):
-            blocks.append(content)
+        if isinstance(message, dict):
+            blocks.extend(_iter_blocks(message.get("content")))
     system = data.get("system") if isinstance(data, dict) else None
     if isinstance(system, list):
-        blocks.extend(b for b in system if isinstance(b, dict))
+        blocks.extend(_iter_blocks(system))
     raw_input = data.get("input") if isinstance(data, dict) else None
-    for item in raw_input if isinstance(raw_input, list) else []:
-        # Responses API: images arrive as input items or inside item content.
-        if isinstance(item, dict):
-            blocks.append(item)
-            if isinstance(item.get("content"), list):
-                blocks.extend(b for b in item["content"] if isinstance(b, dict))
+    if isinstance(raw_input, list):
+        # Responses API: images arrive as input items, item content, or tool output items.
+        blocks.extend(_iter_blocks(raw_input))
     for block in blocks:
         if block.get("type") in ("image", "image_url", "input_image") or "imageData" in block or "image_url" in block:
             raise unprocessable(f"model {entry['id']} does not support image input", param="messages")
@@ -772,7 +779,8 @@ def _finish(data, parsed, dialect, search=False, cfg=None):
         parsed.wants_usage = bool(inc)
     else:
         parsed.wants_usage = True
-    parsed.tools = _tools(data, parsed if search else None)
+    allow_search = bool(search) and (cfg is None or (cfg.get("transport") or "direct") == "direct")
+    parsed.tools = _tools(data, parsed if allow_search else None)
     if parsed.entry.get("upstream", "retool") != "retool" and parsed.tools and not parsed.entry.get("tools", True):
         label = "this Minara model" if parsed.entry.get("upstream") == "minara" else f"model '{parsed.entry['id']}'"
         raise unprocessable(f"tools are not enabled for {label}", param="tools")
@@ -1109,7 +1117,8 @@ def parse_anthropic(data, cfg):
     if stop is not None and not isinstance(stop, list):
         raise unprocessable("'stop_sequences' must be an array", param="stop_sequences")
     parsed.show_thinking = _show_thinking(data, cfg)
-    return _finish(data, parsed, 'anthropic', search=web_search.provider(cfg) is not None, cfg=cfg)
+    direct_transport = (cfg.get("transport") or "direct") == "direct"
+    return _finish(data, parsed, 'anthropic', search=direct_transport and web_search.provider(cfg) is not None, cfg=cfg)
 
 
 def _effort(data):

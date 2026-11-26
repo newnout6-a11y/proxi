@@ -31,6 +31,7 @@ import zlib
 CATALOG_FILE = pathlib.Path(__file__).with_name("minara_models.json")
 BASE = "https://api.minara.ai"
 CREDITS_PER_USD = 220
+RESPONSES_ENDPOINTS = frozenset({"openai-response", "responses"})
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city",
           "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
@@ -83,6 +84,30 @@ def png(width, height, pixel):
 
 IMAGE = "data:image/png;base64," + base64.b64encode(
     png(256, 256, lambda x, y: (230, 200, 0) if y < 128 else (0, 160, 60))).decode()
+
+
+def endpoint_types(item):
+    """Normalized `supported_endpoint_types` list from a Minara listing entry or sequence."""
+    raw = item.get("supported_endpoint_types") if isinstance(item, dict) else item
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    seen = []
+    for value in raw:
+        if isinstance(value, str):
+            norm = value.strip().lower()
+            if norm and norm not in seen:
+                seen.append(norm)
+    return seen
+
+
+def supports_responses(item):
+    """True when a Minara listing entry advertises a native Responses endpoint."""
+    return any(kind in RESPONSES_ENDPOINTS for kind in endpoint_types(item))
+
+
+def supports_chat(item):
+    """True when a Minara listing entry advertises the OpenAI Chat Completions endpoint."""
+    return "openai" in endpoint_types(item)
 
 
 def public_id(upstream):
@@ -182,9 +207,19 @@ class Client:
         )
 
     def credits(self):
-        data = self.get("/auth/me").json()
+        response = self.get("/auth/me")
+        try:
+            if getattr(response, "status_code", 200) != 200:
+                raise RuntimeError(f"/auth/me HTTP {response.status_code}")
+            data = response.json()
+        finally:
+            _close_response(response)
+        if not isinstance(data, dict):
+            raise ValueError("invalid /auth/me payload")
         part = data.get("creditBalanceBreakdown") or {}
-        return float(part.get("plan", 0)) + float(part.get("extra", 0))
+        if not isinstance(part, dict):
+            part = {}
+        return float(part.get("plan") or 0) + float(part.get("extra") or 0)
 
     def chat(self, body, stream=False, timeout=240):
         from drivers import curl_pool
@@ -206,6 +241,7 @@ class Client:
             if response.status_code in (500, 502, 503, 524) and attempt < 3:
                 text = response.text if not stream else b"".join(response.iter_content()).decode("utf-8", "replace")
                 if _channel_trouble(text) or not text.strip() or response.status_code == 524:
+                    _close_response(response)
                     if self.wait(8 * (attempt + 1)):  # Minara's windows of empty 5xx; unbilled, retry later
                         return response, text
                     continue
@@ -236,12 +272,55 @@ class Client:
             if response.status_code in (500, 502, 503, 524) and attempt < 3:
                 text = b"".join(response.iter_content()).decode("utf-8", "replace")
                 if _channel_trouble(text) or not text.strip() or response.status_code == 524:
+                    _close_response(response)
                     if self.wait(8 * (attempt + 1)):
                         return response, text
                     continue
                 return response, text
             return response, None
         return response, ""
+
+    def responses(self, body, stream=True, timeout=600):
+        """One /v1/responses request (OpenAI Responses shape), retried like chat() on Minara's empty 5xx."""
+        from drivers import curl_pool
+
+        headers = self.headers("text/event-stream" if stream else "application/json")
+        payload = dict(body, stream=stream) if stream else dict(body)
+        for attempt in range(4):
+            response = self.requests.post(
+                self.base + "/v1/responses",
+                json=payload,
+                impersonate=self._impersonate,
+                default_headers=False,
+                discard_cookies=True,
+                accept_encoding=curl_pool.DEFAULT_ACCEPT_ENCODING,
+                timeout=(30, timeout) if stream else timeout,
+                stream=stream,
+                allow_redirects=False,
+                headers=headers,
+            )
+            if response.status_code in (500, 502, 503, 524) and attempt < 3:
+                text = response.text if not stream else b"".join(response.iter_content()).decode("utf-8", "replace")
+                if _channel_trouble(text) or not text.strip() or response.status_code == 524:
+                    _close_response(response)
+                    if self.wait(8 * (attempt + 1)):
+                        return response, text
+                    continue
+                return response, text
+            if stream:
+                return response, None
+            return response, response.text
+        return response, ""
+
+
+def _close_response(response):
+    """Best-effort close for streaming or buffered probe HTTP responses."""
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 def _channel_trouble(text):
@@ -310,57 +389,61 @@ def probe_thinking(client, model):
     started = time.monotonic()
     response, text = client.chat(body, stream=True)
     if response.status_code == 400:
+        _close_response(response)
         body.pop("reasoning_effort")
         started = time.monotonic()
         response, text = client.chat(body, stream=True)
-    if response.status_code != 200:
-        return {"status": classify_error(response.status_code, text or "")}
-    fields, details, signature, chunks, first_reason, first_text, usage, error = set(), set(), False, 0, None, None, {}, None
-    buffer = b""
-    for piece in response.iter_content():
-        buffer += piece
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            line = line.strip()
-            if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
-                continue
-            try:
-                item = json.loads(line[5:])
-            except ValueError:
-                continue
-            now = time.monotonic() - started
-            if "base_resp" in item or "error" in item:
-                error = "broken"
-            usage = item.get("usage") or usage
-            for choice in item.get("choices") or []:
-                delta = choice.get("delta") or {}
-                seen = False
-                for key in ("reasoning", "reasoning_content"):
-                    if isinstance(delta.get(key), str) and delta[key]:
-                        fields.add(key)
-                        seen = True
-                for detail in delta.get("reasoning_details") or []:
-                    fields.add("reasoning_details")
-                    details.add(detail.get("type"))
-                    signature = signature or bool(detail.get("signature"))
-                if seen:
-                    chunks += 1
-                    first_reason = first_reason if first_reason is not None else now
-                if isinstance(delta.get("content"), str) and delta["content"].strip() and first_text is None:
-                    first_text = now
-    if error:
-        return {"status": error}
-    tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-    if tokens is None:
-        tokens = ((usage.get("billing_usage") or {}).get("gemini_usage_metadata") or {}).get("thoughtsTokenCount")
-    if chunks == 0:
-        mode = "hidden" if tokens else "none"
-    elif chunks >= 3 and (first_text is None or first_text - first_reason > 0.3):
-        mode = "stream"
-    else:
-        mode = "end"
-    return {"status": "ok", "thinking": mode, "fields": sorted(fields), "details": sorted(d for d in details if d),
-            "signature": signature, "reasoning_tokens": tokens, "chunks": chunks}
+    try:
+        if response.status_code != 200:
+            return {"status": classify_error(response.status_code, text or "")}
+        fields, details, signature, chunks, first_reason, first_text, usage, error = set(), set(), False, 0, None, None, {}, None
+        buffer = b""
+        for piece in response.iter_content():
+            buffer += piece
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                    continue
+                try:
+                    item = json.loads(line[5:])
+                except ValueError:
+                    continue
+                now = time.monotonic() - started
+                if "base_resp" in item or "error" in item:
+                    error = "broken"
+                usage = item.get("usage") or usage
+                for choice in item.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    seen = False
+                    for key in ("reasoning", "reasoning_content"):
+                        if isinstance(delta.get(key), str) and delta[key]:
+                            fields.add(key)
+                            seen = True
+                    for detail in delta.get("reasoning_details") or []:
+                        fields.add("reasoning_details")
+                        details.add(detail.get("type"))
+                        signature = signature or bool(detail.get("signature"))
+                    if seen:
+                        chunks += 1
+                        first_reason = first_reason if first_reason is not None else now
+                    if isinstance(delta.get("content"), str) and delta["content"].strip() and first_text is None:
+                        first_text = now
+        if error:
+            return {"status": error}
+        tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        if tokens is None:
+            tokens = ((usage.get("billing_usage") or {}).get("gemini_usage_metadata") or {}).get("thoughtsTokenCount")
+        if chunks == 0:
+            mode = "hidden" if tokens else "none"
+        elif chunks >= 3 and (first_text is None or first_text - first_reason > 0.3):
+            mode = "stream"
+        else:
+            mode = "end"
+        return {"status": "ok", "thinking": mode, "fields": sorted(fields), "details": sorted(d for d in details if d),
+                "signature": signature, "reasoning_tokens": tokens, "chunks": chunks}
+    finally:
+        _close_response(response)
 
 
 def probe_effort(client, model):
@@ -371,24 +454,27 @@ def probe_effort(client, model):
         body = {"model": model, "max_tokens": 3000, "reasoning_effort": level, "stream": True,
                 "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": EFFORT_TASK}]}
         response, text = client.chat(body, stream=True)
-        if response.status_code != 200:
-            ladder[level] = {"accepted": False, "status": response.status_code, "detail": (text or "")[:160]}
-            continue
-        usage, buffer = {}, b""
-        for piece in response.iter_content():
-            buffer += piece
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                line = line.strip()
-                if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
-                    try:
-                        usage = json.loads(line[5:]).get("usage") or usage
-                    except ValueError:
-                        pass
-        tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-        if tokens is None:
-            tokens = ((usage.get("billing_usage") or {}).get("gemini_usage_metadata") or {}).get("thoughtsTokenCount")
-        ladder[level] = {"accepted": True, "reasoning_tokens": tokens, "completion_tokens": usage.get("completion_tokens")}
+        try:
+            if response.status_code != 200:
+                ladder[level] = {"accepted": False, "status": response.status_code, "detail": (text or "")[:160]}
+                continue
+            usage, buffer = {}, b""
+            for piece in response.iter_content():
+                buffer += piece
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line = line.strip()
+                    if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
+                        try:
+                            usage = json.loads(line[5:]).get("usage") or usage
+                        except ValueError:
+                            pass
+            tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            if tokens is None:
+                tokens = ((usage.get("billing_usage") or {}).get("gemini_usage_metadata") or {}).get("thoughtsTokenCount")
+            ladder[level] = {"accepted": True, "reasoning_tokens": tokens, "completion_tokens": usage.get("completion_tokens")}
+        finally:
+            _close_response(response)
     return {"status": "ok", "ladder": ladder}
 
 
@@ -417,19 +503,22 @@ def probe_channels(client, model):
         if level != "default":
             body["reasoning_effort"] = level
         response, _ = client.chat(body, stream=True)
-        if response.status_code != 200:
-            continue
-        for line in b"".join(response.iter_content()).split(b"\n"):
-            line = line.strip()
-            if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+        try:
+            if response.status_code != 200:
                 continue
-            try:
-                ident = json.loads(line[5:]).get("id")
-            except ValueError:
-                continue
-            if ident:
-                channels[level] = channel_of(ident)
-                break
+            for line in b"".join(response.iter_content()).split(b"\n"):
+                line = line.strip()
+                if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                    continue
+                try:
+                    ident = json.loads(line[5:]).get("id")
+                except ValueError:
+                    continue
+                if ident:
+                    channels[level] = channel_of(ident)
+                    break
+        finally:
+            _close_response(response)
     # Only a full measure is used: a level whose request failed is unknown, and a channel rule built on a gap lowered
     # or raised levels that were never measured (review of 2026-11-10).
     return {"status": "ok" if len(channels) == len(CHANNEL_LEVELS) else "partial" if channels else "failed",
@@ -675,7 +764,8 @@ def generate(results, listing, published=None, study=None):
     seen = set()
     for item in listing:
         upstream = item["id"]
-        if "openai" not in (item.get("supported_endpoint_types") or []) or upstream in NOT_CHAT:
+        ep_types = endpoint_types(item)
+        if ("openai" not in ep_types and not supports_responses(ep_types)) or upstream in NOT_CHAT:
             continue
         source = INHERIT.get(upstream, upstream)
         measured = results.get(source) or {}
@@ -794,6 +884,9 @@ def generate(results, listing, published=None, study=None):
         if name in seen:
             raise SystemExit("duplicate public id " + name)
         seen.add(name)
+        resp_probe = measured.get("responses") or {}
+        has_responses = (bool(resp_probe.get("responses", True)) if resp_probe.get("status") == "ok"
+                         else supports_responses(ep_types))
         entry = {
             "id": name, "upstream_model": upstream, "label": _label(upstream), "provider": upstream.split("/")[0],
             "status": status, "backend": backend, "tools": tools.get("tools") if tools.get("status") == "ok" else None,
@@ -807,6 +900,7 @@ def generate(results, listing, published=None, study=None):
             "effort_map": effort_map, "effort_control": effort_control, "effort_study": effort_detail,
             "default_effort": default_effort, "natural_effort": natural if reasoning else None, "channels": channels,
             "messages_levels": messages_levels,
+            "responses": has_responses,
             "context": context, "max_output": output,
             "limits_source": ("openrouter /api/v1/models" if context else None),
             "limits_checked": WINDOW_CHECKS.get(upstream),
@@ -815,6 +909,8 @@ def generate(results, listing, published=None, study=None):
             "measured_from": source if source != upstream else None,
             "checked_at": measured.get("checked_at"),
         }
+        if ep_types:
+            entry["supported_endpoint_types"] = ep_types
         if served and source == upstream and served.split("/")[-1] != upstream.split("/")[-1]:
             entry["served_as"] = served
         entries.append(entry)
@@ -990,35 +1086,38 @@ def _usage_tokens(usage):
 def _stream_summary(client, body, timeout=600):
     """One streamed chat request: status, reply id, OpenRouter's provider, usage, text and reasoning characters."""
     response, text = client.chat(body, stream=True, timeout=timeout)
-    if response.status_code != 200:
-        if text is None:
-            text = b"".join(response.iter_content()).decode("utf-8", "replace")
-        return {"status": response.status_code, "detail": (text or "")[:300]}
-    ident, provider, usage, answer, reasoning, buffer = "", None, {}, "", 0, b""
-    for piece in response.iter_content():
-        buffer += piece
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            line = line.strip()
-            if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
-                continue
-            try:
-                item = json.loads(line[5:])
-            except ValueError:
-                continue
-            if not isinstance(item, dict):
-                continue
-            ident = ident or str(item.get("id") or "")
-            provider = provider or item.get("provider")
-            usage = item.get("usage") or usage
-            for choice in item.get("choices") or []:
-                delta = choice.get("delta") or {}
-                for key in ("reasoning", "reasoning_content"):
-                    if isinstance(delta.get(key), str):
-                        reasoning += len(delta[key])
-                if isinstance(delta.get("content"), str):
-                    answer += delta["content"]
-    return {"status": 200, "id": ident, "provider": provider, "usage": usage, "text": answer, "reasoning_chars": reasoning}
+    try:
+        if response.status_code != 200:
+            if text is None:
+                text = b"".join(response.iter_content()).decode("utf-8", "replace")
+            return {"status": response.status_code, "detail": (text or "")[:300]}
+        ident, provider, usage, answer, reasoning, buffer = "", None, {}, "", 0, b""
+        for piece in response.iter_content():
+            buffer += piece
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                    continue
+                try:
+                    item = json.loads(line[5:])
+                except ValueError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                ident = ident or str(item.get("id") or "")
+                provider = provider or item.get("provider")
+                usage = item.get("usage") or usage
+                for choice in item.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    for key in ("reasoning", "reasoning_content"):
+                        if isinstance(delta.get(key), str):
+                            reasoning += len(delta[key])
+                    if isinstance(delta.get("content"), str):
+                        answer += delta["content"]
+        return {"status": 200, "id": ident, "provider": provider, "usage": usage, "text": answer, "reasoning_chars": reasoning}
+    finally:
+        _close_response(response)
 
 
 def probe_cache(client, model, level=None):
@@ -1050,39 +1149,42 @@ def probe_cache(client, model, level=None):
 def _messages_summary(client, body):
     """One streamed /v1/messages request: status, reply id, usage, thinking characters, stop reason."""
     response, text = client.messages(body)
-    if response.status_code != 200:
-        if text is None:
-            text = b"".join(response.iter_content()).decode("utf-8", "replace")
-        return {"status": response.status_code, "detail": (text or "")[:300]}
-    ident, usage, thinking, stop, buffer = "", {}, 0, None, b""
-    for piece in response.iter_content():
-        buffer += piece
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            line = line.strip()
-            if not line.startswith(b"data:"):
-                continue
-            try:
-                item = json.loads(line[5:])
-            except ValueError:
-                continue
-            if not isinstance(item, dict):
-                continue
-            kind = item.get("type")
-            if kind == "message_start":
-                message = item.get("message") or {}
-                ident = str(message.get("id") or "")
-                usage.update(message.get("usage") or {})
-            elif kind == "content_block_delta":
-                delta = item.get("delta") or {}
-                if delta.get("type") == "thinking_delta":
-                    thinking += len(delta.get("thinking") or "")
-            elif kind == "message_delta":
-                usage.update({k: v for k, v in (item.get("usage") or {}).items() if v is not None})
-                stop = (item.get("delta") or {}).get("stop_reason")
-            elif kind == "error":
-                return {"status": "stream_error", "detail": json.dumps(item)[:300]}
-    return {"status": 200, "id": ident, "usage": usage, "thinking_chars": thinking, "stop": stop}
+    try:
+        if response.status_code != 200:
+            if text is None:
+                text = b"".join(response.iter_content()).decode("utf-8", "replace")
+            return {"status": response.status_code, "detail": (text or "")[:300]}
+        ident, usage, thinking, stop, buffer = "", {}, 0, None, b""
+        for piece in response.iter_content():
+            buffer += piece
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                try:
+                    item = json.loads(line[5:])
+                except ValueError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                kind = item.get("type")
+                if kind == "message_start":
+                    message = item.get("message") or {}
+                    ident = str(message.get("id") or "")
+                    usage.update(message.get("usage") or {})
+                elif kind == "content_block_delta":
+                    delta = item.get("delta") or {}
+                    if delta.get("type") == "thinking_delta":
+                        thinking += len(delta.get("thinking") or "")
+                elif kind == "message_delta":
+                    usage.update({k: v for k, v in (item.get("usage") or {}).items() if v is not None})
+                    stop = (item.get("delta") or {}).get("stop_reason")
+                elif kind == "error":
+                    return {"status": "stream_error", "detail": json.dumps(item)[:300]}
+        return {"status": 200, "id": ident, "usage": usage, "thinking_chars": thinking, "stop": stop}
+    finally:
+        _close_response(response)
 
 
 def _messages_cache(client, model, level):
@@ -1165,22 +1267,203 @@ def study_row(client, model, level):
             "correct": HARD_ANSWER in (row.get("text") or "").replace(",", ""), "cost": usage.get("cost")}
 
 
-def study_effort(client, model, samples=2, stop=None, budget=None):
+def _responses_summary(client, body, timeout=600):
+    """One streamed /v1/responses request: status, reply id, usage, text, tool calls, reasoning chars and signatures."""
+    response, text = client.responses(body, stream=True, timeout=timeout)
+    try:
+        if response.status_code != 200:
+            if text is None:
+                text = b"".join(response.iter_content()).decode("utf-8", "replace")
+            return {"status": response.status_code, "detail": (text or "")[:300]}
+        ident, usage, answer, calls = "", {}, "", []
+        reasoning_chars, reasoning_chunks, first_reason, first_text = 0, 0, None, None
+        signature, saw_terminal, error, buffer = False, False, None, b""
+        started = time.monotonic()
+        for piece in response.iter_content():
+            buffer += piece
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                    continue
+                try:
+                    item = json.loads(line[5:])
+                except ValueError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                now = time.monotonic() - started
+                kind = item.get("type")
+                if kind in ("error", "response.failed"):
+                    error = "broken"
+                elif kind == "response.created":
+                    resp = item.get("response") or {}
+                    ident = ident or str(resp.get("id") or "")
+                elif kind in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                    delta = item.get("delta")
+                    if isinstance(delta, str) and delta:
+                        reasoning_chars += len(delta)
+                        reasoning_chunks += 1
+                        first_reason = first_reason if first_reason is not None else now
+                elif kind == "response.output_text.delta":
+                    delta = item.get("delta")
+                    if isinstance(delta, str) and delta:
+                        answer += delta
+                        if delta.strip() and first_text is None:
+                            first_text = now
+                elif kind == "response.output_item.done":
+                    out_item = item.get("item") if isinstance(item.get("item"), dict) else {}
+                    if out_item.get("type") == "reasoning" and out_item.get("encrypted_content"):
+                        signature = True
+                    elif out_item.get("type") == "function_call":
+                        calls.append(out_item)
+                elif kind in ("response.completed", "response.incomplete"):
+                    saw_terminal = True
+                    resp = item.get("response") or {}
+                    ident = ident or str(resp.get("id") or "")
+                    usage = resp.get("usage") or usage
+                    if not answer:
+                        for out_item in resp.get("output") or []:
+                            if isinstance(out_item, dict) and out_item.get("type") == "message":
+                                for part in out_item.get("content") or []:
+                                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                                        answer += part["text"]
+                            elif isinstance(out_item, dict) and out_item.get("type") == "function_call" and not calls:
+                                calls.append(out_item)
+        if error:
+            return {"status": error}
+        if not saw_terminal:
+            return {"status": "stream_error", "detail": "truncated responses stream"}
+        return {"status": 200, "id": ident, "usage": usage, "text": answer, "calls": calls,
+                "reasoning_chars": reasoning_chars, "reasoning_chunks": reasoning_chunks,
+                "first_reason": first_reason, "first_text": first_text, "signature": signature}
+    finally:
+        _close_response(response)
+
+
+def probe_responses(client, model):
+    """Probe whether a model accepts native /v1/responses requests."""
+    body = {"model": model, "max_output_tokens": 256, "store": False, "stream": True,
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Reply OK"}]}]}
+    row = _responses_summary(client, body, timeout=120)
+    if row.get("status") != 200:
+        return {"status": classify_error(row.get("status") or 0, row.get("detail") or ""),
+                "responses": False, "detail": row.get("detail")}
+    return {"status": "ok", "responses": True, "id": str(row.get("id") or "")[:20]}
+
+
+def _probe_tools_responses(client, model):
+    tools = [{"type": "function", "name": "get_weather", "description": "Current weather for a city",
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+    body = {"model": model, "max_output_tokens": 1000, "reasoning": {"effort": "low"}, "tools": tools,
+            "store": False, "stream": True,
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "What's the weather in Paris right now? Use the tool."}]}]}
+    row = _responses_summary(client, body)
+    if row.get("status") == 400 and "reasoning" in (row.get("detail") or "").lower():
+        body.pop("reasoning", None)
+        row = _responses_summary(client, body)
+    if row.get("status") != 200:
+        return {"status": classify_error(row.get("status") or 0, row.get("detail") or ""),
+                "detail": (row.get("detail") or "")[:200]}
+    ok = False
+    for call in row.get("calls") or []:
+        try:
+            ok = ok or (call.get("name") == "get_weather"
+                        and "paris" in json.loads(call.get("arguments") or "{}").get("city", "").lower())
+        except (ValueError, AttributeError):
+            pass
+    return {"status": "ok", "tools": ok, "id": str(row.get("id") or "")[:20]}
+
+
+def _probe_vision_responses(client, model):
+    body = {"model": model, "max_output_tokens": 600, "reasoning": {"effort": "low"}, "store": False, "stream": True,
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Top half colour and bottom half colour of this image? Two words."},
+                {"type": "input_image", "image_url": IMAGE}]}]}
+    row = _responses_summary(client, body)
+    if row.get("status") == 400 and "reasoning" in (row.get("detail") or "").lower():
+        body.pop("reasoning", None)
+        row = _responses_summary(client, body)
+    if row.get("status") != 200:
+        return {"status": classify_error(row.get("status") or 0, row.get("detail") or ""),
+                "detail": (row.get("detail") or "")[:200]}
+    answer = row.get("text") or ""
+    low = answer.lower()
+    colours = ("yellow", "green", "gold", "olive", "amber", "lime", "mustard", "khaki", "orange")
+    blind = any(words in low for words in ("can't see", "cannot see", "no image", "unable to", "don't see", "not able"))
+    return {"status": "ok", "vision": not blind and any(colour in low for colour in colours), "answer": answer[:60],
+            "prompt_tokens": (row.get("usage") or {}).get("input_tokens")}
+
+
+def _probe_thinking_responses(client, model):
+    body = {"model": model, "max_output_tokens": 500, "reasoning": {"effort": "medium", "summary": "auto"},
+            "include": ["reasoning.encrypted_content"], "store": False, "stream": True,
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": THINK_TASK}]}]}
+    row = _responses_summary(client, body)
+    if row.get("status") == 400:
+        body.pop("reasoning", None)
+        row = _responses_summary(client, body)
+    if row.get("status") != 200:
+        return {"status": classify_error(row.get("status") or 0, row.get("detail") or "")}
+    usage = row.get("usage") or {}
+    tokens = (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+    chunks, first_reason, first_text = row.get("reasoning_chunks") or 0, row.get("first_reason"), row.get("first_text")
+    if chunks == 0:
+        mode = "hidden" if (tokens or row.get("signature")) else "none"
+    elif chunks >= 3 and (first_text is None or (first_reason is not None and first_text - first_reason > 0.3)):
+        mode = "stream"
+    else:
+        mode = "end"
+    return {"status": "ok", "thinking": mode, "fields": ["responses"], "details": [],
+            "signature": bool(row.get("signature")), "reasoning_tokens": tokens, "chunks": chunks}
+
+
+def _study_row_responses(client, model, level):
+    body = {"model": model, "max_output_tokens": STUDY_MAX_TOKENS, "store": False, "stream": True,
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": HARD_QUESTION}]}]}
+    if level is not None:
+        body["reasoning"] = {"effort": level, "summary": "auto"}
+    started = time.monotonic()
+    try:
+        row = _responses_summary(client, body)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "stream_error", "detail": type(exc).__name__}
+    if row.get("status") != 200:
+        return {"status": row.get("status"), "detail": row.get("detail")}
+    usage = row.get("usage") or {}
+    tokens = (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+    return {"status": 200, "reasoning_tokens": tokens, "completion_tokens": usage.get("output_tokens"),
+            "reasoning_chars": row.get("reasoning_chars"), "secs": round(time.monotonic() - started, 1),
+            "correct": HARD_ANSWER in (row.get("text") or "").replace(",", ""), "cost": usage.get("cost")}
+
+
+def study_effort(client, model, samples=2, stop=None, budget=None, row_fn=None):
     """The effort study of one model on the hard question: {"default" | level: [rows]}, "_question": "hard".
 
     With a `budget` (credits), the first request's cost decides: when the whole study would cost more, it stops there and
     returns None (models reason from 300 to 27,000 tokens on this question, so no price list says it in advance)."""
     rows = {"_question": "hard"}
-    before = client.credits() if budget is not None else None
+    before = None
+    if budget is not None:
+        try:
+            before = client.credits()
+        except Exception:  # noqa: BLE001 - a transient /auth/me failure must not abort measurement
+            return None
+    measure_row = row_fn or study_row
     for level in STUDY_LEVELS:
         key = "default" if level is None else level
         for _ in range(samples):
             if stop is not None and stop():
                 return rows
-            rows.setdefault(key, []).append(study_row(client, model, level))
+            rows.setdefault(key, []).append(measure_row(client, model, level))
             if before is not None:
                 client.wait(1.5)  # Minara debits right after the reply
-                first = max(0.0, before - client.credits())
+                try:
+                    after = client.credits()
+                except Exception:  # noqa: BLE001 - cannot verify remaining study budget
+                    return None
+                first = max(0.0, before - after)
                 before = None
                 if first * len(STUDY_LEVELS) * samples > budget:
                     return None
@@ -1198,9 +1481,10 @@ def checks_for(item):
     """The checks a model of the listing is measured with. A Claude model Minara also serves on its Anthropic endpoint gets
     its channels on chat and on /v1/messages (which tell where it caches); any other Claude model one cache check."""
     checks = ["tools", "vision", "thinking"]
-    if "anthropic" in (item.get("supported_endpoint_types") or []):
+    ep = endpoint_types(item)
+    if "anthropic" in ep:
         checks += ["channels", "messages"]
-    elif item["id"].startswith("anthropic/"):
+    elif item["id"].startswith("anthropic/") and supports_chat(ep):
         checks.append("cache")
     return checks + ["study"]
 
@@ -1225,6 +1509,9 @@ def measure_estimate(pricing, checks, samples=2):
     return round(total, 2)
 
 
+_ORIG_PROBES = {"tools": probe_tools, "vision": probe_vision, "thinking": probe_thinking, "study_row": study_row}
+
+
 def measure_model(client, item, checks=None, samples=2, stop=None, study_budget=None):
     """Every check of one listed model, in order: (results for generate(), the effort study's rows or None).
 
@@ -1232,8 +1519,14 @@ def measure_model(client, item, checks=None, samples=2, stop=None, study_budget=
     left out when its first request shows it would cost more than `study_budget` credits."""
     upstream = item["id"]
     checks = list(checks or checks_for(item))
-    probes = {"tools": probe_tools, "vision": probe_vision, "thinking": probe_thinking, "channels": probe_channels,
-              "messages": probe_messages, "cache": probe_cache}
+    responses_only = supports_responses(item) and not supports_chat(item)
+    probes = {
+        "tools": _probe_tools_responses if responses_only and probe_tools is _ORIG_PROBES["tools"] else probe_tools,
+        "vision": _probe_vision_responses if responses_only and probe_vision is _ORIG_PROBES["vision"] else probe_vision,
+        "thinking": (_probe_thinking_responses if responses_only and probe_thinking is _ORIG_PROBES["thinking"]
+                     else probe_thinking),
+        "channels": probe_channels, "messages": probe_messages, "cache": probe_cache, "responses": probe_responses,
+    }
     record = {}
     for check in checks:
         if check == "study" or (stop is not None and stop()):
@@ -1248,5 +1541,10 @@ def measure_model(client, item, checks=None, samples=2, stop=None, study_budget=
     study = None
     usable = (record.get("tools") or {}).get("status") == "ok" or (record.get("thinking") or {}).get("status") == "ok"
     if "study" in checks and usable and not (stop is not None and stop()):
-        study = study_effort(client, upstream, samples=samples, stop=stop, budget=study_budget)
+        row_fn = _study_row_responses if responses_only and study_row is _ORIG_PROBES["study_row"] else None
+        try:
+            study = study_effort(client, upstream, samples=samples, stop=stop, budget=study_budget,
+                                 **({"row_fn": row_fn} if row_fn is not None else {}))
+        except Exception:  # noqa: BLE001 - a failing study leaves the model with family levels, never aborts look
+            study = None
     return record, study

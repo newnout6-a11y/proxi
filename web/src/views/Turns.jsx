@@ -5,27 +5,54 @@ import { Section, ease } from '../motion.jsx';
 import { Empty, Tag } from '../ui.jsx';
 import { TapeLegend, TurnTape } from '../charts.jsx';
 import { LEVELS, STATUS_TONE, TURN_STATUS } from '../catalog.js';
-import { TASK_LABEL, buildTraces, costOf, effortText, isUsdOnly, phasesOf, scaleOf, shownCost, speedOf, staleLimit, statusAt } from '../turns.js';
+import { TASK_LABEL, buildTraces, costCurrencies, costOf, effortText, isUsdOnly, phasesOf, scaleOf, shownCost, speedOf, staleLimit, statusAt } from '../turns.js';
 import { fmtAgo, fmtClock, fmtFixed, fmtInt, fmtMs, fmtSpeed, fmtTokens } from '../format.js';
 import { TurnsArt } from '../stage/Art.jsx';
 
 const LIVE_PHASE = { wait: 'ждём upstream', think: 'upstream: thinking', tools: 'аргументы инструмента', out: 'пишет ответ', exec: 'выполняет команду' };
 
+const fmtUsd = (val) => `$${fmtFixed(val, val > 0 && val < 0.01 ? 4 : 2)}`;
+
 // "нет данных" and the lower-bound mark are for a turn that is over and lacks a price; a running turn just has none yet.
-// A Minara turn shows Minara's own credits (220 per dollar of its list), named as such: they are never Retool's.
+// A Minara turn shows Minara's own credits (220 per dollar of its list), named as such: they are never Retool's;
+// mixed-upstream failover turns keep all present currencies visible together.
 const fmtCostValue = (cost) => {
+  const parts = costCurrencies(cost);
+  if (!parts.length) return '—';
+  if (parts.length > 1) {
+    return parts.map((part) => (part.kind === 'usd' ? fmtUsd(part.value) : fmtFixed(part.value, 2))).join(' + ');
+  }
   const val = shownCost(cost);
   if (val === null) return '—';
-  if (isUsdOnly(cost)) return `$${fmtFixed(val, val > 0 && val < 0.01 ? 4 : 2)}`;
+  if (isUsdOnly(cost)) return fmtUsd(val);
   return fmtFixed(val, 2);
 };
-const costNote = (cost) => (cost.running ? 'ход идёт' : shownCost(cost) === null ? 'нет данных'
-  : !cost.complete ? 'неполные данные' : cost.minara !== undefined ? 'кредитов Minara' : isUsdOnly(cost) ? 'USD' : '');
-const costTitle = (cost) => (cost.running ? 'Ход ещё идёт: стоимость будет известна, когда upstream ответит'
-  : shownCost(cost) === null ? 'Стоимость не сообщена'
-    : cost.minara !== undefined ? `Цена по прайсу Minara в её кредитах (220 за доллар): $${fmtFixed(cost.minara / 220, 4)}${cost.complete ? '' : '; часть стоимости не сообщена'}`
-      : isUsdOnly(cost) ? `Расчётная стоимость по прайсу API / models.dev: $${fmtFixed(cost.usd, 6)}${cost.complete ? '' : '; часть стоимости не сообщена'}`
-        : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена');
+const costNote = (cost) => {
+  if (cost.running) return 'ход идёт';
+  const parts = costCurrencies(cost);
+  if (!parts.length || shownCost(cost) === null) return 'нет данных';
+  if (parts.length > 1) {
+    const units = parts.map((p) => (p.kind === 'minara' ? 'кредитов Minara' : p.kind === 'usd' ? 'USD' : 'Retool')).join(' + ');
+    return cost.complete ? units : `${units} · неполные данные`;
+  }
+  return !cost.complete ? 'неполные данные' : cost.minara !== undefined ? 'кредитов Minara' : isUsdOnly(cost) ? 'USD' : '';
+};
+const costTitle = (cost) => {
+  if (cost.running) return 'Ход ещё идёт: стоимость будет известна, когда upstream ответит';
+  const parts = costCurrencies(cost);
+  if (!parts.length || shownCost(cost) === null) return 'Стоимость не сообщена';
+  if (parts.length > 1) {
+    const items = parts.map((part) => {
+      if (part.kind === 'minara') return `Minara: ${fmtFixed(part.value, 2)} кр. ($${fmtFixed(part.value / 220, 4)})`;
+      if (part.kind === 'usd') return `API / models.dev: $${fmtFixed(part.value, 6)}`;
+      return `Retool: ${fmtFixed(part.value, 2)} кр.`;
+    });
+    return `${items.join('; ')}${cost.complete ? '' : '; часть стоимости не сообщена'}`;
+  }
+  return cost.minara !== undefined ? `Цена по прайсу Minara в её кредитах (220 за доллар): $${fmtFixed(cost.minara / 220, 4)}${cost.complete ? '' : '; часть стоимости не сообщена'}`
+    : isUsdOnly(cost) ? `Расчётная стоимость по прайсу API / models.dev: $${fmtFixed(cost.usd, 6)}${cost.complete ? '' : '; часть стоимости не сообщена'}`
+      : cost.complete ? 'Сообщённая стоимость' : 'Часть стоимости не сообщена';
+};
 const lowerBound = (cost) => shownCost(cost) !== null && !cost.complete;
 const SPEED_TITLE = 'Выходные токены / время обработки запроса до завершения runner, включая ожидание, мышление, повторы и смену аккаунта, поиск и команды relay. Без отправки последних байтов клиенту. Не скорость декодирования; без полных данных — прочерк.';
 

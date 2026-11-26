@@ -50,9 +50,10 @@ def _pricing_key(pricing):
 
 
 def chat_model(item):
-    """True for a model of the list the relay can publish: a chat model, not one the owner excluded."""
+    """True for a model of the list the relay can publish: a chat or responses model, not one the owner excluded."""
     upstream = item.get("id")
-    return (isinstance(upstream, str) and "/" in upstream and "openai" in (item.get("supported_endpoint_types") or [])
+    return (isinstance(upstream, str) and "/" in upstream
+            and (minara_probe.supports_chat(item) or minara_probe.supports_responses(item))
             and upstream not in minara_probe.NOT_CHAT and upstream not in minara_probe.INHERIT
             and not minara_probe.excluded(upstream))
 
@@ -238,20 +239,30 @@ class CatalogRefresher:
         reference = len(previous) or len(minara_catalog.SHIPPED)
         complete = len(listed) >= COMPLETE_SHARE * reference
         now = _now()
-        measured = minara_catalog.MEASURED
+        measured = minara_catalog.snapshot()
         overlay = state.setdefault("models", {})
-        # Prices first: Minara debits its own list, so a turn of a repriced model is priced wrong until this is taken.
+        # Prices and endpoint capabilities: Minara debits its own list, and may enable /v1/responses dynamically.
         for upstream, item in listed.items():
             entry = measured.get(upstream)
-            if entry is None or not isinstance(item.get("pricing"), dict):
+            if entry is None:
                 continue
-            if _pricing_key(entry.get("pricing")) != _pricing_key(item["pricing"]):
-                overlay[upstream] = dict(entry, pricing=copy.deepcopy(item["pricing"]), refreshed_at=now)
-                summary["repriced"].append(upstream)
-            # A published model whose price the relay cannot read has every turn unpriced: said on each look, never quietly.
-            problem = minara.price_problem(item["pricing"]) if entry.get("status") == "ok" else None
-            if problem:
-                summary["unpriced"][upstream] = problem
+            current = overlay.get(upstream) or entry
+            if isinstance(item.get("pricing"), dict):
+                if _pricing_key(current.get("pricing")) != _pricing_key(item["pricing"]):
+                    current = overlay[upstream] = dict(current, pricing=copy.deepcopy(item["pricing"]), refreshed_at=now)
+                    summary["repriced"].append(upstream)
+                # A published model whose price the relay cannot read has every turn unpriced: said on each look, never quietly.
+                problem = minara.price_problem(item["pricing"]) if entry.get("status") == "ok" else None
+                if problem:
+                    summary["unpriced"][upstream] = problem
+            ep_types = minara_probe.endpoint_types(item)
+            if ep_types:
+                has_resp = minara_probe.supports_responses(ep_types)
+                if (has_resp != bool(current.get("responses"))
+                        or ("supported_endpoint_types" in current
+                            and current.get("supported_endpoint_types") != ep_types)):
+                    overlay[upstream] = dict(current, responses=has_resp, supported_endpoint_types=ep_types,
+                                             refreshed_at=now)
         missing = state.setdefault("missing", {})
         self._relevel(listed, measured, overlay, summary, now)
         if complete:
@@ -274,7 +285,10 @@ class CatalogRefresher:
         state["spent_credits"] = round(float(state.get("spent_credits") or 0) + summary["spent_credits"], 4)
         with self._file_lock:
             fresh = self._read()
-            state["switched"] = fresh.get("switched") or state.get("switched") or {}
+            if "switched" in fresh and isinstance(fresh["switched"], dict):
+                state["switched"] = fresh["switched"]
+            elif not isinstance(state.get("switched"), dict):
+                state["switched"] = {}
             self._write(state)
         changed = minara_catalog.apply_overlay(self.path)
         if changed:
@@ -391,20 +405,21 @@ class CatalogRefresher:
                 published = {}
         studies = {upstream: dict(study, _question="hard")} if study else {}
         generated = minara_probe.generate({upstream: results}, [item], published, studies)
-        return inherit_effort(generated["models"][0], minara_catalog.MEASURED)
+        return inherit_effort(generated["models"][0], minara_catalog.snapshot())
 
     def install(self):
         """Rebuild the routes from the measured catalog, in place: every account's cfg holds the same dict."""
         import models
         routes = models.build_minara_catalog(self.cfg.get("accounts") or [self.cfg])
-        target = self.cfg.get("_minara_models")
-        if not isinstance(target, dict):
-            self.cfg["_minara_models"] = routes
-            return
-        for key, value in routes.items():
-            target[key] = value
-        for key in [key for key in target if key not in routes]:
-            target.pop(key, None)
+        with models._CATALOG_LOCK:
+            target = self.cfg.get("_minara_models")
+            if not isinstance(target, dict):
+                self.cfg["_minara_models"] = routes
+                return
+            for key, value in routes.items():
+                target[key] = value
+            for key in [key for key in target if key not in routes]:
+                target.pop(key, None)
 
     def _report(self, summary):
         for upstream in summary["added"]:
@@ -422,7 +437,7 @@ class CatalogRefresher:
             console_log.write("[catalog] Minara: %s is gone from Minara's list, unpublished" % name)
         for upstream in summary["releveled"]:
             name = minara_catalog.public_id(upstream)
-            entry = minara_catalog.MEASURED.get(upstream) or {}
+            entry = minara_catalog.snapshot().get(upstream) or {}
             journal.emit("catalog.model_releveled", "Minara: уровни effort %s по данным провайдера: %s" % (
                 name, ", ".join(entry.get("reasoning_effort_levels") or ()) or "нет"), "info", upstream="minara",
                 model=name, upstream_model=upstream, levels=entry.get("reasoning_effort_levels"))

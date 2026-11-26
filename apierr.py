@@ -14,6 +14,9 @@ HOURLY_LIMITS = (HOURLY_LIMIT, "reached your hourly limit")
 # Retool answers 402 "This model is not available for your plan." when the account's plan does not include the model the
 # request names (journal of 2026-11-12/13: three accounts refused every claude-opus-5-5 request, the others served it).
 NOT_IN_PLAN = "model is not available for your plan"
+# Retool answers 403 "Assist is not available for this plan." when an unmarked/Assist request reaches an account whose
+# plan lacks Assist (live 2026-11-24 under assistCopilotStreamGateEnabled).
+ASSIST_NOT_IN_PLAN = "assist is not available for this plan"
 
 # Anthropic documents a closed set of error types (platform.claude.com/docs/en/api/errors, checked
 # 2026-11-05). A relay code outside it is translated, or the client meets a type its error handling does
@@ -194,6 +197,11 @@ def is_account_quota(error) -> bool:
 def is_not_in_plan(text) -> bool:
     """Retool's refusal of a model the account's plan does not include, as opposed to any other 402 (credits, a feature)."""
     return NOT_IN_PLAN in " ".join(str(text or "").lower().split())
+
+
+def is_assist_not_in_plan(text) -> bool:
+    """Retool's 403 refusal of Assist for the account's plan, as opposed to an expired session or Cloudflare challenge."""
+    return ASSIST_NOT_IN_PLAN in " ".join(str(text or "").lower().split())
 
 
 def is_plan_refusal(error) -> bool:

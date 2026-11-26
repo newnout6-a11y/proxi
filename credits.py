@@ -157,6 +157,7 @@ class CreditsManager:
         self._fetch_lock = threading.Lock()
         self._balance = None
         self._cached_at = float("-inf")
+        self._failed_at = float("-inf")
         self.session_used = 0.0
         # Billed turns since start: _history keeps only the last HISTORY_MAX of them, and its length was shown as this count.
         self.turns = 0
@@ -178,7 +179,7 @@ class CreditsManager:
         now = time.monotonic()
         with self._lock:
             usage_revision = self._usage_revision
-            if not force_refresh and now - self._cached_at < CACHE_TTL:
+            if not force_refresh and now - max(self._cached_at, self._failed_at) < CACHE_TTL:
                 if self._balance:
                     return dict(self._balance, stale=bool(self.last_error or self._unreported_usage or self._refresh_raced),
                                 unreported_usage=self._unreported_usage,
@@ -221,7 +222,7 @@ class CreditsManager:
         except Exception as exc:
             with self._lock:
                 self.last_error = str(exc) or type(exc).__name__
-                self._cached_at = time.monotonic()
+                self._failed_at = time.monotonic()
                 if self._balance:
                     return dict(self._balance, stale=True, stale_error=self.last_error,
                                 unreported_usage=self._unreported_usage)
@@ -235,6 +236,7 @@ class CreditsManager:
             info["session_used"] = round(self.session_used, 4)
             self._balance = dict(info)
             self._cached_at = time.monotonic()
+            self._failed_at = float("-inf")
             self.last_fetched_at = time.time()
             self.last_error = None
             self._balance_estimated = False
@@ -290,7 +292,10 @@ class CreditsManager:
         with self._lock:
             if not self._balance or self._balance.get("available") is None:
                 return None
-            if time.monotonic() - self._cached_at >= max_age:
+            now = time.monotonic()
+            if now - self._cached_at >= max_age:
+                return None
+            if self.last_error and now - self._failed_at >= CACHE_TTL:
                 return None
             return dict(self._balance, stale=bool(self.last_error or self._unreported_usage or self._refresh_raced),
                         unreported_usage=self._unreported_usage,

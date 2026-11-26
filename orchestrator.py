@@ -1872,10 +1872,11 @@ class TurnRunner:
                                 elif (event["type"] == "tool_call" and searcher is not None and direct_mode
                                       and event.get("name") == search_spec["name"]):
                                     # The relay's own tool: the client sees a server_tool_use block, not a call to run.
-                                    out.put({key: value for key, value in event.items() if key != "partial"}
+                                    complete = not event.get("partial") and not event.get("invalid")
+                                    out.put({key: value for key, value in event.items() if key not in ("partial", "invalid")}
                                             | {"tool_type": "function", "server": "web_search",
-                                               "done": not event.get("partial")})
-                                    if not event.get("partial"):
+                                               "done": complete})
+                                    if complete:
                                         search_calls[event.get("id") or event["name"]] = {
                                             "id": event.get("id") or event["name"], "arguments": event.get("arguments")}
                                 elif event["type"] == "tool_call" and event.get("name") in tool_names:
@@ -2202,12 +2203,20 @@ class TurnRunner:
                             client_chunks.extend("[tool result %s id=%s]: %s" % (search_spec["name"], call_id, text)
                                                  for call_id, _, text in outcomes)
                             # A forced choice applied to the step that asked for the search, not to the answer after it.
+                            if choice != "none":
+                                tool_names = list(tool_definitions)
                             parsed.tool_choice = choice = "auto"
                             holder["_attempt_budget"].new_step()
                             continue
                         if not streamed_tool_call:
                             log("web_search.loop_stopped", "Цикл поиска остановлен: модель продолжает вызывать поиск "
                                 "после лимита max_uses=%d" % search_spec["max_uses"], "warn", uses=search_uses)
+                            holder["reason"] = "stop"
+                            self._commit_native_context(native_target, native_context, upstream_completed, cancelled)
+                            if direct_mode and native_target is not None and upstream_completed and not cancelled.is_set():
+                                native_target._client_context_pending = False
+                            out.put({"type": "end", "reason": "stop"})
+                            return
 
                     native_calls = (executor.extract_tool_calls(final_text, tool_names) if tool_names else []) if not direct_mode else []
                     if not direct_mode and not native_calls and tool_names:

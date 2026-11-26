@@ -2,7 +2,7 @@ import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { isNum, fmtShortTime, fmtTokens, fmtFixed, fmtInt, fmtMs, plural } from './format.js';
 import { uncoveredBuckets } from './coverage.js';
 import { PHASES, phasesOf } from './turns.js';
-import { spendAxisLabel } from './spend.js';
+import { showSpendPeak, spendAxisLabel } from './spend.js';
 
 function useSize() {
   const ref = useRef(null);
@@ -264,9 +264,9 @@ export function SpendChart({ buckets, windowSec, coveredFrom = null, unit = 'cre
             {model.unsure.map((flag, i) => flag && <path key={`u${i}`} className="c-unsure-dot" d={diamond(xAt(i), yAt(model.values[i]))} />)}
             <circle className="c-peak" cx={xAt(model.peakIndex)} cy={yAt(model.peak)} r={4} />
             {/* The figure is dropped when the scale's top tick already says it; a lower bound always keeps it */}
-            {(peakUnsure || fmtFixed(model.peak, model.max < 1 ? 2 : 1) !== fmtFixed(model.max, model.max < 1 ? 2 : 1)) && (
+            {showSpendPeak(model.peak, model.max, unit, peakUnsure) && (
               <text className="c-label c-label-accent" x={xAt(model.peakIndex) + (peakRight ? -8 : 8)} y={yAt(model.peak) - 8}
-                textAnchor={peakRight ? 'end' : 'start'}>{peakUnsure ? '≥ ' : ''}{fmtFixed(model.peak, 2)}</text>
+                textAnchor={peakRight ? 'end' : 'start'}>{peakUnsure ? '≥ ' : ''}{spendAxisLabel(model.peak, unit)}</text>
             )}
           </>
         )}

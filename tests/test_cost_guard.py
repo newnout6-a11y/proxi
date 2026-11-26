@@ -84,8 +84,14 @@ def test_a_dialog_is_warm_after_a_priced_turn_and_a_first_contact_is_cold():
     assert guard.warm_prefix("conv", model="m", account="b", shared=False) == 0  # an account's own cache
     assert guard.warm_prefix("conv", model="m", account="a", shared=False) == 300_000
     assert guard.warm_prefix("conv", model="other", account="a", shared=True) == 0
-    clock.now += cost_guard.WARM_SHARED + 1
+    # Even when the session carries its last prefix tokens, an account mismatch, model switch, or expired TTL is cold.
+    assert guard.warm_prefix("conv", model="m", account="b", shared=False, session_prefix=300_000) == 0
+    assert guard.warm_prefix("conv", model="other", account="a", shared=True, session_prefix=300_000) == 0
+    clock.now += cost_guard.WARM_OWN
+    assert guard.warm_prefix("conv", model="m", account="a", shared=False, session_prefix=300_000) == 0
+    clock.now += cost_guard.WARM_SHARED - cost_guard.WARM_OWN + 1
     assert guard.warm_prefix("conv", model="m", account="a", shared=True) == 0
+    assert guard.warm_prefix("conv", model="m", account="a", shared=True, session_prefix=300_000) == 0
 
 
 CFG = {"cost_guard": "block", "cost_guard_request_minara": 1500, "cost_guard_hour_minara": 12000,

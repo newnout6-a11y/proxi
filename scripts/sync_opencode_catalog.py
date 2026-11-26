@@ -24,8 +24,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import models
@@ -104,8 +106,15 @@ def _usd_cost(entry):
     return cost
 
 
+def _positive_int(value, fallback):
+    """Return `value` when it is a positive non-bool integer, else `fallback`."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return fallback
+    return value
+
+
 def _small_candidates(entries, new_models):
-    """Published small/fast models in preference order: SMALL_MODELS first, then universal/alias small-tier models."""
+    """Published small/fast models in preference order: SMALL_MODELS first, then universal/alias/Minara small-tier models."""
     ordered = [name for name in SMALL_MODELS if name in new_models]
     seen = set(ordered)
     ranked = []
@@ -113,7 +122,7 @@ def _small_candidates(entries, new_models):
         name = entry['id']
         if name in seen or name not in new_models or 'virtual' in entry:
             continue
-        if not (entry.get('provider_id') or entry.get('is_route_alias')):
+        if not (entry.get('provider_id') or entry.get('is_route_alias') or entry.get('upstream') == 'minara'):
             continue
         slug = str(entry.get('upstream_model') or name).rsplit('/', 1)[-1].split(':', 1)[0].lower()
         cost = _usd_cost(entry)
@@ -185,11 +194,12 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
         name = entry['id']
         item = copy.deepcopy(old_models.get(name))
         item = item if isinstance(item, dict) else {}
-        levels = entry.get('reasoning_effort_levels') or []
-        # OpenCode needs numbers here; a Minara model whose limits nobody measured gets a floor every model of
+        levels = (entry.get('reasoning_effort_levels') or []) if entry.get('reasoning', True) else []
+        # OpenCode needs numbers here; a Minara/universal model whose limits nobody measured gets a floor every model of
         # Minara's current catalog exceeds (OpenCode compacts a little early rather than overflowing).
-        limit = {'context': entry['context'] or UNKNOWN_CONTEXT, 'output': entry['max_output'] or UNKNOWN_OUTPUT}
-        item.update(name=entry['label'], limit=limit,
+        limit = {'context': _positive_int(entry.get('context'), UNKNOWN_CONTEXT),
+                 'output': _positive_int(entry.get('max_output'), UNKNOWN_OUTPUT)}
+        item.update(name=entry.get('label') or name, limit=limit,
                     tool_call=bool(entry.get('tools')), attachment=bool(entry.get('vision')),
                     reasoning=bool(entry.get('reasoning')))
         # Verified USD pricing (universal providers / models.dev / OpenRouter) is published as OpenCode `cost`;
@@ -222,6 +232,8 @@ def update_document(document, entries, default_model='claude-opus-5-5', warnings
         previous = [value for scope in scopes for value in effort_controls(scope)]
         valid = [value for value in previous if isinstance(value, str) and value in levels]
         selected = valid[0] if len(set(valid)) == 1 else entry.get('default_reasoning_effort')
+        if levels and selected is not None and selected not in levels:
+            selected = 'medium' if 'medium' in levels else levels[0]
         for scope in scopes:
             _clear_effort(scope)
         for key in ('settings', 'body'):
@@ -484,14 +496,57 @@ def mask_document(value, secret=False, assignments=False):
     return MASK if secret else mask_string(value, assignments)
 
 
+_REPLACE_ATTEMPTS = 4
+_TRANSIENT_WINERRORS = frozenset((5, 32, 33))
+
+
+def _is_transient_replace_error(error):
+    winerror = getattr(error, 'winerror', None)
+    if winerror is not None:
+        return winerror in _TRANSIENT_WINERRORS
+    return isinstance(error, PermissionError)
+
+
+def _unlink_quiet(target):
+    path = Path(target)
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.unlink(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            if not _is_transient_replace_error(error):
+                return
+            try:
+                mode = path.stat().st_mode
+                if not (mode & stat.S_IWUSR):
+                    os.chmod(path, mode | stat.S_IWUSR)
+            except OSError:
+                pass
+            if attempt + 1 < _REPLACE_ATTEMPTS:
+                time.sleep(0.02 * (attempt + 1))
+
+
 def write_preview(path, data):
     """Create a new owner-only file; an existing preview is never overwritten."""
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
     except FileExistsError:
         raise ValueError('preview file already exists: %s' % path) from None
-    with os.fdopen(fd, 'wb') as output:
-        output.write(data)
+    try:
+        output = os.fdopen(fd, 'wb')
+    except BaseException:
+        os.close(fd)
+        _unlink_quiet(path)
+        raise
+    try:
+        with output:
+            output.write(data)
+            output.flush()
+    except BaseException:
+        _unlink_quiet(path)
+        raise
 
 
 def _replace_windows(path, replacement, backup):
@@ -501,8 +556,16 @@ def _replace_windows(path, replacement, backup):
     replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
                         wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID]
     replace.restype = wintypes.BOOL
-    if not replace(str(path), str(replacement), str(backup), 0, None, None):
-        raise ctypes.WinError(ctypes.get_last_error())
+    for attempt in range(_REPLACE_ATTEMPTS):
+        if replace(str(path), str(replacement), str(backup), 0, None, None):
+            return
+        error = ctypes.WinError(ctypes.get_last_error())
+        # Never retry once a backup was created (e.g. error 1177): let _restore_original recover it.
+        if (not _is_transient_replace_error(error)
+                or Path(backup).exists()
+                or attempt + 1 == _REPLACE_ATTEMPTS):
+            raise error
+        time.sleep(0.02 * (attempt + 1))
 
 
 def _replace_posix(path, replacement, backup):
@@ -516,7 +579,14 @@ def _replace_posix(path, replacement, backup):
         with open(path, 'rb') as source, open(backup, 'xb') as target:
             shutil.copyfileobj(source, target)
     try:
-        os.replace(replacement, path)
+        for attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                os.replace(replacement, path)
+                return
+            except OSError as error:
+                if not _is_transient_replace_error(error) or attempt + 1 == _REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     except BaseException:
         try:
             if Path(backup).read_bytes() == Path(path).read_bytes():
@@ -538,11 +608,16 @@ def _restore_original(path, backup):
     """After a failed replacement, ReplaceFileW (error 1177) can leave the original only as the backup."""
     if path.exists() or not backup.exists():
         return
-    try:
-        os.rename(backup, path)
-    except OSError as error:
-        raise RuntimeError('Could not restore the client configuration; the original is saved as %s (%s)'
-                           % (backup, error.strerror or error)) from error
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.rename(backup, path)
+            return
+        except OSError as error:
+            if _is_transient_replace_error(error) and attempt + 1 < _REPLACE_ATTEMPTS:
+                time.sleep(0.02 * (attempt + 1))
+                continue
+            raise RuntimeError('Could not restore the client configuration; the original is saved as %s (%s)'
+                               % (backup, error.strerror or error)) from error
 
 
 def write_backed_up(path, original, updated, backup_dir):
@@ -559,8 +634,15 @@ def write_backed_up(path, original, updated, backup_dir):
     backup = backup_dir / (path.name + '-' + stamp + '.bak')
     fd, temporary = tempfile.mkstemp(prefix='.proxi-catalog-', suffix='.tmp', dir=path.parent)
     try:
-        with os.fdopen(fd, 'wb') as output:
+        try:
+            output = os.fdopen(fd, 'wb')
+        except BaseException:
+            os.close(fd)
+            raise
+        with output:
             output.write(updated)
+            output.flush()
+            os.fsync(output.fileno())
         if path.read_bytes() != original:
             raise RuntimeError('Client configuration changed before replacement')
         try:
@@ -583,12 +665,10 @@ def write_backed_up(path, original, updated, backup_dir):
                             shutil.copyfile(backup, path)
                         raise
                 finally:
-                    if recovery.exists():
-                        recovery.unlink()
+                    _unlink_quiet(recovery)
             raise RuntimeError('Client configuration changed during replacement; recovery copies: ' + str(backup))
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        _unlink_quiet(temporary)
     return backup
 
 

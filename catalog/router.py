@@ -4,11 +4,13 @@ from __future__ import annotations
 import copy
 import random
 import re
+import threading
 
 from accounts import priority as account_priority
 from catalog import discovery, models_dev
 
 _SAFE_ROUTE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")
+_ROUTE_LOCK = threading.RLock()
 
 
 def sanitize_public_model_id(provider_id: str, upstream_model: str) -> str:
@@ -167,9 +169,19 @@ def build_provider_catalog(cfg: dict, discovered_map: dict[str, list[dict]] | No
 
 def _target_lookup(cfg: dict, model_catalog_module):
     """The function that finds a route target by the name routes[] gives it, in the catalogs `cfg` has right now."""
-    provider_entries = cfg.get("_provider_models") or {}
-    minara_entries = cfg.get("_minara_models") or {}
-    retool_by_id = getattr(model_catalog_module, "_BY_ID", None) or {m["id"]: m for m in model_catalog_module.CATALOG}
+    provider_entries = dict(cfg.get("_provider_models") or {})
+    cat_lock = getattr(model_catalog_module, "_CATALOG_LOCK", None)
+    if cat_lock is not None:
+        with cat_lock:
+            minara_entries = dict(cfg.get("_minara_models") or {})
+            raw_by_id = getattr(model_catalog_module, "_BY_ID", None)
+            retool_by_id = dict(raw_by_id) if raw_by_id is not None else {m["id"]: m for m in model_catalog_module.CATALOG}
+            aliases = dict(model_catalog_module.ALIASES)
+    else:
+        minara_entries = dict(cfg.get("_minara_models") or {})
+        raw_by_id = getattr(model_catalog_module, "_BY_ID", None)
+        retool_by_id = dict(raw_by_id) if raw_by_id is not None else {m["id"]: m for m in list(model_catalog_module.CATALOG)}
+        aliases = dict(model_catalog_module.ALIASES)
 
     def lookup_target(target_name: str) -> dict | None:
         t = (target_name or "").strip()
@@ -181,12 +193,12 @@ def _target_lookup(cfg: dict, model_catalog_module):
             return minara_entries[t]
         if t in retool_by_id:
             return retool_by_id[t]
-        canon = model_catalog_module.ALIASES.get(t)
+        canon = aliases.get(t)
         if canon and canon in retool_by_id:
             return retool_by_id[canon]
         # Allow matching `<provider_id>/<upstream_model>` when upstream_model has vendor prefix
         for entry in provider_entries.values():
-            if f"{entry['provider_id']}/{entry['upstream_model']}" == t:
+            if entry.get("provider_id") and entry.get("upstream_model") and f"{entry['provider_id']}/{entry['upstream_model']}" == t:
                 return entry
         if t.lower().startswith("minara/") and hasattr(model_catalog_module, "minara_entry"):
             # A Minara model named by its upstream id (minara/anthropic/claude-opus-5.5), as a request may name it.
@@ -197,16 +209,23 @@ def _target_lookup(cfg: dict, model_catalog_module):
 
 
 def build_route_aliases(cfg: dict, model_catalog_module) -> dict[str, dict]:
-    """Build user-configured model aliases & cross-provider fallback groups from `cfg['routes']`.
+    """Build user-configured model aliases & fallback groups from `cfg['routes']`.
 
     What cannot be used is said, not dropped in silence (audit A08-04): `cfg['_route_warnings']` names each target that is
     no known model (a typo, another route, a Minara model no account serves yet) and each route left with none, and
     config.load shows them with its other warnings. `cfg['_route_sources']` keeps the catalog entries the targets were
     found as, so that refresh_route_aliases builds the routes again once a catalog changed."""
+    with _ROUTE_LOCK:
+        return _build_route_aliases_locked(cfg, model_catalog_module)
+
+
+def _build_route_aliases_locked(cfg: dict, model_catalog_module) -> dict[str, dict]:
     routes_raw = cfg.get("routes")
-    cfg["_route_warnings"] = warnings = []
-    cfg["_route_sources"] = sources = []
+    warnings: list[str] = []
+    sources: list[tuple[str, dict | None]] = []
     if not isinstance(routes_raw, list) or not routes_raw:
+        cfg["_route_warnings"] = warnings
+        cfg["_route_sources"] = sources
         return {}
 
     lookup_target = _target_lookup(cfg, model_catalog_module)
@@ -248,6 +267,8 @@ def build_route_aliases(cfg: dict, model_catalog_module) -> dict[str, dict]:
         primary["route_targets"] = [copy.deepcopy(t) for t in resolved_targets]
         # Intersection or permissive union of capabilities: keep primary's context/effort, allow vision/tools if primary supports them
         aliases[route_id] = primary
+    cfg["_route_warnings"] = warnings
+    cfg["_route_sources"] = sources
     return aliases
 
 
@@ -259,16 +280,18 @@ def refresh_route_aliases(cfg: dict, model_catalog_module) -> dict[str, dict]:
     a restart, a model published later never became a target, and one Minara withdrew stayed one (audits A08-04, A12-10).
     This compares the entries each target name finds now with those it found (a few dict lookups) on every read of the
     routes (models.route_alias_catalog); what a rebuild newly cannot use goes to the journal."""
-    aliases = cfg.get("_route_aliases") or {}
-    sources = cfg.get("_route_sources")
-    if not sources:
-        return aliases
-    lookup_target = _target_lookup(cfg, model_catalog_module)
-    if all(lookup_target(name) is found for name, found in sources):
-        return aliases
-    before = set(cfg.get("_route_warnings") or ())
-    cfg["_route_aliases"] = aliases = build_route_aliases(cfg, model_catalog_module)
-    fresh = [text for text in cfg["_route_warnings"] if text not in before]
+    with _ROUTE_LOCK:
+        aliases = cfg.get("_route_aliases") or {}
+        sources = list(cfg.get("_route_sources") or ())
+        if not sources:
+            return aliases
+        lookup_target = _target_lookup(cfg, model_catalog_module)
+        if all(lookup_target(name) is found for name, found in sources):
+            return aliases
+        before = set(cfg.get("_route_warnings") or ())
+        aliases = _build_route_aliases_locked(cfg, model_catalog_module)
+        cfg["_route_aliases"] = aliases
+        fresh = [text for text in cfg.get("_route_warnings") or () if text not in before]
     if fresh:
         import console_log
         import journal

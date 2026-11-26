@@ -1,6 +1,7 @@
 """Live USD balance & quota checkers for universal providers (OpenRouter, DeepSeek, Moonshot, SiliconFlow) + unmetered USD."""
 from __future__ import annotations
 
+import inspect
 import math
 import threading
 import time
@@ -113,6 +114,16 @@ def _parse_balance_response(preset: str, url: str, payload: dict) -> dict:
     return {"available": None, "balance_supported": False, "unit": "usd"}
 
 
+def _is_async_transport(custom_transport) -> bool:
+    """Detect async transports including `httpx.MockTransport(async_handler)` (which subclasses both bases)."""
+    if isinstance(custom_transport, httpx.MockTransport):
+        handler = getattr(custom_transport, "handler", None)
+        return inspect.iscoroutinefunction(handler) or (
+            callable(handler) and inspect.iscoroutinefunction(type(handler).__call__)
+        )
+    return isinstance(custom_transport, httpx.AsyncBaseTransport) and not isinstance(custom_transport, httpx.BaseTransport)
+
+
 class ProviderBalanceAccount(UnmeteredAccount):
     """USD usage & optional live-balance account manager for universal providers."""
 
@@ -156,18 +167,30 @@ class ProviderBalanceAccount(UnmeteredAccount):
         }
         if custom_transport is not None:
             # Support sync or async MockTransport in tests via Client/AsyncClient
-            if isinstance(custom_transport, httpx.BaseTransport):
+            if not _is_async_transport(custom_transport):
                 kwargs["transport"] = custom_transport
                 with httpx.Client(**kwargs) as client:
                     resp = client.get(url, headers=headers)
             else:
                 import asyncio
+                import concurrent.futures
 
                 async def _async_get():
-                    async with httpx.AsyncClient(transport=custom_transport, follow_redirects=False, timeout=12.0) as client:
+                    async with httpx.AsyncClient(
+                        transport=custom_transport,
+                        follow_redirects=False,
+                        timeout=12.0,
+                        trust_env=kwargs["trust_env"],
+                    ) as client:
                         return await client.get(url, headers=headers)
 
-                resp = asyncio.run(_async_get())
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    resp = asyncio.run(_async_get())
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        resp = pool.submit(asyncio.run, _async_get()).result()
         else:
             proxy_url = http_pool.validate_proxy_url(self.cfg.get("proxy_url"))
             if proxy_url:
@@ -225,21 +248,26 @@ class ProviderBalanceAccount(UnmeteredAccount):
             **({"error": err, "stale": True} if err else {}),
         }
 
+    def _fresh_cache_hit(self, now: float, force_refresh: bool) -> bool:
+        """Return True when cached success or recent error coalesces this poll (caller holds `self._lock`)."""
+        if force_refresh:
+            return False
+        if self._cached_info is not None and (now - self._fetched_at) < CACHE_SECONDS:
+            return True
+        return bool(self.last_error) and (now - self._failed_at) < CACHE_SECONDS
+
     def get_balance(self, force_refresh: bool = False) -> dict:
         if not self._endpoint:
             return self.balance_snapshot()
 
-        now = time.monotonic()
-        if not force_refresh and self._cached_info is not None and (now - self._fetched_at) < CACHE_SECONDS:
-            return self.balance_snapshot()
-        if not force_refresh and self.last_error and (now - self._failed_at) < CACHE_SECONDS:
-            return self.balance_snapshot()
+        with self._lock:
+            if self._fresh_cache_hit(time.monotonic(), force_refresh):
+                return self.balance_snapshot()
 
         with self._fetch_lock:
-            now = time.monotonic()
-            if not force_refresh and self._cached_info is not None and (now - self._fetched_at) < CACHE_SECONDS:
-                return self.balance_snapshot()
             with self._lock:
+                if self._fresh_cache_hit(time.monotonic(), force_refresh):
+                    return self.balance_snapshot()
                 # What was spent until now; costs recorded while the read is under way stay on the local debit (the
                 # provider may answer before it counts them: OpenRouter counts usage with a delay). Zeroing it all made the
                 # balance shown go up after every read (audit A11-16), as MinaraAccount._fetch_balance already avoids.
@@ -257,4 +285,5 @@ class ProviderBalanceAccount(UnmeteredAccount):
                 self._fetched_at = time.monotonic()
                 self._spent_since_fetch = max(0.0, self._spent_since_fetch - spent_before)
                 self.last_error = None
+                self._failed_at = float("-inf")
             return self.balance_snapshot()

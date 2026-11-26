@@ -19,9 +19,10 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 - `Referer: https://<tenant>.retool.com/`
 - `User-Agent: <браузерный UA>`
 - `x-retool-client-version: <version>` — то, что шлёт фронтенд Retool: `RETOOL_VERSION_STRING` его входного скрипта
-  (`main-*.js`), на 2026-11-18 `4.99.0-dd22f13 (Build 424025)`; живые ответы называют ту же версию в
+  (`main-*.js`, на 2026-11-24 `4.103.0-f4f6d56 (Build 428358)`); живые ответы называют ту же версию в
   `x-retool-api-version`. Проверка каталога (`retool_refresh`) читает версию из текущего входного скрипта и хранит её в
   `retool_models.auto.json` (`client_version`); до первой проверки relay шлёт версию из `auth.CLIENT_VERSION`.
+  При отключённом чтении версии в `retool_models.auto.json` или старте без обновления версия берётся из запасного значения `auth.CLIENT_VERSION`.
 - `Content-Type: application/json`
 - `Accept: application/json`
 
@@ -161,3 +162,21 @@ Receive (JSON frames):
 - При 401/403 или по расписанию: `POST /api/refreshtoken` с пустым телом.
   Успех возвращает `Set-Cookie` с новыми `accessToken` / `xsrfToken`.
 - `cf_clearance` привязан к IP и User-Agent: менять UA между запросами нельзя.
+
+## 4. Транспорт, универсальные провайдеры и маршрутизация (2026-11-24)
+
+- **Пул сессий и HTTP/2**: для Retool по умолчанию работает `drivers/curl_pool.py` с TLS/HTTP-профилем `chrome152`
+  (`impersonate`, по умолчанию и с поддержкой HTTP/2 при `http2: true`) или опционально `retool_http_backend: "httpx"`
+  через `drivers/http_pool.py`; провайдерские запросы идут через общий `httpx`-пул с HTTP/2 и per-account / per-provider
+  `proxy_url` (без автоматической подстановки системных env-прокси).
+- **Немедленная отмена стрима**: при обрыве клиентского соединения или явной отмене (`make_stream_abort`)
+  верхнеуровневый запрос к upstream закрывается немедленно без дочитывания остатка потока.
+- **Фильтрация `anthropic-beta`**: клиентский заголовок `anthropic-beta` проходит белый список `SAFE_ANTHROPIC_BETAS`
+  в `drivers/anthropic_messages.py`; неподдерживаемые/опасные бета-флаги отсеиваются до отправки upstream.
+- **Универсальные провайдеры и маршруты (`providers[]`, `routes[]`)**: `drivers/presets.py` задаёт пресеты совместимых
+  API (`openai`, `openai-responses`, `anthropic`, `openrouter`, `deepseek`, `gemini`, `groq`, `xai`, `mistral`,
+  `together`, `fireworks`, `moonshot`, `siliconflow`, `ollama`, `vllm`, `lmstudio`), а `routes[]` определяет
+  пользовательские алиасы моделей (`{id (или alias), targets[], label, strategy, enabled}`) поверх активного каталога.
+- **Prompt Control (`publish_as_model` и per-model pins)**: виртуальные модели `@<profile>` допускают запросы только
+  при активном `publish_as_model` у профиля в `prompts.json` (иначе runtime отвечает 404); прикрепление диалогов
+  хранит закреплённую ревизию по модели и сбрасывается защищённым правилом при compaction.

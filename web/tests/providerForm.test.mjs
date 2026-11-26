@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildProviderPayload, parseModelsInput, presetMatchesUrl, providerToForm } from '../src/providerForm.js';
+import {
+  EMPTY_CLIENT_KEY, buildClientKeyPayload, buildProviderPayload, clientKeyToForm,
+  parseModelsInput, presetMatchesUrl, providerToForm,
+} from '../src/providerForm.js';
 
 const PRESETS = [
   { id: 'openrouter', name: 'OpenRouter', driver: 'openai-chat', base_url: 'https://openrouter.ai/api/v1', auth_mode: 'bearer', cache_policy: 'auto' },
@@ -87,4 +90,57 @@ test('a new provider without a key or a variable is refused, an edit keeps the s
   const edit = buildProviderPayload(blank, 'deepseek', PRESETS);
   assert.equal('api_key' in edit || 'credentials' in edit || 'api_key_env' in edit, false);
   assert.deepEqual(buildProviderPayload({ ...blank, api_keys_text: 'k1\nk2' }, 'deepseek', PRESETS).credentials, [{ api_key: 'k1' }, { api_key: 'k2' }]);
+});
+
+test('editing a preset provider to a custom base_url emits preset: "custom" so PATCH clears the old preset', () => {
+  const form = providerToForm(saved({ preset: 'deepseek', base_url: 'https://api.deepseek.com' }));
+  assert.equal(form.preset, 'deepseek');
+  // Unchanged base_url keeps its preset
+  assert.equal(buildProviderPayload(form, 'deepseek', PRESETS).preset, 'deepseek');
+  // Moving base_url off the preset host (even after UI cleared form.preset to '') emits 'custom' on edit
+  const clearedByUi = { ...form, preset: '', base_url: 'https://proxy.custom.invalid/v1' };
+  assert.equal(buildProviderPayload(clearedByUi, 'deepseek', PRESETS).preset, 'custom');
+  // Direct call with mismatched preset/url also resets to 'custom' on edit, while new providers omit preset
+  const directMoved = { ...form, base_url: 'https://proxy.custom.invalid/v1' };
+  assert.equal(buildProviderPayload(directMoved, 'deepseek', PRESETS).preset, 'custom');
+  assert.equal('preset' in buildProviderPayload({ ...directMoved, api_keys_text: 'k1' }, null, PRESETS), false);
+});
+
+test('client key form guards non-numeric limits instead of turning NaN into null and includes Minara limits', () => {
+  for (const badRpm of ['abc', '12abc', '1e5', '1.5', '0', '100001', '-5']) {
+    assert.throws(() => buildClientKeyPayload({ ...EMPTY_CLIENT_KEY, label: 'IDE', rpm_limit: badRpm }), /RPM/);
+  }
+  for (const [field, pattern] of [
+    ['max_budget_usd', /Бюджет в USD/],
+    ['max_request_minara', /Лимит Minara за запрос/],
+    ['max_day_minara', /Дневной лимит Minara/],
+  ]) {
+    for (const badVal of ['abc', '10abc', 'NaN', 'Infinity', '-1', '1e5']) {
+      assert.throws(() => buildClientKeyPayload({ ...EMPTY_CLIENT_KEY, label: 'IDE', [field]: badVal }), pattern);
+    }
+  }
+  const payload = buildClientKeyPayload({
+    ...EMPTY_CLIENT_KEY,
+    label: '  Cursor  ',
+    allowed_text: 'minara/*, claude-opus-5-5',
+    rpm_limit: '60',
+    max_budget_usd: '12,5',
+    max_request_minara: '25.5',
+    max_day_minara: '250',
+    allow_cost_confirm: true,
+  });
+  assert.deepEqual(payload, {
+    label: 'Cursor',
+    allowed_models: ['minara/*', 'claude-opus-5-5'],
+    rpm_limit: 60,
+    max_budget_usd: 12.5,
+    max_request_minara: 25.5,
+    max_day_minara: 250,
+    allow_cost_confirm: true,
+  });
+  const roundtrip = clientKeyToForm({ id: 'ck-1', ...payload });
+  assert.equal(roundtrip.editing, true);
+  assert.equal(roundtrip.max_request_minara, '25.5');
+  assert.equal(roundtrip.max_day_minara, '250');
+  assert.equal(roundtrip.allow_cost_confirm, true);
 });

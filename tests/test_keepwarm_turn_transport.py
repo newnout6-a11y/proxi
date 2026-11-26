@@ -29,7 +29,8 @@ CASES = {
     "a cut stream": (200, TEXT + [USAGE], "truncated", 1),
     "an error event": (200, [{"event": "error", "error": {"message": "boom"}, "statusCode": 500}], "error", 1),
     "a server error": (500, b"upstream exploded", "error", 1),
-    "a rejected body": (400, b"Invalid request format", "rejected", 1),
+    "a rejected body": (400, b"Bad request", "rejected", 1),
+    "a gate-rejected body": (400, b"Invalid request format", "rejected", 2),
 }
 
 
