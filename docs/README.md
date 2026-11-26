@@ -7,6 +7,7 @@
 
 | Документ | О чём |
 |---|---|
+| [repository-hygiene.md](repository-hygiene.md) | Размещение кода и отчётов, локальные файлы и проверка структуры в Git и CI |
 | [client-setup.md](client-setup.md) | Настройка клиентов под relay: Codex, Claude Code, Claude Desktop, OpenCode, DeepSeek Harness |
 | [minara.md](minara.md) | Отдельный набор моделей Minara `minara/…`: аккаунты, замер каталога, кэш, мышление, баланс |
 | [minara-questions.md](minara-questions.md) | Minara: вопросы владельцу, решения по ним и что из них сделано (9–10 ноября 2026) |

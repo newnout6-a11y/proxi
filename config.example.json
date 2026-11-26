@@ -12,6 +12,8 @@
   "impersonate_note": "impersonate — TLS/HTTP-профиль curl_cffi (chrome152; можно переопределить внутри записи accounts[]). proxy_url и impersonate задаются глобально или на конкретный аккаунт (без подстановки env-прокси). http2=true включает HTTP/2. retool_http_backend: curl_cffi (по умолчанию) или httpx.",
   "host": "127.0.0.1",
   "port": 8787,
+  "state_dir": "",
+  "state_dir_note": "Общий каталог relay.log, journal.jsonl, commands.log, logs/upstream-400 и conversations. Относительный путь считается от config.json, пустое значение оставляет обычные пути. --state-dir (PowerShell: -StateDir) важнее; после изменения перезапустите relay или супервизор.",
   "relay_api_key": "<optional; иначе env RELAY_API_KEY или сгенерированный relay_key.txt>",
   "transport": "direct",
   "transport_note": "direct = POST /api/gpt/copilotStreamGPT с кэшируемым system-блоком и нативными инструментами (быстро, ~2 с).",

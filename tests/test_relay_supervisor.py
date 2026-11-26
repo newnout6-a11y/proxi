@@ -90,6 +90,31 @@ def free_port():
         return probe.getsockname()[1]
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_supervisor_uses_same_profile_state_for_child_and_log(tmp_path, override):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    config = profile / "relay.json"
+    config.write_text(json.dumps({"port": free_port(), "state_dir": "local state"}), encoding="utf-8")
+    stub = tmp_path / "relay-stub.cmd"
+    stub.write_bytes(b'@echo off\r\necho %* >"%~dp0arguments.txt"\r\necho state path probe\r\nexit /b 1\r\n')
+    command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+               "-Config", str(config), "-Python", str(stub), "-MaxFastExits", "1", "-LogFormat", "text"]
+    configured = profile / "local state"
+    expected = tmp_path / "explicit state" if override else configured
+    if override:
+        command.extend(["-StateDir", str(expected)])
+    environ = {key: value for key, value in os.environ.items() if key != "RELAY_PORT"}
+    done = subprocess.run(command, cwd=tmp_path, env=environ, capture_output=True, timeout=30)
+    assert done.returncode == 1, done.stderr
+    arguments = (tmp_path / "arguments.txt").read_text()
+    assert "--config" in arguments and str(config) in arguments
+    assert "--state-dir" in arguments and str(expected) in arguments
+    assert "state path probe" in (expected / "relay.log").read_text(encoding="utf-8")
+    if override:
+        assert not configured.exists()
+
+
 @pytest.fixture
 def listening():
     """A port this test listens on itself: never the relay's."""

@@ -3,3 +3,5 @@
 web/index.html text eol=lf
 web/public/** text eol=lf
 web/dist/** -text
+# Git for Windows executes the versioned local hook through sh.
+scripts/hooks/* text eol=lf

@@ -7,6 +7,7 @@ import time
 from urllib.parse import quote
 
 import pytest
+import apierr
 import client_context
 import journal
 import proxy
@@ -197,6 +198,40 @@ def test_startup_config_uses_existing_credentials_and_separate_state(tmp_path, m
     # Without --state-dir an already configured path is kept as is.
     kept = proxy.startup_config(["--config", str(config_file)])
     assert kept["journal_path"] == "old-path" and kept["command_log"] == "old-commands"
+
+
+@pytest.mark.parametrize("cli_state", [None, "cli state"])
+def test_startup_config_resolves_profile_state_and_cli_override(tmp_path, monkeypatch, cli_state):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    config_file = profile / "relay.json"
+    config_file.write_text(json.dumps({
+        "providers": [], "relay_api_key": "fixture-key-01234567890123456789", "state_dir": "local state",
+        "journal_path": "old-journal", "command_log": "old-commands", "upstream_error_dir": "old-dumps",
+        "conversation_state_dir": "old-conversations",
+    }), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    args = ["--config", str(config_file)]
+    if cli_state:
+        args.extend(["--state-dir", cli_state])
+    picked = proxy.startup_config(args)
+    expected = (tmp_path / cli_state) if cli_state else (profile / "local state")
+    assert expected.is_dir()
+    assert Path(picked["journal_path"]) == expected / "journal.jsonl"
+    assert Path(picked["command_log"]) == expected / "commands.log"
+    assert Path(picked["upstream_error_dir"]) == expected / "logs/upstream-400"
+    assert Path(picked["conversation_state_dir"]) == expected / "conversations"
+    assert Path(picked["prompts_file"]) == profile / "prompts.json"
+    if cli_state:
+        assert not (profile / "local state").exists()
+
+
+@pytest.mark.parametrize("invalid", [None, 7, ["state"], "bad\x00path"])
+def test_startup_config_rejects_invalid_state_directory(tmp_path, invalid):
+    config_file = tmp_path / "relay.json"
+    config_file.write_text(json.dumps({"providers": [], "state_dir": invalid}), encoding="utf-8")
+    with pytest.raises(apierr.ApiError, match="state_dir must be a string path"):
+        proxy.startup_config(["--config", str(config_file)])
 
 
 def test_external_config_uses_its_own_existing_relay_key(tmp_path, monkeypatch):

@@ -1757,7 +1757,7 @@ def startup_config(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=config_module.CONFIG_PATH, help="Path to the existing relay config")
     parser.add_argument("--state-dir", help="Directory for journal, command log, rejected upstream bodies "
-                                            "and stored conversation state")
+                                            "and stored conversation state (overrides config state_dir)")
     args = parser.parse_args(argv)
     cfg_path = os.path.abspath(args.config)
     bootstrap = (
@@ -1765,12 +1765,13 @@ def startup_config(argv=None):
         and not os.path.exists(cfg_path)
     )
     cfg = config_module.load(cfg_path, bootstrap=True) if bootstrap else config_module.load(cfg_path)
-    state = os.path.abspath(args.state_dir or HERE)
-    os.makedirs(state, exist_ok=True)
+    override = args.state_dir or cfg.get("state_dir")
+    state = os.path.abspath(override or HERE)
+    os.makedirs(state, mode=0o700, exist_ok=True)
     for key, relative in (("command_log", "commands.log"), ("journal_path", "journal.jsonl"),
                           ("upstream_error_dir", os.path.join("logs", "upstream-400")),
                           ("conversation_state_dir", "conversations")):
-        if args.state_dir or not cfg.get(key):
+        if override or not cfg.get(key):
             cfg[key] = os.path.join(state, relative)
     return cfg
 

@@ -114,6 +114,24 @@ function Get-RelayPort([string]$ConfigPath) {
     }
 }
 
+function Get-RelayStateDir([string]$ConfigPath, [string]$StateDir) {
+    if ($StateDir) {
+        return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StateDir)
+    }
+    try {
+        $saved = Get-Content -Raw -LiteralPath $ConfigPath -Encoding UTF8 -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        $value = $saved.state_dir
+        if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value) -or $value.Contains([char]0)) {
+            return $null
+        }
+        return [IO.Path]::GetFullPath([IO.Path]::Combine([IO.Path]::GetDirectoryName($ConfigPath), $value.Trim()))
+    } catch {
+        # Keep the legacy log available so the relay can report a missing or invalid config.
+        return $null
+    }
+}
+
 function Test-PortListening([int]$Port) {
     # Reads the system's table of listeners: nothing connects to the port, so a relay serving on it sees nothing.
     try {
@@ -178,15 +196,18 @@ $env:NO_COLOR = "1" # This supervisor redirects to a plain file; colorize in wat
 # re-encode it as UTF-16LE with a BOM, so relay.log is written explicitly as UTF-8.
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $relayArgs = @("-u", "proxy.py")
-if ($Config) { $relayArgs += @("--config", $Config) }
-if ($StateDir) {
-    $null = New-Item -ItemType Directory -Path $StateDir -Force
-    $relayArgs += @("--state-dir", $StateDir)
+$configPath = if ($Config) { $Config } else { "config.json" }
+$configPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($configPath)
+if ($Config) { $relayArgs += @("--config", $configPath) }
+$statePath = Get-RelayStateDir $configPath $StateDir
+if ($statePath) {
+    $null = [IO.Directory]::CreateDirectory($statePath)
+    # Pass the same resolved path to the child, keeping its output together with this supervisor's log.
+    $relayArgs += @("--state-dir", $statePath)
 }
-$logPath = if ($StateDir) { Join-Path $StateDir "relay.log" } else { "relay.log" }
+$logPath = if ($statePath) { Join-Path $statePath "relay.log" } else { "relay.log" }
 # .NET resolves relative paths against the process directory, not Set-Location.
 $logPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($logPath)
-$configPath = if ($Config) { $Config } else { "config.json" }
 $code = Invoke-Supervisor -Python $Python -RelayArgs $relayArgs -ConfigPath $configPath -LogPath $logPath `
     -FastExitSeconds $FastExitSeconds -MaxFastExits $MaxFastExits
 exit $code
