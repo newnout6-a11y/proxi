@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import { usePolling } from '../useJournal.js';
 import { AnimatedNumber, Dot, Page } from '../motion.jsx';
 import { CacheChart, RankedList, SpendChart, bucketLabel } from '../charts.jsx';
+import { hasUsdSpend as usdSpendIn, spendUnitOf } from '../spend.js';
 import { MIN_FORECAST_SECONDS, burnRate, coverageOf, fmtSince, fmtSpan } from '../coverage.js';
 import { Button, Tag } from '../ui.jsx';
 import {
@@ -247,8 +248,8 @@ export default function Overview({ apiKey, overview, overviewError, refreshOverv
   const busy = buckets.filter((b) => (b.credits || 0) > 0).length;
   const unsure = buckets.some((b) => b.credits_complete === false);
   const coverage = coverageOf(current, windowSec);
-  const hasUsdSpend = isNum(totals.cost_usd) && totals.cost_usd > 0;
-  const activeUnit = spendUnit || (hasUsdSpend && !(totals.credits > 0) ? 'usd' : 'credits');
+  const hasUsdSpend = usdSpendIn(totals);
+  const activeUnit = spendUnitOf(spendUnit, totals);
   const hasUniversalProviders = (overview?.providers?.length || 0) > 0;
   const hasRetool = overview?.session?.keepalive || (overview?.accounts || []).some((a) => !a.upstream || a.upstream === 'retool');
   const okLabel = hasUniversalProviders && !hasRetool ? 'Провайдеры отвечают'

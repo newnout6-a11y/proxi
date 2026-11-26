@@ -27,6 +27,7 @@ import compaction_tools
 import config as config_module
 import conversation_infer
 import conversation_state
+import cost_guard
 import drivers
 from drivers import http_pool
 import forced_choice
@@ -60,7 +61,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RECORD_REQUEST_BYTES = 1024 * 1024
 # What pass 2 takes over from the parse of the original body: the identity of the request is fixed by that body.
 _CARRIED_OVER = ("conversation_key", "parent_conversation_key", "request_purpose", "prompt_purpose", "request_id",
-                 "dialect", "thinking_placeholder", "virtual_profile", "requested_model", "client_task")
+                 "dialect", "virtual_profile", "requested_model", "client_task", "client_key", "cost_confirm",
+                 "credential_scope")
 
 
 def _carry_compatibility(first, parsed, changes):
@@ -474,10 +476,16 @@ def make_handler(runtime: Runtime):
 
         def _log(self, note=""):
             status = getattr(self, "_status", 0) or getattr(self, "_stream_status", 0)
-            took = (time.time() - self._started) * 1000
+            # A refusal the client answers by itself (tool search of Claude Code, a switched-off Codex memory job) is how the
+            # exchange is meant to go: neither a warning in the journal nor a red status in the console (audit A01-06).
+            expected = getattr(self, "_expected", False) and 400 <= status < 500
+            if expected:
+                note = " ".join(part for part in ("[expected]", note) if part)
+            took = (time.monotonic() - self._started) * 1000
             model = getattr(self, "_model", "-")
             # A compaction can run on the dialog's effort instead of the one its client asked for (orchestrator).
-            effort = (getattr(self, "_holder", None) or {}).get("kept_effort") or getattr(self, "_effort_str", "")
+            holder = getattr(self, "_holder", None) or {}
+            effort = holder.get("kept_effort") or getattr(self, "_effort_str", "")
             effort_tag = f" [{effort}]" if effort and model != "-" else ""
             route = getattr(self, "_log_route", None)
             local_note = {"count_tokens": "[local-token-count]", "models": "[local-model-catalog]"}.get(route, "")
@@ -485,9 +493,23 @@ def make_handler(runtime: Runtime):
             # It is not part of duration_ms, which starts when the request is handled.
             slot_wait = getattr(self, "_slot_wait", 0.0) or 0.0
             queued = "[queued %.1fs for a max_workers slot]" % slot_wait if slot_wait >= SLOT_WAIT_NOTE else ""
+            # A stream can commit HTTP 200 before it fails. Keep the wire status and the effective status distinct.
+            streaming = bool(getattr(self, "_streaming", False))
+            http_status = 200 if streaming and getattr(self, "_response_started", False) else getattr(self, "_status", 0)
+            error = getattr(self, "_error_code", None)
+            disconnected = getattr(self, "_client_left", False) or error == "client_disconnected"
+            slow_admin = took >= SLOW_ADMIN_MS and self.path != "/admin/api/events/stream"
+            level = ("info" if expected or disconnected else "error" if status >= 500 or status == 0 else
+                     "warn" if status >= 400 or (route == "admin" and slow_admin) else "success")
+            fields = dict(method=self.command, path=self.path, route=route, status=status, http_status=http_status or None,
+                          duration_ms=round(took), slot_wait_ms=round(slot_wait * 1000),
+                          model=None if model == "-" else model, stream=streaming, error=error,
+                          expected=True if expected else None, disconnected=True if disconnected else None)
+            fields.update(holder.get("_console_route") or {})
             console_log.write("relay %s %s %s %s %s%s %.0fms %s" % (
                 self.request_id, self.command, redact(self.path), status, model, effort_tag, took,
-                " ".join(part for part in (client_context.label(), local_note, queued, note) if part)))
+                " ".join(part for part in (client_context.label(), local_note, queued, note) if part)),
+                kind="http.request", level=level, request_id=self.request_id, message=None, **fields)
             if route in ("chat", "responses", "anthropic") and getattr(self, "_model_called", False):
                 backend, manager = self._serving_account()
                 snapshot = getattr(manager, "balance_snapshot", None)
@@ -496,15 +518,20 @@ def make_handler(runtime: Runtime):
                     # A Minara account's balance is in Minara credits: so is what this request spent there.
                     minara = (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
                     spent = getattr(self, "_minara_used", None) if minara else self._credits_used
-                    console_log.write(console_log.balance_line(self.request_id, snapshot(), spent, account=tag))
+                    balance = snapshot()
+                    upstream = (getattr(backend, "cfg", None) or {}).get("upstream", "retool") if backend else None
+                    console_log.write(console_log.balance_line(self.request_id, balance, spent, account=tag),
+                                      kind="account.balance", account=account_tag(backend), upstream=upstream,
+                                      available=console_log.number(balance.get("available"), signed=True),
+                                      unit=balance.get("unit") or ("retool_credits" if upstream == "retool" else None),
+                                      stale=balance.get("stale"), estimated=balance.get("estimated"),
+                                      unreported_usage=balance.get("unreported_usage"), message=None,
+                                      text_only=backend is None)
             # Admin polling and live streams would drown the journal in its own traffic. A slow answer is journaled all the
             # same (the live journal stream excepted, which lasts by design): a page that took seconds to open left no
             # trace anywhere but the console (2026-11-13).
-            slow_admin = took >= SLOW_ADMIN_MS and self.path.split("?", 1)[0] != "/admin/api/events/stream"
             if route == "admin" and self.command in ("GET", "HEAD") and 0 < status < 400 and not slow_admin:
                 return
-            level = ("error" if status >= 500 or status == 0 else "warn" if status >= 400
-                     or (route == "admin" and slow_admin) else "success")
             message = "%s %s → %s" % (self.command, self.path, status or "—")
             if route == "admin" and slow_admin:
                 message += " за %.1f с" % (took / 1000)
@@ -512,9 +539,11 @@ def make_handler(runtime: Runtime):
                          request_id=self.request_id, method=self.command, path=self.path, route=route,
                          status=status, duration_ms=round(took), slot_wait_ms=round(slot_wait * 1000),
                          model=None if model == "-" else model,
-                         stream=bool(getattr(self, "_streaming", False)),
+                         stream=streaming, http_status=http_status or None,
                          user_agent=self.headers.get("user-agent", "")[:120] if self.headers else "",
-                         error=getattr(self, "_error_code", None), **self._account_fields())
+                         error=error, **({"expected": True} if expected else {}),
+                         **({"disconnected": True} if disconnected else {}),
+                         **self._account_fields())
 
         def _serving_account(self):
             """The account that answered this request, else the primary one."""
@@ -535,8 +564,8 @@ def make_handler(runtime: Runtime):
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
             context_token = client_context.bind({"request_id": self.request_id})
-            self._started = time.time()
-            self._request_started_monotonic = time.monotonic() - max(0.0, getattr(self, "_slot_wait", 0.0) or 0.0)
+            self._started = time.monotonic()
+            self._request_started_monotonic = self._started - max(0.0, getattr(self, "_slot_wait", 0.0) or 0.0)
             # Keep-alive reuses the handler: a stale status from the previous
             # request (e.g. a 404 probe) must not leak into this log line.
             self._status = 0
@@ -549,11 +578,13 @@ def make_handler(runtime: Runtime):
             self._model_called = False
             self._holder = None
             self._error_code = None
+            self._expected = False
             self._response_started = False
             self._client_trace = None
             self._adapter = None
             self._body_read = False
             self._client_left = False
+            self._credential_scope = None
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             self.path = path
@@ -588,6 +619,10 @@ def make_handler(runtime: Runtime):
                         if exc.message == "invalid relay API key":
                             self._throttle_auth_failure()
                         raise
+                    if route in ("balance", "usage") and not self._client_key_profile.get("master"):
+                        # These reports describe the entire account pool, not the caller's own client key.
+                        raise apierr.ApiError(403, "forbidden", "relay master key is required for account reports")
+                    self._credential_scope = auth.conversation_namespace(self._client_key_profile, cfg["relay_api_key"])
                 if route == "chat":
                     if not cfg["enable_chat"]:
                         raise apierr.not_found("chat API disabled")
@@ -632,17 +667,27 @@ def make_handler(runtime: Runtime):
                     self._health()
             except apierr.ApiError as err:
                 self._error_code = err.code
+                self._expected = bool(getattr(err, "expected", False))
                 self._close_if_body_unread()
                 self._log_error(err)
-                if err.status >= 400 and not getattr(err, "expected", False):
-                    console_log.write("[err] %s %s %s" % (err.status, err.code, (err.message or '')[:160]))
+                if err.status >= 400 and not self._expected:
+                    console_log.write("[err] %s %s %s" % (err.status, err.code,
+                                      journal.redact_whole(err.message or '')[:160]), text_only=True)
                 if getattr(self, "_streaming", False):
                     self._stream_failure(dialect, err)
                 else:
                     self._respond_error(err, dialect)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+                self._close_if_body_unread()
+                self.close_connection = True
+                self._error_code = "client_disconnected"
+                journal.emit("http.client_disconnect",
+                             "Клиент закрыл соединение до окончания ответа (%s)" % type(exc).__name__,
+                             "info", request_id=self.request_id, path=self.path)
             except Exception as exc:  # never leak a bare traceback
                 self._close_if_body_unread()
-                console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__, str(exc)[:200]))
+                console_log.write("relay %s EXC %s: %s" % (self.request_id, type(exc).__name__,
+                                  journal.redact_whole(str(exc))[:200]), kind="http.exception", level="error")
                 self._error_code = "internal_error"
                 journal.emit("http.exception", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "error",
                              request_id=self.request_id, path=self.path)
@@ -702,7 +747,8 @@ def make_handler(runtime: Runtime):
         def _log_error(self, err):
             journal.emit("http.error", err.message, "debug" if getattr(err, "expected", False)
                          else "error" if err.status >= 500 else "warn",
-                         status=err.status, code=err.code, param=err.param, model=self._model,
+                         status=err.status, code=err.code, param=err.param, model=self._model, route=self._log_route,
+                         expected=True if getattr(err, "expected", False) else None,
                          effort=self._effort_str or None,
                          stage=getattr(err, "stage", "upstream" if hasattr(err, "upstream_status") else "relay"),
                          upstream_status=getattr(err, "upstream_status", None),
@@ -757,7 +803,8 @@ def make_handler(runtime: Runtime):
             parsed = validate.parse_anthropic(data, cfg)
             # The conversation's last real count scales the answer; chars/4 said two thirds of the real size.
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
-                data, self.headers, client_context.current())
+                data, self.headers, client_context.current(), namespace=self._credential_scope)
+            parsed.credential_scope = self._credential_scope
             anchor = runtime.pool.count_anchor(parsed.conversation_key, parsed.model,
                                                **acquire_plan(cfg, parsed).kwargs)
             tokens, basis = adapters.count_input_tokens(adapters.request_chars(parsed), anchor)
@@ -878,7 +925,7 @@ def make_handler(runtime: Runtime):
             identity = client_context.current()
             if chats is None or prompt_policy.prompt_client(identity, self.headers) != "codex":
                 return data
-            key, _ = validate.conversation_affinity(data, self.headers, identity)
+            key, _ = validate.conversation_affinity(data, self.headers, identity, namespace=self._credential_scope)
             if not key:
                 return data
             if data.get("tools"):
@@ -954,18 +1001,26 @@ def make_handler(runtime: Runtime):
                 else:
                     parsed = validate.parse_chat(data, cfg)
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
-                data, self.headers, client_context.current())
+                data, self.headers, client_context.current(), namespace=self._credential_scope)
+            parsed.credential_scope = self._credential_scope
             self._infer_conversation(parsed)
             parsed.request_id = self.request_id
+            client_context.bind({**client_context.current(), "conversation": journal.tag(parsed.conversation_key),
+                                 "route": self._log_route})
             # The size of the request as the client sent it, for count_tokens to scale from the real usage of this
             # request (a profile may rewrite the body, which the next count_tokens of the client does not see).
             client_chars = adapters.request_chars(parsed)
-            parsed.thinking_placeholder = cfg.get("thinking_placeholder", "")
             parsed.dialect = dialect
             self._model = parsed.model
             runtime.client_keys.enforce_request(
                 getattr(self, "_client_key_profile", None), parsed.model, parsed.requested_model
             )
+            # The cost guard's inputs (cost_guard): the client key's own ceilings, and a sum the client allows one request
+            # to cost, which only the master key and a key with allow_cost_confirm may name.
+            key_profile = getattr(self, "_client_key_profile", None)
+            parsed.client_key = key_profile if key_profile and not key_profile.get("master") else None
+            parsed.cost_confirm = (self.headers.get(cost_guard.CONFIRM_HEADER)
+                                   if not parsed.client_key or parsed.client_key.get("allow_cost_confirm") else None)
             substituted = model_catalog.substitute_for(parsed.requested_model)
             if substituted != parsed.model:
                 substituted = None
@@ -977,9 +1032,13 @@ def make_handler(runtime: Runtime):
                                  parsed.requested_model, substituted), "info",
                              request_id=self.request_id, requested=parsed.requested_model, served=substituted)
             parsed.request_purpose = client_context.request_kind(parsed)
+            if parsed.request_purpose == "prompt-suggestion":
+                substituted = self._optimize_prompt_suggestion(parsed, substituted)
             # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
-            # identity, so that every event of the request, the transport's included, says what it is.
-            parsed.client_task = client_context.client_task(parsed)
+            # identity, so that every event of the request, the transport's included, says what it is. A suggestion is
+            # already a background job (_optimize_prompt_suggestion): that mark was wiped here (audit A15-05), so its
+            # one-off session was kept warm and the tail of its prompt was written to a cache nothing continues.
+            parsed.client_task = getattr(parsed, "client_task", None) or client_context.client_task(parsed)
             if (not parsed.client_task and parsed.request_purpose == "generation" and parsed.structured_output
                     and prompt_policy.prompt_client(client_context.current(), self.headers) == "codex"):
                 # A tool-less request of Codex for a strict schema is one of its own one-shot jobs: the memory
@@ -1045,14 +1104,16 @@ def make_handler(runtime: Runtime):
                              request_id=self.request_id, control='mid_conversation_system',
                              handling='inline_user_text')
             if self._client_trace:
-                # The prompt layer's own attributes (prompt_*) are not part of what the client validated.
+                # The authenticated profile holds the original credential. It isn't a property of the wire request.
                 self._client_trace.event("validated_request",
                                          parsed={key: value for key, value in vars(parsed).items()
-                                                 if not key.startswith("prompt_")},
+                                                  if key not in ("client_key", "credential_scope") and not key.startswith("prompt_")},
                                          effective_effort=self._effort_str)
             client_context.bind({**client_context.current(), "request_purpose": parsed.request_purpose})
             task_note = " | TASK: " + parsed.client_task if parsed.client_task else ""
-            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}{task_note}")
+            console_log.write(f"[{self.request_id}] {client_context.label()} {self.command} {self.path} | MODEL: {parsed.model} | EFFORT: {self._effort_str.upper()} | PURPOSE: {parsed.request_purpose}{task_note}",
+                              kind="request.validated", model=parsed.model, requested_effort=self._effort_str or None,
+                              method=self.command, path=self.path, stream=parsed.stream, message=None)
 
             wait = runtime.limiter.take()
             if wait:
@@ -1129,7 +1190,7 @@ def make_handler(runtime: Runtime):
             if not (version and version >= tool_search_policy.MIN_VERSION):
                 return
             where = tool_search_policy.deferral(data)
-            conversation = (identity.get("client_session_id") or "", identity.get("agent") or "")
+            conversation = (self._credential_scope or "", identity.get("client_session_id") or "", identity.get("agent") or "")
             if where is None:
                 runtime.tool_search_guard.forgive(conversation)  # the client fell back: no loop
                 return
@@ -1163,7 +1224,7 @@ def make_handler(runtime: Runtime):
             family = prompt_policy.prompt_client(client_context.current(), self.headers)
             if family not in families:
                 return
-            key = tool_union.client_key(family, self.headers, parsed)
+            key = tool_union.client_key(family, self.headers, parsed, namespace=self._credential_scope)
             if key is None:
                 return
             merged, carried = union.apply(key, parsed.tools, getattr(parsed, "conversation_key", None))
@@ -1187,6 +1248,102 @@ def make_handler(runtime: Runtime):
             if carried:
                 parsed.tools = merged
                 parsed.carried_tools = frozenset(carried)
+
+        # The models a prompt suggestion runs on with prompt_suggestion_model "auto", fastest first (design_routing_errors.md
+        # section 5.1). Each serves only when the live catalog has it (a Minara model needs a Minara account) and an account
+        # can take it now. Claude Haiku 4.5 on Retool answered all 8 suggestions of the live journal (TTFT 1.1 s); Minara's
+        # Haiku 4.5 writes without reasoning first; gpt-5-nano and GLM-5.3-Flash reason, on their lowest level. When none
+        # can, the chat model serves the suggestion on its lowest level. The chain of 54b1023 had fast-auto, a model no
+        # catalog has, and gpt-5.6-luna and gpt-5.5, reasoning models outside the plan of part of the pool.
+        SUGGESTION_MODELS = ("claude-haiku-4-5-20251001", "minara/claude-haiku-4-5", "gpt-5-nano", "zai-org/GLM-5.3-Flash")
+        # The conversation a suggestion reads: the latest messages and the suggestion request, each cut to a few lines.
+        SUGGESTION_TAIL = 6
+        SUGGESTION_CHUNK_CHARS = 1200
+
+        @staticmethod
+        def _chunk_text(chunk):
+            """A message chunk as text: a list of blocks (an image, a marked block) gives its texts, [image] for an image and
+            [<type>] for any other block, never the Python repr of the list (an image's base64 in the prompt)."""
+            if isinstance(chunk, str):
+                return chunk
+            if isinstance(chunk, dict):
+                if isinstance(chunk.get("text"), str):
+                    return chunk["text"]
+                if chunk.get("type") in ("image", "image_url", "input_image") or "imageData" in chunk:
+                    return "[image]"
+                if "content" in chunk:
+                    return Handler._chunk_text(chunk["content"])
+                return "[%s]" % (chunk.get("type") or "block")
+            if isinstance(chunk, list):
+                return "\n".join(text for text in (Handler._chunk_text(block) for block in chunk) if text)
+            return ""
+
+        def _optimize_prompt_suggestion(self, parsed, substituted):
+            """Run a [SUGGESTION MODE: ...] side request on a fast light model, alone: the conversation's tail, no tools, no thinking.
+
+            The model is the first of prompt_suggestion_model's chain ("auto": SUGGESTION_MODELS, a model id: that one) the
+            catalog has, the client's key may use and an account can take now, else the chat model ("same", or nothing left).
+            It runs on its lowest level. The client's key was charged for the request once already (_completion): a candidate is
+            checked against the key's models only, a second enforce_request took a second RPM slot (audit A02-12)."""
+            pref = str(cfg.get("prompt_suggestion_model") or "auto").strip()
+            profile = getattr(self, "_client_key_profile", None)
+            candidates = () if pref == "same" else self.SUGGESTION_MODELS if pref == "auto" else (pref,)
+            for candidate in candidates:
+                try:
+                    cand_entry, _ = model_catalog.resolve(candidate, cfg=cfg)
+                except apierr.ApiError:
+                    continue  # not in the live catalog: a Minara model without a Minara account, a retired id
+                if not auth.model_allowed_for_profile(profile, cand_entry["id"], candidate):
+                    continue
+                # Served at all is not enough: every account of the model may be at its hourly limit or out of credits now.
+                if runtime.pool.unavailable_error(cand_entry, **acquire_plan(cfg, parsed).kwargs) is not None:
+                    continue
+                if cand_entry["id"] != parsed.model:
+                    parsed.entry = cand_entry
+                    parsed.model = cand_entry["id"]
+                    self._model = parsed.model
+                    substituted = parsed.model if parsed.model != parsed.requested_model else substituted
+                break
+            # The lowest level the model has: a model whose levels start at medium or offer only max was sent its default.
+            levels = [level for level in parsed.entry.get("reasoning_effort_levels") or () if level in models.EFFORT_ORDER]
+            parsed.effort = min(levels, key=models.EFFORT_ORDER.index) if levels else None
+            parsed.verbosity = "low" if "low" in (parsed.entry.get("verbosity_levels") or ()) else None
+            parsed.tools = []
+            parsed.tool_choice = "auto"
+            parsed.web_search = None
+            parsed.structured_output = None
+            parsed.show_thinking = False
+            parsed.thinking_placeholder = ""
+            # The client's thinking switch reaches a universal provider through provider_options: none for a suggestion.
+            parsed.provider_options = {key: value for key, value in (getattr(parsed, "provider_options", None) or {}).items()
+                                       if key not in ("thinking", "parallel_tool_calls", "disable_parallel_tool_use")}
+            # A model that reasons before its text can spend 64 tokens on that and end on its cap with no word written.
+            reasons = bool(parsed.entry.get("reasoning")) and parsed.entry.get("thinking") != "none"
+            parsed.max_tokens = 1024 if reasons else max(16, min(parsed.max_tokens or 64, 64))
+            parsed.output_cap = generation.output_cap(parsed.entry, parsed.max_tokens)
+            parsed.client_task = client_context.BACKGROUND
+            parsed.system = (
+                "Reply with ONLY a natural 2-12 word next user message in the user's language, with no quotes or meta-text."
+            )
+            chunks = [self._chunk_text(chunk) for chunk in getattr(parsed, "message_chunks", None) or ()]
+            if not chunks and (getattr(parsed, "prompt", "") or ""):
+                chunks = [parsed.prompt]
+            prior = [chunk for chunk in chunks[:-1] if chunk.strip()]
+            kept = []
+            if len(prior) > self.SUGGESTION_TAIL and prior[0].startswith("User: "):
+                kept.append(prior[0][:self.SUGGESTION_CHUNK_CHARS])  # what the conversation is about
+            for item in prior[-self.SUGGESTION_TAIL:]:
+                trimmed = item[:self.SUGGESTION_CHUNK_CHARS]
+                if not kept or kept[-1] != trimmed:
+                    kept.append(trimmed)
+            if chunks:
+                kept.append(chunks[-1])
+            parsed.message_chunks = kept
+            parsed.prompt = "\n\n".join(kept)
+            # None, not []: a transport that builds from native messages (Minara, the universal drivers) took an empty list
+            # for the whole conversation and sent the instruction alone (audit A15-03). It builds from the chunks above.
+            parsed.native_messages = None
+            return substituted
 
         def _stabilize_prompt(self, parsed):
             """The client's system prompt with the parts that change between requests held as the conversation has them.
@@ -1219,7 +1376,8 @@ def make_handler(runtime: Runtime):
             if not parsed.tools or not digests:
                 return
             stored = getattr(runtime.pool, "has_stored", None)
-            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests, stored)
+            parsed.conversation_key, how = index.identify(parsed.model, parsed.system, digests, stored,
+                                                          namespace=getattr(parsed, "credential_scope", None))
             if how == "stored":
                 journal.emit("conversation.inferred",
                              "Запрос без идентификатора диалога: продолжен сохранённый диалог (после перезапуска relay)",
@@ -1338,7 +1496,8 @@ def make_handler(runtime: Runtime):
             text = redact(str(exc)).replace("\n", " ")[:160]
             journal.emit("prompt.runtime_error", "Слой промптов дал сбой (%s), запрос идёт прежним путём: %s: %s" % (
                 stage, type(exc).__name__, text), "error", request_id=self.request_id, stage=stage)
-            console_log.write("[err] prompt layer failed (%s): %s; legacy path" % (stage, type(exc).__name__))
+            console_log.write("[err] prompt layer failed (%s): %s; legacy path" % (stage, type(exc).__name__),
+                              kind="prompt.runtime_error", level="warn", stage=stage)
 
         def _pool_unavailable(self, entry, scope):
             """acquire()'s error for this request if it were asked now, after the one balance recheck a 402 gets."""
@@ -1417,18 +1576,19 @@ def make_handler(runtime: Runtime):
             fut.cancel()
 
         def _pump(self, fut, events, adapter, holder, writer):
-            """Stream events to the client, sending heartbeats and honouring disconnects."""
-            last_write = time.time()
+            """Stream events to the client, keeping a silent stream alive and honouring disconnects.
+
+            The keepalive is the dialect's own (adapter.keepalive: Responses response.in_progress, Messages ping, Chat
+            a comment) and goes out once nothing was written to the client for its interval, counted on the monotonic
+            clock from the writer's last write. It used to be a comment sent only when the queue had been empty for
+            15 s: Codex and Claude Code drop comments, and events that write nothing (a transport's heartbeat, a reply
+            held for its check) kept it from going out at all (findings 3 №16, A01-01)."""
             reason = "stop"
             while True:
                 try:
                     event = events.get(timeout=0.25)
                 except queue.Empty:
-                    now = time.time()
-                    writer_last = getattr(writer, "last_write", last_write)
-                    if now - writer_last >= sse.HEARTBEAT_EVERY:
-                        writer.comment()
-                        last_write = now
+                    self._keep_alive(adapter, writer)
                     if sse.client_gone(self) or getattr(writer, "broken", False):
                         self._cancel_turn(fut, holder)
                         return "cancelled"
@@ -1450,12 +1610,19 @@ def make_handler(runtime: Runtime):
                 except apierr.ApiError:
                     self._cancel_turn(fut, holder)
                     raise
-                last_write = time.time()
+                self._keep_alive(adapter, writer)
                 # Check for a disconnect on every event, not only when the stream idles.
                 if sse.client_gone(self) or getattr(writer, "broken", False):
                     self._cancel_turn(fut, holder)
                     return "cancelled"
             return holder.get("reason", reason)
+
+        @staticmethod
+        def _keep_alive(adapter, writer):
+            """The dialect's keepalive, when nothing was written to the client for its interval."""
+            last = getattr(writer, "last_write", None)
+            if last is not None and time.monotonic() - last >= adapter.keepalive_every:
+                adapter.keepalive()
 
     return Handler
 
@@ -1666,7 +1833,7 @@ def main(argv=None):
                {"pending": "reading %d account%s in the background; the relay already serves" % (
                    reading, "" if reading == 1 else "s")})
     for line in banner_lines(cfg, pending, warnings):
-        console_log.write(line)
+        console_log.write(line, kind="relay.startup")
     first_round = threading.Thread(target=startup_round, args=(runtime,), name="startup-balances", daemon=True)
     first_round.start()
 
@@ -1676,7 +1843,7 @@ def main(argv=None):
         if stop_requested.is_set():
             return
         stop_requested.set()
-        console_log.write("shutting down…")
+        console_log.write("shutting down…", kind="relay.shutdown")
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1686,7 +1853,8 @@ def main(argv=None):
             pass
 
     def _thread_crash(args):
-        console_log.write("thread crash: %s %s" % (args.exc_type.__name__, args.exc_value))
+        console_log.write("thread crash: %s %s" % (args.exc_type.__name__, args.exc_value),
+                          kind="relay.thread_crash", level="error")
 
     threading.excepthook = _thread_crash
 
@@ -1698,7 +1866,7 @@ def main(argv=None):
             except Exception as exc:  # never lose the listener on a stray error
                 if stop_requested.is_set():
                     break
-                console_log.write("serve_forever crashed: %s" % exc)
+                console_log.write("serve_forever crashed: %s" % exc, kind="relay.listener_error", level="error")
                 time.sleep(0.5)
     finally:
         try:

@@ -5,6 +5,9 @@ import time
 import apierr
 
 MAX_ATTEMPTS = 5  # Initial POST plus at most four further POSTs per step, never five retries.
+# How many POSTs one request may get back (AttemptBudget.refund) for accounts that refused it outright and were taken out
+# of its way: a pool that keeps refusing still ends, after at most this many accounts.
+MAX_REFUNDS = 64
 
 
 class AttemptBudget:
@@ -34,13 +37,38 @@ class AttemptBudget:
         self.sent_at = None
         self._clock = clock
         self._lock = threading.Lock()
+        self.refunds = 0
 
     @property
     def remaining(self):
         left = max(0, MAX_ATTEMPTS - self.step_used)
         if self.total_cap:
-            left = min(left, max(0, self.total_cap - self.used))
+            left = min(left, max(0, self.total_cap - self.charged))
         return left
+
+    @property
+    def charged(self):
+        """The POSTs of the request that count against total_cap: every one that left, less the ones given back."""
+        return self.used - self.refunds
+
+    def refund(self):
+        """Give back the latest POST: its account refused the request outright and is now out of the request's way.
+
+        Retool's 402 for a model the account's plan lacks, its hourly limit and a spent balance come back before anything
+        is generated or billed, and the turn moves to another account. Charged as attempts, they used up the step: with
+        claude-opus-5-5 in the plan of 13 of 65 live accounts (2026-11-18), five refusals in a row were common and the
+        client got the refusal as a 502 while accounts that serve the model stood idle. At most MAX_REFUNDS a request.
+
+        Only the budget is given back: `used` still counts every POST that left, for the client's upstream_attempts and the
+        numbers of the attempts in the journal and the diagnostics (audit A09-06: after ten refusals and a failure the client
+        was told 1, and all eleven attempts were numbered 1). True when the POST was given back."""
+        with self._lock:
+            if self.refunds >= MAX_REFUNDS or self.step_used <= 0:
+                return False
+            self.refunds += 1
+            self.step_used -= 1
+            self.account_streak = 0
+            return True
 
     def new_step(self):
         """A successful local exec follow-up is a new step with a fresh retry counter."""
@@ -49,7 +77,7 @@ class AttemptBudget:
             self.account_streak = 0
 
     def _limit_error(self):
-        limit = self.total_cap if self.total_cap and self.used >= self.total_cap else MAX_ATTEMPTS
+        limit = self.total_cap if self.total_cap and self.charged >= self.total_cap else MAX_ATTEMPTS
         return self.error("upstream_attempt_limit", "upstream attempt limit reached (%d attempts)" % limit)
 
     def wait(self, delay, cancelled):
@@ -104,15 +132,16 @@ class AttemptBudget:
             error.upstream_status = self.last.get("http_status")
         error.upstream_request_id = self.last.get("upstream_request_id")
         error.upstream_attempts = self.used
+        error.upstream_refunded = self.refunds
         error.stage = "upstream"
         return error
 
     # The answer to a turn whose every attempt came back without text or a tool call. An empty or thinking-only end is how
     # the provider's classifier refuses a request (HTTP 200, no stop reason through Retool); probes of 2026-11-06 traced
     # such refusals to instructions in the client's system prompt (docs/reports/thinking-only-replies-2026-11-05.md).
-    EMPTY_TURN = ("upstream returned an empty turn: no text and no tool call. This can be a refusal by the provider's "
-                  "classifier, for example of instructions that claim priority over the platform's rules or ask the model "
-                  "to reveal its reasoning; check the system prompt and the project instructions the client sends")
+    EMPTY_TURN = ("upstream returned an empty turn: no text and no tool call. "
+                  "Common causes: a transient upstream channel glitch, a prompt asking the model to stay silent, "
+                  "or a provider classifier filtering part of the system prompt or conversation.")
 
     def error(self, code="upstream_empty_turn", message=EMPTY_TURN):
         return self.attach(apierr.ApiError(502, code, message))

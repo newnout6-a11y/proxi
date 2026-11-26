@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 
-from redact import redact
+import journal
 import tool_names
 
 EXEC_REGEX = re.compile(r"<exec_command>(.*?)</exec_command>", re.DOTALL | re.IGNORECASE)
@@ -576,12 +576,12 @@ def _audit(path, cmd, code, duration, output_len, error=None):
     if not path:
         return
     try:
-        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": redact(cmd),
+        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": journal.redact_whole(cmd),
                   "exit": code, "seconds": round(duration, 2), "output_chars": output_len}
         if error:
-            record["error"] = str(error)[:300]
+            record["error"] = journal.redact_whole(str(error))[:300]
         with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
     except OSError:
         pass
 

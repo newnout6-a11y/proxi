@@ -3,6 +3,7 @@ import json
 import os
 import pathlib
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -127,6 +128,42 @@ def test_a_file_over_two_mebibytes_or_a_directory_is_refused(tmp_path):
     (other / "prompts.json").mkdir(parents=True)
     store = make_store(other)
     assert store.snapshot() is None and "not a regular file" in store.errors()[0]["message"]
+
+
+def test_reload_bounds_the_actual_read_when_a_file_grew_after_stat(tmp_path, monkeypatch):
+    path = tmp_path / "prompts.json"
+    path.write_text(json.dumps(doc()), encoding="utf-8")
+    store = make_store(tmp_path)
+    original_stat = pathlib.Path.stat
+
+    def stale_stat(target, *args, **kwargs):
+        info = original_stat(target, *args, **kwargs)
+        if target == path:
+            return SimpleNamespace(st_mode=info.st_mode, st_size=2, st_mtime_ns=info.st_mtime_ns)
+        return info
+
+    monkeypatch.setattr(pathlib.Path, "stat", stale_stat)
+    monkeypatch.setattr(pp, "MAX_DOCUMENT_BYTES", 32)
+    with pytest.raises(pp.PromptConfigError, match="larger"):
+        store._read_document()
+
+
+def test_inclusion_quota_uses_bytes_read_after_stat(tmp_path, monkeypatch):
+    included = text_file(tmp_path)
+    included.write_bytes(b"x" * 64)
+    compiler = pp._Compiler({}, tmp_path)
+    compiler.limit = 32
+    original_stat = pathlib.Path.stat
+
+    def stale_stat(target, *args, **kwargs):
+        info = original_stat(target, *args, **kwargs)
+        if target == included:
+            return SimpleNamespace(st_mode=info.st_mode, st_size=2, st_mtime_ns=info.st_mtime_ns)
+        return info
+
+    monkeypatch.setattr(pathlib.Path, "stat", stale_stat)
+    with pytest.raises(pp.PromptConfigError, match="together are larger"):
+        compiler._file("prompts/t.md", "texts.a")
 
 
 def test_errors_are_copies(tmp_path):
@@ -828,15 +865,15 @@ def test_a_prompts_file_that_is_locked_for_a_moment_is_read_on_a_later_look(tmp_
     clock = Clock()
     store = make_store(tmp_path, doc(), clock=clock)
     rewrite(tmp_path / "prompts.json", doc("V2"))
-    real, failures = pathlib.Path.read_bytes, []
+    real, failures = pathlib.Path.open, []
 
-    def locked(self):
-        if self == store.path and len(failures) < 3:
+    def locked(self, mode="r", *args, **kwargs):
+        if self == store.path and mode == "rb" and len(failures) < 3:
             failures.append(1)
             raise PermissionError(13, "The process cannot access the file because it is being used")
-        return real(self)
+        return real(self, mode, *args, **kwargs)
 
-    monkeypatch.setattr(pathlib.Path, "read_bytes", locked)
+    monkeypatch.setattr(pathlib.Path, "open", locked)
     since = mark()
     tick(store, clock)
     assert store.snapshot().rev == 1 and "cannot read the prompts file" in store.errors()[0]["message"]

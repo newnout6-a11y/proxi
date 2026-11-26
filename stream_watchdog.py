@@ -1,13 +1,20 @@
 """Stall watchdog for normalized async upstream event streams.
 
-Three independent silence budgets run on elapsed time since the last meaningful model event:
+Four independent silence budgets run on elapsed time since the last meaningful model event:
   - first_token: from stream start until the first meaningful event (default 300 s)
   - idle:        between two consecutive meaningful events (default 120 s)
-  - tool_call:   while waiting for arguments of an announced tool call that the upstream buffers whole (default 600 s)
+  - tool_call:   while an announced tool call is not complete: its upstream may buffer the arguments (default 600 s,
+                 renewed by every argument piece that arrives)
+  - thinking:    after a real sign from the upstream that the model reasons in silence (default 900 s): Retool sends
+                 nothing between the start of an Opus thinking block and its signature, 9-107 s in probes and over
+                 300 s on a ~1M-character prompt at max effort (2026-11-18)
 
 Setting a budget to 0 or None disables it. Non-content events (request_sent, usage_start, usage, credits,
-thinking_start, thinking_heartbeat, thinking_status, thinking_signature, and duplicate empty tool-call announcements)
-never reset any silence timer.
+thinking_heartbeat, the relay's own thinking_status timer, and duplicate empty tool-call announcements) never reset any
+silence timer; a real thinking sign (thinking_start, an empty thinking delta, thinking_signature, or thinking_status from
+the upstream) switches to the thinking budget, never to a shorter one. So does reasoning text (a non-empty thinking
+delta) until the answer starts: a model may stream a reasoning summary and then reason in silence for minutes before it
+writes; text and tool-call progress go back to the idle and tool budgets.
 """
 from __future__ import annotations
 
@@ -19,11 +26,13 @@ import apierr
 DEFAULT_FIRST_TOKEN_TIMEOUT = 300.0
 DEFAULT_IDLE_TIMEOUT = 120.0
 DEFAULT_TOOL_TIMEOUT = 600.0
+DEFAULT_THINKING_TIMEOUT = 900.0
 CLOSE_GRACE = 2.0
 
 FIRST_TOKEN = "first_token"
 IDLE = "idle"
 TOOL = "tool_call"
+THINKING = "thinking"
 
 _END = object()
 
@@ -54,11 +63,15 @@ def tool_timeout(cfg) -> float | None:
     return _seconds((cfg or {}).get("stream_tool_timeout", DEFAULT_TOOL_TIMEOUT), DEFAULT_TOOL_TIMEOUT)
 
 
+def thinking_timeout(cfg) -> float | None:
+    """Seconds allowed while the upstream said the model is thinking and sends nothing else; None when disabled."""
+    return _seconds((cfg or {}).get("stream_thinking_timeout", DEFAULT_THINKING_TIMEOUT), DEFAULT_THINKING_TIMEOUT)
+
+
 def max_silence_budget(cfg) -> float | None:
-    """Largest active phase timeout (including tool_timeout), so socket read timeouts never fire before the watchdog."""
+    """Largest active phase timeout (including tool and thinking), so socket read timeouts never fire before the watchdog."""
     first, idle = timeouts(cfg)
-    tool = tool_timeout(cfg)
-    budgets = [b for b in (first, idle, tool) if b is not None]
+    budgets = [b for b in (first, idle, tool_timeout(cfg), thinking_timeout(cfg)) if b is not None]
     return max(budgets) if budgets else None
 
 
@@ -71,6 +84,8 @@ def stream_timeout_error(phase: str, seconds: float) -> apierr.ApiError:
         message = f"upstream produced no output within {seconds:g}s of the request (first-token timeout)"
     elif phase == TOOL:
         message = f"upstream stream went silent: no output for {seconds:g}s after announcing a tool call (tool timeout)"
+    elif phase == THINKING:
+        message = f"upstream stream went silent: no output for {seconds:g}s after the model began thinking (thinking timeout)"
     else:
         message = f"upstream stream went silent: no output for {seconds:g}s after output started (idle timeout)"
     error = apierr.upstream_timeout(message)
@@ -83,6 +98,11 @@ def stream_timeout_error(phase: str, seconds: float) -> apierr.ApiError:
 
 def _call_key(event: dict):
     return event.get("id") or event.get("index") or event.get("name")
+
+
+def _outlasts(budget, other) -> bool:
+    """True when `budget` is longer than `other`; a disabled budget (None) is the longest of all."""
+    return other is not None and (budget is None or budget > other)
 
 
 def opens_tool_call(event, calls: dict) -> bool:
@@ -122,6 +142,18 @@ def is_progress(event, calls: dict | None = None) -> bool:
             calls[key] = size
         return grew or _nonempty(event.get("delta"))
     return False
+
+
+def is_thinking_signal(event) -> bool:
+    """True for the upstream's own sign that the model reasons without output yet: the start of a thinking block, its
+    (possibly empty) delta, its signature, or the transport's status for such a start. The relay's timer status
+    (source "relay") and its heartbeats are no such sign."""
+    if not isinstance(event, dict):
+        return False
+    kind = event.get("type")
+    if kind in ("thinking_start", "thinking_signature", "thinking"):
+        return True
+    return kind == "thinking_status" and event.get("source") == "upstream"
 
 
 async def _advance(iterator):
@@ -180,11 +212,13 @@ async def watch(
     *,
     close_grace: float = CLOSE_GRACE,
     tool_timeout: float | None = DEFAULT_TOOL_TIMEOUT,
+    thinking_timeout: float | None = DEFAULT_THINKING_TIMEOUT,
 ):
     """Yield events of `source` unchanged; abort and raise upstream_timeout when a silence budget expires."""
     first = _seconds(first_timeout, None)
     idle = _seconds(idle_timeout, None)
     tool = _seconds(tool_timeout, None)
+    thinking = _seconds(thinking_timeout, None)
     iterator = source.__aiter__()
     loop = asyncio.get_running_loop()
     calls: dict = {}
@@ -204,14 +238,29 @@ async def watch(
                     return
                 now = loop.time()
                 if is_progress(event, calls):
-                    if event.get("type") == "tool_call":
+                    if event.get("type") == "tool_call" and not event.get("partial"):
+                        # Only the complete call ends its budget: Retool without fine-grained streaming sends the first
+                        # ~20 characters of the arguments and holds the rest for tens of seconds (the idle budget cut
+                        # six Claude Code turns at a Write on 2026-11-18).
                         announced.discard(_call_key(event))
-                    phase, limit = (TOOL, tool) if announced else (IDLE, idle)
+                    if announced:
+                        phase, limit = TOOL, tool
+                    elif event.get("type") == "thinking" and _outlasts(thinking, idle):
+                        # Reasoning text is no answer yet: the model may reason in silence again before it writes.
+                        # gpt-6.2-sol at max streamed its reasoning summary for 59-64 s, then thought for over 120 s
+                        # without a word, and the idle budget cut it with a 504 (2026-11-19).
+                        phase, limit = THINKING, thinking
+                    else:
+                        phase, limit = IDLE, idle
                     deadline = None if limit is None else now + limit
                 elif opens_tool_call(event, calls):
                     announced.add(_call_key(event))
                     phase, limit = TOOL, tool
                     deadline = None if limit is None else now + limit
+                elif phase != TOOL and deadline is not None and is_thinking_signal(event) and (
+                        thinking is None or now + thinking > deadline):
+                    phase, limit = THINKING, thinking
+                    deadline = None if thinking is None else now + thinking
                 elif deadline is not None and now >= deadline:
                     _expire(phase, limit, on_timeout)
                 yield event
@@ -224,4 +273,5 @@ async def watch(
 def guard(source, cfg, on_timeout=None, *, close_grace: float = CLOSE_GRACE):
     """Wrap `source` with the silence budgets configured in `cfg`."""
     first, idle = timeouts(cfg)
-    return watch(source, first, idle, on_timeout, close_grace=close_grace, tool_timeout=tool_timeout(cfg))
+    return watch(source, first, idle, on_timeout, close_grace=close_grace, tool_timeout=tool_timeout(cfg),
+                 thinking_timeout=thinking_timeout(cfg))

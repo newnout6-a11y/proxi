@@ -350,3 +350,142 @@ def test_each_text_segment_opens_its_own_answer_span(tmp_path, monkeypatch, name
     assert not any(event["type"] == "error" for event in events)
     starts = [e for e in log.query() if e["kind"] == "upstream.text_start"]
     assert len(starts) == expected
+
+
+SUGGESTION_PROMPT = (
+    "[SUGGESTION MODE: Suggest what the user might naturally type next in this conversation.]\n"
+    "Stay silent if the next step isn't obvious from what the user said.\n"
+    "Format: 2-12 words, match the user's style. Or nothing."
+)
+
+PTC_RUN_CODE = {
+    "type": "function",
+    "function": {
+        "name": "run_code",
+        "description": (
+            "Execute a TypeScript program against the available tools. Takes two required arguments: "
+            "`code`, the BODY of an async function (erasable syntax only; top-level `await` and `return` work), "
+            "and `description`, a short summary of what the program does. "
+            "Call tools as `await tools.name(args)` per the declarations in the system prompt."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"code": {"type": "string"}, "description": {"type": "string"}},
+            "required": ["code", "description"],
+        },
+    },
+}
+
+
+def test_prompt_suggestion_uses_fast_model_slims_context_and_accepts_empty_reply(relay):
+    payload = {
+        "model": "claude-opus-5-5",
+        "max_tokens": 16000,
+        "output_config": {"effort": "max"},
+        "system": "HUGE_AGENT_SYSTEM " * 2000,
+        "tools": [
+            {"name": f"tool_{i}", "description": "desc " * 30, "input_schema": {"type": "object", "properties": {}}}
+            for i in range(20)
+        ],
+        "messages": [
+            {"role": "user", "content": "Привет, проверь логи"},
+            *[{"role": "assistant" if i % 2 == 0 else "user", "content": f"turn {i} " + ("x" * 1500)} for i in range(12)],
+            {"role": "user", "content": [{"type": "text", "text": SUGGESTION_PROMPT}]},
+        ],
+    }
+    with relay.request("/v1/messages", payload) as response:
+        assert response.status == 200
+        sub = response.headers.get("x-proxi-model-substituted", "")
+        body = json.loads(response.read())
+    assert sub == "claude-opus-5-5=claude-haiku-4-5-20251001"
+    seen = relay.fake.seen[-1]
+    assert seen.request_purpose == "prompt-suggestion"
+    assert seen.model == "claude-haiku-4-5-20251001"
+    assert seen.tools == []
+    assert "no quotes" in seen.system
+    assert len(seen.prompt) < 10000 and SUGGESTION_PROMPT in seen.prompt
+    assert body["stop_reason"] == "end_turn"
+
+
+def test_prompt_suggestion_strips_meta_silence_markers(tmp_path, monkeypatch):
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[])
+
+    async def chatty_silent(session, prompt, provider, tool_names=None):
+        yield {"type": "text", "delta": "(staying silent - conversation is explicitly closed)"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(RelaySession, "stream", chatty_silent)
+    parsed = request([{"role": "user", "content": SUGGESTION_PROMPT}], tools=[], system="")
+    parsed.request_purpose = "prompt-suggestion"
+    events = asyncio.run(run(runner, parsed))
+    assert not any(e["type"] in ("error", "text") for e in events)
+    assert events[-1] == {"type": "end", "reason": "stop"}
+
+
+@pytest.mark.parametrize("transport, refusal", [("direct", False), ("agent", False), ("agent", True)])
+def test_prompt_suggestion_distinguishes_silence_from_a_saved_upstream_error(tmp_path, monkeypatch, transport, refusal):
+    _, pool, runner = setup(tmp_path, transport=transport, project_context=False, cookie_values=[])
+    calls = 0
+    diagnoses = []
+
+    async def silent_stream(session, prompt, provider, tool_names=None):
+        nonlocal calls
+        calls += 1
+        yield {"type": "thinking_start"}
+        yield {"type": "thinking_signature", "signature": "sig"}
+        yield {"type": "end", "reason": "stop"}
+
+    monkeypatch.setattr(RelaySession, "stream", silent_stream)
+
+    async def get_messages(thread_id):
+        diagnoses.append(thread_id)
+        return {"messages": [{"senderRole": "sandpack", "createdAt": "2099-01-01T00:00:00Z",
+                              "content": {"type": "error", "error": "AI credits exhausted"}}] if refusal else []}
+
+    monkeypatch.setattr(pool.backend, "get_messages", get_messages, raising=False)
+    parsed = request([{"role": "user", "content": SUGGESTION_PROMPT}], tools=[], system="")
+    parsed.request_purpose = "prompt-suggestion"
+    events = asyncio.run(run(runner, parsed))
+    assert calls == 1
+    assert len(diagnoses) == int(transport == "agent")
+    if refusal:
+        assert events[-1]["type"] == "error"
+        assert events[-1]["error"].status == 402 and events[-1]["error"].code == "insufficient_credits"
+    else:
+        assert not any(e["type"] == "error" for e in events)
+        assert events[-1] == {"type": "end", "reason": "stop"}
+
+
+def test_ptc_mode_wraps_undeclared_tool_call_into_run_code(tmp_path, monkeypatch):
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[])
+
+    async def stream(session, prompt, provider, tool_names=None):
+        yield {"type": "tool_call", "id": "call_ptc_1", "name": "pwsh", "arguments": '{"command":', "partial": True}
+        yield {"type": "tool_call", "id": "call_ptc_1", "name": "pwsh", "arguments": '{"command":"git status"}'}
+        yield {"type": "end", "reason": "tool_calls"}
+
+    monkeypatch.setattr(RelaySession, "stream", stream)
+    parsed = request(FIRST, tools=[copy.deepcopy(PTC_RUN_CODE)])
+    events = asyncio.run(run(runner, parsed))
+    assert not any(e["type"] == "error" for e in events)
+    tool_events = [e for e in events if e["type"] == "tool_call"]
+    assert len(tool_events) == 1
+    assert tool_events[0]["name"] == "run_code" and tool_events[0]["done"] is True
+    wrapped = json.loads(tool_events[0]["arguments"])
+    assert wrapped["code"] == 'return await tools["pwsh"]({"command": "git status"});'
+    assert wrapped["description"]
+
+
+def test_non_ptc_undeclared_tool_call_on_auto_choice_names_tool_without_blaming_classifier(tmp_path, monkeypatch):
+    _, _, runner = setup(tmp_path, transport="direct", project_context=False, cookie_values=[])
+
+    async def stream(session, prompt, provider, tool_names=None):
+        yield {"type": "tool_call", "id": "call_bad", "name": "pwsh", "arguments": '{"command":"dir"}'}
+        yield {"type": "end", "reason": "tool_calls"}
+
+    monkeypatch.setattr(RelaySession, "stream", stream)
+    events = asyncio.run(run(runner, request(FIRST)))
+    assert events[-1]["type"] == "error"
+    err = events[-1]["error"]
+    assert err.status == 502 and err.code == "upstream_invalid_output"
+    assert "pwsh" in err.message and "classifier" not in err.message

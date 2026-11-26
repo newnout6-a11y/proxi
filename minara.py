@@ -21,7 +21,6 @@ import apierr
 import client_context
 import forced_choice
 import journal
-import redact
 
 BASE = "https://api.minara.ai/v1"
 BILLING_PREFIX = "x-anthropic-billing-header:"
@@ -301,17 +300,16 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
         # a hash, so nothing of the client's identifiers goes upstream.
         body["prompt_cache_key"] = "proxi-" + hashlib.sha256(
             json.dumps(conversation, default=str).encode("utf-8")).hexdigest()[:32]
-    elif model.startswith("anthropic/"):
+    elif model.startswith("anthropic/") and conversation:
         # OpenRouter spreads some Claude models over providers with caches of their own (Fable 5.2: Anthropic, Google
         # Vertex, Azure): without a key a follow-up read the head in 3 of 5 requests and each new provider wrote it again
         # (12.8 credits a 5.8k head), with one all 6 went to one provider and every follow-up read it (2026-11-10). The key
-        # is the head's (model, instructions, tools), not the conversation's: a client's conversations and subagents share
-        # their head, so they share the provider that holds it too, and a level change keeps it.
+        # follows this conversation's head. Identical heads from different chats must not use the same key; changes
+        # to instructions/tools still change the key, while an effort change in the same chat keeps it.
         head_part = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
-        seed = [model, head_part, body.get("tools")] if head_part else [model, conversation]
-        if head_part or conversation:
-            body["prompt_cache_key"] = "proxi-" + hashlib.sha256(json.dumps(
-                seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+        seed = [model, conversation, head_part, body.get("tools")]
+        body["prompt_cache_key"] = "proxi-" + hashlib.sha256(json.dumps(
+            seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass")).hexdigest()[:32]
     return body
 
 
@@ -922,8 +920,10 @@ class EventParser:
             item = _bounded_json(data)
         except (ValueError, RecursionError):
             raise apierr.upstream_error("Minara returned malformed SSE JSON") from None
-        if not isinstance(item, dict) or "error" in item:
+        if not isinstance(item, dict):
             raise apierr.upstream_error("Minara returned a stream error")
+        if "error" in item or item.get("type") == "error":
+            raise _sse_error(item)
         failed = _upstream_failure(item)
         if failed:
             raise apierr.upstream_error("Minara's upstream failed: " + failed)
@@ -1034,11 +1034,13 @@ _CHANNEL_MARKS = (b"channel_selection", b"channel_unavailable", b"no_enabled_cha
                   # OpenRouter's provider down: Opus 4.7 answered every request so for ten minutes, the same requests were
                   # answered before and after (2026-11-10 01:05-01:15)
                   b"The request could not be processed")
+_DEFINITE_CHANNEL_REFUSALS = (b"channel_selection", b"channel_unavailable", b"no_enabled_channel",
+                              b"no available channel", b"unknown or unsupported model")
 CHANNEL_RETRY_AFTER = 30
 
 
 def _channel_trouble(status, text):
-    if status in (500, 502, 503, 504, 524) and not text.strip():
+    if status in (500, 502, 503) and not text.strip():
         return True
     return status in (400, 404, 500, 502, 503) and any(mark in text for mark in _CHANNEL_MARKS)
 
@@ -1047,11 +1049,15 @@ def _http_error(status, headers, text=b""):
     """The error a Minara answer of `status` becomes, marked as upstream's (the journal logged them as the relay's)."""
     error = _status_error(status, headers, text)
     error.upstream_status = status
-    error.unbilled = True  # answered instead of a stream: nothing was generated, so another account may take it
+    # An HTTP response alone does not prove a turn was never sent to a model (e.g. a gateway timeout).
+    error.unbilled = (status in (401, 402, 403, 429) or (
+        status in (400, 404, 500, 502, 503) and any(mark in text.lower() for mark in _DEFINITE_CHANNEL_REFUSALS)))
     return error
 
 
 def _status_error(status, headers, text=b""):
+    if status in (504, 524):
+        return apierr.upstream_timeout("Minara gateway timed out (upstream HTTP %s)" % status)
     if status in (401, 403):
         # The code is the one every account path knows (auth_dead, failover); the words are Minara's, not Retool's.
         error = apierr.ApiError(502, "upstream_auth_error", "Minara rejected the account's token (HTTP %s): it expired or "
@@ -1114,9 +1120,15 @@ def _upstream_message(text, limit=400):
     except (ValueError, AttributeError, RecursionError):
         message = text if "<html" not in text[:200].lower() else ""
     message = _innermost(" ".join(str(message).split()))
+    message = journal.redact_whole(message)
     if len(message) > limit:
         message = message[:limit - 1] + "…"
-    return redact.redact(message) if message else ""
+    return message
+
+
+def _sse_error(item):
+    detail = _upstream_message(json.dumps({"error": item.get("error"), "message": item.get("message")}))
+    return apierr.upstream_error("Minara returned a stream error" + (": " + detail if detail else ""))
 
 
 def _forced_requirement(model_provider, tools, tool_choice):
@@ -1532,9 +1544,7 @@ class MessagesParser:
         kind = item.get("type")
         events = []
         if kind == "error":
-            error = item.get("error") if isinstance(item.get("error"), dict) else {}
-            raise apierr.upstream_error("Minara returned a stream error" + (
-                ": " + _upstream_message(json.dumps({"error": error})) if error.get("message") else ""))
+            raise _sse_error(item)
         if kind == "message_start":
             message = item.get("message") if isinstance(item.get("message"), dict) else {}
             self.reply_id = str(message.get("id") or "")
@@ -1809,6 +1819,13 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                 if stopped.is_set():
                     return
                 if response.status_code == 200:
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "text/event-stream" not in content_type:
+                        raise apierr.upstream_error("Minara did not return an SSE stream")
+                    for data in sse_data(response.iter_content(chunk_size=16384)):
+                        if stopped.is_set():
+                            return
+                        put(data)
                     break
                 text = _error_body(response)
                 if (route["messages"] and not route["measured"] and response.status_code in (400, 404, 422)
@@ -1829,7 +1846,7 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                     refused = getattr(getattr(getattr(session, "backend", None), "credits", None), "note_refusal", None)
                     if refused is not None:
                         refused()  # the balance check that follows marks the account exhausted
-                if not (delays and _channel_trouble(response.status_code, text)
+                if not (delays and error.unbilled and _channel_trouble(response.status_code, text)
                         and time.monotonic() + delays[0] < deadline):
                     raise error
                 # Said, so a slow answer can be told from Minara's own retries (one took 17 s on an image).
@@ -1844,13 +1861,6 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                     pass
                 if stopped.wait(delays.pop(0)):
                     return
-            content_type = response.headers.get("content-type", "").lower()
-            if "text/event-stream" not in content_type:
-                raise apierr.upstream_error("Minara did not return an SSE stream")
-            for data in sse_data(response.iter_content(chunk_size=16384)):
-                if stopped.is_set():
-                    return
-                put(data)
         except apierr.ApiError as exc:
             put(exc)
         except Exception as exc:
@@ -1891,11 +1901,17 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
             raise apierr.upstream_timeout("Minara turn expired before upstream request")
         thread.start()
         started = True
+        # No display status while Minara is silent: the client learns that the model reasons from Minara itself (a
+        # thinking_start of the parser, real reasoning text), and a silent stream is kept alive by the keepalive of
+        # its dialect (proxy._pump). A timer of the relay's own (54b1023: a status after 1.5 s, then a heartbeat every
+        # 5 s, for every level but "none") printed "Модель думает…" with no signal from the backend and made a
+        # refusal that came later than 1.5 s final instead of moving it to another account.
         while True:
             if getattr(session, "_cancelled", False):
                 yield {"type": "end", "reason": "cancelled"}
                 return
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 raise apierr.upstream_timeout("Minara turn exceeded its deadline")
             try:
                 item = q.get_nowait()

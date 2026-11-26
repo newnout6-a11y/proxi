@@ -10,13 +10,32 @@ param(
     [int]$MaxFastExits = 8
 )
 
-function Format-RelayLogLine([string]$Line) {
+function Format-RelayLogLine([string]$Line, [switch]$FromRelay, [string]$Kind = 'supervisor.lifecycle',
+                             [string]$Level = 'info') {
+    if ($env:RELAY_LOG_FORMAT -eq 'jsonl') {
+        if ($FromRelay) {
+            if ($Line.StartsWith('{"ts":"')) {
+                try {
+                    $record = ConvertFrom-Json -InputObject $Line -ErrorAction Stop
+                    if ($record.ts -and $record.kind -match '^[a-z][a-z0-9_.-]+$' -and
+                        $record.level -in @('debug', 'info', 'success', 'warn', 'error')) { return $Line }
+                } catch { }
+            }
+            # Python may fail before loading redaction rules. Never persist raw output outside that boundary in JSONL.
+            $Kind = 'supervisor.unstructured_output'
+            $Level = 'warn'
+            $Line = 'Relay emitted a line outside its structured logger'
+        }
+        return ([ordered]@{ ts = [DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz'); kind = $Kind;
+                            level = $Level; message = $Line } | ConvertTo-Json -Compress)
+    }
     # Python supplies its event time; supervisor messages (or startup errors before Python logging) need one too.
     if ($Line -match '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}\] ') { return $Line }
     return ('[{0}] {1}' -f [DateTimeOffset]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff zzz'), $Line)
 }
 
-function Write-RelayLog([string]$Path, [string]$Line, [long]$MaxBytes = 20MB, [int]$Keep = 3) {
+function Write-RelayLog([string]$Path, [string]$Line, [long]$MaxBytes = 20MB, [int]$Keep = 3,
+                        [switch]$FromRelay, [string]$Kind = 'supervisor.lifecycle', [string]$Level = 'info') {
     # Bounded like the journal: past $MaxBytes the log becomes relay.log.1 (relay.log.2 .. $Keep are older ones) and
     # starts again. It is copied and emptied in place rather than renamed: watch_relay.py holds the file open, which
     # on Windows forbids a rename, and it reads a file that shrank from its start again.
@@ -37,7 +56,8 @@ function Write-RelayLog([string]$Path, [string]$Line, [long]$MaxBytes = 20MB, [i
         # A rotation that fails (an old file held open, a full disk) leaves the log growing; no line is lost.
     }
     foreach ($part in ($Line -split "\r?\n")) {
-        [IO.File]::AppendAllText($Path, "$(Format-RelayLogLine $part)`r`n", [Text.UTF8Encoding]::new($false))
+        $rendered = Format-RelayLogLine $part -FromRelay:$FromRelay -Kind $Kind -Level $Level
+        [IO.File]::AppendAllText($Path, "$rendered`r`n", [Text.UTF8Encoding]::new($false))
     }
 }
 
@@ -81,28 +101,30 @@ function Invoke-Supervisor {
         if ($null -ne $port -and (Test-PortListening $port)) {
             $text = "supervisor: port $port is already in use (another relay, a second supervisor or another " +
                     "program listens on it); the relay was not started and the supervisor stops"
-            Write-RelayLog $LogPath "$text $(Get-Date -Format o)"
-            Write-Warning (Format-RelayLogLine $text)
+            Write-RelayLog $LogPath $text -Kind 'supervisor.port_in_use' -Level 'error'
+            if ($env:RELAY_LOG_FORMAT -ne 'jsonl') { Write-Warning (Format-RelayLogLine $text) }
             return 1
         }
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $code = "none"
         try {
-            & $Python @RelayArgs 2>&1 | ForEach-Object { Write-RelayLog $LogPath "$_" }
+            & $Python @RelayArgs 2>&1 | ForEach-Object { Write-RelayLog $LogPath "$_" -FromRelay }
             $code = $LASTEXITCODE
         } catch {
-            Write-RelayLog $LogPath "supervisor: cannot start the relay with ${Python}: $_"
+            $text = if ($env:RELAY_LOG_FORMAT -eq 'jsonl') { "Cannot start relay: $($_.Exception.GetType().Name)" }
+                    else { "supervisor: cannot start the relay with ${Python}: $_" }
+            Write-RelayLog $LogPath $text -Kind 'supervisor.start_failed' -Level 'error'
         }
         $fastExits = if ($clock.Elapsed.TotalSeconds -lt $FastExitSeconds) { $fastExits + 1 } else { 0 }
         if ($fastExits -ge $MaxFastExits) {
             $text = "supervisor: the relay exited within $FastExitSeconds s of its start $fastExits times in a row " +
                     "(exit code $code); the supervisor stops, the lines above say why"
-            Write-RelayLog $LogPath "$text $(Get-Date -Format o)"
-            Write-Warning (Format-RelayLogLine $text)
+            Write-RelayLog $LogPath $text -Kind 'supervisor.stopped' -Level 'error'
+            if ($env:RELAY_LOG_FORMAT -ne 'jsonl') { Write-Warning (Format-RelayLogLine $text) }
             return 1
         }
         $delay = Get-RestartDelay $fastExits
-        Write-RelayLog $LogPath "restart in $delay s (exit code $code) $(Get-Date -Format o)"
+        Write-RelayLog $LogPath "restart in $delay s (exit code $code)" -Kind 'supervisor.restart'
         Start-Sleep -Seconds $delay
     }
 }

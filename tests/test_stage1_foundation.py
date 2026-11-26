@@ -153,6 +153,40 @@ def test_http_pool_reuses_client_and_never_follows_redirects():
     asyncio.run(scenario())
 
 
+def test_http_pool_does_not_implicitly_share_cookies_between_credentials():
+    seen = []
+
+    def reply(request):
+        seen.append(request.headers.get("cookie"))
+        return httpx.Response(200, headers={"set-cookie": "session=private; Path=/"})
+
+    async def scenario():
+        client = http_pool.get_async_client({"_http_transport": httpx.MockTransport(reply)})
+        try:
+            base = "https://provider.example/v1"
+            await client.get(base, headers={"Authorization": "Bearer first", "Cookie": "manual=1"})
+            await client.get(base, headers={"Authorization": "Bearer second"})
+            assert seen == ["manual=1", None]
+        finally:
+            await http_pool.close_loop_clients()
+
+    asyncio.run(scenario())
+
+
+def test_http_pool_keeps_system_proxy_opt_in_out_of_direct_connections():
+    async def scenario():
+        try:
+            opted_in = http_pool.get_async_client({"use_system_proxy": True})
+            direct = http_pool.get_async_client({"use_system_proxy": False})
+            assert direct is not opted_in
+            assert not direct.trust_env and opted_in.trust_env
+            assert http_pool.get_async_client({}) is direct
+        finally:
+            await http_pool.close_loop_clients()
+
+    asyncio.run(scenario())
+
+
 def test_stream_watchdog_first_token_idle_and_tool_call_budgets():
     aborted = []
 

@@ -5,9 +5,12 @@ Claude Code 2.1.304 and later defers its MCP tools behind ToolSearch behind a ga
 41% of the tokens written in the Claude Code dialog of 2026-11-06, one of them 33.8 credits at 336k tokens). A 400 makes the
 client (2.1.305 and later; checked against 2.1.310 on a fake gateway) send the request again with all tools loaded."""
 import copy
+import json
+import time
 
 import pytest
 
+import console_log
 import journal
 import tool_search_policy as policy
 from test_conversation_state import stored
@@ -79,6 +82,52 @@ def test_a_request_that_carries_tool_search_is_refused_before_anything_is_spent(
     (event,) = stored(seq, "tool_search.refused")
     assert event["data"]["version"] == "2.1.310" and event["data"]["where"] == "2"
     assert all(item["level"] == "debug" for item in stored(seq, "http.error"))   # expected: not a warning of the relay
+
+
+def answered(relay, body, monkeypatch):
+    """The `http.request` event and the console line of one request (both are written after the answer is sent)."""
+    lines = []
+    monkeypatch.setattr(console_log, "write", lambda line, **_: lines.append(str(line)))
+    seq = journal.JOURNAL.last_seq
+    status = ask(relay, body)[0]
+    deadline = time.monotonic() + 2
+    while not stored(seq, "http.request"):
+        assert time.monotonic() < deadline, "the request was not journaled"
+        time.sleep(0.01)
+    (event,) = stored(seq, "http.request")
+    (line,) = [line for line in lines if line.startswith("relay ")]
+    return status, event, console_log.render(line, color=True)
+
+
+def test_an_expected_refusal_is_neither_a_warning_in_the_journal_nor_red_in_the_console(relay, monkeypatch):
+    """Claude Code is refused three times at each start and sends the request again each time: every refusal was a yellow
+    `http.request` in the journal and a red 400 in the console (104 of 104 live refusals, audit A01-06)."""
+    status, event, line = answered(relay, request(), monkeypatch)
+    assert status == 400 and event["level"] == "info" and event["data"]["expected"] is True
+    assert "[expected]" in line and "\x1b[1;91m" not in line
+
+
+def test_a_real_client_error_still_warns_and_is_red(relay, monkeypatch):
+    status, event, line = answered(relay, {"model": "claude-opus-5-5", "max_tokens": 64}, monkeypatch)   # no messages
+    assert status == 400 and event["level"] == "warn" and "expected" not in event["data"]
+    assert "[expected]" not in line and "\x1b[1;91m400\x1b[0m" in line
+
+
+def test_jsonl_distinguishes_expected_refusal_from_invalid_request(relay, monkeypatch, capsys):
+    monkeypatch.setenv("RELAY_LOG_FORMAT", "jsonl")
+    seq = journal.JOURNAL.last_seq
+    refused = ask(relay, request())[1]["request_id"]
+    invalid = ask(relay, {"model": "claude-opus-5-5", "max_tokens": 64})[1]["request_id"]
+    deadline = time.monotonic() + 3
+    while len(stored(seq, "http.request")) < 2:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    for request_id, levels in ((refused, {"http.error": "debug", "http.request": "info"}),
+                               (invalid, {"http.error": "warn", "http.request": "warn"})):
+        rows = [row for row in records if row.get("request_id") == request_id]
+        assert {row["kind"]: row["level"] for row in rows} == levels
+        assert all(row["status"] == 400 and row.get("expected", False) == (request_id == refused) for row in rows)
 
 
 def test_the_request_the_client_sends_again_without_tool_search_is_served(relay):

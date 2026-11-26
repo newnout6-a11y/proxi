@@ -114,19 +114,20 @@ def test_text_after_a_call_is_a_message_of_its_own_and_the_texts_stay_apart():
     assert deltas == [(0, "before "), (0, "the call"), (2, "after")]
 
 
-def test_thinking_after_a_call_is_a_reasoning_item_of_its_own_and_the_placeholder_is_not_counted():
+def test_thinking_after_a_call_is_a_reasoning_item_of_its_own_and_an_old_label_is_never_written():
     parsed_with_label = parsed()
-    parsed_with_label.thinking_placeholder = "Thinking...\n"
+    parsed_with_label.thinking_placeholder = "Thinking...\n"  # what an old config set: the adapters no longer read it
     writer = Writer()
     adapter = adapters.ResponsesAdapter(parsed_with_label, writer)
     adapter.begin()
-    adapter.feed({"type": "thinking_start"})  # the label is shown but is not part of the thinking
+    adapter.feed({"type": "thinking_start"})  # opens the reasoning item, without a word of its own
     adapter.feed({"type": "thinking", "delta": "first thought"})
     call(adapter, "a", "{}", done=True)
     adapter.feed({"type": "thinking", "delta": "second thought"})
     final = adapter.end("tool_calls")
     summaries = [item["summary"][0]["text"] for item in final["output"] if item["type"] == "reasoning"]
     assert summaries == ["first thought", "second thought"]
+    assert "Thinking..." not in json.dumps(writer.events)
 
 
 def test_a_call_that_is_not_ended_holds_back_the_calls_after_it():
@@ -186,12 +187,15 @@ def test_a_reply_of_text_only_has_the_events_it_always_had():
     adapter.feed({"type": "thinking", "delta": "hm"})
     adapter.feed({"type": "text", "delta": "an answer"})
     final = adapter.end("stop")
+    # The reasoning item is done before the message is added, as OpenAI streams them (it used to stay open to the end of
+    # the reply): Codex files every delta into the item added last, and Codex Desktop's "Thought for N s" ends at the
+    # reasoning item's done event, not at the end of the answer (research S4 §2.4, §2.7).
     assert names(writer) == [
         "response.created", "response.output_item.added", "response.reasoning_summary_part.added",
-        "response.reasoning_summary_text.delta", "response.output_item.added", "response.content_part.added",
-        "response.output_text.delta", "response.reasoning_summary_text.done", "response.reasoning_summary_part.done",
-        "response.output_item.done", "response.output_text.done", "response.content_part.done",
-        "response.output_item.done", "response.completed", "done"]
+        "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+        "response.reasoning_summary_part.done", "response.output_item.done", "response.output_item.added",
+        "response.content_part.added", "response.output_text.delta", "response.output_text.done",
+        "response.content_part.done", "response.output_item.done", "response.completed", "done"]
     assert [item["type"] for item in final["output"]] == ["reasoning", "message"]
 
 

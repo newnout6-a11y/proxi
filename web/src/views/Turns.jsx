@@ -5,7 +5,7 @@ import { Section, ease } from '../motion.jsx';
 import { Empty, Tag } from '../ui.jsx';
 import { TapeLegend, TurnTape } from '../charts.jsx';
 import { LEVELS, STATUS_TONE, TURN_STATUS } from '../catalog.js';
-import { TASK_LABEL, buildTraces, costOf, effortText, phasesOf, scaleOf, speedOf, staleLimit, statusAt } from '../turns.js';
+import { TASK_LABEL, buildTraces, costOf, effortText, isUsdOnly, phasesOf, scaleOf, shownCost, speedOf, staleLimit, statusAt } from '../turns.js';
 import { fmtAgo, fmtClock, fmtFixed, fmtInt, fmtMs, fmtSpeed, fmtTokens } from '../format.js';
 import { TurnsArt } from '../stage/Art.jsx';
 
@@ -13,8 +13,6 @@ const LIVE_PHASE = { wait: 'ждём upstream', think: 'upstream: thinking', too
 
 // "нет данных" and the lower-bound mark are for a turn that is over and lacks a price; a running turn just has none yet.
 // A Minara turn shows Minara's own credits (220 per dollar of its list), named as such: they are never Retool's.
-const isUsdOnly = (cost) => cost.usd !== undefined && cost.minara === undefined && cost.credits === null;
-const shownCost = (cost) => (cost.minara !== undefined ? cost.minara : cost.usd !== undefined && cost.credits === null ? cost.usd : cost.credits);
 const fmtCostValue = (cost) => {
   const val = shownCost(cost);
   if (val === null) return '—';

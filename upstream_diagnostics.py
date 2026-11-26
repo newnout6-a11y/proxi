@@ -1,5 +1,6 @@
 """Response-shape summaries and explicitly enabled private wire traces."""
 from collections import Counter
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -12,9 +13,11 @@ import time
 import uuid
 import weakref
 
+import regex
+
 import journal
 from accounts import cfg_tag
-from redact import redact
+from redact import literal_pattern, redact
 from upstream_attempts import MAX_ATTEMPTS
 
 _KNOWN = frozenset({"content_block_start", "content_block_delta", "content_block_end",
@@ -122,8 +125,64 @@ def prune_diagnostics(cfg, folder, keep=None):
         pass
 
 
+@lru_cache(maxsize=4)
+def _wire_redaction(values):
+    # Latin-1 preserves byte offsets in the shared literal trie. A JSON field can escape a configured value.
+    encodings = set()
+    for value in values:
+        encodings.add(value.encode("utf-8", "backslashreplace"))
+        for ascii_only in (True, False):
+            encodings.add(json.dumps(value, ensure_ascii=ascii_only)[1:-1].encode("utf-8", "backslashreplace"))
+    pattern = literal_pattern(value.decode("latin-1") for value in encodings)
+    # U+0100 cannot occur in Latin-1. Asking for it after a literal makes a matching suffix visible as a partial match.
+    pending = regex.compile("(?:" + pattern.pattern + ")\u0100") if pattern is not None else None
+    return pattern, pending, max(map(len, encodings), default=1) - 1
+
+
+def _mask_wire_prefix(data, pattern, pending=None, lookback=0):
+    """Mask the part ready to write and retain a tail where a new match can still start."""
+    if pattern is None:
+        return data, b""
+    text = data.decode("latin-1")
+    match = pending.search(text, pos=max(0, len(text)-lookback), partial=True) if pending is not None else None
+    boundary = match.start() if match is not None else len(text)
+    masked = None
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if start >= boundary:
+            break
+        if masked is None:
+            masked = bytearray(data)
+        masked[start:end] = b"*" * (end-start)
+        boundary = max(boundary, end)
+    return data[:boundary] if masked is None else bytes(masked[:boundary]), data[boundary:]
+
+
+@lru_cache(maxsize=4)
+def _diagnostic_pattern(values):
+    return literal_pattern(values)
+
+
+def _capture_config_ok(cfg):
+    values = cfg.get("cookie_values")
+    return values is None or (isinstance(values, (list, tuple)) and all(isinstance(value, str) for value in values))
+
+
+def _mask_fields(value, string, stringify=False):
+    if isinstance(value, str):
+        return string(value)
+    if isinstance(value, dict):
+        return {(string(key) if isinstance(key, str) else key): _mask_fields(item, string, stringify)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mask_fields(item, string, stringify) for item in value]
+    if stringify and value is not None and not isinstance(value, (int, float)):
+        return string(str(value))
+    return value
+
+
 class WireTrace:
-    """Opt-in private bodies plus a timed timeline; never capture auth headers."""
+    """Opt-in private bodies and timeline, masking configured credentials without shifting byte offsets."""
     def __init__(self, cfg, trace_id, payload, *, root_key="upstream_trace_dir",
                  response_file="response-body.ndjson"):
         self.folder = None
@@ -137,11 +196,17 @@ class WireTrace:
         self._hash = hashlib.sha256()
         self._raw = self._timeline = None
         self._release = None
+        self._response_tail = b""
+        self._response_redacted = False
         root = cfg.get(root_key)
         self.enabled = bool(root)
         if not self.enabled:
             return
+        if not _capture_config_ok(cfg):
+            self.failed = True  # A malformed redaction configuration must not result in a private capture.
+            return
         try:
+            self._secret_pattern, self._pending_secret, self._secret_width = _wire_redaction(journal.trace_secret_values(cfg))
             self.folder = pathlib.Path(root) / trace_id
             # Open from before the folder exists to after the handles are closed, so a prune never sees it
             # unprotected. The finalizer also lets go of a trace that is dropped without close().
@@ -150,11 +215,13 @@ class WireTrace:
             self._release.atexit = False
             _open_trace(where, trace_id)
             self.folder.mkdir(parents=True, exist_ok=False)
-            (self.folder / "request-body.json").write_bytes(payload)
+            saved_payload, _ = _mask_wire_prefix(payload, self._secret_pattern)
+            (self.folder / "request-body.json").write_bytes(saved_payload)
             self._raw = (self.folder / response_file).open("wb")
             self._timeline = (self.folder / "timeline.jsonl").open("w", encoding="utf-8")
-            self.event("request", body_bytes=len(payload), body_sha256=hashlib.sha256(payload).hexdigest())
-        except (OSError, UnicodeError, TypeError, ValueError):
+            self.event("request", body_bytes=len(saved_payload), body_sha256=hashlib.sha256(saved_payload).hexdigest(),
+                       body_redacted=saved_payload != payload)
+        except (OSError, UnicodeError, TypeError, ValueError, RecursionError, regex.error):
             self.failed = True
             self.close()
             return
@@ -177,10 +244,14 @@ class WireTrace:
                 self._seq += 1
                 row = {"seq": self._seq, "elapsed_ms": round((time.monotonic()-self.started)*1000, 3),
                        "stage": stage, **fields}
-                self._timeline.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                row = _mask_fields(row, self._mask_string, stringify=True)
+                self._timeline.write(json.dumps(row, ensure_ascii=True) + "\n")
                 self._timeline.flush()
             except (OSError, UnicodeError, TypeError, ValueError, RecursionError):
                 self.failed = True
+
+    def _mask_string(self, value):
+        return _mask_wire_prefix(value.encode("utf-8", "backslashreplace"), self._secret_pattern)[0].decode("utf-8")
 
     def request(self, headers):
         self.event("request_headers", headers=self.safe_headers(headers))
@@ -197,19 +268,35 @@ class WireTrace:
                 return
             try:
                 offset = self._offset
-                self._raw.write(data)
-                self._raw.flush()
-                self._hash.update(data)
+                original = self._response_tail + data
+                safe, self._response_tail = _mask_wire_prefix(original, self._secret_pattern,
+                                                              self._pending_secret, self._secret_width)
+                self._response_redacted |= safe != original[:len(safe)]
+                self._write_bytes(safe)
                 self._offset += len(data)
                 self.event("response_bytes", offset=offset, length=len(data))
             except (OSError, ValueError):
                 self.failed = True
 
+    def _write_bytes(self, data):
+        if data:
+            self._raw.write(data)
+            self._raw.flush()
+            self._hash.update(data)
+
     def close(self):
         with self._lock:
+            if self._raw is not None and not self._raw.closed and not self.failed:
+                try:
+                    original = self._response_tail
+                    tail, self._response_tail = _mask_wire_prefix(original, self._secret_pattern)
+                    self._response_redacted |= tail != original
+                    self._write_bytes(tail)
+                except OSError:
+                    self.failed = True
             if self._timeline is not None and not self._timeline.closed:
                 self.event("wire_end", response_bytes=self._offset, response_sha256=self._hash.hexdigest(),
-                           capture_failed=self.failed)
+                           response_redacted=self._response_redacted, capture_failed=self.failed)
             for handle in (self._raw, self._timeline):
                 try:
                     if handle is not None:
@@ -244,12 +331,18 @@ class AttemptTrace:
         self.ended = False
         self.saved = False
         self.payload_hash = hashlib.sha256(payload).hexdigest()
+        self._capture_config_ok = _capture_config_ok(cfg)
+        text_cfg = cfg if self._capture_config_ok else {**cfg, "cookie_values": ()}
+        self._private_text = _diagnostic_pattern(journal.trace_secret_values(text_cfg))
         self.wire = WireTrace(cfg, self.id, payload)
+
+    def _mask_text(self, value):
+        return self._private_text.sub("[redacted]", value) if self._private_text is not None else value
 
     def response(self, response, status=None):
         self.http_status = status or getattr(response, "status", None)
         headers = getattr(response, "headers", None) or {}
-        self.headers = {key: str(headers.get(key))[:160] for key in _HEADERS if headers.get(key)}
+        self.headers = {key: self._mask_text(str(headers.get(key)))[:160] for key in _HEADERS if headers.get(key)}
         self.wire.response(response, self.http_status)
 
     @staticmethod
@@ -272,14 +365,14 @@ class AttemptTrace:
         kind = kind if isinstance(kind, str) else "<invalid>"
         block_type = event.get("type")
         block_type = block_type if isinstance(block_type, str) else "<missing>"
-        self.count(self.shapes, "%s/%s" % (kind[:80], block_type[:80]))
-        keys = sorted(str(k)[:32] for k in event)[:12]
+        self.count(self.shapes, "%s/%s" % (self._mask_text(kind)[:80], self._mask_text(block_type)[:80]))
+        keys = sorted(self._mask_text(str(k))[:32] for k in event)[:12]
         if keys not in self.keys and len(self.keys) < 12:
             self.keys.append(keys)
         if kind not in _KNOWN:
-            self.count(self.unknown, kind)
+            self.count(self.unknown, self._mask_text(kind))
         if not event.get("event") and kind != "end_of_stream":
-            self.count(self.unsupported, kind)
+            self.count(self.unsupported, self._mask_text(kind))
         self.ended |= kind == "end_of_stream"
         delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
         block = event.get("type") if event.get("event") else delta.get("type")
@@ -301,7 +394,8 @@ class AttemptTrace:
             for key in _SIGNALS:
                 if key in container and len(self.signals) < 12:
                     value = container[key]
-                    signal = {"field": key, "value": str(value)[:120] if isinstance(value, (str, int, float, bool)) else type(value).__name__}
+                    shown = self._mask_text(str(value))[:120] if isinstance(value, (str, int, float, bool)) else type(value).__name__
+                    signal = {"field": key, "value": shown}
                     if signal not in self.signals:
                         self.signals.append(signal)
         if "refusal" in str(kind).lower() or "refusal" in str(block).lower() or "refusal" in event:
@@ -309,7 +403,7 @@ class AttemptTrace:
                 self.signals.append({"field": "refusal", "present": True})
         if kind == "error" and len(self.signals) < 12:
             message = event.get("error") if isinstance(event.get("error"), str) else error.get("message")
-            signal = {"field": "error", "type": str(error.get("type") or "")[:80]}
+            signal = {"field": "error", "type": self._mask_text(str(error.get("type") or ""))[:80]}
             if isinstance(message, str):
                 signal.update(message_chars=len(message), message_sha256=hashlib.sha256(message.encode("utf-8", "replace")).hexdigest())
             self.signals.append(signal)
@@ -339,38 +433,29 @@ class AttemptTrace:
             summary.update(wire_trace_id=self.id,
                            wire_trace_saved=not self.wire.failed and self.wire.folder is not None)
         try:
-            secrets = list(self.cfg.get("cookie_values") or [])
-            secrets += [str(self.cfg[k]) for k in ("cookie", "xsrf", "relay_api_key") if self.cfg.get(k)]
-            secrets += [segment.strip().split("=", 1)[1] for segment in str(self.cfg.get("cookie") or "").split(";") if "=" in segment]
-
-            def scrub(value):
-                if isinstance(value, str):
-                    for secret in secrets:
-                        if len(secret) >= 4:
-                            value = value.replace(secret, "[redacted]")
-                    return redact(value, cookie_values=secrets)
-                if isinstance(value, dict):
-                    return {scrub(k): scrub(v) for k, v in value.items()}
-                if isinstance(value, list):
-                    return [scrub(v) for v in value]
-                return value
-            summary = scrub(summary)
+            if not self._capture_config_ok:
+                raise ValueError("invalid diagnostic redaction config")
+            summary = _mask_fields(summary, lambda value: redact(self._mask_text(value)))
             self._text = json.dumps(summary, ensure_ascii=False, allow_nan=False)
         except Exception:  # noqa: BLE001 - diagnostics must never replace the original result
-            summary = {key: summary[key] for key in (
+            subset = {key: summary[key] for key in (
                 "diagnostic_id", "request_id", "attempt", "step_attempt", "max_attempts", "model", "outcome",
                 "http_status", "upstream_request_id") if key in summary}
+            summary = _mask_fields(subset, self._mask_text)
             self._text = None
         self.summary = summary
         summary["diagnostic_saved"] = False
-        if outcome != "content":
-            # A successful attempt is not an incident: no summary file per exec step.
+        # A successful attempt is not an incident: no summary file per exec step. Neither is one the client cancelled (Esc
+        # mid-answer, a step Codex Desktop restarts): its file took one of the upstream_attempt_summaries_max places from a
+        # real failure (audit A09-03). An error that later points at such an attempt still saves it (AttemptBudget.attach).
+        if outcome not in ("content", "cancelled"):
             self.save()
         if self.attempt >= self.budget.last.get("attempt", 0):
             self.budget.last = summary
             self.budget.last_trace = self
         journal.emit("upstream.attempt", "Попытка %d/%d: %s" % (self.step_attempt, MAX_ATTEMPTS, outcome),
-                     "debug" if outcome == "content" else "warn", account=cfg_tag(self.cfg), **summary)
+                     "debug" if outcome == "content" else "info" if outcome == "cancelled" else "warn",
+                     account=cfg_tag(self.cfg), **summary)
         return summary
 
     def save(self):

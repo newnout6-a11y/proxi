@@ -46,7 +46,7 @@ const BUILTIN_TEXTS = {
 };
 
 export const PROTECTED_RULES = [
-  { name: 'protected: service requests', if: { purpose: ['session-title', 'auto-mode-check', 'connection-probe', 'client-service'] }, use: 'passthrough' },
+  { name: 'protected: service requests', if: { purpose: ['session-title', 'auto-mode-check', 'connection-probe', 'prompt-suggestion', 'client-service'] }, use: 'passthrough' },
   { name: 'protected: Claude Code compaction', if: { request_class: ['compaction', 'auxiliary'] }, use: 'passthrough' },
 ];
 
@@ -70,7 +70,7 @@ export const BUILTIN = {
   conditions: {
     client: { type: 'string', glob: true, values: ['opencode', 'claude-code', 'claude-desktop', 'codex', 'harness', 'unknown'] },
     agent: { type: 'string', glob: true },
-    purpose: { type: 'string', glob: true, values: ['client-tools', 'client-text', 'generation', 'session-title', 'auto-mode-check', 'connection-probe', 'client-service'] },
+    purpose: { type: 'string', glob: true, values: ['client-tools', 'client-text', 'generation', 'session-title', 'auto-mode-check', 'connection-probe', 'prompt-suggestion', 'client-service'] },
     request_class: { type: 'string', glob: true },
     model: { type: 'string', glob: true },
     tools: { type: 'boolean' },

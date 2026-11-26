@@ -207,7 +207,7 @@ def usage_report(runtime, rows=None):
     totals = {"session_used": 0.0, "turns": 0, "recent_total": 0.0, "cost_usd": 0.0}
     available, unreported = [], False
     credit_accounts = 0
-    monetary_accounts = 0
+    usd_accounts = 0
     for backend, manager in rows:
         usage = manager.usage()
         tag = account_tag(backend, UNNAMED)
@@ -218,13 +218,16 @@ def usage_report(runtime, rows=None):
         upstream_kind = backend.cfg.get("upstream", "retool")
         monetary = upstream_kind != "retool"
         credit_accounts += not monetary
-        monetary_accounts += int(monetary)
+        usd_accounts += int(monetary and upstream_kind != "minara")
         totals["session_used"] += used if not monetary else 0
         totals["turns"] += turns
         totals["recent_total"] += console_log.number(usage.get("recent_total")) or sum(
             console_log.number(item.get("credits")) or 0.0 for item in items)
         p_cost = console_log.number(usage.get("provider_cost"))
-        if monetary and p_cost is not None and (usage.get("provider_cost_currency") or "USD").upper() == "USD":
+        # cost_usd is what the universal providers cost. Minara's dollars are Minara's credits (220 per dollar), shown
+        # apart; summed here as well, the same money was in the dollar total too (audit A07-02).
+        if (monetary and upstream_kind != "minara" and p_cost is not None
+                and (usage.get("provider_cost_currency") or "USD").upper() == "USD"):
             totals["cost_usd"] += p_cost
         unreported = unreported or bool(usage.get("unreported_usage"))
         balance = known(usage.get("available"))
@@ -246,7 +249,7 @@ def usage_report(runtime, rows=None):
     recent.sort(key=lambda item: item.get("ts") or 0)
     return {
         "session_used": round(totals["session_used"], 4) if credit_accounts else None,
-        "cost_usd": round(totals["cost_usd"], 6) if monetary_accounts else None,
+        "cost_usd": round(totals["cost_usd"], 6) if usd_accounts else None,
         "turns": totals["turns"],
         "recent": recent[-50:],
         "recent_total": round(totals["recent_total"], 4) if credit_accounts else None,

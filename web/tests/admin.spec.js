@@ -617,6 +617,36 @@ test('system role preserves multiline instructions, explicit empty text and rese
   await expect.poll(() => state.settings.relay_system_prompt).toBe(null);
 });
 
+// A14-07 / A14-06: the sync button reported success when a DeepSeek Harness profile failed, and the OpenCode snippet made a
+// provider the relay's sync does not fill.
+test('the client sync says which files it updated and a failed Harness profile is a warning', async ({ page }) => {
+  const state = await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  await page.getByText('Готовые конфиги для OpenCode').click();
+  const snippet = page.locator('.snippet-box', { hasText: 'OpenCode (opencode.jsonc)' }).locator('pre');
+  await expect(snippet).toContainText('"retool-relay"');
+  await expect(snippet).toContainText('"model": "retool-relay/claude-opus-5-5"');
+  const sync = page.getByRole('button', { name: 'Синхр. OpenCode и Harness' });
+  await sync.click();
+  await expect(page.getByText('Список моделей обновлён в opencode.jsonc', { exact: true })).toBeVisible();
+  state.syncAnswer = { ok: false, written: true, changed: true,
+    result: { written: true, harness: [{ error: 'no Proxi provider in the profile', settings: 'web/cordis.patch.yml' }] } };
+  await sync.click();
+  await expect(page.getByText('DeepSeek Harness: no Proxi provider in the profile')).toBeVisible();
+});
+
+// A14-10: the catalog's "Обновить" re-reads only the providers' /models and models.dev, and its "Каталог обновлён"
+// suggested Retool's and Minara's catalogs were read too.
+test('the catalog refresh says what it re-read', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Настройки');
+  await page.getByRole('button', { name: 'Обновить провайдеров' }).click();
+  await expect(page.getByText('Каталог провайдеров обновлён')).toBeVisible();
+  await expect(page.getByText(/модели Retool и Minara relay перечитывает сам/)).toBeVisible();
+});
+
 test('typing during a pending save is preserved as a new draft', async ({ page }) => {
   const state = await mockAdmin(page);
   state.patchDelay = 800;
@@ -1616,8 +1646,37 @@ test('universal providers, route aliases and client AccessKeys can be tested and
 
   // 3. Create a virtual client AccessKey and verify one-time banner
   await page.getByRole('button', { name: 'Создать ключ' }).click();
+  // What the budget counts: dollars of Minara and API providers since the relay started, never Retool's turns (A14-05)
+  await expect(page.getByText(/ходы Retool не входят/)).toBeVisible();
   await page.getByLabel('Название клиента / устройства').fill('Cursor Laptop');
   await page.getByRole('button', { name: 'Выпустить ключ' }).click();
   await expect(page.locator('.gw-key-banner')).toContainText('sk-proxi-e2e-synthetic-test-key-abcd');
   await expect(page.locator('.gw-row', { hasText: 'Cursor Laptop' })).toContainText('sk-proxi-…abcd');
+  await expect(page.locator('.gw-row', { hasText: 'Cursor Laptop' })).toContainText('с запуска relay, без Retool');
+});
+
+// A14-01 / A14-03: the edit form turned an OpenCode models object into garbage ids and replaced the saved headers.
+test('editing a provider sends only what the edit changed and names the saved headers', async ({ page }) => {
+  const state = await mockAdmin(page);
+  state.providers.push({ id: 'deepseek', name: 'DeepSeek', preset: 'deepseek', driver: 'openai-chat',
+    base_url: 'https://api.deepseek.com', auth_mode: 'bearer', routing_strategy: 'fill-first', cache_policy: 'auto',
+    enabled: true, routable: true, auto_discover: true, proxy_url: null, published_models_count: 2, credentials_count: 1,
+    credentials: [{ index: 1, api_key_set: true, api_key_env: null }], turns: 0, cost_usd: 0,
+    headers_keys: ['HTTP-Referer', 'X-Title'], body_overrides: {},
+    models: { 'deepseek-chat': { name: 'DeepSeek Chat', limit: { context: 128000 } }, 'deepseek-reasoner': { name: 'R1' } } });
+  await login(page);
+  await nav(page, 'Аккаунты');
+  await page.locator('.gw-row', { hasText: 'DeepSeek' }).getByRole('button', { name: 'Изменить' }).click();
+  await page.getByText('Расширенные настройки').click();
+  await expect(page.getByText(/добавить к сохранённым HTTP-Referer, X-Title/)).toBeVisible();
+  await page.getByLabel('Название', { exact: true }).fill('DeepSeek main');
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(page.getByText('Провайдер обновлён')).toBeVisible();
+  expect(state.providerPatches).toHaveLength(1);
+  const sent = state.providerPatches[0].body;
+  expect(sent.name).toBe('DeepSeek main');
+  expect(sent).not.toHaveProperty('models');
+  expect(sent).not.toHaveProperty('headers');
+  expect(sent).not.toHaveProperty('body_overrides');
+  expect(sent).not.toHaveProperty('proxy_url');
 });

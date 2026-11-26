@@ -22,6 +22,8 @@ TAIL_UNWRITTEN_INPUT = 8192
 # ping), so a repeat can only come from the same attempt reported twice, moments apart: a few thousand cover that, where
 # the set kept every id of the process's life (about 120 bytes each, some 2,000 a day).
 SEEN_TURNS_MAX = 4096
+# The paths a Minara reply names in its usage (minara.py: /v1/chat/completions and /v1/messages); no other upstream sets it.
+MINARA_PATHS = ("chat", "messages")
 
 # Retool rates measured by a least-squares fit over 350 journal turns (2026-10-31).
 # Retool passes Anthropic pricing through: cache read 0.05x, cache write ~1.25x and
@@ -91,13 +93,20 @@ def cost_breakdown(usage, model=None):
 
 
 def minara_credits(usage):
-    """Minara's own credits for a turn already priced in US dollars (220 per dollar), None when unpriced.
+    """Minara's own credits for a Minara turn already priced in US dollars (220 per dollar), None otherwise.
 
     Minara debits its own price list, so a turn carries provider_cost in USD and this is that figure in the currency its
     balance speaks. It is never added to `credits`, which is Retool's unit: the two are kept apart everywhere
-    (account_report.aggregate_balance sums each in its own field)."""
+    (account_report.aggregate_balance sums each in its own field).
+
+    Only Minara's usage is Minara's money: its usage names the path that answered (minara.py sets `channel_path` to "chat"
+    or "messages" on every usage it reports, and the orchestrator's attempt snapshot keeps it). A universal provider's
+    dollars came out here as Minara credits as well: an OpenRouter reply of $0.05 was journaled as "11.0 кредитов Minara"
+    and counted again in the dollar total (audit A07-02)."""
     cost = usage.get("provider_cost") if isinstance(usage, dict) else None
     if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
+        return None
+    if usage.get("channel_path") not in MINARA_PATHS:
         return None
     if (usage.get("provider_cost_currency") or "USD") != "USD":
         return None

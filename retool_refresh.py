@@ -224,10 +224,16 @@ class CatalogRefresher:
                 continue
             entry = found[1]
             summary["entry_script"] = entry
-            if entry == state.get("entry_script") and isinstance(state.get("registry"), dict):
+            # An entry script already read is not read again, unless it was read before the relay kept its version.
+            if (entry == state.get("entry_script") and isinstance(state.get("registry"), dict)
+                    and "client_version" in state):
                 summary.pop("error", None)
                 return state["registry"]
             script = self._fetch(EDGE + entry, SCRIPT_BYTES)
+            # The version the frontend sends as X-Retool-Client-Version; None when the script no longer names it.
+            state["client_version"] = retool_catalog.client_version(script)
+            if state["client_version"]:
+                summary["client_version"] = state["client_version"]
             chunks = list(dict.fromkeys(_CHUNK.findall(script)))
             if state.get("registry_chunk") in chunks:
                 chunks.remove(state["registry_chunk"])

@@ -151,7 +151,7 @@ Relay отправляет модели один system-блок (head), ист�
 | --- | --- |
 | `client` | `opencode`, `claude-code`, `claude-desktop`, `codex`, `harness`, `unknown`, [как определяется](#как-relay-определяет-клиента) |
 | `agent` | имя агента OpenCode (его присылает плагин в `X-Proxi-Agent`) или id агента Claude Code |
-| `purpose` | `client-tools` (в запросе есть tools: основной чат IDE), `client-text` (без tools, известный клиент), `generation` (без tools, остальные клиенты), `session-title`, `auto-mode-check`, `connection-probe`, `client-service` (title, compaction и summary OpenCode) |
+| `purpose` | `client-tools` (в запросе есть tools: основной чат IDE), `client-text` (без tools, известный клиент), `generation` (без tools, остальные клиенты), `session-title`, `auto-mode-check`, `connection-probe`, `prompt-suggestion` (подсказка следующей реплики Claude Code и Desktop: последнее сообщение начинается с `[SUGGESTION MODE:`), `client-service` (title, compaction и summary OpenCode) |
 | `request_class` | значение `x-claude-code-request-class`: `main`, `subagent`, `workflow`, `compaction`, `auxiliary` (Claude Code 2.1.273 и новее присылает его на пользовательский base URL только при `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`) |
 | `model` | id модели после разрешения алиасов или исходное имя из запроса |
 | `tools`, `structured`, `has_client_system` | `true` / `false`: есть ли в запросе tools, structured-формат ответа, непустой system клиента |
@@ -398,6 +398,7 @@ You are a coding assistant working in the user's project. Follow the user's inst
 | | title Claude Code, Agent SDK и Desktop | `purpose: session-title`: схема ровно `{title: string}` или начало промпта |
 | | классификатор Auto mode Claude Code | `purpose: auto-mode-check` |
 | | проба соединения Claude Desktop | `purpose: connection-probe` |
+| | подсказка следующей реплики Claude Code и Desktop | `purpose: prompt-suggestion`: последнее сообщение пользователя начинается с `[SUGGESTION MODE:` (так бывает и при 140 tools в запросе) |
 | `protected: Claude Code compaction` | compaction и auxiliary Claude Code (заголовки, классификаторы, summaries) | `request_class: compaction` или `auxiliary` |
 
 Claude Code присылает `x-claude-code-request-class` на пользовательский base URL, только если задан `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` (нужен Claude Code 2.1.273 или новее, [источник](https://code.claude.com/docs/en/llm-gateway-protocol)). Без него compaction и auxiliary Claude Code по классу не распознаются; title и классификатор Auto mode распознаются по схеме и подписи, как и раньше.

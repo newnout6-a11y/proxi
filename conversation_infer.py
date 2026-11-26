@@ -35,14 +35,16 @@ class ConversationIndex:
         self._lengths = collections.Counter()
 
     @staticmethod
-    def _hasher(model, system):
+    def _hasher(model, system, namespace=None):
         hasher = hashlib.sha256()
         hasher.update(str(model or "").encode("utf-8", "surrogatepass"))
         hasher.update(b"\x00")
         hasher.update(hashlib.sha256(str(system or "").encode("utf-8", "surrogatepass")).digest())
+        if namespace:
+            hasher.update(b"\x00proxi-credential\x00" + namespace.encode("utf-8"))
         return hasher
 
-    def identify(self, model, system, digests, stored=None):
+    def identify(self, model, system, digests, stored=None, *, namespace=None):
         """(key, how) for a request, and remember its history for the next one.
 
         `digests` is the tuple of per-message digests of the request (bytes). how is "extended" when the request carries
@@ -55,7 +57,7 @@ class ConversationIndex:
         whole history, and the signed history stored under the old key was never read again: the request went cold, its
         prefix was written to the cache again, and the old file was orphaned."""
         now = self._clock()
-        hasher = self._hasher(model, system)
+        hasher = self._hasher(model, system, namespace)
         total = len(digests)
         with self._lock:
             self._expire(now)
@@ -75,16 +77,16 @@ class ConversationIndex:
                 key = self._touch(seen, now)
             else:
                 key = "inferred:" + full[1].hex()[:20]
-                found = self._stored_prefix(model, system, digests, stored) if stored is not None else None
+                found = self._stored_prefix(model, system, digests, stored, namespace) if stored is not None else None
                 if found is not None:
                     key, how = found, "stored"
             if full != seen:
                 self._add(full, key, now)
         return key, how
 
-    def _stored_prefix(self, model, system, digests, stored):
+    def _stored_prefix(self, model, system, digests, stored, namespace=None):
         """The key of the longest history prefix (shorter than the request) that a stored conversation was started with."""
-        hasher, keys = self._hasher(model, system), []
+        hasher, keys = self._hasher(model, system, namespace), []
         for digest in digests[:-1]:
             hasher.update(digest)
             keys.append("inferred:" + hasher.copy().digest().hex()[:20])

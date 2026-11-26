@@ -17,6 +17,7 @@ import uuid
 
 import apierr
 import adapters
+import cost_guard
 import executor
 import credits
 import journal
@@ -189,6 +190,11 @@ class _FailoverOut:
     """Forwards turn events, holding back the error and end sentinel so the
     runner can retry on another account before the client sees anything."""
 
+    # Events that carry nothing the reply is made of: accounting, and the display statuses that say the model reasons
+    # (or that time passes) without a word of it. A refusal after them was not answered yet: it moves like one before
+    # them. Counted as output, a thinking_status made every unbilled refusal after it final (A02-01).
+    NO_OUTPUT = frozenset({"credits", "usage", "usage_start", "thinking_status", "thinking_heartbeat"})
+
     def __init__(self, out):
         self.out = out
         self.error = None
@@ -205,7 +211,7 @@ class _FailoverOut:
         # output yet. Counted as output, it made every failed Minara turn final, a 402 included (audit, 2026-11-10).
         if event.get("type") == "request_sent":
             self.sent = True
-        elif event.get("type") not in ("credits", "usage", "usage_start"):
+        elif event.get("type") not in self.NO_OUTPUT:
             self.started = True
         self.out.put(event)
 
@@ -228,9 +234,23 @@ def _minara_refusal(error):
     return getattr(error, "status", 0) == 402 or getattr(error, "code", None) == "upstream_auth_error"
 
 
-def _model_id(parsed):
-    """The catalog id of the model a request runs on: what the pool and an account's plan refusals are keyed by."""
-    return (getattr(parsed, "entry", None) or {}).get("id") or getattr(parsed, "model", None)
+def _model_id(parsed, lease=None):
+    """The catalog id of the model a request runs on: what the pool and an account's plan refusals are keyed by. A route
+    alias runs as the target its lease was bound to (SessionPool._bound_target), and a refusal is that target's: one kept
+    under the alias's id was seen by no account choice (audit A08-01)."""
+    entry = getattr(parsed, "entry", None) or {}
+    bound = getattr(lease, "bound_entry", None) if lease is not None else None
+    if isinstance(bound, dict) and bound.get("alias_id") and bound.get("alias_id") == entry.get("id"):
+        return bound.get("id")
+    return entry.get("id") or getattr(parsed, "model", None)
+
+
+def _failed_pair(parsed, lease, backend):
+    """What a failure of the model takes out of a request's failover: the account, or for a route alias the pair (account,
+    target the turn ran as), so that the alias's other targets of that account are still tried (audit A17-01)."""
+    model = _model_id(parsed, lease)
+    entry = getattr(parsed, "entry", None) or {}
+    return (backend, model) if entry.get("route_targets") and model != entry.get("id") else backend
 
 
 def _may_be_balance_related(error):
@@ -245,6 +265,39 @@ def _may_be_balance_related(error):
 # A conversation moved to another account writes its prefix there again; below this many prompt tokens that costs next
 # to nothing, and waiting for the limited account (account_rate_limit_wait) is only a delay.
 LIMIT_WAIT_MIN_PREFIX = 8000
+# From how many milliseconds the first token of an attempt is journaled as warn, by the effort sent upstream. The model
+# reasons before its first token, and a reasoning that is not streamed is silence: one 8 s for every level made a warning of
+# 65% of the xhigh turns and 39% of the max turns in the live journal (19.4k first tokens, 2026-11-19). Each figure sits at
+# about the 95th-98th percentile of its levels there: low, medium and high p95 15-17 s (2-4% above 20 s), xhigh p95 37 s
+# and max p95 33 s (2-3% above 45 s). Without reasoning (none, minimal) or with no effort sent the old 8 s stays (none:
+# p99 3.3 s).
+FIRST_TOKEN_WARN_MS = {"low": 20_000, "medium": 20_000, "high": 20_000, "xhigh": 45_000, "max": 45_000}
+FIRST_TOKEN_WARN_DEFAULT_MS = 8_000
+
+
+def first_token_warn_ms(effort):
+    """The first-token time from which upstream.first_token is a warning for this effort."""
+    return FIRST_TOKEN_WARN_MS.get(str(effort or "").strip().lower(), FIRST_TOKEN_WARN_DEFAULT_MS)
+
+
+def first_token_level(ttft_ms, effort):
+    return "success" if ttft_ms < first_token_warn_ms(effort) else "warn"
+
+
+# How long a universal provider that answered 429 without a Retry-After is left out of the pool: a provider's limit is per
+# minute (OpenRouter, OpenAI, Anthropic), not Retool's sliding hour, so account_rate_limit_cooldown (900 s) never fits it.
+PROVIDER_RATE_LIMIT_PAUSE = 60
+# How many times a request chooses its account again after acquire() met a Retool plan hold that landed while it waited
+# (SessionPool marks such a 404 plan_hold; design D4 1.7). Each time a 402 of another request must land within one wait.
+PLAN_HOLD_RACES = 3
+
+
+def _provider_label(backend):
+    """The name of the universal provider behind this account (OpenRouter, Anthropic, ...), None for Retool and Minara."""
+    cfg = getattr(backend, "cfg", None) or {}
+    if cfg.get("upstream", "retool") in ("retool", "minara"):
+        return None
+    return str(cfg.get("provider_name") or cfg.get("provider_id") or account_tag(backend) or cfg.get("upstream"))
 
 
 async def _pause(cancelled, seconds):
@@ -256,6 +309,16 @@ async def _pause(cancelled, seconds):
             return False
         await asyncio.sleep(min(0.25, left))
     return True
+
+
+def _settle_turn(holder, went_on=None):
+    """Write the turn.error and turn.end a failed attempt left pending (TurnRunner._run_once), now that its fate is known.
+
+    `went_on` says what the request did next ("moved" to another account, "retried"): the attempt's error reached no client
+    and is logged at warn with that outcome. None: the error is the request's answer, logged at error as before."""
+    close = holder.pop("_close_turn", None)
+    if close is not None:
+        close(went_on)
 
 
 def _can_exec(cfg, steps: int) -> bool:
@@ -453,6 +516,8 @@ def acquire_plan(cfg, parsed):
     purpose = _purpose(parsed)
     key = getattr(parsed, "conversation_key", None)
     parent_key = getattr(parsed, "parent_conversation_key", None)
+    if purpose == "prompt-suggestion":
+        return AcquirePlan("isolated", {"isolated": True})
     if getattr(parsed, "web_search", None) and len(getattr(parsed, "tools", None) or ()) == 1:
         # Claude Code runs WebSearch as a request of its own, carrying the id of the chat it serves: that is a job on its own
         # (a standalone head, one tool), and on the chat's session it would replace the head and the tools the chat's
@@ -465,6 +530,10 @@ def acquire_plan(cfg, parsed):
     isolated = (not native_tools and not persistent_text
                 and (direct_mode or purpose in client_context.CLIENT_TEXT_KINDS or (key and not can_exec)))
     child_scope = ("subagent", key) if parent_key and key and mode == "shared" else None
+    credential_scope = getattr(parsed, "credential_scope", None)
+    if credential_scope and mode == "shared":
+        # The operator may share their legacy root session. A client key must never enter it.
+        child_scope = ("credential", credential_scope, key or getattr(parsed, "request_id", None) or id(parsed))
     if persistent_text:
         # Ordinary text chats retain idle keepwarm, with state separate from native
         # tools even when their conversation ID is the same.
@@ -487,6 +556,8 @@ class TurnRunner:
         self.prompts = None
         # (profile, client) pairs whose dropped system prompt the journal has already named (_warn_dropped_client_system).
         self._dropped_noted = set()
+        # What Minara spent, by the hour, by client key and by dialog: the cost guard's ceilings are kept against it.
+        self.cost_guard = cost_guard.Guard(cost_guard.state_path(cfg))
 
     def _can_exec(self, steps: int) -> bool:
         return _can_exec(self.cfg, steps)
@@ -757,7 +828,8 @@ class TurnRunner:
             text = redact(str(exc)).replace("\n", " ")[:160]
             log("prompt.runtime_error", "Слой промптов не собрал head, запрос идёт прежним путём: %s: %s" % (
                 type(exc).__name__, text), "error", stage="compose")
-            console_log.write("[err] prompt layer failed (compose): %s; legacy head" % type(exc).__name__)
+            console_log.write("[err] prompt layer failed (compose): %s; legacy head" % type(exc).__name__,
+                              kind="prompt.runtime_error", level="warn")
             return None
         return head, parts, warnings
 
@@ -895,7 +967,7 @@ class TurnRunner:
             "tools=" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         )
 
-    async def _explain_empty(self, holder):
+    async def _explain_empty(self, holder, *, quiet=False):
         """Silent turns are usually a persisted upstream error (e.g. out of credits)."""
         session = holder.get("session")
         if session is None:
@@ -906,7 +978,8 @@ class TurnRunner:
                 backend = self.pool.backend
             data = await backend.get_messages(session.thread_id)
         except Exception as exc:
-            console_log.write("[explain] fetch failed: %s" % exc)
+            if not quiet:
+                console_log.write("[explain] fetch failed: %s" % exc, kind="upstream.explain_failed", level="warn")
             return None
         # Retool returns messages newest-first.
         for message in data.get("messages", []):
@@ -926,6 +999,54 @@ class TurnRunner:
             if message.get("senderRole") == "sandpack" and content.get("type") in ("text", "tool_call"):
                 return None
         return None
+
+    def _guard_cost(self, parsed, holder, session, entry, model_provider, log):
+        """Price a Minara request before anything is sent and raise the cost guard's refusal when it is above a ceiling.
+
+        The estimate (cost_guard.estimate) prices the request with the formula of its debit; the dialog's cache counts as
+        warm when the relay has seen a priced turn of it (the guard's memory, or the prefix the session keeps on disk), so a
+        running session is never priced as a first contact. The client gets a final 400 cost_limit_exceeded (or 429 for
+        the hourly ceiling) that names the estimate, the journal cost.blocked, the console a [cost] line."""
+        if self.cfg.get("cost_guard", "block") == "off":
+            return
+        request_tag = getattr(parsed, "request_id", None) or "req"
+        try:
+            chars = getattr(parsed, "client_chars", None) or adapters.request_chars(parsed)
+            anchor = getattr(session, "_count_anchor", None)
+            anchor = anchor[:2] if isinstance(anchor, tuple) and len(anchor) == 3 and anchor[2] == parsed.model else None
+            tokens, basis = adapters.count_input_tokens(chars, anchor)
+            account = account_tag(getattr(session, "backend", None))
+            key = getattr(parsed, "conversation_key", None)
+            prefix = self.cost_guard.warm_prefix(
+                key if isinstance(key, (str, tuple)) else None, model=parsed.model, account=account,
+                shared=cost_guard.shared_cache(entry), session_prefix=getattr(session, "_last_prefix_tokens", 0))
+            estimate = cost_guard.estimate(entry, prompt_tokens=tokens, basis=basis, warm_prefix=prefix,
+                                           max_tokens=getattr(parsed, "max_tokens", None),
+                                           effort=model_provider.get("reasoningEffort"))
+            if estimate is None:
+                return
+            error, warn = self.cost_guard.check(self.cfg, estimate, entry=entry, account=account,
+                                                key=getattr(parsed, "client_key", None),
+                                                confirm=getattr(parsed, "cost_confirm", None))
+        except Exception as exc:  # noqa: BLE001 - a guard that fails must not fail the request it guards
+            log("cost.estimate_failed", "Оценка цены запроса не удалась, запрос идёт без проверки: %s" % (
+                type(exc).__name__), "warn")
+            return
+        holder["_cost_estimate"] = estimate
+        holder.pop("_cost_actual", None)
+        fields = dict(estimate._asdict(), model=entry.get("id"))
+        how = cost_guard.explain(estimate, entry, account)
+        if error is not None:
+            log("cost.blocked", "Запрос остановлен защитой по цене: оценка %s кредитов Minara (%s)" % (
+                estimate.credits, error.code), "warn", code=error.code, status=error.status, **fields)
+            console_log.write("[%s] [cost] blocked: estimated %s Minara credits (~$%.2f): %s" % (
+                request_tag, estimate.credits, estimate.usd, how))
+            raise error
+        log("cost.estimate", "Оценка цены запроса: %s кредитов Minara (кэш %s)" % (
+            estimate.credits, "тёплый" if estimate.warm else "холодный"), "warn" if warn else "debug", **fields)
+        if warn:
+            console_log.write("[%s] [cost] estimated %s Minara credits (~$%.2f): %s" % (
+                request_tag, estimate.credits, estimate.usd, how))
 
     def _limit_pause(self, error, session):
         """Seconds to wait on an account at its hourly limit before its conversation moves, or None to move it now.
@@ -1035,11 +1156,14 @@ class TurnRunner:
             cancelled, total_cap=MAX_ATTEMPTS * (max_steps + 2) if max_steps > 0 else None,
             clock=getattr(getattr(self, "accounts", None), "clock", None))
         while True:
+            # A path below that asks again without saying how leaves the attempt's close pending: it was retried.
+            _settle_turn(holder, "retried")
             relay = _FailoverOut(out)
             holder.pop("session", None)
             try:
                 await self._run_once(parsed, relay, holder, exclude=tuple(exclude))
             except BaseException:
+                _settle_turn(holder)
                 if relay.error is not None:
                     out.put({"type": "error", "error": relay.error})
                 out.put(None)
@@ -1063,10 +1187,13 @@ class TurnRunner:
                          and (not relay.sent or getattr(error, "unbilled", False)))
             exhausted = False
             rate_limited = plan_refused = False
+            # A universal provider's 429 is a rate limit of its own (drivers/sse_utils marks it an account quota so that the
+            # turn moves), not Retool's hourly managed-key limit: no wait on it, no hourly cooldown or ladder (A02-08).
+            provider = _provider_label(backend)
             try:
                 if error is not None and backend is not None and apierr.is_account_quota(error):
                     pause = (self._limit_pause(error, getattr(lease, "session", lease))
-                             if retryable and backend not in exclude and not waited
+                             if retryable and backend not in exclude and not waited and provider is None
                              and holder["_attempt_budget"].remaining > 1 else None)
                     if pause is not None:
                         # The account is not parked and not excluded: the retry goes to it with the conversation's
@@ -1080,13 +1207,18 @@ class TurnRunner:
                             getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), pause))
                         if not await _pause(cancelled, pause):
                             holder["reason"] = "stop"
+                            _settle_turn(holder, "retried")
                             continue
                         retryable = False  # the client went away while the request waited: only the account is told
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):
-                        # A limit that a request sent before the account's last return reports is old news.
-                        accounts.mark_rate_limited(backend, retry_after=getattr(error, "retry_after", None),
+                        # A limit that a request sent before the account's last return reports is old news. A provider is
+                        # parked for its Retry-After or a short pause: a hint never climbs the hourly ladder.
+                        hint = getattr(error, "retry_after", None)
+                        if provider is not None and not hint:
+                            hint = PROVIDER_RATE_LIMIT_PAUSE
+                        accounts.mark_rate_limited(backend, retry_after=hint,
                                                    request_id=getattr(parsed, "request_id", None),
                                                    sent_at=holder["_attempt_budget"].sent_at)
                     rate_limited = retryable and backend not in exclude
@@ -1095,7 +1227,8 @@ class TurnRunner:
                     # account is held back from this model alone (never from the others), whether or not this turn can
                     # still move, and the turn moves while the client has seen nothing. No balance is read for it.
                     if hasattr(accounts, "mark_plan_refusal"):
-                        accounts.mark_plan_refusal(backend, _model_id(parsed), request_id=getattr(parsed, "request_id", None))
+                        accounts.mark_plan_refusal(backend, _model_id(parsed, lease),
+                                                   request_id=getattr(parsed, "request_id", None))
                     plan_refused = retryable and backend not in exclude
                 if (retryable and backend is None and error.code == "insufficient_credits"
                         and not rechecked and hasattr(accounts, "recheck_exhausted")):
@@ -1103,6 +1236,7 @@ class TurnRunner:
                     # balances once, so a top-up is used without waiting for the timer.
                     rechecked = True
                     if await _off_loop(accounts.recheck_exhausted, getattr(parsed, "entry", None)):
+                        _settle_turn(holder, "retried")
                         continue
                 minara_refusal = (retryable and backend is not None and backend not in exclude
                                   and (getattr(backend, "cfg", None) or {}).get("upstream") == "minara"
@@ -1120,29 +1254,42 @@ class TurnRunner:
                     # With no account left, the next acquire raises a clear 402.
                     exhausted = await _off_loop(accounts.check_balance_now, backend)
             except BaseException:
+                _settle_turn(holder)
                 out.put({"type": "error", "error": error})
                 out.put(None)
                 raise
             if rate_limited:
                 exclude.append(backend)
-                journal.emit("account.failover", "Часовой лимит Retool — запрос повторён на другом аккаунте",
+                _settle_turn(holder, "moved")
+                # Refused before anything was generated or billed: the move to the next account costs no attempt.
+                holder["_attempt_budget"].refund()
+                limit = ("часовой лимит Retool" if provider is None
+                         else "лимит частоты провайдера %s" % provider)
+                journal.emit("account.failover", "%s — запрос повторён на другом аккаунте" % (limit[0].upper() + limit[1:]),
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                              error=error.code, reason="rate_limited")
-                console_log.write("[%s] [account] %s: часовой лимит Retool, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED)))
+                console_log.write("[%s] [account] %s: %s, повтор на другом аккаунте" % (
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), limit))
                 holder["reason"] = "stop"
                 continue
             if plan_refused:
-                exclude.append(backend)
+                exclude.append(_failed_pair(parsed, lease, backend))
+                _settle_turn(holder, "moved")
+                holder["_attempt_budget"].refund()
                 journal.emit("account.failover", "Модель не входит в тариф аккаунта Retool — запрос повторён на другом аккаунте",
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
-                             error=error.code, reason="plan_refused", model=_model_id(parsed))
+                             error=error.code, reason="plan_refused", model=_model_id(parsed, lease))
                 console_log.write("[%s] [account] %s: %s не входит в тариф Retool, повтор на другом аккаунте" % (
-                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), _model_id(parsed)))
+                    getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), _model_id(parsed, lease)))
                 holder["reason"] = "stop"
                 continue
             if exhausted:
                 exclude.append(backend)
+                _settle_turn(holder, "moved")
+                if minara_refusal:
+                    # Minara said 402/401/403 before generating anything (unbilled). An exhaustion confirmed by a balance
+                    # read after some other failure (a 5xx) keeps that failure's attempt charged.
+                    holder["_attempt_budget"].refund()
                 rejected = error.code == "upstream_auth_error"
                 journal.emit("account.failover", "Токен аккаунта отклонён — запрос повторён на другом" if rejected else
                              "Баланс аккаунта закончился — запрос повторён на другом",
@@ -1158,10 +1305,15 @@ class TurnRunner:
                     and error.code in ("upstream_error", "service_unavailable", "upstream_timeout",
                                        "upstream_auth_error", "insufficient_credits", "rate_limit_error")):
                 check_next = getattr(self.pool, "unavailable_error", None)
+                # A failure of the model takes out the pair (account, target) of a route alias: the next target of the same
+                # provider is still tried on this key (A17-01). A failure of the key itself (401, quota, 429) takes the key.
+                failed = (_failed_pair(parsed, lease, backend)
+                          if error.code in ("upstream_error", "service_unavailable", "upstream_timeout") else backend)
                 if check_next is not None and check_next(
-                    parsed.entry, exclude=(*exclude, backend), **acquire_plan(self.cfg, parsed).kwargs
+                    parsed.entry, exclude=(*exclude, failed), **acquire_plan(self.cfg, parsed).kwargs
                 ) is None:
-                    exclude.append(backend)
+                    exclude.append(failed)
+                    _settle_turn(holder, "moved")
                     journal.emit("account.failover", "Сбой апстрима провайдера — запрос переключён на резервный маршрут",
                                  "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
                                  error=error.code, reason="provider_failover")
@@ -1169,10 +1321,26 @@ class TurnRunner:
                         getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), error.code))
                     holder["reason"] = "stop"
                     continue
+            if (retryable and backend is None and getattr(error, "plan_hold", False)
+                    and holder.get("_plan_hold_races", 0) < PLAN_HOLD_RACES and self._pool_refusal(parsed, exclude) is None):
+                # The pool's 404 named only a Retool plan hold that a neighbour's 402 left on the account acquire() had
+                # chosen while it waited (design D4 1.7, SessionPool._check_route): another account serves the model now,
+                # so the request chooses again, as it would have a moment earlier, instead of a settled 404.
+                holder["_plan_hold_races"] = holder.get("_plan_hold_races", 0) + 1
+                _settle_turn(holder, "moved")
+                journal.emit("account.failover", "Тариф аккаунта отказал в модели, пока запрос ждал, — аккаунт выбран заново",
+                             "warn", request_id=getattr(parsed, "request_id", None), error=error.code,
+                             reason="plan_hold_race", model=_model_id(parsed))
+                holder["reason"] = "stop"
+                continue
             if error is not None and apierr.is_plan_refusal(error):
                 # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
                 # the client gets the settled 404 that names the cause rather than a 502 it would only send again.
                 error = self._pool_refusal(parsed, exclude) or error
+            if error is None and relay.started and backend is not None and hasattr(accounts, "mark_plan_served"):
+                # The account's Retool plan includes the model: the pool asks such accounts first (retool_plans).
+                accounts.mark_plan_served(backend, _model_id(parsed, lease))
+            _settle_turn(holder)  # the error, if any, is what the client gets: red
             if error is not None:
                 out.put({"type": "error", "error": error})
             out.put(None)
@@ -1192,6 +1360,7 @@ class TurnRunner:
     async def _run_once(self, parsed, out, holder, exclude=()):
         turn_id = str(uuid.uuid4())
         holder["turn_id"] = turn_id
+        holder.pop("_console_route", None)
         # Loop detection is per client turn, never shared by concurrent chats.
         recent = []
         cancelled = holder.setdefault("cancel_event", threading.Event())
@@ -1207,7 +1376,7 @@ class TurnRunner:
         output_attempts = {}
         request_attempts = holder.setdefault("_speed_attempts", {})
         outcome = {"reason": None, "error": None, "first": False}
-        trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None),
+        trace = {"turn_id": turn_id, "request_id": getattr(parsed, "request_id", None), "model": parsed.model,
                  "conversation": journal.tag(getattr(parsed, "conversation_key", None))}
 
         def log(kind, message, level="info", **fields):
@@ -1220,7 +1389,7 @@ class TurnRunner:
                 if count is not None:
                     output_attempts[fields["attempt"]] = count
                     request_attempts[(turn_id, fields["attempt"])] = count
-            journal.emit(kind, message, level, **trace, **fields)
+            journal.emit(kind, message, level, **{**trace, **fields})
 
         try:
             native_tools = getattr(parsed, "tools", None) or []
@@ -1403,10 +1572,6 @@ class TurnRunner:
                 acquired = session.session if isinstance(session, SessionLease) else session
                 # Every later event of this turn, errors included, names the account serving it.
                 trace["account"] = account_tag(getattr(acquired, "backend", None))
-                if trace["account"]:
-                    # Events that other modules emit for this turn (the transport, native history) get the
-                    # tag through the context: they know no more than the session they run on.
-                    account_context = client_context.bind({**client_context.current(), "account": trace["account"]})
                 # Debit the account that actually served the turn.
                 account_credits = getattr(getattr(acquired, "backend", None), "credits", None) or self.credits
                 acquired._credits_manager = account_credits
@@ -1418,11 +1583,17 @@ class TurnRunner:
                 # must come from the backend cfg the turn actually runs on, not the
                 # global config (accounts[] can span tenants).
                 acc_cfg = getattr(getattr(acquired, "backend", None), "cfg", None) or self.cfg
-                bound_entry = model_catalog.bind_entry_for_backend(parsed.entry, acc_cfg)
+                # A route alias runs as the target the pool chose the account for (lease.bound_entry, A08-02).
+                bound_entry = (getattr(session, "bound_entry", None)
+                               or model_catalog.bind_entry_for_backend(parsed.entry, acc_cfg))
                 acquired._bound_entry = bound_entry
                 acquired._provider_options = dict(getattr(parsed, "provider_options", None) or {})
                 acquired._structured_output = getattr(parsed, "structured_output", None)
                 model_provider["model"] = bound_entry.get("upstream_model") or bound_entry["id"]
+                if isinstance(bound_entry, dict) and bound_entry.get("alias_id"):
+                    # The bound target's price, Minara fields and effort, not those of the alias's first target (A12-03).
+                    model_catalog.bind_provider(model_provider, bound_entry, getattr(parsed, "effort", None), self.cfg,
+                                                kept=holder.get("kept_effort"))
                 resource = model_catalog.provider_resource(acc_cfg, bound_entry)
                 if resource:
                     model_provider["providerResourceName"] = resource
@@ -1430,20 +1601,29 @@ class TurnRunner:
                     # __managed__: omit the field entirely (never send null).
                     model_provider.pop("providerResourceName", None)
                 actual_upstream = acc_cfg.get("upstream", "retool")
+                bound_route = {"upstream": actual_upstream, "upstream_model": model_provider.get("model"),
+                               "effective_effort": model_provider.get("reasoningEffort"),
+                               "account": trace["account"], "turn_id": turn_id}
+                holder["_console_route"] = bound_route
+                trace.update(bound_route)
+                # The transport's own events and the runner's events refer to the same serving attempt.
+                account_context = client_context.bind({**client_context.current(), **trace})
                 console_log.write(console_log.route_line(
                     getattr(parsed, "request_id", None) or "req", upstream=actual_upstream,
                     account=account_tag(getattr(acquired, "backend", None)), model=parsed.model,
                     upstream_model=model_provider.get("model"), effort=model_provider.get("reasoningEffort"),
-                    child=bool(parent_key)))
+                    child=bool(parent_key)), text_only=True)
                 log("route.bound", "Выбран фактический маршрут %s" % actual_upstream,
-                    upstream=actual_upstream, model=parsed.model, upstream_model=model_provider.get("model"),
-                    effective_effort=model_provider.get("reasoningEffort"), child=bool(parent_key))
+                    child=bool(parent_key), provider=_provider_label(getattr(acquired, "backend", None)))
                 if actual_upstream != "retool" and getattr(parsed, "client_task", "") not in client_context.SIDE_TASKS:
                     # What the dialog's turns go with: its compaction keeps it (_minara_dialog_effort).
                     target = acquired.session if isinstance(acquired, SessionLease) else acquired
                     target._minara_effort = model_provider.get("reasoningEffort")
                     target._minara_effort_model = parsed.model
                     target._minara_effort_set = True
+                if actual_upstream == "minara":
+                    # Priced before anything leaves: a refusal costs nothing (cost_guard).
+                    self._guard_cost(parsed, holder, acquired, bound_entry, model_provider, log)
                 # How many turns the pool has in flight, on this account and in all, this one included: the load this turn met.
                 counted = getattr(self.pool, "inflight", None)
                 load = ({} if counted is None else dict(zip(("inflight_account", "inflight_total"),
@@ -1478,6 +1658,7 @@ class TurnRunner:
                     upstream_text = ""
                     visible_text = ""
                     holder["upstream_started_at"] = time.time()
+                    upstream_started = time.monotonic()
                     streamed_tool_call = False
                     dropped_calls = []
                     upstream_completed = False
@@ -1532,8 +1713,10 @@ class TurnRunner:
                             final_choice,
                             getattr(parsed, "max_tokens", None),
                             chunks)
+                        # An empty list is no history: a transport that builds from it (Minara, the universal drivers) sent
+                        # the head alone, without the chunks of the conversation (audit A15-03).
                         direct_target._native_client_messages = (
-                            getattr(parsed, "native_messages", None)
+                            getattr(parsed, "native_messages", None) or None
                             if native_tools or actual_upstream != "retool"
                             else None
                         )
@@ -1589,11 +1772,15 @@ class TurnRunner:
                                 if event["type"] == "request_sent":
                                     out.put(event)
                                     continue
-                                if not first_token and event["type"] in ("text", "thinking", "tool_call"):
+                                if (not first_token and event.get("source") != "relay"
+                                        and event["type"] in ("text", "thinking", "tool_call")):
                                     first_token = True
-                                    ttft = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                    ttft = round((time.monotonic() - upstream_started) * 1000)
+                                    sent_effort = model_provider.get("reasoningEffort")
                                     log("upstream.first_token", "Первый токен через %d мс" % ttft,
-                                        "success" if ttft < 8000 else "warn", ttft_ms=ttft, first=event["type"])
+                                        first_token_level(ttft, sent_effort), ttft_ms=ttft, first=event["type"],
+                                        effort=sent_effort, warn_ms=first_token_warn_ms(sent_effort),
+                                        attempt=journal_attempt)
                                 if event["type"] in ("thinking_status", "thinking_start", "thinking", "thinking_signature",
                                                      "tool_call"):
                                     text_open = False
@@ -1601,15 +1788,17 @@ class TurnRunner:
                                     if not text_open and event["delta"]:
                                         # Every text segment (text, thinking, text) opens its own answer span.
                                         text_open = True
-                                        ms = round((time.time() - holder["upstream_started_at"]) * 1000)
+                                        ms = round((time.monotonic() - upstream_started) * 1000)
                                         log("upstream.text_start", "Модель начала писать текст через %d мс" % ms,
-                                            "debug", ms=ms)
+                                            "debug", ms=ms, attempt=journal_attempt)
                                     final_text += event["delta"]
                                     upstream_text += event["delta"]
                                     # Tool envelopes are parsed only after the complete
                                     # upstream turn, so do not leak their markup to a
                                     # native client. Ordinary text remains streamed.
-                                    if direct_mode or not native_tools:
+                                    if purpose == "prompt-suggestion":
+                                        pass
+                                    elif direct_mode or not native_tools:
                                         out.put(event)
                                         visible_text += event["delta"]
                                     else:
@@ -1621,7 +1810,9 @@ class TurnRunner:
                                     if event.get("text"):
                                         final_text = event["text"]
                                 elif event["type"] in ("thinking_status", "thinking_start"):
-                                    if think_started is None:
+                                    # Only a sign the upstream gave starts the thinking span of the journal: a status of the
+                                    # relay's own (source "relay", the Minara timer of 54b1023) said nothing about the model.
+                                    if think_started is None and event.get("source") != "relay":
                                         think_started = time.time()
                                         ms = round((think_started - holder["upstream_started_at"]) * 1000)
                                         log("upstream.thinking_start", "Upstream сообщил начало thinking через %d мс" % ms,
@@ -1691,10 +1882,64 @@ class TurnRunner:
                                             | {"tool_type": definition.get("x-client-type", "function"),
                                                "done": complete})
                                 elif event["type"] == "tool_call":
-                                    # A call of a tool the client did not declare (under a forced choice, of another
-                                    # tool) has nothing to run it on the client and is not passed on; the journal names
-                                    # it instead of losing it without a trace (ultracode audit of the relay, C4).
-                                    if not event.get("partial"):
+                                    ptc_def = tool_definitions.get("run_code") if len(tool_definitions) == 1 else None
+                                    ptc_desc = str((ptc_def or {}).get("description") or "")
+                                    is_ptc = ptc_def is not None and "Execute a " in ptc_desc and "await tools." in ptc_desc
+                                    if is_ptc and event.get("partial"):
+                                        pass
+                                    elif is_ptc and not event.get("invalid"):
+                                        sub_name = str(event.get("name") or "").strip()
+                                        try:
+                                            args_obj = json.loads(event.get("arguments") or "{}")
+                                        except (ValueError, TypeError):
+                                            args_obj = None
+                                        if sub_name and isinstance(args_obj, dict):
+                                            args_json = json.dumps(args_obj, ensure_ascii=False)
+                                            if "Execute a Python program" in ptc_desc:
+                                                code = (
+                                                    "import json\n"
+                                                    "_res = await getattr(tools, %s)(json.loads(%s))\n"
+                                                    "print(_res if isinstance(_res, str) else json.dumps(_res, ensure_ascii=False, indent=2))"
+                                                    % (json.dumps(sub_name), json.dumps(args_json))
+                                                )
+                                            elif "the BODY of an async function" in ptc_desc:
+                                                code = "return await tools[%s](%s);" % (json.dumps(sub_name), args_json)
+                                            else:
+                                                code = (
+                                                    "const _res = await tools[%s](%s);\n"
+                                                    "console.log(typeof _res === \"string\" ? _res : JSON.stringify(_res, null, 2));"
+                                                    % (json.dumps(sub_name), args_json)
+                                                )
+                                            desc_label = str(args_obj.get("description") or ("Invoke %s tool" % sub_name)).strip()[:120]
+                                            wrapped_args = json.dumps(
+                                                {"code": code, "description": desc_label or ("Invoke %s tool" % sub_name)},
+                                                ensure_ascii=False,
+                                            )
+                                            streamed_tool_call = True
+                                            if direct_mode:
+                                                direct_target._direct_reply = None
+                                            log("tool.ptc_wrapped",
+                                                "Вызов %s обёрнут в run_code для PTC-режима клиента" % sub_name,
+                                                "info", original=sub_name, call_id=event.get("id"))
+                                            out.put({
+                                                "type": "tool_call",
+                                                "id": event.get("id") or ("call_" + uuid.uuid4().hex[:16]),
+                                                "name": "run_code",
+                                                "arguments": wrapped_args,
+                                                "tool_type": ptc_def.get("x-client-type", "function"),
+                                                "done": True,
+                                            })
+                                        else:
+                                            dropped_calls.append(event.get("name"))
+                                            log("tool.call_dropped",
+                                                "Вызов инструмента %s не передан клиенту: клиент его не объявлял" % (
+                                                    event.get("name"),),
+                                                "warn", name=event.get("name"), call_id=event.get("id"),
+                                                declared=len(tool_names))
+                                    elif not event.get("partial"):
+                                        # A call of a tool the client did not declare (under a forced choice, of another
+                                        # tool) has nothing to run it on the client and is not passed on; the journal names
+                                        # it instead of losing it without a trace (ultracode audit of the relay, C4).
                                         dropped_calls.append(event.get("name"))
                                         log("tool.call_dropped",
                                             "Вызов инструмента %s не передан клиенту: клиент его не объявлял" % (
@@ -1724,6 +1969,14 @@ class TurnRunner:
                                         minara_spent = round(max(0.0, minara_credits - before), 4)
                                         holder['_attempt_minara'] = minara_credits
                                         event = dict(event, minara_credits=minara_spent)
+                                        holder['_cost_actual'] = minara_credits  # the attempt's, against its estimate
+                                        # What the cost guard keeps its hour, a key's day and the dialog's cache against.
+                                        conversation = getattr(parsed, 'conversation_key', None)
+                                        self.cost_guard.spent(
+                                            minara_spent, key_id=holder.get('_client_key_id'),
+                                            conversation=conversation if isinstance(conversation, (str, tuple)) else None,
+                                            account=trace.get('account'), model=parsed.model,
+                                            prompt_tokens=breakdown['prompt_tokens'] or None)
                                     if usd_spent is not None:
                                         event = dict(event, cost_usd=usd_spent)
                                     ck_id = holder.get('_client_key_id')
@@ -1779,7 +2032,8 @@ class TurnRunner:
                                                 credits=minara_credits, write_cost=write_cost,
                                                 channel=usage.get('channel') or '?', path=usage.get('channel_path'),
                                                 provider=usage.get('provider') or '?')
-                                                + (" " + client_context.label() if client_context.label() else ""))
+                                                + (" " + client_context.label() if client_context.label() else ""),
+                                                kind="cache.summary")
                                     if write_cost is not None and write_cost >= credits.WRITE_WARN:
                                         # A warning only: by the time the usage arrives the turn is paid for. The
                                         # console shows it as a [WRITE COSTLY …] marker inside the [cache] line.
@@ -1894,7 +2148,9 @@ class TurnRunner:
                         return
                     # A provider refusal is terminal even when it carries no visible text.
                     # Never execute a filtered partial command or server-tool call.
-                    if holder.get("reason") in ("timeout", "length", "content_filter"):
+                    # A prompt suggestion cut by its small cap still has its words: they go to the client below.
+                    if (holder.get("reason") in ("timeout", "length", "content_filter")
+                            and not (purpose == "prompt-suggestion" and holder.get("reason") == "length")):
                         out.put({"type": "end", "reason": holder["reason"]})
                         return
 
@@ -2038,11 +2294,29 @@ class TurnRunner:
                         return
 
                     if not direct_mode and not command and not final_text.strip():
-                        # Silent turns are explained via persisted sandpack messages,
-                        # which the direct transport never writes.
-                        explained = await self._explain_empty(holder)
+                        # The agent transport can persist a real refusal without sending it on the stream.
+                        explained = await self._explain_empty(holder, quiet=purpose == "prompt-suggestion")
                         if explained is not None:
                             raise explained
+
+                    if purpose == "prompt-suggestion":
+                        # Silence by itself is a successful suggestion, with no generation retry or incident.
+                        cleaned = final_text.strip().strip("\"'«»").strip()
+                        meta_silent = (
+                            not cleaned
+                            or "\n" in cleaned
+                            or len(cleaned.split()) > 16
+                            or bool(re.search(
+                                r"(?:^\s*[\(\[].*[\)\]]\s*$|"
+                                r"^\s*(?:nothing|none|silent)\.?\s*$|"
+                                r"\b(?:no\s+suggestion|nothing\s+to\s+suggest|stay(?:ing)?\s+silent|"
+                                r"empty\s+response|no\s+natural\s+next)\b)",
+                                cleaned, re.IGNORECASE))
+                        )
+                        if not meta_silent:
+                            out.put({"type": "text", "delta": cleaned})
+                        out.put({"type": "end", "reason": holder.get("reason", "stop")})
+                        return
 
                     if (not direct_mode and not command and not final_text.strip() and empty_retries < 1 and not client_text
                             and holder["_attempt_budget"].remaining):
@@ -2050,8 +2324,7 @@ class TurnRunner:
                         # retries are handled in the transport with the same body.
                         empty_retries += 1
                         log("turn.retry", "Пустой ход — повтор", "warn", reason="empty_turn")
-                        if not direct_mode:
-                            native_context = None  # Retry prompts are not part of the client history in agent mode.
+                        native_context = None  # Retry prompts are not part of the client history in agent mode.
                         retry_instruction = ("Use the supplied native client tools for tool calls; "
                                              "otherwise return a short text answer." if native_tools else
                                              "If a local command is needed, output <exec_command>...</exec_command>; "
@@ -2061,6 +2334,12 @@ class TurnRunner:
                         continue
 
                     if not command and not final_text.strip():
+                        if dropped_calls:
+                            names = ", ".join(sorted({str(name)[:60] for name in dropped_calls})[:5])
+                            raise holder["_attempt_budget"].error(
+                                "upstream_invalid_output",
+                                "upstream returned only undeclared tool call(s) (%s) not in the client's tool list" % names,
+                            )
                         raise holder["_attempt_budget"].error()
 
                     if not can_exec or not command:
@@ -2157,12 +2436,7 @@ class TurnRunner:
         finally:
             duration = round((time.monotonic() - turn_started) * 1000)
             err = outcome["error"]
-            if err is not None:
-                log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]), "error",
-                    status=err.status, code=err.code)
-                reason = "error"
-            else:
-                reason = outcome["reason"] or holder.get("reason") or "stop"
+            reason = "error" if err is not None else outcome["reason"] or holder.get("reason") or "stop"
             holder["_speed_reason"] = reason
             # Explicit account-quota and plan refusals are free; retain their latency, but count no generated tokens.
             if err is not None and (apierr.is_account_quota(err) or apierr.is_plan_refusal(err)):
@@ -2171,10 +2445,37 @@ class TurnRunner:
                     request_attempts[(turn_id, number)] = 0
             output_tokens = (sum(output_attempts.values()) if output_attempts
                              and all(value is not None for value in output_attempts.values()) else None)
-            log("turn.end", "Ход завершён: %s за %.1f с" % (reason, duration / 1000),
-                "error" if reason == "error" else "warn" if reason in ("cancelled", "timeout", "length") else "success",
-                reason=reason, duration_ms=duration, exec_steps=exec_steps,
-                output_tokens=output_tokens, tokens_per_second=None,
-                retries=empty_retries + tool_retries,
-                **({"web_searches": search_uses} if search_uses else {}))
+            estimate, actual = holder.pop("_cost_estimate", None), holder.pop("_cost_actual", None)
+            if estimate is not None and actual is not None:
+                # How far the cost guard's estimate was from the debit: what its rules are calibrated by.
+                log("cost.estimate_vs_actual", "Оценка цены %s, списано %s кредитов Minara" % (estimate.credits, actual),
+                    "debug", estimate=estimate.credits, actual=actual, warm=estimate.warm,
+                    ratio=round(actual / estimate.credits, 3) if estimate.credits else None)
+
+            def close(went_on=None):
+                # went_on: what the request did after this failed attempt ("moved" to another account, "retried" here),
+                # or None when the error is what the client gets. Only that one is red (_settle_turn).
+                moved = {"outcome": went_on} if err is not None and went_on else {}
+                if err is not None:
+                    # Every POST of the request so far, and how many of them refusals gave back (AttemptBudget.refund).
+                    posts = {name: getattr(err, attr) for name, attr in (("upstream_attempts", "upstream_attempts"),
+                                                                         ("refunded", "upstream_refunded"))
+                             if getattr(err, attr, None)}
+                    log("turn.error", "%s: %s" % (err.code, redact(err.message or "")[:300]),
+                        "warn" if moved else "error", status=err.status, code=err.code, **moved, **posts)
+                log("turn.end", "Ход завершён: %s за %.1f с%s" % (
+                        reason, duration / 1000, " · запрос продолжен" if moved else ""),
+                    "warn" if moved else "error" if reason == "error"
+                    else "warn" if reason in ("cancelled", "timeout", "length") else "success",
+                    reason=reason, duration_ms=duration, exec_steps=exec_steps,
+                    output_tokens=output_tokens, tokens_per_second=None,
+                    retries=empty_retries + tool_retries,
+                    **({"web_searches": search_uses} if search_uses else {}), **moved)
+
+            if err is None:
+                close()
+            else:
+                # Whether the client gets this error is decided by _run_request (failover, a wait, a recheck): it writes
+                # turn.error and turn.end once it knows (audit A02-06: 304 red events in requests that ended with 200).
+                holder["_close_turn"] = close
             out.put(None)

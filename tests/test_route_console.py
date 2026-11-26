@@ -1,5 +1,6 @@
 """The console names the provider that actually serves each request: Retool or Minara, per conversation."""
 import json
+import time
 
 import console_log
 import journal
@@ -32,3 +33,39 @@ def test_main_agent_on_retool_and_subagent_on_minara_each_show_their_own_provide
     assert {event['data']['upstream'] for event in events} >= {'minara', 'retool'}
     dumped = json.dumps(events)
     assert 'synthetic-minara-bearer' not in dumped and 'synthetic-retool-cookie' not in dumped
+
+
+def test_jsonl_correlates_http_route_session_latency_and_usage_in_their_own_units(mixed, capsys, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("RELAY_LOG_FORMAT", "jsonl")
+    since = journal.JOURNAL.last_seq
+    for model, session in ((LOCAL, "raw-local-session"), (REMOTE, "raw-remote-session")):
+        body = {"model": model, "messages": [{"role": "user", "content": "private-prompt-marker"}]}
+        assert mixed.call("/v1/chat/completions", body, session)[0] == 200
+    until = time.monotonic() + 3
+    while sum(event["kind"] == "http.request" for event in journal.JOURNAL.query(since=since)) < 2:
+        assert time.monotonic() < until
+        time.sleep(0.01)
+    output = capsys.readouterr().out
+    records = [json.loads(line) for line in output.splitlines()]
+    assert not any(value in output for value in (KEY, "synthetic-minara-bearer", "synthetic-retool-cookie",
+                                                 "raw-local-session", "raw-remote-session", "private-prompt-marker"))
+    finals = [event for event in records if event["kind"] == "http.request"]
+    assert len(finals) == 2
+    assert len({event["conversation"] for event in finals}) == 2
+    for final in finals:
+        related = [event for event in records if event.get("request_id") == final["request_id"]]
+        bound, = [event for event in related if event["kind"] == "route.bound"]
+        session, = [event for event in related if event["kind"] == "session.acquire"]
+        first, = [event for event in related if event["kind"] == "upstream.first_token"]
+        usage, = [event for event in related if event["kind"] == "upstream.usage"]
+        assert all(event["account"] == bound["account"] for event in (final, first, usage))
+        assert all(event["turn_id"] == final["turn_id"] for event in (bound, session, first, usage))
+        assert len(session["thread"]) == 8 and final["client_session"]
+        assert final["http_status"] == final["status"] == 200 and final["level"] == "success"
+        assert first["ttft_ms"] >= 0 and first["first"] == "text"
+        assert usage["output_tokens"] == 3 and usage["input_tokens"] == 2
+        if bound["upstream"] == "retool":
+            assert usage["retool_credits"] == 0.1 and "minara_credits" not in usage
+        else:
+            assert usage["minara_credits"] == 0.22 and usage["provider_cost_currency"] == "USD"
+            assert usage["cost_usd"] == 0.001 and "retool_credits" not in usage

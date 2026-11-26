@@ -177,25 +177,27 @@ def test_responses_streams_function_call_argument_deltas():
     assert json.loads(done[0]["arguments"]) == EXPECTED
 
 
+# Opus 5.5 through Retool reasons silently: only the start of the block and its signature arrive. 54b1023 (and the
+# label of before it) showed "Модель думает…" as reasoning text there; the label came from no upstream, went into the
+# clients' histories (DeepSeek Harness: 134 of 827 replies) and back to the model. The adapters write only what the
+# upstream wrote, whatever the old thinking_placeholder of a config says.
 def _think_parsed(label):
     return type("P", (), {"show_thinking": True, "model": "claude-opus-5-5", "system": "", "prompt": "x",
                           "tools": [], "wants_usage": False, "thinking_placeholder": label})()
 
 
-def test_chat_shows_placeholder_when_silent_thinking_starts():
+def test_chat_writes_no_label_when_silent_thinking_starts():
     writer = Writer()
     adapter = adapters.ChatAdapter(_think_parsed("Модель думает…\n"), writer)
     adapter.feed({"type": "thinking_start"})
     adapter.feed({"type": "thinking_signature", "signature": "sig"})
     adapter.feed({"type": "text", "delta": "42"})
     deltas = [p["choices"][0]["delta"] for n, p in writer.events if n == "data" and p["choices"]]
-    assert deltas[0] == {"reasoning_content": "Модель думает…\n"}
-    assert deltas[1] == {"content": "42"}
-    # Display-only: the label never becomes part of the stored reasoning.
+    assert deltas == [{"content": "42"}]
     assert "reasoning_content" not in adapter.payload("stop")["choices"][0]["message"]
 
 
-def test_chat_placeholder_disabled_and_real_thinking_follows():
+def test_chat_real_thinking_is_streamed_as_it_comes():
     writer = Writer()
     adapter = adapters.ChatAdapter(_think_parsed(""), writer)
     adapter.feed({"type": "thinking_start"})
@@ -205,18 +207,20 @@ def test_chat_placeholder_disabled_and_real_thinking_follows():
     assert adapter.payload("stop")["choices"][0]["message"]["reasoning_content"] == "real"
 
 
-def test_responses_shows_placeholder_as_reasoning_summary():
+def test_responses_opens_a_reasoning_item_without_a_summary_when_silent_thinking_starts():
     writer = Writer()
     adapter = adapters.ResponsesAdapter(_think_parsed("Модель думает…\n"), writer)
     adapter.feed({"type": "thinking_start"})
     adapter.feed({"type": "text", "delta": "ok"})
     names = [n for n, _ in writer.events]
-    assert names.index("response.reasoning_summary_text.delta") < names.index("response.output_text.delta")
-    delta = [p for n, p in writer.events if n == "response.reasoning_summary_text.delta"][0]
-    assert delta["delta"] == "Модель думает…\n"
+    assert "response.reasoning_summary_text.delta" not in names
+    assert "response.reasoning_summary_part.added" not in names
+    reasoning = [p["item"] for n, p in writer.events if n == "response.output_item.added"][0]
+    assert reasoning["type"] == "reasoning" and reasoning["summary"] == []
+    assert names.index("response.output_item.added") < names.index("response.output_text.delta")
 
 
-def test_placeholder_respects_hidden_thinking():
+def test_a_silent_start_respects_hidden_thinking():
     writer = Writer()
     parsed = _think_parsed("Модель думает…\n")
     parsed.show_thinking = False

@@ -65,6 +65,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import apierr
+import client_context
 import journal
 import models
 import structured
@@ -117,7 +118,8 @@ BUILTIN_PROFILES = {"passthrough": {"description": "the client's system prompt, 
 # Service requests keep their own instructions unless the user disables protection (plan I6).
 PROTECTED_RULES = (
     {"name": "protected: service requests", "if": {"purpose": ["session-title", "auto-mode-check",
-                                                               "connection-probe", "client-service"]},
+                                                               "connection-probe", "prompt-suggestion",
+                                                               "client-service"]},
      "use": "passthrough"},
     {"name": "protected: Claude Code compaction", "if": {"request_class": ["compaction", "auxiliary"]},
      "use": "passthrough"},
@@ -243,7 +245,7 @@ def prompt_client(identity: dict, headers: dict) -> str:
 
     It never changes identity["client"] or client_context.request_kind (plan I1). The first signal that names a family wins:
     1. an explicit x-proxi-client header (a family name, or a spelling of one: "Claude Code", "codex_cli_rs", "dsh");
-    2. the client client_context.describe() recognised (OpenCode, Claude Code, Claude Desktop);
+    2. the client client_context.describe() recognised;
     3. Codex, by what codex-rs sends (rust-v0.164.0): the `originator` header (codex_cli_rs, codex-tui, codex_exec,
        codex_vscode, codex_desktop, codex_sdk_ts, "Codex Desktop", ...: every first-party value starts with "codex"), a
        User-Agent that begins with that originator (`codex_cli_rs/0.164.0 (Windows 10.0; x86_64) ...`) or any x-codex-*
@@ -259,14 +261,7 @@ def prompt_client(identity: dict, headers: dict) -> str:
     client = _family((identity or {}).get("client"))
     if client:
         return client
-    originator = str(headers.get("originator") or "").strip().lower()
-    agent = str(headers.get("user-agent") or "").strip().lower()
-    if originator.startswith("codex") or agent.startswith("codex") or any(
-            name.startswith("x-codex-") for name in headers):
-        return "codex"
-    if agent.startswith("deepseek-harness/"):
-        return "harness"
-    return "unknown"
+    return client_context.transport_family(headers) or "unknown"
 
 
 @dataclass(frozen=True)
@@ -1537,7 +1532,7 @@ _STRUCTURED_VARIABLES = ("default", "schema", "schema_name")
 _KNOWN_VALUES = {
     "client": CLIENTS, "dialect": DIALECTS,
     "purpose": ("client-tools", "client-text", "generation", "session-title", "auto-mode-check", "connection-probe",
-                "client-service")}
+                "prompt-suggestion", "client-service")}
 _PLACEHOLDER_WARNING = ("the blocks of a relay task are placeholders in the preview: the relay builds them from its "
                         "configuration when it owns the request")
 
@@ -1784,17 +1779,18 @@ class _Compiler:
             _err(path, "must name a regular file")
         if info.st_size > MAX_TEXT_BYTES:
             _err(path, "a text is limited to %d KiB" % (MAX_TEXT_BYTES // 1024))
-        self._grow(info.st_size, path)
         try:
             with open(target, "rb") as handle:
                 data = handle.read(MAX_TEXT_BYTES + 1)
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            _err(path, "the file is not valid UTF-8")
         except OSError as exc:
             self._unreadable(key, path, exc, replace=True)
         if len(data) > MAX_TEXT_BYTES:
             _err(path, "a text is limited to %d KiB" % (MAX_TEXT_BYTES // 1024))
+        self._grow(len(data), path)
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            _err(path, "the file is not valid UTF-8")
         if text.startswith("\ufeff"):
             text = text[1:]
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -3039,10 +3035,17 @@ class PromptStore:
         signature = (info.st_mtime_ns, info.st_size)
         if not stat.S_ISREG(info.st_mode):
             raise self._unreadable("the prompts file is not a regular file", signature)
-        if info.st_size > MAX_DOCUMENT_BYTES:
+        try:
+            if info.st_size > MAX_DOCUMENT_BYTES:
+                raise _TooLarge()
+            # This watch is on the request path. A temporary sharing violation is retried on the next look.
+            with self.path.open("rb") as handle:
+                data = handle.read(MAX_DOCUMENT_BYTES + 1)
+            if len(data) > MAX_DOCUMENT_BYTES:
+                raise _TooLarge()
+        except _TooLarge:
             raise self._unreadable("the prompts file is larger than %d MiB" % (MAX_DOCUMENT_BYTES // (1024 * 1024)),
-                                   signature)
-        data = self.path.read_bytes()
+                                   signature) from None
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:

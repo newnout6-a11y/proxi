@@ -14,7 +14,36 @@ import time
 import apierr
 from apierr import unauthorized
 
-CLIENT_VERSION = "4.84.0-16f3123 (Build 409813)"
+# What Retool's frontend sends as X-Retool-Client-Version: RETOOL_VERSION_STRING of its entry script (4.99.0-dd22f13, Build
+# 424025, in the public bundle of 2026-11-18; live answers name the same in x-retool-api-version). The relay sent
+# 4.84.0-16f3123 until then, fifteen minor versions behind every browser. The catalog look reads the version of the
+# current frontend (retool_catalog.client_version) and set_client_version puts it here; this one serves until then.
+CLIENT_VERSION = "4.99.0-dd22f13 (Build 424025)"
+_CLIENT_VERSION_SHAPE = re.compile(r"\d+\.\d+\.\d+-[0-9a-f]{4,40} \(Build \d+\)")
+
+
+def set_client_version(version) -> bool:
+    """Send `version` as X-Retool-Client-Version from now on, if it has the shape Retool's frontend gives it."""
+    global CLIENT_VERSION
+    if not isinstance(version, str) or not _CLIENT_VERSION_SHAPE.fullmatch(version):
+        return False
+    CLIENT_VERSION = version
+    return True
+
+
+def cloudflare_challenge(status, headers) -> bool:
+    """True for Cloudflare's challenge in front of Retool: a 403 with `cf-mitigated: challenge`, as Retool's frontend tells
+    it from a refusal of the session (isCloudflareChallenge, CloudflareChallengeError). It concerns the connection (its
+    address, its client), not the account's cookies."""
+    if status != 403 or not headers:
+        return False
+    try:
+        items = headers.items()
+    except AttributeError:
+        return False
+    return any(str(name).lower() == "cf-mitigated" and str(value).strip().lower() == "challenge" for name, value in items)
+
+
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/131.0.0.0 Safari/537.36")
 _CHROME_MAJOR = re.compile(r"\bChrome/(\d+)")
@@ -331,6 +360,16 @@ def validate_client_key_entry(entry: dict, where: str = "client_keys") -> dict:
         if type(budget) not in (int, float) or isinstance(budget, bool) or not math.isfinite(budget) or budget < 0:
             raise ValueError(f"{where} ({kid}): 'max_budget_usd' must be a non-negative number (or null)")
         budget = round(float(budget), 6)
+    # The cost guard's ceilings of this key, in Minara credits (cost_guard): one request, and the key's day.
+    minara_limits = {}
+    for name in ("max_request_minara", "max_day_minara"):
+        value = entry.get(name)
+        if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+            raise ValueError(f"{where} ({kid}): '{name}' must be a non-negative number (or null)")
+        minara_limits[name] = None if value is None else round(float(value), 4)
+    confirm = entry.get("allow_cost_confirm", False)
+    if type(confirm) is not bool:
+        raise ValueError(f"{where} ({kid}): 'allow_cost_confirm' must be a boolean")
     return {
         "id": kid,
         "label": label,
@@ -339,6 +378,8 @@ def validate_client_key_entry(entry: dict, where: str = "client_keys") -> dict:
         "allowed_models": allowed,
         "rpm_limit": rpm,
         "max_budget_usd": budget,
+        **minara_limits,
+        "allow_cost_confirm": confirm,
     }
 
 
@@ -359,6 +400,14 @@ def model_allowed_for_profile(profile: dict | None, *model_names: str | None) ->
     return False
 
 
+def conversation_namespace(profile, master_key):
+    """Internal partition for a non-master credential. Reusing its label or ID does not inherit old state."""
+    if not profile or profile.get("master"):
+        return None
+    value = json.dumps(["proxi-dialog-v1", profile["id"], profile["key"]]).encode("utf-8")
+    return hmac.new(master_key.encode("utf-8"), value, "sha256").hexdigest()[:32]
+
+
 class ClientKeyManager:
     """Runtimeauthenticator, RPM rate limiter, USD budget enforcer, and usage tracker for `client_keys[]`."""
 
@@ -368,6 +417,7 @@ class ClientKeyManager:
         self._keys: dict[str, dict] = {}
         self._usage: dict[str, dict] = {}
         self._rpm_stamps: dict[str, collections.deque] = {}
+        self._counted: dict[str, str] = {}  # the last request each key was counted for (enforce_request)
         self.reload(cfg.get("client_keys") or [])
 
     def reload(self, raw_entries: list) -> None:
@@ -422,6 +472,10 @@ class ClientKeyManager:
 
         now_mono = time.monotonic()
         now_wall = time.time()
+        # A client request may check several models (a prompt suggestion tries its candidates after the request's own
+        # check): each took an RPM slot and counted a request, so one suggestion used two slots or more (audit A07-05).
+        import client_context  # imports no project module
+        request_id = (client_context.current() or {}).get("request_id")
         with self._lock:
             live = self._keys.get(kid, profile)
             stats = self._usage.setdefault(
@@ -435,6 +489,8 @@ class ClientKeyManager:
                     "insufficient_credits",
                     f"Client key '{live.get('label') or kid}' has reached its USD budget (${max_budget:.4f})",
                 )
+            if request_id and self._counted.get(kid) == request_id:
+                return  # this request was counted when it was first checked
             rpm = live.get("rpm_limit")
             if rpm is not None and rpm > 0:
                 window = self._rpm_stamps.setdefault(kid, collections.deque())
@@ -449,6 +505,8 @@ class ClientKeyManager:
                 window.append(now_mono)
             stats["requests"] += 1
             stats["last_used_at"] = round(now_wall, 3)
+            if request_id:
+                self._counted[kid] = request_id
 
     def record_usage(self, key_id: str | None, *, input_tokens: int = 0, output_tokens: int = 0, cost_usd: float | None = None) -> None:
         if not key_id or key_id == "master":
@@ -478,6 +536,9 @@ class ClientKeyManager:
                     "allowed_models": entry["allowed_models"],
                     "rpm_limit": entry["rpm_limit"],
                     "max_budget_usd": entry["max_budget_usd"],
+                    "max_request_minara": entry.get("max_request_minara"),
+                    "max_day_minara": entry.get("max_day_minara"),
+                    "allow_cost_confirm": entry.get("allow_cost_confirm", False),
                     "requests": stats.get("requests", 0),
                     "input_tokens": stats.get("input_tokens", 0),
                     "output_tokens": stats.get("output_tokens", 0),

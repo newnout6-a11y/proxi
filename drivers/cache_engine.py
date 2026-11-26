@@ -176,22 +176,16 @@ def apply_openai_cache_hints(
     if not supports_cache_key:
         return
 
-    explicit_key = opts.get("prompt_cache_key")
-    if isinstance(explicit_key, str) and explicit_key.strip():
-        body["prompt_cache_key"] = explicit_key.strip()[:64]
-    else:
-        conv_key = getattr(session, "_native_conversation_key", None) if session is not None else None
-        if preset == "openrouter" and low_model.startswith("anthropic/"):
-            sys_part = None
-            msgs = body.get("messages")
-            if isinstance(msgs, list) and msgs and msgs[0].get("role") in ("system", "developer"):
-                sys_part = msgs[0].get("content")
-            seed = [model, sys_part, body.get("tools")] if sys_part else [model, conv_key]
-        else:
-            seed = [cfg.get("provider_id") or preset, model, conv_key] if conv_key else None
-        if seed:
-            digest = hashlib.sha256(json.dumps(seed, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:32]
-            body["prompt_cache_key"] = f"proxi-{digest}"
+    conv_key = getattr(session, "_native_conversation_key", None) if session is not None else None
+    if conv_key:
+        seed = [cfg.get("provider_id") or preset, model, conv_key]
+        # An administrator's hint can select a group within a conversation, but never share the key between chats.
+        explicit_key = opts.get("prompt_cache_key")
+        if isinstance(explicit_key, str) and explicit_key.strip():
+            seed.append(explicit_key.strip()[:64])
+        digest = hashlib.sha256(json.dumps(seed, sort_keys=True, ensure_ascii=False, default=str).encode(
+            "utf-8", "surrogatepass")).hexdigest()[:32]
+        body["prompt_cache_key"] = f"proxi-{digest}"
 
     if include_retention and preset in ("openai", "openai-responses"):
         ret = opts.get("prompt_cache_retention")

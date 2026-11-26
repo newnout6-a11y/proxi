@@ -31,6 +31,10 @@ from upstream_attempts import AttemptBudget
 MESSAGE = ("You have exceeded your hourly limit of managed API key usage. Please go to the Retool AI resource "
            "in the Resources page to configure your own API keys.")
 HOURLY_BODY = json.dumps({"statusCode": 429, "error": "Too Many Requests", "message": MESSAGE})
+# The wording Retool switched to on 2026-11-18 (journal: 585 client 429s on 11 accounts, none parked, none moved).
+COPILOT_MESSAGE = ("You've reached your hourly limit for Copilot. Please try again in an hour.\n"
+                   "You can still use other AI features like Ask AI and Agents.")
+COPILOT_BODY = json.dumps({"statusCode": 429, "error": "Too Many Requests", "message": COPILOT_MESSAGE})
 SHORT_BODY = json.dumps({"statusCode": 429, "error": "Too Many Requests", "message": "Slow down, try again"})
 
 
@@ -47,6 +51,10 @@ def _headers(**values):
     (MESSAGE.upper(), True),
     ("You have exceeded your HOURLY   limit\nof managed API key usage.", True),
     (HOURLY_BODY, True),
+    (COPILOT_MESSAGE, True),
+    (COPILOT_BODY, True),
+    ("you've REACHED your   hourly\nlimit for copilot.", True),
+    ("Retool models are rate limited right now. Please try again shortly.", False),
     ("Too Many Requests", False),
     ("Rate limit reached for requests", False),
     ("", False),
@@ -54,6 +62,21 @@ def _headers(**values):
 ])
 def test_hourly_limit_text_is_recognised_without_regard_to_case_and_spacing(text, expected):
     assert apierr.is_hourly_limit(text) is expected
+
+
+def test_http_429_with_the_copilot_hourly_text_is_an_account_quota_not_a_retry_on_the_same_account():
+    error = direct._api_error(429, COPILOT_BODY, _headers())
+    assert (error.status, error.code) == (429, "rate_limit_error")
+    assert apierr.is_account_quota(error)
+    assert not direct._refused_for_now(error)
+
+
+def test_a_stream_error_event_with_the_copilot_hourly_text_is_an_account_quota_too():
+    error = direct._error_from_event({"event": "error", "error": COPILOT_MESSAGE, "statusCode": 429})
+    assert apierr.is_account_quota(error)
+    assert not direct._refused_for_now(error)
+    # Without a status the sentence itself still identifies the quota.
+    assert apierr.is_account_quota(direct._error_from_event({"event": "error", "error": {"message": COPILOT_MESSAGE}}))
 
 
 def test_http_429_with_the_hourly_text_is_flagged_as_an_account_quota():
@@ -607,6 +630,9 @@ def test_the_account_returns_after_the_pause_and_new_conversations_use_it_again(
 
 def test_the_first_real_request_after_the_pause_parks_the_account_again_for_longer(retool):
     retool.script["acc-a"] = hourly
+    # acc-a's plan served the model before its limit (as an account that hits it has): a new conversation is offered to
+    # the least loaded of the accounts that served the model (SessionPool._plan_order), acc-a once it is back.
+    retool.dispatcher.mark_plan_served(retool.a, "claude-opus-5-5")
 
     async def scenario():
         await run(retool.runner, turn("conv-1"))
@@ -642,6 +668,9 @@ def test_a_limit_reported_by_a_request_that_left_before_the_pause_is_not_a_secon
 
 def test_a_limit_from_a_request_that_left_after_the_return_parks_the_account_again(retool):
     retool.script["acc-a"] = hourly
+    # acc-a's plan served the model before its limit (as an account that hits it has): a new conversation is offered to
+    # the least loaded of the accounts that served the model (SessionPool._plan_order), acc-a once it is back.
+    retool.dispatcher.mark_plan_served(retool.a, "claude-opus-5-5")
 
     async def scenario():
         await run(retool.runner, turn("conv-1"))

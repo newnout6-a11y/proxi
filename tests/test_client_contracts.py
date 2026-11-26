@@ -1,4 +1,5 @@
 """Client contracts shared by OpenCode, Claude Code and Responses/Codex."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 import apierr
 import auth
 import models
+import orchestrator
 import validate
 
 CFG = {"strict_models": True, "model": "claude-opus-5-5", "show_thinking": True}
@@ -32,6 +34,35 @@ def test_invalid_utf8_is_rejected_without_replacement(raw):
 def test_valid_utf8_is_preserved():
     text = "Прочитай проект и ответь"
     assert validate.load_json(json.dumps({"text": text}, ensure_ascii=False).encode())["text"] == text
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["same-session-id", "same-inferred-history"])
+def test_parallel_clients_with_different_keys_do_not_share_conversation_keys(relay, explicit):
+    entries = [{"id": name, "label": name, "key": "relay-test-credential-" + name + "-012345"} for name in ("one", "two")]
+    relay.api_runtime.client_keys.reload(entries)
+    body = _body("chat", tools=[{"type": "function", "function": {
+        "name": "lookup", "parameters": {"type": "object", "properties": {}}}}])
+    headers = {"x-session-affinity": "same-identifier"} if explicit else {}
+    keys = [relay.key, *(entry["key"] for entry in entries)]
+
+    def send(key):
+        return relay.status_of("/v1/chat/completions", body, key=key, headers=headers)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(send, keys)) == [200, 200, 200]
+    assert send(keys[1]) == 200  # identical follow-up/retry with the same credential
+    conversations = {}
+    shared_scopes = []
+    for parsed in relay.fake.seen:
+        owner = (parsed.client_key or {}).get("id", "master")
+        conversations.setdefault(owner, set()).add(parsed.conversation_key)
+        if owner != "master":
+            plan = orchestrator.acquire_plan({**relay.cfg, "transport": "direct", "session_mode": "shared"}, parsed)
+            shared_scopes.append(plan.kwargs.get("context_scope"))
+    assert all(len(keys) == 1 and None not in keys for keys in conversations.values())
+    assert conversations.keys() == {"master", "one", "two"}
+    assert len(set.union(*conversations.values())) == 3
+    assert all(shared_scopes) and len(set(shared_scopes)) == 2  # even in shared mode
 
 
 @pytest.mark.parametrize("dialect", ["chat", "responses", "anthropic"])

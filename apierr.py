@@ -5,6 +5,12 @@ from email.utils import parsedate_to_datetime
 
 # Retool answers 429 with this sentence once an organization has spent its hourly managed-key budget.
 HOURLY_LIMIT = "hourly limit of managed api key usage"
+# Since 2026-11-18 Retool words the same hourly quota differently: "You've reached your hourly limit for Copilot. Please
+# try again in an hour. You can still use other AI features like Ask AI and Agents." (585 client 429s on 11 accounts in one
+# afternoon: taken for a short-lived 429, each turn was retried three times on the spent account and then failed instead
+# of moving). Every known wording, lower-cased with single spaces; the short-lived "Retool models are rate limited right
+# now" names no hourly limit and stays a retry on the same account.
+HOURLY_LIMITS = (HOURLY_LIMIT, "reached your hourly limit")
 # Retool answers 402 "This model is not available for your plan." when the account's plan does not include the model the
 # request names (journal of 2026-11-12/13: three accounts refused every claude-opus-5-5 request, the others served it).
 NOT_IN_PLAN = "model is not available for your plan"
@@ -23,6 +29,8 @@ _ANTHROPIC_TYPES = {
     "context_length_exceeded": "invalid_request_error",
     "rate_limit_error": "rate_limit_error", "insufficient_credits": "billing_error",
     "service_unavailable": "overloaded_error", "upstream_timeout": "timeout_error",
+    # The relay's cost guard refused a request it estimated above a ceiling: final, the client must not ask again.
+    "cost_limit_exceeded": "invalid_request_error",
     # The relay's own upstream, not the client's key: a 502 the client can only retry or report.
     "upstream_error": "api_error", "upstream_auth_error": "api_error", "upstream_invalid_output": "api_error",
     "upstream_empty_turn": "api_error", "upstream_attempt_limit": "api_error",
@@ -56,6 +64,8 @@ RESPONSES_ERROR_CODES = {
     # The relay has already spent its own attempts on these.
     "upstream_invalid_output": "invalid_prompt", "upstream_empty_turn": "invalid_prompt",
     "upstream_attempt_limit": "invalid_prompt", "upstream_tool_choice_ignored": "invalid_prompt",
+    # The cost guard refused the request before anything was sent: asked again, it is refused again (cost_guard).
+    "cost_limit_exceeded": "invalid_prompt",
     "insufficient_credits": "insufficient_quota",
     # Codex's own code for an input past the context window: it stops, without a retry, and says so in its words.
     "context_length_exceeded": "context_length_exceeded",
@@ -132,6 +142,14 @@ def context_length_exceeded(message: str) -> ApiError:
     return ApiError(400, "context_length_exceeded", message)
 
 
+def cost_limit_exceeded(message: str, estimate=None) -> ApiError:
+    """The cost guard refused a request whose estimated cost is above a ceiling (cost_guard): nothing was sent, and the
+    same request is refused again, so every dialect gets a final code (x-should-retry: false)."""
+    error = ApiError(400, "cost_limit_exceeded", message, headers={"x-should-retry": "false"})
+    error.cost_estimate = estimate
+    return error
+
+
 def unprocessable(message: str, param=None) -> ApiError:
     return ApiError(422, "unprocessable_entity", message, param=param)
 
@@ -158,7 +176,8 @@ def too_many_requests(message: str = "relay is busy", retry_after: float = 1.0) 
 
 def is_hourly_limit(text) -> bool:
     """Retool's per-organization managed-key quota, as opposed to a short-lived 429."""
-    return HOURLY_LIMIT in " ".join(str(text or "").lower().split())
+    normal = " ".join(str(text or "").lower().split())
+    return any(phrase in normal for phrase in HOURLY_LIMITS)
 
 
 def account_rate_limited(message: str, retry_after=None) -> ApiError:

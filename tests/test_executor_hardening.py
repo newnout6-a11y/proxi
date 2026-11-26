@@ -4,6 +4,7 @@ import json
 import pytest
 
 import executor
+import journal
 from executor import PolicyError, check_policy, clean_env, split_segments
 
 DEFAULTS = [
@@ -83,6 +84,18 @@ def test_audit_redacts_command_and_records_error(tmp_path):
     record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
     assert "ghp_Abcdefghijklmnopqrst" not in record["cmd"], "raw secret must not reach commands.log"
     assert record["error"] == "WinError 2"
+
+
+def test_audit_masks_configured_literals_in_command_and_error(tmp_path, monkeypatch):
+    secret = "opaque-application-value-012345"
+    test_journal = journal.Journal()
+    test_journal.configure({"client_keys": [{"id": "test", "key": secret}]})
+    monkeypatch.setattr(journal, "JOURNAL", test_journal)
+    path = tmp_path / "commands.log"
+    executor._audit(str(path), f"echo {secret}", -1, 0, 0, error=f"could not use {secret}")
+    assert secret not in path.read_text(encoding="utf-8")
+    item = json.loads(path.read_text(encoding="utf-8"))
+    assert item["cmd"] == "echo [redacted]" and item["error"] == "could not use [redacted]"
 
 
 def test_split_segments_still_uses_quote_awareness():

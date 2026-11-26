@@ -89,6 +89,15 @@ _REPLY_BLOCKS = {
     "tool_call": {"toolCallId": str, "toolName": str, "toolInput": dict},
 }
 _NOT_EMPTY = frozenset({"signature", "toolCallId", "toolName"})
+# Block types accepted since the stamp was first taken, checked like the ones above but left out of the stamp. A file that
+# older code wrote cannot hold one, so accepting it changes nothing such a file holds: with a new stamp every stored
+# conversation would be dropped unread as `format`, and the next turn of each would write its whole prefix again. A file
+# that holds one and is read by an older relay is `corrupt` there, and that conversation alone starts cold. A change to a
+# shape of _REPLY_BLOCKS, which older files hold, still changes the stamp.
+_LATER_BLOCKS = {
+    # Retool's own opaque state of a turn (RedactedRetoolContentsContentBlockSchema: data and responseItemId, required).
+    "redacted_retool_contents": {"data": str, "responseItemId": str},
+}
 
 
 def _blocks_stamp():
@@ -408,7 +417,7 @@ def _thinking_blocks(snapshot):
         content = message.get("content")
         if message.get("role") == "assistant" and isinstance(content, list):
             count += sum(1 for block in content
-                         if isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"))
+                         if isinstance(block, dict) and block.get("type") in native_history.MODEL_STATE_BLOCKS)
     return count
 
 
@@ -462,7 +471,7 @@ def _reply_block(block):
     """A block of an assistant turn the way ReplyCapture records it: typed, with the fields the transport reads."""
     block_type = block.get("type")
     # A type that is no string (a list, an object) is no key to look up: it raised TypeError out of decode().
-    shape = _REPLY_BLOCKS.get(block_type) if isinstance(block_type, str) else None
+    shape = (_REPLY_BLOCKS.get(block_type) or _LATER_BLOCKS.get(block_type)) if isinstance(block_type, str) else None
     return shape is not None and all(
         isinstance(block.get(field), kind) and (block[field] or field not in _NOT_EMPTY)
         for field, kind in shape.items())

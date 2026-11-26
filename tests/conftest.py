@@ -269,6 +269,7 @@ def relay(monkeypatch, tmp_path):
         credits = runtime.credits
         cfg = runtime.cfg
         workspace = tmp_path
+        api_runtime = runtime
 
         def request(self, path, payload=None, *, key=KEY, method=None, headers=None, raw=None):
             body = raw if raw is not None else (json.dumps(payload).encode() if payload is not None else None)

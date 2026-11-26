@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 
 import apierr
+import auth
 import conversation_state
 import credits
 import forced_choice
@@ -45,6 +46,9 @@ MIN_OUTPUT_TOKENS = 16
 _LIVE_EVENTS = frozenset({"credits", "usage", "thinking_heartbeat", "end"})
 # What an attempt that produced only reasoning looks like on the event stream (thinking_only, not content).
 _THINKING_EVENTS = frozenset({"thinking", "thinking_start", "thinking_signature", "thinking_heartbeat"})
+# Retool's blocks of reasoning that come whole and encrypted, without a delta: GPT's reasoning items (redacted_thinking with
+# its responseItemId) and Retool's own opaque state (redacted_retool_contents). Each is a sign that the model reasons.
+_ENCRYPTED_REASONING = frozenset({"redacted_thinking", "redacted_retool_contents"})
 _EMPTY_DUMPED = set()  # (request_purpose, model) pairs whose empty answer is already saved this run
 
 
@@ -62,6 +66,17 @@ def _int_setting(cfg, key, default):
 # These are the pauses before the 1st, 2nd and 3rd retry, on top of the 0.5, 1 and 2 seconds that AttemptBudget.take
 # adds before any further POST of a step.
 RATE_LIMIT_WAITS = (1.5, 3.0, 6.0)
+# An error event that Retool marks isRetryable, before the model gave anything: Retool's own frontend asks the same request
+# again up to three times, 250 ms * 2^n apart (streamWithRetry); so does the relay, on the same account.
+RETRYABLE_WAITS = (0.25, 0.5, 1.0)
+
+# Retool models whose registry entry says supportsFineGrainedStreaming: true (public frontend bundle, 2026-11-18); Retool's
+# own Sandpack agent asks for it on them. With enableFineGrainedStreaming the arguments of a tool call stream in ~18
+# characters every ~50 ms; without it Retool sends the first ~20 characters and holds the rest (16.6 s for a 6 kB Write in
+# probes, minutes on long ones), which the stall watchdog took for a dead stream. It changes nothing in text or thinking.
+FINE_GRAINED_STREAMING_MODELS = frozenset({
+    "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-sonnet-4-6", "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514"})
 
 
 def _refused_for_now(error):
@@ -1194,7 +1209,10 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     body = {"model": model_provider.get("model"),
             "messages": messages,
             "rit": make_rit(messages, tools),
-            "metadata": {"sandpackAgent": True}}
+            # The App Builder marker goes as Retool's own frontend sends it: every one of its requests that carries the
+            # marker also says requestOrigin "Browser" (R2's helpers; its AI monitoring sorts credits by the origin).
+            # Neither rit nor the cache key covers metadata.
+            "metadata": {"sandpackAgent": True, "requestOrigin": "Browser"}}
     resource = model_provider.get("providerResourceName")
     if resource:
         body["providerResourceName"] = resource
@@ -1210,6 +1228,8 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
             (tool_choice or {}).get("function", {}).get("name") if isinstance(tool_choice, dict) else None)
         if choice and choice != "auto":
             body["toolChoice"] = choice
+        if body["model"] in FINE_GRAINED_STREAMING_MODELS:
+            body["enableFineGrainedStreaming"] = True
     if prefix_key:
         body["openAICacheKey"] = prefix_key
     return body
@@ -1259,12 +1279,51 @@ def _bounded_put(loop, queue, item, is_cancelled, max_wait=120.0):
     return True
 
 
+class _AttemptQueue(asyncio.Queue):
+    """The queue between the reader thread of one attempt and its consumer.
+
+    Lines of the answer wait for room (_bounded_put): `maxsize` bounds what a slow consumer makes the relay buffer. The
+    attempt's last items (its end, its error, a cancel) never wait and never take a line's place: put_last appends them
+    past the bound. They took the place of the OLDEST line before, so a consumer that lagged by a full queue lost a text
+    delta, a piece of a call or the metadata, and the turn still ended as a clean stop (A03-02)."""
+
+    def __init__(self, maxsize):
+        super().__init__(maxsize)
+        self._last = False
+
+    def full(self):
+        return not self._last and super().full()
+
+    def put_last(self, item):
+        """Append a terminal item whatever the queue holds (on the queue's loop)."""
+        self._last = True
+        try:
+            self.put_nowait(item)
+        finally:
+            self._last = False
+
 # How providers word a refusal of an input past the model's context window (Retool passes the provider's sentence on).
 _CONTEXT_EXCEEDED = re.compile(r"(?i)exceeds? the context window|context[ _]length[ _]exceeded|maximum context length"
                                r"|prompt is too long|input is too long for")
 
 
 def _error_from_event(event):
+    """The relay's error for an error event of Retool's stream.
+
+    The event's isRetryable (Retool's schema requires it) is kept as error.retryable: Retool's own frontend asks the same
+    request again only when it is true (_stream_body does so, before anything reached the client). A final error that
+    would go out as a 5xx says so to the SDK clients that resend a 5xx (x-should-retry: false): the same request meets the
+    same refusal."""
+    error = _error_of_event(event)
+    retryable = event.get("isRetryable")
+    if isinstance(retryable, bool):
+        error.retryable = retryable
+        if not retryable and error.status >= 500:
+            error.headers["x-should-retry"] = "false"
+    return error
+
+
+def _error_of_event(event):
     message = event.get("error")
     if isinstance(message, dict):
         message = message.get("message")
@@ -1445,11 +1504,25 @@ def _wire_json(body):
         return json.dumps(_without_inf(body), ensure_ascii=True).encode("utf-8")
 
 
+class PingCancelled(InterruptedError):
+    """A keepwarm ping cut by the cancel of the turn on its session, or by the session's close: no failure of the cache."""
+
+
+def _dispatcher(session):
+    """The dispatcher of the session's account: AccountDispatcher names itself the keepalive owner of the refresher of
+    every account it runs. None outside a pool."""
+    return getattr(getattr(getattr(session, "backend", None), "refresher", None), "keepalive_owner", None)
+
+
 def _ping(session, body):
     """Cheap request that re-reads the cached prefix so its TTL does not lapse.
 
     Returns the credits Retool actually billed for the ping (from the usage
-    metadata event), or None when the stream ended without reporting them."""
+    metadata event), or None when the stream ended without reporting them.
+
+    A refusal with an HTTP status is read and let go at once and raised as what it says (_api_error: the account's hourly
+    limit, a plan refusal): an HTTPError holds its socket until the garbage collector comes. A ping that the cancel or the
+    close of its session cuts (RelaySession.cancel aborts it with the turn) raises PingCancelled."""
     payload = ping_body(body)
     # Effort can be part of the provider cache scope. Preserve the exact request
     # settings rather than replacing max with low during a cache refresh.
@@ -1458,38 +1531,68 @@ def _ping(session, body):
     request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
                                      data=_wire_json(payload),
                                      headers=headers, method="POST")
-    response = urllib.request.urlopen(request, timeout=120)
-    abort = lambda: _force_close_response(response)
+    try:
+        response = urllib.request.urlopen(request, timeout=120)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read(16384).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - the status alone still says enough
+            detail = ""
+        finally:
+            exc.close()
+        error = _api_error(exc.code, detail, exc.headers)
+        error.upstream_status = exc.code
+        raise error from None
+    aborted = threading.Event()
+
+    def abort():
+        aborted.set()
+        _force_close_response(response)
     session._active_warm_abort = abort
     actual_credits = None
     complete = False
+    # Whether the model began an answer: an error event before it is a refusal made before generating, which costs
+    # nothing (as in _stream_body).
+    began = False
+    refused = False
     billing_id = "keepwarm:" + uuid.uuid4().hex
     warm_usage = {}
     try:
-        for raw in response:
-            if getattr(session, "_cancelled", False):
-                raise InterruptedError("cache refresh cancelled")
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
-            warm_usage.update(usage)
-            if usage.get("creditsUsed") is not None:
-                reported = console_log.number(usage["creditsUsed"])
-                if reported is not None:
-                    actual_credits = reported
-            if event.get("event") == "error":
-                # Preserve any billed usage attached to the error, without claiming a refreshed TTL.
-                raise _error_from_event(event)
-            if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
-                complete = True
-                break
+        try:
+            for raw in response:
+                if getattr(session, "_cancelled", False):
+                    raise PingCancelled("cache refresh cancelled")
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+                warm_usage.update(usage)
+                if usage.get("creditsUsed") is not None:
+                    reported = console_log.number(usage["creditsUsed"])
+                    if reported is not None:
+                        actual_credits = reported
+                if event.get("event") == "error":
+                    # Preserve any billed usage attached to the error, without claiming a refreshed TTL.
+                    refused = not began and not warm_usage
+                    error = _error_from_event(event)
+                    error.in_stream = True
+                    raise error
+                began = began or event.get("event") in ("content_block_start", "content_block_delta")
+                if event.get("event") == "end_of_stream" or event.get("type") == "end_of_stream":
+                    complete = True
+                    break
+        except PingCancelled:
+            raise
+        except Exception as exc:
+            if aborted.is_set():
+                raise PingCancelled("cache refresh cut by the cancel of its session") from exc
+            raise
     finally:
         if getattr(session, "_active_warm_abort", None) is abort:
             session._active_warm_abort = None
@@ -1504,7 +1607,7 @@ def _ping(session, body):
                 session._keepwarm_cost = getattr(session, "_keepwarm_cost", 0.0) + actual_credits
                 if manager is not None:
                     manager.record_turn(billing_id, actual_credits)
-            else:
+            elif not refused:
                 mark_unknown = getattr(manager, "mark_usage_unknown", None)
                 if mark_unknown:
                     mark_unknown()
@@ -1571,17 +1674,19 @@ _STOP_TEXT = {
     "cache_rewritten": "Прогрев остановлен: пинг перезаписал префикс вместо чтения из кэша",
     "compacted": "Прогрев остановлен: клиент сжал историю диалога и больше не продолжит прежний префикс",
     "too_small": "Прогрев не нужен: префикс меньше 1024 токенов, провайдер его не кэширует",
+    "account_rate_limited": "Прогрев остановлен: у аккаунта кончился часовой лимит Retool, аккаунт отложен",
 }
 
 
-def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen):
-    """The class of one finished upstream attempt: cancelled, error, truncated, content, thinking_only or empty.
+def attempt_outcome(*, cancelled, failed, ended, usable, thinking_seen, timed_out=False):
+    """The class of one finished upstream attempt: timeout, cancelled, error, truncated, content, thinking_only or empty.
 
     One definition for the attempt trace (_stream_body) and for the verdict on a whole turn (iter_events).
     Only `content`, a non-blank text or a finished tool call delivered by a stream that reached its end, is an
-    answer; every other class is a paid attempt that gave the client nothing."""
-    return ("cancelled" if cancelled else "error" if failed else "truncated" if not ended else
-            "content" if usable else "thinking_only" if thinking_seen else "empty")
+    answer; every other class is a paid attempt that gave the client nothing. `timeout` is an attempt the silence
+    watchdog cut (RelaySession.abort_active_turn): its abort lands as a CancelledError, which is not a client that left."""
+    return ("timeout" if timed_out else "cancelled" if cancelled else "error" if failed else
+            "truncated" if not ended else "content" if usable else "thinking_only" if thinking_seen else "empty")
 
 
 def _hit_the_cap(body, flags):
@@ -1761,6 +1866,7 @@ async def _keepwarm(session, cfg):
     try:
         while True:
             busy, seq, touch_at = False, None, None
+            owner = sent_at = None
             context_token = client_context.bind({})
             try:
                 await asyncio.sleep(0.05)
@@ -1829,6 +1935,10 @@ async def _keepwarm(session, cfg):
                 # snapshotting before to_thread so a following turn cannot relabel it.
                 client_context.bind(identity)
                 ping_started = now
+                owner = _dispatcher(session)
+                # When the ping left, on the dispatcher's own clock: a limit it reports is old news for an account that
+                # came back after that (AccountDispatcher.mark_rate_limited).
+                sent_at = owner.clock() if callable(getattr(owner, "clock", None)) else None
                 cycle.pings += 1
                 cycle.idle_pings += 0 if busy else 1
                 loop = asyncio.get_running_loop()
@@ -1880,14 +1990,37 @@ async def _keepwarm(session, cfg):
             except asyncio.CancelledError:
                 cycle.cancelled()
                 return
+            except PingCancelled:
+                # The client cancelled the turn of this session (or the pool closed it) while the ping was out, and the
+                # abort cut the ping with the turn. That is no failure of the cache: neither counted among the five nor
+                # red. Its result is unknown, so it touched nothing; the next look decides (a cancelled turn stops the
+                # cycle as last_turn_failed).
+                if busy and getattr(session, "_turn_seq", 0) == seq:
+                    session._turn_pinged = True
+                retry_at = next_turn_ping = time.time() + PING_RETRY
+                journal.emit("cache.keepwarm", "Пинг прогрева прерван вместе с ходом клиента", "debug", account=account)
             except Exception as exc:
                 if busy and getattr(session, "_turn_seq", 0) == seq:
                     session._turn_pinged = True
+                if apierr.is_account_quota(exc):
+                    # The account's hourly limit: Retool refuses every request on it for a while, a ping as well, and the
+                    # cache window closes long before it lifts. Asked again on the same account 10 and 20 s later, with a
+                    # red line each time, the account was never parked (A03-07). The dispatcher parks it now, as for a
+                    # turn, and the cycle ends: there is nothing to keep warm on it.
+                    if owner is not None and hasattr(owner, "mark_rate_limited"):
+                        try:
+                            owner.mark_rate_limited(session.backend, retry_after=getattr(exc, "retry_after", None),
+                                                    sent_at=sent_at)
+                        except Exception:  # noqa: BLE001 - the cycle ends all the same
+                            pass
+                    cycle.stop("account_rate_limited", retry_after=getattr(exc, "retry_after", None))
+                    return
                 failures = getattr(session, "_warm_failures", 0) + 1
                 session._warm_failures = failures
                 if failures >= 5:
                     journal.emit("cache.keepwarm", _STOP_TEXT["failures"], "warn", account=account)
-                    console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire")
+                    console_log.write("[err] cache keepwarm stopped after five failures; cached prefix may expire",
+                                      kind="cache.keepwarm_stopped", level="warn", account=account)
                     cycle.stop("failures", failures=failures)
                     return
                 failed_at = time.time()
@@ -1907,7 +2040,9 @@ async def _keepwarm(session, cfg):
                              if fits else
                              "Прогрев не удался; повтор не успевает до истечения кэша: %s" % str(exc)[:200],
                              "warn", account=account)
-                console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" % str(exc)[:200])
+                console_log.write("[err] cache keepwarm failed; cached prefix may expire: %s" %
+                                  journal.redact_whole(str(exc))[:200], kind="cache.keepwarm_failed", level="warn",
+                                  account=account)
                 if not fits:
                     cycle.stop("cache_expired", touch_age_seconds=round(failed_at - touch_at), limit=PING_DEADLINE,
                                during_turn=busy, after_failure=True, failures=failures)
@@ -2001,7 +2136,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         req_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None) or "req"
         console_log.write("[%s] [history] native continuation %s thinking=%d tool_calls=%d" % (
             req_id, "forked from the last request" if forked else "restored",
-            sum(b["type"] in ("thinking", "redacted_thinking") for b in replayed),
+            sum(b["type"] in native_history.MODEL_STATE_BLOCKS for b in replayed),
             sum(b["type"] == "tool_call" for b in replayed)))
     else:
         # A one-shot job continues nothing of the session it runs on, so it changes nothing of it either: Codex can run
@@ -2562,27 +2697,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
 
     def hand_off_final(item, queue=None):
         """Land a terminal item (sentinel/error/cancel) without blocking. Safe from
-        any thread; sacrifices one buffered data line if the queue is full."""
+        any thread; it never takes the place of a line (_AttemptQueue.put_last)."""
         queue = queue if queue is not None else holder["queue"]
         if queue is None:
             return
-
-        def _put():
-            try:
-                queue.put_nowait(item)
-                return
-            except asyncio.QueueFull:
-                pass
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                queue.put_nowait(item)
-            except asyncio.QueueFull:
-                pass
         try:
-            loop.call_soon_threadsafe(_put)
+            loop.call_soon_threadsafe(queue.put_last, item)
         except RuntimeError:  # a cancelled daemon reader can outlive the loop
             pass
 
@@ -2591,6 +2711,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         hand_off_final(asyncio.CancelledError())
 
     session._active_direct_abort = abort_direct
+    session._abort_reason = None  # "timeout" once the watchdog aborts this stream (RelaySession.abort_active_turn)
 
     def worker(queue):
         try:
@@ -2625,6 +2746,19 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                                      diagnostic_id=diagnostic, model=body.get("model"),
                                      effort=body.get("reasoningEffort"),
                                      upstream_request_id=exc.headers.get("request-id") or exc.headers.get("x-request-id"))
+                    if auth.cloudflare_challenge(exc.code, exc.headers):
+                        # Cloudflare's challenge in front of Retool: the connection was taken for a bot. The session is
+                        # not the cause, and a renewal would meet the same challenge (and count as a failed sign-in).
+                        journal.emit("upstream.cloudflare_challenge",
+                                     "Retool ответил проверкой Cloudflare (HTTP 403, cf-mitigated: challenge): сессия не "
+                                     "продлевается, это проверка соединения, а не отказ авторизации", "warn",
+                                     model=body.get("model"), account=account_tag(getattr(session, "backend", None)))
+                        error = apierr.upstream_error(
+                            "Retool answered with a Cloudflare challenge (HTTP 403, cf-mitigated: challenge): the relay's "
+                            "connection was taken for a bot; the session is not at fault and was not renewed")
+                        error.upstream_status = exc.code
+                        error.cloudflare_challenge = True
+                        raise error
                     if exc.code in (401, 403) and attempt == 0:
                         attempt = 1
                         # The 401 may come from a header snapshot taken just before
@@ -2696,6 +2830,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
         empty_retries = 0
         max_limit_retries = _int_setting(cfg, "upstream_rate_limit_retries", 3)
         limit_retries = 0
+        retryable_retries = 0
         while True:
             usable = False
             thinking_seen = False
@@ -2705,12 +2840,12 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             held = []
             may_retry = (not service_request and empty_retries < max_empty_retries and budget.remaining > 1)
             yield {"type": "usage_start"}
-            queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
+            queue: asyncio.Queue = _AttemptQueue(maxsize=1024)
             holder["queue"] = queue
             previous_trace = holder.get("trace")
             task = loop.run_in_executor(getattr(loop, "_relay_io_executor", None),
                                         contextvars.copy_context().run, worker, queue)
-            flags = {"budget": budget}
+            flags = {"budget": budget, "model": body.get("model")}
             failure = None
             try:
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
@@ -2756,11 +2891,14 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     200 <= status < 300 if status is not None else getattr(failure, "request_sent", True)))
                 if _refused_for_now(failure) and not flags.get("usage_seen"):
                     possibly_billed = False  # refused before anything was generated: it cost nothing, as an HTTP 429 never does
-                elif (apierr.is_account_quota(failure) and not flags.get("usage_seen")
+                elif (getattr(failure, "in_stream", False) and not flags.get("usage_seen")
                       and not (usable or thinking_seen or spoke or held)):
-                    # The account's hourly limit as an error event inside a 200, before the model gave anything: the same
-                    # refusal as its HTTP 429 form, which costs nothing. Taken for a possible charge, it marked the balance
-                    # unreported, told the client an unknown cost and sent the empty usage event that zeroed the
+                    # An error event that opens the HTTP 200, before the model gave anything and without metadata: a refusal
+                    # made before generating, which costs nothing, as its HTTP form never does. Retool sends the account's
+                    # hourly limit this way, and its provider's refusal of an input past the context window ("Your input
+                    # exceeds the context window", "prompt is too long": probes p21 and p31 of 2026-11-18, both
+                    # isRetryable false and nothing else but end_of_stream). Taken for a possible charge, it marked the
+                    # balance unreported, told the client an unknown cost and sent the empty usage event that zeroed the
                     # conversation's prefix size, so account_rate_limit_wait moved it at once. One that comes after text or
                     # thinking may have been billed, and stays unknown.
                     possibly_billed = False
@@ -2777,9 +2915,11 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     pass
                 trace = holder.get("trace")
                 if trace is not None:
+                    # The client's cancel wins over the watchdog's mark: an attempt both ended is a client that left.
                     outcome = attempt_outcome(
                         cancelled=is_cancelled() or isinstance(failure, asyncio.CancelledError),
-                        failed=bool(failure), ended=flags.get("end"), usable=usable, thinking_seen=thinking_seen)
+                        failed=bool(failure), ended=flags.get("end"), usable=usable, thinking_seen=thinking_seen,
+                        timed_out=getattr(session, "_abort_reason", None) == "timeout" and not is_cancelled())
                     trace.finish(outcome)
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)
@@ -2794,6 +2934,29 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                              "Retool ограничил частоту запросов к моделям (429): повтор на том же аккаунте через %.1f с "
                              "(%d из %d)" % (wait, limit_retries, max_limit_retries), "warn", model=body.get("model"),
                              attempt=budget.used, wait=round(wait, 2), retry=limit_retries, retries=max_limit_retries,
+                             account=account_tag(getattr(session, "backend", None)),
+                             thread=journal.tag(getattr(session, "thread_id", None)))
+                if not await _pause(wait, is_cancelled):
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                text.clear()
+                thinking.clear()
+                holder["response"] = None
+                continue
+            if (getattr(failure, "retryable", None) is True and getattr(failure, "in_stream", False) and not spoke
+                    and not usable and failure.status != 429 and retryable_retries < len(RETRYABLE_WAITS)
+                    and budget.remaining and not is_cancelled()):
+                # Retool said that asking again may well work (isRetryable), and the client has been given nothing of
+                # this attempt: asked again on the same account, as Retool's own frontend does, instead of a 502 the
+                # client would send again in full. A 429 has its own ways: the account's hourly limit moves the turn,
+                # a limit of the moment waits above (RATE_LIMIT_WAITS).
+                wait = RETRYABLE_WAITS[retryable_retries]
+                retryable_retries += 1
+                journal.emit("upstream.retryable_error",
+                             "Retool сообщил о временной ошибке (isRetryable): повтор на том же аккаунте через %.2f с "
+                             "(%d из %d): %s" % (wait, retryable_retries, len(RETRYABLE_WAITS),
+                                                 str(failure.message or "")[:160]),
+                             "warn", model=body.get("model"), attempt=budget.used, wait=wait, retry=retryable_retries,
                              account=account_tag(getattr(session, "backend", None)),
                              thread=journal.tag(getattr(session, "thread_id", None)))
                 if not await _pause(wait, is_cancelled):
@@ -2819,7 +2982,11 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             # asking again pays the same cap for the same nothing (two paid attempts, then a 502).
             capped = _hit_the_cap(body, flags)
             cut = bool(flags.get("cut_calls"))
-            if not usable and saw_end and not capped:
+            # A prompt suggestion is told to stay silent when the next step is not obvious: its empty reply is the
+            # expected answer, kept out of logs/upstream-400. Any other empty reply, a service request's too, is a
+            # case worth one dump.
+            suggestion = client_context.current().get("request_purpose") == "prompt-suggestion"
+            if not usable and saw_end and not capped and not suggestion:
                 _dump_empty_once(payload, flags, cfg, session, body.get("model"))
             if (usable or not saw_end or service_request or not budget.remaining
                     or empty_retries >= max_empty_retries or capped):
@@ -2880,6 +3047,9 @@ def _delta_target(event, current):
 async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=None, *, cache_scope=None):
     started = loop_now()
     think_started = None
+    # Whether the client has been told of the reasoning under way since the model last wrote text or began a call: GPT's
+    # reasoning comes as a run of encrypted blocks, and one status stands for the whole run.
+    reasoning_told = False
     flags = {} if flags is None else flags
     """Consume one attempt's NDJSON lines, yielding normalised events.
 
@@ -2930,7 +3100,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
         except asyncio.TimeoutError:
             if think_started is not None and not text and not stack and not calls:
                 elapsed = loop_now() - think_started
-                console_log.write(f"[{req_id}] Waiting for upstream reasoning output... ({round(elapsed)}s elapsed)")
+                console_log.write(f"[{req_id}] Waiting for upstream reasoning output... ({round(elapsed)}s elapsed)",
+                                  kind="upstream.thinking_heartbeat", level="debug", elapsed_ms=round(elapsed * 1000),
+                                  message=None)
                 journal.emit("upstream.thinking_heartbeat",
                              f"Ожидаем ответ upstream после начала thinking ({round(elapsed)} с)",
                              "debug", elapsed=round(elapsed, 1), thread=journal.tag(req_id))
@@ -2945,7 +3117,8 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             raise item
 
         if cfg.get("direct_raw"):
-            console_log.write("[raw] " + str(item)[:200])
+            console_log.write("[raw] " + journal.redact_whole(str(item))[:200],
+                              kind="upstream.raw_diagnostic", level="debug")
         try:
             event = json.loads(item)
         except Exception:
@@ -2979,12 +3152,33 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
                 # Opus 5.5 streams no thinking text, only this early start and a final
                 # signature; surfacing the start replaces silence with "thinking".
                 think_started = loop_now()
-                console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start")
+                reasoning_told = True
+                console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start",
+                                  kind="upstream.thinking_signal", signal="content_block_start", message=None)
                 journal.emit("upstream.thinking_signal", "Upstream сообщил начало блока thinking", "info",
                              source="upstream", signal="content_block_start", thread=journal.tag(req_id))
                 yield {"type": "thinking_start"}
+            elif event.get("type") in _ENCRYPTED_REASONING:
+                # GPT on Retool streams no reasoning text: each reasoning item comes whole, as one encrypted block, one
+                # every 3.5-12 s (5-10 of them before the first word, 13-70 s in the probes of 2026-11-18), and nothing
+                # else comes meanwhile. The first block of a run is the real sign that the model reasons, as the start of a
+                # thinking block is for Claude: one status for the run, and no text (the data is encrypted; it goes back
+                # upstream with the history, ReplyCapture). Dropped, it left the client without a sign for up to 70 s
+                # and the stall watchdog on its first-token budget.
+                if think_started is None:
+                    think_started = loop_now()
+                if not reasoning_told:
+                    reasoning_told = True
+                    console_log.write(f"[{req_id}] [thinking] started source=upstream event=content_block_start "
+                                      f"block={event.get('type')}", kind="upstream.thinking_signal",
+                                      signal="content_block_start", block=event.get("type"), message=None)
+                    journal.emit("upstream.thinking_signal", "Upstream начал рассуждение: зашифрованный блок без текста",
+                                 "info", source="upstream", signal="content_block_start", block=event.get("type"),
+                                 thread=journal.tag(req_id))
+                    yield {"type": "thinking_start"}
             elif event.get("type") == "tool_call":
                 think_started = None
+                reasoning_told = False
                 if event.get("toolCallId"):
                     current = event["toolCallId"]
                 else:
@@ -3004,9 +3198,10 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             if block == "text":
                 piece = event.get("partialText") or ""
                 if piece and cfg.get("direct_debug") and not text:
-                    console_log.write("[ttft] %.2fs" % (time.time() - started))
+                    console_log.write("[ttft] %.2fs" % (time.time() - started), text_only=True)
                 if piece:
                     text.append(piece)
+                    reasoning_told = False
                     yield {"type": "text", "delta": piece}
             elif block == "thinking":
                 if think_started is None:
@@ -3051,12 +3246,21 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             current = stack[-1] if stack else None
         elif kind == "metadata":
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            served, asked = event.get("model"), flags.get("model")
+            if (isinstance(served, str) and served and isinstance(asked, str) and asked and served != asked
+                    and not served.startswith(asked) and not asked.startswith(served)
+                    and not flags.get("substitution_told")):
+                # The metadata names the model that answered (Retool's schema requires it). Retool can serve another one
+                # than asked (its Ask AI answers every model with gpt-5-nano); a dated name of the same model is no other.
+                flags["substitution_told"] = True
+                journal.emit("upstream.model_substituted", "Retool ответил моделью %s вместо запрошенной %s" % (
+                    served, asked), "warn", requested=asked, served=served, thread=journal.tag(req_id))
             if usage:
                 flags["usage_seen"] = True
                 flags.setdefault("last_usage", {}).update(usage)
             if any(k in usage for k in ("promptTokensReadFromCache", "promptTokensWrittenToCache", "creditsUsed")):
                 console_log.write(monitor.line(req_id, usage, scope=cache_scope) +
-                                  (" " + client_context.label() if client_context.label() else ""))
+                                  (" " + client_context.label() if client_context.label() else ""), kind="cache.summary")
             credits_value = console_log.number(usage.get("creditsUsed"))
             normalized = {target: usage[source] for source, target in (
                 ('inputTokens', 'input_tokens'), ('outputTokens', 'output_tokens'),
@@ -3084,7 +3288,9 @@ async def _drain(cfg, session, queue, text, thinking, param_types=None, flags=No
             elif usage:
                 yield {"type": "usage", "usage": normalized}
         elif kind == "error":
-            raise _error_from_event(event)
+            error = _error_from_event(event)
+            error.in_stream = True  # said by upstream inside its answer, not a read that failed
+            raise error
 
 
 def _http_error(status, detail):

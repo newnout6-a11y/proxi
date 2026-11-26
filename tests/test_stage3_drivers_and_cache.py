@@ -4,12 +4,14 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+from types import SimpleNamespace
 
 import httpx
+import pytest
 
 import config as config_module
 import conversation_state
-from drivers import http_pool
+from drivers import cache_engine, http_pool
 import proxy
 
 
@@ -21,6 +23,86 @@ def _sse_bytes(frames: list[tuple[str | None, dict | str]]) -> bytes:
         data = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
         chunks.append(f"data: {data}\n\n")
     return "".join(chunks).encode("utf-8")
+
+
+@pytest.mark.parametrize("hint", [None, "operator-cache-hint"])
+def test_openrouter_claude_cache_key_never_groups_different_conversations(hint):
+    def cache_key(conversation):
+        body = {"messages": [{"role": "system", "content": "same system text"}]}
+        cache_engine.apply_openai_cache_hints(body, {"preset": "openrouter"},
+                                              SimpleNamespace(_native_conversation_key=conversation),
+                                              "anthropic/claude-sonnet", {"prompt_cache_key": hint})
+        return body.get("prompt_cache_key")
+
+    first = cache_key("chat-1")
+    assert first.startswith("proxi-") and first == cache_key("chat-1")
+    assert first != cache_key("chat-2")
+    assert cache_key(None) is None
+
+
+@pytest.mark.parametrize("preset,model,frames,expected", [
+    ("openai", "gpt-5.4", [
+        (None, {"choices": [{"delta": {"content": "hello"}, "finish_reason": None}]})], 502),
+    ("openai", "gpt-5.4", [
+        (None, {"choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}]})], 200),
+    ("openai-responses", "gpt-5.4", [
+        ("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+        (None, "[DONE]")], 502),
+    ("openai-responses", "gpt-5.4", [
+        ("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+        ("response.completed", {"type": "response.completed", "response": {}})], 200),
+    ("anthropic", "claude-sonnet-4-6", [
+        ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hello"}}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}})], 502),
+    ("anthropic", "claude-sonnet-4-6", [
+        ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hello"}}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ("message_stop", {"type": "message_stop"})], 200),
+], ids=["chat-eof", "chat-finish", "responses-done-only", "responses-completed", "messages-eof", "messages-stop"])
+def test_provider_requires_a_terminal_stream_frame_before_committing_history(monkeypatch, tmp_path, preset, model, frames, expected):
+    monkeypatch.delenv("RELAY_API_KEY", raising=False)
+    sent, saved = [], []
+
+    def handler(request):
+        sent.append(request.method)
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=_sse_bytes(frames))
+
+    monkeypatch.setattr(cache_engine, "record_canonical_reply", lambda *_a, **_k: saved.append(True))
+    path = tmp_path / "config.json"
+    key = "stage3-terminal-frame-test-key"
+    path.write_text(json.dumps({
+        "relay_api_key": key, "workspace_root": str(tmp_path), "conversation_state": False,
+        "project_context": False, "exec_policy": "off", "providers": [
+            {"id": "probe", "preset": preset, "api_key": "stage3-synthetic-upstream-key", "models": [model]}]
+    }), encoding="utf-8")
+    cfg = config_module.load(str(path))
+    cfg["journal_path"] = str(tmp_path / "journal.jsonl")
+    cfg["accounts"][0]["_http_transport"] = httpx.MockTransport(handler)
+    rt = proxy.Runtime(cfg)
+    server = proxy.BoundedServer(("127.0.0.1", 0), proxy.make_handler(rt), threading.BoundedSemaphore(4))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+    try:
+        conn.request("POST", "/v1/chat/completions", json.dumps({
+            "model": "probe/" + model, "messages": [{"role": "user", "content": "Say hello"}],
+        }), {"Authorization": "Bearer " + key, "Content-Type": "application/json", "x-proxi-session-id": "test"})
+        with conn.getresponse() as reply:
+            assert reply.status == expected
+            result = json.loads(reply.read())
+        assert sent == ["POST"]
+        if expected == 200:
+            assert result["choices"][0]["message"]["content"] == "hello"
+        else:
+            assert not saved
+            assert result["error"]["code"] == "upstream_error"
+    finally:
+        conn.close()
+        server.shutdown()
+        server.server_close()
+        rt.close()
 
 
 def test_anthropic_driver_signed_thinking_replay_4point_cache_pdf_and_forced_choice(monkeypatch, tmp_path):

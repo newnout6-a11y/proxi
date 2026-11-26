@@ -6,6 +6,7 @@ import { usePolling } from '../useJournal.js';
 import { Dot, Page, ease } from '../motion.jsx';
 import { Button, CopyButton, Tag, Toggle, useToast } from '../ui.jsx';
 import { fmtInt, fmtTokens, isNum } from '../format.js';
+import { opencodeSnippet, pingModelOf } from '../catalog.js';
 
 // Each group answers one question an operator actually has.
 export const GROUPS = [
@@ -181,15 +182,7 @@ function Connection({ apiKey, overview, onUnauthorized }) {
   const defaultModel = overview?.models?.default || 'claude-opus-5-5';
   const rows = [['OpenAI-совместимый адрес', overview?.connection?.openai_base_url], ['Anthropic-совместимый адрес', overview?.connection?.anthropic_base_url]];
   const session = sessionStatus(overview);
-  const opencodeSnippet = JSON.stringify({
-    provider: {
-      proxi: {
-        npm: '@ai-sdk/openai-compatible',
-        name: 'Proxi Gateway',
-        options: { baseURL: openaiUrl, apiKey: '{env:PROXI_API_KEY}' },
-      },
-    },
-  }, null, 2);
+  const opencodeConfig = opencodeSnippet(openaiUrl, defaultModel);
   const claudeSnippet = `ANTHROPIC_BASE_URL=${anthropicUrl}\nANTHROPIC_AUTH_TOKEN=<ваш_ключ_relay_или_AccessKey>`;
   const codexSnippet = `OPENAI_BASE_URL=${openaiUrl}\nOPENAI_API_KEY=<ваш_ключ_relay_или_AccessKey>\n# модель по умолчанию: ${defaultModel}`;
 
@@ -197,9 +190,16 @@ function Connection({ apiKey, overview, onUnauthorized }) {
     setSyncing(true);
     try {
       const res = await api(apiKey, 'clients/sync-opencode', { method: 'POST', body: {} });
+      // The relay writes OpenCode's file and the DeepSeek Harness profiles; ok holds only when every file was synced, and
+      // written says whether one was rewritten (a list already current is left alone).
+      const harness = (res.result?.harness || []).filter((item) => item && item.error);
+      const files = (res.result?.harness || []).length ? 'opencode.jsonc и профилях DeepSeek Harness' : 'opencode.jsonc';
       toast(res.ok
-        ? { tone: 'success', title: 'OpenCode синхронизирован', text: 'Список моделей обновлён в opencode.jsonc' }
-        : { tone: 'warn', title: 'Синхронизация OpenCode', text: res.reason || res.result?.error || 'Не удалось обновить файл' });
+        ? { tone: 'success', title: 'Клиенты синхронизированы',
+          text: res.written === false ? `Список моделей в ${files} уже актуален: файлы не менялись`
+            : `Список моделей обновлён в ${files}` }
+        : { tone: 'warn', title: 'Синхронизация клиентов',
+          text: res.reason || res.result?.error || (harness.length ? `DeepSeek Harness: ${harness.map((item) => item.error).join(' · ')}` : 'Не удалось обновить файл') });
     } catch (failure) {
       if (failure.status === 401) onUnauthorized();
       else toast({ tone: 'error', title: 'Ошибка синхронизации', text: failure.message });
@@ -214,8 +214,9 @@ function Connection({ apiKey, overview, onUnauthorized }) {
         <h2>Подключение IDE</h2>
         <div className="head-actions">
           <span className="status" title={session.title}><Dot tone={session.tone} />{session.text}</span>
-          <Button icon={RefreshCw} disabled={syncing} onClick={syncOpenCode}>
-            {syncing ? 'Синхронизация…' : 'Синхр. OpenCode'}
+          <Button icon={RefreshCw} disabled={syncing} onClick={syncOpenCode}
+            title="Переписывает список моделей relay в opencode.jsonc и в профилях DeepSeek Harness (с резервной копией)">
+            {syncing ? 'Синхронизация…' : 'Синхр. OpenCode и Harness'}
           </Button>
         </div>
       </div>
@@ -231,8 +232,8 @@ function Connection({ apiKey, overview, onUnauthorized }) {
         <summary>Готовые конфиги для OpenCode, Claude Code и Codex CLI</summary>
         <div className="snippet-grid">
           <div className="snippet-box">
-            <div className="snippet-head"><strong>OpenCode (opencode.jsonc)</strong><CopyButton value={opencodeSnippet} label="Копировать конфиг OpenCode" /></div>
-            <pre>{opencodeSnippet}</pre>
+            <div className="snippet-head"><strong>OpenCode (opencode.jsonc)</strong><CopyButton value={opencodeConfig} label="Копировать конфиг OpenCode" /></div>
+            <pre>{opencodeConfig}</pre>
           </div>
           <div className="snippet-box">
             <div className="snippet-head"><strong>Claude Code (.env / settings)</strong><CopyButton value={claudeSnippet} label="Копировать конфиг Claude Code" /></div>
@@ -291,7 +292,7 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
 
   const all = data?.data || [];
   const routableList = all.filter((m) => m.routable);
-  const activePingModel = pingTarget || data?.default_model || routableList[0]?.id || '';
+  const activePingModel = pingModelOf(data, pingTarget);
   const items = all.filter((model) => (!onlyRoutable || model.routable)
     && (!query || `${model.id} ${model.label} ${model.provider}`.toLowerCase().includes(query.toLowerCase())));
   // The default model leads; a long catalog is folded unless searched or expanded.
@@ -301,9 +302,16 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
   async function refreshAllCatalog() {
     setRefreshing(true);
     try {
-      await api(apiKey, 'catalog/refresh', { method: 'POST', body: {} });
+      // The relay re-reads /models of the universal providers and models.dev here; Retool's and Minara's catalogs it
+      // reads on its own schedule (retool_catalog_refresh_hours, minara_catalog_refresh_hours), not on this button.
+      const res = await api(apiKey, 'catalog/refresh', { method: 'POST', body: {} });
       await loadCatalog();
-      toast({ tone: 'success', title: 'Каталог обновлён' });
+      const failed = Object.entries(res?.providers || {}).filter(([, info]) => info && info.ok === false);
+      toast(res && res.ok === false
+        ? { tone: 'warn', title: 'Каталог обновляется', text: res.error || 'Обновление ещё идёт' }
+        : failed.length
+          ? { tone: 'warn', title: 'Каталог провайдеров обновлён не полностью', text: failed.map(([pid, info]) => `${pid}: ${info.error || 'ошибка'}`).join(' · ') }
+          : { tone: 'success', title: 'Каталог провайдеров обновлён', text: 'Перечитаны /models API-провайдеров и models.dev; модели Retool и Minara relay перечитывает сам по расписанию' });
     } catch (failure) {
       if (failure.status === 401) onUnauthorized();
       else toast({ tone: 'error', title: 'Не удалось обновить каталог', text: failure.message });
@@ -343,8 +351,9 @@ function Catalog({ apiKey, onUnauthorized, onData }) {
             <input type="checkbox" checked={onlyRoutable} onChange={(e) => setOnlyRoutable(e.target.checked)} />
             <span>Только с маршрутом</span>
           </label>
-          <Button icon={RefreshCw} disabled={refreshing} onClick={refreshAllCatalog}>
-            {refreshing ? 'Обновление…' : 'Обновить'}
+          <Button icon={RefreshCw} disabled={refreshing} onClick={refreshAllCatalog}
+            title="Перечитать /models API-провайдеров и models.dev; модели Retool и Minara relay перечитывает сам по расписанию">
+            {refreshing ? 'Обновление…' : 'Обновить провайдеров'}
           </Button>
         </div>
       </div>

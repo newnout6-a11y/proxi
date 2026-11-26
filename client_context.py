@@ -19,6 +19,7 @@ _USER_ID_LIMIT = 4096
 _CODEX_TURN_LIMIT = 16 * 1024
 _LOCK = threading.Lock()
 _CLIENTS = {"claude-code": "Claude Code", "claude-desktop": "Claude Desktop", "opencode": "OpenCode"}
+_CLIENT_LABELS = {**_CLIENTS, "codex": "Codex", "harness": "DeepSeek Harness"}
 # The client families and the spellings people put into x-proxi-client, as prompt_policy reads them (prompt_policy.CLIENTS,
 # _family: a test keeps the two in step). This module imports no project module, so prompt_policy cannot be imported here.
 FAMILIES = ("opencode", "claude-code", "claude-desktop", "codex", "harness", "unknown")
@@ -33,14 +34,25 @@ def family(value) -> str:
     if name.startswith("codex"):
         return "codex"
     return FAMILY_ALIASES.get(name, "")
+
+
+def transport_family(headers) -> str:
+    """Identify Codex and Harness from their wire metadata, even without a relay plugin."""
+    originator = str(headers.get("originator") or "").strip().lower()
+    agent = str(headers.get("user-agent") or "").strip().lower()
+    if originator.startswith("codex") or agent.startswith("codex") or any(
+            str(key).lower().startswith("x-codex-") for key in headers):
+        return "codex"
+    return "harness" if agent.startswith("deepseek-harness/") else ""
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 _READ_LIMIT = 256 * 1024
 # Lookups scan local client folders on the request path. A found title is
 # re-read soon enough to show renames; a miss is retried less often.
 _TITLE_TTL = 15
 _MISS_TTL = 30
-SERVICE_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe"})
+SERVICE_KINDS = frozenset({"auto-mode-check", "session-title", "connection-probe", "prompt-suggestion"})
 CLIENT_TEXT_KINDS = SERVICE_KINDS | {"client-text"}
+SUGGESTION_PREFIX = "[SUGGESTION MODE:"
 # x-claude-code-request-class values whose system prompt is the client's own
 # output contract (summaries, titles, classifiers), never the chat the relay
 # policy is written for. The header needs CLAUDE_CODE_GATEWAY_HINT_HEADERS=1.
@@ -167,8 +179,23 @@ def keeps_client_prompt(purpose, identity=None):
     return purpose in SERVICE_KINDS or info.get("request_class") in OWN_PROMPT_CLASSES
 
 
+def is_prompt_suggestion(parsed):
+    """True for Claude Code / Claude Desktop next-prompt suggestion side requests ([SUGGESTION MODE: ...])."""
+    for block in _last_user_blocks(parsed):
+        if block.lstrip().startswith(SUGGESTION_PREFIX):
+            return True
+    for text in _trailing_user_texts(parsed):
+        stripped = text.lstrip()
+        if stripped.startswith(_REMINDER_PREFIX):
+            continue
+        return stripped.startswith(SUGGESTION_PREFIX)
+    return False
+
+
 def request_kind(parsed, identity=None):
     """Describe known client calls; prompt length alone says nothing about purpose."""
+    if is_prompt_suggestion(parsed):
+        return "prompt-suggestion"
     if getattr(parsed, "tools", None):
         return "client-tools"
     system = (getattr(parsed, "system", "") or "").lstrip()
@@ -332,9 +359,14 @@ def reset(token):
 
 def label(identity=None):
     info = current() if identity is None else identity
-    client = _CLIENTS.get(info.get("client"), clean(info.get("client"), 60))
+    name = log_client(info)
+    client = _CLIENT_LABELS.get(name, clean(name, 60))
     title = clean(info.get("chat_title"))
     return " · ".join(part for part in (client, "«%s»" % title if title else "") if part)
+
+
+def log_client(identity):
+    return identity.get("client") or identity.get("wire_client")
 
 
 def _json_lines(path):
@@ -525,6 +557,11 @@ def describe(data, headers, cfg=None):
                                        headers.get("x-opencode-parent-session-id") or
                                        metadata.get("parent_session_id") or
                                        identity.get("parent_session_id"), 160)}.items() if value}
+    if not client:
+        # Logs can identify another wire client without changing how request_kind or affinity uses this identity.
+        wire = transport_family(headers)
+        if wire:
+            info["wire_client"] = wire
     if not title and session_id and client in _CLIENTS:
         home = Path((cfg or {}).get("client_metadata_home") or Path.home()).resolve()
         info.update(_local_title(client, session_id, home))

@@ -426,12 +426,14 @@ class OpenAIChatDriver(UpstreamDriver):
                 tool_calls_by_idx: dict[int, dict] = {}
                 finish_reason: str | None = None
                 latest_usage: dict | None = None
+                saw_done = False
 
                 async for _ev_name, data_str in sse_utils.aiter_sse_events(resp.aiter_bytes(), label=cfg.get("provider_name") or "OpenAI"):
                     if getattr(session, "_cancelled", False):
                         yield {"type": "end", "reason": "cancelled"}
                         return
                     if data_str.strip() == "[DONE]":
+                        saw_done = True
                         break
                     try:
                         chunk = sse_utils.bounded_json(data_str)
@@ -517,6 +519,12 @@ class OpenAIChatDriver(UpstreamDriver):
                         finish_reason = _FINISH_MAP.get(fr, "stop")
 
                 # Finalize tool calls & record canonical history
+                if getattr(session, "_cancelled", False):
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                if finish_reason is None and not saw_done:
+                    raise apierr.upstream_error("Upstream Chat Completions stream ended before its terminal frame")
+
                 reply_blocks: list[dict] = []
                 full_thinking = "".join(thinking_chunks)
                 if full_thinking or reasoning_details_acc:

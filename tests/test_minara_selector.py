@@ -232,7 +232,8 @@ async def collect(cfg, session, provider, tools=None, choice=None):
 
 def test_a_channel_failure_is_asked_again_before_anything_is_generated():
     answers = [Response(500, b'{"error":{"code":"channel_selection_error","message":"Unable to route model x"}}'),
-               Response(503, b''), Response(200, lines=stream_chunks({'content': 'OK'}))]
+               Response(503, b'{"error":{"code":"no_enabled_channel"}}'),
+               Response(200, lines=stream_chunks({'content': 'OK'}))]
     posts = []
 
     def post(*args, **kwargs):
@@ -241,6 +242,36 @@ def test_a_channel_failure_is_asked_again_before_anything_is_generated():
     session = types.SimpleNamespace(backend=types.SimpleNamespace(_minara_post=post), _cancelled=False)
     events = asyncio.run(collect({'minara_channel_retry_delays': [0, 0]}, session, {'model': 'openai/x'}))
     assert [e['delta'] for e in events if e['type'] == 'text'] == ['OK'] and len(posts) == 3
+
+
+@pytest.mark.parametrize("status,body,code,http", [
+    (524, b"", "upstream_timeout", 504),
+    (524, b"<html>Gateway timeout</html>", "upstream_timeout", 504),
+    (504, b"", "upstream_timeout", 504),
+    (503, b"", "service_unavailable", 503),
+])
+def test_an_ambiguous_minara_http_error_never_starts_a_second_generation(status, body, code, http):
+    answers = [Response(status, body), Response(200, lines=stream_chunks({"content": "should not run"}))]
+
+    def post(*args, **kwargs):
+        return answers.pop(0)
+
+    session = types.SimpleNamespace(backend=types.SimpleNamespace(_minara_post=post), _cancelled=False)
+    with pytest.raises(apierr.ApiError) as raised:
+        asyncio.run(collect({"minara_channel_retry_delays": [0]}, session, {"model": "openai/x"}))
+    assert raised.value.code == code and raised.value.status == http
+    assert raised.value.upstream_status == status and raised.value.unbilled is False
+    assert len(answers) == 1
+
+
+def test_the_first_sse_error_is_explained_without_reposting_a_paid_request():
+    failure = json.dumps({"error": {"message": "provider connection closed after accepting the request"}})
+    answers = [Response(200, lines=[failure]), Response(200, lines=stream_chunks({"content": "should not run"}))]
+    session = types.SimpleNamespace(backend=types.SimpleNamespace(_minara_post=lambda *a, **kw: answers.pop(0)),
+                                    _cancelled=False)
+    with pytest.raises(apierr.ApiError, match="provider connection closed"):
+        asyncio.run(collect({"minara_channel_retry_delays": [0]}, session, {"model": "openai/x"}))
+    assert len(answers) == 1
 
 
 def test_a_lasting_channel_failure_is_a_503_with_retry_after_and_a_real_refusal_stays_400():
@@ -313,6 +344,24 @@ def test_an_unreadable_balance_is_unknown_not_zero():
         raise ConnectionError('down')
     info = accounts.MinaraAccount({'bearer_token': 't'}, fetch=fetch).get_balance()
     assert info['available'] is None and info['error'] == 'ConnectionError'
+
+
+def test_sequential_forced_balance_reads_work_on_the_same_clock_tick(monkeypatch):
+    # Windows Python 3.12's monotonic clock commonly gives the same value to all three reads.
+    monkeypatch.setattr(accounts, "time", types.SimpleNamespace(monotonic=lambda: 100, time=lambda: 1000))
+    results = iter([ConnectionError("down"), 210, 220])
+
+    def fetch():
+        value = next(results)
+        if isinstance(value, Exception):
+            raise value
+        return {"creditBalanceBreakdown": {"plan": value}}
+
+    manager = accounts.MinaraAccount({"bearer_token": "fake"}, fetch=fetch)
+    assert manager.get_balance()["error"] == "ConnectionError"
+    assert manager.get_balance(force_refresh=True)["available"] == 210
+    assert manager.get_balance(force_refresh=True)["available"] == 220
+    assert manager.get_balance()["available"] == 220
 
 
 class Backend:

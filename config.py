@@ -71,6 +71,8 @@ DEFAULTS = {
     "stream_first_token_timeout": 300,
     "stream_idle_timeout": 120,
     "stream_tool_timeout": 600,
+    # The budget once the upstream said the model is thinking in silence (stream_watchdog.DEFAULT_THINKING_TIMEOUT).
+    "stream_thinking_timeout": 900,
     "upstream_timeout": 120,
     "session_refresh_interval": 900,
     "command_timeout": 300,
@@ -90,9 +92,6 @@ DEFAULTS = {
     "enable_anthropic": True,
     "enable_chat": True,
     "show_thinking": True,
-    # OpenAI-compatible clients open a reasoning view only on non-empty text; Opus 5.5
-    # reasons silently, so this label is shown when thinking starts ("" disables it).
-    "thinking_placeholder": "Модель думает…\n",
     "enable_responses": True,
     "reasoning_effort": "auto",
     "allow_effort_downgrade": False,
@@ -115,6 +114,23 @@ DEFAULTS = {
     # (client_task "background"), about 5 credits each on gpt-6.1-terra. False answers them with a 400 before anything is
     # spent, so Codex makes no memories until they are switched on again; a switch in the admin, applied at once.
     "codex_memory_jobs": True,
+    # Claude Desktop / Claude Code [SUGGESTION MODE: ...] side requests, run alone (a background job: no tools, no thinking,
+    # the conversation's tail) on the lowest level of their model: "auto" takes the first of claude-haiku-4-5-20251001,
+    # minara/claude-haiku-4-5, gpt-5-nano, zai-org/GLM-5.3-Flash that the catalog has and an account can take now, else the
+    # chat's model; "same" keeps the chat's own model; a model id takes that one (proxy.Handler._optimize_prompt_suggestion).
+    "prompt_suggestion_model": "auto",
+    # The cost guard (cost_guard.py): a Minara request is priced before it is sent, with the formula of its debit. "block"
+    # refuses one above a ceiling (400 cost_limit_exceeded, 429 for the hour), "warn" only says so, "off" prices nothing.
+    # Ceilings in Minara credits (220 per dollar), 0 for none: one request (the owner's dearest was 1,195; three agent forks
+    # cost 1,925 to 3,533), a sliding hour over all Minara accounts (a guard against loops: the owner's busiest hour was
+    # 6,373), and the estimate from which a request is named in the console and the journal (the owner's p99 is 250).
+    # Default "warn" until the estimate is calibrated on live traffic (journal cost.estimate_vs_actual): the review of
+    # 2026-11-19 found it priced a moved conversation cold (non-Claude cache is shared across Minara accounts) and a prompt
+    # suggestion by the whole dialog, so "block" could refuse a real session of the owner.
+    "cost_guard": "warn",
+    "cost_guard_request_minara": 1500,
+    "cost_guard_hour_minara": 12000,
+    "cost_guard_warn_minara": 300,
     # true: /codex/models lists GPT models only (Retool's and Minara's), so Codex's picker shows no Claude, GLM or Gemini
     # route (the owner's config sets it, 2026-11-10).
     "codex_catalog_gpt_only": False,
@@ -234,7 +250,7 @@ JOURNAL_NUMBERS = ("journal_max_file_bytes", "journal_keep_files")
 # hourly limit: whole numbers of seconds, checked the same way.
 POOL_NUMBERS = ("conversation_wait", "account_rate_limit_wait")
 # Silence timeouts for stream_watchdog (whole seconds, 0 disables, up to 24h).
-STREAM_TIMEOUTS = ("stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout")
+STREAM_TIMEOUTS = ("stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout", "stream_thinking_timeout")
 STREAM_TIMEOUT_MAX = 86400
 
 # Cookie values that are just host names are not secrets.
@@ -822,6 +838,12 @@ def _load(path):
         raise service_unavailable("compaction_keep_effort must be a boolean")
     if type(cfg["codex_memory_jobs"]) is not bool:
         raise service_unavailable("codex_memory_jobs must be a boolean")
+    if cfg["cost_guard"] not in ("off", "warn", "block"):
+        raise service_unavailable('cost_guard must be "off", "warn" or "block"')
+    for key in ("cost_guard_request_minara", "cost_guard_hour_minara", "cost_guard_warn_minara"):
+        value = cfg[key]
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 10_000_000:
+            raise service_unavailable("%s must be a number of Minara credits from 0 to 10000000 (0: no ceiling)" % key)
     if type(cfg["codex_catalog_gpt_only"]) is not bool:
         raise service_unavailable("codex_catalog_gpt_only must be a boolean")
     if type(cfg["codex_compaction_cache"]) is not bool:
@@ -995,6 +1017,7 @@ def _load(path):
     cfg['_minara_models'] = models.build_minara_catalog(accounts if accounts is not None else [cfg])
     cfg['_provider_models'] = catalog_router.build_provider_catalog(cfg)
     cfg['_route_aliases'] = catalog_router.build_route_aliases(cfg, models)
+    warnings.extend(cfg.get('_route_warnings') or [])  # routes[] targets that are no known model (A08-04)
     if 'model' not in saved and not any(
         isinstance(a, dict) and a.get('upstream', 'retool') == 'retool'
         for a in (accounts if isinstance(accounts, list) else ([] if cfg.get('_empty_pool') else [cfg]))

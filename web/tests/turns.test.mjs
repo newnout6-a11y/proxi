@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { STALE_AFTER, STALE_MARGIN, TASK_LABEL, buildTraces, costOf, effortText, phasesOf, scaleOf, speedOf, staleLimit, statusAt } from '../src/turns.js';
+import { STALE_AFTER, STALE_MARGIN, TASK_LABEL, buildTraces, costOf, effortText, isUsdOnly, phasesOf, scaleOf, shownCost, speedOf, staleLimit, statusAt } from '../src/turns.js';
 import { fmtSpeed } from '../src/format.js';
 import { MIN_FORECAST_SECONDS, burnRate, coverageOf, coveredSeconds, fmtSince, fmtSpan, uncoveredBuckets } from '../src/coverage.js';
 
@@ -590,4 +590,21 @@ test('a universal provider turn is priced in USD (cost_usd) without marking cred
   assert.equal(two.usd, 0.004);
   assert.equal(two.credits, null);
   assert.equal(two.complete, true);
+  assert.equal(isUsdOnly(cost), true);
+  assert.equal(shownCost(cost), 0.0042);
+});
+
+// The relay writes a Minara reply with its price twice: Minara's credits and the same money in dollars (cost_usd, since the
+// USD ledger). Read as two prices, the dollars were a second spend (audit A07-02); a provider reply has dollars alone.
+test('the dollars of a Minara reply are the same money as its Minara credits, not a second price', () => {
+  const REAL = (n, minara, usd) => USAGE(n, null, { credits_reported: false, minara_credits: minara, cost_usd: usd });
+  const cost = costOf(turnOf([START(1), REAL(1, 11, 0.05), END()]));
+  assert.deepEqual(cost, { credits: null, minara: 11, unknown: 0, running: false, complete: true });
+  assert.equal(isUsdOnly(cost), false);
+  assert.equal(shownCost(cost), 11);
+  // A failover from Minara to a provider within one turn: each attempt in its own currency.
+  const mixed = costOf(turnOf([START(1), REAL(1, 2.2, 0.01), START(2),
+    USAGE(2, null, { credits_reported: false, minara_credits: null, cost_usd: 0.03 }), END()]));
+  assert.equal(mixed.minara, 2.2);
+  assert.equal(mixed.usd, 0.03);
 });

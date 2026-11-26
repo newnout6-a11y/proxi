@@ -5,27 +5,7 @@ import { usePolling } from '../useJournal.js';
 import { Dot } from '../motion.jsx';
 import { Button, CopyButton, Tag, Toggle, useToast } from '../ui.jsx';
 import { fmtFixed, fmtInt, isNum } from '../format.js';
-
-const EMPTY_PROVIDER = {
-  preset: 'openrouter',
-  name: 'OpenRouter',
-  id: 'openrouter',
-  driver: 'openai-chat',
-  base_url: 'https://openrouter.ai/api/v1',
-  auth_mode: 'bearer',
-  auth_header_name: '',
-  api_keys_text: '',
-  api_key_env: '',
-  routing_strategy: 'fill-first',
-  cache_policy: 'auto',
-  proxy_url: '',
-  auto_discover: true,
-  models_text: '',
-  whitelist_text: '',
-  blacklist_text: '',
-  headers_text: '',
-  body_overrides_text: '',
-};
+import { EMPTY_PROVIDER, buildProviderPayload, presetMatchesUrl, providerToForm } from '../providerForm.js';
 
 const DRIVER_LABELS = {
   'openai-chat': 'OpenAI Chat Completions',
@@ -52,98 +32,14 @@ const ROUTE_STRATEGY_LABELS = {
   'least-inflight': 'least-inflight (наименее занятый)',
 };
 
-function parseListInput(text) {
-  const trimmed = (text || '').trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith('[')) {
-    const parsed = JSON.parse(trimmed);
-    if (!Array.isArray(parsed)) throw new Error('Ожидается JSON-массив');
-    return parsed;
-  }
-  return trimmed.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
-}
-
-function parseJsonObject(text, fieldName) {
-  const trimmed = (text || '').trim();
-  if (!trimmed) return undefined;
-  let parsed;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    throw new Error(`Поле «${fieldName}» должно быть корректным JSON-объектом`);
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`Поле «${fieldName}» должно быть JSON-объектом`);
-  }
-  return parsed;
-}
-
-function providerToForm(prov) {
-  const envFromCred = prov.credentials?.length === 1 ? prov.credentials[0].api_key_env || '' : '';
-  return {
-    preset: prov.preset || '',
-    name: prov.name || prov.id,
-    id: prov.id,
-    driver: prov.driver || 'openai-chat',
-    base_url: prov.base_url || '',
-    auth_mode: prov.auth_mode || 'bearer',
-    auth_header_name: prov.auth_header_name || '',
-    api_keys_text: '',
-    api_key_env: envFromCred,
-    routing_strategy: prov.routing_strategy || 'fill-first',
-    cache_policy: prov.cache_policy || 'auto',
-    proxy_url: prov.proxy_url || '',
-    auto_discover: prov.auto_discover !== false,
-    models_text: Array.isArray(prov.models) && prov.models.length
-      ? (prov.models.every((m) => typeof m === 'string') ? prov.models.join(', ') : JSON.stringify(prov.models))
-      : (prov.models && Object.keys(prov.models).length ? JSON.stringify(prov.models) : ''),
-    whitelist_text: (prov.model_whitelist || []).join(', '),
-    blacklist_text: (prov.model_blacklist || []).join(', '),
-    headers_text: '',
-    body_overrides_text: prov.body_overrides && Object.keys(prov.body_overrides).length
-      ? JSON.stringify(prov.body_overrides, null, 2) : '',
-  };
-}
-
-function buildProviderPayload(form, editingId) {
-  const keys = form.api_keys_text.split('\n').map((s) => s.trim()).filter(Boolean);
-  const env = form.api_key_env.trim();
-  const payload = {
-    name: form.name.trim() || form.id.trim(),
-    driver: form.driver,
-    base_url: form.base_url.trim(),
-    auth_mode: form.auth_mode,
-    routing_strategy: form.routing_strategy,
-    cache_policy: form.cache_policy,
-    auto_discover: !!form.auto_discover,
-    proxy_url: form.proxy_url.trim() || null,
-  };
-  if (!editingId && form.id.trim()) payload.id = form.id.trim().toLowerCase();
-  if (form.preset) payload.preset = form.preset;
-  if (form.auth_mode === 'custom-header') payload.auth_header_name = form.auth_header_name.trim();
-
-  if (form.auth_mode !== 'none') {
-    if (keys.length > 1) {
-      payload.credentials = keys.map((k) => ({ api_key: k }));
-    } else if (keys.length === 1) {
-      payload.api_key = keys[0];
-    } else if (env) {
-      payload.api_key_env = env;
-    } else if (!editingId) {
-      throw new Error('Укажите хотя бы один API-ключ или имя переменной окружения');
-    }
-  }
-
-  const manualModels = parseListInput(form.models_text);
-  payload.models = manualModels || [];
-  payload.model_whitelist = parseListInput(form.whitelist_text);
-  payload.model_blacklist = parseListInput(form.blacklist_text);
-
-  const headers = parseJsonObject(form.headers_text, 'Доп. заголовки');
-  if (headers !== undefined) payload.headers = headers;
-  const overrides = parseJsonObject(form.body_overrides_text, 'Body overrides');
-  if (overrides !== undefined) payload.body_overrides = overrides;
-  return payload;
+// What a save or a refresh of /models says beyond "done": the error of a provider whose /models did not answer, and a
+// restart the relay asks for when it could not take the provider in live (the answer carries both; they were dropped).
+function discoveryNote(result, pid) {
+  const info = result?.discovery?.providers?.[pid];
+  const notes = [];
+  if (info && info.ok === false) notes.push(`/models не прочитан: ${info.error || 'ошибка запроса'}`);
+  if (result?.restart_required) notes.push('подключится после перезапуска relay');
+  return notes.join(' · ');
 }
 
 function ProviderForm({ presets, editing, onCancel, onSaved, apiKey, onUnauthorized }) {
@@ -156,7 +52,16 @@ function ProviderForm({ presets, editing, onCancel, onSaved, apiKey, onUnauthori
 
   const set = (key) => (e) => {
     const val = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
-    setForm((prev) => ({ ...prev, [key]: val }));
+    setForm((prev) => {
+      const next = { ...prev, [key]: val };
+      // A base URL moved off the preset's host is a provider of its own: the preset (and its balance endpoint, which
+      // would get this provider's key) no longer applies.
+      if (key === 'base_url' && prev.preset) {
+        const spec = presets.find((p) => p.id === prev.preset);
+        if (spec && !presetMatchesUrl(spec, val)) next.preset = '';
+      }
+      return next;
+    });
     setFormError('');
   };
 
@@ -186,7 +91,7 @@ function ProviderForm({ presets, editing, onCancel, onSaved, apiKey, onUnauthori
     setProbe(null);
     let payload;
     try {
-      payload = buildProviderPayload(form, editing?.id || null);
+      payload = buildProviderPayload(form, editing?.id || null, presets);
       if (editing?.id) payload.provider_id = editing.id;
     } catch (err) {
       setFormError(err.message);
@@ -209,7 +114,7 @@ function ProviderForm({ presets, editing, onCancel, onSaved, apiKey, onUnauthori
     setFormError('');
     let payload;
     try {
-      payload = buildProviderPayload(form, editing?.id || null);
+      payload = buildProviderPayload(form, editing?.id || null, presets);
     } catch (err) {
       setFormError(err.message);
       return;
@@ -219,10 +124,11 @@ function ProviderForm({ presets, editing, onCancel, onSaved, apiKey, onUnauthori
       const result = editing
         ? await api(apiKey, `providers/${editing.id}`, { method: 'PATCH', body: payload })
         : await api(apiKey, 'providers', { method: 'POST', body: payload });
+      const note = discoveryNote(result, result.provider.id);
       toast({
-        tone: 'success',
+        tone: note ? 'warn' : 'success',
         title: editing ? 'Провайдер обновлён' : 'Провайдер подключён',
-        text: `${result.provider.name}: моделей в каталоге — ${fmtInt(result.provider.published_models_count)}`,
+        text: `${result.provider.name}: моделей в каталоге — ${fmtInt(result.provider.published_models_count)}${note ? ` · ${note}` : ''}`,
       });
       onSaved();
     } catch (failure) {
@@ -332,7 +238,7 @@ function ProviderForm({ presets, editing, onCancel, onSaved, apiKey, onUnauthori
         <summary>Расширенные настройки (ручные модели, фильтры, прокси, заголовки)</summary>
         <div className="form-grid gw-details-body">
           <label className="field field-wide">
-            <span>Ручные модели (ID через запятую или JSON-массив)</span>
+            <span>Ручные модели (ID через запятую, JSON-массив или объект OpenCode)</span>
             <input value={form.models_text} onChange={set('models_text')} placeholder="deepseek/deepseek-chat-v3, anthropic/claude-sonnet-4-5" spellCheck={false} />
           </label>
           <label className="field">
@@ -348,7 +254,9 @@ function ProviderForm({ presets, editing, onCancel, onSaved, apiKey, onUnauthori
             <input value={form.proxy_url} onChange={set('proxy_url')} placeholder="socks5://127.0.0.1:1080" spellCheck={false} />
           </label>
           <label className="field">
-            <span>Доп. HTTP-заголовки (JSON)</span>
+            <span>{form.saved_headers?.length
+              ? `Доп. HTTP-заголовки (JSON): добавить к сохранённым ${form.saved_headers.join(', ')}; null удаляет`
+              : 'Доп. HTTP-заголовки (JSON)'}</span>
             <textarea rows={2} value={form.headers_text} onChange={set('headers_text')} placeholder={'{"HTTP-Referer": "https://localhost"}'} spellCheck={false} />
           </label>
           <label className="field">
@@ -516,7 +424,12 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
               <Button icon={RefreshCw} disabled={!!busy.refreshAll}
                 onClick={() => withBusy('refreshAll', async () => {
                   const res = await api(apiKey, 'catalog/refresh', { method: 'POST', body: {} });
-                  toast({ tone: 'success', title: 'Каталог обновлён', text: `Всего моделей провайдеров: ${fmtInt(res.total_models)}` });
+                  const failed = Object.entries(res.providers || {}).filter(([, info]) => info && info.ok === false);
+                  toast(!res.ok
+                    ? { tone: 'warn', title: 'Каталог обновляется', text: res.error || 'Обновление ещё идёт' }
+                    : failed.length
+                      ? { tone: 'warn', title: 'Каталог обновлён не полностью', text: failed.map(([pid, info]) => `${pid}: ${info.error || 'ошибка'}`).join(' · ') }
+                      : { tone: 'success', title: 'Каталог обновлён', text: `Всего моделей провайдеров: ${fmtInt(res.total_models)}` });
                 })}>
                 Обновить /models
               </Button>
@@ -572,13 +485,14 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
                     disabled={!!busy[`prov:${prov.id}`]}
                     onChange={(enabled) => withBusy(`prov:${prov.id}`, () => api(apiKey, `providers/${prov.id}`, { method: 'PATCH', body: { enabled } }))}
                   />
-                  <Button icon={RefreshCw} disabled={!!busy[`disc:${prov.id}`]}
+                  <Button icon={RefreshCw} disabled={!!busy[`disc:${prov.id}`] || prov.enabled === false}
+                    title={prov.enabled === false ? 'Провайдер выключен: его /models не читается' : undefined}
                     onClick={() => withBusy(`disc:${prov.id}`, async () => {
                       const res = await api(apiKey, `providers/${prov.id}/discover`, { method: 'POST', body: {} });
                       const info = res.providers?.[prov.id];
                       toast(info?.ok
                         ? { tone: 'success', title: `${prov.name}: /models обновлён`, text: `Найдено моделей: ${fmtInt(info.count)}` }
-                        : { tone: 'warn', title: `${prov.name}: не удалось обновить`, text: info?.error || 'Ошибка запроса' });
+                        : { tone: 'warn', title: `${prov.name}: не удалось обновить`, text: info?.error || res.error || 'Ошибка запроса' });
                     })}>
                     Модели
                   </Button>
@@ -756,7 +670,7 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
                   onChange={(e) => setKeyDraft((d) => ({ ...d, rpm_limit: e.target.value }))} placeholder="60" />
               </label>
               <label className="field">
-                <span>Бюджет в USD (необязательно)</span>
+                <span>Бюджет в USD (необязательно): ходы Minara и API-провайдеров с запуска relay, ходы Retool не входят</span>
                 <input type="number" min="0" step="0.01" value={keyDraft.max_budget_usd}
                   onChange={(e) => setKeyDraft((d) => ({ ...d, max_budget_usd: e.target.value }))} placeholder="10.00" />
               </label>
@@ -781,10 +695,11 @@ export default function GatewayPanels({ apiKey, onUnauthorized, refreshOverview 
                   </div>
                 </div>
                 <div className="gw-meta mono">
-                  <span>
+                  <span title="Счётчики с запуска relay. В долларах — ходы Minara и API-провайдеров; ходы Retool (его кредиты) в расход и бюджет ключа не входят">
                     запросов: <b>{fmtInt(ck.requests)}</b> · потрачено: <b>${fmtFixed(ck.spent_usd, 4)}</b>
                     {isNum(ck.max_budget_usd) && ` из $${fmtFixed(ck.max_budget_usd, 2)}`}
                     {isNum(ck.rpm_limit) && ` · лимит ${fmtInt(ck.rpm_limit)} RPM`}
+                    {' · с запуска relay, без Retool'}
                   </span>
                   {ck.allowed_models?.length > 0 && <span>модели: {ck.allowed_models.join(', ')}</span>}
                 </div>

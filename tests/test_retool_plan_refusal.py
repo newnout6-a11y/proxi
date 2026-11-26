@@ -312,6 +312,88 @@ def test_two_refusing_accounts_and_a_third_that_serves(retool, tmp_path):
     assert set(retool.a.refused_models) == set(retool.b.refused_models) == {OPUS} and third.refused_models == {}
 
 
+def test_more_refusing_accounts_than_attempts_still_reach_the_account_that_serves(retool, tmp_path, monkeypatch):
+    # Live pool of 2026-11-18: claude-opus-5-5 is in the plan of 13 of 65 accounts. Each refusal used to cost one of the
+    # five attempts, so a turn that met five refusing accounts in a row got the refusal as a 502. A refusal is instant and
+    # unbilled: it gives its attempt back.
+    monkeypatch.setattr(upstream_attempts, "MAX_ATTEMPTS", 2)
+    added = []
+    for name in ("acc-c", "acc-d"):
+        backend = Backend(tmp_path, base="https://%s.invalid" % name, account_id=name, transport="direct")
+        backend.headers = lambda: {}
+        retool.pool.backends.append(backend)
+        retool.dispatcher.add_account(backend, None)
+        added.append(backend)
+    retool.script["acc-a"] = retool.script["acc-b"] = retool.script["acc-c"] = refused
+    holder = {}
+    events = asyncio.run(run(retool.runner, turn(), holder))
+    assert retool.posts == ["acc-a", "acc-b", "acc-c", "acc-d"]
+    assert texts(events) == [{"type": "text", "delta": "OK"}] and errors(events) == []
+    assert retool.pool._conversations["conv-1"].backend is added[1]
+    assert holder["_attempt_budget"].refunds == 3
+
+
+def test_a_request_gets_back_at_most_max_refunds_attempts(monkeypatch):
+    monkeypatch.setattr(upstream_attempts, "MAX_REFUNDS", 2)
+    budget = upstream_attempts.AttemptBudget()
+    assert budget.refund() is False  # nothing taken yet: nothing to give back
+    for _ in range(2):
+        budget.take(lambda: False)
+        assert budget.refund() is True and budget.remaining == upstream_attempts.MAX_ATTEMPTS
+    budget.take(lambda: False)
+    assert budget.refund() is False and budget.remaining == upstream_attempts.MAX_ATTEMPTS - 1
+    # A refund gives back the step's attempt, not the POST: `used` counts every POST that left (audit A09-06: after ten
+    # refusals and a failure the client was told upstream_attempts=1 and every attempt was numbered 1). It was (1, 2).
+    assert (budget.used, budget.refunds) == (3, 2)
+
+
+def test_the_error_counts_every_post_and_says_how_many_were_given_back():
+    budget = upstream_attempts.AttemptBudget()
+    numbers = []
+    for _ in range(3):
+        numbers.append(budget.take(lambda: False))
+        budget.refund()
+    numbers.append(budget.take(lambda: False))
+    assert numbers == [1, 2, 3, 4]  # each POST has a number of its own (diagnostic ids, "attempt%d")
+    assert (budget.step_used, budget.remaining) == (1, upstream_attempts.MAX_ATTEMPTS - 1)
+    error = budget.attach(apierr.upstream_error("down"))
+    assert (error.upstream_attempts, error.upstream_refunded) == (4, 3)
+
+
+def test_a_refunded_post_does_not_count_against_the_requests_hard_cap():
+    budget = upstream_attempts.AttemptBudget(total_cap=2)
+    for _ in range(3):
+        budget.take(lambda: False)
+        assert budget.refund() is True
+    budget.take(lambda: False)
+    assert budget.remaining == 1 and budget.used == 4
+    budget.take(lambda: False)
+    assert budget.remaining == 0
+    with pytest.raises(apierr.ApiError) as caught:
+        budget.take(lambda: False)
+    assert caught.value.code == "upstream_attempt_limit" and "(2 attempts)" in caught.value.message
+
+
+def test_the_client_is_told_every_post_of_a_request_that_met_refusals(retool, tmp_path):
+    third = Backend(tmp_path, base="https://acc-c.invalid", account_id="acc-c", transport="direct")
+    third.headers = lambda: {}
+    retool.pool.backends.append(third)
+    retool.dispatcher.add_account(third, None)
+
+    def bad(request_):
+        raise urllib.error.HTTPError(request_.full_url, 400, "x", Message(), io.BytesIO(b'{"message": "bad request"}'))
+
+    retool.script["acc-a"] = retool.script["acc-b"] = refused
+    retool.script["acc-c"] = bad
+    events = asyncio.run(run(retool.runner, turn()))
+    assert retool.posts == ["acc-a", "acc-b", "acc-c"]
+    error = errors(events)[0]
+    assert (error.upstream_attempts, error.upstream_refunded) == (3, 2)
+    logged = [event for event in journal.JOURNAL.query(limit=5000) if event["kind"] == "turn.error"
+              and event.get("request_id") == "req-conv-1"]
+    assert [(event["data"].get("upstream_attempts"), event["data"].get("refunded")) for event in logged][-1] == (3, 2)
+
+
 def test_a_bound_conversation_of_that_model_moves_at_its_next_request(retool):
     async def scenario():
         await run(retool.runner, turn())
@@ -400,6 +482,11 @@ def test_after_the_hold_the_account_is_asked_again_and_a_new_refusal_holds_it_ag
         first = retool.a.refused_models[OPUS]["pause"]
         retool.clock.now += first + 1
         assert retool.dispatcher.release_plan_refusals() and retool.a.refused_models == {}
+        # acc-b's plan served the model and acc-a's never did: a new conversation goes to acc-b first, until acc-b carries
+        # more than twice acc-a's load plus one (SessionPool._plan_order, design D4 1.6). It was offered to the refusing
+        # account first, being the least loaded one (audit A03-03). acc-b takes one more conversation here ...
+        await run(retool.runner, turn("conv-x"))
+        # ... and the next one asks acc-a again.
         await run(retool.runner, turn("conv-2"))
         again = retool.a.refused_models[OPUS]["pause"]
         retool.script["acc-a"] = serve_ok  # the plan includes the model now
@@ -410,7 +497,7 @@ def test_after_the_hold_the_account_is_asked_again_and_a_new_refusal_holds_it_ag
 
     # Five minutes, then an hour: the account refused again within the hour after its first hold ended.
     assert asyncio.run(scenario()) == (PLAN_REFUSAL_FIRST, PLAN_REFUSAL_HOLD)
-    assert retool.posts == ["acc-a", "acc-b", "acc-a", "acc-b", "acc-a"]
+    assert retool.posts == ["acc-a", "acc-b", "acc-b", "acc-a", "acc-b", "acc-a"]
     assert retool.pool._conversations["conv-3"].backend is retool.a
     # The conversations that moved stay where their cache is.
     assert retool.pool._conversations["conv-1"].backend is retool.b

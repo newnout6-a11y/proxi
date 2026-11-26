@@ -1,9 +1,10 @@
 """Persistent async HTTP/1.1 + HTTP/2 connection pool for universal upstream drivers.
 
 Key safety invariants:
-  - One cached httpx.AsyncClient pool per event loop and `(proxy_url, verify_tls, http2)` tuple,
+  - One cached httpx.AsyncClient pool per event loop and `(proxy_url, verify_tls, http2, trust_env)` tuple,
     reusing TCP/TLS sockets across turns and keepwarm pings (saving 150-400 ms per request).
   - Redirects are NEVER followed (`follow_redirects=False`), preventing credential exfiltration on 3xx.
+  - Upstream Set-Cookie is not shared across credentials. Explicit per-request Cookie headers still pass through.
   - Link-local / cloud metadata addresses (169.254.0.0/16, fe80::/10, fd00:ec2::254) are blocked.
   - Plain HTTP is permitted only for loopback / private LAN addresses (Ollama, vLLM, LM Studio, LAN GPU hosts)
     unless `allow_insecure_http=True` is explicitly set on the provider.
@@ -12,6 +13,7 @@ Key safety invariants:
 from __future__ import annotations
 
 import asyncio
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 import ipaddress
 import urllib.parse
 import weakref
@@ -31,6 +33,11 @@ _CLOUD_METADATA_V6 = ipaddress.ip_network("fd00:ec2::254/128")
 _LOOP_CLIENTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple, httpx.AsyncClient]] = (
     weakref.WeakKeyDictionary()
 )
+
+
+class _NoResponseCookies(DefaultCookiePolicy):
+    def set_ok(self, cookie, request):
+        return False
 
 
 def is_local_or_private_host(host: str | None) -> bool:
@@ -143,7 +150,8 @@ def get_async_client(cfg: dict | None = None) -> httpx.AsyncClient:
     proxy_url = validate_proxy_url(cfg.get("proxy_url"))
     verify_tls = bool(cfg.get("verify_tls", True))
     http2 = bool(cfg.get("http2", False))
-    key = ("transport", id(custom_transport)) if custom_transport is not None else (proxy_url, verify_tls, http2)
+    trust_env = bool(cfg.get("use_system_proxy", False)) and not proxy_url and custom_transport is None
+    key = ("transport", id(custom_transport)) if custom_transport is not None else (proxy_url, verify_tls, http2, trust_env)
 
     client = table.get(key)
     if client is not None and not client.is_closed:
@@ -156,8 +164,9 @@ def get_async_client(cfg: dict | None = None) -> httpx.AsyncClient:
     )
     kwargs: dict = {
         "follow_redirects": False,
+        "cookies": CookieJar(policy=_NoResponseCookies()),
         "limits": limits,
-        "trust_env": bool(cfg.get("use_system_proxy", False)) and not proxy_url and custom_transport is None,
+        "trust_env": trust_env,
     }
     if custom_transport is not None:
         kwargs["transport"] = custom_transport

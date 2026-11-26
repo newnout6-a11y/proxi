@@ -168,6 +168,19 @@ def gateway_admin(tmp_path, monkeypatch):
     runtime.close()
 
 
+@pytest.mark.parametrize("path, master_status", [("/v1/balance", 503), ("/v1/usage", 200)])
+def test_global_account_reports_require_the_master_key(gateway_admin, path, master_status):
+    status, created = gateway_admin.admin_call("/admin/api/client-keys", {"label": "reports"}, method="POST")
+    assert status == 200
+    key = created["raw_key"]
+    assert gateway_admin.api_call("/v1/models", key=key)[0] == 200
+    assert gateway_admin.api_call(path, key="")[0] == 401
+    status, body = gateway_admin.api_call(path, key=key)
+    assert status == 403
+    assert body["error"]["code"] == "forbidden"
+    assert gateway_admin.api_call(path)[0] == master_status
+
+
 def test_empty_bootstrap_admin_endpoints_work_cleanly(gateway_admin):
     st, ov = gateway_admin.admin_call("/admin/api/overview")
     assert st == 200
@@ -357,7 +370,16 @@ def test_provider_crud_live_adopt_ping_routes_and_client_keys(gateway_admin, moc
     # Delete client key & route & provider
     assert gateway_admin.admin_call(f"/admin/api/client-keys/{ck_id}", method="DELETE")[0] == 200
     assert gateway_admin.admin_call("/admin/api/routes/coding-best", method="DELETE")[0] == 200
+    # The provider is the only backend of this relay: it is not removed while nothing else would answer (audit A14-13, as
+    # for the last enabled account); beside a second one it is.
+    assert gateway_admin.admin_call("/admin/api/providers/myhub", method="DELETE")[0] == 409
+    st, _ = gateway_admin.admin_call(
+        "/admin/api/providers",
+        {"id": "spare", "driver": "openai-chat", "base_url": mock_upstream, "api_key": secret_key, "discover_now": False},
+        method="POST",
+    )
+    assert st == 200
     assert gateway_admin.admin_call("/admin/api/providers/myhub", method="DELETE")[0] == 200
 
     st, provs_end = gateway_admin.admin_call("/admin/api/providers")
-    assert st == 200 and provs_end["providers"] == []
+    assert st == 200 and [p["id"] for p in provs_end["providers"]] == ["spare"]

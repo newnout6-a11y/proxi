@@ -24,6 +24,7 @@ import time
 
 import client_context
 import console_clock
+import console_records
 import redact as redact_module
 from redact import redact
 
@@ -52,6 +53,25 @@ COOKIE_SECRET_CHARS = 8
 def _cookie_secrets(values):
     return [value for value in values or () if isinstance(value, str) and len(value) >= COOKIE_SECRET_CHARS]
 _TOP_LEVEL = ("turn_id", "request_id", "conversation")
+# The terminal feed is a projection of the journal's operational events, not of its payloads and debug metadata.
+_CONSOLE_PHASES = {
+    "http.error": ("status", "code", "stage", "upstream_status", "expected"),
+    "turn.begin": ("transport", "requested_effort", "effort_source"),
+    "route.bound": ("child", "provider"),
+    "session.acquire": ("thread", "isolated", "mode", "wait_ms"),
+    "upstream.first_token": ("attempt", "ttft_ms", "first", "warn_ms"),
+    "upstream.text_start": ("attempt", "ms"),
+    "upstream.usage": ("attempt", "input_tokens", "output_tokens", "cache_read", "cache_write", "cost_usd",
+                       "minara_credits", "provider_cost", "provider_cost_currency",
+                       "provider_cost_estimated", "channel", "channel_path", "provider"),
+    "upstream.channel_retry": ("status", "attempt", "delay"),
+    "upstream.model_substituted": ("requested", "served"),
+    "account.failover": ("status", "reason", "error"),
+    "cache.tail_unwritten": ("attempt", "input_tokens", "minara_credits"),
+    "turn.error": ("status", "code", "outcome"),
+    "turn.end": ("reason", "outcome", "duration_ms", "output_tokens", "retries"),
+    "request.speed": ("reason", "duration_ms", "output_tokens", "tokens_per_second"),
+}
 # Rollups: numeric counters per FINE seconds (the smallest chart bucket), distributions per
 # COARSE seconds (window-wide figures only), both kept for the longest window plus a margin.
 FINE = 10
@@ -119,6 +139,17 @@ def _price(value):
     """A reported price is a finite number >= 0; anything else is 'unknown'."""
     number = _number(value)
     return number if number is not None and number >= 0 else None
+
+
+def _usage_prices(data):
+    """(Retool credits, Minara credits, US dollars) of one upstream.usage event, each None when it carries none.
+
+    A Minara reply carries its price twice: in Minara's credits and, since the USD ledger, the same money in dollars
+    (cost_usd). Counted in both, the overview showed it in "Minara за окно" and again in "Расход USD" (audit A07-02):
+    the dollars of an event priced in Minara credits are not a spend of their own. Only cost_usd is a dollar spend: an
+    event's provider_cost is its attempt's running total in the upstream's currency, so it is never read as one."""
+    minara = _price(data.get("minara_credits"))
+    return _price(data.get("credits")), minara, _price(data.get("cost_usd")) if minara is None else None
 
 
 def _whole(value):
@@ -535,11 +566,7 @@ class _Rollup:
             self.turn(key, ts, restored).start(_attempt_number(data), index)
         elif kind == "upstream.usage":
             fine = self.fine_slot(index)
-            price = _price(data.get("credits"))
-            minara = _price(data.get("minara_credits"))
-            usd = _price(data.get("cost_usd"))
-            if usd is None and "cost_usd" not in data:
-                usd = _price(data.get("provider_cost"))
+            price, minara, usd = _usage_prices(data)
             attempt, change = self.turn(key, ts, restored).usage(_attempt_number(data), price, index, minara, usd)
             if price is not None:
                 fine.credits += price
@@ -575,6 +602,22 @@ class _Secrets(list):
     pattern redact() masks the cookie values with (False: not built, redact() looks it up)."""
     pattern = None
     cookies = False
+
+
+def configured_secret_values(cfg):
+    """Credentials and private routing IDs that should be masked even when echoed as plain text."""
+    fields = ("relay_api_key", "cookie", "xsrf", "thread_id", "page_uuid", "bearer_token", "api_key")
+    values = [cfg.get(key) for key in fields]
+    values += _cookie_secrets(cfg.get("cookie_values"))
+    for account in cfg.get("accounts") or ():
+        if isinstance(account, dict):
+            values += [account.get(key) for key in fields]
+            values += _cookie_secrets(account.get("cookie_values"))
+    values.extend(cfg.get("_extra_secrets") or ())
+    values.extend(profile.get("key") for profile in cfg.get("client_keys") or () if isinstance(profile, dict))
+    # A client's tool call can contain the search key even though it lives only in the environment.
+    values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))
+    return [value for value in values if isinstance(value, str) and len(value) >= 4]
 
 
 class Journal:
@@ -685,16 +728,7 @@ class Journal:
     # -- redaction ---------------------------------------------------------
     def _secrets(self):
         cfg = self._cfg or {}
-        values = [cfg.get(key) for key in ("relay_api_key", "cookie", "xsrf", "thread_id", "page_uuid")]
-        values += _cookie_secrets(cfg.get("cookie_values"))
-        for account in cfg.get("accounts") or []:
-            if isinstance(account, dict):
-                values += [account.get(key) for key in ("cookie", "xsrf", "thread_id", "page_uuid")]
-                values += _cookie_secrets(account.get("cookie_values"))
-        # The search provider's key lives in the environment, never in the config, and it still turned up in the journal:
-        # a client's tool call that set it (a shell command) was journaled with its arguments (v3 run of 2026-11-07).
-        values.append(os.environ.get(str(cfg.get("web_search_key_env") or "EXA_API_KEY")))
-        found = _Secrets(value for value in values if isinstance(value, str) and len(value) >= 4)
+        found = _Secrets(configured_secret_values(cfg))
         found.pattern = self._pattern_of(found)
         # redact() masks the cookie values with a pattern of its own: looked up once per event here, not for every string
         # of it (a tuple of 1,027 values hashed a million times was 10 s of the restore at startup).
@@ -765,6 +799,9 @@ class Journal:
                 level = "info"
             identity = client_context.current()
             fields = {**identity, **fields}
+            wire_client = fields.pop("wire_client", None)
+            if wire_client:
+                fields.setdefault("client", wire_client)
             caption = client_context.label(identity)
             if caption:
                 message = "[%s] %s" % (caption, message or kind)
@@ -848,11 +885,15 @@ class Journal:
                 # on itself, so use stderr.
                 # Do not re-enter console_log/journal.scrub here: this is the journal's own failure path. Raw exception
                 # text can contain a path or credential; the safe error class is enough to diagnose the failure category.
-                try:
-                    print(console_clock.timestamp() + "[journal] rotation failed: %s" % type(exc).__name__,
-                          file=sys.stderr, flush=True)
-                except (OSError, ValueError):
-                    pass
+                if console_records.enabled():
+                    console_records.write("journal.rotation_failed", "warn", {"error": type(exc).__name__},
+                                          file=sys.stderr)
+                else:
+                    try:
+                        print(console_clock.timestamp() + "[journal] rotation failed: %s" % type(exc).__name__,
+                              file=sys.stderr, flush=True)
+                    except (OSError, ValueError):
+                        pass
 
     # -- reading -----------------------------------------------------------
     @property
@@ -979,11 +1020,8 @@ class Journal:
             elif kind == "upstream.usage_start":
                 costs[turn_id].start(_attempt_number(data), None)
             elif kind == "upstream.usage":
-                usd_val = _price(data.get("cost_usd"))
-                if usd_val is None and "cost_usd" not in data:
-                    usd_val = _price(data.get("provider_cost"))
-                costs[turn_id].usage(_attempt_number(data), _price(data.get("credits")), None,
-                                     _price(data.get("minara_credits")), usd_val)
+                price, minara, usd = _usage_prices(data)
+                costs[turn_id].usage(_attempt_number(data), price, None, minara, usd)
                 trace["cache_read"] += _whole(data.get("cache_read"))
                 trace["cache_write"] += _whole(data.get("cache_write"))
             elif kind == "tool.call":
@@ -1069,6 +1107,19 @@ def scrub(value):
     return JOURNAL._clean(value, JOURNAL._secrets())
 
 
+def trace_secret_values(cfg):
+    """A per-attempt config may contain only the serving account; also mask known secrets from the live config."""
+    shared = JOURNAL._cfg
+    values = configured_secret_values(cfg)
+    # A transport or an offline diagnostic can construct its own per-account config without normalizing the cookie.
+    if isinstance(cfg.get("cookie"), str) and not cfg.get("cookie_values"):
+        values.extend(value for segment in cfg["cookie"].split(";")
+                      if len(value := segment.partition("=")[2].strip()) >= 4)
+    if shared and shared is not cfg:
+        values.extend(configured_secret_values(shared))
+    return tuple(sorted(set(values)))
+
+
 _SECRET_NAME = re.compile(r"(?i)api[_-]?key|secret|password|passwd|token|authorization|cookie|credential")
 MASK = "[redacted]"
 
@@ -1112,4 +1163,17 @@ def redact_whole(text):
 
 
 def emit(kind, message="", level="info", **fields):
-    return JOURNAL.emit(kind, message, level, **fields)
+    event = JOURNAL.emit(kind, message, level, **fields)
+    if event and kind in _CONSOLE_PHASES and console_records.enabled():
+        data = event["data"]
+        record = {key: data.get(key) for key in (*console_records.IDENTITY, *_CONSOLE_PHASES[kind])}
+        record.update((key, event[key]) for key in _TOP_LEVEL if key in event)
+        record["client_session"] = tag(data.get("client_session_id"))
+        if kind == "upstream.usage":
+            snapshot = data.get("usage_snapshot")
+            record["retool_credits"] = data.get("credits") if data.get("upstream") == "retool" else None
+            if isinstance(snapshot, dict):
+                for key in ("provider_cost_currency", "channel", "channel_path", "provider"):
+                    record[key] = snapshot.get(key)
+        console_records.write(kind, event["level"], record, when=event["ts"])
+    return event

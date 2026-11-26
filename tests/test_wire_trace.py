@@ -19,6 +19,55 @@ def _trace_names(count, minute=12):
     return [f"20261105-{minute:02d}00{i:02d}-abc-attempt1-{i:012x}" for i in range(count)]
 
 
+def test_trace_keeps_lengths_and_masks_a_configured_key_everywhere(tmp_path):
+    secret = "r1-virtual-trace-test-key-012345"
+    cfg = {"upstream_trace_dir": str(tmp_path), "client_keys": [{"id": "test", "key": secret}]}
+    request = json.dumps({"content": "hello " + secret}).encode()
+    response = ("data: " + secret + "\n\n").encode()
+    trace = WireTrace(cfg, _trace_names(1)[0], request)
+    trace.event("parsed", nested={"line": "prefix " + secret})
+    trace.raw(response[:11])
+    trace.raw(response[11:])
+    trace.close()
+    files = {f.name: f.read_bytes() for f in trace.folder.iterdir()}
+    assert all(secret.encode() not in content for content in files.values())
+    assert json.loads(files["request-body.json"])["content"] == "hello " + "*" * len(secret)
+    stored_response = files["response-body.ndjson"]
+    assert stored_response == b"data: " + b"*" * len(secret) + b"\n\n"
+    events = [json.loads(line) for line in files["timeline.jsonl"].splitlines()]
+    assert events[0]["body_bytes"] == len(request)
+    assert events[0]["body_sha256"] == hashlib.sha256(files["request-body.json"]).hexdigest()
+    assert [(row["offset"], row["length"]) for row in events if row["stage"] == "response_bytes"] == [
+        (0, 11), (11, len(response) - 11)]
+    assert events[-1]["response_sha256"] == hashlib.sha256(stored_response).hexdigest()
+
+
+def test_trace_masks_escaped_and_unescaped_credentials_without_changing_near_misses(tmp_path):
+    secret = 'configured-"clé"-012345'
+    cfg = {"upstream_trace_dir": str(tmp_path), "api_key": secret}
+    request = json.dumps({"content": secret}, ensure_ascii=True).encode()
+    trace = WireTrace(cfg, _trace_names(1)[0], request)
+    preserved = b"ordinary data: " + secret[:-1].encode() + b"!\n"
+    for byte in preserved + secret.encode():
+        trace.raw(bytes((byte,)))
+    trace.close()
+    assert (trace.folder / "response-body.ndjson").read_bytes() == preserved + b"*" * len(secret.encode())
+    assert set(json.loads((trace.folder / "request-body.json").read_bytes())["content"]) == {"*"}
+
+
+def test_trace_timeline_keeps_numeric_fields_and_marks_redacted_wire_files(tmp_path):
+    cfg = {"upstream_trace_dir": str(tmp_path), "api_key": "123456"}
+    body = b'{"number":123456}'
+    trace = WireTrace(cfg, _trace_names(1)[0], body)
+    trace.event("sample", number=123456, label="123456")
+    trace.raw(body)
+    trace.close()
+    events = [json.loads(line) for line in (trace.folder / "timeline.jsonl").read_bytes().splitlines()]
+    assert events[0]["body_redacted"] and events[-1]["response_redacted"]
+    assert events[1]["number"] == 123456 and events[1]["label"] == "******"
+    assert b"123456" not in (trace.folder / "request-body.json").read_bytes()
+
+
 def test_trace_directory_keeps_only_the_newest_folders_and_leaves_other_entries(tmp_path):
     cfg = {"upstream_trace_dir": str(tmp_path), "trace_max_folders": 3}
     (tmp_path / "notes").mkdir()
@@ -72,9 +121,10 @@ def test_open_traces_survive_when_more_requests_run_than_the_limit_allows(tmp_pa
         # Not a husk (Windows) and not unlinked (POSIX): every file of the trace is still there and still written.
         assert sorted(p.name for p in (tmp_path / name).iterdir()) == [
             "request-body.json", "response-body.ndjson", "timeline.jsonl"]
-        assert (tmp_path / name / "response-body.ndjson").read_bytes() == b"late bytes"
     for trace in traces:
         trace.close()
+        # Close flushes any trailing bytes that could start a credential split between chunks.
+        assert (trace.folder / "response-body.ndjson").read_bytes() == b"late bytes"
     # Closed, they are ordinary folders again: the next prune brings the directory back to the limit.
     WireTrace(cfg, _trace_names(7)[6], b"{}").close()
     assert sorted(p.name for p in tmp_path.iterdir()) == _trace_names(7)[4:]

@@ -442,6 +442,7 @@ class AnthropicMessagesDriver(UpstreamDriver):
                 emitted_sig = False
                 raw_usage: dict = {}
                 finish_reason: str | None = None
+                saw_stop = False
 
                 async for ev_name, data_str in sse_utils.aiter_sse_events(resp.aiter_bytes(), label=cfg.get("provider_name") or "Anthropic"):
                     if getattr(session, "_cancelled", False):
@@ -551,8 +552,14 @@ class AnthropicMessagesDriver(UpstreamDriver):
                             raw_usage.update({k: v for k, v in item["usage"].items() if v is not None})
 
                     elif kind == "message_stop":
+                        saw_stop = True
                         break
 
+                if getattr(session, "_cancelled", False):
+                    yield {"type": "end", "reason": "cancelled"}
+                    return
+                if not saw_stop:
+                    raise apierr.upstream_error("Upstream Anthropic Messages stream ended before message_stop")
                 reply_blocks: list[dict] = []
                 for idx in sorted(blocks_by_idx):
                     blk = blocks_by_idx[idx]

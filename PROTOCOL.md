@@ -18,7 +18,10 @@ Host: `https://<tenant>.retool.com` — аутентификация по cookie
 - `Origin: https://<tenant>.retool.com`
 - `Referer: https://<tenant>.retool.com/`
 - `User-Agent: <браузерный UA>`
-- `x-retool-client-version: <version>`
+- `x-retool-client-version: <version>` — то, что шлёт фронтенд Retool: `RETOOL_VERSION_STRING` его входного скрипта
+  (`main-*.js`), на 2026-11-18 `4.99.0-dd22f13 (Build 424025)`; живые ответы называют ту же версию в
+  `x-retool-api-version`. Проверка каталога (`retool_refresh`) читает версию из текущего входного скрипта и хранит её в
+  `retool_models.auto.json` (`client_version`); до первой проверки relay шлёт версию из `auth.CLIENT_VERSION`.
 - `Content-Type: application/json`
 - `Accept: application/json`
 

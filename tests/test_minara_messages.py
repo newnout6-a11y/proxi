@@ -263,9 +263,7 @@ def test_a_chat_usage_names_its_channel():
     assert events[0]["usage"]["channel"] == "openrouter" and events[0]["usage"]["channel_path"] == "chat"
 
 
-def test_a_claude_head_gets_one_cache_key_for_every_conversation_and_level():
-    """OpenRouter keeps the requests of one prompt_cache_key on one provider (Fable 5.2: 6 of 6, every follow-up read);
-    the key is the head's, so conversations and subagents with the same head share the provider that holds it."""
+def test_a_claude_head_has_a_distinct_cache_key_in_each_conversation_but_not_each_level():
     def body(conversation, level=None, head="HEAD"):
         provider = {"model": "minara/anthropic/claude-fable-5.2"}
         if level:
@@ -274,7 +272,8 @@ def test_a_claude_head_gets_one_cache_key_for_every_conversation_and_level():
         return minara.build_body({}, provider, head, "hi", None, None, 100, session=session)
     first, second, other_level = body(("a",)), body(("b",)), body(("a",), "max")
     assert first["prompt_cache_key"].startswith("proxi-")
-    assert first["prompt_cache_key"] == second["prompt_cache_key"] == other_level["prompt_cache_key"]
+    assert first["prompt_cache_key"] == other_level["prompt_cache_key"]
+    assert first["prompt_cache_key"] != second["prompt_cache_key"]
     assert body(("a",), head="OTHER")["prompt_cache_key"] != first["prompt_cache_key"]
     gpt = lambda conversation: minara.build_body(  # noqa: E731
         {}, {"model": "minara/openai/gpt-6.1-sol"}, "HEAD", "hi", None, None, 100,

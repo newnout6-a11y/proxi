@@ -49,7 +49,7 @@ STUB = ('@echo off\r\necho started>>"%~dp0starts.txt"\r\necho relay could not bi
 def powershell(tmp_path, scenario, **env):
     harness = tmp_path / "harness.ps1"
     harness.write_text(LOADER + scenario, encoding="utf-8-sig")
-    environ = {key: value for key, value in os.environ.items() if key != "RELAY_PORT"}
+    environ = {key: value for key, value in os.environ.items() if key not in {"RELAY_PORT", "RELAY_LOG_FORMAT"}}
     environ.update(RUN_RELAY_SCRIPT=str(SCRIPT), **env)
     done = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                            "-File", str(harness)], capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -200,3 +200,19 @@ def test_supervisor_keeps_python_event_time_and_stamps_its_own_multiline_message
     assert lines[0] == "[2026-11-08 13:14:15.123 +03:00] original"
     assert all(STAMP.match(line) for line in lines)
     assert [STAMP.sub("", line) for line in lines] == ["original", "first", "second"]
+
+
+def test_supervisor_jsonl_keeps_relay_records_and_masks_unstructured_child_output(tmp_path):
+    log = tmp_path / "relay.log"
+    powershell(tmp_path, """
+Write-RelayLog $env:LOG '{"ts":"2026-11-08T13:14:15.123+03:00","kind":"http.request","level":"success","status":200}' -FromRelay
+Write-RelayLog $env:LOG '{"ts":"broken","kind":"incomplete" [fake-token]' -FromRelay
+Write-RelayLog $env:LOG 'restart in 2 s' -Kind 'supervisor.restart'
+'{}'
+""", LOG=str(log), RELAY_LOG_FORMAT="jsonl")
+    output = log.read_text(encoding="utf-8")
+    generated, unsafe, own = (json.loads(line) for line in output.splitlines())
+    assert generated["ts"] == "2026-11-08T13:14:15.123+03:00" and generated["status"] == 200
+    assert unsafe["kind"] == "supervisor.unstructured_output" and unsafe["level"] == "warn"
+    assert own["kind"] == "supervisor.restart" and own["message"] == "restart in 2 s"
+    assert "fake-token" not in output
