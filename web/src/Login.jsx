@@ -44,7 +44,7 @@ export default function Login({ onLogin }) {
         <div className="brand"><Mark /><strong>Proxi</strong></div>
         <div className="login-copy">
           <h1>Весь relay перед глазами</h1>
-          <p>Баланс аккаунтов, расход кредитов и каждый ход модели — от запроса IDE до ответа Retool</p>
+          <p>Баланс провайдеров и аккаунтов, расход USD и кредитов, кэш и каждый ход модели — от запроса IDE до ответа API</p>
         </div>
         <label className="field" htmlFor="relay-key">
           <span>Relay key</span>

@@ -24,10 +24,28 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import sync_virtual_models
 from scripts.probe_client_settings import routable_entries
-from scripts.sync_opencode_catalog import (MASK, is_environment_list, is_secret_flag, is_secret_key, mask_string,
-                                           mask_text, read_file, write_backed_up, write_preview)
+from scripts.sync_opencode_catalog import (MASK, UNKNOWN_CONTEXT, UNKNOWN_OUTPUT, is_environment_list, is_secret_flag,
+                                           is_secret_key, mask_string, mask_text, read_file, write_backed_up,
+                                           write_preview)
 
 STR = 'tag:yaml.org,2002:str'
+HARNESS_THINKING_LEVELS = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+
+
+def _harness_efforts(entry):
+    """Map Proxi effort levels to Harness reasoningEfforts, or False when no thinking level beyond 'off' is offered."""
+    if not entry.get('reasoning'):
+        return False
+    levels = entry.get('reasoning_effort_levels') or []
+    mapped = {}
+    for level in levels:
+        key = 'off' if level == 'none' else level
+        if key in HARNESS_THINKING_LEVELS:
+            mapped[key] = level
+    # dsh-llm-pi-ai strict validation rejects reasoningEfforts with only 'off' ("offers no level beyond 'off'").
+    if not any(key != 'off' for key in mapped):
+        return False
+    return mapped
 
 
 def _copy(value):
@@ -96,18 +114,18 @@ def update_document(document, entries):
         updated = []
         for entry in selected:
             item = _copy(old.get(entry['id']) or {})
-            item.update(id=entry['id'], name=entry['label'], contextWindow=entry['context'],
-                        maxTokens=entry['max_output'], input=['text', 'image'] if entry.get('vision') else ['text'])
-            levels = entry.get('reasoning_effort_levels') or []
-            item['reasoningEfforts'] = ({'off' if level == 'none' else level: level for level in levels}
-                                        if entry.get('reasoning') and levels else False)
+            item.update(id=entry['id'], name=entry['label'],
+                        contextWindow=entry['context'] or UNKNOWN_CONTEXT,
+                        maxTokens=entry['max_output'] or UNKNOWN_OUTPUT,
+                        input=['text', 'image'] if entry.get('vision') else ['text'])
+            item['reasoningEfforts'] = _harness_efforts(entry)
             updated.append(item)
         return updated
 
-    # The SDK rejects its inherited reasoning default for a model without selectors, so only
-    # models with selectable levels can share the reasoning provider.
-    reasoning = [entry for entry in entries if entry.get('reasoning') and entry.get('reasoning_effort_levels')]
-    text = [entry for entry in entries if entry not in reasoning]
+    # The SDK rejects its inherited reasoning default for a model without selectors (or with only 'off'), so only
+    # models offering at least one thinking level beyond 'off' can share the reasoning provider.
+    reasoning = [entry for entry in entries if _harness_efforts(entry)]
+    text = [entry for entry in entries if not _harness_efforts(entry)]
     secondary = parent.get('retool-text')
     if secondary is not None:
         # Never overwrite a pre-existing provider belonging to someone else.

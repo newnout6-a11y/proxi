@@ -16,6 +16,7 @@ from urllib.parse import parse_qs
 import account_report
 import apierr
 import auth
+from catalog import admin_ops
 import config
 import direct
 import journal
@@ -41,7 +42,9 @@ BUILD_ROOT = Path(__file__).resolve().parent / "web" / "dist"
 LIVE_SETTINGS = {"rate_limit_rps", "rate_limit_burst", "min_account_balance", "account_balance_interval",
                  "relay_system_prompt", "relay_system_prompt_mode", "compaction_keep_effort",
                  "max_conversations", "conversation_wait", "account_rate_limit_wait", "account_move_keeps_history",
-                 "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs", "codex_compaction_cache"}
+                 "journal_max_file_bytes", "journal_keep_files", "codex_memory_jobs", "codex_compaction_cache",
+                 "models_dev_sync", "catalog_refresh_hours", "opencode_sync",
+                 "stream_first_token_timeout", "stream_idle_timeout", "stream_tool_timeout"}
 STREAM_MAX_SECONDS = 600
 STREAM_HEARTBEAT = 10.0
 # A credential the admin masks in its answers is at least this long (an account's id, page or thread at least 5). Retool's
@@ -72,6 +75,8 @@ ROLE_PROMPT_SHARE = 0.5
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 ACCOUNT_PATH = re.compile(r"/admin/api/accounts/([A-Za-z0-9_-]{1,64})(?:/(balance|renew))?")
+PROVIDER_PATH = re.compile(r"/admin/api/providers/([a-z0-9][a-z0-9_.-]{0,62})(?:/(discover))?")
+CLIENT_KEY_PATH = re.compile(r"/admin/api/client-keys/([A-Za-z0-9_.-]{1,64})")
 SETTING_GROUPS = ("routing", "model", "instructions", "retries", "cache", "exec", "limits", "api")
 # Prompt control (docs/prompt-control-plan.md 4.1): the routes and the methods each one answers.
 PROMPTS_PATH = "/admin/api/prompts"
@@ -194,6 +199,12 @@ def _schema(cfg=None):
         ("show_unrouted_models", "boolean", "Показывать модели без маршрута", "model",
          "Перечислять в /v1/models модели, для которых у аккаунтов нет ресурса Retool",
          None, None, None, None),
+        ("models_dev_sync", "boolean", "Метаданные и тарифы models.dev", "model",
+         "Обогащать открытые модели контекстом, возможностями и USD-ценами из каталога models.dev. Применяется сразу",
+         None, None, None, None),
+        ("catalog_refresh_hours", "number", "Автообновление /models провайдеров", "model",
+         "Как часто опрашивать /models подключённых универсальных провайдеров; 0 — только вручную. Применяется сразу",
+         "ч", 0, 168, None),
         ("project_context", "boolean", "Контекст проекта", "model",
          "Добавлять краткое описание рабочей папки relay к запросам, которые relay ведёт сам: без системного "
          "промпта клиента и без его инструментов. Запросы Claude Code, Codex, OpenCode и других клиентов со своими "
@@ -253,6 +264,15 @@ def _schema(cfg=None):
          "Сколько ждать соединения и ответа на HTTP-запрос к Retool", "с", 1, 3600, None),
         ("recv_timeout", "integer", "Ожидание WebSocket", "limits",
          "Сколько ждать следующего сообщения по WebSocket Retool", "с", 1, 3600, None),
+        ("stream_first_token_timeout", "number", "Таймаут первого токена стрима", "limits",
+         "Сколько секунд ждать первый токен от универсального провайдера до сброса попытки; 0 — без отдельного предела. "
+         "Применяется сразу", "с", 0, 3600, None),
+        ("stream_idle_timeout", "number", "Таймаут тишины в стриме", "limits",
+         "Максимальная пауза между чанками текста/мышления универсального провайдера; 0 — выключено. Применяется сразу",
+         "с", 0, 3600, None),
+        ("stream_tool_timeout", "number", "Таймаут генерации аргументов tool", "limits",
+         "Максимальная пауза при потоковой генерации аргументов инструментов; 0 — выключено. Применяется сразу",
+         "с", 0, 3600, None),
         ("max_prompt_bytes", "integer", "Размер промпта", "limits",
          "Отклонять запросы с промптом больше этого размера; 0 — без ограничения", "байт", 0, 1_073_741_824, None),
         ("max_body_bytes", "integer", "Размер HTTP body", "limits",
@@ -271,6 +291,9 @@ def _schema(cfg=None):
          "Принимать запросы OpenAI Responses на /v1/responses", None, None, None, None),
         ("enable_anthropic", "boolean", "Anthropic API", "api",
          "Принимать запросы Anthropic Messages на /v1/messages", None, None, None, None),
+        ("opencode_sync", "boolean", "Автосинхронизация с OpenCode", "api",
+         "Обновлять список моделей в opencode.jsonc при изменении каталога провайдеров. Применяется сразу",
+         None, None, None, None),
     ]
     fields = {}
     for key, kind, label, group, description, unit, minimum, maximum, enum in rows:
@@ -505,11 +528,13 @@ class Admin:
         if key is not None and cached is not None and cached[0] == key:
             return cached[1]
         tokens = []
-        for record in self._records(self._saved()):
+        saved = self._saved()
+        for record in self._records(saved):
             token = (os.environ.get(record.get("bearer_token_env") or "")
                      or record.get("bearer_token"))
             if isinstance(token, str) and token:
                 tokens.append(token)
+        tokens.extend(admin_ops.collect_extra_secrets(saved))
         self._tokens_cache = (key, tuple(tokens))
         return self._tokens_cache[1]
 
@@ -520,9 +545,11 @@ class Admin:
         accounts, three times for each switch of an account."""
         backends = list(getattr(self.runtime.accounts, "backends", None) or [])
         tokens = self._saved_tokens()
-        fingerprint = (tokens, tuple(
+        extras = tuple(self.cfg.get("_extra_secrets") or ())
+        fingerprint = (tokens, extras, tuple(
             (id(backend),) + tuple((getattr(backend, "cfg", None) or {}).get(key) for key in (
-                "cookie", "xsrf", "bearer_token", "bearer_token_env", "account_id", "page_uuid", "thread_id", "base"))
+                "cookie", "xsrf", "bearer_token", "bearer_token_env", "api_key", "api_key_env",
+                "account_id", "page_uuid", "thread_id", "base", "provider_id"))
             + (tuple((getattr(backend, "cfg", None) or {}).get("cookie_values") or ()),)
             for backend in backends))
         cached = self._secrets_cache
@@ -531,16 +558,19 @@ class Admin:
         # Pending accounts are saved before they are loaded into the routing pool.
         # Their credentials must protect free-text responses too, including after
         # restarting the old runtime with the same configuration file.
-        secrets = list(tokens)
+        secrets = list(tokens) + list(extras)
         for backend in backends:
             cfg = getattr(backend, "cfg", None) or {}
-            secrets += [cfg.get("cookie"), cfg.get("xsrf"), cfg.get("bearer_token"),
-                        os.environ.get(cfg.get("bearer_token_env") or "")]
+            secrets += [cfg.get("cookie"), cfg.get("xsrf"), cfg.get("bearer_token"), cfg.get("api_key"),
+                        os.environ.get(cfg.get("bearer_token_env") or ""),
+                        os.environ.get(cfg.get("api_key_env") or "")]
             secrets += [part.partition("=")[2].strip() for part in str(cfg.get("cookie") or "").split(";")]
             secrets += cfg.get("cookie_values") or []
         secrets = [secret for secret in secrets if isinstance(secret, str) and len(secret) >= SECRET_CHARS]
         for backend in backends:
             cfg = getattr(backend, "cfg", None) or {}
+            if cfg.get("provider_id"):
+                continue  # Public API base_urls and provider credential IDs are not Retool tenant secrets
             secrets += [str(cfg[key]) for key in ("account_id", "page_uuid", "thread_id", "base")
                         if cfg.get(key) and len(str(cfg[key])) >= 5]
         result = sorted(set(secrets), key=len, reverse=True)
@@ -679,6 +709,21 @@ class Admin:
                 accounts[-1].update({key: per_account[key] for key in (
                     "attempts", "provider_cost", "provider_cost_currency", "provider_cost_complete")
                     if key in per_account})
+            elif backend.cfg.get("provider_id"):
+                accounts[-1].update(
+                    upstream=backend.cfg.get("upstream"),
+                    provider_id=backend.cfg.get("provider_id"),
+                    provider_name=backend.cfg.get("provider_name"),
+                    preset=backend.cfg.get("preset"),
+                    base_url=backend.cfg.get("base_url") or backend.cfg.get("base"),
+                    balance_supported=bool(info.get("balance_supported", False)),
+                    balance_unit="usd",
+                    renewal_supported=False,
+                    usd=entry["available"],
+                )
+                accounts[-1].update({key: per_account[key] for key in (
+                    "attempts", "provider_cost", "provider_cost_currency", "provider_cost_complete")
+                    if key in per_account})
             if entry.get("rate_limited_until"):
                 accounts[-1]["rate_limited_until"] = entry["rate_limited_until"]
             refused = getattr(backend, "refused_models", None)
@@ -745,16 +790,30 @@ class Admin:
             "resources": {key: self.cfg[key] for key, field in self.schema.items()
                           if field["type"] in ("integer", "number")},
             "connection": {"openai_base_url": base_url + "/v1", "anthropic_base_url": base_url},
+            "providers": [
+                {"id": p.get("id"), "name": p.get("name") or p.get("id"), "driver": p.get("driver"),
+                 "enabled": p.get("enabled", True) is not False}
+                for p in (self.cfg.get("providers") or []) if isinstance(p, dict) and p.get("id")
+            ],
         })
 
     # -- account pool ------------------------------------------------------------
     @staticmethod
+    def _has_root_account(saved):
+        if not isinstance(saved, dict):
+            return False
+        return (any(saved.get(k) for k in ("base", "page_uuid", "cookie", "xsrf", "bearer_token", "bearer_token_env"))
+                or bool(os.environ.get("RETOOL_BASE") or os.environ.get("RETOOL_COOKIE")))
+
+    @staticmethod
     def _records(saved):
         if isinstance(saved.get("accounts"), list):
             return [record for record in saved["accounts"] if isinstance(record, dict)]
-        # A file without accounts[] is the one account, whatever it holds: its base and page_uuid may come from RETOOL_BASE
-        # and RETOOL_PAGE_UUID (README), and then the account the relay runs on was listed as removed from config.json.
-        return [saved]
+        # A file without accounts[] is the one account when root credentials or RETOOL_* env exist; an empty bootstrap
+        # or providers[]-only configuration has no legacy root account.
+        if Admin._has_root_account(saved):
+            return [saved]
+        return []
 
     @staticmethod
     def _same_account(record, cfg):
@@ -799,17 +858,19 @@ class Admin:
         return holds
 
     def _live_backends(self):
+        if self.cfg.get("_empty_pool") and not getattr(self.runtime.pool, "backends", None):
+            return []
         return getattr(self.runtime.pool, "backends", None) or [self.runtime.backend]
 
     def _pool(self):
         """Loaded accounts (with live state) plus accounts saved but not loaded until a restart."""
         runtime = self.runtime
-        entries = account_report.collect(runtime)
+        entries = [e for e in account_report.collect(runtime) if not (getattr(e["backend"], "cfg", None) or {}).get("provider_id")]
         usage = account_report.usage_report(runtime, [(entry["backend"], entry["manager"]) for entry in entries])
         saved = self._saved() if self.cfg.get("_config_path") else None
         records = self._records(saved) if saved is not None else None
         # Without accounts[] the file's root and the one loaded account are the same account: nothing to match, nothing added.
-        single = saved is not None and not isinstance(saved.get("accounts"), list)
+        single = saved is not None and not isinstance(saved.get("accounts"), list) and self._has_root_account(saved)
         saved_holds = self._account_index(records or [])
         pool = []
         for entry, item in zip(entries, self._accounts(entries, usage)):
@@ -879,8 +940,11 @@ class Admin:
     def _other_enabled(self, saved, backend):
         """Loaded, still configured and enabled accounts other than `backend`."""
         saved_holds = self._account_index(self._records(saved))
+        provider_ids = {str(p.get("id") or "").strip().lower() for p in (saved.get("providers") or [])
+                        if isinstance(p, dict) and p.get("enabled", True) is not False}
         return [other for other in self._live_backends() if other is not backend and account_enabled(other)
-                and saved_holds(other.cfg)]
+                and (str(other.cfg.get("provider_id") or "").lower() in provider_ids
+                     if other.cfg.get("provider_id") else saved_holds(other.cfg))]
 
     @staticmethod
     def _write(path, saved):
@@ -1137,21 +1201,24 @@ class Admin:
         """Append new account records to the file's accounts[], check that the relay still starts with them and give each
         its account_id. A single-account file becomes a pool first. The caller holds the transaction and writes."""
         if not isinstance(saved.get("accounts"), list):
-            # A single-account configuration becomes a pool; the account keeps its id and session.
-            # Its session must be in the file: RETOOL_COOKIE/RETOOL_XSRF are not, and a pool
-            # record without them would stop the relay from starting.
-            if saved.get("upstream") != "minara" and (
-                    not (saved.get("cookie") and saved.get("xsrf")) or not self.cfg.get("_persist_auth", True)):
-                raise apierr.conflict("The current account's session comes from RETOOL_COOKIE/RETOOL_XSRF, "
-                                      "not config.json; move it into the file before adding accounts")
-            first = {key: copy.deepcopy(saved[key]) for key in ACCOUNT_RECORD_KEYS if key in saved}
-            if not first.get("account_id") and self.cfg.get("account_id"):
-                first["account_id"] = self.cfg["account_id"]
-            # The access descriptor moves with the account: with accounts[] a root copy is ignored,
-            # and config.load would warn about it at every start.
-            for key in ("cookie", "xsrf", "provider_access", "upstream", "bearer_token", "bearer_token_env", "minara_models"):
-                saved.pop(key, None)
-            saved["accounts"] = [first]
+            if not self._has_root_account(saved):
+                saved["accounts"] = []
+            else:
+                # A single-account configuration becomes a pool; the account keeps its id and session.
+                # Its session must be in the file: RETOOL_COOKIE/RETOOL_XSRF are not, and a pool
+                # record without them would stop the relay from starting.
+                if saved.get("upstream") != "minara" and (
+                        not (saved.get("cookie") and saved.get("xsrf")) or not self.cfg.get("_persist_auth", True)):
+                    raise apierr.conflict("The current account's session comes from RETOOL_COOKIE/RETOOL_XSRF, "
+                                          "not config.json; move it into the file before adding accounts")
+                first = {key: copy.deepcopy(saved[key]) for key in ACCOUNT_RECORD_KEYS if key in saved}
+                if not first.get("account_id") and self.cfg.get("account_id"):
+                    first["account_id"] = self.cfg["account_id"]
+                # The access descriptor moves with the account: with accounts[] a root copy is ignored,
+                # and config.load would warn about it at every start.
+                for key in ("cookie", "xsrf", "provider_access", "upstream", "bearer_token", "bearer_token_env", "minara_models"):
+                    saved.pop(key, None)
+                saved["accounts"] = [first]
         saved["accounts"].extend(records)
         try:
             models.build_minara_catalog(saved["accounts"])
@@ -1185,14 +1252,16 @@ class Admin:
         # Only this account's renewal can write the record being removed (or the root it shares with the file).
         with self._transaction(refreshers=(getattr(backend, "refresher", None),)) as (path, saved):
             record = self._saved_record(saved, account)
-            if not isinstance(saved.get("accounts"), list) or len(self._records(saved)) <= 1:
+            has_providers = any(isinstance(p, dict) and p.get("enabled", True) is not False
+                                for p in (saved.get("providers") or []))
+            if not has_providers and (not isinstance(saved.get("accounts"), list) or len(self._records(saved)) <= 1):
                 raise apierr.conflict("The last account cannot be removed")
             if backend is not None and account_enabled(backend) and not self._other_enabled(saved, backend):
                 raise apierr.conflict("The last enabled account cannot be removed")
             if backend is not None and self.runtime.pool.mode == "shared" and backend is self.runtime.pool.backend:
                 raise apierr.conflict("Shared session mode serves only the first account")
-            remaining = [item for item in saved["accounts"] if item is not record]
-            if not any(isinstance(item, dict) and item.get("enabled", True) is not False for item in remaining):
+            remaining = [item for item in (saved.get("accounts") or []) if item is not record]
+            if not has_providers and not any(isinstance(item, dict) and item.get("enabled", True) is not False for item in remaining):
                 raise apierr.conflict("No enabled account would remain")
             saved["accounts"] = remaining
             if self._same_account(saved, record) and (saved.get("base") or saved.get("page_uuid")):
@@ -1657,6 +1726,96 @@ class Admin:
             if sse.client_gone(handler):
                 break
 
+    def _gateway_route(self, handler, path):
+        """Dispatch universal gateway CRUD and probe routes; returns None when `path` is not a gateway route."""
+        cmd = handler.command
+
+        def _body():
+            handler.close_connection = True
+            self._mutation_guard(handler)
+            return validate.load_json(handler._read_body())
+
+        if path == "/admin/api/providers":
+            if cmd == "GET":
+                return admin_ops.list_providers(self)
+            if cmd == "POST":
+                return admin_ops.create_provider(self, _body())
+            raise apierr.method_not_allowed()
+
+        if path == "/admin/api/providers/test":
+            if cmd != "POST":
+                raise apierr.method_not_allowed()
+            return admin_ops.test_provider_connection(self, _body())
+
+        prov_match = PROVIDER_PATH.fullmatch(path)
+        if prov_match:
+            pid, action = prov_match.groups()
+            if action == "discover":
+                if cmd != "POST":
+                    raise apierr.method_not_allowed()
+                _body()
+                return admin_ops.discover_provider(self, pid)
+            if cmd == "PATCH":
+                return admin_ops.update_provider(self, pid, _body())
+            if cmd == "DELETE":
+                _body()
+                return admin_ops.delete_provider(self, pid)
+            raise apierr.method_not_allowed()
+
+        if path == "/admin/api/catalog/refresh":
+            if cmd != "POST":
+                raise apierr.method_not_allowed()
+            data = _body()
+            return admin_ops.discover_provider(self, data.get("provider_id") if isinstance(data, dict) else None)
+
+        if path == "/admin/api/models/ping":
+            if cmd != "POST":
+                raise apierr.method_not_allowed()
+            return admin_ops.ping_model(self, _body())
+
+        if path == "/admin/api/routes":
+            if cmd == "GET":
+                return admin_ops.list_routes(self)
+            if cmd == "POST":
+                return admin_ops.create_route(self, _body())
+            raise apierr.method_not_allowed()
+
+        if path.startswith("/admin/api/routes/"):
+            rid = unquote(path[len("/admin/api/routes/"):])
+            if not rid:
+                raise apierr.not_found()
+            if cmd == "PATCH":
+                return admin_ops.update_route(self, rid, _body())
+            if cmd == "DELETE":
+                _body()
+                return admin_ops.delete_route(self, rid)
+            raise apierr.method_not_allowed()
+
+        if path == "/admin/api/client-keys":
+            if cmd == "GET":
+                return admin_ops.list_client_keys(self)
+            if cmd == "POST":
+                return admin_ops.create_client_key(self, _body())
+            raise apierr.method_not_allowed()
+
+        ck_match = CLIENT_KEY_PATH.fullmatch(path)
+        if ck_match:
+            kid = ck_match.group(1)
+            if cmd == "PATCH":
+                return admin_ops.update_client_key(self, kid, _body())
+            if cmd == "DELETE":
+                _body()
+                return admin_ops.delete_client_key(self, kid)
+            raise apierr.method_not_allowed()
+
+        if path == "/admin/api/clients/sync-opencode":
+            if cmd != "POST":
+                raise apierr.method_not_allowed()
+            _body()
+            return admin_ops.sync_opencode_now(self)
+
+        return None
+
     def handle(self, handler, path):
         if not path.startswith("/admin/api/"):
             if handler.command not in ("GET", "HEAD"):
@@ -1687,6 +1846,10 @@ class Admin:
             return
         if path in PROMPT_ROUTES:
             handler._json(200, self._prompts_route(handler, path, query))
+            return
+        gateway_payload = self._gateway_route(handler, path)
+        if gateway_payload is not None:
+            handler._json(200, gateway_payload)
             return
         if handler.command == "GET":
             if path == "/admin/api/overview":

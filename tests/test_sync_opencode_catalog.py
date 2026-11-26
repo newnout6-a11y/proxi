@@ -799,3 +799,65 @@ def test_opencode_takes_images_where_the_model_sees_and_no_variant_is_switched_o
     assert opus['modalities'] == {'input': ['text', 'image'] if opus['attachment'] else ['text'], 'output': ['text']}
     assert catalog['gpt-4.1']['modalities']['output'] == ['text']
     assert not any(value.get('disabled') for item in catalog.values() for value in item['variants'].values())
+
+
+def test_universal_providers_routes_pricing_pdf_and_small_models_sync_cleanly(tmp_path, capsys):
+    relay_file = tmp_path / 'config.json'
+    relay_file.write_text(json.dumps({
+        'providers': [
+            {'id': 'or', 'preset': 'openrouter', 'api_key': 'sk-or-v1-synthetic0123456789abcdef'},
+            {'id': 'local', 'preset': 'ollama', 'models': ['qwen3-coder:latest']},
+        ],
+        'routes': [
+            {'id': 'coding-best', 'label': 'Coding Best', 'targets': ['or/anthropic/claude-opus-4.6', 'local/qwen3-coder:latest']},
+        ],
+    }), encoding='utf-8')
+    (tmp_path / 'provider_models.auto.json').write_text(json.dumps({
+        'providers': {
+            'or': [
+                {'id': 'anthropic/claude-opus-4.6', 'context': 1000000, 'max_output': 128000, 'vision': True, 'pdf': True,
+                 'tools': True, 'reasoning': True,
+                 'pricing': {'input': 5.0, 'output': 25.0, 'cache_read': 0.5, 'cache_write': 6.25}},
+                {'id': 'google/gemini-2.5-flash:free', 'context': 1048576, 'max_output': 65536, 'vision': True, 'pdf': True,
+                 'tools': True, 'reasoning': True,
+                 'pricing': {'input': 0.0, 'output': 0.0, 'cache_read': 0.0, 'cache_write': 0.0}},
+                {'id': 'anthropic/claude-haiku-4.5', 'context': 200000, 'max_output': 64000, 'vision': True, 'pdf': True,
+                 'tools': True, 'reasoning': True,
+                 'pricing': {'input': 1.0, 'output': 5.0, 'cache_read': 0.1, 'cache_write': 1.25}},
+            ],
+        },
+    }), encoding='utf-8')
+    settings = installed(tmp_path, {
+        'model': 'retool-relay/coding-best#high',
+        'small_model': 'retool-relay/removed-small',
+        'agent': {
+            'build': {'model': 'retool-relay/or/google/gemini-2.5-flash:free#low'},
+            'compaction': {'model': 'retool-relay/removed-compactor'},
+        },
+        'provider': {'retool-relay': {'options': {'baseURL': 'http://127.0.0.1:8787/v1', 'apiKey': 'relay-private'}, 'models': {}}},
+    })
+    code, summary, error = client(tmp_path, capsys, '--write', '--backup-dir', str(tmp_path / 'backups'), relay=relay_file)
+    assert code == 0 and summary['written'] is True, error
+    saved = json.loads(settings.read_text(encoding='utf-8'))
+    catalog = saved['provider']['retool-relay']['models']
+    assert {'or/anthropic/claude-opus-4.6', 'or/google/gemini-2.5-flash:free', 'or/anthropic/claude-haiku-4.5',
+            'local/qwen3-coder:latest', 'coding-best'} <= set(catalog)
+    # Verified USD pricing is published as OpenCode cost, including zero-priced :free endpoints.
+    assert catalog['or/anthropic/claude-opus-4.6']['cost'] == {'input': 5.0, 'output': 25.0, 'cache_read': 0.5, 'cache_write': 6.25}
+    assert catalog['or/google/gemini-2.5-flash:free']['cost'] == {'input': 0.0, 'output': 0.0, 'cache_read': 0.0, 'cache_write': 0.0}
+    assert catalog['or/anthropic/claude-opus-4.6']['modalities']['input'] == ['text', 'image', 'pdf']
+    # User references to route aliases and colon-suffixed universal models survive canonicalization.
+    assert saved['model'] == 'retool-relay/coding-best#high'
+    assert saved['agent']['build']['model'] == 'retool-relay/or/google/gemini-2.5-flash:free#low'
+    # Small tier picks Haiku first for small_model, and roomy Flash (1M >= 1M) for compaction!
+    assert saved['small_model'] == 'retool-relay/or/anthropic/claude-haiku-4.5'
+    assert saved['agent']['compaction']['model'] == 'retool-relay/or/google/gemini-2.5-flash:free'
+    # Minara quota pricing (prompt/completion multipliers, not input/output USD) is never published as USD cost.
+    minara_item = update_document(
+        {'provider': {'retool-relay': {'models': {}}}},
+        [{'id': 'minara/gpt-6.2-sol', 'label': 'GPT-6.2 Sol', 'upstream': 'minara', 'provider': 'openai',
+          'context': 1050000, 'max_output': 128000, 'vision': True, 'tools': True, 'reasoning': True,
+          'reasoning_effort_levels': ['low', 'medium', 'high', 'xhigh', 'max'],
+          'pricing': {'quota_type': 0, 'prompt': 2, 'completion': 10}}],
+    )['provider']['retool-relay']['models']['minara/gpt-6.2-sol']
+    assert 'cost' not in minara_item

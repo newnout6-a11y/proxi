@@ -91,3 +91,40 @@ def test_every_look_of_both_catalogs_ends_with_the_client_lists(tmp_path):
     minara.look()  # no Minara account: the look says so, the client lists are still brought up to date
     retool.look()
     assert called == ["minara", "retool"]
+
+
+def test_harness_profiles_are_synced_alongside_opencode_when_present(tmp_path, monkeypatch):
+    from ruamel.yaml import YAML
+    config, settings = relay_files(tmp_path)
+    profiles = tmp_path / "dsh-profiles"
+    for sub in ("desktop", "web", "headless"):
+        (profiles / sub).mkdir(parents=True)
+    patch_body = (
+        "- id: llm-pi-ai\n"
+        "  config:\n"
+        "    providers:\n"
+        "      retool:\n"
+        "        displayName: 'Retool Relay'\n"
+        "        baseURL: http://127.0.0.1:8787/v1\n"
+        "        apiKeyEnv: RETOOL_RELAY_API_KEY\n"
+        "        reasoning: medium\n"
+        "        models: []\n"
+    )
+    (profiles / "desktop" / "cordis.patch.yml").write_text(patch_body, encoding="utf-8")
+    (profiles / "web" / "cordis.patch.yml").write_text(patch_body, encoding="utf-8")
+    (profiles / "headless" / "cordis.patch.yml").write_text("[]\n", encoding="utf-8")
+    monkeypatch.setattr(client_sync, "HARNESS_DEFAULT_FOLDER", profiles)
+    sync = client_sync.OpenCodeSync({"_config_path": str(config), "opencode_settings": str(settings)})
+    before = journal.JOURNAL.last_seq
+    summary = sync("minara")
+    assert summary["written"] is True and len(summary["harness"]) == 2
+    assert all(item["written"] is True and item["models"] == 27 for item in summary["harness"])
+    for sub in ("desktop", "web"):
+        loaded = YAML().load((profiles / sub / "cordis.patch.yml").read_text(encoding="utf-8"))
+        provs = loaded[0]["config"]["providers"]
+        assert len(provs["retool"]["models"]) == 23 and len(provs["retool-text"]["models"]) == 4
+        assert len(list((profiles / sub / client_sync.BACKUPS).iterdir())) == 1
+    events = [ev for ev in journal.JOURNAL.query(since=before, limit=50) if ev["kind"] == "client.harness_synced"]
+    assert len(events) == 2
+    again = sync("retool")
+    assert again["written"] is False and all(item["written"] is False for item in again["harness"])

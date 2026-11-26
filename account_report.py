@@ -18,7 +18,11 @@ def account_managers(runtime):
         manager = runtime.credits if backend is runtime.backend else runtime.accounts.managers.get(backend)
         if manager is not None:
             rows.append((backend, manager))
-    return rows or [(runtime.backend, runtime.credits)]
+    if rows:
+        return rows
+    if getattr(runtime, "cfg", {}).get("_empty_pool"):
+        return []
+    return [(runtime.backend, runtime.credits)]
 
 
 def known(value):
@@ -77,6 +81,8 @@ def collect(runtime, *, force_refresh=False):
                 return info
         return manager.get_balance(force_refresh=force_refresh)
 
+    if not rows:
+        return []
     if len(rows) == 1:
         infos = [fetch(rows[0])]
     else:
@@ -99,10 +105,9 @@ def collect(runtime, *, force_refresh=False):
 
 
 def serving_entry(entries):
-    """The account /health describes: a routable one first, then an enabled one, then the first.
-
-    The first account in config.json is not special: it may be switched off while the pool serves.
-    """
+    """The account /health describes: a routable one first, then an enabled one, then the first (or None if empty)."""
+    if not entries:
+        return None
     return (next((entry for entry in entries if entry["routable"]), None)
             or next((entry for entry in entries if enabled(entry["backend"])), None) or entries[0])
 
@@ -130,14 +135,26 @@ def aggregate_balance(infos):
     Only Retool credits are summed here. Minara counts its own credits (220 per US dollar): they go in `minara`, a total
     of their own, and never into Retool's figures."""
     minara = [info for info in infos if info.get("unit") == "minara_credits"]
-    infos = [info for info in infos if info.get("unit") != "minara_credits"]
-    report = _aggregate(infos)
+    usd_infos = [info for info in infos if info.get("unit") == "usd"]
+    retool_infos = [info for info in infos if info.get("unit") not in ("minara_credits", "usd")]
+    report = _aggregate(retool_infos)
     if minara:
         known_minara = [info for info in minara if known(info.get("available")) is not None]
         credits = round(sum(known(info["available"]) for info in known_minara), 4) if known_minara else None
         report["minara"] = {"available": credits, "unit": "minara_credits",
                             "usd": round(credits / CREDITS_PER_USD, 4) if credits is not None else None,
                             "accounts_total": len(minara), "unknown_accounts": len(minara) - len(known_minara)}
+    if usd_infos:
+        known_usd = [info for info in usd_infos if known(info.get("available")) is not None]
+        avail_usd = round(sum(known(info["available"]) for info in known_usd), 4) if known_usd else None
+        spent_usd = round(sum(known(info.get("session_used")) or 0.0 for info in usd_infos), 6)
+        report["usd"] = {
+            "available": avail_usd,
+            "session_used": spent_usd,
+            "unit": "usd",
+            "accounts_total": len(usd_infos),
+            "unknown_accounts": len([i for i in usd_infos if i.get("balance_supported", True) and known(i.get("available")) is None]),
+        }
     return report
 
 
@@ -185,10 +202,12 @@ def balance_report(entries):
 
 
 def usage_report(runtime, rows=None):
-    rows, recent, accounts = rows or account_managers(runtime), [], []
-    totals = {"session_used": 0.0, "turns": 0, "recent_total": 0.0}
+    rows = account_managers(runtime) if rows is None else rows
+    recent, accounts = [], []
+    totals = {"session_used": 0.0, "turns": 0, "recent_total": 0.0, "cost_usd": 0.0}
     available, unreported = [], False
     credit_accounts = 0
+    monetary_accounts = 0
     for backend, manager in rows:
         usage = manager.usage()
         tag = account_tag(backend, UNNAMED)
@@ -196,24 +215,42 @@ def usage_report(runtime, rows=None):
         recent.extend(items)
         used = console_log.number(usage.get("session_used")) or 0.0
         turns = int(usage.get("turns") or 0)
-        monetary = backend.cfg.get("upstream") == "minara"
+        upstream_kind = backend.cfg.get("upstream", "retool")
+        monetary = upstream_kind != "retool"
         credit_accounts += not monetary
+        monetary_accounts += int(monetary)
         totals["session_used"] += used if not monetary else 0
         totals["turns"] += turns
         totals["recent_total"] += console_log.number(usage.get("recent_total")) or sum(
             console_log.number(item.get("credits")) or 0.0 for item in items)
+        p_cost = console_log.number(usage.get("provider_cost"))
+        if monetary and p_cost is not None and (usage.get("provider_cost_currency") or "USD").upper() == "USD":
+            totals["cost_usd"] += p_cost
         unreported = unreported or bool(usage.get("unreported_usage"))
         balance = known(usage.get("available"))
-        if balance is not None:
+        if balance is not None and not monetary:
             available.append(balance)
-        accounts.append({"account": tag, "session_used": None if monetary else round(used, 4),
-                         "turns": turns, "available": balance,
-                         **({"upstream": "minara", **{key: usage[key] for key in (
-                             "attempts", "provider_cost", "provider_cost_currency", "provider_cost_complete",
-                             "provider_cost_records") if key in usage}} if monetary else {})})
+        accounts.append({
+            "account": tag,
+            "session_used": None if monetary else round(used, 4),
+            "turns": turns,
+            "available": balance,
+            **({
+                "upstream": upstream_kind,
+                **({"provider_id": backend.cfg["provider_id"]} if backend.cfg.get("provider_id") else {}),
+                **{key: usage[key] for key in (
+                    "attempts", "provider_cost", "provider_cost_currency", "provider_cost_complete",
+                    "provider_cost_records") if key in usage},
+            } if monetary else {}),
+        })
     recent.sort(key=lambda item: item.get("ts") or 0)
-    return {"session_used": round(totals["session_used"], 4) if credit_accounts else None, "turns": totals["turns"],
-            "recent": recent[-50:], "recent_total": round(totals["recent_total"], 4) if credit_accounts else None,
-            "unreported_usage": unreported,
-            "available": round(sum(available), 4) if available else None,
-            "accounts": accounts}
+    return {
+        "session_used": round(totals["session_used"], 4) if credit_accounts else None,
+        "cost_usd": round(totals["cost_usd"], 6) if monetary_accounts else None,
+        "turns": totals["turns"],
+        "recent": recent[-50:],
+        "recent_total": round(totals["recent_total"], 4) if credit_accounts else None,
+        "unreported_usage": unreported,
+        "available": round(sum(available), 4) if available else None,
+        "accounts": accounts,
+    }

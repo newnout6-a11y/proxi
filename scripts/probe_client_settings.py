@@ -232,6 +232,17 @@ def catalog_policy(config, catalog_output, mode, *, allowed_entries=None, requir
     return policy
 
 
+def _reference_string(value):
+    """Normalize an OpenCode 1 string or OpenCode 2.3+ {providerID, model, variant} object to 'provider/model[#variant]'."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("providerID"), str) and isinstance(value.get("model"), str):
+        variant = value.get("variant")
+        suffix = ("#" + variant) if isinstance(variant, str) and variant else ""
+        return "%s/%s%s" % (value["providerID"], value["model"], suffix)
+    return None
+
+
 def run_models(config, mode):
     """(field, reference) for each model setting of `config` that an OpenCode probe run can send a request with.
 
@@ -239,14 +250,19 @@ def run_models(config, mode):
     """
     found = []
     for info in config_documents(config, mode):
-        # Any top-level text under a key with "model" in its name, so a renamed small-model key still counts.
-        found += [(key, value) for key, value in info.items() if "model" in key.lower() and isinstance(value, str)]
+        # Any top-level text (or OpenCode 2.3+ model object) under a key with "model" in its name.
+        for key, value in info.items():
+            if "model" in key.lower():
+                ref = _reference_string(value)
+                if ref is not None:
+                    found.append((key, ref))
         for section in ("agent", "agents"):  # OpenCode 1 and OpenCode 2
             agents = info.get(section)
             for name in RUN_AGENTS:
                 agent = agents.get(name) if isinstance(agents, dict) else None
                 if isinstance(agent, dict) and agent.get("model") is not None:
-                    found.append(("%s.%s.model" % (section, name), agent["model"]))
+                    ref = _reference_string(agent["model"])
+                    found.append(("%s.%s.model" % (section, name), ref if ref is not None else agent["model"]))
     return found
 
 
@@ -311,18 +327,37 @@ def routable_entries(relay_config):
         raise ValueError("relay configuration %s is not valid JSON (%s)" % (relay_config, error)) from None
     if not isinstance(saved, dict):
         raise ValueError("relay configuration %s must contain a JSON object" % relay_config)
-    cfg = {**RELAY_DEFAULTS, **saved}
-    accounts = load_accounts(relay_config)
+    cfg = {**RELAY_DEFAULTS, **saved, '_config_path': str(Path(relay_config).resolve())}
+    if isinstance(saved.get('providers'), list):
+        import copy
+        from drivers import presets as driver_presets
+        pmeta = {}
+        for idx, prov in enumerate(saved['providers']):
+            try:
+                meta, _, _ = driver_presets.expand_provider_to_accounts(copy.deepcopy(prov), f'providers[{idx}]')
+                pmeta[meta['id']] = meta
+            except ValueError:
+                continue
+        cfg['_providers_meta'] = pmeta
+    try:
+        accounts = load_accounts(relay_config)
+    except (AttributeError, TypeError) as error:
+        raise ValueError("relay configuration %s has an invalid accounts section" % relay_config) from error
+    if not accounts and ('providers' in saved or saved.get('accounts') == []):
+        cfg['_empty_pool'] = True
     backends = [SimpleNamespace(cfg=account) for account in accounts]
-    # The models the relay measured or published by itself since its catalogs were made (minara_refresh and
-    # retool_refresh write them beside config.json), as config.load puts them in: without them a model the relay already
-    # served never reached the client's list.
+    # The models the relay measured or published by itself since its catalogs were made (minara_refresh,
+    # retool_refresh and catalog.discovery write them beside config.json), as config.load puts them in: without them
+    # a model the relay already served never reached the client's list.
     import minara_catalog
     import retool_catalog
+    from catalog import router as catalog_router
     minara_catalog.apply_overlay(minara_catalog.overlay_path(relay_config))
     retool_catalog.apply_overlay(retool_catalog.overlay_path(relay_config))
-    # Minara models come from the accounts of this file (minara_models.json and their lists), as the relay builds them.
+    # Minara, universal provider models, and route aliases come from the accounts/providers of this file.
     cfg['_minara_models'] = models.build_minara_catalog(accounts)
+    cfg['_provider_models'] = catalog_router.build_provider_catalog(cfg)
+    cfg['_route_aliases'] = catalog_router.build_route_aliases(cfg, models)
     return [entry for entry in models.catalog(cfg) if models.catalog_routable(entry, cfg, backends)]
 
 
@@ -349,6 +384,7 @@ def default_executable(mode, environ=None, home=None):
 
 
 def run_client(args, **kwargs):
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
     return subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", **kwargs)
 
 
@@ -440,8 +476,14 @@ def main(argv=None):
         if not turns:
             error = ("the probe server received no model request, so the client ignored the endpoint override "
                      "and may have contacted the real relay")
+        def _expected_effort(row):
+            if mode == "claude" and (row.get("resolved_identity") or {}).get("agent"):
+                # proxi-smoke requests effort="xhigh"; Claude Code >=2.1.322 honours it, older builds inherit "high".
+                return row["effort"] in ("high", "xhigh")
+            return row["effort"] == "high"
+
         passed = (error is None and result.returncode == 0 and "PROXI_SMOKE_OK" in result.stdout
-                  and len(turns) >= 3 and all(row["effort"] == "high" for row in turns))
+                  and len(turns) >= 3 and all(_expected_effort(row) for row in turns))
         if mode == "claude":
             passed = passed and bool(stats and stats.get("spawned") == 1 and stats.get("completed") == 1)
         else:

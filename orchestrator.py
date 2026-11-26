@@ -547,7 +547,7 @@ class TurnRunner:
         if not client or not key or peek is None:
             return None, None
         session = peek(key, model_entry=parsed.entry, exclude=exclude, **acquire_plan(self.cfg, parsed).kwargs)
-        if parsed.entry.get("upstream") == "minara":
+        if parsed.entry.get("upstream", "retool") != "retool":
             return self._minara_dialog_effort(parsed, session), None
         history = getattr(session, "_native_history", None)
         if history is None or not history.branches:
@@ -1153,6 +1153,22 @@ class TurnRunner:
                     "токен отклонён" if rejected else "баланс закончился"))
                 holder["reason"] = "stop"
                 continue
+            if (retryable and error is not None and backend is not None and backend not in exclude
+                    and (getattr(backend, "cfg", None) or {}).get("upstream", "retool") not in ("retool", "minara")
+                    and error.code in ("upstream_error", "service_unavailable", "upstream_timeout",
+                                       "upstream_auth_error", "insufficient_credits", "rate_limit_error")):
+                check_next = getattr(self.pool, "unavailable_error", None)
+                if check_next is not None and check_next(
+                    parsed.entry, exclude=(*exclude, backend), **acquire_plan(self.cfg, parsed).kwargs
+                ) is None:
+                    exclude.append(backend)
+                    journal.emit("account.failover", "Сбой апстрима провайдера — запрос переключён на резервный маршрут",
+                                 "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
+                                 error=error.code, reason="provider_failover")
+                    console_log.write("[%s] [account] %s: %s, failover на резервный маршрут" % (
+                        getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED), error.code))
+                    holder["reason"] = "stop"
+                    continue
             if error is not None and apierr.is_plan_refusal(error):
                 # The turn cannot move (no attempt left, the client went away): when no account can take the model now,
                 # the client gets the settled 404 that names the cause rather than a 502 it would only send again.
@@ -1273,7 +1289,9 @@ class TurnRunner:
             task_block = ""
             previous_steps = []
             last_followup = None
-            if parsed.entry.get("upstream") != "minara" and not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"]):
+            if (parsed.entry.get("upstream", "retool") == "retool"
+                    and not parsed.entry.get("route_targets")
+                    and not model_catalog.PROVIDER_RESOURCE_KEY.get(parsed.entry["provider"])):
                 raise apierr.service_unavailable(f"provider '{parsed.entry['provider']}' is not routed")
             # The resource is per-account (org-scoped UUID or __managed__): it is
             # resolved from the acquired session's backend cfg below. Resolving it
@@ -1400,7 +1418,12 @@ class TurnRunner:
                 # must come from the backend cfg the turn actually runs on, not the
                 # global config (accounts[] can span tenants).
                 acc_cfg = getattr(getattr(acquired, "backend", None), "cfg", None) or self.cfg
-                resource = model_catalog.provider_resource(acc_cfg, parsed.entry)
+                bound_entry = model_catalog.bind_entry_for_backend(parsed.entry, acc_cfg)
+                acquired._bound_entry = bound_entry
+                acquired._provider_options = dict(getattr(parsed, "provider_options", None) or {})
+                acquired._structured_output = getattr(parsed, "structured_output", None)
+                model_provider["model"] = bound_entry.get("upstream_model") or bound_entry["id"]
+                resource = model_catalog.provider_resource(acc_cfg, bound_entry)
                 if resource:
                     model_provider["providerResourceName"] = resource
                 else:
@@ -1415,7 +1438,7 @@ class TurnRunner:
                 log("route.bound", "Выбран фактический маршрут %s" % actual_upstream,
                     upstream=actual_upstream, model=parsed.model, upstream_model=model_provider.get("model"),
                     effective_effort=model_provider.get("reasoningEffort"), child=bool(parent_key))
-                if actual_upstream == "minara" and getattr(parsed, "client_task", "") not in client_context.SIDE_TASKS:
+                if actual_upstream != "retool" and getattr(parsed, "client_task", "") not in client_context.SIDE_TASKS:
                     # What the dialog's turns go with: its compaction keeps it (_minara_dialog_effort).
                     target = acquired.session if isinstance(acquired, SessionLease) else acquired
                     target._minara_effort = model_provider.get("reasoningEffort")
@@ -1487,8 +1510,10 @@ class TurnRunner:
                             parsed._full_prompt_text = sent
 
                         if native_tools:
-                            tools_converted = (parsed.tools if parsed.entry.get("upstream") == "minara"
-                                               else direct.tools_to_retool(parsed.tools))
+                            import drivers as _drivers
+                            uses_retool_tools = _drivers.get_driver(acc_cfg).capabilities.uses_retool_tool_schema
+                            tools_converted = (direct.tools_to_retool(parsed.tools) if uses_retool_tools
+                                               else parsed.tools)
                             if hasattr(direct_target, "register_tools"):
                                 direct_target.register_tools(tools_converted)
                             final_tools = tools_converted
@@ -1507,8 +1532,11 @@ class TurnRunner:
                             final_choice,
                             getattr(parsed, "max_tokens", None),
                             chunks)
-                        direct_target._native_client_messages = (getattr(parsed, "native_messages", None)
-                                                                 if native_tools or parsed.entry.get("upstream") == "minara" else None)
+                        direct_target._native_client_messages = (
+                            getattr(parsed, "native_messages", None)
+                            if native_tools or actual_upstream != "retool"
+                            else None
+                        )
                         # Which calls the client can receive: a call of another tool is dropped below, and is no part
                         # of what the turn delivered or of the branch kept for it (direct.iter_events).
                         direct_target._native_callable_tools = list(tool_names) if native_tools else None
@@ -1622,6 +1650,7 @@ class TurnRunner:
                                         holder['_attempt_usage'] = {}
                                         holder['_attempt_credited'] = False
                                         holder['_attempt_minara'] = None
+                                        holder['_attempt_usd'] = None
                                     out.put(event)
                                 elif (event["type"] == "tool_call" and searcher is not None and direct_mode
                                       and event.get("name") == search_spec["name"]):
@@ -1679,6 +1708,13 @@ class TurnRunner:
                                     breakdown = credits.cost_breakdown(usage, parsed.model)
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
                                     provider_cost = usage.get('provider_cost')
+                                    usd_spent = None
+                                    if (isinstance(provider_cost, (int, float)) and not isinstance(provider_cost, bool)
+                                            and math.isfinite(provider_cost)
+                                            and (usage.get('provider_cost_currency') or 'USD').upper() == 'USD'):
+                                        before_usd = holder.get('_attempt_usd') or 0.0
+                                        usd_spent = round(max(0.0, float(provider_cost) - before_usd), 10)
+                                        holder['_attempt_usd'] = float(provider_cost)
                                     minara_credits = credits.minara_credits(usage)
                                     # The attempt's Minara credits so far, against what earlier usage of the same attempt
                                     # already said: the journal and the console's spent= add each event's share once.
@@ -1688,16 +1724,27 @@ class TurnRunner:
                                         minara_spent = round(max(0.0, minara_credits - before), 4)
                                         holder['_attempt_minara'] = minara_credits
                                         event = dict(event, minara_credits=minara_spent)
+                                    if usd_spent is not None:
+                                        event = dict(event, cost_usd=usd_spent)
+                                    ck_id = holder.get('_client_key_id')
+                                    ck_rec = holder.get('_client_key_recorder')
+                                    if ck_id and callable(ck_rec):
+                                        ck_rec(
+                                            ck_id,
+                                            input_tokens=(delta.get('input_tokens') or 0) + (delta.get('cache_read') or 0) + (delta.get('cache_write') or 0),
+                                            output_tokens=delta.get('output_tokens') or 0,
+                                            cost_usd=usd_spent,
+                                        )
                                     if not known and provider_cost is not None:
-                                        # Minara reports a cost in USD (or the relay estimated one from the catalog): the
-                                        # turn is priced, only not in Retool credits. It was a warning on every turn.
+                                        # Minara or a universal provider reports a cost in USD (or the relay estimated one
+                                        # from the catalog): the turn is priced, only not in Retool credits.
                                         log('upstream.usage', 'Токены получены; стоимость %s %.6f%s%s' % (
                                                 usage.get('provider_cost_currency') or 'USD', provider_cost,
                                                 ' (оценка по прайсу)' if usage.get('provider_cost_estimated') else '',
                                                 ' = %s кредитов Minara' % minara_credits
                                                 if minara_credits is not None else ''),
                                             'info', credits=None, attempt=journal_attempt, credits_reported=False,
-                                            provider_cost=provider_cost, minara_credits=minara_spent,
+                                            provider_cost=provider_cost, cost_usd=usd_spent, minara_credits=minara_spent,
                                             provider_cost_estimated=bool(usage.get('provider_cost_estimated')), **delta,
                                             **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
                                     else:

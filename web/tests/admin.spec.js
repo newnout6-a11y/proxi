@@ -1589,3 +1589,35 @@ test('Minara account never labels monetary usage as Retool credits', async ({ pa
   await expect(row.getByRole('button', { name: 'Баланс', exact: true })).toBeDisabled();
   await expect(row.getByRole('button', { name: 'Продлить', exact: true })).toHaveCount(0);
 });
+
+test('universal providers, route aliases and client AccessKeys can be tested and created from Accounts', async ({ page }) => {
+  await mockAdmin(page);
+  await login(page);
+  await nav(page, 'Аккаунты');
+
+  // 1. Connect a universal provider via 1-click preset + connection test
+  await page.getByRole('button', { name: 'Подключить провайдера' }).click();
+  await page.getByRole('group', { name: 'Пресеты провайдеров' }).getByRole('button', { name: 'Ollama (Local)' }).click();
+  await page.getByRole('button', { name: 'Проверить соединение' }).click();
+  await expect(page.getByText(/Соединение проверено/)).toBeVisible();
+  await page.getByRole('button', { name: 'Подключить', exact: true }).click();
+  await expect(page.getByText('Провайдер подключён')).toBeVisible();
+  await expect(page.locator('.gw-row', { hasText: 'Ollama (Local)' })).toContainText('ollama/…');
+
+  // 2. Create a route alias and ping it
+  await page.getByRole('button', { name: 'Новый маршрут' }).click();
+  await page.getByLabel('Имя алиаса (модель для IDE)').fill('coding-best');
+  await page.getByLabel(/Целевые модели по порядку фолбэка/).fill('ollama/qwen3-coder, claude-opus-5-5');
+  await page.getByRole('button', { name: 'Сохранить маршрут' }).click();
+  const routeRow = page.locator('.gw-row', { hasText: 'coding-best' });
+  await expect(routeRow).toBeVisible();
+  await routeRow.getByRole('button', { name: 'Пинг' }).click();
+  await expect(routeRow).toContainText('OK · 85 мс');
+
+  // 3. Create a virtual client AccessKey and verify one-time banner
+  await page.getByRole('button', { name: 'Создать ключ' }).click();
+  await page.getByLabel('Название клиента / устройства').fill('Cursor Laptop');
+  await page.getByRole('button', { name: 'Выпустить ключ' }).click();
+  await expect(page.locator('.gw-key-banner')).toContainText('sk-proxi-e2e-synthetic-test-key-abcd');
+  await expect(page.locator('.gw-row', { hasText: 'Cursor Laptop' })).toContainText('sk-proxi-…abcd');
+});

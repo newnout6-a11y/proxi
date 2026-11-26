@@ -581,3 +581,13 @@ test('a time span and a moment are written for people', () => {
   assert.match(fmtSince(now - 3 * 86400, now), /^\d{1,2} [а-яё]+, \d{2}:\d{2}$/);
   assert.equal(fmtSince(undefined, now), '—');
 });
+
+test('a universal provider turn is priced in USD (cost_usd) without marking credits as unknown', () => {
+  const USD = (n, usd) => USAGE(n, null, { credits_reported: false, cost_usd: usd });
+  const cost = costOf(turnOf([START(1), USD(1, 0.0042), END()]));
+  assert.deepEqual(cost, { credits: null, usd: 0.0042, unknown: 0, running: false, complete: true });
+  const two = costOf(turnOf([START(1), USD(1, 0.0015), START(2), USD(2, 0.0025), END()]));
+  assert.equal(two.usd, 0.004);
+  assert.equal(two.credits, null);
+  assert.equal(two.complete, true);
+});
