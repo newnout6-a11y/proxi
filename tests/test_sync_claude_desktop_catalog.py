@@ -278,6 +278,29 @@ def test_local_configuration_is_replaced_atomically_when_no_policy_exists(tmp_pa
                                       for hive, access in state.opened if hive == 'HKLM')
 
 
+def test_effort_only_repairs_an_existing_minara_picker_without_syncing_the_whole_list(tmp_path, monkeypatch, capsys):
+    registry(monkeypatch)
+    model = 'minara/claude-sonnet-5-5'
+    rows = ['claude-local-unlisted', {'name': model, 'labelOverride': 'My model', 'supports1m': False},
+            {'name': 'claude-sonnet-5-5', 'behavesAs': 'my-override'}]
+    path, before = local_library(tmp_path / 'configLibrary', rows)
+    config = relay_config(tmp_path, allow_effort_downgrade=True,
+                          accounts=[{'upstream': 'minara', 'base': 'https://example.invalid',
+                                     'bearer_token': 'fixture-token'}])
+    args = ('--relay-config', config, '--desktop-catalog', anthropic_catalog(tmp_path),
+            '--config-library', path.parent, '--effort-only', '--write', '--backup-dir', tmp_path / 'backups')
+    code, report, error = cli(capsys, *args)
+    assert code == 0, error
+    assert report['added'] == report['removed'] == []
+    assert report['default_model'] == rows[0]
+    assert Path(report['backup']).read_bytes() == before
+    after = json.loads(path.read_bytes())
+    assert after == dict(json.loads(before), inferenceModels=[
+        rows[0], dict(rows[1], behavesAs='claude-sonnet-5-5', maxEffort='max'),
+        rows[2]])
+    assert cli(capsys, *args)[1]['changed'] is False
+
+
 def test_a_string_encoded_local_list_stays_a_string(tmp_path, monkeypatch, capsys):
     registry(monkeypatch)
     path, data = local_library(tmp_path / 'configLibrary', json.dumps(USER_ROWS))
