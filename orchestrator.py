@@ -1318,7 +1318,8 @@ class TurnRunner:
                 journal.emit("account.failover", "Токен аккаунта отклонён — запрос повторён на другом" if rejected else
                              "Баланс аккаунта закончился — запрос повторён на другом",
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
-                             error=error.code)
+                             error=error.code, reason="token_rejected" if rejected else "balance_exhausted",
+                             model=_model_id(parsed, lease))
                 console_log.write("[%s] [account] %s: %s, повтор на другом аккаунте" % (
                     getattr(parsed, "request_id", None) or "req", account_tag(backend, UNNAMED),
                     "токен отклонён" if rejected else "баланс закончился"))
