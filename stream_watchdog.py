@@ -178,21 +178,35 @@ async def _bounded(awaitable, grace: float) -> bool:
     return task.done()
 
 
-async def _shutdown(iterator, pending, grace: float):
-    if pending is not None:
-        if not pending.done():
-            pending.cancel()
-            await asyncio.wait({pending}, timeout=grace)
-        if not pending.done():
-            pending.add_done_callback(_consume)
-            return
-        _consume(pending)
+async def _close_iterator(iterator, grace: float):
     close = getattr(iterator, "aclose", None)
     if close is not None:
         try:
             await _bounded(close(), grace)
         except Exception:
             pass
+
+
+async def _shutdown(iterator, pending, grace: float):
+    if pending is not None:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.wait({pending}, timeout=grace)
+        if not pending.done():
+            loop = asyncio.get_running_loop()
+
+            def _finish(task):
+                _consume(task)
+                try:
+                    closer = loop.create_task(_close_iterator(iterator, grace))
+                    closer.add_done_callback(_consume)
+                except RuntimeError:
+                    pass
+
+            pending.add_done_callback(_finish)
+            return
+        _consume(pending)
+    await _close_iterator(iterator, grace)
 
 
 def _expire(phase: str, limit: float, on_timeout):
@@ -238,11 +252,19 @@ async def watch(
                     return
                 now = loop.time()
                 if is_progress(event, calls):
-                    if event.get("type") == "tool_call" and not event.get("partial"):
-                        # Only the complete call ends its budget: Retool without fine-grained streaming sends the first
-                        # ~20 characters of the arguments and holds the rest for tens of seconds (the idle budget cut
-                        # six Claude Code turns at a Write on 2026-11-18).
-                        announced.discard(_call_key(event))
+                    if event.get("type") == "tool_call":
+                        key = _call_key(event)
+                        if event.get("partial"):
+                            # OpenAI Chat and Minara often attach initial arguments on the very first
+                            # partial tool_call event; register it in `announced` so later pauses
+                            # receive the TOOL budget instead of falling back to IDLE.
+                            announced.add(key)
+                            calls.setdefault(key, 0)
+                        else:
+                            # Only the complete call ends its budget: Retool without fine-grained streaming sends the first
+                            # ~20 characters of the arguments and holds the rest for tens of seconds (the idle budget cut
+                            # six Claude Code turns at a Write on 2026-11-18).
+                            announced.discard(key)
                     if announced:
                         phase, limit = TOOL, tool
                     elif event.get("type") == "thinking" and _outlasts(thinking, idle):

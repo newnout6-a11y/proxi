@@ -9,9 +9,9 @@ import { isObject } from './draft.js';
 /** Which rule and profile answered, and what the head weighs. `forced`: the profile was applied whatever the rules say. */
 export function PreviewFacts({ data, forced = false }) {
   const legacy = data.profile === null;
-  const routing = forced && !data.protected ? [] : [
-    ['Профиль', legacy ? 'legacy: прежний путь' : data.profile],
-    ['Правило', legacy ? '—' : data.rule || 'по умолчанию (default_profile)'],
+  const routing = [
+    ['Профиль', legacy ? 'legacy: прежний путь' : forced && !data.protected ? `${data.profile} (симуляция)` : data.profile],
+    ['Правило', legacy ? '—' : forced && !data.protected ? 'отключены (принудительный профиль)' : data.rule || 'по умолчанию (default_profile)'],
     ['Ревизия', data.rev === null ? 'черновик' : String(data.rev)],
   ];
   const rows = [

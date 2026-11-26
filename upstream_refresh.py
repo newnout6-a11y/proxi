@@ -9,6 +9,7 @@ import urllib.request
 from accounts import cfg_tag
 from auth import cloudflare_challenge, merge_set_cookie, upstream_headers
 from config import _account_record, persist_auth, reload_auth, renewal_lock
+from drivers import curl_pool
 import journal
 from redact import redact
 
@@ -37,9 +38,15 @@ class Refresher:
         self.keepalive_owner = None
 
     def _default(self):
-        req = urllib.request.Request(self.cfg["base"] + "/api/refreshtoken",
-                                     data=b"{}", headers=upstream_headers(self.cfg), method="POST")
-        with urllib.request.urlopen(req, timeout=min(self.cfg["upstream_timeout"], 15)) as resp:
+        with curl_pool.retool_open(
+            self.cfg,
+            self.cfg["base"] + "/api/refreshtoken",
+            data=b"{}",
+            headers=upstream_headers(self.cfg),
+            method="POST",
+            timeout=min(self.cfg["upstream_timeout"], 15),
+            stream=False,
+        ) as resp:
             # PROTOCOL.md specifies an empty body: an empty or non-JSON reply is a
             # successful renewal, and its Set-Cookie headers must not be lost to a
             # strict parser.
@@ -100,7 +107,7 @@ class Refresher:
         # Hostname only: credentials, paths or queries in the URL stay out of logs.
         tenant = (urllib.parse.urlsplit(base).hostname or "") if isinstance(base, str) else ""
         with self._lock:
-            if rejected_cookie is not None and self.cfg["cookie"] != rejected_cookie:
+            if rejected_cookie is not None and self.cfg.get("cookie") != rejected_cookie:
                 return self._mark_adopted()
             try:
                 if reload_auth(self.cfg):
@@ -108,8 +115,12 @@ class Refresher:
             except Exception as exc:
                 self.persistence_error = "cannot read session configuration: " + type(exc).__name__
             now = time.monotonic()
-            if not force and now - self._last < MIN_INTERVAL:
-                return (self._last_result if rejected_cookie is not None else False), self.last_failure_kind, self.last_error
+            # When the caller reports an active 401/403 against the exact current cookie (e.g. a prior
+            # 200 keepalive/refresh returned without rotating it), never return cached success inside
+            # MIN_INTERVAL — force a real renewal attempt instead of replaying the rejected cookie.
+            rejected_same = rejected_cookie is not None and self.cfg.get("cookie") == rejected_cookie
+            if not force and not rejected_same and now - self._last < MIN_INTERVAL:
+                return False, self.last_failure_kind, self.last_error
             self._last = now
             try:
                 headers = self._http_refresh()

@@ -1,8 +1,8 @@
-import { Fragment, useRef, useState } from 'react';
+import { Fragment, useContext, useEffect, useRef, useState } from 'react';
 import { Plus, Trash } from 'lucide-react';
 import { Button, Tag } from '../ui.jsx';
 import { fmtInt } from '../format.js';
-import { Area, Disclosure, IconBtn, Line, Notice } from './controls.jsx';
+import { Area, Disclosure, IconBtn, Line, Notice, PromptFormContext, useExactError } from './controls.jsx';
 import { isObject, removeText, renameText, setRelayText, textNameError, textNameHint, textUsage, textsOf } from './draft.js';
 import { useFocusLater } from './hooks.js';
 
@@ -119,10 +119,95 @@ function NamedTexts({ doc, setDoc, limit, pattern }) {
   );
 }
 
-// codex_base is one string for every model or a map of model masks to strings.
-function CodexBase({ value, onChange, limit }) {
+let nextCodexRowId = 1;
+const toCodexRows = (map) => Object.entries(map).map(([glob, text]) => ({ id: nextCodexRowId++, glob, text }));
+
+function CodexMap({ map, onChange, limit }) {
   const root = useRef(null);
   const focusLater = useFocusLater();
+  const form = useContext(PromptFormContext);
+  const mapError = useExactError('relay_texts.codex_base');
+  const [items, setItems] = useState(() => toCodexRows(map));
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const lastEmitted = useRef(map);
+
+  useEffect(() => {
+    if (map === lastEmitted.current) return;
+    lastEmitted.current = map;
+    setItems(toCodexRows(map));
+  }, [map]);
+
+  useEffect(() => form?.registerValidator?.(() => {
+    const current = itemsRef.current;
+    const seen = new Set();
+    for (const row of current) {
+      if (!row.glob.trim()) {
+        return { message: 'Заполните пустую маску модели в базовых инструкциях Codex или уберите строку', param: 'relay_texts.codex_base' };
+      }
+      if (seen.has(row.glob)) {
+        return { message: `Маска модели «${row.glob}» повторяется в базовых инструкциях Codex`, param: 'relay_texts.codex_base' };
+      }
+      seen.add(row.glob);
+    }
+    return null;
+  }), [form]);
+
+  const counts = new Map();
+  for (const row of items) counts.set(row.glob, (counts.get(row.glob) || 0) + 1);
+
+  const commit = (nextItems) => {
+    setItems(nextItems);
+    const nextMap = Object.fromEntries(nextItems.map((row) => [row.glob, row.text]));
+    lastEmitted.current = nextMap;
+    onChange(nextMap);
+  };
+
+  const rows = () => [...(root.current?.querySelectorAll('.p-codex-row') || [])];
+  const addMask = () => {
+    commit([...items, { id: nextCodexRowId++, glob: '', text: '' }]);
+    // a new mask is for typing: the focus goes to its field
+    focusLater(() => rows().at(-1)?.querySelector('input'));
+  };
+  const removeMask = (index) => {
+    commit(items.filter((_, i) => i !== index));
+    // the pressed button may go with its row: the focus goes to the mask that took its place, or to the button that adds one
+    focusLater(() => {
+      const list = rows();
+      return list[Math.min(index, list.length - 1)]?.querySelector('[data-act="remove"]') || root.current?.querySelector('[data-act="add-mask"]');
+    });
+  };
+
+  return (
+    <div className="p-codex-map" ref={root} data-path="relay_texts.codex_base">
+      {mapError && <Notice tone="neg" role="alert">{mapError}</Notice>}
+      {items.map((row, index) => {
+        const duplicate = row.glob !== '' && (counts.get(row.glob) || 0) > 1;
+        const rowError = duplicate ? 'Такая маска уже есть — измените или уберите строку' : '';
+        const removeLabel = row.glob
+          ? `Убрать маску ${row.glob}${duplicate ? ` (${index + 1})` : ''}`
+          : `Убрать маску ${index + 1}`;
+        return (
+          <div className="p-codex-row" key={row.id}>
+            <Line label="Маска модели" value={row.glob} error={rowError} required
+              onChange={(next) => commit(items.map((item, i) => (i === index ? { ...item, glob: next } : item)))} placeholder="gpt-5*" />
+            <Area label={`Инструкции для ${row.glob || 'маски'}`} value={row.text} limit={limit} rows={5} path={`relay_texts.codex_base.${row.glob}`}
+              onChange={(next) => commit(items.map((item, i) => (i === index ? { ...item, text: next } : item)))} />
+            <IconBtn icon={Trash} tone="danger" label={removeLabel} data-act="remove" onClick={() => removeMask(index)} />
+          </div>
+        );
+      })}
+      <div className="head-actions">
+        <Button icon={Plus} data-act="add-mask" onClick={addMask}>Добавить маску</Button>
+        <Button onClick={() => onChange(items[0]?.text ?? '')}>Одна строка для всех моделей</Button>
+      </div>
+      <p className="p-hint">Первая подходящая маска в порядке списка. Модели, которых не поймала ни одна маска, получают встроенный текст</p>
+    </div>
+  );
+}
+
+// codex_base is one string for every model or a map of model masks to strings.
+function CodexBase({ value, onChange, limit }) {
   const map = isObject(value) && typeof value.file !== 'string' ? value : null;
   if (!map) {
     return (
@@ -132,37 +217,9 @@ function CodexBase({ value, onChange, limit }) {
       </>
     );
   }
-  const entries = Object.entries(map);
-  const set = (next) => onChange(Object.fromEntries(next));
-  const rows = () => [...(root.current?.querySelectorAll('.p-codex-row') || [])];
-  const addMask = () => {
-    set([...entries, ['', '']]);
-    // a new mask is for typing: the focus goes to its field
-    focusLater(() => rows().at(-1)?.querySelector('input'));
-  };
-  const removeMask = (index) => {
-    set(entries.filter((_, i) => i !== index));
-    // the pressed button may go with its row: the focus goes to the mask that took its place, or to the button that adds one
-    focusLater(() => rows()[Math.min(index, rows().length - 1)]?.querySelector('[data-act="remove"]') || root.current?.querySelector('[data-act="add-mask"]'));
-  };
-  return (
-    <div className="p-codex-map" ref={root}>
-      {entries.map(([glob, text], index) => (
-        <div className="p-codex-row" key={index}>
-          <Line label="Маска модели" value={glob} onChange={(next) => set(entries.map(([key, item], i) => [i === index ? next : key, item]))} placeholder="gpt-5*" />
-          <Area label={`Инструкции для ${glob || 'маски'}`} value={text} limit={limit} rows={5} path={`relay_texts.codex_base.${glob}`}
-            onChange={(next) => set(entries.map(([key, item], i) => [key, i === index ? next : item]))} />
-          <IconBtn icon={Trash} tone="danger" label={`Убрать маску ${glob || index + 1}`} data-act="remove" onClick={() => removeMask(index)} />
-        </div>
-      ))}
-      <div className="head-actions">
-        <Button icon={Plus} data-act="add-mask" onClick={addMask}>Добавить маску</Button>
-        <Button onClick={() => onChange(entries[0]?.[1] ?? '')}>Одна строка для всех моделей</Button>
-      </div>
-      <p className="p-hint">Первая подходящая маска в порядке списка. Модели, которых не поймала ни одна маска, получают встроенный текст</p>
-    </div>
-  );
+  return <CodexMap map={map} onChange={onChange} limit={limit} />;
 }
+
 
 function RelayText({ doc, setDoc, builtin, info }) {
   const raw = doc.relay_texts?.[info.name];

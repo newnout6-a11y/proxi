@@ -19,6 +19,7 @@ import auth
 from catalog import admin_ops
 import config
 import direct
+from drivers import curl_pool, http_pool
 import journal
 import minara_accounts
 import models
@@ -61,14 +62,14 @@ class _Masks:
 
     def __init__(self, pattern, cookies):
         self.pattern, self.cookies = pattern, cookies
-POOL_FIELDS = {"enabled", "priority", "label"}
+POOL_FIELDS = {"enabled", "priority", "label", "proxy_url", "impersonate"}
 NEW_ACCOUNT_REQUIRED = ("base", "page_uuid", "cookie", "xsrf")
-NEW_ACCOUNT_OPTIONAL = ("label", "provider_resource_name", "openai_provider_resource_name")
+NEW_ACCOUNT_OPTIONAL = ("label", "provider_resource_name", "openai_provider_resource_name", "proxy_url", "impersonate")
 # Moved into accounts[0] when a single-account configuration becomes a pool. SessionPool reads
 # provider_access (like enabled, priority and label) only from the account record, never the root.
 ACCOUNT_RECORD_KEYS = ("base", "page_uuid", "cookie", "xsrf", "account_id", "thread_id", "label", "enabled",
                        "priority", "provider_access", "upstream", "bearer_token", "bearer_token_env",
-                       "minara_models", *models.PROVIDER_RESOURCE_KEY.values())
+                       "minara_models", "proxy_url", "impersonate", *models.PROVIDER_RESOURCE_KEY.values())
 # The role is sent with every request: capped outright and, when max_prompt_bytes is set, to a
 # share of it so the conversation itself still fits.
 ROLE_MAX_BYTES = 32 * 1024
@@ -582,6 +583,7 @@ class Admin:
         for backend in backends:
             cfg = getattr(backend, "cfg", None) or {}
             secrets += [cfg.get("cookie"), cfg.get("xsrf"), cfg.get("bearer_token"), cfg.get("api_key"),
+                        admin_ops._proxy_password(cfg.get("proxy_url")),
                         os.environ.get(cfg.get("bearer_token_env") or ""),
                         os.environ.get(cfg.get("api_key_env") or "")]
             secrets += [part.partition("=")[2].strip() for part in str(cfg.get("cookie") or "").split(";")]
@@ -911,6 +913,16 @@ class Admin:
                          "priority": account_priority(backend),
                          "last_balance_at": getattr(entry["manager"], "last_fetched_at", None),
                          "pending": "removed" if removed else None, "_backend": backend})
+            proxy_val = (backend.cfg.get("_account_ref") or {}).get("proxy_url") or (
+                backend.cfg.get("proxy_url") if single and "proxy_url" in (saved or {}) else None
+            )
+            if proxy_val:
+                pool[-1]["proxy_url"] = admin_ops.public_proxy_url(proxy_val)
+            imp_val = (backend.cfg.get("_account_ref") or {}).get("impersonate") or (
+                backend.cfg.get("impersonate") if single and "impersonate" in (saved or {}) else None
+            )
+            if imp_val:
+                pool[-1]["impersonate"] = imp_val
         loaded_holds = self._account_index([entry["backend"].cfg for entry in entries])
         for record in [] if single else records or []:
             if loaded_holds(record):
@@ -923,6 +935,10 @@ class Admin:
                 "monthly_allocation": None, "used_month": None, "reset_date": None, "stale": False,
                 "session_used": 0.0, "turns": 0, "auth_failures": 0, "last_renewed_at": None,
                 "last_balance_at": None, "error": None, "pending": "added", "_record": record})
+            if record.get("proxy_url"):
+                pool[-1]["proxy_url"] = admin_ops.public_proxy_url(record["proxy_url"])
+            if record.get("impersonate"):
+                pool[-1]["impersonate"] = record["impersonate"]
             if record.get("upstream") == "minara":
                 pool[-1].update(upstream="minara", balance_supported=False, balance_unit="minara_credits",
                                 renewal_supported=False,
@@ -997,10 +1013,14 @@ class Admin:
 
     def _patch_account(self, tag, changes):
         if not changes:
-            raise apierr.bad_request("Expected enabled, priority or label")
+            raise apierr.bad_request("Expected enabled, priority, label, proxy_url or impersonate")
         for key, value in changes.items():
             if key not in POOL_FIELDS:
                 raise apierr.bad_request("Unknown or protected account field", param=key)
+            if key in ("proxy_url", "impersonate"):
+                if value is not None and not isinstance(value, str):
+                    raise apierr.bad_request(f"Invalid value for '{key}'", param=key)
+                continue
             valid = ((key == "enabled" and type(value) is bool) or
                      (key == "priority" and type(value) is int and 0 <= value <= 99) or
                      (key == "label" and isinstance(value, str) and len(value.strip()) <= 40 and _plain(value)))
@@ -1012,19 +1032,84 @@ class Admin:
         if account["pending"] == "removed":
             raise apierr.conflict("The account is removed from config.json and leaves after a restart")
         backend = account.get("_backend")
+        live_changes = dict(changes)
+        changed_transport = False
+        proxy_secret = None
         with self._transaction(refreshers=()) as (path, saved):
             record = self._saved_record(saved, account)
+            is_single = record is saved
             if changes.get("enabled") is False and backend is not None and account_enabled(backend):
                 if not self._other_enabled(saved, backend):
                     raise apierr.conflict("The last enabled account cannot be switched off")
                 if self.runtime.pool.mode == "shared" and backend is self.runtime.pool.backend:
                     raise apierr.conflict("Shared session mode serves only the first account")
-            record.update(changes)
+            if "proxy_url" in changes:
+                raw_proxy = changes["proxy_url"]
+                existing_proxy = record.get("proxy_url")
+                if (isinstance(raw_proxy, str) and existing_proxy
+                        and raw_proxy.strip() == admin_ops.public_proxy_url(existing_proxy)):
+                    live_changes["proxy_url"] = existing_proxy
+                else:
+                    try:
+                        clean_proxy = http_pool.validate_proxy_url(raw_proxy)
+                    except ValueError as exc:
+                        raise apierr.bad_request(str(exc), param="proxy_url") from None
+                    if clean_proxy:
+                        record["proxy_url"] = clean_proxy
+                        live_changes["proxy_url"] = clean_proxy
+                        proxy_secret = admin_ops._proxy_password(clean_proxy)
+                    else:
+                        record.pop("proxy_url", None)
+                        live_changes["proxy_url"] = "" if is_single else self.cfg.get("proxy_url", "")
+                    changed_transport = clean_proxy != (existing_proxy or None)
+            if "impersonate" in changes:
+                try:
+                    clean_imp = curl_pool.validate_impersonate(changes["impersonate"])
+                except ValueError as exc:
+                    raise apierr.bad_request(str(exc), param="impersonate") from None
+                existing_imp = record.get("impersonate")
+                if clean_imp:
+                    record["impersonate"] = clean_imp
+                    live_changes["impersonate"] = clean_imp
+                else:
+                    record.pop("impersonate", None)
+                    live_changes["impersonate"] = (
+                        curl_pool.DEFAULT_IMPERSONATE
+                        if is_single
+                        else self.cfg.get("impersonate", curl_pool.DEFAULT_IMPERSONATE)
+                    )
+                changed_transport = changed_transport or (clean_imp != (existing_imp or None))
+            for key in ("enabled", "priority", "label"):
+                if key in changes:
+                    record[key] = changes[key]
             self._write(path, saved)
+            if proxy_secret:
+                self._mask_tokens([proxy_secret])
             if backend is not None:
-                self._apply_live(backend, changes)
+                if changed_transport:
+                    curl_pool.close_account(backend.cfg)
+                    http_pool.close_account_clients(backend.cfg.get("account_id"))
+                backend.cfg.update(live_changes)
+                reference = backend.cfg.get("_account_ref")
+                if isinstance(reference, dict) and reference is not backend.cfg:
+                    for key in ("enabled", "priority", "label"):
+                        if key in live_changes:
+                            reference[key] = live_changes[key]
+                    if "proxy_url" in live_changes:
+                        if record.get("proxy_url"):
+                            reference["proxy_url"] = record["proxy_url"]
+                        else:
+                            reference.pop("proxy_url", None)
+                    if "impersonate" in live_changes:
+                        if record.get("impersonate"):
+                            reference["impersonate"] = record["impersonate"]
+                        else:
+                            reference.pop("impersonate", None)
+        changed_log = dict(changes)
+        if "proxy_url" in changed_log:
+            changed_log["proxy_url"] = admin_ops.public_proxy_url(live_changes.get("proxy_url")) if live_changes.get("proxy_url") else ""
         journal.emit("admin.account", "Аккаунт %s изменён: %s" % (tag, ", ".join(sorted(changes))), "info",
-                     account=tag, changed=changes)
+                     account=tag, changed=changed_log)
         return self._account_response(tag)
 
     def _loaded(self, tag):
@@ -1058,7 +1143,8 @@ class Admin:
     @staticmethod
     def _new_account(data):
         if data.get("upstream") == "minara":
-            allowed = {"upstream", "base", "bearer_token", "bearer_token_env", "minara_models", "label"}
+            allowed = {"upstream", "base", "bearer_token", "bearer_token_env", "minara_models", "label",
+                       "proxy_url", "impersonate"}
             unknown = set(data) - allowed
             if unknown:
                 raise apierr.bad_request("Unknown account field", param=sorted(unknown)[0])
@@ -1066,6 +1152,24 @@ class Admin:
             record.setdefault("base", "https://api.minara.ai/v1")
             if record.get("minara_models") in (None, []):
                 record.pop("minara_models", None)  # no list: every model minara_models.json publishes
+            if "proxy_url" in record:
+                try:
+                    proxy = http_pool.validate_proxy_url(record.get("proxy_url"))
+                except ValueError as exc:
+                    raise apierr.bad_request(str(exc), param="proxy_url") from None
+                if proxy:
+                    record["proxy_url"] = proxy
+                else:
+                    record.pop("proxy_url", None)
+            if "impersonate" in record:
+                try:
+                    imp = curl_pool.validate_impersonate(record.get("impersonate"))
+                except ValueError as exc:
+                    raise apierr.bad_request(str(exc), param="impersonate") from None
+                if imp:
+                    record["impersonate"] = imp
+                else:
+                    record.pop("impersonate", None)
             try:
                 config.validate_minara_account(copy.deepcopy(record), "new account")
             except apierr.ApiError as exc:
@@ -1096,6 +1200,20 @@ class Admin:
             # so a control character cannot split a header and a header cannot fail to encode.
             if len(value) > 16384 or not _plain(value, ascii_only=key != "label"):
                 raise apierr.bad_request(f"Invalid value for '{key}'", param=key)
+            if key == "proxy_url":
+                try:
+                    value = http_pool.validate_proxy_url(value)
+                except ValueError as exc:
+                    raise apierr.bad_request(str(exc), param="proxy_url") from None
+                if not value:
+                    continue
+            elif key == "impersonate":
+                try:
+                    value = curl_pool.validate_impersonate(value)
+                except ValueError as exc:
+                    raise apierr.bad_request(str(exc), param="impersonate") from None
+                if not value:
+                    continue
             record[key] = value
         parsed = urlsplit(record["base"])
         try:
@@ -1130,7 +1248,12 @@ class Admin:
         # No provider IO or live routing change: only extend redaction before
         # emitting the new account's operator-controlled label to the journal.
         if record.get("upstream") == "minara":
-            self._mask_tokens([os.environ.get(record.get("bearer_token_env") or "") or record.get("bearer_token")])
+            self._mask_tokens([
+                os.environ.get(record.get("bearer_token_env") or "") or record.get("bearer_token"),
+                admin_ops._proxy_password(record.get("proxy_url")),
+            ])
+        elif record.get("proxy_url"):
+            self._mask_tokens([admin_ops._proxy_password(record.get("proxy_url"))])
         tag = self._record_tag(record)
         live = self._adopt(record)
         journal.emit("admin.account", "Добавлен аккаунт %s%s" % (
@@ -1183,19 +1306,32 @@ class Admin:
         """Minara accounts from several Bearer tokens at once (minara_accounts.plan decides): each token is judged on its
         own, the valid ones the pool does not have yet are saved in one write, and the answer reports every token by its
         position in the list, never by its value."""
-        unknown = set(data) - {"upstream", "base", "bearer_tokens", "minara_models", "label"}
+        unknown = set(data) - {"upstream", "base", "bearer_tokens", "minara_models", "label", "proxy_url", "impersonate"}
         if unknown:
             raise apierr.bad_request("Unknown account field", param=sorted(unknown)[0])
+        try:
+            proxy_url = http_pool.validate_proxy_url(data.get("proxy_url"))
+        except ValueError as exc:
+            raise apierr.bad_request(str(exc), param="proxy_url") from None
+        try:
+            impersonate = curl_pool.validate_impersonate(data.get("impersonate"))
+        except ValueError as exc:
+            raise apierr.bad_request(str(exc), param="impersonate") from None
         with self._transaction() as (path, saved):
             results, records = minara_accounts.plan(
                 self._records(saved), data.get("bearer_tokens"), now=time.time(), label=data.get("label"),
-                base=data.get("base"), minara_models=data.get("minara_models"))
+                base=data.get("base"), minara_models=data.get("minara_models"),
+                proxy_url=proxy_url, impersonate=impersonate)
             renewed = minara_accounts.apply_renewals(results)
             if records:
                 self._append_records(saved, records)
             if records or renewed:
                 self._write(path, saved)
-        self._mask_tokens([record["bearer_token"] for record in records] + renewed)
+        self._mask_tokens(
+            [record["bearer_token"] for record in records]
+            + renewed
+            + ([admin_ops._proxy_password(proxy_url)] if proxy_url else [])
+        )
         adopted = [record for record in records if self._adopt(record)]
         renewed_live = sum(1 for result in results
                            if result.get("status") == "renewed" and self._renew_token(result["of"]))
@@ -1217,6 +1353,7 @@ class Admin:
         backend = next((item for item in self._live_backends() if self._same_account(record, item.cfg)), None)
         if backend is None:
             return False
+        curl_pool.close_account(backend.cfg)
         self._apply_live(backend, {"bearer_token": record["bearer_token"]})
         dispatcher = getattr(self.runtime, "accounts", None)
         if dispatcher is not None and hasattr(dispatcher, "check_soon"):
@@ -1317,6 +1454,8 @@ class Admin:
         if backend is None or not hasattr(getattr(runtime, "pool", None), "remove_account"):
             return False
         try:
+            curl_pool.close_account(backend.cfg)
+            http_pool.close_account_clients(backend.cfg.get("account_id"))
             runtime.pool.remove_account(backend)
             if getattr(runtime, "accounts", None) is not None:
                 runtime.accounts.remove_account(backend)

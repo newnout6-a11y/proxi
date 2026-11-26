@@ -1,31 +1,33 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Plus, Trash } from 'lucide-react';
 import { Button } from '../ui.jsx';
-import { Area, Check, IconBtn, Line, Select } from './controls.jsx';
+import { Area, Check, IconBtn, Line, Select, useExactError, useFieldError } from './controls.jsx';
 import { idOf, insertAt, isObject, moveItem, removeAt, updateAt } from './draft.js';
 import { useFocusLater } from './hooks.js';
 import { SCOPES, describeEdit, flagValue, flagsOf, joinFlags, newEdit, opOf, setEditField, switchOp } from './ops.js';
 
 const FLAG_LABELS = [['i', 'i · без учёта регистра'], ['m', 'm · ^ и $ на каждой строке'], ['s', 's · точка берёт и перевод строки']];
 
-function Flags({ value, onChange }) {
+function Flags({ value, onChange, disabled = false, path }) {
   const flags = flagsOf(value);
+  const blamed = useFieldError(path);
   return (
-    <fieldset className="p-flags">
+    <fieldset className="p-flags" data-path={path}>
       <legend>Флаги</legend>
       {FLAG_LABELS.map(([flag, label]) => (
         <label className="check" key={flag}>
-          <input type="checkbox" checked={flags.has(flag)}
+          <input type="checkbox" checked={flags.has(flag)} disabled={disabled}
             onChange={(event) => { const next = new Set(flags); if (event.target.checked) next.add(flag); else next.delete(flag); onChange(joinFlags(next)); }} />
           <span>{label}</span>
         </label>
       ))}
+      {blamed && <p className="p-error" role="alert">{blamed}</p>}
     </fieldset>
   );
 }
 
 // One heading per line; the box keeps what is typed, the edit keeps the cleaned list.
-function Lines({ label, value, onChange, hint, placeholder, path, required }) {
+function Lines({ label, value, onChange, hint, placeholder, path, required, disabled = false }) {
   const list = Array.isArray(value) ? value : [];
   const parse = (text) => text.split('\n').map((line) => line.trim()).filter(Boolean);
   const [text, setText] = useState(() => list.join('\n'));
@@ -35,7 +37,7 @@ function Lines({ label, value, onChange, hint, placeholder, path, required }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
   return (
-    <Area label={label} value={text} rows={3} hint={hint} placeholder={placeholder} path={path} required={required}
+    <Area label={label} value={text} rows={3} hint={hint} placeholder={placeholder} path={path} required={required} disabled={disabled}
       onChange={(next) => { setText(next); onChange(parse(next)); }} />
   );
 }
@@ -49,13 +51,13 @@ function FromFile({ label, value }) {
   );
 }
 
-function Field({ field, edit, onChange, path }) {
+function Field({ field, edit, onChange, path, disabled = false }) {
   const value = edit[field.key];
   if (isObject(value) && value.file) return <FromFile label={field.label} value={value} />;
   const set = (next) => onChange(setEditField(edit, field.key, next));
-  const common = { label: field.label, hint: field.hint, path: `${path}.${field.key}`, required: field.required };
-  if (field.kind === 'bool') return <Check label={field.label} hint={field.hint} checked={flagValue(field.key, value)} onChange={set} path={common.path} />;
-  if (field.kind === 'flags') return <Flags value={value} onChange={set} />;
+  const common = { label: field.label, hint: field.hint, path: `${path}.${field.key}`, required: field.required, disabled };
+  if (field.kind === 'bool') return <Check label={field.label} hint={field.hint} checked={flagValue(field.key, value)} disabled={disabled} onChange={set} path={common.path} />;
+  if (field.kind === 'flags') return <Flags value={value} disabled={disabled} onChange={set} path={common.path} />;
   if (field.kind === 'lines') return <Lines {...common} value={value} placeholder={field.placeholder} onChange={set} />;
   if (field.kind === 'area') return <Area {...common} value={value} rows={3} placeholder={field.placeholder} onChange={set} />;
   return <Line {...common} value={value} placeholder={field.placeholder} mono={field.mono !== false} onChange={set} />;
@@ -67,8 +69,22 @@ function EditRow({ scope, edit, index, count, path, ops, onChange, onMove, onRem
   const spec = specs[op];
   const choices = [...new Set([...ops, ...(op && !ops.includes(op) ? [op] : [])])];
   const rowPath = `${path}.${index}`;
+  const rowError = useExactError(rowPath);
+  const isDropTag = scope === 'user_blocks' && op === 'drop_tag';
+  const hasContains = Boolean(edit.contains);
+  const hasPattern = Boolean(edit.pattern);
+  const hasFlags = Boolean(edit.flags);
+  const conflictDropTag = isDropTag && hasContains && (hasPattern || hasFlags);
+  const orphanFlags = isDropTag && !hasPattern && hasFlags;
+  const fieldDisabled = (key) => {
+    if (!isDropTag || conflictDropTag) return false;
+    if (key === 'contains') return hasPattern || hasFlags;
+    if (key === 'pattern') return hasContains;
+    if (key === 'flags') return hasContains || (!hasPattern && !hasFlags);
+    return false;
+  };
   return (
-    <li className="p-edit">
+    <li className="p-edit" data-path={rowPath}>
       <div className="p-edit-head">
         <span className="p-edit-no num" aria-hidden="true">{index + 1}</span>
         <Select label={`Операция правки ${index + 1}`} labelHidden value={op || ''} path={`${rowPath}.op`}
@@ -88,8 +104,15 @@ function EditRow({ scope, edit, index, count, path, ops, onChange, onMove, onRem
         <>
           {spec.hint && <p className="p-hint">{spec.hint}</p>}
           <div className="p-edit-fields">
-            {spec.fields.map((field) => <Field key={field.key} field={field} edit={edit} path={rowPath} onChange={onChange} />)}
+            {spec.fields.map((field) => <Field key={field.key} field={field} edit={edit} path={rowPath} disabled={fieldDisabled(field.key)} onChange={onChange} />)}
           </div>
+          {rowError && <p className="p-error" role="alert">{rowError}</p>}
+          {conflictDropTag && !rowError && (
+            <p className="p-error" role="alert">Используйте либо «Только если содержит», либо «Или подходит под выражение», не оба сразу</p>
+          )}
+          {orphanFlags && !conflictDropTag && !rowError && (
+            <p className="p-error" role="alert">Флаги применяются только вместе с регулярным выражением</p>
+          )}
         </>
       ) : (
         <p className="p-hint mono">Операция «{String(op)}» неизвестна экрану и сохранится как есть: {describeEdit(scope, edit)}</p>

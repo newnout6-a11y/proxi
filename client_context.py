@@ -12,6 +12,7 @@ import unicodedata
 from urllib.parse import unquote
 
 _CURRENT = contextvars.ContextVar("proxi_client", default=None)
+_ANTHROPIC_BETAS = contextvars.ContextVar("proxi_anthropic_betas", default=())
 _CACHE = collections.OrderedDict()
 _CACHE_MAX = 1024
 _USER_ID_LIMIT = 4096
@@ -176,7 +177,9 @@ def is_sdk_title_system(system):
 def keeps_client_prompt(purpose, identity=None):
     """True when relay prompt policy must leave the client's system prompt alone."""
     info = current() if identity is None else identity
-    return purpose in SERVICE_KINDS or info.get("request_class") in OWN_PROMPT_CLASSES
+    return (purpose in SERVICE_KINDS
+            or info.get("request_class") in OWN_PROMPT_CLASSES
+            or info.get("client_task") == COMPACTION)
 
 
 def is_prompt_suggestion(parsed):
@@ -355,6 +358,25 @@ def bind(identity):
 
 def reset(token):
     _CURRENT.reset(token)
+
+
+def bind_anthropic_betas(headers):
+    raw = ""
+    if headers:
+        for k, v in headers.items():
+            if str(k).lower() == "anthropic-beta" and isinstance(v, str):
+                raw = v
+                break
+    items = tuple(part.strip() for part in raw.split(",") if part.strip())[:32]
+    return _ANTHROPIC_BETAS.set(items)
+
+
+def reset_anthropic_betas(token):
+    _ANTHROPIC_BETAS.reset(token)
+
+
+def anthropic_betas():
+    return _ANTHROPIC_BETAS.get() or ()
 
 
 def label(identity=None):

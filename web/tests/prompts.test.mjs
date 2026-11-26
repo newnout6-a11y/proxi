@@ -6,9 +6,9 @@ import { normalizeParts, segmentHead, sourceKind, sourceLabel, summarizeKinds } 
 import { describeEdit, flagValue, flagsOf, joinFlags, newEdit, normalizeEditOps, opOf, setEditField, switchOp } from '../src/prompts/ops.js';
 import { CONDITION_SPECS, conditionText, fromValues, normalizeConditions, setCondition, summarizeConditions, valuesOf } from '../src/prompts/conditions.js';
 import {
-  addProfile, blankDocument, catchAllIndex, changedPaths, equalJson, errorHits, idOf, insertAt, locate, moveItem, newRule, normalizePath, patchProfile,
+  addProfile, blankDocument, catchAllIndex, changedPaths, defaultRuleConditions, equalJson, errorHits, idOf, insertAt, locate, moveItem, newRule, normalizePath, patchProfile,
   pathLabel, profileNameError, profileUsage, protectedEnabled, pruneProfile, removeAt, removeProfile, removeText, renameProfile, renameText,
-  setProtected, setRelayText, setRuleField, STARTERS, starterProfile, systemEditsOf, textNameError, textNameHint, textUsage, uniqueName, updateAt,
+  selectedProfileName, setProtected, setRelayText, setRuleField, STARTERS, starterProfile, systemEditsOf, textNameError, textNameHint, textUsage, uniqueName, updateAt,
 } from '../src/prompts/draft.js';
 import {
   BASELINE_DOCUMENT, DEFAULT_VARIABLES, MAX_DOCUMENT_BYTES, RELAY_TASK_VARIABLES, compileName, compileProfileName, compileTextName, detectDialect, failureLead, failureOf, forceProfile,
@@ -17,8 +17,8 @@ import {
 } from '../src/prompts/api.js';
 import { describeChange, describeGroup, describeReport, describeUnmatched, editTarget, groupChanges, opLabel, scopeLabel, shortList } from '../src/prompts/changes.js';
 import { fmtInt } from '../src/format.js';
-import { emptySample, newestSample, recentLabel, resolveSample } from '../src/prompts/sample.js';
-import { publishedModels } from '../src/prompts/publish.js';
+import { emptySample, newestSample, preferredSample, recentLabel, resolveSample } from '../src/prompts/sample.js';
+import { hasPublishAsModel, matchesGlobs, profileModelScope, publishedModels, publishMasksOf } from '../src/prompts/publish.js';
 
 test('publish masks match the full model id the way the relay does: case-insensitive fnmatch', () => {
   const catalog = ['claude-opus-5-5', 'claude-sonnet-5-5', 'zai-org/GLM-5.3', 'zai-org/GLM-5.3-Flash', 'gpt-5.5'];
@@ -1001,4 +1001,93 @@ test('what an edit of the client system looks for is the first thing its form na
   assert.deepEqual(systemEditsOf({ profiles: { mine: { client_system: { edits: 'junk' } } } }, 'mine'), []);
   assert.deepEqual(systemEditsOf({ profiles: {} }, 'passthrough'), []);
   assert.deepEqual(systemEditsOf(null, 'mine'), []);
+});
+
+test('publish scope helpers classify single-model vs unrestricted profiles cleanly', () => {
+  assert.deepEqual(publishMasksOf({ publish_as_model: ['gpt-5*', '  ', 'claude-opus-*'] }), ['gpt-5*', 'claude-opus-*']);
+  assert.deepEqual(publishMasksOf({ publish_as_model: true }), []);
+  assert.equal(hasPublishAsModel({ publish_as_model: true }), true);
+  assert.equal(hasPublishAsModel({ publish_as_model: ['gpt-5*'] }), true);
+  assert.equal(hasPublishAsModel({ publish_as_model: false }), false);
+  assert.equal(matchesGlobs(['Claude-Opus-*'], 'claude-opus-5-5'), true);
+  assert.equal(matchesGlobs(['Claude-Opus-*'], 'claude-sonnet-5-5'), false);
+
+  const doc = {
+    version: 1,
+    default_profile: null,
+    profiles: {
+      gpt5: { head: 'h', publish_as_model: ['gpt-5*'] },
+      open: { head: 'h' },
+      draftOnly: { head: 'h' },
+      disabledOnly: { head: 'h', publish_as_model: ['claude-opus-*'] },
+    },
+    rules: [
+      { name: 'open', if: { client: 'opencode' }, use: 'open' },
+      { name: 'off', enabled: false, if: {}, use: 'gpt5' },
+    ],
+  };
+  const gptScope = profileModelScope(doc, 'gpt5');
+  assert.equal(gptScope.unrestricted, false);
+  assert.deepEqual(gptScope.modelMasks, ['gpt-5*']);
+  assert.equal(gptScope.matchesModel('gpt-5.4'), true);
+  assert.equal(gptScope.matchesModel('claude-sonnet-5-5'), false);
+
+  const openScope = profileModelScope(doc, 'open');
+  assert.equal(openScope.unrestricted, true);
+  assert.equal(openScope.matchesModel('claude-sonnet-5-5'), true);
+
+  const draftScope = profileModelScope(doc, 'draftOnly');
+  assert.equal(draftScope.matchesModel('claude-sonnet-5-5'), null);
+});
+
+test('preferredSample picks a matching non-protected recent request for the active profile', () => {
+  const recent = [
+    { request_id: 'r-prot', has_request: true, protected: true, model: 'gpt-5.4', client: 'opencode' },
+    { request_id: 'r-sonnet', has_request: true, protected: false, model: 'claude-sonnet-5-5', client: 'opencode' },
+    { request_id: 'r-opus', has_request: true, protected: false, model: 'claude-opus-5-5', client: 'claude-code' },
+    { request_id: 'r-gpt5', has_request: true, protected: false, model: 'gpt-5.4', client: 'codex' },
+  ];
+  const doc = {
+    version: 1,
+    profiles: {
+      gpt5: { head: 'h', publish_as_model: ['gpt-5*'] },
+      opus: { head: 'h' },
+      plain: { head: 'h' },
+    },
+    rules: [
+      { name: 'opus-open', if: { model: 'claude-opus-*', client: 'opencode' }, use: 'opus' },
+    ],
+  };
+  assert.equal(preferredSample(recent, doc, 'gpt5')?.request_id, 'r-gpt5');
+  assert.equal(preferredSample(recent, doc, 'opus')?.request_id, 'r-opus');
+  assert.equal(preferredSample(recent, doc, 'plain')?.request_id, 'r-sonnet');
+  assert.equal(preferredSample(recent, doc, null)?.request_id, 'r-sonnet');
+});
+
+test('new rules added from a published profile inherit its model masks instead of becoming catch-all', () => {
+  const doc = {
+    version: 1,
+    profiles: {
+      gpt5: { head: 'h', publish_as_model: ['gpt-5*', 'o3-*'] },
+      allModels: { head: 'h', publish_as_model: true },
+      plain: { head: 'h' },
+    },
+    rules: [],
+  };
+  assert.deepEqual(defaultRuleConditions(doc, 'gpt5'), { model: ['gpt-5*', 'o3-*'] });
+  assert.deepEqual(newRule('gpt5', defaultRuleConditions(doc, 'gpt5')), { name: 'Новое правило', if: { model: ['gpt-5*', 'o3-*'] }, use: 'gpt5' });
+  assert.deepEqual(defaultRuleConditions(doc, 'allModels'), {});
+  assert.deepEqual(defaultRuleConditions(doc, 'plain'), {});
+  assert.equal(catchAllIndex([{ name: 'r', if: { model: [] }, use: 'plain' }]), 0);
+  assert.equal(catchAllIndex([{ name: 'r', if: { model: ['gpt-5*'] }, use: 'gpt5' }]), -1);
+  assert.equal(selectedProfileName(doc, { profiles: ['passthrough'] }, 'allModels'), 'allModels');
+  assert.equal(selectedProfileName(doc, { profiles: ['passthrough'] }, 'passthrough'), 'passthrough');
+  assert.equal(selectedProfileName(doc, { profiles: ['passthrough'] }, 'missing'), 'gpt5');
+});
+
+test('drop_tag supports flags only when pattern is present and strips orphan flags when pattern is cleared', () => {
+  const withRegex = { op: 'drop_tag', tag: 'system-reminder', pattern: 'secret', flags: 'im' };
+  assert.deepEqual(setEditField(withRegex, 'pattern', ''), { op: 'drop_tag', tag: 'system-reminder' });
+  assert.deepEqual(switchOp('user_blocks', { op: 'remove_regex', flags: 'i' }, 'drop_tag'), { op: 'drop_tag' });
+  assert.deepEqual(switchOp('user_blocks', { op: 'remove_regex', pattern: 'x', flags: 'i' }, 'drop_tag'), { op: 'drop_tag', pattern: 'x', flags: 'i' });
 });

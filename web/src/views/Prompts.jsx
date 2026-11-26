@@ -7,15 +7,15 @@ import { usePolling } from '../useJournal.js';
 import { fmtInt } from '../format.js';
 import { api } from '../api.js';
 import { failureLead, failureOf, loadPrompts, loadRecent, savePrompts, warningsToShow } from '../prompts/api.js';
-import { ErrorContext, Notice } from '../prompts/controls.jsx';
-import { addProfile, blankDocument, changedPaths, equalJson, errorHits, insertAt, locate, newRule, normalizePath, pathLabel, profilesOf, rulesOf, starterProfile } from '../prompts/draft.js';
+import { ErrorContext, Notice, PromptFormContext } from '../prompts/controls.jsx';
+import { addProfile, blankDocument, changedPaths, defaultRuleConditions, equalJson, errorHits, insertAt, locate, newRule, normalizePath, pathLabel, profilesOf, rulesOf, selectedProfileName, starterProfile } from '../prompts/draft.js';
 import { useFocusLater } from '../prompts/hooks.js';
 import LegacyStart from '../prompts/LegacyStart.jsx';
 import PinsTab from '../prompts/PinsTab.jsx';
 import PreviewTab from '../prompts/PreviewTab.jsx';
 import ProfilesTab from '../prompts/ProfilesTab.jsx';
 import RulesTab from '../prompts/RulesTab.jsx';
-import { emptySample, newestSample, resolveSample } from '../prompts/sample.js';
+import { emptySample, preferredSample, resolveSample } from '../prompts/sample.js';
 import SeenTab from '../prompts/SeenTab.jsx';
 import TextsTab from '../prompts/TextsTab.jsx';
 import '../prompts/prompts.css';
@@ -75,11 +75,14 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
   const [selected, setSelected] = useState(null);
   const [expand, setExpand] = useState(null);
   const [sampleState, setSampleState] = useState(emptySample);
+  const [manualSample, setManualSample] = useState(false);
   const [recent, setRecent] = useState([]);
   const [recentError, setRecentError] = useState('');
   const [recentLoading, setRecentLoading] = useState(false);
   const draftRef = useRef(draft);
   const baseRef = useRef(base);
+  const committersRef = useRef(new Set());
+  const validatorsRef = useRef(new Set());
   const focusLater = useFocusLater();
   draftRef.current = draft;
   baseRef.current = base;
@@ -88,6 +91,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
 
   const adopt = useCallback((next) => {
     setBase({ document: next.document, rev: next.rev });
+    draftRef.current = next.document;
     setDraft(next.document);
     setFailure(null);
     setLastSave(NO_SAVE);
@@ -144,26 +148,57 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
 
   useEffect(() => { history.replaceState(null, '', `#prompts/${tab}`); }, [tab]);
 
-  // A recent request with a kept body is the sample until the user picks another.
+  const builtin = server?.builtin;
+  const currentProfile = tab === 'profiles' ? selectedProfileName(draft, builtin, selected) : null;
+  const updateSample = useCallback((nextOrUpdater) => {
+    setManualSample(true);
+    setSampleState(nextOrUpdater);
+  }, []);
+
+  // Keep an automatically selected recent sample aligned with the profile in view unless the user chose one manually.
   useEffect(() => {
-    if (sampleState.mode !== 'recent' || sampleState.requestId) return;
-    const first = newestSample(recent);
-    if (first) setSampleState((state) => ({ ...state, requestId: first.request_id }));
-  }, [recent, sampleState.mode, sampleState.requestId]);
+    if (sampleState.mode !== 'recent') return;
+    if (manualSample && sampleState.requestId && recent.some((entry) => entry.request_id === sampleState.requestId && entry.has_request)) return;
+    const pick = preferredSample(recent, draft, currentProfile);
+    if (pick && pick.request_id !== sampleState.requestId) {
+      setSampleState((state) => (state.mode === 'recent' ? { ...state, requestId: pick.request_id } : state));
+    }
+  }, [recent, draft, currentProfile, manualSample, sampleState.mode, sampleState.requestId]);
 
   const recentKey = recent.map((item) => `${item.request_id}:${item.has_request}`).join('|');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const resolved = useMemo(() => resolveSample(sampleState, recent), [sampleState, recentKey]);
 
+  const formContext = useMemo(() => ({
+    registerCommit(fn) {
+      committersRef.current.add(fn);
+      return () => { committersRef.current.delete(fn); };
+    },
+    registerValidator(fn) {
+      validatorsRef.current.add(fn);
+      return () => { validatorsRef.current.delete(fn); };
+    },
+  }), []);
+
   // A refused save is pointed out once: the next edit takes the mark away (a conflict stays until it is resolved)
   const setDoc = useCallback((update) => {
-    setDraft((current) => update(current ?? blankDocument()));
+    const next = update(draftRef.current ?? blankDocument());
+    draftRef.current = next;
+    setDraft(next);
     setFailure((current) => (current && current.status !== 409 ? null : current));
   }, []);
   const conflict = failure?.status === 409 || (!!server && !!base && server.rev !== base.rev && dirty > 0);
 
   async function save() {
-    const submitted = draft;
+    for (const commit of committersRef.current) commit();
+    for (const validate of validatorsRef.current) {
+      const problem = validate();
+      if (problem) {
+        setFailure({ status: 400, ...problem });
+        return;
+      }
+    }
+    const submitted = draftRef.current;
     setSaving(true);
     setFailure(null);
     try {
@@ -215,9 +250,15 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
   };
 
   const addRuleFor = (profile) => {
-    const rule = newRule(profile);
-    setDoc((current) => ({ ...current, rules: insertAt(rulesOf(current), rulesOf(current).length, rule) }));
-    setExpand(rulesOf(draft).length);
+    for (const commit of committersRef.current) commit();
+    const rule = newRule(profile, defaultRuleConditions(draftRef.current, profile));
+    let addedIndex = 0;
+    setDoc((current) => {
+      const existing = rulesOf(current);
+      addedIndex = existing.length;
+      return { ...current, rules: insertAt(existing, existing.length, rule) };
+    });
+    setExpand(addedIndex);
     setTab('rules');
   };
 
@@ -230,12 +271,11 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
     document.getElementById(`prompts-tab-${TABS[next].id}`)?.focus();
   };
 
-  const builtin = server?.builtin;
   // The relay lists its warnings with the document in force; the answer of the last save adds those of the engine
   const docWarnings = warningsToShow(server, lastSave);
   const profileNames = [...(builtin?.profiles?.length ? builtin.profiles : ['passthrough']), ...Object.keys(profilesOf(draft))];
   const counts = { profiles: Object.keys(profilesOf(draft)).length, rules: rulesOf(draft).length, texts: Object.keys(draft?.texts || {}).length };
-  const live = { sampleState, setSampleState, resolved, recent, detected: sampleState.mode === 'paste' && !sampleState.dialect ? resolved.sample?.dialect : '', refreshRecent: loadSamples };
+  const live = { sampleState, setSampleState: updateSample, resolved, recent, detected: sampleState.mode === 'paste' && !sampleState.dialect ? resolved.sample?.dialect : '', refreshRecent: loadSamples };
   const legacyMode = !!server && !draft;
 
   return (
@@ -298,42 +338,46 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
               ))}
             </div>
           </div>
-          <ErrorContext.Provider value={failure?.param ? failure : null}>
-            {TABS.map((item) => (
-              <div key={item.id} role="tabpanel" id={`prompts-panel-${item.id}`} aria-labelledby={`prompts-tab-${item.id}`} hidden={tab !== item.id}>
-                {tab === item.id && (
-                  item.id === 'profiles' && legacyMode ? (
-                    <LegacyStart legacy={server.legacy} builtin={builtin} path={server.path} invalid={server.errors.length > 0} onCreate={(name, starter) => {
-                      setDraft(addProfile(blankDocument(), name, starterProfile(starter)));
-                      setSelected(name);
-                      setTab('profiles');
-                      focusLater(() => document.querySelector('.p-profile-bar [aria-current="true"]'));
-                    }} />
-                  ) : item.id === 'profiles' ? (
-                    <ProfilesTab apiKey={apiKey} doc={draft} setDoc={setDoc} builtin={builtin} selected={selected} select={setSelected}
-                      onAddRule={addRuleFor} live={live} onUnauthorized={onUnauthorized} catalog={catalog} />
-                  ) : item.id === 'rules' ? (
-                    <>
-                      {legacyMode && <NoFileYet what="правила" onProfiles={() => { setTab('profiles'); focusLater(toActiveTab); }} />}
-                      <RulesTab doc={draft ?? EMPTY_DOCUMENT} setDoc={setDoc} builtin={builtin} profileNames={profileNames} expandIndex={expand} onExpanded={() => setExpand(null)} />
-                    </>
-                  ) : item.id === 'texts' ? (
-                    <>
-                      {legacyMode && <NoFileYet what="тексты" onProfiles={() => { setTab('profiles'); focusLater(toActiveTab); }} />}
-                      <TextsTab doc={draft ?? EMPTY_DOCUMENT} setDoc={setDoc} builtin={builtin} />
-                    </>
-                  ) : item.id === 'preview' ? (
-                    <PreviewTab apiKey={apiKey} doc={draft} saved={base?.document} dirty={dirty > 0} {...live} onUnauthorized={onUnauthorized} />
-                  ) : item.id === 'seen' ? (
-                    <SeenTab items={recent} error={recentError} loading={recentLoading} refresh={loadSamples}
-                      onPreview={(entry) => { setSampleState((state) => ({ ...state, mode: 'recent', requestId: entry.request_id })); setTab('preview'); focusLater(toActiveTab); }} />
-                  ) : (
-                    <PinsTab apiKey={apiKey} rev={server.rev} onUnauthorized={onUnauthorized} />
-                  )
-                )}
-              </div>
-            ))}
-          </ErrorContext.Provider>
+          <PromptFormContext.Provider value={formContext}>
+            <ErrorContext.Provider value={failure?.param ? failure : null}>
+              {TABS.map((item) => (
+                <div key={item.id} role="tabpanel" id={`prompts-panel-${item.id}`} aria-labelledby={`prompts-tab-${item.id}`} hidden={tab !== item.id}>
+                  {tab === item.id && (
+                    item.id === 'profiles' && legacyMode ? (
+                      <LegacyStart legacy={server.legacy} builtin={builtin} path={server.path} invalid={server.errors.length > 0} onCreate={(name, starter) => {
+                        const created = addProfile(blankDocument(), name, starterProfile(starter));
+                        draftRef.current = created;
+                        setDraft(created);
+                        setSelected(name);
+                        setTab('profiles');
+                        focusLater(() => document.querySelector('.p-profile-bar [aria-current="true"]'));
+                      }} />
+                    ) : item.id === 'profiles' ? (
+                      <ProfilesTab apiKey={apiKey} doc={draft} setDoc={setDoc} builtin={builtin} selected={selected} select={setSelected}
+                        onAddRule={addRuleFor} live={live} onUnauthorized={onUnauthorized} catalog={catalog} />
+                    ) : item.id === 'rules' ? (
+                      <>
+                        {legacyMode && <NoFileYet what="правила" onProfiles={() => { setTab('profiles'); focusLater(toActiveTab); }} />}
+                        <RulesTab doc={draft ?? EMPTY_DOCUMENT} setDoc={setDoc} builtin={builtin} profileNames={profileNames} expandIndex={expand} onExpanded={() => setExpand(null)} />
+                      </>
+                    ) : item.id === 'texts' ? (
+                      <>
+                        {legacyMode && <NoFileYet what="тексты" onProfiles={() => { setTab('profiles'); focusLater(toActiveTab); }} />}
+                        <TextsTab doc={draft ?? EMPTY_DOCUMENT} setDoc={setDoc} builtin={builtin} />
+                      </>
+                    ) : item.id === 'preview' ? (
+                      <PreviewTab apiKey={apiKey} doc={draft} saved={base?.document} dirty={dirty > 0} {...live} onUnauthorized={onUnauthorized} />
+                    ) : item.id === 'seen' ? (
+                      <SeenTab items={recent} error={recentError} loading={recentLoading} refresh={loadSamples}
+                        onPreview={(entry) => { updateSample((state) => ({ ...state, mode: 'recent', requestId: entry.request_id })); setTab('preview'); focusLater(toActiveTab); }} />
+                    ) : (
+                      <PinsTab apiKey={apiKey} rev={server.rev} onUnauthorized={onUnauthorized} />
+                    )
+                  )}
+                </div>
+              ))}
+            </ErrorContext.Provider>
+          </PromptFormContext.Provider>
         </>
       )}
 
@@ -341,7 +385,7 @@ export default function PromptsView({ apiKey, onUnauthorized, unsaved }) {
         {dirty > 0 && (
           <motion.div className="savebar" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} transition={{ duration: 0.2, ease }}>
             <span><b className="num">{dirty}</b> несохранённых: <span className="savebar-keys" title={dirtyPaths.map(pathLabel).join(', ')}>{dirtyPaths.map(pathLabel).join(', ')}</span></span>
-            <Button icon={RotateCcw} onClick={() => { setDraft(base.document); setFailure(null); focusLater(toActiveTab); }}>Отменить</Button>
+            <Button icon={RotateCcw} onClick={() => { draftRef.current = base.document; setDraft(base.document); setFailure(null); focusLater(toActiveTab); }}>Отменить</Button>
             <Button icon={Save} tone="primary" onClick={save} disabled={saving}>{saving ? 'Сохранение' : 'Сохранить'}</Button>
           </motion.div>
         )}

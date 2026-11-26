@@ -184,7 +184,11 @@ async def refresh_models_dev_async(cfg: dict) -> int:
     url = str(cfg.get("models_dev_url") or MODELS_DEV_URL)
     http_pool.validate_endpoint_url(url)
     client = http_pool.get_async_client(cfg)
-    resp = await client.get(url, timeout=http_pool.make_timeout(cfg, read_timeout=25.0))
+    resp = await client.get(
+        url,
+        headers={"User-Agent": "Proxi-Gateway/2.0", "Accept": "application/json"},
+        timeout=http_pool.make_timeout(cfg, read_timeout=25.0),
+    )
     if resp.status_code != 200:
         return 0
     parsed = parse_models_dev_payload(resp.json())

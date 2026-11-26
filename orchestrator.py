@@ -899,7 +899,7 @@ class TurnRunner:
             log("prompt.runtime_error", "Не удалось записать план промпта", "error", stage="record")
 
     @staticmethod
-    def _unpriced(parsed, usage):
+    def _unpriced(parsed, usage, entry=None):
         """What the journal says of an attempt's usage that came without a price, and why: (message, extra fields).
 
         An attempt cut before any usage (a stream that ended without its end, a 503 after the request left) has no
@@ -909,15 +909,37 @@ class TurnRunner:
             'input_tokens', 'output_tokens', 'cache_read', 'cache_write'))
         if not counted:
             return 'Попытка оборвалась до отчёта о расходе: стоимость неизвестна', {}
-        if str(getattr(parsed, 'model', '')).startswith('minara/'):
+        effective_entry = entry if isinstance(entry, dict) else (getattr(parsed, 'entry', None) or {})
+        effective_model = effective_entry.get('id') or getattr(parsed, 'model', '')
+        if str(effective_model).startswith('minara/') or effective_entry.get('upstream') == 'minara':
             try:
                 import minara
-                reason = minara.price_problem((getattr(parsed, 'entry', None) or {}).get('pricing'))
+                reason = minara.price_problem(effective_entry.get('pricing'))
             except Exception:  # noqa: BLE001 - what the journal says must never fail the turn it describes
                 reason = None
             reason = reason or 'Minara не сообщила цену'
             return 'Токены получены; цену по прайсу Minara не посчитать: %s' % reason, {'price_problem': reason}
         return 'Токены получены; стоимость upstream не сообщена', {}
+
+    @staticmethod
+    def _reset_attempt_accounting(holder):
+        holder['_attempt_usage'] = {}
+        holder['_attempt_credited'] = False
+        holder['_attempt_minara'] = None
+        holder['_attempt_usd'] = None
+
+    @staticmethod
+    def _record_client_key_usage(holder, delta, cost_usd=None):
+        ck_id = holder.get('_client_key_id')
+        ck_rec = holder.get('_client_key_recorder')
+        if ck_id and callable(ck_rec):
+            ck_rec(
+                ck_id,
+                input_tokens=((delta.get('input_tokens') or 0) + (delta.get('cache_read') or 0)
+                              + (delta.get('cache_write') or 0)),
+                output_tokens=delta.get('output_tokens') or 0,
+                cost_usd=cost_usd,
+            )
 
     @staticmethod
     def _usage_update(holder, event):
@@ -1190,10 +1212,11 @@ class TurnRunner:
             # A universal provider's 429 is a rate limit of its own (drivers/sse_utils marks it an account quota so that the
             # turn moves), not Retool's hourly managed-key limit: no wait on it, no hourly cooldown or ladder (A02-08).
             provider = _provider_label(backend)
+            is_minara = (getattr(backend, "cfg", None) or {}).get("upstream", "retool") == "minara"
             try:
                 if error is not None and backend is not None and apierr.is_account_quota(error):
                     pause = (self._limit_pause(error, getattr(lease, "session", lease))
-                             if retryable and backend not in exclude and not waited and provider is None
+                             if retryable and backend not in exclude and not waited and provider is None and not is_minara
                              and holder["_attempt_budget"].remaining > 1 else None)
                     if pause is not None:
                         # The account is not parked and not excluded: the retry goes to it with the conversation's
@@ -1213,10 +1236,10 @@ class TurnRunner:
                     # Hourly managed-key limit: park the account so later requests skip it, then
                     # retry here while the client has seen nothing.
                     if hasattr(accounts, "mark_rate_limited"):
-                        # A limit that a request sent before the account's last return reports is old news. A provider is
-                        # parked for its Retry-After or a short pause: a hint never climbs the hourly ladder.
+                        # A limit that a request sent before the account's last return reports is old news. A provider
+                        # (or Minara upstream channel) is parked briefly instead of climbing Retool's hourly ladder.
                         hint = getattr(error, "retry_after", None)
-                        if provider is not None and not hint:
+                        if (provider is not None or is_minara) and not hint:
                             hint = PROVIDER_RATE_LIMIT_PAUSE
                         accounts.mark_rate_limited(backend, retry_after=hint,
                                                    request_id=getattr(parsed, "request_id", None),
@@ -1263,7 +1286,8 @@ class TurnRunner:
                 _settle_turn(holder, "moved")
                 # Refused before anything was generated or billed: the move to the next account costs no attempt.
                 holder["_attempt_budget"].refund()
-                limit = ("часовой лимит Retool" if provider is None
+                limit = ("лимит частоты Minara" if is_minara
+                         else "часовой лимит Retool" if provider is None
                          else "лимит частоты провайдера %s" % provider)
                 journal.emit("account.failover", "%s — запрос повторён на другом аккаунте" % (limit[0].upper() + limit[1:]),
                              "warn", account=account_tag(backend), request_id=getattr(parsed, "request_id", None),
@@ -1586,6 +1610,8 @@ class TurnRunner:
                 # A route alias runs as the target the pool chose the account for (lease.bound_entry, A08-02).
                 bound_entry = (getattr(session, "bound_entry", None)
                                or model_catalog.bind_entry_for_backend(parsed.entry, acc_cfg))
+                effective_entry = bound_entry if isinstance(bound_entry, dict) else (getattr(parsed, "entry", None) or {})
+                effective_model = effective_entry.get("id") or parsed.model
                 acquired._bound_entry = bound_entry
                 acquired._provider_options = dict(getattr(parsed, "provider_options", None) or {})
                 acquired._structured_output = getattr(parsed, "structured_output", None)
@@ -1729,6 +1755,7 @@ class TurnRunner:
                         # canonical replay must not discard those later attempts.
                         direct_target._native_allow_cold_replay = not (empty_retries or tool_retries or exec_steps)
                         direct_target._native_conversation_key = key
+                        direct_target._credential_scope = getattr(parsed, "credential_scope", None)
                     stream = (session.stream(stream_prompt, model_provider, tool_names=tool_names)
                               if native_tools else session.stream(stream_prompt, model_provider))
                     log("upstream.request", "Запрос к upstream (%s)" % ("direct" if direct_mode else "agent"),
@@ -1738,6 +1765,7 @@ class TurnRunner:
                     text_open = False
                     think_started = None
                     tool_started = {}
+                    self._reset_attempt_accounting(holder)
                     out.put({"type": "usage_start"})
                     journal_attempt = holder.get('_journal_attempt', 0) + 1
                     holder['_journal_attempt'] = journal_attempt
@@ -1835,13 +1863,11 @@ class TurnRunner:
                                                 with accounting_lock:
                                                     if sent_attempt.is_set():
                                                         account_credits.finish_provider_attempt(attempt_cell["id"], turn_id)
+                                                    sent_attempt.clear()
                                                     attempt_cell["id"] = "%s:%d" % (turn_id, journal_attempt)
                                         usage_started = True
                                         think_started = None
-                                        holder['_attempt_usage'] = {}
-                                        holder['_attempt_credited'] = False
-                                        holder['_attempt_minara'] = None
-                                        holder['_attempt_usd'] = None
+                                        self._reset_attempt_accounting(holder)
                                     out.put(event)
                                 elif (event["type"] == "tool_call" and searcher is not None and direct_mode
                                       and event.get("name") == search_spec["name"]):
@@ -1950,7 +1976,7 @@ class TurnRunner:
                                     usage, delta = self._usage_update(holder, event)
                                     if provider_recorder and sent_attempt.is_set():
                                         provider_recorder(attempt_cell["id"], turn_id, usage)
-                                    breakdown = credits.cost_breakdown(usage, parsed.model)
+                                    breakdown = credits.cost_breakdown(usage, effective_model)
                                     known = holder.get('_attempt_credited') or event.get('credits_reported')
                                     provider_cost = usage.get('provider_cost')
                                     usd_spent = None
@@ -1975,19 +2001,11 @@ class TurnRunner:
                                         self.cost_guard.spent(
                                             minara_spent, key_id=holder.get('_client_key_id'),
                                             conversation=conversation if isinstance(conversation, (str, tuple)) else None,
-                                            account=trace.get('account'), model=parsed.model,
+                                            account=trace.get('account'), model=effective_model,
                                             prompt_tokens=breakdown['prompt_tokens'] or None)
                                     if usd_spent is not None:
                                         event = dict(event, cost_usd=usd_spent)
-                                    ck_id = holder.get('_client_key_id')
-                                    ck_rec = holder.get('_client_key_recorder')
-                                    if ck_id and callable(ck_rec):
-                                        ck_rec(
-                                            ck_id,
-                                            input_tokens=(delta.get('input_tokens') or 0) + (delta.get('cache_read') or 0) + (delta.get('cache_write') or 0),
-                                            output_tokens=delta.get('output_tokens') or 0,
-                                            cost_usd=usd_spent,
-                                        )
+                                    self._record_client_key_usage(holder, delta, cost_usd=usd_spent)
                                     if not known and provider_cost is not None:
                                         # Minara or a universal provider reports a cost in USD (or the relay estimated one
                                         # from the catalog): the turn is priced, only not in Retool credits.
@@ -1999,23 +2017,24 @@ class TurnRunner:
                                             'info', credits=None, attempt=journal_attempt, credits_reported=False,
                                             provider_cost=provider_cost, cost_usd=usd_spent, minara_credits=minara_spent,
                                             provider_cost_estimated=bool(usage.get('provider_cost_estimated')), **delta,
-                                            **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                            **credits.cost_breakdown(delta, effective_model), usage_snapshot=dict(usage))
                                     else:
                                         text, unpriced = (('Токены обновлены; стоимость уже сообщена', {}) if known
-                                                          else self._unpriced(parsed, usage))
+                                                          else self._unpriced(parsed, usage, effective_entry))
                                         log('upstream.usage', text,
                                             'info' if known else 'warn', credits=None, attempt=journal_attempt,
                                             credits_reported=bool(known), minara_credits=minara_spent, **delta,
-                                            **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage),
+                                            **credits.cost_breakdown(delta, effective_model), usage_snapshot=dict(usage),
                                             **unpriced)
                                     # The same `[cache]` line Retool's path prints, in the same shape — in= read= write=
                                     # credits= out= — for a Minara turn, which had none at all and whose cost was
                                     # therefore invisible. Only for minara/*: direct.py's _drain prints it for Retool,
                                     # and printing it here too would show every Retool turn twice. `credits` is
                                     # Minara's own currency (220 per dollar), never Retool's.
-                                    minara_turn = str(parsed.model).startswith('minara/')
+                                    minara_turn = (str(effective_model).startswith('minara/')
+                                                   or effective_entry.get('upstream') == 'minara')
                                     write_cost = credits.write_cost(
-                                        delta, parsed.model, (getattr(parsed, 'entry', None) or {}).get('pricing'))
+                                        delta, effective_model, effective_entry.get('pricing'))
                                     monitor = getattr(session, '_console_cache_monitor', None) if session is not None else None
                                     if minara_turn:
                                         if session is not None and monitor is None:
@@ -2028,7 +2047,7 @@ class TurnRunner:
                                             # (minara.provider_of). A Minara line always names both ("?" when unknown).
                                             console_log.write(monitor.line(
                                                 getattr(parsed, 'request_id', None) or 'req', usage,
-                                                scope=(parsed.model, getattr(parsed, 'conversation_key', None)),
+                                                scope=(effective_model, getattr(parsed, 'conversation_key', None)),
                                                 credits=minara_credits, write_cost=write_cost,
                                                 channel=usage.get('channel') or '?', path=usage.get('channel_path'),
                                                 provider=usage.get('provider') or '?')
@@ -2041,37 +2060,37 @@ class TurnRunner:
                                                 console_log.amount(delta.get('cache_write'), tokens=True),
                                                 console_log.amount(write_cost),
                                                 'кредитов Minara' if minara_turn else 'кредитов'), 'warn',
-                                            model=parsed.model, cache_write=delta.get('cache_write'),
+                                            model=effective_model, cache_write=delta.get('cache_write'),
                                             write_cost=write_cost, attempt=journal_attempt)
                                     if (usage.get('cache_write_reported') is False and not delta.get('cache_read')
-                                            and (getattr(parsed, 'entry', None) or {}).get('cache') == 'explicit'
+                                            and effective_entry.get('cache') == 'explicit'
                                             and breakdown['prompt_tokens'] >= 2048):
                                         # The marks were sent, and the answer came from a channel that has no cache at all
                                         # (Minara's Bedrock or Anthropic path: no cache write field): the whole prompt is
                                         # billed each turn. The level moves to /v1/messages, where those channels cache.
                                         log('cache.uncached_channel', 'Minara ответила с канала без кэша: промпт %d '
                                             'токенов оплачен полностью' % breakdown['prompt_tokens'], 'warn',
-                                            model=parsed.model, effort=getattr(parsed, 'effort', None),
+                                            model=effective_model, effort=getattr(parsed, 'effort', None),
                                             sent_effort=model_provider.get('reasoningEffort'),
                                             channel=usage.get('channel'), path=usage.get('channel_path'),
                                             prompt_tokens=breakdown['prompt_tokens'], attempt=journal_attempt)
-                                        if parsed.entry.get('upstream') == 'minara' and usage.get('channel_path') == 'chat':
+                                        if effective_entry.get('upstream') == 'minara' and usage.get('channel_path') == 'chat':
                                             import minara
                                             minara.switch_to_messages(
-                                                parsed.entry.get('upstream_model'), model_provider.get('reasoningEffort'),
+                                                effective_entry.get('upstream_model'), model_provider.get('reasoningEffort'),
                                                 reason='chat channel %s' % (usage.get('channel') or 'unknown'))
                                     elif (usage.get('channel_path') == 'messages' and not delta.get('cache_read')
                                             and not delta.get('cache_write')
-                                            and (getattr(parsed, 'entry', None) or {}).get('cache') == 'explicit'
+                                            and effective_entry.get('cache') == 'explicit'
                                             and breakdown['prompt_tokens'] >= 8192):
                                         # /v1/messages answered a marked prompt above every model's smallest cacheable
                                         # size without reading or writing it: a channel there that drops the marks too.
                                         log('cache.uncached_channel', 'Minara /v1/messages ответила без кэша: промпт %d '
                                             'токенов оплачен полностью' % breakdown['prompt_tokens'], 'warn',
-                                            model=parsed.model, sent_effort=model_provider.get('reasoningEffort'),
+                                            model=effective_model, sent_effort=model_provider.get('reasoningEffort'),
                                             channel=usage.get('channel'), path='messages',
                                             prompt_tokens=breakdown['prompt_tokens'], attempt=journal_attempt)
-                                    if (minara_turn and (getattr(parsed, 'entry', None) or {}).get('cache') == 'explicit'
+                                    if (minara_turn and effective_entry.get('cache') == 'explicit'
                                             and self.cfg.get('direct_cache', True) and usage.get('cache_write_reported')
                                             and not usage.get('cache_write') and usage.get('cache_read')
                                             and (delta.get('input_tokens') or 0) >= credits.TAIL_UNWRITTEN_INPUT):
@@ -2081,7 +2100,7 @@ class TurnRunner:
                                         # cached still can). A warning only: the turn is paid for.
                                         log('cache.tail_unwritten', console_log.tail_unwritten_text(
                                                 delta.get('input_tokens'), minara_credits), 'warn',
-                                            model=parsed.model, path=usage.get('channel_path'), channel=usage.get('channel'),
+                                            model=effective_model, path=usage.get('channel_path'), channel=usage.get('channel'),
                                             input_tokens=delta.get('input_tokens'), cache_read=usage.get('cache_read'),
                                             minara_credits=minara_credits, attempt=journal_attempt)
                                         console_log.write(console_log.tail_unwritten_line(
@@ -2105,13 +2124,14 @@ class TurnRunner:
                                         event["value"])
                                     holder['_attempt_credited'] = True
                                     usage, delta = self._usage_update(holder, event)
-                                    breakdown = credits.cost_breakdown(usage, parsed.model)
+                                    self._record_client_key_usage(holder, delta)
+                                    breakdown = credits.cost_breakdown(usage, effective_model)
                                     hit = breakdown["cache_hit_ratio"]
                                     log("upstream.usage", "Кредиты %.4f · кэш read %s / write %s · hit %s" % (
                                         event["value"], usage.get("cache_read", "—"), usage.get("cache_write", "—"),
                                         "%d%%" % round(hit * 100) if hit is not None else "—"),
                                         "info", credits=event["value"], attempt=journal_attempt, credits_reported=True, **delta,
-                                        **credits.cost_breakdown(delta, parsed.model), usage_snapshot=dict(usage))
+                                        **credits.cost_breakdown(delta, effective_model), usage_snapshot=dict(usage))
                                     if session is not None and breakdown["prompt_tokens"] > 0:
                                         # Write through the lease: SessionLease only proxies
                                         # reads, so keepwarm (which holds the real session)

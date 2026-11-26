@@ -11,7 +11,7 @@ DOCUMENT = {"version": 1, "profiles": {
     "low": {"head": "{{client_system}}", "generation": {"effort": "low"}},
     "max": {"head": "{{client_system}}", "generation": {"effort": "max"}},
     "silent": {"head": "{{client_system}}"}},
-    "rules": [{"name": "by header", "if": {"header_profile": "*"}, "use": "$header"}]}
+    "rules": [{"name": "by header", "if": {"header_profile": "*"}, "use": "$header", "override_protected": True}]}
 USER = [{"role": "user", "content": "hi"}]
 
 

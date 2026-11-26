@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 
 from apierr import bad_request, unprocessable, ApiError
+import auth
 import models as model_catalog
 import tool_names
 import web_search
@@ -368,7 +369,7 @@ def _fetch_remote(url, where):
         return kept
     _assert_public_http_url(url, where)
     mime_type = "image/png"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": auth.DEFAULT_UA})
     max_bytes = 10 * 1024 * 1024
     try:
         with _IMAGE_OPENER.open(req, timeout=10) as r:

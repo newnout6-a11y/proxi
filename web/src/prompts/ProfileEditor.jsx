@@ -7,7 +7,7 @@ import EditList from './EditList.jsx';
 import { isObject, patchProfile, profileNameError } from './draft.js';
 import { useFocusLater } from './hooks.js';
 import { MID_SYSTEM_MODES } from './ops.js';
-import { publishedModels } from './publish.js';
+import { publishedModels, publishMasksOf } from './publish.js';
 import { insertAt, problemText, templateProblems, variableNames } from './template.js';
 
 const EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
@@ -167,7 +167,11 @@ export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, u
   const mode = profile.history?.mid_system || 'keep';
   const hasGeneration = isObject(profile.generation) && Object.values(profile.generation).some((value) => value !== null && value !== undefined && value !== '');
   const modes = MID_SYSTEM_MODES.filter((item) => builtin.editOps.mid_system.includes(item.id) || item.id === mode);
-  const used = usage.rules.length + (usage.isDefault ? 1 : 0);
+  const publishMasks = publishMasksOf(profile);
+  const publishedAll = profile.publish_as_model === true;
+  const isPublished = publishedAll || publishMasks.length > 0;
+  const ruleUsed = usage.rules.length + (usage.isDefault ? 1 : 0);
+  const used = ruleUsed + (isPublished ? 1 : 0);
 
   return (
     <div className="p-profile" ref={root}>
@@ -179,7 +183,7 @@ export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, u
         <div className="head-actions">
           <Button icon={Pencil} data-act="rename" onClick={() => rename(!renaming)} aria-expanded={renaming}>Переименовать</Button>
           <Button icon={Copy} onClick={onDuplicate}>Дублировать</Button>
-          <Button tone="danger" disabled={used > 0} title={used > 0 ? 'Профиль используется правилами: сначала измените их' : undefined} onClick={onDelete}>Удалить</Button>
+          <Button tone="danger" disabled={ruleUsed > 0} title={ruleUsed > 0 ? 'Профиль используется правилами: сначала измените их' : undefined} onClick={onDelete}>Удалить</Button>
         </div>
       </div>
       {renaming && (
@@ -197,10 +201,20 @@ export default function ProfileEditor({ doc, setDoc, name, builtin, textNames, u
         </form>
       )}
       {used > 0 ? (
-        <p className="p-usage">
-          Применяется: {usage.rules.map(({ rule, index }) => <span key={index} className="tag">{`${index + 1}. ${rule.name || 'правило'}`}</span>)}
-          {usage.isDefault && <span className="tag">профиль по умолчанию</span>}
-        </p>
+        <div className="p-usage-block">
+          <p className="p-usage">
+            Применяется: {usage.rules.map(({ rule, index }) => <span key={index} className="tag">{`${index + 1}. ${rule.name || 'правило'}`}</span>)}
+            {usage.isDefault && <span className="tag">профиль по умолчанию</span>}
+            {publishedAll && <span className="tag">виртуальная модель для всех моделей</span>}
+            {publishMasks.length > 0 && <span className="tag">{`виртуальная модель: ${publishMasks.join(', ')}`}</span>}
+          </p>
+          {ruleUsed === 0 && (
+            <p className="p-hint">
+              Обычные запросы без суффикса <code className="mono">{`@${name}`}</code> этот профиль не получают, пока для них нет правила.{' '}
+              <button type="button" className="link-button" onClick={onAddRule}><Plus size={14} strokeWidth={1.5} aria-hidden="true" /> Добавить правило</button>
+            </p>
+          )}
+        </div>
       ) : (
         <Notice tone="warn" icon={TriangleAlert}>
           <span>Ни одно правило не использует этот профиль, поэтому он ничего не меняет. </span>

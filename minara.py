@@ -19,6 +19,7 @@ import zoneinfo
 
 import apierr
 import client_context
+from drivers import curl_pool, http_pool
 import forced_choice
 import journal
 
@@ -174,6 +175,14 @@ def _messages(history):
         yield {'role': 'user', 'content': images}
 
 
+_NO_CACHE_TTL_RE = re.compile(r"^anthropic/claude-(?:3\b|(?:opus|sonnet|haiku)-4(?:[.-](?:0|1)|$))")
+
+
+def _cache_ttl_supported(model):
+    """Legacy Claude 3 / 4.0 / 4.1 models reject `cache_control.ttl` with HTTP 400."""
+    return not _NO_CACHE_TTL_RE.match(str(model or ""))
+
+
 def _mark(message, ttl):
     """Put a cache breakpoint on the last part of a message; False when the message has nothing to carry one."""
     content = message.get("content")
@@ -264,6 +273,8 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     # one of them continues a tool call without them. Kept, they cost memory and a larger body on every request.
     if model.startswith("anthropic/") and cfg.get("direct_cache", True):
         ttl = cfg.get("minara_cache_ttl", "1h")
+        if not _cache_ttl_supported(model):
+            ttl = None
         # An hour costs Minara's accounts nothing more than five minutes (it bills every write at its list price), and a
         # subagent that waits on a long command still reads its own history when it comes back.
         _cache_marks(messages, ttl if ttl in ("1h", "5m") else None, mark_tail)
@@ -294,18 +305,9 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     if effort and effort != "auto":
         body["reasoning_effort"] = effort
     conversation = getattr(session, "_native_conversation_key", None) if session is not None else None
-    if model.startswith("openai/") and conversation:
-        # OpenAI routes a request with a cache key to where the same key's prefix is: through Minara, GPT-6.1 Sol read
-        # its cached prefix in 6 of 7 follow-ups with one and 1 of 7 without (2026-11-10). One key per conversation;
-        # a hash, so nothing of the client's identifiers goes upstream.
-        body["prompt_cache_key"] = "proxi-" + hashlib.sha256(
-            json.dumps(conversation, default=str).encode("utf-8")).hexdigest()[:32]
-    elif model.startswith("anthropic/") and conversation:
-        # OpenRouter spreads some Claude models over providers with caches of their own (Fable 5.2: Anthropic, Google
-        # Vertex, Azure): without a key a follow-up read the head in 3 of 5 requests and each new provider wrote it again
-        # (12.8 credits a 5.8k head), with one all 6 went to one provider and every follow-up read it (2026-11-10). The key
-        # follows this conversation's head. Identical heads from different chats must not use the same key; changes
-        # to instructions/tools still change the key, while an effort change in the same chat keeps it.
+    if model.startswith(("openai/", "anthropic/")) and conversation:
+        # Key by model, conversation, system head, and tools so identical instructions across different
+        # models, heads, or tool schemas never collide while effort changes on the same chat reuse the key.
         head_part = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
         seed = [model, conversation, head_part, body.get("tools")]
         body["prompt_cache_key"] = "proxi-" + hashlib.sha256(json.dumps(
@@ -402,7 +404,7 @@ def normalize_usage(value, pricing=None):
     # to 0.0002 credits (end-to-end runs of 2026-11-10). So the list prices every reply it can read; what upstream reported
     # stays as upstream_cost, for diagnosis.
     estimate = (estimated_cost(pricing, dict(result, **_modalities(value)))
-                if pricing is not None and 'input_tokens' in result else None)
+                if pricing is not None and ('input_tokens' in result or 'output_tokens' in result) else None)
     if estimate is not None:
         result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
         if reported is not None:
@@ -923,7 +925,7 @@ class EventParser:
         if not isinstance(item, dict):
             raise apierr.upstream_error("Minara returned a stream error")
         if "error" in item or item.get("type") == "error":
-            raise _sse_error(item)
+            raise _sse_error(item, pre_output=not (self.text or self.calls or self.thinking))
         failed = _upstream_failure(item)
         if failed:
             raise apierr.upstream_error("Minara's upstream failed: " + failed)
@@ -1006,17 +1008,61 @@ class EventParser:
         return events
 
 
-def _error_body(response, limit=65536):
-    """The start of an error answer's body, to tell Minara's channel failures from real refusals."""
+_ABORTED = object()
+
+
+def _iter_response_chunks(response, stopped: threading.Event, deadline: float):
+    """Yield response body chunks while waking promptly if `abort()` signals `stopped`."""
+    resp_q = getattr(response, "queue", None)
+    if resp_q is None or not hasattr(resp_q, "get"):
+        for chunk in response.iter_content(chunk_size=None):
+            if stopped.is_set():
+                return
+            yield chunk
+        return
+    try:
+        from curl_cffi.requests.models import STREAM_END
+    except ImportError:
+        STREAM_END = None
+    while not stopped.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Minara stream read exceeded turn deadline")
+        try:
+            chunk = resp_q.get(timeout=min(0.25, remaining))
+        except queue.Empty:
+            continue
+        if stopped.is_set() or chunk is _ABORTED:
+            return
+        if isinstance(chunk, BaseException):
+            raise chunk
+        if chunk is STREAM_END or chunk is None:
+            return
+        yield chunk
+
+
+def _read_error_body(response, limit=65536):
+    """Read up to `limit` bytes of an error body and report whether the full body drained cleanly."""
     data = b""
+    clean = True
     try:
         for piece in response.iter_content():
-            data += piece if isinstance(piece, bytes) else str(piece).encode("utf-8")
-            if len(data) >= limit:
+            chunk = piece if isinstance(piece, bytes) else str(piece).encode("utf-8")
+            if not chunk:
+                continue
+            if len(data) + len(chunk) > limit:
+                data += chunk[: max(0, limit - len(data))]
+                clean = False
                 break
+            data += chunk
     except Exception:
-        pass
-    return data[:limit]
+        clean = False
+    return data[:limit], clean
+
+
+def _error_body(response, limit=65536):
+    """The start of an error answer's body, to tell Minara's channel failures from real refusals."""
+    return _read_error_body(response, limit=limit)[0]
 
 
 def _upstream_failure(item):
@@ -1058,14 +1104,55 @@ def _http_error(status, headers, text=b""):
 def _status_error(status, headers, text=b""):
     if status in (504, 524):
         return apierr.upstream_timeout("Minara gateway timed out (upstream HTTP %s)" % status)
-    if status in (401, 403):
+    if status == 401:
         # The code is the one every account path knows (auth_dead, failover); the words are Minara's, not Retool's.
-        error = apierr.ApiError(502, "upstream_auth_error", "Minara rejected the account's token (HTTP %s): it expired or "
-                                "was revoked; the request moves to another account, the account needs a new token" % status)
+        error = apierr.ApiError(502, "upstream_auth_error", "Minara rejected the account's token (HTTP 401): it expired or "
+                                "was revoked; the request moves to another account, the account needs a new token")
+        error.upstream_status = status
+        return error
+    if status == 403:
+        import auth
+
+        raw_text = text.decode("utf-8", "replace") if isinstance(text, bytes) else str(text or "")
+        low_raw = raw_text[:1500].lower()
+        if auth.cloudflare_challenge(status, headers) or (
+            "<html" in low_raw[:400] and any(k in low_raw for k in ("cloudflare", "attention required", "just a moment"))
+        ):
+            return apierr.upstream_error("Minara gateway blocked by Cloudflare challenge (HTTP 403)")
+        detail = _upstream_message(text)
+        low = detail.lower()
+        auth_hint = any(k in low for k in (
+            "unauthorized", "invalid api key", "invalid_api_key", "invalid token", "token",
+            "expired", "revoked", "authentication", "bad credentials",
+        ))
+        err_type = ""
+        has_upstream_meta = False
+        try:
+            parsed_err = json.loads(raw_text).get("error") if raw_text.strip() else None
+            if isinstance(parsed_err, dict):
+                err_type = str(parsed_err.get("type") or "").lower()
+                meta = parsed_err.get("metadata") if isinstance(parsed_err.get("metadata"), dict) else {}
+                has_upstream_meta = "previous_errors" in meta or "provider_name" in meta
+        except (ValueError, AttributeError, TypeError, RecursionError):
+            pass
+        if _channel_trouble(403, text) or (
+            bool(low) and not auth_hint and (
+                err_type == "upstream_error" or has_upstream_meta
+                or any(k in low for k in (
+                    "is banned", "banned", "moderation", "flagged", "region", "country",
+                    "unsupported", "unavailable", "not available", "not allowed", "blocked", "violates",
+                ))
+            )
+        ):
+            return apierr.upstream_error(
+                "Minara upstream rejected request (HTTP 403)" + (": " + detail if detail else "")
+            )
+        error = apierr.ApiError(502, "upstream_auth_error", "Minara rejected the account's token (HTTP 403): it expired or "
+                                "was revoked; the request moves to another account, the account needs a new token")
         error.upstream_status = status
         return error
     if status == 429:
-        return apierr.too_many_requests("Minara rate limit", apierr.retry_after_seconds(headers.get("retry-after")) or 2)
+        return apierr.account_rate_limited("Minara rate limit", apierr.retry_after_seconds(headers.get("retry-after")) or 2)
     if status == 402:
         return apierr.ApiError(402, "insufficient_credits", "Minara account has insufficient balance")
     if _channel_trouble(status, text):
@@ -1126,9 +1213,25 @@ def _upstream_message(text, limit=400):
     return message
 
 
-def _sse_error(item):
-    detail = _upstream_message(json.dumps({"error": item.get("error"), "message": item.get("message")}))
-    return apierr.upstream_error("Minara returned a stream error" + (": " + detail if detail else ""))
+def _sse_error(item, *, pre_output=False):
+    raw = item.get("error")
+    code = raw.get("code") if isinstance(raw, dict) else item.get("code")
+    etype = str(raw.get("type") or "").lower() if isinstance(raw, dict) else ""
+    detail = _upstream_message(json.dumps({"error": raw, "message": item.get("message")}))
+    low = detail.lower()
+    suffix = ": " + detail if detail else ""
+    if code == 429 or etype in ("rate_limit_error", "rate_limited") or "rate-limit" in low or "rate limit" in low or "too many requests" in low:
+        error = (apierr.account_rate_limited("Minara returned a stream error" + suffix, 5)
+                 if pre_output else apierr.too_many_requests("Minara returned a stream error" + suffix, 5))
+        error.upstream_status = 429
+        error.unbilled = bool(pre_output)
+        return error
+    if code == 402 or ("insufficient" in low and ("credit" in low or "balance" in low or "quota" in low)):
+        error = apierr.ApiError(402, "insufficient_credits", "Minara returned a stream error" + suffix)
+        error.upstream_status = 402
+        error.unbilled = bool(pre_output)
+        return error
+    return apierr.upstream_error("Minara returned a stream error" + suffix)
 
 
 def _forced_requirement(model_provider, tools, tool_choice):
@@ -1490,9 +1593,20 @@ def normalize_messages_usage(value, pricing=None, channel=None):
         provider = provider_of(channel)  # nothing in an Anthropic-shaped reply names OpenRouter's provider
         if provider:
             result["provider"] = provider
-    estimate = estimated_cost(pricing, result) if pricing is not None and "input_tokens" in result else None
+    estimate = (estimated_cost(pricing, dict(result, **_modalities(value)))
+                if pricing is not None and ("input_tokens" in result or "output_tokens" in result) else None)
     if estimate is not None:
         result.update(provider_cost=estimate, provider_cost_currency="USD", provider_cost_estimated=True)
+    else:
+        cost = value.get("cost")
+        reported = cost if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0 else None
+        if reported is not None and not (reported == 0 and result.get("output_tokens")):
+            result["provider_cost"] = reported
+            currency = value.get("currency")
+            if isinstance(currency, str) and 1 <= len(currency) <= 16 and currency.isascii() and currency.isalpha():
+                result["provider_cost_currency"] = currency.upper()
+            else:
+                result["provider_cost_currency"] = "USD"
     return result
 
 
@@ -1544,7 +1658,7 @@ class MessagesParser:
         kind = item.get("type")
         events = []
         if kind == "error":
-            raise _sse_error(item)
+            raise _sse_error(item, pre_output=not (self.text or self.calls or self.thinking))
         if kind == "message_start":
             message = item.get("message") if isinstance(item.get("message"), dict) else {}
             self.reply_id = str(message.get("id") or "")
@@ -1718,6 +1832,9 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                           None if text_only else tool_choice, max_tokens, chunks, None if text_only else session,
                           instruction)
     route["measured"] = route["messages"] and level in set(model_provider.get("messages_levels") or ())
+    token = token_of(cfg)
+    if not isinstance(token, str) or not token.strip():
+        raise apierr.service_unavailable("Minara Bearer token is missing")
     # Requests that go at once with one Claude head nobody has cached yet (Claude Code starts several subagents in one
     # message): the first writes it, the others wait for its answer to begin and then read it, as on Retool
     # (direct._claim_head). Minara's cache is shared by all its accounts; an entry is there once its response began.
@@ -1727,14 +1844,13 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
     head_role, head_gate = (direct._claim_head(head_key, time.monotonic(), id(session), warm=warm)
                             if head_key else (None, None))
     head_marked = False
-    token = token_of(cfg)
-    if not isinstance(token, str) or not token.strip():
-        raise apierr.service_unavailable("Minara Bearer token is missing")
     q = queue.Queue(maxsize=32)
     stopped = threading.Event()
     holder = {"response": None}
+    lease_holder = {"lease": None}
     close_lock = threading.Lock()
     close_claimed = False
+    delegated_lease = False
     close_finished = threading.Event()
     slots = _worker_slots(cfg)
     admitted = started = False
@@ -1756,10 +1872,20 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
         with close_lock:
             response = holder["response"]
             if response is None:
-                return
-            claimed = close_claimed
-            if not claimed:
-                close_claimed = True
+                pending = lease_holder["lease"] if delegated_lease else None
+                if pending is not None:
+                    lease_holder["lease"] = None
+                close_finished.set()
+                claimed = False
+            else:
+                pending = None
+                claimed = close_claimed
+                if not claimed:
+                    close_claimed = True
+        if response is None:
+            if pending is not None:
+                pending.release(reusable=False)
+            return
         if claimed:
             # Only worker/cleanup daemons call this, never the asyncio loop.
             close_finished.wait()
@@ -1769,65 +1895,108 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
         except Exception:
             pass
         finally:
-            close_finished.set()
+            with close_lock:
+                pending = lease_holder["lease"] if delegated_lease else None
+                if pending is not None:
+                    lease_holder["lease"] = None
+                close_finished.set()
+            if pending is not None:
+                pending.release(reusable=False)
 
     def abort():
         stopped.set()
-        response = holder["response"]
+        with close_lock:
+            response = holder["response"]
         if response is not None:
-            # Signal curl immediately, but leave the potentially blocking join
-            # to a daemon. Before headers arrive the request timeout bounds it.
+            # Signal curl and unblock iter_content queue immediately; close_response runs off-loop.
             quit_now = getattr(response, "quit_now", None)
             if quit_now is not None:
                 quit_now.set()
+            resp_q = getattr(response, "queue", None)
+            if resp_q is not None and hasattr(resp_q, "put_nowait"):
+                try:
+                    resp_q.put_nowait(_ABORTED)
+                except Exception:
+                    pass
             threading.Thread(target=close_response, name="minara-close", daemon=True).start()
 
     request_sent = getattr(session, "_provider_request_sent", None)
 
     def worker():
+        nonlocal delegated_lease
+        lease = None
+        stream_clean = False
+        response_received = False
         try:
-            from curl_cffi import requests
             from curl_cffi.requests.exceptions import Timeout as CurlTimeout
             if stopped.is_set():
                 return
             if time.monotonic() >= deadline:
                 raise apierr.upstream_timeout("Minara turn expired before upstream request")
-            post = getattr(session.backend, "_minara_post", None) or requests.post
+            custom_post = getattr(session.backend, "_minara_post", None)
+            if custom_post is None:
+                lease = curl_pool.POOL.acquire(cfg)
+                with close_lock:
+                    lease_holder["lease"] = lease
+                post = lease.session.post
+            else:
+                post = custom_post
             if request_sent is not None:
                 request_sent()
                 put({"type": "request_sent"})
             delays = list(cfg.get("minara_channel_retry_delays", (3, 8)))  # numbers: config.load checked them
             base = cfg.get("base", BASE).rstrip("/")
+            profile = curl_pool.resolve_profile(cfg)
+            proxy_url = http_pool.validate_proxy_url(cfg.get("proxy_url")) if custom_post is not None else None
             while True:
+                extra_headers = {"Authorization": "Bearer " + token}
                 if route["messages"]:
                     url, payload = base + "/messages", messages_body(body)
-                    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                               "Accept": "text/event-stream", "anthropic-version": ANTHROPIC_VERSION}
+                    extra_headers["anthropic-version"] = ANTHROPIC_VERSION
                 else:
                     url, payload = base + "/chat/completions", body
-                    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                               "Accept": "text/event-stream"}
-                response = post(url, headers=headers, json=payload, impersonate="chrome131", stream=True,
-                                allow_redirects=False,
-                                # (connect, read): curl_cffi makes a lone number on a stream its low-speed window too,
-                                # and cut a reply silent for 120 s (a model that reasons before it writes anything: Opus
-                                # at max took up to 292 s to its first event on Retool). curl adds the two: silence is
-                                # allowed for SILENCE_LIMIT, never past the turn's deadline, so a cancelled silent request
-                                # gives its worker slot back within that.
-                                timeout=_read_timeout(cfg, deadline))
-                holder["response"] = response
+                headers = curl_pool.minara_headers(
+                    cfg,
+                    accept="text/event-stream",
+                    content_type="application/json",
+                    extra=extra_headers,
+                )
+                post_kwargs = {
+                    "headers": headers,
+                    "json": payload,
+                    "impersonate": profile,
+                    "default_headers": False,
+                    "discard_cookies": True,
+                    "accept_encoding": curl_pool.DEFAULT_ACCEPT_ENCODING,
+                    "stream": True,
+                    "allow_redirects": False,
+                    # (connect, read): curl_cffi makes a lone number on a stream its low-speed window too,
+                    # and cut a reply silent for 120 s (a model that reasons before it writes anything: Opus
+                    # at max took up to 292 s to its first event on Retool). curl adds the two: silence is
+                    # allowed for SILENCE_LIMIT, never past the turn's deadline, so a cancelled silent request
+                    # gives its worker slot back within that.
+                    "timeout": _read_timeout(cfg, deadline),
+                }
+                if proxy_url:
+                    post_kwargs["proxy"] = proxy_url
+                response_received = False
+                response = post(url, **post_kwargs)
+                response_received = True
+                with close_lock:
+                    holder["response"] = response
                 if stopped.is_set():
                     return
                 if response.status_code == 200:
                     content_type = response.headers.get("content-type", "").lower()
                     if "text/event-stream" not in content_type:
                         raise apierr.upstream_error("Minara did not return an SSE stream")
-                    for data in sse_data(response.iter_content(chunk_size=16384)):
+                    for data in sse_data(_iter_response_chunks(response, stopped, deadline)):
                         if stopped.is_set():
                             return
                         put(data)
+                    stream_clean = not stopped.is_set()
                     break
-                text = _error_body(response)
+                text, body_clean = _read_error_body(response)
                 if (route["messages"] and not route["measured"] and response.status_code in (400, 404, 422)
                         and not _channel_trouble(response.status_code, text)):
                     # A level the relay moved to /v1/messages by itself, refused there before anything was generated:
@@ -1835,11 +2004,20 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                     switch_to_messages(body.get("model"), level, switched=False,
                                        reason="HTTP %s: %s" % (response.status_code, _upstream_message(text, 160)))
                     route["messages"] = False
-                    holder["response"] = None
+                    with close_lock:
+                        holder["response"] = None
                     try:
                         response.close()
                     except Exception:
                         pass
+                    if not body_clean and lease is not None:
+                        with close_lock:
+                            lease_holder["lease"] = None
+                        lease.release(reusable=False)
+                        lease = curl_pool.POOL.acquire(cfg)
+                        with close_lock:
+                            lease_holder["lease"] = lease
+                        post = lease.session.post
                     continue
                 error = _http_error(response.status_code, response.headers, text)
                 if response.status_code == 402:
@@ -1848,29 +2026,69 @@ async def _stream(cfg, session, model_provider, prompt, head, tools, tool_choice
                         refused()  # the balance check that follows marks the account exhausted
                 if not (delays and error.unbilled and _channel_trouble(response.status_code, text)
                         and time.monotonic() + delays[0] < deadline):
+                    stream_clean = body_clean
                     raise error
                 # Said, so a slow answer can be told from Minara's own retries (one took 17 s on an image).
                 journal.emit("upstream.channel_retry", "Minara: нет рабочего канала (HTTP %s), повтор через %g с" % (
                     response.status_code, delays[0]), "info", upstream="minara", status=response.status_code,
                     delay=delays[0], model=body.get("model"))
                 # Minara's channel failures are answered before anything is generated or billed: ask again shortly.
-                holder["response"] = None
+                with close_lock:
+                    holder["response"] = None
                 try:
                     response.close()
                 except Exception:
                     pass
+                if not body_clean and lease is not None:
+                    with close_lock:
+                        lease_holder["lease"] = None
+                    lease.release(reusable=False)
+                    lease = curl_pool.POOL.acquire(cfg)
+                    with close_lock:
+                        lease_holder["lease"] = lease
+                    post = lease.session.post
                 if stopped.wait(delays.pop(0)):
                     return
         except apierr.ApiError as exc:
             put(exc)
         except Exception as exc:
             # curl exceptions may contain credential-bearing URLs/headers; never forward them.
-            timed_out = isinstance(exc, TimeoutError) or (
-                "CurlTimeout" in locals() and isinstance(exc, CurlTimeout)) or getattr(exc, "code", None) == 28
-            put(apierr.upstream_timeout("Minara upstream request timed out") if timed_out else
-                apierr.upstream_error("Minara connection or stream read failed"))
+            timed_out = curl_pool._is_timeout_exc(exc) or (
+                "CurlTimeout" in locals() and isinstance(exc, CurlTimeout))
+            err = (
+                apierr.upstream_timeout("Minara upstream request timed out")
+                if timed_out
+                else apierr.upstream_error("Minara connection or stream read failed")
+            )
+            err.unbilled = not response_received and curl_pool.is_presend_curl_exc(exc)
+            put(err)
         finally:
-            close_response()
+            with close_lock:
+                response = holder["response"]
+                st = getattr(response, "stream_task", None) if response is not None else None
+                detach = bool(
+                    stopped.is_set()
+                    and response is not None
+                    and st is not None
+                    and callable(getattr(st, "done", None))
+                    and not st.done()
+                    and not close_finished.is_set()
+                )
+                if detach:
+                    delegated_lease = True
+                    active_lease = None
+                    need_spawn = not close_claimed
+                else:
+                    active_lease = lease_holder["lease"]
+                    lease_holder["lease"] = None
+                    need_spawn = False
+            if detach:
+                if need_spawn:
+                    threading.Thread(target=close_response, name="minara-close", daemon=True).start()
+            else:
+                close_response()
+                if active_lease is not None:
+                    active_lease.release(reusable=stream_clean)
             slots.release()
             put(None)
 

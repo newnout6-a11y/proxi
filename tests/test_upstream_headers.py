@@ -25,8 +25,8 @@ def test_an_account_brand_list_is_kept_as_it_is():
 
 def test_without_a_user_agent_the_default_one_and_its_hints_agree():
     headers = auth.upstream_headers(dict(BASE))
-    assert headers["user-agent"] == auth.DEFAULT_UA and "Chrome/131." in auth.DEFAULT_UA
-    assert 'v="131"' in headers["sec-ch-ua"]
+    assert headers["user-agent"] == auth.DEFAULT_UA and "Chrome/152." in auth.DEFAULT_UA
+    assert 'v="152"' in headers["sec-ch-ua"]
 
 
 def test_a_browser_that_is_not_chromium_sends_no_client_hints():

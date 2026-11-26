@@ -1,8 +1,10 @@
 import { useRef, useState } from 'react';
-import { X } from 'lucide-react';
-import { IconBtn, Select, Tokens } from './controls.jsx';
+import { TriangleAlert, X } from 'lucide-react';
+import { IconBtn, Notice, Select, Tokens } from './controls.jsx';
 import { fromValues, setCondition, valuesOf } from './conditions.js';
 import { useFocusLater } from './hooks.js';
+
+const isActiveConditionValue = (val) => val !== undefined && val !== null && val !== '' && (!Array.isArray(val) || val.length > 0);
 
 function BoolCondition({ spec, value, onChange, path }) {
   return (
@@ -14,17 +16,25 @@ function BoolCondition({ spec, value, onChange, path }) {
 /** The conditions of one rule: all of them must hold (AND); several values of one condition are alternatives (OR). */
 export default function Conditions({ value, onChange, specs, path }) {
   const conditions = value || {};
+  const conditionsRef = useRef(conditions);
+  conditionsRef.current = conditions;
   const [pending, setPending] = useState([]);
   const root = useRef(null);
   const focusLater = useFocusLater();
   const known = new Map(specs.map((spec) => [spec.name, spec]));
   // A condition without values yet lives only here; a condition the screen does not know is kept as a plain list.
   const names = [...new Set([...Object.keys(conditions), ...pending])];
+  const activeNames = Object.keys(conditions).filter((key) => isActiveConditionValue(conditions[key]));
   const free = specs.filter((spec) => !names.includes(spec.name));
+  const updateCondition = (name, nextValue) => {
+    const next = setCondition(conditionsRef.current, name, nextValue);
+    conditionsRef.current = next;
+    onChange(next);
+  };
   const remove = (name) => {
     const at = names.indexOf(name);
     setPending((list) => list.filter((item) => item !== name));
-    onChange(setCondition(conditions, name, undefined));
+    updateCondition(name, undefined);
     // the pressed button goes with its condition: the focus goes to the one that took its place, or to the list that adds one
     focusLater(() => {
       const rows = [...(root.current?.querySelectorAll('.p-condition') || [])];
@@ -33,16 +43,24 @@ export default function Conditions({ value, onChange, specs, path }) {
   };
   const add = (name) => {
     if (!name) return;
-    if (known.get(name)?.kind === 'bool') onChange(setCondition(conditions, name, true));
-    else setPending((list) => [...list, name]);
+    if (known.get(name)?.kind === 'bool') updateCondition(name, true);
+    else setPending((list) => (list.includes(name) ? list : [...list, name]));
   };
   return (
     <div className="p-conditions" ref={root}>
       <p className="p-hint">Все условия должны выполняться сразу. Несколько значений одного условия — любое из них. Строки — маски: <code>*</code> и <code>?</code>, без учёта регистра</p>
-      {!names.length && <p className="p-hint">Условий нет: правило сработает на любой запрос</p>}
+      {!activeNames.length && (
+        pending.length > 0 ? (
+          <Notice tone="warn" icon={TriangleAlert} role="status">
+            Условий нет: правило сработает на любой запрос, пока не добавлено хотя бы одно значение
+          </Notice>
+        ) : (
+          <p className="p-hint">Условий нет: правило сработает на любой запрос</p>
+        )
+      )}
       {names.map((name) => {
         const spec = known.get(name) || { name, label: name, kind: 'list' };
-        const set = (next) => onChange(setCondition(conditions, name, next));
+        const set = (next) => updateCondition(name, next);
         return (
           <div className="p-condition" key={name}>
             {spec.kind === 'bool' || typeof conditions[name] === 'boolean' ? (

@@ -1,5 +1,7 @@
 // The prompts document as the editor holds it: plain JSON updated immutably, so unchanged parts keep their
 // identity and comparing the draft with the saved document stays cheap. Unknown fields are never dropped.
+import { publishMasksOf } from './publish.js';
+
 const ids = new WeakMap();
 let counter = 0;
 
@@ -214,8 +216,23 @@ export function setProtected(doc, enabled) {
   return next;
 }
 
-export function newRule(use = '') {
-  return { name: 'Новое правило', if: {}, use };
+/** Profile name currently in view in the Profiles tab. */
+export function selectedProfileName(doc, builtin, selected) {
+  const names = Object.keys(profilesOf(doc));
+  const builtinNames = builtin?.profiles?.length ? builtin.profiles : [BUILTIN_PROFILE];
+  if (names.includes(selected) || builtinNames.includes(selected)) return selected;
+  return names[0] || null;
+}
+
+/** Initial rule conditions derived from `profile.publish_as_model` when it restricts models by mask. */
+export function defaultRuleConditions(doc, profile) {
+  const masks = publishMasksOf(profilesOf(doc)[profile]);
+  return masks.length ? { model: masks } : {};
+}
+
+export function newRule(use = '', conditions = {}) {
+  const nextIf = isObject(conditions) && Object.keys(conditions).length ? structuredClone(conditions) : {};
+  return { name: 'Новое правило', if: nextIf, use };
 }
 
 /** Set one field of a rule; `enabled: true` and `override_protected: false` are the defaults and are not written. */
@@ -229,7 +246,8 @@ export function setRuleField(rule, key, value) {
 
 /** The index of the first enabled rule that matches every request; whatever follows it can never be reached. */
 export function catchAllIndex(rules) {
-  const matchesAll = (rule) => !rule?.if || (isObject(rule.if) && !Object.keys(rule.if).length);
+  const emptyVal = (value) => value === undefined || value === null || value === '' || (Array.isArray(value) && !value.length);
+  const matchesAll = (rule) => !rule?.if || (isObject(rule.if) && Object.values(rule.if).every(emptyVal));
   return rules.findIndex((rule) => rule?.enabled !== false && matchesAll(rule));
 }
 

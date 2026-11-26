@@ -468,6 +468,17 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
 
     records: list[dict] = []
     secrets_found: list[str] = []
+
+    def _add_proxy_secret(raw_proxy: str | None) -> None:
+        if isinstance(raw_proxy, str) and "@" in raw_proxy:
+            try:
+                pw = urllib.parse.urlsplit(raw_proxy).password
+            except ValueError:
+                pw = None
+            if pw and pw not in secrets_found:
+                secrets_found.append(pw)
+
+    _add_proxy_secret(provider_proxy)
     for idx, cred in enumerate(raw_creds):
         cwhere = f"{where}.credentials[{idx}]"
         if not isinstance(cred, dict):
@@ -503,6 +514,7 @@ def expand_provider_to_accounts(provider: dict, where: str = "provider") -> tupl
             label = str(label)[:40]
 
         cred_proxy = http_pool.validate_proxy_url(cred.get("proxy_url")) or provider_proxy
+        _add_proxy_secret(cred_proxy)
         acc_id = cred.get("id") or cred.get("account_id") or _derived_credential_id(provider_id, idx)
         if not isinstance(acc_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", acc_id):
             raise ValueError(f"{cwhere}: invalid credential id '{acc_id}'")

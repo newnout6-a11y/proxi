@@ -28,6 +28,7 @@ import apierr
 import auth
 import conversation_state
 import credits
+from drivers import curl_pool
 import forced_choice
 import journal
 import client_context
@@ -97,6 +98,49 @@ async def _pause(seconds, is_cancelled):
 _ASSIST_ONLY = {"claude-haiku-4-5-20251001", "claude-haiku", 'gpt-4.1',
                 'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.1', 'gpt-5.2'}
 _ASSIST_SEEDS = frozenset(_ASSIST_ONLY)
+_ASSIST_TTL_SECONDS = 300.0
+_ASSIST_LEARNED: dict[tuple[object, str], float] = {}
+_ASSIST_LOCK = threading.Lock()
+
+
+def _assist_account_key(session):
+    backend = getattr(session, "backend", None)
+    if backend is None:
+        return None
+    cfg = getattr(backend, "cfg", None) or {}
+    account_id = cfg.get("account_id")
+    return (id(backend), account_id) if account_id else id(backend)
+
+
+def _is_assist_only(model_name, session=None):
+    if not model_name:
+        return False
+    if model_name in _ASSIST_ONLY:
+        return True
+    key = (_assist_account_key(session), model_name)
+    now = time.monotonic()
+    with _ASSIST_LOCK:
+        expires_at = _ASSIST_LEARNED.get(key)
+        if expires_at is None:
+            return False
+        if now >= expires_at:
+            _ASSIST_LEARNED.pop(key, None)
+            return False
+        return True
+
+
+def _remember_assist_only(model_name, session=None):
+    if not model_name or model_name in _ASSIST_ONLY:
+        return
+    key = (_assist_account_key(session), model_name)
+    now = time.monotonic()
+    with _ASSIST_LOCK:
+        for stale in [k for k, exp in _ASSIST_LEARNED.items() if now >= exp]:
+            _ASSIST_LEARNED.pop(stale, None)
+        if key not in _ASSIST_LEARNED and len(_ASSIST_LEARNED) >= 200:
+            oldest = min(_ASSIST_LEARNED, key=_ASSIST_LEARNED.__getitem__)
+            _ASSIST_LEARNED.pop(oldest, None)
+        _ASSIST_LEARNED[key] = now + _ASSIST_TTL_SECONDS
 # Whether upstream refused a body that carried a cache hint on the result of a tool; once it did, no body carries one for
 # the rest of the run (see _hints_tool_results and the retry in iter_events).
 _TOOL_RESULT_HINTS = {"refused": False}
@@ -183,7 +227,7 @@ def _owning_socket(resp):
     return None
 
 
-def _force_close_response(resp):
+def _force_close_response(resp, async_close=False):
     """Instantaneously unblock threads waiting in WinSock recv() or HTTPResponse read().
 
     Windows needs a real closesocket() to abort a blocked recv(); shutdown() alone
@@ -192,6 +236,19 @@ def _force_close_response(resp):
     reference survives resp.fp = None) can never close the number a second time
     after it has been reused by an unrelated connection."""
     if resp is None:
+        return
+    if hasattr(resp, "abort") and hasattr(resp, "quit_now"):
+        try:
+            resp.abort()
+        except Exception:
+            pass
+        if async_close:
+            threading.Thread(target=resp.close, name="retool-close", daemon=True).start()
+        else:
+            try:
+                resp.close()
+            except Exception:
+                pass
         return
     owner = None
     try:
@@ -1014,9 +1071,13 @@ def _is_tool_result_chunk(chunk):
             or "[tool result" in lowered or "[tool_result" in lowered or "[command result" in lowered)
 
 
-def cache_key_for(head, model="", tools=None):
-    """Prefix cache key. The model and the toolset are part of the upstream prompt
-    prefix, so a change to either must not reuse the previous cache entry."""
+def _cache_scope(session, credential_scope=None):
+    return credential_scope if credential_scope is not None else (
+        getattr(session, "_credential_scope", None) if session is not None else None)
+
+
+def cache_key_for(head, model="", tools=None, *, credential_scope=None):
+    """Prefix cache key. Model, toolset, and credential scope isolate prefixes."""
     digest = hashlib.sha256()
     digest.update((model or "").encode("utf-8"))
     digest.update(b"\x00")
@@ -1024,6 +1085,9 @@ def cache_key_for(head, model="", tools=None):
         digest.update(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     digest.update(b"\x00")
     digest.update((head or "").encode("utf-8"))
+    if credential_scope:
+        digest.update(b"\x00")
+        digest.update(str(credential_scope).encode("utf-8", "surrogatepass"))
     return digest.hexdigest()[:24]
 
 
@@ -1052,7 +1116,7 @@ def _forced_alone(tools, tool_choice):
 
 
 def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks=None, session=None,
-               mark_tail=True):
+               mark_tail=True, *, credential_scope=None):
     """Assemble the request body.
 
     The stable head becomes a cached system block and the history is sent as one
@@ -1065,7 +1129,10 @@ def build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens
     messages = []
     tools, tool_choice = _forced_alone(tools, tool_choice)
     cache = cfg.get("direct_cache", True) and len(head or "") >= _CACHE_MIN_CHARS
-    prefix_key = cache_key_for(head, model_provider.get("model"), tools) if cache and head else None
+    cred_scope = _cache_scope(session, credential_scope)
+    prefix_key = (cache_key_for(head, model_provider.get("model"), tools,
+                                credential_scope=cred_scope)
+                  if cache and head else None)
     if head:
         block = {"type": "text", "text": head}
         if cache:
@@ -1528,11 +1595,16 @@ def _ping(session, body):
     # settings rather than replacing max with low during a cache refresh.
     headers = session.backend.headers()
     headers["content-type"] = "application/json"
-    request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
-                                     data=_wire_json(payload),
-                                     headers=headers, method="POST")
     try:
-        response = urllib.request.urlopen(request, timeout=120)
+        response = curl_pool.retool_open(
+            session.backend.cfg,
+            session.backend.cfg["base"] + ROUTE,
+            data=_wire_json(payload),
+            headers=headers,
+            method="POST",
+            timeout=120,
+            stream=True,
+        )
     except urllib.error.HTTPError as exc:
         try:
             detail = exc.read(16384).decode("utf-8", "replace")
@@ -1547,7 +1619,7 @@ def _ping(session, body):
 
     def abort():
         aborted.set()
-        _force_close_response(response)
+        _force_close_response(response, async_close=True)
     session._active_warm_abort = abort
     actual_credits = None
     complete = False
@@ -2104,7 +2176,9 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         return lambda: native_history.cache_messages(source, cfg.get("direct_cache", True), tools,
                                                      mark_tail=not side_request)
 
-    scope = native_scope(getattr(session, "_native_conversation_key", None), model_provider, head, tools, tool_choice)
+    conv_key = getattr(session, "_native_conversation_key", None)
+    cred_scope = getattr(session, "_credential_scope", None)
+    scope = native_scope(conv_key, model_provider, head, tools, tool_choice)
     tools, tool_choice = _forced_alone(tools, tool_choice)
     parent, messages = (conversation_state.resume(session, history, scope, client)
                         if history is not None and client is not None else (None, None))
@@ -2117,7 +2191,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
     # history sends the same request again from the client's own messages (below).
     pruned_parent = bool(parent is not None and not forked and parent in getattr(history, "pruned", ()))
     if messages is not None:
-        body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens)
+        body = build_body(cfg, model_provider, head, "", tools, tool_choice, max_tokens,
+                          credential_scope=cred_scope)
         body["messages"] = native_history.cache_messages(messages, cfg.get("direct_cache", True), tools,
                                                          mark_tail=not side_request, tool_results=hint_results)
         if _has_tool_result_hint(body["messages"]):
@@ -2151,7 +2226,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                          restored=any(getattr(branch, "restored", False) for branch in history.branches),
                          why=history.mismatch(scope, client, getattr(session, "_native_tool_defaults", None)))
         body = build_body(cfg, model_provider, head, prompt, tools, tool_choice, max_tokens, chunks,
-                          session=None if background else session, mark_tail=not side_request)
+                          session=None if background else session, mark_tail=not side_request,
+                          credential_scope=cred_scope)
         cold = (native_history.unsigned_tool_transcript(
                     client, without_results=_cold_from_the_start(model_provider.get("model")))
                 if client is not None and getattr(session, '_native_allow_cold_replay', False) else None)
@@ -2169,7 +2245,7 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                          'info', messages=len(cold), signatures=0)
     session._direct_reply = None
     param_types = {tool["name"]: tool.get("params") or {} for tool in (tools or [])}
-    if model_provider.get("model") in _ASSIST_ONLY:
+    if _is_assist_only(model_provider.get("model"), session):
         body = _unmarked(body)
     identity = client_context.current()
     session._busy = True
@@ -2303,7 +2379,8 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         # Built anew, this body carried the App Builder marker however the request went: on a model of the Assist list, whose
         # two tries with tools went without it, the route refused this third one ("not available right now") and the
         # compaction failed after two paid tries. It goes the way the request goes, as the retry below sends it too.
-        sent = build_body(cfg, model_provider, head, prompt, None, "none", max_tokens, chunks, session=None, mark_tail=False)
+        sent = build_body(cfg, model_provider, head, prompt, None, "none", max_tokens, chunks, session=None,
+                          mark_tail=False, credential_scope=cred_scope)
         return sent if "metadata" in body else _unmarked(sent)
 
     def open_stream(sent):
@@ -2396,16 +2473,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 async with contextlib.aclosing(open_stream(body)) as stream:
                     async for event in stream:
                         if not learned and _from_upstream(event):
-                            # Learned only once the request without the marker is answered, as the other fallbacks are:
-                            # "not available right now" also comes for a while from a model that is on the App Builder list
-                            # (or from one account of a pool), and the retry then fails too. Learned before it, the model was
-                            # sent without the marker by every account until a restart, and every request of it failed.
+                            # Learned only once the request without the marker is answered, and bounded per account
+                            # with a TTL so a transient App Builder outage on one account never permanently degrades
+                            # all accounts and conversations until restart.
                             learned = True
-                            if len(_ASSIST_ONLY) > 200:
-                                # Flush only self-learned names: wiping the proven seeds would make
-                                # known assist models pay a 400 + retry cycle all over again.
-                                _ASSIST_ONLY.intersection_update(_ASSIST_SEEDS)
-                            _ASSIST_ONLY.add(model_name)
+                            _remember_assist_only(model_name, session)
                         note(event)
                         yield event
         reply = getattr(session, "_direct_reply", None)
@@ -2687,18 +2759,26 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
     budget = getattr(session, "_attempt_budget", None) or AttemptBudget()
     request_id = client_context.current().get("request_id") or getattr(session, "_request_tag", None)
 
+    abort_event = threading.Event()
+
+    def client_cancelled():
+        return bool(session._cancelled or (budget.cancel_event and budget.cancel_event.is_set()))
+
     def is_cancelled():
-        return session._cancelled or bool(budget.cancel_event and budget.cancel_event.is_set())
+        return client_cancelled() or abort_event.is_set()
     # Bounded so a stalled consumer (slow or gone client) cannot balloon memory:
     # the upstream worker blocks on hand-off, which backpressures the TCP read.
-    # One queue per attempt: a retried attempt must never read the previous
-    # worker's terminal sentinel (it made every retry end empty at once).
-    holder = {"response": None, "queue": None, "trace": None}
+    # One queue/attempt_state per attempt: a retried or unwinding worker must never
+    # read or close a later attempt's response/trace/sentinel.
+    holder = {"attempt": None}
+    turn_abort_reason = {"value": None}
 
     def hand_off_final(item, queue=None):
         """Land a terminal item (sentinel/error/cancel) without blocking. Safe from
         any thread; it never takes the place of a line (_AttemptQueue.put_last)."""
-        queue = queue if queue is not None else holder["queue"]
+        if queue is None:
+            current = holder.get("attempt")
+            queue = current.get("queue") if current is not None else None
         if queue is None:
             return
         try:
@@ -2707,13 +2787,20 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             pass
 
     def abort_direct():
-        _force_close_response(holder.get("response"))
-        hand_off_final(asyncio.CancelledError())
+        if turn_abort_reason["value"] is None:
+            turn_abort_reason["value"] = getattr(session, "_abort_reason", None)
+        abort_event.set()
+        current = holder.get("attempt")
+        if current is not None:
+            _force_close_response(current.get("response"), async_close=True)
+            hand_off_final(asyncio.CancelledError(), current.get("queue"))
 
     session._active_direct_abort = abort_direct
     session._abort_reason = None  # "timeout" once the watchdog aborts this stream (RelaySession.abort_active_turn)
 
-    def worker(queue):
+    def worker(queue, attempt_state):
+        local_response = None
+        local_trace = None
         try:
             attempt = 0
             while True:
@@ -2721,16 +2808,24 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     return
                 budget.take(is_cancelled, session.backend)
                 trace = AttemptTrace(cfg, budget, request_id, body.get("model"), payload)
-                holder["trace"] = trace
-                request = urllib.request.Request(session.backend.cfg["base"] + ROUTE,
-                                                 data=payload, headers=headers, method="POST")
+                local_trace = trace
+                attempt_state["trace"] = trace
                 trace.wire.request(headers)
                 try:
-                    response = urllib.request.urlopen(request, timeout=timeout)
+                    response = curl_pool.retool_open(
+                        session.backend.cfg,
+                        session.backend.cfg["base"] + ROUTE,
+                        data=payload,
+                        headers=headers,
+                        method="POST",
+                        timeout=timeout,
+                        stream=True,
+                    )
                     break
                 except urllib.error.HTTPError as exc:
                     trace.response(exc, exc.code)
-                    holder["response"] = exc
+                    local_response = exc
+                    attempt_state["response"] = exc
                     detail_bytes = exc.read(16384)
                     trace.wire.raw(detail_bytes)
                     trace.wire.event("http_error_body_read", limit_bytes=16384,
@@ -2768,20 +2863,27 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                         if session.backend.refresher.refresh(rejected_cookie=headers.get("cookie")):
                             trace.finish("auth_retry")
                             exc.close()
+                            local_response = None
+                            attempt_state["response"] = None
                             headers.update(session.backend.headers())
                             continue
                         error = apierr.upstream_auth_failed(detail[:400])
                         error.upstream_status = exc.code
                         raise error
-                    holder["response"] = exc
+                    local_response = exc
+                    attempt_state["response"] = exc
                     error = _api_error(exc.code, detail, exc.headers)
                     error.upstream_status = exc.code
                     error.diagnostic_id = diagnostic
                     raise error
-            holder["response"] = response
+            local_response = response
+            attempt_state["response"] = response
             trace.response(response)
             if is_cancelled():
-                _force_close_response(response)
+                _force_close_response(local_response)
+                local_response = None
+                if attempt_state.get("response") is response:
+                    attempt_state["response"] = None
                 return
             for raw in response:
                 trace.wire.raw(raw)
@@ -2799,9 +2901,8 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     break
             trace.wire.event("reader_end", cancelled=is_cancelled())
         except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
-            trace = holder.get("trace")
-            if trace:
-                trace.wire.event("reader_error", exception_type=type(exc).__name__)
+            if local_trace is not None:
+                local_trace.wire.event("reader_error", exception_type=type(exc).__name__)
             if not is_cancelled():
                 # urlopen wraps DNS, refused, TLS and send failures in URLError: the request never
                 # reached upstream. Any other failure (a read timeout, a closed connection)
@@ -2816,7 +2917,9 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     exc.request_sent = False
                 hand_off_final(exc, queue)
         finally:
-            _force_close_response(holder.get("response"))
+            _force_close_response(local_response)
+            if attempt_state.get("response") is local_response:
+                attempt_state["response"] = None
             hand_off_final(None, queue)
 
     text, thinking = [], []
@@ -2841,16 +2944,16 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             may_retry = (not service_request and empty_retries < max_empty_retries and budget.remaining > 1)
             yield {"type": "usage_start"}
             queue: asyncio.Queue = _AttemptQueue(maxsize=1024)
-            holder["queue"] = queue
-            previous_trace = holder.get("trace")
+            attempt_state = {"response": None, "queue": queue, "trace": None}
+            holder["attempt"] = attempt_state
             task = loop.run_in_executor(getattr(loop, "_relay_io_executor", None),
-                                        contextvars.copy_context().run, worker, queue)
+                                        contextvars.copy_context().run, worker, queue, attempt_state)
             flags = {"budget": budget, "model": body.get("model")}
             failure = None
             try:
                 async for event in _drain(cfg, session, queue, text, thinking, param_types, flags,
                                           cache_scope=(body.get("model"), body.get("openAICacheKey"))):
-                    trace = holder.get("trace")
+                    trace = attempt_state.get("trace")
                     if trace:
                         trace.wire.event("parser_event", event=event)
                     kind = event.get("type")
@@ -2882,9 +2985,7 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                 if not isinstance(exc, Exception):
                     raise
             finally:
-                current_trace = holder.get("trace")
-                if current_trace is previous_trace:
-                    current_trace = None  # this attempt stopped before creating a trace of its own
+                current_trace = attempt_state.get("trace")
                 status = getattr(current_trace, "http_status", None)
                 # Without a status the request may still be in flight, unless it provably never left.
                 possibly_billed = (current_trace is not None and (
@@ -2908,19 +3009,26 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     if mark_unknown:
                         mark_unknown()
                 if not task.done():
-                    _force_close_response(holder.get("response"))
+                    _force_close_response(attempt_state.get("response"))
+                raw_abort_reason = (turn_abort_reason["value"] if turn_abort_reason["value"] is not None
+                                    else getattr(session, "_abort_reason", None))
+                aborted = is_cancelled() or isinstance(failure, asyncio.CancelledError) or raw_abort_reason == "timeout"
                 try:
-                    await asyncio.wait_for(asyncio.shield(task), timeout=5)
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1.0 if aborted else 5.0)
                 except Exception:
                     pass
-                trace = holder.get("trace")
+                trace = attempt_state.get("trace")
                 if trace is not None:
                     # The client's cancel wins over the watchdog's mark: an attempt both ended is a client that left.
+                    cc = client_cancelled()
+                    timed_out = raw_abort_reason == "timeout" and not cc
                     outcome = attempt_outcome(
-                        cancelled=is_cancelled() or isinstance(failure, asyncio.CancelledError),
+                        cancelled=cc or (isinstance(failure, asyncio.CancelledError) and not timed_out),
                         failed=bool(failure), ended=flags.get("end"), usable=usable, thinking_seen=thinking_seen,
-                        timed_out=getattr(session, "_abort_reason", None) == "timeout" and not is_cancelled())
+                        timed_out=timed_out)
                     trace.finish(outcome)
+                if holder.get("attempt") is attempt_state:
+                    holder["attempt"] = None
                 if isinstance(failure, apierr.ApiError):
                     budget.attach(failure)
             if flags.get('cost_unknown') and not flags.get('usage_seen'):
@@ -2941,7 +3049,6 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     return
                 text.clear()
                 thinking.clear()
-                holder["response"] = None
                 continue
             if (getattr(failure, "retryable", None) is True and getattr(failure, "in_stream", False) and not spoke
                     and not usable and failure.status != 429 and retryable_retries < len(RETRYABLE_WAITS)
@@ -2964,7 +3071,6 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                     return
                 text.clear()
                 thinking.clear()
-                holder["response"] = None
                 continue
             if failure is not None:
                 raise failure
@@ -3000,7 +3106,6 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
             # full history. Never turn the user's task into a status-only job.
             text.clear()
             thinking.clear()
-            holder["response"] = None
         if text:
             yield {"type": "final_text", "text": "".join(text)}
         if not saw_end and not is_cancelled():
@@ -3031,7 +3136,9 @@ async def _stream_body(cfg, session, body, param_types=None, *, payload=None):
                          empty=not usable, effort=body.get("reasoningEffort"))
         yield {"type": "end", "reason": "length" if truncated else "stop"}
     finally:
-        session._active_direct_abort = None
+        if getattr(session, "_active_direct_abort", None) is abort_direct:
+            session._active_direct_abort = None
+            session._direct_detached = False
 
 
 def _delta_target(event, current):

@@ -33,6 +33,7 @@ import uuid
 import auth
 import console_log
 import direct
+from drivers import curl_pool
 import journal
 import models
 import retool_catalog
@@ -47,7 +48,6 @@ SCRIPT_BYTES = 16 * 1024 * 1024
 EDGE = "https://retool-edge.com/assets_vjs/"
 _ENTRY = re.compile(r"assets_vjs/(main-[A-Za-z0-9_-]+\.js)")
 _CHUNK = re.compile(r"assets_vjs/([A-Za-z0-9_.-]+\.js)")
-_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) retool-relay-catalog"
 
 
 def _now():
@@ -59,10 +59,14 @@ def _origin(base):
     return match[1] if match else None
 
 
-def fetch(url, limit, timeout=30.0):
+def fetch(url, limit, timeout=30.0, cfg=None):
     """The text at `url` (a public page or script, no cookie), at most `limit` bytes; OSError when it cannot be read."""
-    request = urllib.request.Request(url, headers={"User-Agent": _AGENT, "Accept": "*/*"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    headers = {
+        "User-Agent": auth.DEFAULT_UA,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    with curl_pool.retool_open(cfg or {}, url, headers=headers, method="GET", timeout=timeout, stream=True) as response:
         if response.status != 200:
             raise OSError("HTTP %s" % response.status)
         data = response.read(limit + 1)
@@ -91,13 +95,14 @@ def probe(backend, entry, timeout=90.0, effort=None):
     body = direct.build_body(cfg, provider, head, "Reply now with the word.", [], None, 2048)
     headers = auth.upstream_headers(cfg)
     headers["content-type"] = "application/json"
-    request = urllib.request.Request(str(cfg["base"]).rstrip("/") + direct.ROUTE,
-                                     data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    url = str(cfg["base"]).rstrip("/") + direct.ROUTE
+    payload = json.dumps(body).encode("utf-8")
     row = {"ok": False, "http": None, "error": None, "credits": None, "thinking": 0, "accepted": False,
            "seconds": None}
     text, ended, started = [], False, time.monotonic()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with curl_pool.retool_open(cfg, url, data=payload, headers=headers, method="POST", timeout=timeout,
+                                   stream=True) as response:
             row["http"] = response.status
             for index, raw in enumerate(response):
                 if index >= 20000 or time.monotonic() - started > timeout:
@@ -214,7 +219,8 @@ class CatalogRefresher:
             if not origin:
                 continue
             try:
-                page = self._fetch(origin + "/", PAGE_BYTES)
+                page = (self._fetch(origin + "/", PAGE_BYTES, cfg=backend.cfg)
+                        if self._fetch is fetch else self._fetch(origin + "/", PAGE_BYTES))
             except OSError as error:
                 summary["error"] = "login page: %s" % error
                 continue
@@ -229,7 +235,8 @@ class CatalogRefresher:
                     and "client_version" in state):
                 summary.pop("error", None)
                 return state["registry"]
-            script = self._fetch(EDGE + entry, SCRIPT_BYTES)
+            script = (self._fetch(EDGE + entry, SCRIPT_BYTES, cfg=backend.cfg)
+                      if self._fetch is fetch else self._fetch(EDGE + entry, SCRIPT_BYTES))
             # The version the frontend sends as X-Retool-Client-Version; None when the script no longer names it.
             state["client_version"] = retool_catalog.client_version(script)
             if state["client_version"]:
@@ -239,7 +246,9 @@ class CatalogRefresher:
                 chunks.remove(state["registry_chunk"])
                 chunks.insert(0, state["registry_chunk"])
             for chunk in [entry] + [name for name in chunks if name != entry]:
-                text = script if chunk == entry else self._fetch(EDGE + chunk, SCRIPT_BYTES)
+                text = (script if chunk == entry
+                        else (self._fetch(EDGE + chunk, SCRIPT_BYTES, cfg=backend.cfg)
+                              if self._fetch is fetch else self._fetch(EDGE + chunk, SCRIPT_BYTES)))
                 registry = retool_catalog.parse_registry(text)
                 if registry is not None:
                     state.update(entry_script=entry, registry_chunk=chunk, registry=retool_catalog.chat_models(registry),

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { TriangleAlert } from 'lucide-react';
+import { Info, TriangleAlert } from 'lucide-react';
 import { BASELINE_DOCUMENT, forceProfile, previewRequest } from './api.js';
 import { Disclosure, Notice } from './controls.jsx';
 import { systemEditsOf } from './draft.js';
@@ -8,6 +8,7 @@ import DiffView from './DiffView.jsx';
 import HeadView from './HeadView.jsx';
 import { usePreview } from './hooks.js';
 import { PreviewFacts, PreviewLists } from './PreviewResult.jsx';
+import { profileModelScope } from './publish.js';
 import SampleInput from './SampleInput.jsx';
 
 /**
@@ -26,6 +27,8 @@ export default function LivePreview({ apiKey, doc, profile, sampleState, setSamp
   const [folded, setFolded] = useState(null);
   const rows = useMemo(() => (live.data && base.data ? diffLines(base.data.head, live.data.head) : []), [live.data, base.data]);
   const data = live.data;
+  const scope = useMemo(() => profileModelScope(doc, profile), [doc, profile]);
+  const modelFits = data && !data.protected ? scope.matchesModel(data.model) : null;
 
   return (
     <section className="panel p-live" aria-label="Что получит модель">
@@ -46,6 +49,26 @@ export default function LivePreview({ apiKey, doc, profile, sampleState, setSamp
       )}
       {data && (
         <div className="p-live-body" aria-busy={live.loading}>
+          {!data.protected && (
+            modelFits === false ? (
+              <Notice tone="warn" icon={TriangleAlert} role="status" className="p-live-sim">
+                <span>
+                  Принудительная симуляция профиля <code className="mono">{profile}</code>: правила и{' '}
+                  <code className="mono">publish_as_model</code> отключены. Модель образца{' '}
+                  <code className="mono">{data.model || 'без модели'}</code> не входит в ограничения этого профиля (
+                  <code className="mono">{scope.modelMasks.join(', ')}</code>), поэтому в реальных запросах она его не получит.
+                </span>
+              </Notice>
+            ) : (
+              <Notice tone="muted" icon={Info} role="status" className="p-live-sim">
+                <span>
+                  Принудительная симуляция профиля <code className="mono">{profile}</code>: правила и{' '}
+                  <code className="mono">publish_as_model</code> отключены, чтобы показать действие профиля на образце.
+                  Реальный выбор правила проверяйте во вкладке «Предпросмотр».
+                </span>
+              </Notice>
+            )
+          )}
           <PreviewFacts data={data} forced />
           <div className="segmented" role="group" aria-label="Что показать">
             <button type="button" aria-pressed={view === 'cut'} onClick={() => setView('cut')}>Что вырезано</button>

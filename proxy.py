@@ -29,7 +29,7 @@ import conversation_infer
 import conversation_state
 import cost_guard
 import drivers
-from drivers import http_pool
+from drivers import curl_pool, http_pool
 import forced_choice
 import generation
 import minara_refresh
@@ -286,6 +286,7 @@ class Runtime:
             future.cancel()
             journal.emit("relay.shutdown", "Истекло время завершения задач relay", "warn")
         finally:
+            curl_pool.close_all()
             # The writer finishes what is queued (bounded), so a normal stop loses nothing it was handed.
             self.pool.close_store()
             # The conversation pins of prompts.json go to disk with the state they keep usable.
@@ -564,6 +565,7 @@ def make_handler(runtime: Runtime):
         def _dispatch(self):
             self.request_id = uuid.uuid4().hex[:12]
             context_token = client_context.bind({"request_id": self.request_id})
+            beta_token = client_context.bind_anthropic_betas(self.headers)
             self._started = time.monotonic()
             self._request_started_monotonic = self._started - max(0.0, getattr(self, "_slot_wait", 0.0) or 0.0)
             # Keep-alive reuses the handler: a stale status from the previous
@@ -711,6 +713,7 @@ def make_handler(runtime: Runtime):
                         if trace.failed:
                             journal.emit("client.trace_failed", "Не удалось сохранить подробную трассу клиента",
                                          "warn", request_id=self.request_id)
+                    client_context.reset_anthropic_betas(beta_token)
                     client_context.reset(context_token)
                     # The writer holds its handler, and the adapter and the holder reach the whole parsed request (every message
                     # of the conversation, as text and as parsed JSON): left on the handler they are a cycle that only the garbage
@@ -1003,14 +1006,16 @@ def make_handler(runtime: Runtime):
             parsed.conversation_key, parsed.parent_conversation_key = validate.conversation_affinity(
                 data, self.headers, client_context.current(), namespace=self._credential_scope)
             parsed.credential_scope = self._credential_scope
-            self._infer_conversation(parsed)
             parsed.request_id = self.request_id
-            client_context.bind({**client_context.current(), "conversation": journal.tag(parsed.conversation_key),
-                                 "route": self._log_route})
             # The size of the request as the client sent it, for count_tokens to scale from the real usage of this
             # request (a profile may rewrite the body, which the next count_tokens of the client does not see).
             client_chars = adapters.request_chars(parsed)
             parsed.dialect = dialect
+            parsed.request_purpose = client_context.request_kind(parsed)
+            if parsed.request_purpose != "prompt-suggestion":
+                self._infer_conversation(parsed)
+            client_context.bind({**client_context.current(), "conversation": journal.tag(parsed.conversation_key),
+                                 "route": self._log_route})
             self._model = parsed.model
             runtime.client_keys.enforce_request(
                 getattr(self, "_client_key_profile", None), parsed.model, parsed.requested_model
@@ -1031,7 +1036,6 @@ def make_handler(runtime: Runtime):
                              "Модель %s не обслуживается маршрутом Retool: запрос выполняет %s" % (
                                  parsed.requested_model, substituted), "info",
                              request_id=self.request_id, requested=parsed.requested_model, served=substituted)
-            parsed.request_purpose = client_context.request_kind(parsed)
             if parsed.request_purpose == "prompt-suggestion":
                 substituted = self._optimize_prompt_suggestion(parsed, substituted)
             # What the request asks the model for, beyond its purpose: the summary of a compaction. Bound to the
@@ -1325,15 +1329,20 @@ def make_handler(runtime: Runtime):
             parsed.system = (
                 "Reply with ONLY a natural 2-12 word next user message in the user's language, with no quotes or meta-text."
             )
-            chunks = [self._chunk_text(chunk) for chunk in getattr(parsed, "message_chunks", None) or ()]
+            self._apply_suggestion_history(parsed)
+            return substituted
+
+        @classmethod
+        def _apply_suggestion_history(cls, parsed):
+            chunks = [cls._chunk_text(chunk) for chunk in getattr(parsed, "message_chunks", None) or ()]
             if not chunks and (getattr(parsed, "prompt", "") or ""):
                 chunks = [parsed.prompt]
             prior = [chunk for chunk in chunks[:-1] if chunk.strip()]
             kept = []
-            if len(prior) > self.SUGGESTION_TAIL and prior[0].startswith("User: "):
-                kept.append(prior[0][:self.SUGGESTION_CHUNK_CHARS])  # what the conversation is about
-            for item in prior[-self.SUGGESTION_TAIL:]:
-                trimmed = item[:self.SUGGESTION_CHUNK_CHARS]
+            if len(prior) > cls.SUGGESTION_TAIL and prior[0].startswith("User: "):
+                kept.append(prior[0][:cls.SUGGESTION_CHUNK_CHARS])  # what the conversation is about
+            for item in prior[-cls.SUGGESTION_TAIL:]:
+                trimmed = item[:cls.SUGGESTION_CHUNK_CHARS]
                 if not kept or kept[-1] != trimmed:
                     kept.append(trimmed)
             if chunks:
@@ -1343,7 +1352,6 @@ def make_handler(runtime: Runtime):
             # None, not []: a transport that builds from native messages (Minara, the universal drivers) took an empty list
             # for the whole conversation and sent the instruction alone (audit A15-03). It builds from the chunks above.
             parsed.native_messages = None
-            return substituted
 
         def _stabilize_prompt(self, parsed):
             """The client's system prompt with the parts that change between requests held as the conversation has them.
@@ -1354,7 +1362,11 @@ def make_handler(runtime: Runtime):
             if stabilizer is None or not parsed.system:
                 return
             try:
-                system, done = stabilizer.apply(parsed.system, parsed.conversation_key)
+                system, done = stabilizer.apply(
+                    parsed.system,
+                    parsed.conversation_key,
+                    credential_scope=getattr(parsed, "credential_scope", None),
+                )
             except Exception as exc:  # noqa: BLE001 - a prompt left as the client wrote it is what it was before
                 journal.emit("prompt.runtime_error", "Стабилизация system клиента не выполнена: %s" % type(exc).__name__,
                              "error", request_id=self.request_id, stage="stabilize")
@@ -1369,6 +1381,8 @@ def make_handler(runtime: Runtime):
 
             Such a client (DeepSeek Harness sends no session header) used to get a throwaway session per request, and its
             native history never continued. See conversation_infer for what makes a match exact."""
+            if getattr(parsed, "request_purpose", None) == "prompt-suggestion":
+                return
             index = getattr(runtime, "conversations", None)
             digests = getattr(parsed, "message_fingerprints", None)
             if parsed.conversation_key is not None or index is None or not cfg.get("infer_conversations", True):
@@ -1439,6 +1453,13 @@ def make_handler(runtime: Runtime):
                     # client sent, never the one the profile made of it (plan I9): hiding every tool must not turn a
                     # client's job into a relay task.
                     parsed.prompt_origin = client_origin(first)
+                    if first.request_purpose == "prompt-suggestion":
+                        for attr in ("entry", "model", "effort", "verbosity", "tools", "tool_choice", "web_search",
+                                     "structured_output", "show_thinking", "thinking_placeholder", "provider_options",
+                                     "max_tokens", "output_cap", "client_task", "system"):
+                            if hasattr(first, attr):
+                                setattr(parsed, attr, getattr(first, attr))
+                        self._apply_suggestion_history(parsed)
                 except Exception as exc:
                     self._prompt_failure("rewrite", exc)
                     first.prompt_plan = prompt_policy.Plan()

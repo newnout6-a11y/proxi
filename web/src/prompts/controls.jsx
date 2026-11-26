@@ -1,15 +1,23 @@
-import { createContext, useContext, useId, useRef, useState } from 'react';
+import { createContext, useContext, useEffect, useId, useRef, useState } from 'react';
 import { ChevronRight, X } from 'lucide-react';
 import { fmtInt } from '../format.js';
-import { errorHits } from './draft.js';
+import { errorHits, normalizePath } from './draft.js';
 import { utf8Bytes } from './template.js';
 
 // The error a failed save blames, {message, param}: a control shows it when the path is its own or inside it.
 export const ErrorContext = createContext(null);
 
+// Hooks for form controls to flush uncommitted drafts (e.g. unblurred Tokens) and validate local invariants before save.
+export const PromptFormContext = createContext(null);
+
 export function useFieldError(path) {
   const error = useContext(ErrorContext);
   return error && path && errorHits(error.param, path) ? error.message : '';
+}
+
+export function useExactError(path) {
+  const error = useContext(ErrorContext);
+  return error && path && normalizePath(error.param) === normalizePath(path) ? error.message : '';
 }
 
 function Message({ id, error, hint, alert }) {
@@ -24,10 +32,10 @@ function Message({ id, error, hint, alert }) {
 const describedBy = (id, error, hint) => [hint && `${id}-hint`, error && `${id}-error`].filter(Boolean).join(' ') || undefined;
 
 /** A label, a control and what is wrong with it; `path` lets a failed save point at this field. */
-export function Line({ label, value, onChange, path, hint, placeholder, mono = true, disabled, required, type = 'text', inputRef, className = '' }) {
+export function Line({ label, value, onChange, path, hint, placeholder, mono = true, disabled, required, type = 'text', inputRef, className = '', error: ownError = '' }) {
   const id = useId();
   const blamed = useFieldError(path);
-  const error = blamed || (required && !String(value ?? '').trim() ? 'Заполните поле' : '');
+  const error = blamed || ownError || (required && !String(value ?? '').trim() ? 'Заполните поле' : '');
   return (
     <div className={`p-field ${className}`}>
       <label htmlFor={id}>{label}</label>
@@ -108,13 +116,27 @@ export function Tokens({ label, values, onChange, suggestions = [], placeholder,
   const id = useId();
   const [draft, setDraft] = useState('');
   const input = useRef(null);
+  const valuesRef = useRef(values);
+  const draftRef = useRef(draft);
+  valuesRef.current = values;
+  draftRef.current = draft;
+  const form = useContext(PromptFormContext);
   const blamed = useFieldError(path);
   const error = blamed;
-  const add = (raw) => {
-    const fresh = String(raw).split(/[,\n]/).map((item) => item.trim()).filter((item) => item && !values.includes(item));
+  const add = (raw = draftRef.current) => {
+    const current = valuesRef.current;
+    const fresh = String(raw).split(/[,\n]/).map((item) => item.trim()).filter((item) => item && !current.includes(item));
+    draftRef.current = '';
     setDraft('');
-    if (fresh.length) onChange([...new Set([...values, ...fresh])]);
+    if (fresh.length) {
+      const next = [...new Set([...current, ...fresh])];
+      valuesRef.current = next;
+      onChange(next);
+    }
   };
+  const addRef = useRef(add);
+  addRef.current = add;
+  useEffect(() => form?.registerCommit?.(() => addRef.current(input.current?.value ?? draftRef.current)), [form]);
   const free = suggestions.filter((item) => !values.includes(item));
   return (
     <div className="p-field">
@@ -129,12 +151,19 @@ export function Tokens({ label, values, onChange, suggestions = [], placeholder,
           </span>
         ))}
         <input ref={input} className="mono" value={draft} placeholder={values.length ? '' : placeholder} aria-label={`${label}: добавить значение`} spellCheck={false}
-          autoComplete="off" aria-describedby={describedBy(id, error, hint)} onChange={(event) => setDraft(event.target.value)} onBlur={() => add(draft)}
+          autoComplete="off" aria-describedby={describedBy(id, error, hint)}
+          onChange={(event) => { draftRef.current = event.target.value; setDraft(event.target.value); }}
+          onBlur={(event) => add(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === 'Enter' || event.key === ',') { event.preventDefault(); add(draft); }
+            if (event.key === 'Enter' || event.key === ',') { event.preventDefault(); add(event.currentTarget.value); }
             else if (event.key === 'Backspace' && !draft && values.length) onChange(values.slice(0, -1));
           }} />
       </div>
+      {draft.trim() && (
+        <p className="p-hint p-token-pending">
+          Незакреплённое значение <code>{draft.trim()}</code> — нажмите Enter, запятую или уберите фокус
+        </p>
+      )}
       {free.length > 0 && (
         <div className="p-suggest" role="group" aria-label={`${label}: готовые значения`}>
           {free.map((item) => <button type="button" key={item} className="chip" onClick={() => add(item)}>{item}</button>)}

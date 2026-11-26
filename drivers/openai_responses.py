@@ -305,7 +305,9 @@ class OpenAIResponsesDriver(UpstreamDriver):
                 if provider_opts.get(k) is not None:
                     body[k] = provider_opts[k]
 
-        cache_engine.apply_openai_cache_hints(body, cfg, session, model, provider_opts, include_retention=True)
+        cache_engine.apply_openai_cache_hints(
+            body, cfg, session, model, provider_opts, include_retention=True, head=clean_head, tools=resp_tools
+        )
         body = sse_utils.apply_body_overrides(body, cfg.get("body_overrides"))
 
         base = str(cfg.get("base_url") or cfg.get("base") or "").rstrip("/")
@@ -320,6 +322,8 @@ class OpenAIResponsesDriver(UpstreamDriver):
         head_marked = False
         client = http_pool.get_async_client(cfg)
         timeout = http_pool.make_timeout(cfg)
+        active_resp_holder: dict = {"resp": None}
+        abort = http_pool.make_stream_abort(session, active_resp_holder)
         request_sent_cb = getattr(session, "_provider_request_sent", None)
 
         yield {"type": "usage_start"}
@@ -331,7 +335,15 @@ class OpenAIResponsesDriver(UpstreamDriver):
                 request_sent_cb()
                 yield {"type": "request_sent"}
 
-            async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as resp:
+            async with http_pool.abortable_stream(
+                client,
+                "POST",
+                url,
+                active_resp_holder=active_resp_holder,
+                headers=headers,
+                json=body,
+                timeout=timeout,
+            ) as resp:
                 if resp.status_code >= 400:
                     err_bytes = await resp.aread()
                     err_text = err_bytes.decode("utf-8", errors="replace")
@@ -344,6 +356,7 @@ class OpenAIResponsesDriver(UpstreamDriver):
                 cache_engine.mark_head_started(head_key, head_gate)
 
                 thinking_started = False
+                has_output = False
                 thinking_chunks: list[str] = []
                 encrypted_reasoning_items: list[dict] = []
                 text_chunks: list[str] = []
@@ -353,7 +366,10 @@ class OpenAIResponsesDriver(UpstreamDriver):
                 finish_reason = "stop"
                 saw_terminal = False
 
-                async for ev_name, data_str in sse_utils.aiter_sse_events(resp.aiter_bytes(), label=cfg.get("provider_name") or "OpenAI Responses"):
+                async for ev_name, data_str in sse_utils.aiter_sse_events(
+                    http_pool.iter_abortable_bytes(resp, active_resp_holder),
+                    label=cfg.get("provider_name") or "OpenAI Responses",
+                ):
                     if getattr(session, "_cancelled", False):
                         yield {"type": "end", "reason": "cancelled"}
                         return
@@ -369,11 +385,17 @@ class OpenAIResponsesDriver(UpstreamDriver):
                     kind = item.get("type") or ev_name
                     if kind in ("error", "response.failed"):
                         err_payload = item.get("response", {}).get("error") if kind == "response.failed" else item.get("error")
-                        raise sse_utils.map_http_error(502, resp.headers, json.dumps({"error": err_payload or item}), cfg, unbilled=False)
+                        raise sse_utils.map_sse_error(
+                            json.dumps({"error": err_payload or item}),
+                            resp.headers,
+                            cfg,
+                            pre_output=not has_output,
+                        )
 
                     if kind == "response.reasoning_summary_text.delta":
                         delta_txt = item.get("delta")
                         if isinstance(delta_txt, str) and delta_txt:
+                            has_output = True
                             if not thinking_started:
                                 thinking_started = True
                                 yield {"type": "thinking_start"}
@@ -383,12 +405,19 @@ class OpenAIResponsesDriver(UpstreamDriver):
                     elif kind == "response.output_text.delta":
                         delta_txt = item.get("delta")
                         if isinstance(delta_txt, str) and delta_txt:
+                            has_output = True
                             text_chunks.append(delta_txt)
                             yield {"type": "text", "delta": delta_txt}
 
                     elif kind == "response.output_item.added":
                         out_item = item.get("item") if isinstance(item.get("item"), dict) else {}
-                        if out_item.get("type") == "function_call":
+                        if out_item.get("type") == "reasoning":
+                            has_output = True
+                            if not thinking_started:
+                                thinking_started = True
+                                yield {"type": "thinking_start"}
+                        elif out_item.get("type") == "function_call":
+                            has_output = True
                             item_id = str(out_item.get("id") or out_item.get("call_id") or f"fc_{len(call_order)}")
                             call_id = str(out_item.get("call_id") or item_id)
                             name = str(out_item.get("name") or "")
@@ -412,6 +441,7 @@ class OpenAIResponsesDriver(UpstreamDriver):
                         slot = calls_by_item_id.get(item_id)
                         piece = item.get("delta")
                         if slot is not None and isinstance(piece, str) and piece:
+                            has_output = True
                             slot["arguments"] += piece
                             if len(slot["arguments"].encode("utf-8")) > sse_utils.MAX_EVENT_BYTES:
                                 raise apierr.upstream_error("Responses tool arguments exceeded size limit")
@@ -425,11 +455,16 @@ class OpenAIResponsesDriver(UpstreamDriver):
 
                     elif kind == "response.output_item.done":
                         out_item = item.get("item") if isinstance(item.get("item"), dict) else {}
-                        if out_item.get("type") == "reasoning" and out_item.get("encrypted_content"):
-                            encrypted_reasoning_items.append({
-                                "summary": out_item.get("summary") or [],
-                                "encrypted_content": out_item["encrypted_content"],
-                            })
+                        if out_item.get("type") == "reasoning":
+                            has_output = True
+                            if not thinking_started and (out_item.get("encrypted_content") or out_item.get("summary")):
+                                thinking_started = True
+                                yield {"type": "thinking_start"}
+                            if out_item.get("encrypted_content"):
+                                encrypted_reasoning_items.append({
+                                    "summary": out_item.get("summary") or [],
+                                    "encrypted_content": out_item["encrypted_content"],
+                                })
                         elif out_item.get("type") == "function_call":
                             item_id = str(out_item.get("id") or out_item.get("call_id") or "")
                             slot = calls_by_item_id.get(item_id)
@@ -501,12 +536,11 @@ class OpenAIResponsesDriver(UpstreamDriver):
                         session, scope, client_echo, canonical_msgs, _rb, tools, parent_snapshot
                     )
                 yield {"type": "end", "reason": finish_reason}
-        except httpx.TimeoutException:
-            raise apierr.upstream_timeout(f"{cfg.get('provider_name') or 'Upstream'} Responses request timed out") from None
-        except httpx.HTTPError as exc:
-            raise apierr.upstream_error(f"{cfg.get('provider_name') or 'Upstream'} Responses connection error: {type(exc).__name__}") from None
+        except (httpx.TimeoutException, httpx.HTTPError) as exc:
+            raise http_pool.map_transport_error(exc, f"{cfg.get('provider_name') or 'Upstream'} Responses") from None
         finally:
             cache_engine.release_head(head_key, head_role, head_gate, head_marked)
+            http_pool.clear_stream_abort(session, abort)
 
 
 register_driver(OpenAIResponsesDriver())
