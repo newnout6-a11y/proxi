@@ -3,8 +3,26 @@ __pycache__/
 *.pyo
 *.pyd
 *.bak
+*.bak[._~-]*
+*.backup
+*.backup[._~-]*
 *.log
+*.log.[0-9]*
+*.tmp
+*.swp
+*.orig
+*.rej
+.cache/
+.mypy_cache/
 .ruff_cache/
+.venv/
+
+# Private environment; versioned templates may contain placeholder values only.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 
 # runtime secrets and state (keep config.example.json in git)
 config.json
@@ -39,19 +57,20 @@ probes/chunks/
 /r.txt
 /logs/
 
-# Frontend dependencies and generated source tokens (distribution is shipped).
-/web/node_modules/
+# Frontend dependencies and generated source tokens (web/dist is shipped).
+node_modules/
 /web/src/tokens.css
-/web/test-results/
-/web/playwright-report/
+test-results/
+playwright-report/
 
-# agent scratch work
+# Local scratch work. Keep sensitive backups outside the checkout.
+.tmp/
 .agents/
 
 # Editor and agent tool state of this machine
 .zcode/
-.claude/worktrees/
-.claude/settings.local.json
+.claude/
+.codex/
 
 # A state folder for `python proxy.py --state-dir state` (journal, command log, conversations, upstream-400 dumps)
 /state/

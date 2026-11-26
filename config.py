@@ -30,6 +30,7 @@ KEY_PATH = os.path.join(HERE, "relay_key.txt")
 DEFAULTS = {
     "host": "127.0.0.1",
     "port": 8787,
+    "state_dir": "",  # optional common runtime folder; relative to config.json
     # Keep one upstream thread for one client conversation.  OpenCode sends
     # x-session-affinity/X-Session-Id, which SessionPool uses as the key.
     "session_mode": "per_conversation",
@@ -600,6 +601,13 @@ def _prompts_path(value, config_path):
     return os.path.abspath(os.path.join(os.path.dirname(config_path), value.strip() or PROMPTS_FILE))
 
 
+def state_directory(value, config_path):
+    """Resolve a profile's runtime folder, or None for the legacy per-file paths."""
+    if not isinstance(value, str) or "\x00" in value:
+        raise service_unavailable("state_dir must be a string path without NUL characters")
+    return os.path.abspath(os.path.join(os.path.dirname(config_path), value.strip())) if value.strip() else None
+
+
 def _placeholder(value):
     """A value copied unchanged from config.example.json, which describes what goes there in angle brackets."""
     return isinstance(value, str) and value.strip().startswith("<") and value.strip().endswith(">")
@@ -893,6 +901,7 @@ def _load(path):
     if cfg.get('relay_system_prompt_mode') not in ('standalone', 'append', 'replace'):
         raise service_unavailable("relay_system_prompt_mode must be one of standalone, append, replace")
     cfg["_config_path"] = os.path.abspath(path)
+    cfg["state_dir"] = state_directory(cfg["state_dir"], cfg["_config_path"]) or ""
     # What the relay measured by itself since minara_models.json was made (minara_refresh), kept beside config.json: put
     # over the catalog before the accounts' model lists are checked against it.
     cfg["_minara_catalog_file"] = os.fspath(minara_catalog.overlay_path(cfg["_config_path"]))
