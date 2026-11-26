@@ -583,13 +583,16 @@ def refusal(text):
 
 @pytest.mark.parametrize("text", BLOCK_REFUSALS + OTHER_REFUSALS)
 def test_a_restored_branch_is_forgotten_only_when_the_refusal_names_its_blocks(tmp_path, processes, text):
-    # A refusal that names nothing may be the refusal of a hint on a tool result: the relay asks once more without it
-    # (direct.iter_events), and upstream, which refused for another reason, refuses again.
-    messages, after = restart(tmp_path, processes, scripts=[refusal(text), refusal(text)])
+    # An ambiguous refusal may be the tool-result cache hint. The Retool gate can also require a
+    # retry without the agent marker. Refuse that attempt too so the branch's error handling is tested.
+    gate_refusal = text == "Invalid request format"
+    messages, after = restart(tmp_path, processes, scripts=[refusal(text) for _ in range(3 if gate_refusal else 2)])
     forgotten = text in BLOCK_REFUSALS
     seq = journal.JOURNAL.last_seq
     events = asyncio.run(after.turn(parsed(messages)))
     assert events[-1]["type"] == "error" and events[-1]["error"].status == 400
+    if gate_refusal:
+        assert len(after.sent) == 3
     assert [branch.restored for branch in after.pool._conversations[KEY]._native_history.branches] == (
         [] if forgotten else [True])
     assert len([e for e in stored(seq, "conversation_state.dropped") if e["data"]["reason"] == "rejected"]) == int(forgotten)

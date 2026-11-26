@@ -2390,7 +2390,7 @@ class ResponsesParser:
                       or (f"idx_{out_idx}" if type(out_idx) is int else ""))
         if not item_id:
             raise _stream_error("Minara returned a function call without an identifier")
-        call_id = str(out_item.get("call_id") or item_id)
+        call_id = str(out_item.get("call_id") or "")
         name = str(out_item.get("name") or "")
         args = out_item.get("arguments") if isinstance(out_item.get("arguments"), str) else ""
         if len(args.encode("utf-8")) > self.max_bytes:
@@ -2398,7 +2398,7 @@ class ResponsesParser:
         if item_id not in self.calls:
             if len(self.calls) >= 128:
                 raise _stream_error("Minara returned too many tool calls")
-            self.calls[item_id] = {"id": call_id, "name": name, "arguments": args}
+            self.calls[item_id] = {"id": call_id or item_id, "name": name, "arguments": args}
             self._call_order.append(item_id)
         else:
             slot = self.calls[item_id]
@@ -2444,7 +2444,9 @@ class ResponsesParser:
                     self.signed = True
                     events.append({"type": "thinking_signature", "signature": enc})
         elif itype == "function_call":
-            self._register_call(out_item, out_idx)
+            call = self._register_call(out_item, out_idx)
+            if out_item.get("status") in ("completed", "incomplete", "in_progress"):
+                call["status"] = out_item["status"]
         elif itype == "message" and not self.text and isinstance(out_item.get("content"), list):
             fallback_text = "".join(
                 part.get("text", "") for part in out_item["content"]
@@ -2498,9 +2500,9 @@ class ResponsesParser:
                     self.thinking = True
                     events.append({"type": "thinking_start"})
             elif itype == "function_call":
-                slot = self._register_call(out_item, item.get("output_index"))
-                if slot["id"] and slot["name"]:
-                    events.append({"type": "tool_call", **slot, "partial": True})
+                # A client can run a call once its streamed JSON parses. Keep fragments until the terminal status
+                # tells us which calls actually ended and the snapshot supplies any missing arguments.
+                self._register_call(out_item, item.get("output_index"))
         elif kind in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning.delta"):
             delta = item.get("delta")
             if isinstance(delta, str) and delta:
@@ -2523,8 +2525,6 @@ class ResponsesParser:
             slot["arguments"] += piece
             if len(slot["arguments"].encode("utf-8")) > self.max_bytes:
                 raise _stream_error("Minara tool call exceeds the size limit")
-            if slot["id"] and slot["name"]:
-                events.append({"type": "tool_call", **slot, "partial": True})
         elif kind == "response.function_call_arguments.done":
             slot = self._resolve_call(item.get("item_id"), item.get("output_index"))
             full_args = item.get("arguments")
@@ -2543,16 +2543,16 @@ class ResponsesParser:
             if isinstance(resp_obj.get("output"), list):
                 for idx, out_item in enumerate(resp_obj["output"]):
                     if isinstance(out_item, dict):
-                        itype = out_item.get("type")
-                        if itype == "function_call":
-                            item_id = str(out_item.get("id") or out_item.get("call_id") or "")
-                            if item_id and item_id in self.calls:
-                                continue
                         self._finish_output_item(out_item, idx, events)
-            final_calls = _finalize_tool_calls(self.calls, self._call_order)
+            cut = kind == "response.incomplete"
+            eligible = ("completed",) if cut else (None, "completed")
+            order = [key for key in self._call_order if self.calls[key].get("status") in eligible]
+            final_calls = _finalize_tool_calls(self.calls, order)
+            if cut:
+                final_calls = [event for event in final_calls if not event.get("invalid")]
             self._finalized_calls = final_calls
             events.extend(final_calls)
-            if kind == "response.incomplete":
+            if cut:
                 inc = resp_obj.get("incomplete_details") if isinstance(resp_obj.get("incomplete_details"), dict) else {}
                 self.finish = "content_filter" if inc.get("reason") == "content_filter" else "length"
             else:

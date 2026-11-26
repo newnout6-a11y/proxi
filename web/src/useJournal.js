@@ -21,6 +21,7 @@ export function createJournalBuffer(onUpdate) {
   let timer = null;
   let lastSeq = 0;
   let resetEpoch = 0;
+  let serverEpoch;
 
   const flush = () => {
     timer = null;
@@ -31,16 +32,40 @@ export function createJournalBuffer(onUpdate) {
     onUpdate(events);
   };
 
+  function reset(expectedEpoch) {
+    if (expectedEpoch !== undefined && resetEpoch !== expectedEpoch) return false;
+    resetEpoch += 1;
+    clearTimeout(timer);
+    timer = null;
+    lastSeq = 0;
+    queue = [];
+    if (events.length) {
+      events = [];
+      onUpdate(events);
+    }
+    return true;
+  }
+
   return {
     get events() { return events; },
     get lastSeq() { return lastSeq; },
     get resetEpoch() { return resetEpoch; },
-    loadInitial(data, serverLastSeq = 0, startEpoch = resetEpoch) {
+    get serverEpoch() { return serverEpoch; },
+    loadInitial(data, serverLastSeq = 0, startEpoch = resetEpoch, epoch) {
       if (resetEpoch !== startEpoch) return false;
       events = Array.isArray(data) ? data : [];
       lastSeq = events.length ? Math.max(...events.map((e) => e.seq || 0)) : (serverLastSeq || 0);
+      serverEpoch = Number.isSafeInteger(epoch) ? epoch : undefined;
       onUpdate(events);
       return true;
+    },
+    onHello(epoch) {
+      // If the stream drops before an announced reset arrives, resume with the old cursor again.
+      if (serverEpoch === undefined && Number.isSafeInteger(epoch)) serverEpoch = epoch;
+    },
+    resetFromServer(epoch) {
+      serverEpoch = Number.isSafeInteger(epoch) ? epoch : undefined;
+      reset();
     },
     push(event) {
       lastSeq = Math.max(lastSeq, event.seq);
@@ -51,19 +76,7 @@ export function createJournalBuffer(onUpdate) {
       clearTimeout(timer);
       flush();
     },
-    reset(expectedEpoch) {
-      if (expectedEpoch !== undefined && resetEpoch !== expectedEpoch) return false;
-      resetEpoch += 1;
-      clearTimeout(timer);
-      timer = null;
-      lastSeq = 0;
-      queue = [];
-      if (events.length) {
-        events = [];
-        onUpdate(events);
-      }
-      return true;
-    },
+    reset,
     dispose() {
       clearTimeout(timer);
       timer = null;
@@ -83,7 +96,7 @@ export function useJournal(key, onUnauthorized) {
 
   useEffect(() => {
     const buffer = bufferRef.current;
-    buffer.reset();
+    buffer.resetFromServer();
     const controller = new AbortController();
     const { signal } = controller;
     let stopped = false;
@@ -91,7 +104,7 @@ export function useJournal(key, onUnauthorized) {
       try {
         const startEpoch = buffer.resetEpoch;
         const first = await api(key, 'events?limit=800', { signal });
-        buffer.loadInitial(first.data, first.last_seq, startEpoch);
+        buffer.loadInitial(first.data, first.last_seq, startEpoch, first.reset_epoch);
       } catch (error) {
         if (error.status === 401) { unauthorized.current?.(); return; }
       }
@@ -100,9 +113,10 @@ export function useJournal(key, onUnauthorized) {
         try {
           await followJournal(key, buffer.lastSeq, {
             signal,
-            onHello: () => { setStatus('live'); delay = 1000; },
+            resetEpoch: buffer.serverEpoch,
+            onHello: (event) => { buffer.onHello(event.reset_epoch); setStatus('live'); delay = 1000; },
             onEvent: (event) => buffer.push(event),
-            onReset: () => buffer.reset(),
+            onReset: (event) => buffer.resetFromServer(event.reset_epoch),
           });
         } catch (error) {
           if (stopped) return;
