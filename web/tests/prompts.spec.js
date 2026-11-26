@@ -1811,12 +1811,23 @@ test('a relay that lists no warnings with the document still has the warnings of
   await expect(page.locator('.p-doc-warnings')).toHaveCount(0);
 });
 
+// Let the ordinary poll run after the previous response is rendered. A visibility event
+// can be dropped while the initial poll is still running, and the next real timeout is 15s.
+async function pollPrompts(page) {
+  await Promise.all([
+    page.waitForResponse((response) => response.request().method() === 'GET'
+      && new URL(response.url()).pathname === '/admin/api/prompts' && response.ok()),
+    page.clock.fastForward(15_001),
+  ]);
+}
+
 test('a changed document is picked up on its own while the draft is clean, and flagged when there are unsaved edits', async ({ page }) => {
+  await page.clock.install();
   const { prompts } = await openPrompts(page);
-  const poll = () => page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(page.locator('.page-head .tag')).toHaveText('ревизия 3');
   prompts.rev = 5;
   prompts.doc = { ...initialDocument(), profiles: { ...initialDocument().profiles, 'exact-opus': { head: 'Новый exact' } } };
-  await poll();
+  await pollPrompts(page);
   await expect(page.locator('.page-head .tag')).toHaveText('ревизия 5');
   await expect(savebar(page)).toHaveCount(0);
   await profileBar(page).getByRole('button', { name: 'exact-opus' }).click();
@@ -1824,20 +1835,22 @@ test('a changed document is picked up on its own while the draft is clean, and f
 
   await head(page).fill('мой exact');
   prompts.rev = 6;
-  await poll();
+  await pollPrompts(page);
   await expect(page.locator('.p-conflict')).toContainText('сейчас ревизия 6');
   await expect(head(page)).toHaveValue('мой exact');
   expect(prompts.saves).toHaveLength(0);
 });
 
 test('the file errors of the relay appear and go away with the next poll', async ({ page }) => {
+  await page.clock.install();
   const { prompts } = await openPrompts(page);
+  await expect(page.locator('.page-head .tag')).toHaveText('ревизия 3');
   await expect(page.locator('.p-file-errors')).toHaveCount(0);
   prompts.errors = [{ message: 'prompts.json: invalid JSON at line 3', param: '', ts: 1 }];
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await pollPrompts(page);
   await expect(page.locator('.p-file-errors')).toContainText('invalid JSON at line 3');
   prompts.errors = [];
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await pollPrompts(page);
   await expect(page.locator('.p-file-errors')).toHaveCount(0);
 });
 
