@@ -42,23 +42,24 @@ class Response:
         pass
 
 
-def ok_stream(text):
+def ok_stream(text, *, usage=None):
     data = {'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': 'stop'}],
-            'usage': {'prompt_tokens': 4, 'completion_tokens': 2}}
+            'usage': usage if usage is not None else {'prompt_tokens': 4, 'completion_tokens': 2}}
     return ('data: ' + json.dumps(data) + '\n\ndata: [DONE]\n\n').encode()
 
 
 @pytest.fixture
-def relay(tmp_path, monkeypatch):
+def relay(tmp_path, monkeypatch, request):
+    model = getattr(request, "param", MODEL)
     prior = dict(models._MINARA_MODELS)
     for key in ('RETOOL_BASE', 'RETOOL_COOKIE', 'RETOOL_XSRF', 'RETOOL_PAGE_UUID', 'RELAY_API_KEY'):
         monkeypatch.delenv(key, raising=False)
     path = tmp_path / 'config.json'
     path.write_text(json.dumps({
         'accounts': [{'account_id': 'failover-%d' % n, 'label': 'Minara %d' % n, 'upstream': 'minara',
-                      'bearer_token': 'synthetic-bearer-%d' % n, 'minara_models': [{'id': 'openai/failover-test'}]}
+                       'bearer_token': 'synthetic-bearer-%d' % n, 'minara_models': [{'id': model.removeprefix('minara/')}]}
                      for n in (1, 2)],
-        'model': MODEL, 'relay_api_key': KEY, 'workspace_root': str(tmp_path), 'project_context': False,
+        'model': model, 'relay_api_key': KEY, 'workspace_root': str(tmp_path), 'project_context': False,
         'exec_policy': 'off', 'conversation_state': False, 'cache_keepwarm_seconds': 0, 'session_refresh_interval': 0,
         'account_balance_interval': 0, 'minara_channel_retry_delays': [], 'journal_path': str(tmp_path / 'journal.jsonl'),
         'prompts_file': str(tmp_path / 'absent.json')}), encoding='utf-8')
@@ -88,7 +89,7 @@ def relay(tmp_path, monkeypatch):
     def ask(conversation):
         connection = http.client.HTTPConnection('127.0.0.1', server.server_address[1], timeout=30)
         connection.request('POST', '/v1/chat/completions', json.dumps({
-            'model': MODEL, 'messages': [{'role': 'user', 'content': 'hi'}]}),
+            'model': model, 'messages': [{'role': 'user', 'content': 'hi'}]}),
             {'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json', 'x-conversation-id': conversation})
         reply = connection.getresponse()
         body = json.loads(reply.read().decode())
@@ -97,7 +98,7 @@ def relay(tmp_path, monkeypatch):
     def ask_with(conversation, **fields):
         connection = http.client.HTTPConnection('127.0.0.1', server.server_address[1], timeout=30)
         connection.request('POST', '/v1/chat/completions', json.dumps(dict({
-            'model': MODEL, 'messages': [{'role': 'user', 'content': 'weather?'}]}, **fields)),
+            'model': model, 'messages': [{'role': 'user', 'content': 'weather?'}]}, **fields)),
             {'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json', 'x-conversation-id': conversation})
         reply = connection.getresponse()
         body = json.loads(reply.read().decode())
@@ -134,12 +135,93 @@ def test_a_402_moves_the_request_to_another_account_and_takes_the_first_out(rela
     assert relay.state.posts[0] != relay.state.first.cfg['label']
 
 
+@pytest.mark.parametrize("relay", ["minara/anthropic/claude-cache-failover"], indirect=True)
+def test_a_402_on_a_warm_dialog_reuses_the_identical_marked_body(relay):
+    sent = []
+    for backend in relay.runtime.accounts.backends:
+        original = backend._minara_post
+
+        def record(url, _original=original, _account=backend.cfg["account_id"], **kwargs):
+            serialized = json.dumps(kwargs["json"], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            sent.append((_account, url, serialized))
+            return _original(url, **kwargs)
+
+        backend._minara_post = record
+
+    relay.state.refusal = None
+    messages = [{"role": "system", "content": "Stable instructions. " * 400}, {"role": "user", "content": "First."}]
+    assert relay.ask_with("warm-move", messages=messages)[0] == 200
+
+    relay.state.refusal = 402
+    before = journal.JOURNAL.last_seq
+    messages = [*messages, {"role": "assistant", "content": "FAILOVER_OK"}, {"role": "user", "content": "Continue."}]
+    status, result = relay.ask_with("warm-move", messages=messages)
+    assert status == 200 and result["choices"][0]["message"]["content"] == "FAILOVER_OK"
+    warmed, rejected, retry = sent
+    assert warmed[0] == rejected[0] != retry[0]
+    assert rejected[1:] == retry[1:]  # the route and exact JSON bytes, including history and breakpoints
+    request = json.loads(retry[2])
+    assert request["prompt_cache_key"] == json.loads(warmed[2])["prompt_cache_key"]
+    assert request["messages"][0]["content"][0]["cache_control"]["type"] == "ephemeral"
+    assert request["messages"][-1]["content"][0]["cache_control"]["type"] == "ephemeral"
+    (failover,) = [event for event in journal.JOURNAL.query(since=before) if event["kind"] == "account.failover"]
+    assert failover["data"]["reason"] == "balance_exhausted"
+    assert failover["data"]["model"] == "minara/claude-cache-failover"
+
+
+@pytest.mark.parametrize("relay", ["minara/openai/gpt-6.2-sol"], indirect=True)
+def test_proactive_gpt_migration_keeps_the_shared_cache_prefix(relay):
+    entry = models.minara_entry("minara/openai/gpt-6.2-sol", relay.runtime.cfg)
+    entry["endpoint"] = "chat"
+    cached_prefixes = {}
+    sent = []
+    for backend in relay.runtime.accounts.backends:
+        def post(url, _backend=backend, **kwargs):
+            body = kwargs["json"]
+            sent.append((_backend, url, body))
+            cache_key = json.dumps([body["model"], body["prompt_cache_key"], body["reasoning_effort"],
+                                    body["tools"], body["messages"][0]], sort_keys=True)
+            prefix = cached_prefixes.setdefault(cache_key, [])
+            hit = bool(prefix and body["messages"][:len(prefix)] == prefix)
+            cached_prefixes[cache_key] = body["messages"]
+            usage = {"prompt_tokens": 2000, "completion_tokens": 2,
+                     "prompt_tokens_details": {"cached_tokens": 1800 if hit else 0}}
+            return Response(200, ok_stream("OK", usage=usage))
+
+        backend._minara_post = post
+
+    tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+    messages = [{"role": "system", "content": "Stable instructions. " * 400}, {"role": "user", "content": "First."}]
+    status, warmed = relay.ask_with("proactive-move", messages=messages, tools=tools, reasoning_effort="high")
+    assert status == 200 and warmed["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    first, route, initial_body = sent[0]
+    assert route.endswith("/chat/completions") and initial_body["model"] == "openai/gpt-6.2-sol"
+
+    # An actual dispatcher balance check parks the old account before the next turn; it never receives that turn.
+    relay.state.balance = {"plan": "0", "extra": "0"}
+    assert relay.runtime.accounts.check_balance(first)
+    assert first.unavailable["reason"] == "exhausted"
+    before = journal.JOURNAL.last_seq
+    messages = [*messages, {"role": "assistant", "content": "OK"}, {"role": "user", "content": "Continue."}]
+    status, migrated = relay.ask_with("proactive-move", messages=messages, tools=tools, reasoning_effort="high")
+    assert status == 200 and migrated["usage"]["prompt_tokens_details"]["cached_tokens"] == 1800
+    assert len(sent) == 2 and sent[-1][0] is not first and sent[-1][1] == route
+    assert len(cached_prefixes) == 1
+    events = journal.JOURNAL.query(since=before)
+    (move,) = [event for event in events if event["kind"] == "account.migrate"]
+    assert move["data"]["reason"] == "exhausted"
+    assert not any(event["kind"] == "account.failover" for event in events)
+
+
 def test_a_rejected_token_moves_the_request_and_names_minara(relay):
     relay.state.refusal = 401
+    before = journal.JOURNAL.last_seq
     status, body = relay.ask('conv-401')
     assert status == 200 and body['choices'][0]['message']['content'] == 'FAILOVER_OK'
     dead = relay.state.first.unavailable
     assert dead['reason'] == 'auth_dead' and dead['error'] == 'token_rejected'
+    (failover,) = [event for event in journal.JOURNAL.query(since=before) if event["kind"] == "account.failover"]
+    assert failover["data"]["reason"] == "token_rejected"
 
 
 def test_every_account_refused_says_minara_not_retool(relay):
