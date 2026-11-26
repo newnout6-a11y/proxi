@@ -107,6 +107,12 @@ def _admin_lock(admin_obj):
     return getattr(admin_obj, "lock", None) or contextlib.nullcontext()
 
 
+def _catalog_publication_lock(admin_obj):
+    """Keep live provider replacement and discovery publication from interleaving."""
+    refresher = getattr(admin_obj.runtime, "provider_catalog", None)
+    return getattr(refresher, "publication_lock", None) or contextlib.nullcontext()
+
+
 def collect_extra_secrets(saved: dict | None) -> list[str]:
     """Gather API keys and virtual client keys from saved config so `Admin._safe` masks them everywhere."""
     if not isinstance(saved, dict):
@@ -679,12 +685,13 @@ def create_provider(admin_obj, data: dict) -> dict:
                 raise apierr.conflict(f"Provider '{pid}' already exists")
             prov_list.append(clean)
             admin_obj._write(path, saved)
-            admin_obj.cfg["providers"] = copy.deepcopy(prov_list)
         admin_obj._mask_tokens(secrets_found)
-        metas = admin_obj.cfg.setdefault("_providers_meta", {})
-        metas[pid] = meta
-        live = _replace_provider_backends_live(admin_obj, pid, records)
-        _rebuild_universal_catalogs(admin_obj.cfg)
+        with _catalog_publication_lock(admin_obj):
+            admin_obj.cfg["providers"] = copy.deepcopy(prov_list)
+            metas = admin_obj.cfg.setdefault("_providers_meta", {})
+            metas[pid] = meta
+            live = _replace_provider_backends_live(admin_obj, pid, records)
+            _rebuild_universal_catalogs(admin_obj.cfg)
 
     refresher = getattr(admin_obj.runtime, "provider_catalog", None)
     disc_res = None
@@ -737,13 +744,14 @@ def update_provider(admin_obj, provider_id: str, data: dict) -> dict:
             admin_obj._mask_tokens(secrets_found)
             prov_list[idx] = clean
             admin_obj._write(path, saved)
-            admin_obj.cfg["providers"] = copy.deepcopy(prov_list)
 
-        metas = admin_obj.cfg.setdefault("_providers_meta", {})
-        old_meta = metas.get(pid) or {}
-        metas[pid] = meta
-        live = _replace_provider_backends_live(admin_obj, pid, records)
-        _rebuild_universal_catalogs(admin_obj.cfg)
+        with _catalog_publication_lock(admin_obj):
+            admin_obj.cfg["providers"] = copy.deepcopy(prov_list)
+            metas = admin_obj.cfg.setdefault("_providers_meta", {})
+            old_meta = metas.get(pid) or {}
+            metas[pid] = meta
+            live = _replace_provider_backends_live(admin_obj, pid, records)
+            _rebuild_universal_catalogs(admin_obj.cfg)
 
     conn_changed = (
         old_meta.get("base_url") != meta["base_url"]
@@ -783,18 +791,19 @@ def delete_provider(admin_obj, provider_id: str) -> dict:
                 raise apierr.conflict("The last enabled provider cannot be removed: nothing else would answer")
             saved["providers"] = remaining
             admin_obj._write(path, saved)
+
+        with _catalog_publication_lock(admin_obj):
             admin_obj.cfg["providers"] = copy.deepcopy(remaining)
+            (admin_obj.cfg.get("_providers_meta") or {}).pop(pid, None)
+            overlay = admin_obj.cfg.get("_discovered_provider_models")
+            if isinstance(overlay, dict) and pid in overlay:
+                overlay.pop(pid, None)
+                ov_path = discovery.overlay_path(admin_obj.cfg.get("_config_path"))
+                if ov_path is not None:
+                    discovery.save_overlay(ov_path, overlay)
 
-        (admin_obj.cfg.get("_providers_meta") or {}).pop(pid, None)
-        overlay = admin_obj.cfg.get("_discovered_provider_models")
-        if isinstance(overlay, dict) and pid in overlay:
-            overlay.pop(pid, None)
-            ov_path = discovery.overlay_path(admin_obj.cfg.get("_config_path"))
-            if ov_path is not None:
-                discovery.save_overlay(ov_path, overlay)
-
-        _replace_provider_backends_live(admin_obj, pid, [])
-        _rebuild_universal_catalogs(admin_obj.cfg)
+            _replace_provider_backends_live(admin_obj, pid, [])
+            _rebuild_universal_catalogs(admin_obj.cfg)
     journal.emit("admin.provider", f"Удалён провайдер {pid}", "warn", provider=pid)
     return {"ok": True, "restart_required": False}
 

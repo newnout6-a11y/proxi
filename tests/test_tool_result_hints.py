@@ -252,8 +252,10 @@ def test_a_refusal_that_comes_back_is_not_taken_for_the_hints(prompt_relay, monk
     refused = refusing(relay, monkeypatch, only_hinted=False)  # refuses everything, hinted or not
     with pytest.raises(AssertionError):
         chat.ask(tool_reply("c2", "opaque-2"))
-    assert len(refused) == 2  # the hinted body, and once more without the hint, which fails the same way
-    assert direct._has_tool_result_hint(refused[0]["messages"]) and not direct._has_tool_result_hint(refused[1]["messages"])
+    # Repeating the same HTTP gate error also tries Assist once, which this upstream refuses too.
+    assert [("metadata" in body, direct._has_tool_result_hint(body["messages"])) for body in refused] == [
+        (True, True), (True, False), (False, False),
+    ]
     assert direct._TOOL_RESULT_HINTS["refused"] is False  # the retry was not answered: the hint was not the cause
 
 

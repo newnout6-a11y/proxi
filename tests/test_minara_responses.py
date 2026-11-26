@@ -536,6 +536,46 @@ def test_responses_parser_incomplete_reasons_and_truncation_rejection():
     assert err.value.unbilled is False
 
 
+@pytest.mark.parametrize("prefix", ["", '{"path":'])
+def test_responses_parser_uses_terminal_arguments_for_announced_calls(prefix):
+    parser = minara.ResponsesParser()
+    call = {"type": "function_call", "id": "fc_one", "call_id": "call_one", "name": "read", "arguments": ""}
+    before_terminal = parser.feed(json.dumps({"type": "response.output_item.added", "output_index": 0, "item": call}))
+    if prefix:
+        before_terminal += parser.feed(json.dumps({"type": "response.function_call_arguments.delta", "item_id": "fc_one",
+                                                   "delta": prefix}))
+    events = parser.feed(json.dumps({"type": "response.completed", "response": {"output": [
+        {"type": "function_call", "id": "fc_one", "name": "read", "arguments": '{"path":"note.txt"}', "status": "completed"},
+    ]}}))
+
+    assert events == [{"type": "tool_call", "id": "call_one", "name": "read", "arguments": '{"path":"note.txt"}'},
+                      {"type": "end", "reason": "tool_calls"}]
+    assert parser.reply_blocks() == [{"type": "tool_call", "toolCallId": "call_one", "toolName": "read",
+                                      "toolInput": {"path": "note.txt"}}]
+    assert before_terminal == []
+
+
+@pytest.mark.parametrize(("reason", "expected"), [("max_output_tokens", "length"), ("content_filter", "content_filter")])
+def test_responses_parser_releases_only_completed_calls_on_an_incomplete_response(reason, expected):
+    parser = minara.ResponsesParser()
+    calls = [{"type": "function_call", "id": f"fc_{i}", "call_id": f"call_{i}", "name": "read", "arguments": "{}"}
+             for i in range(3)]
+    events = []
+    for i, call in enumerate(calls):
+        events.extend(parser.feed(json.dumps({"type": "response.output_item.added", "output_index": i, "item": call})))
+    events.extend(parser.feed(json.dumps({"type": "response.output_item.done", "output_index": 0,
+                                         "item": {**calls[0], "status": "completed"}})))
+    events.extend(parser.feed(json.dumps({"type": "response.incomplete", "response": {
+        "status": "incomplete", "incomplete_details": {"reason": reason}, "output": [
+            calls[0], {**calls[1], "status": "incomplete"},
+        ],
+    }})))
+
+    assert events == [{"type": "tool_call", "id": "call_0", "name": "read", "arguments": "{}"},
+                      {"type": "end", "reason": expected}]
+    assert [block["toolCallId"] for block in parser.reply_blocks()] == ["call_0"]
+
+
 @pytest.mark.asyncio
 async def test_truncated_sse_stream_without_completed_fails_unbilled_false():
     resp = _MockResponse(200, _sse_bytes([

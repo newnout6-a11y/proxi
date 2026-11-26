@@ -549,6 +549,57 @@ def test_async_discovery_does_not_resurrect_deleted_provider(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("replace_account", "start_new_refresh"),
+    [(False, True), (True, True), (True, False)],
+    ids=["overlapping-refreshes", "same-url-replacement", "replacement-before-refresh"],
+)
+def test_discovery_discards_results_from_stale_requests(tmp_path, monkeypatch, replace_account, start_new_refresh):
+    base = "https://provider.example/v1"
+    meta = {"id": "sample", "driver": "openai-chat", "base_url": base}
+    original = {"provider_id": "sample", "base_url": base, "account_id": "first"}
+    replacement = dict(original, account_id="second")
+    pool = types.SimpleNamespace(backends=[types.SimpleNamespace(cfg=original)])
+    cfg = {"_config_path": str(tmp_path / "config.json"), "_providers_meta": {"sample": meta},
+           "providers": [meta], "models_dev_sync": False}
+    path = discovery.overlay_path(cfg["_config_path"])
+    assert discovery.save_overlay(path, {"sample": [{"id": "previous-model"}]})
+    refresher = discovery.UniversalCatalogRefresher(cfg, types.SimpleNamespace(pool=pool))
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fetch_models(_cfg):
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+                return [{"id": "stale-model"}]
+            return [{"id": "current-model"}]
+
+        monkeypatch.setattr(discovery, "discover_provider_models", fetch_models)
+        stale = asyncio.create_task(refresher.refresh_async("sample"))
+        await asyncio.wait_for(entered.wait(), 1)
+        try:
+            if replace_account:
+                with refresher.publication_lock:
+                    pool.backends = [types.SimpleNamespace(cfg=replacement)]
+            if start_new_refresh:
+                current = await refresher.refresh_async("sample")
+                assert current["providers"] == {"sample": {"ok": True, "count": 1}}
+        finally:
+            release.set()
+            discarded = await stale
+        assert discarded["providers"] == {}
+        assert discarded["changed"] is False
+
+    asyncio.run(scenario())
+    expected = "current-model" if start_new_refresh else "previous-model"
+    assert list(cfg["_provider_models"]) == [f"sample/{expected}"]
+    assert discovery.load_overlay(path) == {"sample": [{"id": expected}]}
+    expected_status = {"sample": {"ok": True, "count": 1}} if start_new_refresh else {}
+    assert refresher.last_refresh == expected_status
+
+
 def test_save_overlay_and_models_dev_retry_replace_and_unlink_tmp(tmp_path, monkeypatch):
     target = tmp_path / discovery.AUTO_NAME
     real_replace = discovery.os.replace

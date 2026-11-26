@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import builtins
+import io
 import json
 import socket
 import threading
 import time
+from types import SimpleNamespace
 
+import pytest
 import account_report
 import admin
 import drivers.http_pool as http_pool
@@ -663,6 +666,46 @@ def test_journal_sse_stream_delivers_reset_even_when_since_equals_1(admin_relay,
         assert decoded.index("event: reset") < decoded.index("admin.journal_cleared")
     finally:
         sock.close()
+
+
+@pytest.mark.parametrize("reset_while_disconnected", [True, False])
+def test_journal_reconnect_validates_saved_cursor_epoch(monkeypatch, reset_while_disconnected):
+    events = journal.Journal()
+    admin_obj = SimpleNamespace(runtime=SimpleNamespace(journal=events))
+    for message in ("previous first", "previous second"):
+        events.emit("sample.event", message)
+    cursor = admin.Admin._events(admin_obj, {})
+    assert cursor["last_seq"] == 2
+    assert cursor["reset_epoch"] == 0
+    if reset_while_disconnected:
+        events.reset()
+        events.emit("sample.event", "new first")
+        events.emit("sample.event", "new second")
+    events.emit("sample.event", "new third")
+
+    def ignore(*_):
+        pass
+
+    handler = SimpleNamespace(request_id="offline", wfile=io.BytesIO(), send_response=ignore,
+                              send_header=ignore, end_headers=ignore)
+    monkeypatch.setattr(admin.sse, "client_gone", lambda _: True)
+    admin.Admin._stream(admin_obj, handler, {
+        "since": [str(cursor["last_seq"])],
+        "reset_epoch": [str(cursor["reset_epoch"])],
+    })
+    frames = []
+    for frame in handler.wfile.getvalue().decode().strip().split("\n\n"):
+        name, data = frame.split("\n", 1)
+        frames.append((name.removeprefix("event: "), json.loads(data.removeprefix("data: "))))
+    assert frames[0][0] == "hello"
+    assert frames[0][1]["reset_epoch"] == int(reset_while_disconnected)
+    if reset_while_disconnected:
+        assert frames[1] == ("reset", {"last_seq": 3, "reset_epoch": 1})
+        assert [(kind, event["seq"], event["message"]) for kind, event in frames[2:]] == [
+            ("journal", 1, "new first"), ("journal", 2, "new second"), ("journal", 3, "new third"),
+        ]
+    else:
+        assert [(kind, event["seq"], event["message"]) for kind, event in frames[1:]] == [("journal", 3, "new third")]
 
 
 # -- LOWs: account_report snapshot lock & _loggable surrogate handling --------

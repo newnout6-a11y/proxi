@@ -2410,6 +2410,11 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
         return (_forced_stream(cfg, session, sent, param_types, required) if required is not None
                 else _stream_body(cfg, session, sent, param_types))
 
+    def assist_gate_refusal(error):
+        metadata = body.get("metadata")
+        return (error.status == 400 and not began and isinstance(metadata, dict) and bool(metadata.get("sandpackAgent"))
+                and "invalid request format" in (error.message or "").lower())
+
     try:
         try:
             if head_role == "follow":
@@ -2424,14 +2429,13 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                     note(event)
                     yield event
         except apierr.ApiError as error:
+            failure = error
             said = (error.message or "").lower()
             unavailable = (error.status == 400 and "metadata" in body and "not available right now" in said)
             # Retool 4.103.0 Cloud gate (assistCopilotStreamGateEnabled) rejects metadata.sandpackAgent
-            # without sandbox attestation as 400 "Invalid request format"; fall back to unmarked Assist when
-            # no tool-result hint rebuild applies so paid Assist orgs succeed and Freetool orgs hit 403 plan_refusal.
-            gate_rejected = (error.status == 400 and not began and isinstance(body.get("metadata"), dict)
-                             and bool(body["metadata"].get("sandpackAgent")) and "invalid request format" in said)
-            assist = unavailable or gate_rejected
+            # without sandbox attestation as 400 "Invalid request format". A repeated 400 after removing the
+            # tool-result cache hint also needs the existing Assist fallback, which still honors plan refusal.
+            gate_rejected = assist_gate_refusal(error)
             # What may be upstream's refusal of a hint on a tool result: a message that names the cache, or the route
             # validator's own words, which name nothing ("Invalid request format", an empty body). One that names thinking,
             # a signature or the blocks of the history is about the signed branch, whose own handling follows, and any
@@ -2469,31 +2473,42 @@ async def iter_events(cfg, session, model_provider, prompt, head, tools, tool_ch
                 if body.get("openAICacheKey") and not side_request:  # what the turn keeps warm, as above
                     session._turn_body = body
                 answered = False
-                async with contextlib.aclosing(open_stream(body)) as stream:
-                    async for event in stream:
-                        if not answered and _from_upstream(event):
-                            answered = True
-                            _TOOL_RESULT_HINTS["refused"] = True
-                            journal.emit("upstream.tool_result_hint_refused",
-                                         "Upstream отклонил подсказку кэша на результате инструмента (HTTP %s): запрос "
-                                         "повторён без неё, дальше такие подсказки не ставятся" % upstream_status, "warn",
-                                         status=upstream_status, upstream_message=(error.message or "").replace("\n", " ")[:160],
-                                         model=model_provider.get("model"))
-                        note(event)
-                        yield event
-            else:
+                try:
+                    async with contextlib.aclosing(open_stream(body)) as stream:
+                        async for event in stream:
+                            if not answered and _from_upstream(event):
+                                answered = True
+                                _TOOL_RESULT_HINTS["refused"] = True
+                                journal.emit("upstream.tool_result_hint_refused",
+                                             "Upstream отклонил подсказку кэша на результате инструмента (HTTP %s): запрос "
+                                             "повторён без неё, дальше такие подсказки не ставятся" % upstream_status, "warn",
+                                             status=upstream_status,
+                                             upstream_message=(error.message or "").replace("\n", " ")[:160],
+                                             model=model_provider.get("model"))
+                            note(event)
+                            yield event
+                except apierr.ApiError as retry_error:
+                    # Follow the HTTP gate refusal only; a provider error inside HTTP 200 has a different origin.
+                    if (not gate_rejected or not assist_gate_refusal(retry_error)
+                            or getattr(error, "upstream_status", None) != 400
+                            or getattr(retry_error, "upstream_status", None) != 400):
+                        raise
+                    failure = retry_error
+                else:
+                    failure = None
+            if failure is not None:
                 # Models absent from the App Builder list (legacy GPT-5, Haiku) live on
                 # the Assist list, which is the same route without the agent marker.
-                if not assist:
+                if not (unavailable or gate_rejected):
                     raise
                 model_name = model_provider.get("model")
-                console_log.write("[assist] retry without agent marker: %s" % (error.message or "")[:80],
+                console_log.write("[assist] retry without agent marker: %s" % (failure.message or "")[:80],
                                   kind="upstream.assist_retry", level="warn", model=model_name,
                                   request_id=client_context.current().get("request_id") or getattr(session, "_request_tag", None),
                                   account=account_tag(getattr(session, "backend", None)))
                 journal.emit("upstream.assist_retry",
                              ("Запрос с маркером App Builder отклонён (%s) — повтор без маркера"
-                              % (error.message or "")[:80])
+                              % (failure.message or "")[:80])
                              if gate_rejected else "Модель только в списке Assist — повтор без маркера",
                              "warn", model=model_name)
                 body = _unmarked(body)

@@ -994,15 +994,18 @@ class Journal:
         return items
 
     def query(self, since=0, limit=300, levels=None, categories=None, text=None, turn=None, before=None, order="desc"):
-        return self._query_events(self._snapshot(), since=since, limit=limit, levels=levels, categories=categories,
-                                  text=text, turn=turn, before=before, order=order)
+        return self.query_page(since=since, limit=limit, levels=levels, categories=categories,
+                               text=text, turn=turn, before=before, order=order)[2]
 
-    def poll_since(self, since=0, limit=500):
-        """Atomically capture ``(reset_epoch, last_seq, batch)`` for SSE subscribers."""
+    def query_page(self, **filters):
+        """Capture events and their cursor together, so a clear cannot mix two generations."""
         with self._cond:
             epoch, seq = self._reset_epoch, self._seq
             events = list(self._events)
-        return epoch, seq, self._query_events(events, since=since, limit=limit, order="asc")
+        return epoch, seq, self._query_events(events, **filters)
+
+    def poll_since(self, since=0, limit=500):
+        return self.query_page(since=since, limit=limit, order="asc")
 
     def wait(self, since, timeout, epoch=None):
         """Block until an event newer than ``since`` exists, a reset changes ``epoch``, or the timeout elapses."""

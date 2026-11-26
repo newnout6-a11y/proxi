@@ -331,7 +331,8 @@ class UniversalCatalogRefresher:
         self.after_look = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()
+        self.publication_lock = threading.Lock()
+        self._refreshes: dict[str, object] = {}
         self.last_refresh: dict[str, dict] = {}
 
     def _universal_provider_backends(self, provider_id: str | None = None) -> dict[str, dict]:
@@ -386,30 +387,33 @@ class UniversalCatalogRefresher:
             except Exception:
                 pass
 
-        targets = self._universal_provider_backends(provider_id)
+        ticket = object()
+        with self.publication_lock:
+            targets = self._universal_provider_backends(provider_id)
+            self._refreshes.update(dict.fromkeys(targets, ticket))
         path = overlay_path(self.cfg.get("_config_path"))
         results: dict[str, dict] = {}
-        discovered_by_pid: dict[str, tuple[dict, list[dict]]] = {}
+        discovered_by_pid: dict[str, list[dict]] = {}
 
-        for pid, acc_cfg in targets.items():
-            try:
-                found = await discover_provider_models(acc_cfg)
-                results[pid] = {"ok": True, "count": len(found)}
-                discovered_by_pid[pid] = (acc_cfg, found)
-            except Exception as exc:  # noqa: BLE001
-                msg = journal.scrub(str(exc))[:240]
-                results[pid] = {"ok": False, "error": msg}
-                journal.emit(
-                    "catalog.provider_refresh_failed",
-                    f"Не удалось обновить список моделей провайдера {pid}: {msg}",
-                    "warn",
-                    provider=pid,
-                    error=msg,
-                )
+        try:
+            for pid, acc_cfg in targets.items():
+                try:
+                    found = await discover_provider_models(acc_cfg)
+                    results[pid] = {"ok": True, "count": len(found)}
+                    discovered_by_pid[pid] = found
+                except Exception as exc:  # noqa: BLE001
+                    msg = journal.scrub(str(exc))[:240]
+                    results[pid] = {"ok": False, "error": msg}
+        except asyncio.CancelledError:
+            with self.publication_lock:
+                for pid in targets:
+                    if self._refreshes.get(pid) is ticket:
+                        del self._refreshes[pid]
+            raise
 
         changed = False
         pruned = False
-        with self._lock:
+        with self.publication_lock:
             active_targets = self._universal_provider_backends(provider_id)
             valid_pids = self._active_provider_ids()
             current_overlay = (
@@ -420,17 +424,16 @@ class UniversalCatalogRefresher:
             for stale_pid in [pid for pid in current_overlay if pid not in valid_pids]:
                 current_overlay.pop(stale_pid, None)
                 pruned = True
-            for pid, (orig_cfg, found) in discovered_by_pid.items():
-                current_cfg = active_targets.get(pid)
-                if current_cfg is None or pid not in valid_pids:
-                    results.pop(pid, None)
+            for pid, orig_cfg in targets.items():
+                latest = self._refreshes.get(pid) is ticket
+                if latest:
+                    del self._refreshes[pid]
+                # CRUD replaces the backend config even on credential/driver edits that keep the same URL.
+                if not latest or pid not in valid_pids or active_targets.get(pid) is not orig_cfg:
+                    results.pop(pid)
                     continue
-                if (current_cfg.get("base_url") or current_cfg.get("base")) != (
-                    orig_cfg.get("base_url") or orig_cfg.get("base")
-                ):
-                    results.pop(pid, None)
-                    continue
-                if current_overlay.get(pid) != found:
+                found = discovered_by_pid.get(pid)
+                if found is not None and current_overlay.get(pid) != found:
                     current_overlay[pid] = found
                     changed = True
 
@@ -441,9 +444,14 @@ class UniversalCatalogRefresher:
             self.cfg["_discovered_provider_models"] = current_overlay
             self.cfg["_provider_models"] = router.build_provider_catalog(self.cfg, current_overlay)
             self.cfg["_route_aliases"] = router.build_route_aliases(self.cfg, model_catalog)
-            for pid in [p for p in results if p not in valid_pids]:
-                results.pop(pid, None)
             self.last_refresh.update(results)
+
+        for pid, result in results.items():
+            if not result["ok"]:
+                msg = result["error"]
+                journal.emit("catalog.provider_refresh_failed",
+                             f"Не удалось обновить список моделей провайдера {pid}: {msg}",
+                             "warn", provider=pid, error=msg)
 
         if (changed or pruned) and callable(self.after_look):
             try:

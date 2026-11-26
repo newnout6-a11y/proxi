@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { opencodeSnippet, pingModelOf } from '../src/catalog.js';
 import { showSpendPeak, spendAxisLabel, spendUnitOf } from '../src/spend.js';
+import { followJournal } from '../src/api.js';
 import { createJournalBuffer } from '../src/useJournal.js';
 
 // A14-09: the unit picked with the "Кредиты / USD" switch stayed USD after the dollars left the window, and the switch is
@@ -85,4 +86,49 @@ test('journal clear coordinates with SSE reset so seq=1 admin.journal_cleared is
   assert.deepEqual(latest, []);
   assert.equal(buf.lastSeq, 0);
   buf.dispose();
+});
+
+test('journal negotiates the last consumed epoch when reconnecting across a clear', async (t) => {
+  const buf = createJournalBuffer(() => {});
+  buf.loadInitial([{ seq: 2, kind: 'previous.event' }], 2, buf.resetEpoch, 0);
+  let pendingFrames = [];
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    requests.push(String(url));
+    return new Response(pendingFrames.map(([name, payload]) =>
+      `event: ${name}\ndata: ${JSON.stringify(payload)}\n\n`).join(''));
+  });
+
+  async function reconnect(...frames) {
+    pendingFrames = frames;
+    await followJournal('test-key', buf.lastSeq, {
+      resetEpoch: buf.serverEpoch,
+      onHello: ({ reset_epoch }) => buf.onHello(reset_epoch),
+      onReset: ({ reset_epoch }) => buf.resetFromServer(reset_epoch),
+      onEvent: (event) => buf.push(event),
+    });
+    buf.flushNow();
+  }
+
+  try {
+    // A second reconnect is still entitled to a replay if the first one drops after hello and before reset.
+    const hello = ['hello', { last_seq: 3, reset_epoch: 1 }];
+    await reconnect(hello);
+    assert.deepEqual(buf.events, [{ seq: 2, kind: 'previous.event' }]);
+    const fresh = [
+      { seq: 1, kind: 'admin.journal_cleared' },
+      { seq: 2, kind: 'fresh.event' },
+      { seq: 3, kind: 'fresh.event' },
+    ];
+    await reconnect(hello, ['reset', { last_seq: 3, reset_epoch: 1 }], ...fresh.map((event) => ['journal', event]));
+    assert.deepEqual(buf.events, fresh);
+    await reconnect(hello);
+    assert.deepEqual(requests, [
+      '/admin/api/events/stream?since=2&reset_epoch=0',
+      '/admin/api/events/stream?since=2&reset_epoch=0',
+      '/admin/api/events/stream?since=3&reset_epoch=1',
+    ]);
+  } finally {
+    buf.dispose();
+  }
 });

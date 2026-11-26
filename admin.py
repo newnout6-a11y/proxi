@@ -1987,21 +1987,22 @@ class Admin:
                 handler.close_connection = True
 
     def _events(self, query):
-        data = self.runtime.journal.query(
+        epoch, seq, data = self.runtime.journal.query_page(
             since=_int_param(query, "since", 0, 0, 2 ** 62),
             limit=_int_param(query, "limit", 300, 1, 2000),
             levels=_list_param(query, "level"), categories=_list_param(query, "category"),
             text=(query.get("q") or [""])[0][:200] or None,
             turn=(query.get("turn") or [""])[0] or None,
             before=_int_param(query, "before", 0, 0, 2 ** 62) or None)
-        last_seq = data[-1].get("seq", self.runtime.journal.last_seq) if data else self.runtime.journal.last_seq
-        return {"data": data, "last_seq": last_seq}
+        last_seq = data[-1].get("seq", seq) if data else seq
+        return {"data": data, "last_seq": last_seq, "reset_epoch": epoch}
 
     def _stream(self, handler, query):
         """Server-sent journal events; the key travels in headers via fetch streaming."""
         events = self.runtime.journal
-        last_seq, epoch = events.state()
+        last_seq, current_epoch = events.state()
         since = _int_param(query, "since", last_seq, 0, 2 ** 62)
+        epoch = _int_param(query, "reset_epoch", current_epoch, 0, 2 ** 62)
         handler._status = 200
         handler.close_connection = True
         handler.send_response(200)
@@ -2019,7 +2020,7 @@ class Admin:
             handler._holds_slot = False
             handler.server.release_slot()
         writer = sse.StreamWriter(handler)
-        writer.event("hello", {"last_seq": last_seq, "reset_epoch": epoch, "server_time": time.time()})
+        writer.event("hello", {"last_seq": last_seq, "reset_epoch": current_epoch, "server_time": time.time()})
         deadline = time.monotonic() + STREAM_MAX_SECONDS
         last_write = time.monotonic()
         while not writer.broken and time.monotonic() < deadline:
@@ -2033,11 +2034,7 @@ class Admin:
             if events.wait(since, 1.0, epoch=epoch):
                 snap_epoch, snap_seq, batch = events.poll_since(since=since, limit=500)
                 if snap_epoch != epoch or snap_seq < since:
-                    writer.event("reset", {"last_seq": snap_seq, "reset_epoch": snap_epoch})
-                    epoch = snap_epoch
-                    since = 0
-                    snap_epoch, snap_seq, batch = events.poll_since(since=0, limit=500)
-                    last_write = time.monotonic()
+                    continue  # Recheck the current epoch before sending any events from a reset journal.
                 for event in batch:
                     writer.event("journal", event)
                 if batch:

@@ -283,7 +283,8 @@ def test_iter_events_gate_400_to_assist_403_does_not_learn_and_surfaces_unbilled
     assert direct._is_assist_only(OPUS, sess) is False
 
 
-def test_iter_events_tool_result_hint_rebuild_still_takes_precedence_on_400(tmp_path, monkeypatch):
+@pytest.mark.parametrize("outcome", ["rebuild_success", "assist_success", "assist_refused", "other_error"])
+def test_iter_events_retool_gate_after_tool_result_hint_rebuild(tmp_path, monkeypatch, outcome):
     posted = []
 
     def opener(req, **_kw):
@@ -291,7 +292,12 @@ def test_iter_events_tool_result_hint_rebuild_still_takes_precedence_on_400(tmp_
         posted.append(body)
         if direct._has_tool_result_hint(body["messages"]):
             raise _http_error(req.full_url, 400, GATE_400_BODY)
-        return response(text("REBUILD_OK"), *END)
+        if "metadata" in body and outcome != "rebuild_success":
+            detail = GATE_400_BODY if outcome != "other_error" else '{"message":"Invalid tool schema"}'
+            raise _http_error(req.full_url, 400, detail)
+        if "metadata" not in body and outcome == "assist_refused":
+            raise _http_error(req.full_url, 403, ASSIST_403_BODY)
+        return response(text("OK"), *END)
 
     monkeypatch.setattr(direct.urllib.request, "urlopen", opener)
     cfg = {"base": "https://retool.invalid", "upstream_error_dir": str(tmp_path / "diag"), "turn_timeout": 10,
@@ -316,17 +322,26 @@ def test_iter_events_tool_result_hint_rebuild_still_takes_precedence_on_400(tmp_
     )
     token = client_context.bind({"client": "opencode", "request_id": "req-hint"})
     try:
-        events = asyncio.run(_collect(direct.iter_events(
-            cfg, sess, {"model": OPUS}, "go", "head " * 20, tools, "auto", 64
-        )))
+        events = _collect(direct.iter_events(cfg, sess, {"model": OPUS}, "go", "head " * 20, tools, "auto", 64))
+        if outcome in ("assist_refused", "other_error"):
+            with pytest.raises(apierr.ApiError) as caught:
+                asyncio.run(events)
+            error = caught.value
+            assert (error.status, error.message) == ((502, ASSIST_REFUSAL) if outcome == "assist_refused"
+                                                     else (400, "Invalid tool schema"))
+            assert apierr.is_plan_refusal(error) is (outcome == "assist_refused")
+            if outcome == "assist_refused":
+                assert error.unbilled is True
+        else:
+            assert {"type": "text", "delta": "OK"} in asyncio.run(events)
     finally:
         client_context.reset(token)
-    assert len(posted) == 2
-    assert "metadata" in posted[0] and "metadata" in posted[1]
-    assert direct._has_tool_result_hint(posted[0]["messages"])
-    assert not direct._has_tool_result_hint(posted[1]["messages"])
-    assert direct._TOOL_RESULT_HINTS["refused"] is True
-    assert any(ev == {"type": "text", "delta": "REBUILD_OK"} for ev in events)
+    expected = [(True, True), (True, False)]
+    if outcome in ("assist_success", "assist_refused"):
+        expected.append((False, False))
+    assert [("metadata" in body, direct._has_tool_result_hint(body["messages"])) for body in posted] == expected
+    assert direct._TOOL_RESULT_HINTS["refused"] is (outcome == "rebuild_success")
+    assert direct._is_assist_only(OPUS, sess) is (outcome == "assist_success")
 
 
 # -- End-to-end failover tests -----------------------------------------------------------------------------------------

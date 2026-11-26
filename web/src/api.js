@@ -56,8 +56,10 @@ export async function api(key, path, { method = 'GET', body, signal } = {}) {
 }
 
 /** Follow the journal over SSE with header auth (EventSource cannot send headers). */
-export async function followJournal(key, since, { signal, onEvent, onHello, onReset }) {
-  const response = await fetch(`/admin/api/events/stream?since=${since}`, {
+export async function followJournal(key, since, { signal, onEvent, onHello, onReset, resetEpoch }) {
+  const query = new URLSearchParams({ since });
+  if (Number.isSafeInteger(resetEpoch)) query.set('reset_epoch', resetEpoch);
+  const response = await fetch(`/admin/api/events/stream?${query}`, {
     headers: { authorization: `Bearer ${key}` }, signal, cache: 'no-store',
   });
   if (!response.ok || !response.body) throw new ApiError(response.status, 'Поток журнала недоступен');
