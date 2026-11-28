@@ -1457,6 +1457,13 @@ class EventParser:
             finish = choice.get("finish_reason")
             if finish:
                 if finish not in ("stop", "length", "tool_calls", "content_filter", "function_call"):
+                    # The upstream field is untrusted. Keep enum-like tokens under normal journal redaction;
+                    # for free-form text, overlong values or JSON objects, tell the operator only the type.
+                    token = (finish if isinstance(finish, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,47}", finish)
+                             else None)
+                    journal.emit("upstream.unknown_finish_reason", "Minara Chat returned an unknown finish reason", "warn",
+                                 upstream="minara", channel_path="chat", finish_reason=token,
+                                 finish_reason_type=type(finish).__name__)
                     raise apierr.upstream_error("Minara returned an unknown finish reason")
                 normalized_finish = "tool_calls" if finish == "function_call" else finish
                 if self.finish is not None and self.finish != normalized_finish:

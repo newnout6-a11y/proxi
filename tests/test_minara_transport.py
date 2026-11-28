@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 import apierr
+import client_context
+import journal
 import minara
 
 
@@ -447,12 +449,57 @@ def test_conflicting_finish_cannot_turn_filtered_or_cut_reply_into_success(first
     assert caught.value.status == 502
 
 
+FINISH_TEST_KEY = 'SyntheticConfiguredCredential_123'
+
+
+@pytest.mark.parametrize(('finish', 'logged'), [
+    pytest.param('UNEXPECTED_STOP_2', 'UNEXPECTED_STOP_2', id='enum'),
+    pytest.param('x' * 48, 'x' * 48, id='max-enum-length'),
+    pytest.param('x' * 49, None, id='too-long'),
+    pytest.param('-negative-prefix', None, id='invalid-prefix'),
+    pytest.param('non_ascii_я', None, id='non-ascii'),
+    pytest.param('Bearer fictional-token-value', None, id='credential-header'),
+    pytest.param({'raw': 'nested-private-text'}, None, id='non-string'),
+    pytest.param('sk-SyntheticUnconfiguredKey123', '[redacted]', id='recognized-secret-shape'),
+    pytest.param(FINISH_TEST_KEY, '[redacted]', id='configured-secret'),
+])
+def test_unknown_chat_finish_has_safe_diagnostic_and_same_client_error(finish, logged, monkeypatch, tmp_path):
+    path = tmp_path / 'journal.jsonl'
+    instance = journal.Journal()
+    instance.configure({'relay_api_key': FINISH_TEST_KEY}, path, load=False)
+    monkeypatch.setattr(journal, 'JOURNAL', instance)
+    token = client_context.bind({'request_id': 'req-minara-finish'})
+    try:
+        with pytest.raises(apierr.ApiError) as caught:
+            minara.EventParser().feed(chunk(finish=finish))
+    finally:
+        client_context.reset(token)
+        instance.configure()
+
+    error = caught.value
+    assert (error.status, error.code, error.message) == (502, 'upstream_error', 'Minara returned an unknown finish reason')
+    assert not getattr(error, 'unbilled', False)
+    (event,) = instance.query()
+    assert (event['kind'], event['request_id']) == ('upstream.unknown_finish_reason', 'req-minara-finish')
+    assert event['data']['upstream'] == 'minara'
+    assert event['data']['channel_path'] == 'chat'
+    assert event['data']['finish_reason_type'] == type(finish).__name__
+    assert event['data']['finish_reason'] == logged
+    persisted = path.read_text(encoding='utf-8')
+    assert json.loads(persisted) == event
+    if finish != logged:
+        assert (finish if isinstance(finish, str) else finish['raw']) not in persisted
+
+
 @pytest.mark.parametrize('finish', ['stop', 'length', 'tool_calls', 'content_filter'])
-def test_repeated_matching_finish_usage_frame_is_still_supported(finish):
+def test_repeated_matching_finish_usage_frame_is_still_supported(finish, monkeypatch):
+    instance = journal.Journal()
+    monkeypatch.setattr(journal, 'JOURNAL', instance)
     parser = minara.EventParser()
     parser.feed(chunk(finish=finish))
     parser.feed(chunk(finish=finish, usage={'prompt_tokens': 4}))
     assert parser.feed('[DONE]') == [{'type': 'end', 'reason': finish}]
+    assert not instance.query()
 
 
 @pytest.mark.parametrize('field', ['id', 'name', 'arguments', 'content', 'reasoning'])
